@@ -52,6 +52,8 @@ mod arch {
     ];
     /// System calls that open a path, with the index of their flags argument.
     pub const OPEN_CALLS: &[(i64, u8)] = &[(libc::SYS_open, 1), (libc::SYS_openat, 2)];
+    /// chmod variants that only x86_64 has, with the index of their mode argument.
+    pub const CHMOD_CALLS: &[(i64, u8)] = &[(libc::SYS_chmod, 1)];
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -65,6 +67,7 @@ mod arch {
     pub const DENIED: &[i64] = &[294];
     pub const PATH_METADATA: &[i64] = &[];
     pub const OPEN_CALLS: &[(i64, u8)] = &[(libc::SYS_openat, 2)];
+    pub const CHMOD_CALLS: &[(i64, u8)] = &[];
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -74,6 +77,7 @@ mod arch {
     pub const DENIED: &[i64] = &[];
     pub const PATH_METADATA: &[i64] = &[];
     pub const OPEN_CALLS: &[(i64, u8)] = &[];
+    pub const CHMOD_CALLS: &[(i64, u8)] = &[];
 }
 
 /// Whether sandy has a filter for the CPU architecture it was built for.
@@ -200,6 +204,24 @@ const CLONE_NAMESPACES: &[i32] = &[
 /// UNAME26, PER_LINUX32 | UNAME26, and the query value.
 const PERSONALITIES: &[u64] = &[0, 0x8, 0x2_0000, 0x2_0008, 0xffff_ffff];
 
+/// System calls that change another process, with the index of their process ID argument.
+/// Process ID 0 means the caller.
+const PROCESS_CALLS: &[(i64, u8)] = &[
+    (libc::SYS_prlimit64, 0),
+    (libc::SYS_sched_setaffinity, 0),
+    (libc::SYS_sched_setscheduler, 0),
+    (libc::SYS_sched_setparam, 0),
+    (libc::SYS_sched_setattr, 0),
+];
+
+/// System calls with a "which" and a "who" argument, with the "which" value that selects one
+/// process. The other values select a process group or every process of a user.
+const PROCESS_SELECTOR_CALLS: &[(i64, u64)] = &[
+    (libc::SYS_setpriority, libc::PRIO_PROCESS as u64),
+    (libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS),
+];
+const IOPRIO_WHO_PROCESS: u64 = 1;
+
 const NETLINK_ROUTE: u64 = 0;
 const SOCK_TYPE_MASK: u64 = 0xf;
 
@@ -210,13 +232,14 @@ pub struct Filters {
     pub denylist: BpfProgram,
 }
 
-/// Builds the filters for `config` and the CPU architecture sandy was built for.
-pub fn build(config: &FilterConfig) -> Result<Filters, BackendError> {
+/// Builds the filters for `config` and the CPU architecture sandy was built for. `own_pid` is
+/// the process ID of sandy, which the target keeps after execve.
+pub fn build(config: &FilterConfig, own_pid: u32) -> Result<Filters, BackendError> {
     let target = arch::TARGET
         .ok_or_else(|| BackendError::InvalidTargetArch(std::env::consts::ARCH.to_string()))?;
     Ok(Filters {
         allowlist: allowlist(target)?,
-        denylist: denylist(config, target)?,
+        denylist: denylist(config, own_pid, target)?,
     })
 }
 
@@ -247,7 +270,11 @@ fn rule(conditions: Vec<SeccompCondition>) -> Result<SeccompRule, BackendError> 
     SeccompRule::new(conditions)
 }
 
-fn denylist(config: &FilterConfig, target: TargetArch) -> Result<BpfProgram, BackendError> {
+fn denylist(
+    config: &FilterConfig,
+    own_pid: u32,
+    target: TargetArch,
+) -> Result<BpfProgram, BackendError> {
     let mut rules = Rules::default();
     for &call in DENIED.iter().chain(arch::DENIED) {
         rules.add(call, Vec::new());
@@ -270,6 +297,23 @@ fn denylist(config: &FilterConfig, target: TargetArch) -> Result<BpfProgram, Bac
         // utimensat with a NULL path changes the descriptor itself (futimens).
         let path = SeccompCondition::new(1, SeccompCmpArgLen::Qword, SeccompCmpOp::Ne, 0)?;
         rules.add(libc::SYS_utimensat, vec![rule(vec![path])?]);
+    }
+    rules.add(libc::SYS_fchmod, setid_rules(1)?);
+    if !config.deny_path_metadata {
+        for &(call, mode) in [(libc::SYS_fchmodat, 2), (SYS_FCHMODAT2, 2)]
+            .iter()
+            .chain(arch::CHMOD_CALLS)
+        {
+            rules.add(call, setid_rules(mode)?);
+        }
+    }
+    let own_pid = u64::from(own_pid);
+    for &(call, pid) in PROCESS_CALLS {
+        rules.add(call, vec![other_process(pid, own_pid)?]);
+    }
+    for &(call, one_process) in PROCESS_SELECTOR_CALLS {
+        let group_or_user = rule(vec![low(0, SeccompCmpOp::Ne, one_process)?])?;
+        rules.add(call, vec![group_or_user, other_process(1, own_pid)?]);
     }
     for &(call, flags) in arch::OPEN_CALLS {
         rules.add(call, open_rules(flags, config.restrict_truncate)?);
@@ -349,6 +393,29 @@ fn socketpair_rules(config: &FilterConfig) -> Result<Vec<SeccompRule>, BackendEr
         }
     }
     Ok(rules)
+}
+
+/// A file with the setuid or setgid bit runs with the rights of this user when another local
+/// user runs it. Writing to a file clears both bits, so only the chmod calls can set them on a
+/// file with content.
+fn setid_rules(mode: u8) -> Result<Vec<SeccompRule>, BackendError> {
+    [libc::S_ISUID, libc::S_ISGID]
+        .into_iter()
+        .map(|bit| {
+            let bit = u64::from(bit);
+            rule(vec![low(mode, SeccompCmpOp::MaskedEq(bit), bit)?])
+        })
+        .collect()
+}
+
+/// Matches a process ID argument that names neither the caller (0) nor the target. Children of
+/// the target therefore cannot use these calls on each other, and a thread ID other than the
+/// main thread's counts as another process.
+fn other_process(pid: u8, own_pid: u64) -> Result<SeccompRule, BackendError> {
+    rule(vec![
+        low(pid, SeccompCmpOp::Ne, 0)?,
+        low(pid, SeccompCmpOp::Ne, own_pid)?,
+    ])
 }
 
 /// One rule per flag, because a rule matches only when all its conditions match.
@@ -455,8 +522,10 @@ mod tests {
 
     /// Runs both filters like the kernel: the most restrictive action wins, and among equal
     /// actions the most recently installed filter.
+    const OWN_PID: u32 = 4242;
+
     fn decide(config: &FilterConfig, arch: u32, nr: i64, args: [u64; 6]) -> u32 {
-        let filters = build(config).unwrap();
+        let filters = build(config, OWN_PID).unwrap();
         let rank = |action: u32| (action & libc::SECCOMP_RET_ACTION_FULL) as i32;
         let mut result = RET_ALLOW;
         for program in [&filters.denylist, &filters.allowlist] {
@@ -503,7 +572,7 @@ mod tests {
     #[test]
     fn programs_fit_the_kernel_limit() {
         for config in [strict(), open()] {
-            let filters = build(&config).unwrap();
+            let filters = build(&config, OWN_PID).unwrap();
             assert!(filters.allowlist.len() < 4096);
             assert!(filters.denylist.len() < 4096);
         }
@@ -688,6 +757,83 @@ mod tests {
         assert_eq!(call(&allow, libc::SYS_utimensat, path), RET_ALLOW);
         let descriptor = args(&[3, 0]);
         assert_eq!(call(&deny, libc::SYS_utimensat, descriptor), RET_ALLOW);
+    }
+
+    #[test]
+    fn setuid_and_setgid_bits_cannot_be_set() {
+        let setid = [0o4755, 0o2755, 0o6755];
+        let plain = [0o755, 0o644, 0o1777];
+        for config in [strict(), open()] {
+            for mode in setid {
+                let args = args(&[3, mode]);
+                assert_eq!(call(&config, libc::SYS_fchmod, args), RET_EPERM, "{mode:o}");
+            }
+            for mode in plain {
+                let args = args(&[3, mode]);
+                assert_eq!(call(&config, libc::SYS_fchmod, args), RET_ALLOW, "{mode:o}");
+            }
+        }
+        // With path metadata allowed, the path variants get the same check.
+        let mut calls = vec![(libc::SYS_fchmodat, 2), (SYS_FCHMODAT2, 2)];
+        calls.extend(
+            arch::CHMOD_CALLS
+                .iter()
+                .map(|&(call, mode)| (call, usize::from(mode))),
+        );
+        for (nr, mode_index) in calls {
+            let with_mode = |mode: u64| {
+                let mut args = [0; 6];
+                args[mode_index] = mode;
+                args
+            };
+            for mode in setid {
+                assert_eq!(
+                    call(&open(), nr, with_mode(mode)),
+                    RET_EPERM,
+                    "{nr} {mode:o}"
+                );
+            }
+            for mode in plain {
+                assert_eq!(
+                    call(&open(), nr, with_mode(mode)),
+                    RET_ALLOW,
+                    "{nr} {mode:o}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn other_processes_cannot_be_changed() {
+        let own = u64::from(OWN_PID);
+        let other = own + 1;
+        for &(nr, pid_index) in PROCESS_CALLS {
+            let with_pid = |pid: u64| {
+                let mut args = [0; 6];
+                args[usize::from(pid_index)] = pid;
+                args
+            };
+            assert_eq!(call(&open(), nr, with_pid(0)), RET_ALLOW, "{nr}");
+            assert_eq!(call(&open(), nr, with_pid(own)), RET_ALLOW, "{nr}");
+            assert_eq!(call(&open(), nr, with_pid(other)), RET_EPERM, "{nr}");
+        }
+        let prio_pgrp = libc::PRIO_PGRP as u64;
+        let prio_user = libc::PRIO_USER as u64;
+        for (nr, one, groups) in [
+            (
+                libc::SYS_setpriority,
+                libc::PRIO_PROCESS as u64,
+                [prio_pgrp, prio_user],
+            ),
+            (libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, [2, 3]),
+        ] {
+            assert_eq!(call(&open(), nr, args(&[one, 0])), RET_ALLOW, "{nr}");
+            assert_eq!(call(&open(), nr, args(&[one, own])), RET_ALLOW, "{nr}");
+            assert_eq!(call(&open(), nr, args(&[one, other])), RET_EPERM, "{nr}");
+            for which in groups {
+                assert_eq!(call(&open(), nr, args(&[which, 0])), RET_EPERM, "{nr}");
+            }
+        }
     }
 
     #[test]

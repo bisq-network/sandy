@@ -144,6 +144,13 @@ fn only_route_netlink_is_available_with_ip() {
     lines[1].assert_blocked();
 }
 
+/// Yama's ptrace_scope. From 1 up it limits ptrace and `/proc/<pid>/mem` to descendants, also
+/// outside the sandbox. `None` when Yama is not active.
+fn yama_ptrace_scope() -> Option<u32> {
+    let scope = fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope").ok()?;
+    scope.trim().parse().ok()
+}
+
 #[test]
 fn parent_memory_and_environment_are_unreadable() {
     let parent = parent_pid();
@@ -151,19 +158,31 @@ fn parent_memory_and_environment_are_unreadable() {
         format!("/proc/{parent}/mem"),
         format!("/proc/{parent}/environ"),
     );
+    let candidates = [("open", mem.as_str()), ("read", environ.as_str())];
+    // A control run that Yama blocks shows nothing about the sandbox, so that action is skipped.
+    // Any other control failure fails the test.
+    let mut actions = Vec::new();
+    for (action, control) in candidates.iter().zip(probe_outside(&candidates)) {
+        if control.result == "ok" {
+            actions.push(*action);
+        } else if control.result == "denied" && yama_ptrace_scope().is_some_and(|scope| scope >= 1)
+        {
+            skip(&format!(
+                "{} {}: Yama ptrace_scope blocks it outside the sandbox",
+                control.action, control.target
+            ));
+        } else {
+            control.assert_ok();
+        }
+    }
+    actions.push(("read", "/proc/self/status"));
     // With /proc readable, only the process isolation stops these reads.
-    let proc_readable = args(&["--read", "/proc"]);
-    let lines = controlled(
-        &proc_readable,
-        &[
-            ("open", &mem),
-            ("read", &environ),
-            ("read", "/proc/self/status"),
-        ],
-    );
-    lines[0].assert_blocked();
-    lines[1].assert_blocked();
-    lines[2].assert_ok();
+    let lines = probe_inside(&args(&["--read", "/proc"]), &actions);
+    let (status, isolated) = lines.split_last().unwrap();
+    status.assert_ok();
+    for line in isolated {
+        line.assert_blocked();
+    }
 }
 
 #[test]
@@ -365,6 +384,66 @@ fn path_metadata_follows_the_policy() {
     allow.extend(args(&["--linux-path-metadata", "allow"]));
     probe_inside(&allow, &[("set-readonly", &file)])[0].assert_ok();
     assert!(fs::metadata(&file).unwrap().permissions().readonly());
+}
+
+#[test]
+fn setuid_and_setgid_bits_cannot_be_set() {
+    let fixture = Fixture::new("linux-setid");
+    let file = fixture.arg("rw/file");
+    let actions = [
+        ("fchmod-setuid", file.as_str()),
+        ("chmod-setuid", file.as_str()),
+    ];
+    for line in probe_outside(&actions) {
+        line.assert_ok();
+    }
+    let mut allow = fixture.access_args();
+    allow.extend(args(&["--linux-path-metadata", "allow"]));
+    for sandbox_args in [fixture.access_args(), allow] {
+        fixture.reset();
+        for line in probe_inside(&sandbox_args, &actions) {
+            line.assert_blocked();
+        }
+        let mode = fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o6000, 0, "mode {mode:o}");
+    }
+}
+
+/// A process outside the sandbox that a test may change. It is killed when dropped.
+struct Victim(std::process::Child);
+
+impl Drop for Victim {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn other_processes_cannot_be_changed() {
+    let victim = Victim(
+        Command::new(probe_path())
+            .args(["sleep", "600000"])
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let pid = victim.0.id().to_string();
+    // Each action writes back the current value, so the victim does not change.
+    let calls = [
+        "renice-same",
+        "prlimit-same",
+        "affinity-same",
+        "ioprio-same",
+    ];
+    let other: Vec<(&str, &str)> = calls.iter().map(|call| (*call, pid.as_str())).collect();
+    for line in controlled(&[], &other) {
+        line.assert_blocked();
+    }
+    let own: Vec<(&str, &str)> = calls.iter().map(|call| (*call, "self")).collect();
+    for line in probe_inside(&[], &own) {
+        line.assert_ok();
+    }
 }
 
 #[test]

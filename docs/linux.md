@@ -44,8 +44,8 @@ child inherits them.
 | Requirement | Mechanism |
 |---|---|
 | FilesystemConfined | Landlock with every file system right of the ABI handled. The seccomp filter denies opening a file with access mode 3 and `openat2` (see "Access mode 3"). Before ABI 3 it also denies truncation without write access. |
-| NoPrivilegeEscalation | no_new_privs. The filters deny namespaces, mounts, `bpf`, `perf_event_open`, io_uring, keyrings, `userfaultfd`, calls that need capabilities, unknown system calls and other CPU architectures. sandy refuses to run as root or with capabilities. |
-| ProcessMemoryIsolated | Landlock: a domain cannot ptrace, open `/proc/<pid>/mem` or `environ`, or use `process_vm_readv` on processes outside it (all ABIs). The denylist also denies `ptrace`, `process_vm_readv`, `process_vm_writev`, `pidfd_getfd`, `kcmp`, `process_madvise`, System V IPC and POSIX message queues. |
+| NoPrivilegeEscalation | no_new_privs. The filters deny namespaces, mounts, `bpf`, `perf_event_open`, io_uring, keyrings, `userfaultfd`, calls that need capabilities, setuid and setgid mode bits, unknown system calls and other CPU architectures. sandy refuses to run as root or with capabilities. |
+| ProcessMemoryIsolated | Landlock: a domain cannot ptrace, open `/proc/<pid>/mem` or `environ`, or use `process_vm_readv` on processes outside it (all ABIs). The denylist also denies `ptrace`, `process_vm_readv`, `process_vm_writev`, `pidfd_getfd`, `kcmp`, `process_madvise`, System V IPC and POSIX message queues, and changes of the limits, priority and CPU affinity of other processes. |
 | InheritedHandlesClosed | Close-on-exec on every descriptor above 2. |
 | EnvironmentControlled | `execve` with exactly the policy environment. The backend adds no variables. |
 | IpNetworkDenied | The socket family allowlist has no `AF_INET`, `AF_INET6` or `AF_NETLINK`; io_uring is denied. From ABI 4, Landlock also denies TCP bind and connect. |
@@ -109,13 +109,16 @@ filter still denies `TIOCSTI` and `TIOCLINUX` on every descriptor; the test
 ### Access mode 3
 
 Linux accepts the access mode 3 (`O_RDWR | O_WRONLY`) in `open`. It means "check read and write
-permission, then return a descriptor for ioctl only". Landlock requires no right for such an
-open. Tested on Linux 7.2 with ABI 9 enforced: `open(path, 3)` on a file outside the policy
-succeeded, and `fchmod` and `fsetxattr` on that descriptor changed the file. On ABI 1 to 4 the
-descriptor would also give device ioctls on any device the user can open (derived from the
-kernel source, not tested). The denylist therefore
-denies `open` and `openat` with access mode 3, and `openat2` fails with `ENOSYS` because seccomp
-cannot read its flags. This should be reported to the Landlock maintainers.
+permission, then return a descriptor that can neither read nor write, only use ioctl". Landlock
+derives the rights it checks at open time from the read and write modes of the descriptor, so it
+checks no right for such an open. This is a limitation of Landlock, and sandy closes it with
+seccomp.
+
+Tested on Linux 7.2 with ABI 9 enforced: `open(path, 3)` on a file outside the policy succeeded,
+and `fchmod` and `fsetxattr` on that descriptor changed the file. On ABI 1 to 4 such a descriptor
+would also allow device ioctls on any device the user can open (derived from the kernel source,
+not tested). The denylist therefore denies `open` and `openat` with access mode 3, and `openat2`
+fails with `ENOSYS`, because seccomp cannot read its flags.
 
 ## Seccomp
 
@@ -156,6 +159,9 @@ their low 32 bits only, because the kernel ignores the high bits.
 | `keyctl`, `add_key`, `request_key` | always | The keyrings of the user are shared by all its processes. |
 | `kexec_*`, module calls, `reboot`, `swapon`, `swapoff`, `acct`, `quotactl`, `quotactl_fd`, `syslog`, `open_by_handle_at`, `settimeofday`, `clock_settime`; on x86_64 `iopl`, `ioperm`, `modify_ldt`, `uselib` | always | They need capabilities, which sandy never passes on. A second layer. |
 | metadata calls by path | with `linux.path_metadata = "deny"` | See "Metadata". |
+| `fchmod`; with `path_metadata = "allow"` also `chmod`, `fchmodat`, `fchmodat2` | mode with `S_ISUID` or `S_ISGID` | A file with these bits runs with the rights of this user when another local user runs it. See "Setuid and setgid bits". |
+| `prlimit64`, `sched_setaffinity`, `sched_setscheduler`, `sched_setparam`, `sched_setattr` | process ID other than 0 and the target's own | See "Other processes". |
+| `setpriority`, `ioprio_set` | a process group or user, or a process ID other than 0 and the target's own | Same. |
 
 ### Metadata
 
@@ -173,6 +179,33 @@ descriptors, and access mode 3 is denied, so they only reach files that Landlock
 open for reading or writing. Programs that change metadata by path, for example `tar`, `cp -p`
 and `install`, need `path_metadata = "allow"`; then the program can change the metadata of every
 file the user owns.
+
+### Setuid and setgid bits
+
+Under every policy, `fchmod` fails with `EPERM` when the mode has `S_ISUID` or `S_ISGID`. With
+`path_metadata = "allow"`, `chmod`, `fchmodat` and `fchmodat2` get the same check; with the
+default `"deny"` they are denied anyway. Otherwise the program could mark a file in a writable
+path setuid to the user, and another local user who can reach the file would run it with this
+user's rights.
+
+Creating a file with these bits (`open` with `O_CREAT` and mode 4755, `mknod`) stays allowed.
+Tested on Linux 7.2: `write` and `ftruncate` (which `mmap` writes need first) clear both bits, so
+such a file stays empty or loses the bits. Programs that set the setgid bit on directories, for
+example `git init --shared`, fail.
+
+### Other processes
+
+`prlimit64`, `setpriority`, `ioprio_set`, `sched_setaffinity`, `sched_setscheduler`,
+`sched_setparam` and `sched_setattr` can change other processes of the user: lower their
+resource limits, priority or I/O priority, or pin them to one CPU. The denylist allows them only
+with process ID 0 (the caller) or the target's own process ID, which it keeps from sandy after
+`execve`. For `setpriority` and `ioprio_set` it also denies the process group and user forms,
+because sandy's process group can contain processes outside the sandbox.
+
+Costs: children of the program cannot use these calls on each other, and a thread ID other than
+the one of the main thread counts as another process. For example,
+`pthread_setaffinity_np` and `pthread_setschedparam` fail for threads other than the main
+thread, and `nice` works only for the calling thread through ID 0.
 
 ## Minimal system set
 
@@ -239,12 +272,8 @@ secrets passed on command lines, and `/proc/net` of the network namespace. `/pro
   policy succeeded). The program can learn which files exist, their sizes and times, and when
   other programs touch them.
 - **Metadata through open files.** `fchmod`, `fchown`, `fsetxattr` and `futimens` work on every
-  file the program may open, also in `read` paths. They can set the setuid or setgid bit on a
-  file in a writable path, which another local user could then run as this user if the
-  directory is reachable.
-- **Other processes of the user.** The program can lower their priority (`setpriority`,
-  `ioprio_set`), pin them to CPUs (`sched_setaffinity`) and lower their resource limits
-  (`prlimit64`). With `signals = "any"` it can kill them.
+  file the program may open, also in `read` paths, except for setuid and setgid bits.
+- **Signals.** With `signals = "any"` the program can kill other processes of the user.
 - **The terminal.** If standard input or output is the user's terminal, the program can read
   input, write escape sequences and change terminal modes. Only `TIOCSTI` and `TIOCLINUX` are
   denied.
@@ -269,13 +298,23 @@ secrets passed on command lines, and `/proc/net` of the network namespace. `/pro
 
 `crates/sandy-cli/tests/escape_linux.rs` holds the Linux escape tests; the shared ones are in
 `escape.rs`. Every denial has a control run outside the sandbox. Checks that need a host feature
-(a session bus, a pseudo-terminal, ptrace under Yama, a socket family) print why they skip.
+(a session bus, a pseudo-terminal, ptrace or `/proc/<pid>/mem` under Yama `ptrace_scope` 1 or
+higher, a socket family) print why they skip.
 Checks that depend on the Landlock ABI read it from the kernel: below ABI 6, the signal test
 expects sandy to refuse `signals = "isolated"`. The unit tests in `crates/sandy-linux` cover the
 planning function with invented host capabilities, and the filter decisions with a small BPF
 interpreter that applies both filters with the kernel's precedence.
 
-Static test binaries: `cargo test --target x86_64-unknown-linux-musl` builds static test
-executables. With `SANDY_TEST_BIN_DIR` pointing to a directory with static `sandy` and
-`sandy-probe` (`cargo build --release --target x86_64-unknown-linux-musl -p sandy-cli --bins`),
-they run on another host, for example a test VM.
+Static test binaries for another host, for example a test VM:
+
+```sh
+cargo build --release --target x86_64-unknown-linux-musl -p sandy-cli --bins
+cargo test --no-run --target x86_64-unknown-linux-musl -p sandy-cli \
+    --test escape --test escape_linux
+```
+
+The second command prints the paths of the test executables
+(`target/x86_64-unknown-linux-musl/debug/deps/escape-<hash>` and `escape_linux-<hash>`). Copy
+them and `target/x86_64-unknown-linux-musl/release/sandy` and `sandy-probe` to the host, put
+`sandy` and `sandy-probe` in one directory, and run each test executable with
+`SANDY_TEST_BIN_DIR` set to that directory.

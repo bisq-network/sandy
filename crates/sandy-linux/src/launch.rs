@@ -23,7 +23,7 @@ use crate::plan::{LandlockConfig, Sandbox};
 /// the restrictions applied here.
 pub fn launch(sandbox: &Sandbox, command: &TargetCommand) -> Result<Infallible, SandboxError> {
     let ruleset = prepare_ruleset(&sandbox.landlock)?;
-    let filters = filter::build(&sandbox.filter)
+    let filters = filter::build(&sandbox.filter, std::process::id())
         .map_err(|error| SandboxError::new(format!("cannot build the seccomp filter: {error}")))?;
     let exec = Exec::new(command)?;
     if let Some(cwd) = &command.cwd {

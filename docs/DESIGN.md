@@ -154,7 +154,8 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   pairs when Unix sockets are denied, io_uring, ptrace and `process_vm_*`, System V IPC, POSIX
   message queues, namespaces, mounts, `bpf`, `perf_event_open`, `userfaultfd`, keyrings,
   `TIOCSTI`/`TIOCLINUX`, calls that need capabilities, `open` with access mode 3 (Landlock does
-  not check it), the path-based metadata calls when `path_metadata = "deny"`, and before
+  not check it), the path-based metadata calls when `path_metadata = "deny"`, setuid and setgid
+  mode bits, changes of the limits, priority and CPU affinity of other processes, and before
   Landlock ABI 3 truncation without write access.
 - Refused: no Landlock (the reason names the fix), no seccomp, root or any capability, a writable
   path that contains the dynamic loader.

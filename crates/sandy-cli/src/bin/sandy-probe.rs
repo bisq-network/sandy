@@ -213,6 +213,7 @@ mod linux {
     use std::fs;
     use std::io;
     use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::{SocketAddr, UnixStream};
     use std::path::Path;
     use std::process::{Command, Stdio};
@@ -236,6 +237,12 @@ mod linux {
         "shm-attach",
         "setuid-exec",
         "int80-getpid",
+        "fchmod-setuid",
+        "chmod-setuid",
+        "renice-same",
+        "prlimit-same",
+        "affinity-same",
+        "ioprio-same",
     ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
@@ -258,11 +265,105 @@ mod linux {
             "shm-attach" => shm_attach(number(target)?),
             "setuid-exec" => setuid_exec(target),
             "int80-getpid" => int80_getpid(),
+            "fchmod-setuid" => {
+                let file = fs::OpenOptions::new().write(true).open(target)?;
+                file.set_permissions(fs::Permissions::from_mode(SETUID_MODE))?;
+                Ok(String::new())
+            }
+            "chmod-setuid" => fs::set_permissions(target, fs::Permissions::from_mode(SETUID_MODE))
+                .map(|()| String::new()),
+            "renice-same" => renice_same(pid(target)?),
+            "prlimit-same" => prlimit_same(pid(target)?),
+            "affinity-same" => affinity_same(pid(target)?),
+            "ioprio-same" => ioprio_same(pid(target)?),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "unknown action",
             )),
         }
+    }
+
+    const SETUID_MODE: u32 = 0o4755;
+
+    /// A process ID, or `self` for the probe's own one.
+    fn pid(target: &str) -> io::Result<libc::pid_t> {
+        if target == "self" {
+            return Ok(std::process::id() as libc::pid_t);
+        }
+        number(target)
+    }
+
+    fn check_long(result: libc::c_long) -> io::Result<libc::c_long> {
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(result)
+        }
+    }
+
+    // The *-same actions read a setting of a process and write the same value back. The kernel
+    // checks the permission to change the process, but nothing changes.
+
+    fn renice_same(pid: libc::pid_t) -> io::Result<String> {
+        // SAFETY: getpriority returns the raw kernel value (20 - nice) through syscall, so -1 is
+        // never a valid result.
+        let raw =
+            check_long(unsafe { libc::syscall(libc::SYS_getpriority, libc::PRIO_PROCESS, pid) })?;
+        let nice = 20 - raw;
+        // SAFETY: setpriority takes no pointers.
+        check_long(unsafe { libc::syscall(libc::SYS_setpriority, libc::PRIO_PROCESS, pid, nice) })?;
+        Ok(format!("nice {nice}"))
+    }
+
+    fn prlimit_same(pid: libc::pid_t) -> io::Result<String> {
+        let mut limit = libc::rlimit64 {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: prlimit64 writes one rlimit64 through the last pointer.
+        check_long(unsafe {
+            libc::syscall(
+                libc::SYS_prlimit64,
+                pid,
+                libc::RLIMIT_NOFILE,
+                ptr::null::<libc::rlimit64>(),
+                &mut limit as *mut libc::rlimit64,
+            )
+        })?;
+        // SAFETY: prlimit64 reads one rlimit64 through the third pointer.
+        check_long(unsafe {
+            libc::syscall(
+                libc::SYS_prlimit64,
+                pid,
+                libc::RLIMIT_NOFILE,
+                &limit as *const libc::rlimit64,
+                ptr::null_mut::<libc::rlimit64>(),
+            )
+        })?;
+        Ok(String::new())
+    }
+
+    fn affinity_same(pid: libc::pid_t) -> io::Result<String> {
+        // SAFETY: cpu_set_t is a plain bit set; all zeros is a valid value.
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::cpu_set_t>();
+        // SAFETY: the kernel writes at most `size` bytes into `set`.
+        check(unsafe { libc::sched_getaffinity(pid, size, &mut set) })?;
+        // SAFETY: the kernel reads `size` bytes from `set`.
+        check(unsafe { libc::sched_setaffinity(pid, size, &set) })?;
+        Ok(String::new())
+    }
+
+    fn ioprio_same(pid: libc::pid_t) -> io::Result<String> {
+        const IOPRIO_WHO_PROCESS: libc::c_int = 1;
+        // SAFETY: ioprio_get and ioprio_set take no pointers.
+        let priority =
+            check_long(unsafe { libc::syscall(libc::SYS_ioprio_get, IOPRIO_WHO_PROCESS, pid) })?;
+        // SAFETY: as above.
+        check_long(unsafe {
+            libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, pid, priority)
+        })?;
+        Ok(String::new())
     }
 
     fn number<T: FromStr>(target: &str) -> io::Result<T> {

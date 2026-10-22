@@ -44,11 +44,13 @@ pub struct PathRights {
 }
 
 const FILTER_BASELINE: &str = "seccomp denies namespaces, mounts, bpf, perf_event_open, io_uring, \
-    keyrings, userfaultfd, calls that need capabilities, and unknown or foreign system calls";
+    keyrings, userfaultfd, calls that need capabilities, setuid and setgid mode bits, and unknown \
+    or foreign system calls";
 const FILTER_METADATA: &str = "seccomp denies chmod, chown, utime and xattr calls that take a \
     path, and fchmodat, fchmodat2 and fchownat";
 const FILTER_PROCESSES: &str = "seccomp denies ptrace, process_vm_readv, process_vm_writev, \
-    pidfd_getfd, kcmp, process_madvise, System V IPC and POSIX message queues";
+    pidfd_getfd, kcmp, process_madvise, System V IPC and POSIX message queues, and changes of the \
+    limits, priority and CPU affinity of other processes";
 
 pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
     let abi = host
