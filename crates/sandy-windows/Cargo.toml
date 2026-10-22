@@ -1,0 +1,14 @@
+[package]
+name = "sandy-windows"
+description = "Windows backend of sandy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+sandy-core.workspace = true
+
+[lints]
+workspace = true
