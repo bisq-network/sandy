@@ -30,6 +30,7 @@ fn main() -> ExitCode {
             println!("sandy {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
+        Command::Relay { listener, target } => relay(listener, target),
         Command::Sandbox(invocation) => match execute(*invocation) {
             Ok(code) => code,
             Err(message) => {
@@ -37,6 +38,20 @@ fn main() -> ExitCode {
                 ExitCode::from(EXIT_FAILURE)
             }
         },
+    }
+}
+
+fn relay(listener: u64, target: std::net::SocketAddr) -> ExitCode {
+    // SAFETY: a backend starts this command only with a listening socket it passed to this
+    // process and that nothing else here owns.
+    let result = unsafe { sandy_relay::inherited_listener(listener) }
+        .and_then(|listener| sandy_relay::serve(listener, target));
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("sandy: relay failed: {error}");
+            ExitCode::from(EXIT_FAILURE)
+        }
     }
 }
 

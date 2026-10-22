@@ -1,0 +1,94 @@
+name: release
+
+# A tag v<version> builds every platform and creates a DRAFT release with the archives and their
+# SHA-256 sums. A maintainer reviews and publishes it. Running the workflow by hand builds the
+# archives without creating a release.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-15 }
+          - { target: aarch64-apple-darwin, os: macos-15 }
+          - { target: x86_64-pc-windows-msvc, os: windows-2025 }
+          - { target: aarch64-pc-windows-msvc, os: windows-2025 }
+    runs-on: ${{ matrix.os }}
+    env:
+      # Paths of the build machine must not end up in the binary.
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/sandy ${{ contains(matrix.target, 'windows-msvc') && '-C target-feature=+crt-static' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check that the tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != v$version"; exit 1; }
+      - name: Build
+        shell: bash
+        run: |
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          cargo build --release --locked --target ${{ matrix.target }} -p sandy-cli --bin sandy
+      - name: Package
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          name="sandy-$version-${{ matrix.target }}"
+          exe=sandy; [[ "${{ matrix.target }}" == *windows* ]] && exe=sandy.exe
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/$exe" README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          cd dist
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            7z a -tzip -bd "$name.zip" "$name" > /dev/null
+          else
+            mtime="@$(git log -1 --format=%ct)"
+            tar=tar; command -v gtar > /dev/null && tar=gtar
+            if $tar --version 2> /dev/null | grep -q GNU; then
+              $tar --sort=name --mtime="$mtime" --owner=0 --group=0 --numeric-owner -czf "$name.tar.gz" "$name"
+            else
+              tar -czf "$name.tar.gz" "$name"
+            fi
+          fi
+          ls -l "$name"/"$exe" ./*.tar.gz ./*.zip 2> /dev/null || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sandy-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum ./*.tar.gz ./*.zip | sed 's| \./| |' > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "sandy $GITHUB_REF_NAME" \
+            --notes "Draft. Verify the archives against SHA256SUMS and sign SHA256SUMS before publishing. The aarch64 Windows build is cross-compiled and not tested at run time." \
+            ./*.tar.gz ./*.zip SHA256SUMS

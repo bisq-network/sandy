@@ -4,7 +4,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use sandy_core::{NetworkAccess, PathAccess, ResolvedPolicy, SignalScope, SystemAccess};
+use sandy_core::{
+    ExposedPort, NetworkAccess, PathAccess, ResolvedPolicy, SignalScope, SystemAccess,
+};
 
 use crate::system::{self, SystemAccess as Grant};
 
@@ -43,6 +45,40 @@ pub fn generate(policy: &ResolvedPolicy) -> Profile {
     network_rules(&mut writer, policy);
     ancestor_rules(&mut writer);
     protection_rules(&mut writer, policy);
+    Profile {
+        text: writer.text,
+        parameters: writer.parameters,
+    }
+}
+
+/// The profile of the relay behind `network.expose`. The relay keeps running the code that sandy
+/// has already loaded and never executes anything, so it needs no file at all: it accepts on the
+/// listeners sandy passed it and connects to the target's loopback ports. Ports are numbers, so
+/// the text needs no parameters.
+pub fn relay_profile(exposures: &[ExposedPort]) -> Profile {
+    let mut writer = Writer::default();
+    writer.line("(version 1)");
+    writer.line("(deny default)");
+    writer.comment("(deny default) does not cover these operations, and the relay needs none.");
+    writer.line("(deny process-info* file-map-executable file-ioctl file-write*)");
+    writer.comment("Accept on the exposed listeners; connect only to the target's loopback ports.");
+    let inbound: Vec<String> = exposures
+        .iter()
+        .map(|exposure| format!("(local ip \"localhost:{}\")", exposure.listen.port()))
+        .collect();
+    writer.rule("allow", &["network-inbound"], &inbound);
+    let outbound: Vec<String> = exposures
+        .iter()
+        .map(|exposure| format!("(remote ip \"localhost:{}\")", exposure.port))
+        .collect();
+    writer.rule("allow", &["network-outbound"], &outbound);
+    writer.comment("Non-blocking mode for the sockets (connect with a timeout).");
+    let flags: Vec<String> = [system::FIONBIO, system::FIOASYNC]
+        .iter()
+        .map(|request| format!("(ioctl-command {request})"))
+        .collect();
+    writer.rule("allow", &["file-ioctl"], &flags);
+    hardening_rules(&mut writer);
     Profile {
         text: writer.text,
         parameters: writer.parameters,
@@ -283,7 +319,11 @@ fn protection_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
         &["file-write-unlink", "file-write-create"],
         &filters,
     );
+    hardening_rules(writer);
+}
 
+/// Denials that both the program's profile and the relay's profile end with.
+fn hardening_rules(writer: &mut Writer) {
     writer.comment(
         "Operations that (deny default) may not cover and that nothing allows again: hard links\n\
          (a link would make a file from outside reachable through a writable path), NVRAM and\n\
@@ -343,6 +383,7 @@ mod tests {
             system: SystemAccess::Minimal,
             ip: NetworkAccess::None,
             unix_sockets: NetworkAccess::None,
+            expose: Vec::new(),
             signals: SignalScope::Any,
             path_metadata: PathMetadata::Deny,
             environment: EnvironmentPolicy::default(),
@@ -673,6 +714,49 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn relay_profile_allows_only_the_exposed_ports() {
+        let exposures = [
+            ExposedPort {
+                listen: "127.0.0.1:18080".parse().unwrap(),
+                port: 8080,
+            },
+            ExposedPort {
+                listen: "[::1]:18081".parse().unwrap(),
+                port: 8081,
+            },
+        ];
+        let profile = relay_profile(&exposures);
+        assert!(profile.parameters.is_empty());
+        let allows: Vec<&str> = profile
+            .text
+            .lines()
+            .filter(|line| line.starts_with("(allow") || line.starts_with("  ("))
+            .filter(|line| !line.contains("syscall-number"))
+            .collect();
+        assert_eq!(
+            allows,
+            vec![
+                "(allow network-inbound",
+                "  (local ip \"localhost:18080\")",
+                "  (local ip \"localhost:18081\"))",
+                "(allow network-outbound",
+                "  (remote ip \"localhost:8080\")",
+                "  (remote ip \"localhost:8081\"))",
+                "(allow file-ioctl",
+                "  (ioctl-command 2147772030)",
+                "  (ioctl-command 2147772029))",
+            ]
+        );
+        assert!(profile.text.starts_with("(version 1)\n(deny default)\n"));
+        assert!(
+            profile
+                .text
+                .contains("(deny mach-lookup (xpc-service-name-prefix \"\"))")
+        );
+        assert!(!profile.text.contains("file-read"));
     }
 
     #[test]

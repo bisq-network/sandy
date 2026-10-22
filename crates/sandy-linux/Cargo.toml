@@ -13,6 +13,7 @@ sandy-core.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.7"
 seccompiler = "0.5.0"
+sandy-relay.workspace = true
 libc.workspace = true
 
 [lints]

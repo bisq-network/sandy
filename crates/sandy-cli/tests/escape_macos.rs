@@ -11,12 +11,14 @@
 
 mod common;
 
+use std::ffi::{CString, c_char, c_int};
 use std::fs;
+use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::*;
@@ -475,4 +477,183 @@ fn signal_dispositions_pass_through_except_sigpipe() {
         ("ok", "default"),
         "SIGPIPE must start with the default action"
     );
+}
+
+unsafe extern "C" {
+    /// Asks whether process `pid` may perform `operation` under its Seatbelt profile; returns 1
+    /// for a denial. Exported by libSystem; sandy's backend loads it the same way.
+    fn sandbox_check(pid: libc::pid_t, operation: *const c_char, filter: c_int, ...) -> c_int;
+}
+
+/// `sandbox_check` filter type for a path argument.
+const SANDBOX_FILTER_PATH: c_int = 1;
+
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// The probe as a server on `inner` in the sandbox, with sandy relaying `outer` to it.
+fn start_exposed_server(fixture: &Fixture, inner: u16, outer: u16) -> Child {
+    let args = with(
+        home_args(fixture),
+        &[
+            "--ip",
+            "all",
+            "--expose",
+            &format!("127.0.0.1:{outer}={inner}"),
+        ],
+    );
+    let accept = format!("127.0.0.1:{inner}");
+    Command::new(sandy_path())
+        .args(run_args(&args, &[("tcp-accept", &accept)]))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// Waits until sandy has become the probe, so the program, not sandy, runs under its PID.
+fn wait_for_program(pid: u32) {
+    let start = Instant::now();
+    loop {
+        let output = Command::new("/bin/ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        if String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .ends_with("sandy-probe")
+        {
+            return;
+        }
+        assert!(start.elapsed() < WAIT, "sandy never became the program");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+const WAIT: Duration = Duration::from_secs(20);
+
+/// The one process that listens on `port`, found with lsof.
+fn listener_pid(port: u16) -> libc::pid_t {
+    let start = Instant::now();
+    loop {
+        let output = Command::new("/usr/sbin/lsof")
+            .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout).to_string();
+        let pids: Vec<libc::pid_t> = text.lines().filter_map(|l| l.trim().parse().ok()).collect();
+        if pids.len() == 1 {
+            return pids[0];
+        }
+        assert!(
+            start.elapsed() < WAIT,
+            "no single listener on {port}: {text:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn parent_of(pid: libc::pid_t) -> libc::pid_t {
+    let output = Command::new("/bin/ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("no parent for {pid}: {text:?}"))
+}
+
+/// Lets the sandboxed server accept one connection through the relay and finish.
+fn finish_server(server: Child, outer: u16) -> std::process::Output {
+    let address = format!("127.0.0.1:{outer}").parse().unwrap();
+    let mut server = server;
+    let start = Instant::now();
+    while server.try_wait().unwrap().is_none() {
+        assert!(start.elapsed() < WAIT, "the server never accepted");
+        let _ = TcpStream::connect_timeout(&address, Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    server.wait_with_output().unwrap()
+}
+
+/// The relay of an exposed port runs outside the program's sandbox, so it must not be the
+/// program's child (the program could reap it or signal it as its own), the program must not hold
+/// the relay's listener, and the relay's own profile must deny files. The profile is asked from
+/// outside with sandbox_check, which reports what the relay's sandbox would decide.
+#[test]
+fn relay_is_confined_and_not_a_child_of_the_program() {
+    let fixture = home_fixture("relay");
+    let (inner, outer) = (free_port(), free_port());
+    let server = start_exposed_server(&fixture, inner, outer);
+    let program = server.id() as libc::pid_t;
+    wait_for_program(server.id());
+    let relay = listener_pid(outer);
+    assert_ne!(relay, program, "the program holds the relay's listener");
+    assert_ne!(
+        parent_of(relay),
+        program,
+        "the relay is a child of the program"
+    );
+
+    let secret = CString::new(fixture.arg("secret/file")).unwrap();
+    let readable = CString::new(fixture.arg("ro/file")).unwrap();
+    // SAFETY: a null operation asks only whether the process is sandboxed.
+    let sandboxed = unsafe { sandbox_check(relay, std::ptr::null(), 0) };
+    // SAFETY: the operation and the path are NUL-terminated strings that outlive the calls.
+    let (secret_denied, readable_denied) = unsafe {
+        (
+            sandbox_check(
+                relay,
+                c"file-read-data".as_ptr(),
+                SANDBOX_FILTER_PATH,
+                secret.as_ptr(),
+            ),
+            sandbox_check(
+                relay,
+                c"file-read-data".as_ptr(),
+                SANDBOX_FILTER_PATH,
+                readable.as_ptr(),
+            ),
+        )
+    };
+    let output = finish_server(server, outer);
+    assert_eq!(sandboxed, 1, "the relay is not sandboxed");
+    assert_eq!(
+        secret_denied, 1,
+        "the relay may read files outside the policy"
+    );
+    assert_eq!(readable_denied, 1, "the relay may read the program's files");
+    assert!(output.status.success(), "{output:?}");
+    parse(&output)[0].assert_ok();
+}
+
+/// The relay watches the program's process ID with kqueue, so it ends even when the program is
+/// killed without any chance to clean up.
+#[test]
+fn relay_ends_when_the_program_is_killed() {
+    let fixture = home_fixture("relay-kill");
+    let (inner, outer) = (free_port(), free_port());
+    let mut server = start_exposed_server(&fixture, inner, outer);
+    wait_for_program(server.id());
+    let relay = listener_pid(outer);
+    // SAFETY: kill with signal 0 only checks that the process exists.
+    let running = unsafe { libc::kill(relay, 0) } == 0;
+    assert!(running, "the relay is not running");
+
+    server.kill().unwrap();
+    server.wait().unwrap();
+    let start = Instant::now();
+    // SAFETY: as above.
+    while unsafe { libc::kill(relay, 0) } == 0 {
+        assert!(start.elapsed() < WAIT, "the relay outlived the program");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let address = format!("127.0.0.1:{outer}").parse().unwrap();
+    assert!(TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_err());
 }

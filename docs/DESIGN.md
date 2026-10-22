@@ -44,6 +44,7 @@ read_write = ["/var/lib/app"] # read, list, create, change, delete; never execut
 [network]
 ip = "none"                   # "none" | "all"; IPv4 and IPv6 including loopback
 unix_sockets = "none"         # "none" | "all"; "none" reaches no socket outside read_write
+expose = [{ listen = "127.0.0.1:18080", port = 8080 }]  # relay into the program's port 8080
 
 [process]
 signals = "any"               # "any" | "isolated"
@@ -99,6 +100,29 @@ Rules:
    then change the metadata of every file the user owns. macOS and Windows protect metadata
    outside the writable paths in every case.
 
+## Exposed ports
+
+`network.expose` makes a loopback port of the program reachable from outside the sandbox.
+sandy listens on `listen` (a loopback address) and relays every connection to `port` on the
+loopback address of the same family, where the program listens. The relay copies bytes and never
+interprets them.
+
+Windows needs this: it blocks every inbound loopback connection into an AppContainer, with or
+without the loopback exemption. A relay inside the same AppContainer can reach the program over
+loopback, and a listening socket that sandy creates outside the container accepts connections from
+outside. Linux and macOS relay the same way, so a policy means the same on every platform.
+
+Rules:
+
+1. `listen` must be a loopback address and must differ from the program's own address.
+2. The program needs `ip = "all"` to listen in this version.
+3. The relay ends with the program. On Windows the job object ends it; on Linux and macOS the
+   relay watches the program's process.
+4. The relay is confined as tightly as the platform allows: on Windows it runs in the program's
+   AppContainer and job; on Linux and macOS it runs outside the program's sandbox in its own
+   sandbox with no file access.
+5. At most `sandy_relay::MAX_CONNECTIONS` connections are relayed at the same time.
+
 ## Requirements and the enforcement plan
 
 `ResolvedPolicy::requirements` derives the guarantees a policy needs:
@@ -114,6 +138,7 @@ Rules:
 | `UnixSocketsDenied` | `network.unix_sockets = "none"` |
 | `SignalsIsolated` | `process.signals = "isolated"` |
 | `MetadataConfined` | `linux.path_metadata = "deny"` (default) |
+| `ExposedPortsRelayed` | `network.expose` is not empty |
 
 A requirement is a lower bound. A backend may deny more, but never less. For example,
 `UnixSocketsDenied` guarantees that the program cannot connect to Unix sockets outside its
@@ -157,6 +182,10 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   not check it), the path-based metadata calls when `path_metadata = "deny"`, setuid and setgid
   mode bits, changes of the limits, priority and CPU affinity of other processes, and before
   Landlock ABI 3 truncation without write access.
+- Exposed ports: a relay forked twice before sandy confines itself, so it is not a child of the
+  program. It watches the program with a pidfd and exits when the program ends. It confines
+  itself with no_new_privs, Landlock without file access (TCP connect only to the exposed ports
+  from ABI 4) and a seccomp filter limited to TCP, copying and threads.
 - Refused: no Landlock (the reason names the fix), no seccomp, root or any capability, a writable
   path that contains the dynamic loader.
 
@@ -182,6 +211,10 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
 - Metadata (mode, owner, flags, times, extended attributes, ACLs) can change only on `read_write`
   paths, through paths and open descriptors alike. `linux.path_metadata = "allow"` only drops the
   requirement; the profile is the same.
+- Exposed ports: sandy binds the listeners, forks the relay twice so that launchd adopts it (it
+  is not the program's child), and the relay watches the program's process ID with kqueue
+  (`NOTE_EXIT`). The relay has its own profile: accept on the listeners, connect to the program's
+  loopback ports, no files, no Mach services. sandy execs only after the relay reports ready.
 - `sandy check` compiles the profile without applying it, so it reports operations or filters that
   this macOS does not know.
 - `docs/macos.md` describes the profile, the system set with a reason per entry, and the known
@@ -209,11 +242,22 @@ Details, limitations and sources: `docs/windows.md`.
   so `ip = "none"` refuses it.
 - `UnixSocketsDenied` through the file ACL: AF_UNIX connect needs write access to the socket
   file, which the program has only in read-write paths and its profile folder.
+- The AppContainer profile folder (`...\Packages\<name>\AC`, which holds `TEMP`) is private,
+  writable scratch space that Windows always creates and sandy cannot remove. sandy removes
+  `FILE_EXECUTE` from the AppContainer's allow entry on it every run, so the program cannot
+  execute what it writes there (the writable-never-executable rule). A deny entry would not help:
+  the AppContainer access check ignores a deny ACE for the package SID. The folder holds no user
+  data and persists across runs.
 - sandy sets `SystemRoot` and `LOCALAPPDATA`; without the latter Windows refuses to create an
   AppContainer process. Windows sets `LOCALAPPDATA`, `TEMP` and `TMP` to the profile folder.
 - Job object with kill-on-close, no breakaway and all UI restrictions. The program is created
   suspended and assigned before it runs. Inside an outer job with UI restrictions Windows cannot
   nest this job, so the plan refuses; sandy never breaks away from an outer job.
+- `network.expose`: sandy binds the listening socket outside the AppContainer and starts
+  `sandy.exe __relay` in the program's AppContainer and job before the program. The relay has no
+  network capability and only read and execute on `sandy.exe`; the program can control the relay,
+  which gives it nothing beyond the exposed listener. The plan refuses when `sandy.exe` cannot be
+  granted or lies in a read-write path; `sandy setup` with the policy adds the grant.
 - Handle inheritance limited to the standard handles with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`.
   The program gets its own console and never a console handle of sandy; sandy relays its console
   through pipes and ends the job on Ctrl+C.

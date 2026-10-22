@@ -31,6 +31,9 @@ fn main() {
         };
         let detail = detail.replace(['\t', '\n', '\r'], " ");
         println!("{action}\t{target}\t{result}\t{detail}");
+        // Flush now so a later action that crashes the process does not lose earlier results.
+        use std::io::Write;
+        let _ = io::stdout().flush();
     }
 }
 
@@ -107,6 +110,8 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
         "afunix-connect" => windows_actions::afunix_connect(target),
         "ctrl-break-console" => windows_actions::ctrl_break_console(),
         "afunix-accept" => windows_actions::afunix_accept(target),
+        "com-activate" => windows_actions::com_activate(target),
+        "load-library" => windows_actions::load_library(target),
         "copy-self" => {
             fs::copy(std::env::current_exe()?, target).map(|bytes| format!("{bytes} bytes"))
         }
@@ -1187,6 +1192,142 @@ mod windows_actions {
         std::thread::sleep(Duration::from_millis(500));
         Ok(String::new())
     }
+
+    /// Loads `target` as a module with `LoadLibraryExW`. This maps the image for execution and
+    /// needs `FILE_EXECUTE` on the file, so it is an execute vector that runs in this process and
+    /// does not need a child process (unlike `exec`). `ERROR_ACCESS_DENIED` reports `denied`.
+    pub fn load_library(target: &str) -> io::Result<String> {
+        use windows_sys::Win32::Foundation::FreeLibrary;
+        use windows_sys::Win32::System::LibraryLoader::LoadLibraryExW;
+        let wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: the path is NUL-terminated; a zero flag uses the default load.
+        let module = unsafe { LoadLibraryExW(wide.as_ptr(), ptr::null_mut(), 0) };
+        if module.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: LoadLibraryExW returned a module this process owns.
+        unsafe { FreeLibrary(module) };
+        Ok(format!("loaded {target}"))
+    }
+
+    /// Activates a named out-of-process COM server with CLSCTX_LOCAL_SERVER and reports whether an
+    /// interface pointer was returned. This triggers DCOM activation of a system service. If the
+    /// AppContainer cannot reach the service, the activation fails with an access or launch error.
+    /// A success means the AppContainer could start or bind to a process outside the sandbox.
+    pub fn com_activate(target: &str) -> io::Result<String> {
+        use std::ffi::c_void;
+
+        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        use windows_sys::core::GUID;
+
+        // ole32.dll is loaded at run time, not imported, so the probe process still starts in the
+        // AppContainer (a static import of ole32 fails DllMain there with STATUS_DLL_INIT_FAILED).
+        // This matches what an attacker with arbitrary native code would do.
+        const CLSCTX_LOCAL_SERVER: u32 = 0x4;
+        const COINIT_MULTITHREADED: u32 = 0x0;
+        type CoInitializeEx = unsafe extern "system" fn(*const c_void, u32) -> i32;
+        type CoCreateInstance = unsafe extern "system" fn(
+            *const GUID,
+            *mut c_void,
+            u32,
+            *const GUID,
+            *mut *mut c_void,
+        ) -> i32;
+        type CoUninitialize = unsafe extern "system" fn();
+
+        // Named out-of-process servers that run in a system service.
+        let clsid = match target {
+            // CLSID_TaskScheduler: creating a task would run a process outside the AppContainer.
+            "task-scheduler" => GUID {
+                data1: 0x0f87_369f,
+                data2: 0xa4e5,
+                data3: 0x4cfc,
+                data4: [0xbd, 0x3e, 0x73, 0xe6, 0x15, 0x45, 0x72, 0xdd],
+            },
+            // CLSID_BackgroundCopyManager (BITS): a transfer would fetch from the network.
+            "bits" => GUID {
+                data1: 0x4991_d34b,
+                data2: 0x80a1,
+                data3: 0x4291,
+                data4: [0x83, 0xb6, 0x33, 0x28, 0x36, 0x6b, 0x90, 0x97],
+            },
+            _ => return Err(invalid("unknown CLSID name")),
+        };
+        // IID_IUnknown.
+        let iid_unknown = GUID {
+            data1: 0,
+            data2: 0,
+            data3: 0,
+            data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46],
+        };
+        // Only `release` is called; the first two entries fix the layout so `release` sits in the
+        // third slot of the vtable.
+        #[repr(C)]
+        #[allow(dead_code)]
+        struct IUnknownVtbl {
+            query_interface:
+                unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> i32,
+            add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+            release: unsafe extern "system" fn(*mut c_void) -> u32,
+        }
+
+        let ole32 = wide("ole32.dll");
+        // SAFETY: the name is NUL-terminated.
+        let module = unsafe { LoadLibraryW(ole32.as_ptr()) };
+        if module.is_null() {
+            return Err(io::Error::other(
+                "cannot load ole32.dll in the AppContainer",
+            ));
+        }
+        let resolve = |name: &std::ffi::CStr| {
+            // SAFETY: module is loaded and the name is NUL-terminated.
+            unsafe { GetProcAddress(module, name.as_ptr().cast()) }
+        };
+        let (Some(co_init), Some(co_create), Some(co_uninit)) = (
+            resolve(c"CoInitializeEx"),
+            resolve(c"CoCreateInstance"),
+            resolve(c"CoUninitialize"),
+        ) else {
+            return Err(io::Error::other("COM entry points missing"));
+        };
+        // SAFETY: the resolved exports have the documented signatures.
+        let co_init: CoInitializeEx = unsafe { std::mem::transmute(co_init) };
+        // SAFETY: as above.
+        let co_create: CoCreateInstance = unsafe { std::mem::transmute(co_create) };
+        // SAFETY: as above.
+        let co_uninit: CoUninitialize = unsafe { std::mem::transmute(co_uninit) };
+
+        // SAFETY: a null reserved pointer and a valid apartment flag initialize COM for this thread.
+        let hr = unsafe { co_init(ptr::null(), COINIT_MULTITHREADED) };
+        if hr < 0 {
+            return Err(io::Error::from_raw_os_error(hr));
+        }
+        let mut object: *mut c_void = ptr::null_mut();
+        // SAFETY: both GUIDs are valid; object is a writable out pointer; no aggregation.
+        let hr = unsafe {
+            co_create(
+                &clsid,
+                ptr::null_mut(),
+                CLSCTX_LOCAL_SERVER,
+                &iid_unknown,
+                &mut object,
+            )
+        };
+        let outcome = if hr >= 0 && !object.is_null() {
+            // SAFETY: object points to a COM interface whose first field is its vtable; Release is
+            // the third IUnknown method.
+            unsafe {
+                let vtbl = *object.cast::<*const IUnknownVtbl>();
+                ((*vtbl).release)(object);
+            }
+            Ok(format!("activated {target}"))
+        } else {
+            Err(io::Error::from_raw_os_error(hr))
+        };
+        // SAFETY: COM was initialized on this thread above.
+        unsafe { co_uninit() };
+        outcome
+    }
 }
 
 #[cfg(not(windows))]
@@ -1230,6 +1371,14 @@ mod windows_actions {
     }
 
     pub fn afunix_accept(_target: &str) -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn com_activate(_target: &str) -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn load_library(_target: &str) -> io::Result<String> {
         unsupported()
     }
 }

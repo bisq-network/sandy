@@ -7,6 +7,7 @@ mod filter;
 mod host;
 mod launch;
 mod plan;
+mod relay;
 mod system;
 
 use sandy_core::{Backend, PlanItem, ResolvedPolicy, SandboxError, TargetCommand};

@@ -29,6 +29,10 @@ pub enum Requirement {
     /// Permissions, owner, timestamps and extended attributes of files outside the policy paths
     /// cannot be changed.
     MetadataConfined,
+    /// Every exposed port is relayed from outside the sandbox to the target's loopback port, and
+    /// the relay ends with the target. This is a promise of function, not a restriction; a
+    /// backend without a relay must refuse rather than start a server nobody can reach.
+    ExposedPortsRelayed,
 }
 
 impl Requirement {
@@ -45,6 +49,7 @@ impl Requirement {
             Requirement::UnixSocketsDenied => "Unix sockets outside writable paths denied",
             Requirement::SignalsIsolated => "signals limited to the sandbox",
             Requirement::MetadataConfined => "metadata of files outside policy paths protected",
+            Requirement::ExposedPortsRelayed => "exposed ports relayed into the sandbox",
         }
     }
 }

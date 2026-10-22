@@ -12,6 +12,7 @@ use sandy_core::{
 
 use crate::filter::FilterConfig;
 use crate::host::HostCapabilities;
+use crate::relay::RelayConfig;
 use crate::system::{Needed, SystemPath, SystemUse};
 
 #[derive(Debug)]
@@ -25,6 +26,8 @@ pub struct LinuxPlan {
 pub struct Sandbox {
     pub landlock: LandlockConfig,
     pub filter: FilterConfig,
+    /// The relay for exposed ports, when the policy has any.
+    pub relay: Option<RelayConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,6 +79,10 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
                 restrict_truncate: abi < ABI::V3,
                 deny_path_metadata: policy.path_metadata == PathMetadata::Deny,
             },
+            relay: (!policy.expose.is_empty()).then(|| RelayConfig {
+                expose: policy.expose.clone(),
+                abi,
+            }),
         }),
         _ => None,
     };
@@ -165,6 +172,23 @@ fn plan_item(
                 if abi >= ABI::V9 {
                     mechanism.push_str("; Landlock ABI 9 denies pathname socket connections");
                 }
+                enforced(mechanism)
+            }
+        },
+        Requirement::ExposedPortsRelayed => match (&host.landlock, &host.seccomp, &host.pidfd) {
+            (Err(reason), _, _) | (_, Err(reason), _) | (_, _, Err(reason)) => unavailable(reason),
+            _ => {
+                let mut mechanism = format!(
+                    "relay process outside the sandbox, not a child of the program, that \
+                         ends with it (pidfd); confined by no_new_privs, Landlock ABI {abi} \
+                         without file access"
+                );
+                if abi >= ABI::V4 {
+                    mechanism.push_str(", TCP connect only to the exposed ports and no bind");
+                }
+                mechanism.push_str(
+                    ", and a seccomp filter that allows only TCP, copying bytes and threads",
+                );
                 enforced(mechanism)
             }
         },
@@ -306,7 +330,7 @@ fn system_rights(usage: SystemUse) -> BitFlags<AccessFs> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sandy_core::{EnvironmentPolicy, PathRule, Status, WindowsPolicy};
+    use sandy_core::{EnvironmentPolicy, ExposedPort, PathRule, Status, WindowsPolicy};
     use std::path::Path;
 
     fn host(abi: Option<i32>) -> HostCapabilities {
@@ -322,6 +346,7 @@ mod tests {
             seccomp: Ok(()),
             no_new_privs: Ok(()),
             unprivileged: Ok(()),
+            pidfd: Ok(()),
             system_paths: vec![
                 system("/usr/lib", true, SystemUse::Read, Needed::Always),
                 system(
@@ -356,6 +381,7 @@ mod tests {
             system: SystemAccess::Minimal,
             ip: NetworkAccess::None,
             unix_sockets: NetworkAccess::None,
+            expose: Vec::new(),
             signals: SignalScope::Isolated,
             path_metadata: PathMetadata::Deny,
             environment: EnvironmentPolicy::default(),
@@ -478,6 +504,31 @@ mod tests {
             ]
         );
         assert!(plan.sandbox.is_none());
+    }
+
+    #[test]
+    fn exposed_ports_need_pidfd_landlock_and_seccomp() {
+        let mut policy = policy();
+        policy.ip = NetworkAccess::All;
+        policy.expose = vec![ExposedPort {
+            listen: "127.0.0.1:18080".parse().unwrap(),
+            port: 8080,
+        }];
+        let plan = plan_for(&policy, &host(Some(9)));
+        assert_eq!(unavailable(&plan), vec![]);
+        let relay = plan.sandbox.unwrap().relay.unwrap();
+        assert_eq!(relay.expose, policy.expose);
+        assert_eq!(relay.abi, ABI::V9);
+
+        let mut no_pidfd = host(Some(9));
+        no_pidfd.pidfd = Err("old kernel".to_string());
+        let plan = plan_for(&policy, &no_pidfd);
+        assert_eq!(unavailable(&plan), vec![Requirement::ExposedPortsRelayed]);
+        assert!(plan.sandbox.is_none());
+
+        policy.expose.clear();
+        let plan = plan_for(&policy, &host(Some(9)));
+        assert!(plan.sandbox.unwrap().relay.is_none());
     }
 
     #[test]

@@ -1,8 +1,9 @@
 use std::ffi::OsString;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use lexopt::prelude::*;
-use sandy_core::{NetworkAccess, PathMetadata, Policy, SignalScope, SystemAccess};
+use sandy_core::{ExposedPort, NetworkAccess, PathMetadata, Policy, SignalScope, SystemAccess};
 
 pub const USAGE: &str = "\
 Usage:
@@ -22,6 +23,9 @@ Options (they extend the policy file):
   --ip all|none              IP networking (default: none)
   --unix-sockets all|none    Unix domain sockets (default: none)
   --signals any|isolated     who the program may signal (default: any)
+  --expose ADDRESS=PORT      relay connections on the loopback ADDRESS to the program's
+                             loopback PORT, for example 127.0.0.1:18080=8080 (repeatable;
+                             needs --ip all)
   --linux-path-metadata deny|allow
                              metadata changes by path on Linux (default: deny)
   --pass-env NAME            copy variable NAME into the program environment (repeatable)
@@ -55,6 +59,7 @@ pub struct Overrides {
     pass_env: Vec<String>,
     set_env: Vec<(String, String)>,
     appcontainer: Option<String>,
+    expose: Vec<ExposedPort>,
 }
 
 impl Overrides {
@@ -80,6 +85,7 @@ impl Overrides {
         }
         policy.environment.pass.extend(self.pass_env);
         policy.environment.set.extend(self.set_env);
+        policy.network.expose.extend(self.expose);
         if let Some(name) = self.appcontainer {
             policy.windows.appcontainer_name = Some(name);
         }
@@ -91,7 +97,16 @@ pub enum Command {
     Help,
     Version,
     Sandbox(Box<Invocation>),
+    /// Internal: serve an exposed port. A backend starts sandy this way with a listening socket
+    /// it passed by descriptor or handle number.
+    Relay {
+        listener: u64,
+        target: SocketAddr,
+    },
 }
+
+/// The internal command that runs a relay. It is not part of the documented interface.
+pub const RELAY_COMMAND: &str = "__relay";
 
 #[derive(Debug)]
 pub struct Invocation {
@@ -122,6 +137,11 @@ where
             Some("run") => Mode::Run,
             Some("check") => Mode::Check,
             Some("setup") => Mode::Setup,
+            Some(RELAY_COMMAND) => {
+                let listener = parser.value()?.parse()?;
+                let target = parser.value()?.parse()?;
+                return Ok(Command::Relay { listener, target });
+            }
             _ => return Err(format!("unknown command {value:?}").into()),
         },
         Some(other) => return Err(other.unexpected()),
@@ -182,6 +202,19 @@ where
                     .push((name.to_string(), value.to_string()));
             }
             Long("appcontainer") => overrides.appcontainer = Some(parser.value()?.string()?),
+            Long("expose") => {
+                let value = parser.value()?.string()?;
+                let (listen, port) = value
+                    .rsplit_once('=')
+                    .ok_or_else(|| format!("--expose needs ADDRESS=PORT, got {value:?}"))?;
+                let listen = listen
+                    .parse()
+                    .map_err(|_| format!("invalid --expose address {listen:?}"))?;
+                let port = port
+                    .parse()
+                    .map_err(|_| format!("invalid --expose port {port:?}"))?;
+                overrides.expose.push(ExposedPort { listen, port });
+            }
             Long("cwd") => invocation.cwd = Some(parser.value()?.into()),
             Value(program) => {
                 invocation.program = Some(program.into());
@@ -261,6 +294,8 @@ mod tests {
             "A=b=c",
             "--appcontainer",
             "name",
+            "--expose",
+            "127.0.0.1:18080=8080",
         ]);
         let mut policy = Policy::default();
         policy.filesystem.read.push("/z".into());
@@ -275,6 +310,25 @@ mod tests {
         assert_eq!(policy.linux.path_metadata, PathMetadata::Allow);
         assert_eq!(policy.environment.set["A"], "b=c");
         assert_eq!(policy.windows.appcontainer_name.as_deref(), Some("name"));
+        assert_eq!(
+            policy.network.expose,
+            vec![ExposedPort {
+                listen: "127.0.0.1:18080".parse().unwrap(),
+                port: 8080
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_the_internal_relay_command() {
+        match parse_strs(&[RELAY_COMMAND, "7", "127.0.0.1:8080"]).unwrap() {
+            Command::Relay { listener, target } => {
+                assert_eq!(listener, 7);
+                assert_eq!(target, "127.0.0.1:8080".parse().unwrap());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(parse_strs(&[RELAY_COMMAND, "x", "127.0.0.1:8080"]).is_err());
     }
 
     #[test]
@@ -286,6 +340,8 @@ mod tests {
     fn rejects_invalid_values() {
         assert!(parse_strs(&["check", "--ip", "some"]).is_err());
         assert!(parse_strs(&["check", "--set-env", "NOVALUE"]).is_err());
+        assert!(parse_strs(&["check", "--expose", "127.0.0.1:18080"]).is_err());
+        assert!(parse_strs(&["check", "--expose", "localhost:1=2"]).is_err());
         assert!(parse_strs(&["unknown"]).is_err());
     }
 }

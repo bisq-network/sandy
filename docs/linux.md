@@ -56,6 +56,42 @@ be listed, the Landlock-based requirements are unavailable.
 | UnixSocketsDenied | The allowlist has no `AF_UNIX`, and socket pairs are limited to stream and seqpacket. From ABI 6, Landlock scopes abstract sockets; from ABI 9 it denies connections to pathname sockets. |
 | SignalsIsolated | Landlock signal scope (ABI 6). Unavailable on older ABIs. |
 | MetadataConfined | The denylist denies the metadata calls that take a path (see "Metadata"). |
+| ExposedPortsRelayed | A relay process outside the program's sandbox, confined by its own Landlock domain and seccomp filters (see "Exposed ports"). |
+
+## Exposed ports
+
+For `network.expose`, sandy starts a relay before it confines itself:
+
+1. sandy binds every `listen` address and opens a pidfd for its own process ID. The program keeps
+   this ID after `execve`, so the pidfd refers to the program.
+2. sandy verifies that it has one thread and forks twice. The intermediate process exits at once,
+   so the relay is not a child of the program and the program's `wait` never reaps it. The relay
+   is a fork of sandy, not a new program; a single-threaded parent makes this safe.
+3. The relay closes every descriptor except its listeners, the pidfd, standard error and a
+   readiness pipe. It then confines itself:
+   - no_new_privs;
+   - Landlock with every file system right of the ABI handled and no rule, so it cannot open,
+     create or execute any file; from ABI 4 TCP bind is denied and TCP connect is allowed only to
+     the exposed ports (Landlock TCP rules match the port, not the address); from ABI 6 the signal
+     and abstract socket scopes;
+   - the shared allowlist filter and a relay filter that allows only TCP sockets, `accept`,
+     `connect`, reading and writing, polling, memory calls, thread creation without namespace
+     flags and `FIONBIO`. Every other call fails with `EPERM`; `clone3` fails with `ENOSYS`.
+4. The relay starts one serving thread per listener and reports "ready" over the pipe. sandy reads
+   the report and continues only on success. Any failure of the relay is reported back, and sandy
+   refuses to run.
+5. The relay exits when the pidfd becomes readable, that is when the program ends, also by
+   SIGKILL. If sandy fails after starting the relay, sandy's process ends and the relay with it.
+
+The listeners and the pidfd are close-on-exec, and sandy closes its copies before it confines
+itself, so the program never holds them. The relay keeps standard error to report errors; a
+caller that waits for the end of that stream waits until the relay has exited, which happens
+right after the program ends.
+
+The relay runs in its own Landlock domain, a sibling of the program's domain, so neither can
+ptrace the other. The program can still connect to the relay's listener over loopback, which
+only reaches the program itself again. With `signals = "any"` the program can kill the relay.
+
 
 ## Landlock
 

@@ -94,6 +94,7 @@ dependencies = [
  "sandy-core",
  "sandy-linux",
  "sandy-macos",
+ "sandy-relay",
  "sandy-windows",
  "windows-sys",
 ]
@@ -113,6 +114,7 @@ dependencies = [
  "landlock",
  "libc",
  "sandy-core",
+ "sandy-relay",
  "seccompiler",
 ]
 
@@ -122,6 +124,14 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "sandy-core",
+ "sandy-relay",
+]
+
+[[package]]
+name = "sandy-relay"
+version = "0.1.0"
+dependencies = [
+ "windows-sys",
 ]
 
 [[package]]

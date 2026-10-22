@@ -1,10 +1,12 @@
-//! Starts the target in the AppContainer and a job object, and waits for it.
+//! Starts the target and the relays of its exposed ports in the AppContainer and a job object,
+//! and waits for the target.
 
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::{size_of, size_of_val};
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::net::TcpListener;
+use std::os::windows::io::{AsRawHandle, AsRawSocket, FromRawHandle, OwnedHandle};
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::thread::JoinHandle;
@@ -47,8 +49,16 @@ use windows_sys::Win32::System::Threading::{
 
 use super::util::{Sid, last_error, wide_nul};
 
-/// Everything `CreateProcessW` needs, prepared by the caller.
+/// The processes to start in the AppContainer, prepared by the caller.
 pub struct Launch<'a> {
+    pub appcontainer: &'a Sid,
+    pub program: Process<'a>,
+    /// One relay per exposed port, with the listening socket it receives.
+    pub relays: Vec<(Process<'a>, TcpListener)>,
+}
+
+/// Everything `CreateProcessW` needs for one process.
+pub struct Process<'a> {
     /// NUL-terminated path of the executable.
     pub application: Vec<u16>,
     /// NUL-terminated command line.
@@ -56,7 +66,6 @@ pub struct Launch<'a> {
     pub environment: Vec<u16>,
     /// NUL-terminated working directory, or `None` for the current one.
     pub cwd: Option<Vec<u16>>,
-    pub appcontainer: &'a Sid,
     pub capabilities: &'a [Sid],
 }
 
@@ -80,11 +89,50 @@ pub fn run(launch: Launch<'_>) -> Result<i32, SandboxError> {
 }
 
 fn start_and_wait(
-    mut launch: Launch<'_>,
+    launch: Launch<'_>,
     job: &OwnedHandle,
     stdio: StandardHandles,
 ) -> Result<i32, SandboxError> {
-    let process = start(&mut launch, job, &stdio.child)?;
+    let Launch {
+        appcontainer,
+        mut program,
+        relays: port_relays,
+    } = launch;
+    // The relays start before the program, so a relay that cannot start ends the run before the
+    // program runs. A relay uses only its socket; its error messages go to the program's
+    // standard error.
+    if !port_relays.is_empty() {
+        let null = open_null("input and output of the relays")?;
+        for (mut relay, listener) in port_relays {
+            let relay_stdio = [
+                null.as_raw_handle(),
+                null.as_raw_handle(),
+                stdio.child[2].as_raw_handle(),
+            ];
+            let socket = listener.as_raw_socket() as HANDLE;
+            // sandy waits only for the program; the job ends the relays with it.
+            start(
+                &mut relay,
+                appcontainer,
+                job,
+                relay_stdio,
+                &[socket],
+                "relay",
+            )?;
+            // The relay holds its own handle of the socket. Once sandy closes its handle,
+            // clients are refused as soon as the relay ends.
+            drop(listener);
+        }
+    }
+    let stdio_handles = stdio.child.each_ref().map(|handle| handle.as_raw_handle());
+    let process = start(
+        &mut program,
+        appcontainer,
+        job,
+        stdio_handles,
+        &[],
+        "program",
+    )?;
     let StandardHandles { child, relays } = stdio;
     // The target owns its copies now. sandy's copies of the pipe ends would keep the relays
     // from seeing the end of the output.
@@ -100,8 +148,9 @@ fn start_and_wait(
     if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) } == 0 {
         return Err(last_error("cannot read the exit code of the program"));
     }
-    // Processes the program left behind would die when sandy exits and the job closes. Ending
-    // them now also closes their copies of the output pipes, so the relays finish.
+    // Processes the program left behind, and the relays of exposed ports, would die when sandy
+    // exits and the job closes. Ending them now also closes their copies of the output pipes, so
+    // the console relays finish.
     // SAFETY: job is a valid job handle.
     unsafe { TerminateJobObject(job.as_raw_handle(), code) };
     for relay in relays {
@@ -185,12 +234,16 @@ fn set_job_information<T>(
     Ok(())
 }
 
-/// Creates the process suspended, puts it into the job, then lets it run. It cannot run any
-/// code before it is in the job.
+/// Creates the process suspended in the AppContainer, puts it into the job, then lets it run.
+/// It cannot run any code before it is in the job. It inherits `stdio` and `extra`, which must
+/// be inheritable, and no other handle.
 fn start(
-    launch: &mut Launch<'_>,
+    launch: &mut Process<'_>,
+    appcontainer: &Sid,
     job: &OwnedHandle,
-    child: &[OwnedHandle; 3],
+    stdio: [HANDLE; 3],
+    extra: &[HANDLE],
+    what: &str,
 ) -> Result<OwnedHandle, SandboxError> {
     let mut capabilities: Vec<SID_AND_ATTRIBUTES> = launch
         .capabilities
@@ -201,7 +254,7 @@ fn start(
         })
         .collect();
     let security_capabilities = SECURITY_CAPABILITIES {
-        AppContainerSid: launch.appcontainer.as_psid(),
+        AppContainerSid: appcontainer.as_psid(),
         Capabilities: if capabilities.is_empty() {
             ptr::null_mut()
         } else {
@@ -210,11 +263,13 @@ fn start(
         CapabilityCount: capabilities.len() as u32,
         Reserved: 0,
     };
-    let inherited: [HANDLE; 3] = [
-        child[0].as_raw_handle(),
-        child[1].as_raw_handle(),
-        child[2].as_raw_handle(),
-    ];
+    // Windows may reject a handle list that names a handle twice.
+    let mut inherited: Vec<HANDLE> = Vec::with_capacity(stdio.len() + extra.len());
+    for handle in stdio.iter().chain(extra) {
+        if !inherited.contains(handle) {
+            inherited.push(*handle);
+        }
+    }
 
     let mut attributes = AttributeList::new(2)?;
     attributes.set(
@@ -222,15 +277,15 @@ fn start(
         &security_capabilities,
     )?;
     // The handle list limits inheritance to these handles, although bInheritHandles is TRUE.
-    attributes.set(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &inherited)?;
+    attributes.set(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited.as_slice())?;
 
     // SAFETY: the structure is plain data; zero is a valid value for every field.
     let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startup.StartupInfo.hStdInput = inherited[0];
-    startup.StartupInfo.hStdOutput = inherited[1];
-    startup.StartupInfo.hStdError = inherited[2];
+    startup.StartupInfo.hStdInput = stdio[0];
+    startup.StartupInfo.hStdOutput = stdio[1];
+    startup.StartupInfo.hStdError = stdio[2];
     startup.lpAttributeList = attributes.as_ptr();
 
     // CREATE_NO_WINDOW gives a console program its own console without a window instead of
@@ -261,9 +316,9 @@ fn start(
         )
     };
     if ok == 0 {
-        return Err(last_error(
-            "cannot create the program process in the AppContainer",
-        ));
+        return Err(last_error(format!(
+            "cannot create the {what} process in the AppContainer"
+        )));
     }
     // SAFETY: CreateProcessW succeeded, so both handles are new and owned by sandy.
     let (process, thread) = unsafe {
@@ -280,13 +335,13 @@ fn start(
     };
     // SAFETY: job and process are valid handles.
     if unsafe { AssignProcessToJobObject(job.as_raw_handle(), process.as_raw_handle()) } == 0 {
-        return Err(abort(last_error(
-            "cannot put the program into the job object",
-        )));
+        return Err(abort(last_error(format!(
+            "cannot put the {what} into the job object"
+        ))));
     }
     // SAFETY: thread is the valid handle of the suspended main thread.
     if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
-        return Err(abort(last_error("cannot resume the program")));
+        return Err(abort(last_error(format!("cannot resume the {what}"))));
     }
     Ok(process)
 }

@@ -54,6 +54,8 @@ mod arch {
     pub const OPEN_CALLS: &[(i64, u8)] = &[(libc::SYS_open, 1), (libc::SYS_openat, 2)];
     /// chmod variants that only x86_64 has, with the index of their mode argument.
     pub const CHMOD_CALLS: &[(i64, u8)] = &[(libc::SYS_chmod, 1)];
+    /// Calls the relay needs that only x86_64 has (arm64 has only ppoll).
+    pub const RELAY_CALLS: &[i64] = &[libc::SYS_poll];
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -68,6 +70,7 @@ mod arch {
     pub const PATH_METADATA: &[i64] = &[];
     pub const OPEN_CALLS: &[(i64, u8)] = &[(libc::SYS_openat, 2)];
     pub const CHMOD_CALLS: &[(i64, u8)] = &[];
+    pub const RELAY_CALLS: &[i64] = &[];
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -78,6 +81,7 @@ mod arch {
     pub const PATH_METADATA: &[i64] = &[];
     pub const OPEN_CALLS: &[(i64, u8)] = &[];
     pub const CHMOD_CALLS: &[(i64, u8)] = &[];
+    pub const RELAY_CALLS: &[i64] = &[];
 }
 
 /// Whether sandy has a filter for the CPU architecture it was built for.
@@ -457,6 +461,93 @@ fn open_rules(flags: u8, restrict_truncate: bool) -> Result<Vec<SeccompRule>, Ba
     Ok(rules)
 }
 
+/// What the relay for exposed ports needs: accept and connect TCP, copy bytes, start threads,
+/// wait for the program to end, and report an error on standard error. Everything else fails with
+/// EPERM. clone3 is listed so that the shared allowlist, installed with it, decides: ENOSYS.
+const RELAY_CALLS: &[i64] = &[
+    libc::SYS_read,
+    libc::SYS_write,
+    libc::SYS_readv,
+    libc::SYS_writev,
+    libc::SYS_close,
+    libc::SYS_recvfrom,
+    libc::SYS_sendto,
+    libc::SYS_accept,
+    libc::SYS_accept4,
+    libc::SYS_connect,
+    libc::SYS_shutdown,
+    libc::SYS_getsockopt,
+    libc::SYS_fcntl,
+    libc::SYS_ppoll,
+    libc::SYS_mmap,
+    libc::SYS_munmap,
+    libc::SYS_mremap,
+    libc::SYS_mprotect,
+    libc::SYS_madvise,
+    libc::SYS_brk,
+    libc::SYS_clone3,
+    libc::SYS_set_robust_list,
+    libc::SYS_rseq,
+    libc::SYS_futex,
+    libc::SYS_sched_yield,
+    libc::SYS_sched_getaffinity,
+    libc::SYS_gettid,
+    libc::SYS_getpid,
+    libc::SYS_rt_sigprocmask,
+    libc::SYS_rt_sigaction,
+    libc::SYS_rt_sigreturn,
+    libc::SYS_sigaltstack,
+    libc::SYS_nanosleep,
+    libc::SYS_clock_nanosleep,
+    libc::SYS_clock_gettime,
+    libc::SYS_getrandom,
+    libc::SYS_restart_syscall,
+    libc::SYS_exit,
+    libc::SYS_exit_group,
+];
+
+/// Builds the filters of the relay: the shared allowlist and the relay's own list, which allows
+/// only `RELAY_CALLS`, TCP sockets, thread creation without namespaces, and FIONBIO.
+pub fn relay() -> Result<Filters, BackendError> {
+    let target = arch::TARGET
+        .ok_or_else(|| BackendError::InvalidTargetArch(std::env::consts::ARCH.to_string()))?;
+    let mut rules = Rules::default();
+    for &call in RELAY_CALLS.iter().chain(arch::RELAY_CALLS) {
+        rules.add(call, Vec::new());
+    }
+    let tcp = |family: i32| -> Result<SeccompRule, BackendError> {
+        rule(vec![
+            low(0, SeccompCmpOp::Eq, family as u64)?,
+            low(
+                1,
+                SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
+                libc::SOCK_STREAM as u64,
+            )?,
+        ])
+    };
+    rules.add(
+        libc::SYS_socket,
+        vec![tcp(libc::AF_INET)?, tcp(libc::AF_INET6)?],
+    );
+    let namespaces = CLONE_NAMESPACES
+        .iter()
+        .fold(0, |all, &flag| all | flag as u64);
+    let no_namespace = low(0, SeccompCmpOp::MaskedEq(namespaces), 0)?;
+    rules.add(libc::SYS_clone, vec![rule(vec![no_namespace])?]);
+    let fionbio = low(1, SeccompCmpOp::Eq, u64::from(libc::FIONBIO as u32))?;
+    rules.add(libc::SYS_ioctl, vec![rule(vec![fionbio])?]);
+    let filter = SeccompFilter::new(
+        rules.0,
+        SeccompAction::Errno(libc::EPERM as u32),
+        SeccompAction::Allow,
+        target,
+    )?;
+    Ok(Filters {
+        allowlist: allowlist(target)?,
+        denylist: filter.try_into()?,
+    })
+}
+
 /// Installs the allowlist and then the denylist on every thread of the process. Both stay in
 /// force across execve and are inherited by every child.
 pub fn install(filters: &Filters) -> Result<(), seccompiler::Error> {
@@ -533,7 +624,10 @@ mod tests {
     const OWN_PID: u32 = 4242;
 
     fn decide(config: &FilterConfig, arch: u32, nr: i64, args: [u64; 6]) -> u32 {
-        let filters = build(config, OWN_PID).unwrap();
+        decide_with(&build(config, OWN_PID).unwrap(), arch, nr, args)
+    }
+
+    fn decide_with(filters: &Filters, arch: u32, nr: i64, args: [u64; 6]) -> u32 {
         let rank = |action: u32| (action & libc::SECCOMP_RET_ACTION_FULL) as i32;
         let mut result = RET_ALLOW;
         for program in [&filters.denylist, &filters.allowlist] {
@@ -845,6 +939,57 @@ mod tests {
                 assert_eq!(call(&open(), nr, args(&[which, 0])), RET_EPERM, "{nr}");
             }
         }
+    }
+
+    #[test]
+    fn the_relay_can_only_relay() {
+        let filters = relay().unwrap();
+        let relay = |nr: i64, args: [u64; 6]| decide_with(&filters, NATIVE, nr, args);
+        let tcp = |family: i32| socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        for nr in [
+            libc::SYS_accept4,
+            libc::SYS_connect,
+            libc::SYS_read,
+            libc::SYS_write,
+            libc::SYS_recvfrom,
+            libc::SYS_sendto,
+            libc::SYS_shutdown,
+            libc::SYS_close,
+            libc::SYS_ppoll,
+            libc::SYS_futex,
+            libc::SYS_exit_group,
+        ] {
+            assert_eq!(relay(nr, [0; 6]), RET_ALLOW, "system call {nr}");
+        }
+        assert_eq!(relay(libc::SYS_socket, tcp(libc::AF_INET)), RET_ALLOW);
+        assert_eq!(relay(libc::SYS_socket, tcp(libc::AF_INET6)), RET_ALLOW);
+        let thread = (libc::CLONE_VM | libc::CLONE_THREAD | libc::CLONE_SIGHAND) as u64;
+        assert_eq!(relay(libc::SYS_clone, args(&[thread])), RET_ALLOW);
+        let fionbio = args(&[3, u64::from(libc::FIONBIO as u32)]);
+        assert_eq!(relay(libc::SYS_ioctl, fionbio), RET_ALLOW);
+        // No files, no other sockets, no new listeners, no programs, no namespaces.
+        for nr in [
+            libc::SYS_openat,
+            libc::SYS_execve,
+            libc::SYS_bind,
+            libc::SYS_listen,
+            libc::SYS_mkdirat,
+            libc::SYS_unlinkat,
+            libc::SYS_kill,
+            libc::SYS_ptrace,
+            libc::SYS_fchmod,
+        ] {
+            assert_eq!(relay(nr, [0; 6]), RET_EPERM, "system call {nr}");
+        }
+        assert_eq!(relay(libc::SYS_socket, tcp(libc::AF_UNIX)), RET_EPERM);
+        let udp = socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        assert_eq!(relay(libc::SYS_socket, udp), RET_EPERM);
+        let user = thread | libc::CLONE_NEWUSER as u64;
+        assert_eq!(relay(libc::SYS_clone, args(&[user])), RET_EPERM);
+        let tiocsti = args(&[0, u64::from(libc::TIOCSTI as u32)]);
+        assert_eq!(relay(libc::SYS_ioctl, tiocsti), RET_EPERM);
+        // The shared allowlist still decides clone3, so threads fall back to clone.
+        assert_eq!(relay(libc::SYS_clone3, [0; 6]), RET_ENOSYS);
     }
 
     #[test]

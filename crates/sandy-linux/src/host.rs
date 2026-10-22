@@ -23,6 +23,8 @@ pub struct HostCapabilities {
     pub no_new_privs: Support,
     /// `Err` when the process runs as root or holds capabilities.
     pub unprivileged: Support,
+    /// pidfd_open, which the relay of exposed ports uses to watch the program.
+    pub pidfd: Support,
     /// The candidates of the minimal system set that exist on this host.
     pub system_paths: Vec<SystemPath>,
 }
@@ -32,6 +34,7 @@ impl HostCapabilities {
         HostCapabilities {
             landlock: landlock_abi(),
             thread_count: thread_count_support(),
+            pidfd: pidfd_support(),
             seccomp: seccomp_support(),
             no_new_privs: no_new_privs_support(),
             unprivileged: unprivileged(),
@@ -80,6 +83,21 @@ fn thread_count_support() -> Support {
              before Landlock restricts it: {error}"
         )
     })
+}
+
+fn pidfd_support() -> Support {
+    // SAFETY: process ID 0 is invalid, so a kernel with pidfd_open fails with EINVAL and creates
+    // nothing.
+    if unsafe { libc::syscall(libc::SYS_pidfd_open, 0, 0u32) } >= 0 {
+        return Err("pidfd_open accepted process ID 0".to_string());
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::EINVAL) => Ok(()),
+        _ => Err(format!(
+            "pidfd_open is unavailable (Linux 5.3 or newer is required): {}",
+            io::Error::last_os_error()
+        )),
+    }
 }
 
 fn seccomp_support() -> Support {
@@ -217,6 +235,7 @@ mod tests {
         // report spurious errors there.
         assert!(host.no_new_privs.is_ok(), "{host:?}");
         assert!(host.thread_count.is_ok(), "{host:?}");
+        assert!(host.pidfd.is_ok(), "{host:?}");
         assert!(host.seccomp.is_ok(), "{host:?}");
     }
 }

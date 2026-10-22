@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use crate::plan::Requirement;
 use crate::policy::{
-    EnvironmentPolicy, NetworkAccess, PathMetadata, Policy, PolicyError, SignalScope, SystemAccess,
-    WindowsPolicy,
+    EnvironmentPolicy, ExposedPort, NetworkAccess, PathMetadata, Policy, PolicyError, SignalScope,
+    SystemAccess, WindowsPolicy,
 };
 
 /// Access to one path and everything beneath it.
@@ -34,6 +34,7 @@ pub struct ResolvedPolicy {
     pub system: SystemAccess,
     pub ip: NetworkAccess,
     pub unix_sockets: NetworkAccess,
+    pub expose: Vec<ExposedPort>,
     pub signals: SignalScope,
     pub path_metadata: PathMetadata,
     pub environment: EnvironmentPolicy,
@@ -69,6 +70,7 @@ impl ResolvedPolicy {
         check_writable_not_executable(&paths)?;
         check_nothing_inside_writable(&paths)?;
         validate_environment(&policy.environment)?;
+        validate_expose(&policy.network.expose, policy.network.ip)?;
 
         Ok(ResolvedPolicy {
             paths,
@@ -76,6 +78,7 @@ impl ResolvedPolicy {
             system: filesystem.system,
             ip: policy.network.ip,
             unix_sockets: policy.network.unix_sockets,
+            expose: policy.network.expose.clone(),
             signals: policy.process.signals,
             path_metadata: policy.linux.path_metadata,
             environment: policy.environment.clone(),
@@ -104,6 +107,9 @@ impl ResolvedPolicy {
         }
         if self.path_metadata == PathMetadata::Deny {
             requirements.push(Requirement::MetadataConfined);
+        }
+        if !self.expose.is_empty() {
+            requirements.push(Requirement::ExposedPortsRelayed);
         }
         requirements
     }
@@ -188,6 +194,35 @@ fn check_nothing_inside_writable(rules: &[PathRule]) -> Result<(), PolicyError> 
                 path: nested.path.clone(),
                 writable: w.path.clone(),
             });
+        }
+    }
+    Ok(())
+}
+
+/// Exposed ports listen on loopback only, so a relay never makes the target reachable from other
+/// machines. The target must be able to listen, which needs IP networking in this version.
+fn validate_expose(expose: &[ExposedPort], ip: NetworkAccess) -> Result<(), PolicyError> {
+    let invalid = |expose: &ExposedPort, reason| PolicyError::InvalidExpose {
+        expose: *expose,
+        reason,
+    };
+    for (index, entry) in expose.iter().enumerate() {
+        if ip != NetworkAccess::All {
+            return Err(invalid(entry, "the program needs ip = \"all\" to listen"));
+        }
+        if !entry.listen.ip().is_loopback() {
+            return Err(invalid(entry, "listen must be a loopback address"));
+        }
+        if entry.listen.port() == 0 || entry.port == 0 {
+            return Err(invalid(entry, "ports must not be 0"));
+        }
+        if entry.listen == entry.target() {
+            return Err(invalid(entry, "listen and the program's port must differ"));
+        }
+        let collides =
+            |other: &ExposedPort| other.listen == entry.listen || other.target() == entry.listen;
+        if expose[..index].iter().any(collides) {
+            return Err(invalid(entry, "listen address is used twice"));
         }
     }
     Ok(())
@@ -364,6 +399,73 @@ mod tests {
             let error = ResolvedPolicy::resolve(&policy, None).unwrap_err();
             assert!(matches!(error, PolicyError::InvalidEnvironmentName(_)));
         }
+    }
+
+    fn expose(listen: &str, port: u16) -> ExposedPort {
+        ExposedPort {
+            listen: listen.parse().unwrap(),
+            port,
+        }
+    }
+
+    fn with_expose(ip: NetworkAccess, entries: &[ExposedPort]) -> Policy {
+        let mut policy = Policy::default();
+        policy.network.ip = ip;
+        policy.network.expose = entries.to_vec();
+        policy
+    }
+
+    #[test]
+    fn accepts_loopback_expose_with_ip() {
+        for listen in ["127.0.0.1:18080", "[::1]:18080"] {
+            let policy = with_expose(NetworkAccess::All, &[expose(listen, 8080)]);
+            let resolved = ResolvedPolicy::resolve(&policy, None).unwrap();
+            let requirements = resolved.requirements();
+            assert!(requirements.contains(&Requirement::ExposedPortsRelayed));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_expose() {
+        let cases = [
+            with_expose(NetworkAccess::None, &[expose("127.0.0.1:18080", 8080)]),
+            with_expose(NetworkAccess::All, &[expose("0.0.0.0:18080", 8080)]),
+            with_expose(NetworkAccess::All, &[expose("192.168.1.2:18080", 8080)]),
+            with_expose(NetworkAccess::All, &[expose("127.0.0.1:0", 8080)]),
+            with_expose(NetworkAccess::All, &[expose("127.0.0.1:18080", 0)]),
+            with_expose(NetworkAccess::All, &[expose("127.0.0.1:8080", 8080)]),
+            with_expose(
+                NetworkAccess::All,
+                &[
+                    expose("127.0.0.1:18080", 8080),
+                    expose("127.0.0.1:18080", 8081),
+                ],
+            ),
+            with_expose(
+                NetworkAccess::All,
+                &[
+                    expose("127.0.0.1:18080", 8080),
+                    expose("127.0.0.1:8080", 8081),
+                ],
+            ),
+        ];
+        for policy in cases {
+            let error = ResolvedPolicy::resolve(&policy, None).unwrap_err();
+            assert!(
+                matches!(error, PolicyError::InvalidExpose { .. }),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_expose_no_relay_requirement() {
+        let resolved = ResolvedPolicy::resolve(&Policy::default(), None).unwrap();
+        assert!(
+            !resolved
+                .requirements()
+                .contains(&Requirement::ExposedPortsRelayed)
+        );
     }
 
     #[test]

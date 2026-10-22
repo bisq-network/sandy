@@ -6,6 +6,7 @@
 mod common;
 
 use std::fs;
+use std::net::TcpStream;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -13,6 +14,7 @@ use std::os::unix::net::{SocketAddr, UnixListener};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use common::*;
 
@@ -464,6 +466,151 @@ fn mount_and_namespace_listing_is_denied() {
     }
     for line in probe_inside(&[], &actions) {
         assert_eq!(line.result, "denied", "{line:?}");
+    }
+}
+
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+fn read_proc(pid: u32, file: &str) -> Option<String> {
+    fs::read_to_string(format!("/proc/{pid}/{file}")).ok()
+}
+
+/// The inode of the socket that listens on 127.0.0.1:`port`. /proc/net/tcp shows the local
+/// address in hexadecimal (127.0.0.1 is 0100007F on little-endian hosts) and LISTEN as 0A.
+fn listener_inode(port: u16) -> Option<String> {
+    let local = format!("0100007F:{port:04X}");
+    let table = fs::read_to_string("/proc/net/tcp").ok()?;
+    table.lines().skip(1).find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let listening = fields.get(1) == Some(&local.as_str()) && fields.get(3) == Some(&"0A");
+        listening.then(|| fields.get(9).map(|inode| inode.to_string()))?
+    })
+}
+
+/// The processes that hold the socket with `inode`.
+fn socket_holders(inode: &str) -> Vec<u32> {
+    let socket = format!("socket:[{inode}]");
+    let Ok(processes) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    processes
+        .filter_map(|entry| {
+            let pid: u32 = entry.ok()?.file_name().to_str()?.parse().ok()?;
+            let mut descriptors = fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+            let holds = descriptors.any(|fd| {
+                fd.and_then(|fd| fs::read_link(fd.path()))
+                    .is_ok_and(|link| link.as_os_str() == socket.as_str())
+            });
+            holds.then_some(pid)
+        })
+        .collect()
+}
+
+fn parent_of(pid: u32) -> Option<u32> {
+    status_value(&read_proc(pid, "status")?, "PPid")
+        .parse()
+        .ok()
+}
+
+fn status_value(status: &str, name: &str) -> String {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn has_ended(pid: u32) -> bool {
+    read_proc(pid, "status").is_none_or(|status| status_value(&status, "State").starts_with('Z'))
+}
+
+#[test]
+fn relay_is_confined_and_ends_with_the_program() {
+    let (inner, outer) = (free_port(), free_port());
+    let expose = format!("127.0.0.1:{outer}={inner}");
+    let sandbox_args = args(&["--ip", "all", "--expose", &expose]);
+    let mut program = Victim(
+        Command::new(sandy_path())
+            .args(run_args(&sandbox_args, &[("sleep", "600000")]))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let program_pid = program.0.id();
+    // sandy executes the program only after the relay has reported that it is ready, and sandy
+    // gives up its own copy of the listener first. The intermediate process of the double fork,
+    // a child of the program's process, can still hold the listener for a moment. The relay is
+    // ready when it is the only holder and its parent is not the program.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let relay = loop {
+        let executed =
+            read_proc(program_pid, "comm").is_some_and(|comm| comm.trim() == "sandy-probe");
+        let holders = listener_inode(outer)
+            .map(|inode| socket_holders(&inode))
+            .unwrap_or_default();
+        if let [relay] = holders[..]
+            && executed
+            && parent_of(relay).is_some_and(|parent| parent != program_pid)
+        {
+            break relay;
+        }
+        let parents: Vec<_> = holders.iter().map(|&pid| parent_of(pid)).collect();
+        assert!(
+            Instant::now() < deadline,
+            "no ready relay for {expose}: program executed {executed}, listener holders \
+             {holders:?} with parents {parents:?}, program {program_pid}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    let status = read_proc(relay, "status").unwrap();
+    assert_eq!(status_value(&status, "NoNewPrivs"), "1", "{status}");
+    assert_eq!(status_value(&status, "Seccomp"), "2", "{status}");
+    assert_ne!(
+        status_value(&status, "PPid"),
+        program_pid.to_string(),
+        "{status}"
+    );
+    // The relay holds standard error, its listener and the pidfd; nothing that opens files.
+    let descriptors: Vec<String> = fs::read_dir(format!("/proc/{relay}/fd"))
+        .unwrap()
+        .map(|entry| {
+            let link = fs::read_link(entry.unwrap().path()).unwrap();
+            link.to_string_lossy().into_owned()
+        })
+        .collect();
+    assert_eq!(descriptors.len(), 3, "{descriptors:?}");
+    assert!(
+        descriptors.iter().any(|d| d == "anon_inode:[pidfd]"),
+        "{descriptors:?}"
+    );
+    assert!(
+        descriptors.iter().any(|d| d.starts_with("socket:")),
+        "{descriptors:?}"
+    );
+    // The program does not hold the listener.
+    let program_descriptors = fs::read_dir(format!("/proc/{program_pid}/fd"))
+        .unwrap()
+        .count();
+    assert_eq!(program_descriptors, 3);
+
+    let address = format!("127.0.0.1:{outer}").parse().unwrap();
+    assert!(TcpStream::connect_timeout(&address, Duration::from_secs(5)).is_ok());
+    // SAFETY: kill takes no pointers.
+    unsafe { libc::kill(program_pid as libc::pid_t, libc::SIGKILL) };
+    program.0.wait().unwrap();
+    // The main thread of the relay can show as a zombie while its other threads, which share the
+    // listener, are still exiting. The port closes when the last one is gone.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let refused = || TcpStream::connect_timeout(&address, Duration::from_secs(1)).is_err();
+    while !(has_ended(relay) && refused()) {
+        assert!(Instant::now() < deadline, "the relay outlived the program");
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 

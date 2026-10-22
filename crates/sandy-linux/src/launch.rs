@@ -13,9 +13,9 @@ use landlock::{
 };
 use sandy_core::{SandboxError, TargetCommand};
 
-use crate::filter;
 use crate::host::THREADS_DIR;
 use crate::plan::{LandlockConfig, Sandbox};
+use crate::{filter, relay};
 
 /// Applies `sandbox` to this process and executes the target. Returns only on failure.
 ///
@@ -23,6 +23,9 @@ use crate::plan::{LandlockConfig, Sandbox};
 /// it has a single thread, the filters are installed with TSYNC, and execve ends every other
 /// thread, so the target runs with exactly the restrictions applied here.
 pub fn launch(sandbox: &Sandbox, command: &TargetCommand) -> Result<Infallible, SandboxError> {
+    if let Some(relay) = &sandbox.relay {
+        relay::start(relay)?;
+    }
     let ruleset = prepare_ruleset(&sandbox.landlock)?;
     let filters = filter::build(&sandbox.filter, std::process::id())
         .map_err(|error| SandboxError::new(format!("cannot build the seccomp filter: {error}")))?;
@@ -79,7 +82,7 @@ fn prepare_ruleset(config: &LandlockConfig) -> Result<RulesetCreated, SandboxErr
 /// file system rules until execve ends it. sandy starts no threads; this check makes that a
 /// verified fact instead of an assumption. LANDLOCK_RESTRICT_SELF_TSYNC (ABI 8) would cover such
 /// a thread instead, but only on new kernels, and it would hide a thread that should not exist.
-fn ensure_single_thread() -> Result<(), SandboxError> {
+pub(crate) fn ensure_single_thread() -> Result<(), SandboxError> {
     let list_error = |error| SandboxError::io(format!("cannot list {THREADS_DIR}"), error);
     let threads = std::fs::read_dir(THREADS_DIR)
         .map_err(list_error)?
@@ -94,7 +97,7 @@ fn ensure_single_thread() -> Result<(), SandboxError> {
     Ok(())
 }
 
-fn restrict(ruleset: RulesetCreated) -> Result<(), SandboxError> {
+pub(crate) fn restrict(ruleset: RulesetCreated) -> Result<(), SandboxError> {
     let status = ruleset.restrict_self().map_err(landlock_error)?;
     if status.ruleset != RulesetStatus::FullyEnforced {
         return Err(SandboxError::new(format!(
@@ -166,7 +169,7 @@ fn mark_listed_descriptors_close_on_exec() -> Result<(), SandboxError> {
     Ok(())
 }
 
-fn set_no_new_privs() -> Result<(), SandboxError> {
+pub(crate) fn set_no_new_privs() -> Result<(), SandboxError> {
     // SAFETY: PR_SET_NO_NEW_PRIVS only sets a process flag.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(SandboxError::io(

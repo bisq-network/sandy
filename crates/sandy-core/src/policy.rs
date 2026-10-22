@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -91,6 +92,34 @@ pub struct NetworkPolicy {
     /// reach every Unix socket the user can reach, independent of the filesystem rules.
     #[serde(default)]
     pub unix_sockets: NetworkAccess,
+    /// Loopback ports of the target that clients outside the sandbox can reach through a relay.
+    #[serde(default)]
+    pub expose: Vec<ExposedPort>,
+}
+
+/// A relay that makes a loopback port of the target reachable from outside the sandbox.
+///
+/// sandy accepts connections on `listen` and forwards each one to `port` on the loopback address
+/// of the same family (127.0.0.1 or ::1), where the target listens. Windows blocks every inbound
+/// loopback connection into an AppContainer, so this is the only way to reach a sandboxed server
+/// there; the other platforms relay the same way, so a policy means the same everywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExposedPort {
+    pub listen: SocketAddr,
+    pub port: u16,
+}
+
+impl ExposedPort {
+    /// The address the relay connects to inside the sandbox.
+    pub fn target(&self) -> SocketAddr {
+        let ip: std::net::IpAddr = if self.listen.is_ipv4() {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        };
+        SocketAddr::new(ip, self.port)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -181,6 +210,10 @@ pub enum PolicyError {
         path: PathBuf,
         writable: PathBuf,
     },
+    InvalidExpose {
+        expose: ExposedPort,
+        reason: &'static str,
+    },
     ProgramNotAFile(PathBuf),
     InvalidEnvironmentName(String),
     InvalidEnvironmentValue(String),
@@ -214,6 +247,11 @@ impl fmt::Display for PolicyError {
                 "policy path {} lies inside writable path {}; the program could replace it with a symbolic link before the next start",
                 path.display(),
                 writable.display()
+            ),
+            PolicyError::InvalidExpose { expose, reason } => write!(
+                f,
+                "invalid expose {} -> port {}: {reason}",
+                expose.listen, expose.port
             ),
             PolicyError::ProgramNotAFile(path) => {
                 write!(f, "program is not a regular file: {}", path.display())
@@ -264,6 +302,7 @@ mod tests {
             [network]
             ip = "all"
             unix_sockets = "none"
+            expose = [{ listen = "127.0.0.1:18080", port = 8080 }]
             [process]
             signals = "isolated"
             [environment]
@@ -279,6 +318,17 @@ mod tests {
         assert_eq!(policy.filesystem.system, SystemAccess::None);
         assert_eq!(policy.filesystem.read_write, vec![PathBuf::from("/c")]);
         assert_eq!(policy.network.ip, NetworkAccess::All);
+        assert_eq!(
+            policy.network.expose,
+            vec![ExposedPort {
+                listen: "127.0.0.1:18080".parse().unwrap(),
+                port: 8080,
+            }]
+        );
+        assert_eq!(
+            policy.network.expose[0].target(),
+            "127.0.0.1:8080".parse().unwrap()
+        );
         assert_eq!(policy.process.signals, SignalScope::Isolated);
         assert_eq!(policy.environment.set["HOME"], "/c");
         assert_eq!(policy.linux.path_metadata, PathMetadata::Allow);

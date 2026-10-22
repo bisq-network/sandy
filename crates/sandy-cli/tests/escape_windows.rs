@@ -9,11 +9,12 @@
 mod common;
 
 use std::fs;
-use std::net::TcpListener;
+use std::io::Write;
+use std::net::{TcpListener, TcpStream};
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::*;
@@ -636,4 +637,99 @@ fn check_and_run_agree_inside_a_job_with_ui_restrictions() {
     assert!(output.contains("UI restrictions"), "{output}");
     let (code, output) = sandy_in_job(READ_CLIPBOARD, &run);
     assert_eq!(code as i32, EXIT_FAILURE, "{output}");
+}
+
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Connects to `port` until `sandy` listens there.
+fn connect_when_listening(sandy: &mut Child, port: u16) -> TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => return stream,
+            Err(error) => assert!(Instant::now() < deadline, "sandy never listened: {error}"),
+        }
+        if sandy.try_wait().unwrap().is_some() {
+            let output = sandy.stderr.take().map(std::io::read_to_string);
+            panic!("sandy ended before it listened: {output:?}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Whether `listener` (non-blocking) accepts a connection within `wait`.
+fn accepts_within(listener: &TcpListener, wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    while Instant::now() < deadline {
+        match listener.accept() {
+            Ok(_) => return true,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("accept failed: {error}"),
+        }
+    }
+    false
+}
+
+/// A relay connects only to the program's port it was started for, and it connects from inside
+/// the AppContainer. So a listener outside the sandbox stays unreachable through a relay, also
+/// when the policy exposes that listener's port number. The relay to the program shows that the
+/// relays run, and the last connection shows that the outside listener accepts.
+#[test]
+fn relays_reach_only_the_program() {
+    let fixture = Fixture::new("expose-only");
+    let outside = TcpListener::bind("127.0.0.1:0").unwrap();
+    outside.set_nonblocking(true).unwrap();
+    let outside_port = outside.local_addr().unwrap().port();
+    let (inner, to_program, to_outside) = (free_port(), free_port(), free_port());
+    let mut sandbox_args = fixture.access_args();
+    // Without the loopback exemption, which would let the program itself reach the listener.
+    sandbox_args.extend(args(&[
+        "--appcontainer",
+        APPCONTAINER,
+        "--ip",
+        "all",
+        "--expose",
+        &format!("127.0.0.1:{to_program}={inner}"),
+        "--expose",
+        &format!("127.0.0.1:{to_outside}={outside_port}"),
+    ]));
+    let inner_address = format!("127.0.0.1:{inner}");
+    let mut server = Command::new(sandy_path())
+        .args(run_args(&sandbox_args, &[("tcp-accept", &inner_address)]))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut client = connect_when_listening(&mut server, to_outside);
+    let _ = client.write_all(b"probe");
+    assert!(
+        !accepts_within(&outside, Duration::from_secs(3)),
+        "a relay reached a listener outside the sandbox"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while server.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the program never accepted");
+        let _ = TcpStream::connect_timeout(
+            &format!("127.0.0.1:{to_program}").parse().unwrap(),
+            Duration::from_millis(500),
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let output = server.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    parse(&output)[0].assert_ok();
+
+    assert!(!accepts_within(&outside, Duration::from_millis(200)));
+    let _control = TcpStream::connect(("127.0.0.1", outside_port)).unwrap();
+    assert!(accepts_within(&outside, Duration::from_secs(3)));
 }

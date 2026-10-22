@@ -21,13 +21,15 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandleEx, OPEN_EXISTING,
+    WRITE_DAC,
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 
 use super::host;
 use super::util::{LocalBox, SessionLock, Sid, last_error, wide_nul, win32_error};
 use crate::access::{
-    ALL_APPLICATION_PACKAGES, Ace, AceKind, access_mask, ace_flags, grants, has_explicit_ace,
+    ALL_APPLICATION_PACKAGES, Ace, AceKind, CONTAINER_INHERIT_ACE, FILE_EXECUTE, INHERITED_ACE,
+    OBJECT_INHERIT_ACE, access_mask, ace_flags, grants, has_explicit_ace,
 };
 use crate::name::{FileIdentity, grant_capability_name};
 
@@ -35,26 +37,8 @@ use crate::name::{FileIdentity, grant_capability_name};
 /// the target must hold for it. Changes nothing when the grant is already in place.
 pub fn grant(appcontainer: &str, rule: &PathRule) -> Result<Sid, SandboxError> {
     let path = wide_nul(rule.path.as_os_str());
-    let identity = file_identity(&path, &rule.path)?;
-    let capability = capability_sid(&grant_capability_name(appcontainer, rule.access, identity))?;
-    let mask = access_mask(rule.access);
-    let flags = ace_flags(rule.is_dir);
-    let lacks_grant = |dacl: &Dacl| -> Result<bool, SandboxError> {
-        let aces = dacl.aces(&rule.path)?;
-        let entries = aces.entries();
-        if has_explicit_ace(&entries, capability.bytes(), mask, flags) {
-            return Ok(false);
-        }
-        // Paths in the system set, such as the program C:\Windows\System32\cmd.exe, already
-        // grant read and execute to every AppContainer, and the user usually cannot change
-        // their ACL.
-        let granted_by_windows = rule.access != PathAccess::ReadWrite
-            && !aces.has_unknown_types
-            && grants(&entries, ALL_APPLICATION_PACKAGES, mask, rule.is_dir);
-        Ok(!granted_by_windows)
-    };
-
-    if !lacks_grant(&Dacl::read(&path, &rule.path)?)? {
+    let capability = grant_capability(appcontainer, rule, &path)?;
+    if !lacks_grant(rule, &capability, &Dacl::read(&path, &rule.path)?)? {
         return Ok(capability);
     }
     // A change reads the DACL, adds one ACE and writes the whole DACL back. Without the lock,
@@ -64,13 +48,132 @@ pub fn grant(appcontainer: &str, rule: &PathRule) -> Result<Sid, SandboxError> {
     let _lock = SessionLock::acquire(r"Local\sandy-dacl-changes")?;
     // Another run may have changed the DACL while this one waited for the lock.
     let dacl = Dacl::read(&path, &rule.path)?;
-    if lacks_grant(&dacl)? {
+    if lacks_grant(rule, &capability, &dacl)? {
         if rule.is_dir {
             refuse_links_below(&rule.path)?;
         }
-        add_ace(&path, &rule.path, &dacl, &capability, mask, flags)?;
+        add_ace(
+            &path,
+            &rule.path,
+            &dacl,
+            &capability,
+            access_mask(rule.access),
+            ace_flags(rule.is_dir),
+        )?;
     }
     Ok(capability)
+}
+
+/// Whether `grant` would succeed for `rule`: the grant is in place, or the current user may
+/// change the DACL. Changes nothing.
+pub fn grantable(appcontainer: &str, rule: &PathRule) -> Result<(), String> {
+    let path = wide_nul(rule.path.as_os_str());
+    let in_place = grant_capability(appcontainer, rule, &path)
+        .and_then(|capability| {
+            lacks_grant(rule, &capability, &Dacl::read(&path, &rule.path)?).map(|lacks| !lacks)
+        })
+        .map_err(|error| error.to_string())?;
+    if in_place {
+        return Ok(());
+    }
+    // SAFETY: path is NUL-terminated; opening for WRITE_DAC only checks the right.
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            WRITE_DAC,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(format!(
+            "the grant is missing, and the current user may not change the permissions: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: CreateFileW succeeded, so the handle is new; dropping it closes it.
+    drop(unsafe { OwnedHandle::from_raw_handle(handle) });
+    Ok(())
+}
+
+/// Removes `FILE_EXECUTE` from the AppContainer's access to its profile folder, so the program
+/// cannot execute what it writes there.
+///
+/// Windows creates the folder (`...\Packages\<name>\AC`, which holds the program's `TEMP`) with
+/// an inheritable allow ACE that grants the AppContainer SID `FILE_ALL`, including
+/// `FILE_EXECUTE`. The folder is always present, persists across runs, and must stay writable
+/// for data, so sandy cannot remove it. A deny ACE does not help: the AppContainer access check
+/// ignores a deny ACE for the package SID (measured). sandy reduces the allow ACE instead, which
+/// the access check does honor. `SetNamedSecurityInfoW` re-propagates the inheritable ACE, so
+/// files the program wrote on an earlier run lose execute too.
+///
+/// Idempotent: it writes only while the AppContainer SID is still granted `FILE_EXECUTE`.
+pub fn deny_execute_in_profile(appcontainer: &Sid, folder: &Path) -> Result<(), SandboxError> {
+    let path = wide_nul(folder.as_os_str());
+    // The union of the explicit allow masks for the AppContainer SID, when one grants execute.
+    let allow_with_execute = |dacl: &Dacl| -> Result<Option<u32>, SandboxError> {
+        let aces = dacl.aces(folder)?;
+        let mut mask = 0u32;
+        let mut grants_execute = false;
+        for ace in aces.entries() {
+            if ace.kind == AceKind::Allow
+                && ace.flags & INHERITED_ACE == 0
+                && ace.sid == appcontainer.bytes()
+            {
+                mask |= ace.mask;
+                grants_execute |= ace.mask & FILE_EXECUTE != 0;
+            }
+        }
+        Ok(grants_execute.then_some(mask))
+    };
+
+    if allow_with_execute(&Dacl::read(&path, folder)?)?.is_none() {
+        return Ok(());
+    }
+    let _lock = SessionLock::acquire(r"Local\sandy-dacl-changes")?;
+    let dacl = Dacl::read(&path, folder)?;
+    if let Some(mask) = allow_with_execute(&dacl)? {
+        set_access(
+            &path,
+            folder,
+            &dacl,
+            appcontainer,
+            mask & !FILE_EXECUTE,
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+        )?;
+    }
+    Ok(())
+}
+
+/// The capability that names the object at `path` and the access level of `rule`.
+fn grant_capability(
+    appcontainer: &str,
+    rule: &PathRule,
+    path: &[u16],
+) -> Result<Sid, SandboxError> {
+    let identity = file_identity(path, &rule.path)?;
+    capability_sid(&grant_capability_name(appcontainer, rule.access, identity))
+}
+
+/// Whether `dacl` lacks what `rule` needs: an explicit ACE for `capability`, or a grant that
+/// Windows gives every AppContainer.
+fn lacks_grant(rule: &PathRule, capability: &Sid, dacl: &Dacl) -> Result<bool, SandboxError> {
+    let mask = access_mask(rule.access);
+    let aces = dacl.aces(&rule.path)?;
+    let entries = aces.entries();
+    if has_explicit_ace(&entries, capability.bytes(), mask, ace_flags(rule.is_dir)) {
+        return Ok(false);
+    }
+    // Paths in the system set, such as the program C:\Windows\System32\cmd.exe, already
+    // grant read and execute to every AppContainer, and the user usually cannot change their
+    // ACL.
+    let granted_by_windows = rule.access != PathAccess::ReadWrite
+        && !aces.has_unknown_types
+        && grants(&entries, ALL_APPLICATION_PACKAGES, mask, rule.is_dir);
+    Ok(!granted_by_windows)
 }
 
 fn file_identity(path: &[u16], display: &Path) -> Result<FileIdentity, SandboxError> {
@@ -356,6 +459,21 @@ fn add_ace(
     mask: u32,
     flags: u8,
 ) -> Result<(), SandboxError> {
+    set_access(path, display, current, capability, mask, flags)
+}
+
+/// Replaces every explicit ACE for `sid` in the DACL of `path` with one allow ACE for `mask`
+/// with `flags`, and writes the DACL back, keeping its protection state. `SET_ACCESS` replaces
+/// the existing entries for the trustee, so this both grants (a new SID) and reduces (an SID
+/// Windows already granted more).
+fn set_access(
+    path: &[u16],
+    display: &Path,
+    current: &Dacl,
+    sid: &Sid,
+    mask: u32,
+    flags: u8,
+) -> Result<(), SandboxError> {
     let access = EXPLICIT_ACCESS_W {
         grfAccessPermissions: mask,
         grfAccessMode: SET_ACCESS,
@@ -365,7 +483,7 @@ fn add_ace(
             MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
             TrusteeForm: TRUSTEE_IS_SID,
             TrusteeType: TRUSTEE_IS_UNKNOWN,
-            ptstrName: capability.as_psid().cast(),
+            ptstrName: sid.as_psid().cast(),
         },
     };
     let mut merged: *mut ACL = ptr::null_mut();
@@ -396,8 +514,8 @@ fn add_ace(
     };
     if error == ERROR_ACCESS_DENIED {
         return Err(SandboxError::new(format!(
-            "cannot grant the AppContainer access to {}: the current user may not change its \
-             permissions; remove the path from the policy or ask its owner to change them",
+            "cannot change the permissions of {}: the current user may not change them; for a \
+             policy path, remove it or ask its owner to change the permissions",
             display.display()
         )));
     }

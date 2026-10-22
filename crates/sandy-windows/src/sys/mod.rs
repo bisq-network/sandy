@@ -3,9 +3,12 @@ mod appcontainer;
 mod host;
 mod network;
 mod process;
+mod relay;
 mod util;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::os::windows::ffi::OsStringExt;
+use std::os::windows::io::AsRawSocket;
 
 use sandy_core::{
     Backend, NetworkAccess, PlanItem, ResolvedPolicy, SandboxError, Status, TargetCommand,
@@ -15,8 +18,11 @@ use windows_sys::Win32::Security::{
     WinCapabilityPrivateNetworkClientServerSid,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+};
 use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
-use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, KF_FLAG_DEFAULT};
 
 use crate::cmdline::{command_line, is_batch_file, without_verbatim_prefix};
 use crate::envblock::{LOCAL_APP_DATA, SYSTEM_ROOT, environment_block};
@@ -66,6 +72,10 @@ impl Backend for WindowsBackend {
         }
 
         let container = appcontainer::ensure_profile(name)?;
+        // Windows gives the AppContainer a private, persistent, writable folder (its profile,
+        // which holds TEMP). sandy removes execute there so the program cannot run what it
+        // writes, keeping the writable-never-executable rule.
+        acl::deny_execute_in_profile(&container, &profile_folder(name)?)?;
         let mut capabilities = Vec::new();
         for capability in network_capabilities(policy.ip) {
             capabilities.push(network_capability_sid(*capability)?);
@@ -74,34 +84,89 @@ impl Backend for WindowsBackend {
             capabilities.push(acl::grant(name, rule)?);
         }
 
-        let program = wide(command.program.as_os_str());
-        let program = without_verbatim_prefix(&program);
-        let args: Vec<Vec<u16>> = command.args.iter().map(|arg| wide(arg)).collect();
-        let command_line = command_line(program, &args)
-            .map_err(|error| SandboxError::new(format!("invalid command line: {error}")))?;
-        let mut application = program.to_vec();
-        application.push(0);
+        // The relays run sandy's own executable with one capability: read and execute access to
+        // that file.
+        let relay_capability = if policy.expose.is_empty() {
+            None
+        } else {
+            let rule = relay::relay_program(name).map_err(SandboxError::new)?;
+            Some((acl::grant(name, &rule)?, rule.path))
+        };
+        let mut relays = Vec::new();
+        if let Some((capability, sandy)) = &relay_capability {
+            for (listener, target) in relay::listen(&policy.expose)? {
+                let args = [
+                    wide(relay::RELAY_COMMAND.as_ref()),
+                    wide(listener.as_raw_socket().to_string().as_ref()),
+                    wide(target.to_string().as_ref()),
+                ];
+                let relay = process_for(
+                    sandy.as_os_str(),
+                    &args,
+                    &[],
+                    None,
+                    std::slice::from_ref(capability),
+                )?;
+                relays.push((relay, listener));
+            }
+        }
 
+        let args: Vec<Vec<u16>> = command.args.iter().map(|arg| wide(arg)).collect();
+        let cwd = command.cwd.as_ref().map(|cwd| wide_nul(cwd.as_os_str()));
+        let program = process_for(
+            command.program.as_os_str(),
+            &args,
+            &command.env,
+            cwd,
+            &capabilities,
+        )?;
         process::run(process::Launch {
-            application,
-            command_line,
-            environment: environment(&command.env)?,
-            cwd: command.cwd.as_ref().map(|cwd| wide_nul(cwd.as_os_str())),
             appcontainer: &container,
-            capabilities: &capabilities,
+            program,
+            relays,
         })
     }
 
     /// Makes the loopback exemption of the policy's AppContainer match the policy: present with
-    /// `ip = "all"`, absent otherwise. Needs administrator rights when it changes something.
+    /// `ip = "all"`, absent otherwise. With exposed ports, also lets the relays run sandy's
+    /// executable, which a user without the right to change its permissions cannot do at run
+    /// time. Needs administrator rights when it changes something.
     fn setup(&self, policy: &ResolvedPolicy) -> Result<(), SandboxError> {
         let name = policy.windows.appcontainer_name.as_deref().ok_or_else(|| {
             SandboxError::new("the policy names no AppContainer; pass --appcontainer NAME")
         })?;
         validate_appcontainer_name(name).map_err(SandboxError::new)?;
         let container = appcontainer::sid(name)?;
-        network::set_loopback_exempt(&container, policy.ip == NetworkAccess::All)
+        network::set_loopback_exempt(&container, policy.ip == NetworkAccess::All)?;
+        if !policy.expose.is_empty() {
+            acl::grant(name, &relay::relay_rule().map_err(SandboxError::new)?)?;
+        }
+        Ok(())
     }
+}
+
+/// A process of `program` with `args`, the policy environment `env` plus the variables sandy
+/// sets, and `capabilities`.
+fn process_for<'a>(
+    program: &OsStr,
+    args: &[Vec<u16>],
+    env: &[(OsString, OsString)],
+    cwd: Option<Vec<u16>>,
+    capabilities: &'a [Sid],
+) -> Result<process::Process<'a>, SandboxError> {
+    let program = wide(program);
+    let program = without_verbatim_prefix(&program);
+    let command_line = command_line(program, args)
+        .map_err(|error| SandboxError::new(format!("invalid command line: {error}")))?;
+    let mut application = program.to_vec();
+    application.push(0);
+    Ok(process::Process {
+        application,
+        command_line,
+        environment: environment(env)?,
+        cwd,
+        capabilities,
+    })
 }
 
 /// Reads the host state the plan depends on. Changes nothing.
@@ -119,6 +184,13 @@ fn detect(policy: &ResolvedPolicy) -> HostCapabilities {
         outer_job_ui: host::outer_job_ui(),
         firewall: network::firewall_running(),
         loopback_exempt: container.and_then(|sid| network::is_loopback_exempt(&sid)),
+        // Only the requirement `ExposedPortsRelayed` reads it.
+        relay_program: match policy.windows.appcontainer_name.as_deref() {
+            Some(name) if !policy.expose.is_empty() => {
+                relay::relay_program(name).map(|rule| rule.path)
+            }
+            _ => Err("no relay is needed".into()),
+        },
     }
 }
 
@@ -151,12 +223,23 @@ fn windows_directory() -> Result<Vec<u16>, SandboxError> {
     }
 }
 
+/// The AppContainer's profile folder, `<LOCALAPPDATA>\Packages\<name>\AC`. Windows redirects
+/// the program's `LOCALAPPDATA`, `TEMP` and `TMP` here [Implementing an AppContainer].
+fn profile_folder(name: &str) -> Result<std::path::PathBuf, SandboxError> {
+    let local = OsString::from_wide(&local_app_data()?);
+    Ok(std::path::PathBuf::from(local)
+        .join("Packages")
+        .join(name)
+        .join("AC"))
+}
+
 fn local_app_data() -> Result<Vec<u16>, SandboxError> {
+    let known_folder_path = sh_get_known_folder_path()?;
     let mut path: windows_sys::core::PWSTR = std::ptr::null_mut();
     // SAFETY: the folder ID is a valid GUID, a null token selects the current user, and path is
     // a valid out pointer.
     let hresult = unsafe {
-        SHGetKnownFolderPath(
+        known_folder_path(
             &FOLDERID_LocalAppData,
             KF_FLAG_DEFAULT as u32,
             std::ptr::null_mut(),
@@ -178,6 +261,40 @@ fn local_app_data() -> Result<Vec<u16>, SandboxError> {
     // freed exactly once; CoTaskMemFree accepts null.
     unsafe { CoTaskMemFree(path.cast()) };
     result
+}
+
+type ShGetKnownFolderPath = unsafe extern "system" fn(
+    *const windows_sys::core::GUID,
+    u32,
+    windows_sys::Win32::Foundation::HANDLE,
+    *mut windows_sys::core::PWSTR,
+) -> windows_sys::core::HRESULT;
+
+/// `SHGetKnownFolderPath`, loaded at run time. shell32.dll loads user32.dll, and user32.dll
+/// fails to initialize in an AppContainer when the window station does not admit AppContainers,
+/// for example in an SSH session (`STATUS_DLL_INIT_FAILED`). `sandy.exe` also runs the relays
+/// in the AppContainer, so it must not import shell32.dll at load time.
+fn sh_get_known_folder_path() -> Result<ShGetKnownFolderPath, SandboxError> {
+    let module = wide_nul("shell32.dll".as_ref());
+    // SAFETY: the name is NUL-terminated and the search is limited to System32. sandy never
+    // frees the module, so the function stays valid.
+    let handle = unsafe {
+        LoadLibraryExW(
+            module.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    };
+    if handle.is_null() {
+        return Err(util::last_error("cannot load shell32.dll"));
+    }
+    // SAFETY: the module handle is valid and the export name is NUL-terminated.
+    let address = unsafe { GetProcAddress(handle, c"SHGetKnownFolderPath".as_ptr().cast()) }
+        .ok_or_else(|| util::last_error("cannot find SHGetKnownFolderPath"))?;
+    // SAFETY: the export has the documented signature of SHGetKnownFolderPath.
+    Ok(unsafe {
+        std::mem::transmute::<unsafe extern "system" fn() -> isize, ShGetKnownFolderPath>(address)
+    })
 }
 
 fn network_capability_sid(capability: NetworkCapability) -> Result<Sid, SandboxError> {

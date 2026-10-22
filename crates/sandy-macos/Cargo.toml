@@ -12,6 +12,7 @@ sandy-core.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc.workspace = true
+sandy-relay.workspace = true
 
 [lints]
 workspace = true

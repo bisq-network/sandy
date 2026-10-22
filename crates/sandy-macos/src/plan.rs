@@ -97,6 +97,12 @@ fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
             "file-write* (mode, owner, flags, times, extended attributes, ACLs) only on read_write \
              paths, by path and through open descriptors alike"
         }
+        Requirement::ExposedPortsRelayed => {
+            "a relay process that is not a child of the target (forked twice, so launchd \
+             adopts it), confined by its own profile: deny by default, accept on the exposed \
+             listeners and connect only to the target's loopback ports, no files, no Mach \
+             services; it ends when the target ends (kqueue NOTE_EXIT)"
+        }
     };
     Mechanism::Profile(text.to_string())
 }
@@ -120,6 +126,7 @@ mod tests {
             system: SystemAccess::Minimal,
             ip,
             unix_sockets,
+            expose: Vec::new(),
             signals,
             path_metadata: PathMetadata::Deny,
             environment: EnvironmentPolicy::default(),

@@ -1,7 +1,9 @@
 //! The enforcement plan: how this backend enforces each requirement of a policy on a given host.
 //! `plan_for` is pure; `sys` detects the host capabilities.
 
-use sandy_core::{NetworkAccess, PlanItem, Requirement, ResolvedPolicy, SystemAccess};
+use std::path::{Path, PathBuf};
+
+use sandy_core::{NetworkAccess, PathAccess, PlanItem, Requirement, ResolvedPolicy, SystemAccess};
 
 use crate::name::validate_appcontainer_name;
 use crate::version::{WindowsVersion, below_minimum, firewall_bypass};
@@ -24,6 +26,9 @@ pub struct HostCapabilities {
     pub firewall: Result<(), String>,
     /// Whether the AppContainer of the policy is exempt from loopback isolation.
     pub loopback_exempt: Result<bool, String>,
+    /// sandy's own executable, which runs the relays of exposed ports, if sandy can allow the
+    /// AppContainer to run it.
+    pub relay_program: Result<PathBuf, String>,
 }
 
 const SYSTEM_NONE: &str = "Windows grants every AppContainer read and execute access to the \
@@ -84,7 +89,9 @@ fn job_problem(host: &HostCapabilities) -> Option<String> {
     match &host.outer_job_ui {
         Err(reason) => Some(format!("cannot read the job sandy runs in: {reason}")),
         Ok(Some(ui)) if *ui != 0 => Some(format!(
-            "sandy runs inside a job with UI restrictions ({ui:#x}); Windows does not nest              sandy's job, which sets UI restrictions too, so the program cannot be put into              it; start sandy outside that job"
+            "sandy runs inside a job with UI restrictions ({ui:#x}); Windows does not nest \
+             sandy's job, which sets UI restrictions too, so the program cannot be put into \
+             it; start sandy outside that job"
         )),
         Ok(_) => None,
     }
@@ -99,9 +106,13 @@ fn contained(
 ) -> PlanItem {
     let enforced = |mechanism: String| PlanItem::enforced(requirement, mechanism);
     let unavailable = |reason: String| PlanItem::unavailable(requirement, reason);
-    // The job carries the no-breakaway rule and the UI restrictions.
-    if let (Requirement::NoPrivilegeEscalation | Requirement::SignalsIsolated, Some(reason)) =
-        (requirement, job_problem(host))
+    // The job carries the no-breakaway rule and the UI restrictions, and ends the relays.
+    if let (
+        Requirement::NoPrivilegeEscalation
+        | Requirement::SignalsIsolated
+        | Requirement::ExposedPortsRelayed,
+        Some(reason),
+    ) = (requirement, job_problem(host))
     {
         return unavailable(reason);
     }
@@ -123,6 +134,23 @@ fn contained(
                  entry on the path (no FILE_EXECUTE on read and read-write paths); besides, what \
                  Windows grants all AppContainers and the AppContainer profile folder"
             )),
+        },
+        Requirement::ExposedPortsRelayed => match &host.relay_program {
+            Err(reason) => unavailable(reason.clone()),
+            Ok(sandy) => match writable_parent(policy, sandy) {
+                Some(writable) => unavailable(format!(
+                    "the relays run sandy's executable {}, which lies in the read-write path {}; \
+                     the program could replace it",
+                    sandy.display(),
+                    writable.display()
+                )),
+                None => enforced(format!(
+                    "`sandy __relay` in AppContainer {name:?} and the program's job, on a \
+                     listening socket that sandy creates outside the AppContainer; the relay \
+                     has no network capability and only read and execute access to {}",
+                    sandy.display()
+                )),
+            },
         },
         Requirement::MetadataConfined => enforced(format!(
             "AppContainer {name:?} holds no WRITE_DAC, WRITE_OWNER, FILE_WRITE_ATTRIBUTES or \
@@ -169,6 +197,17 @@ fn contained(
     }
 }
 
+/// The read-write path of `policy` that contains `path`. The relays get read and execute access
+/// to sandy's executable, so it must not be writable (writable-and-executable rule), and sandy
+/// itself must stay out of the program's reach.
+fn writable_parent<'a>(policy: &'a ResolvedPolicy, path: &Path) -> Option<&'a Path> {
+    policy
+        .paths
+        .iter()
+        .find(|rule| rule.access == PathAccess::ReadWrite && path.starts_with(&rule.path))
+        .map(|rule| rule.path.as_path())
+}
+
 /// The network capabilities the target gets. The policy allows IP networking completely or not
 /// at all. `internetClientServer` includes `internetClient`.
 pub fn network_capabilities(ip: NetworkAccess) -> &'static [NetworkCapability] {
@@ -194,8 +233,8 @@ mod tests {
     use std::path::PathBuf;
 
     use sandy_core::{
-        EnforcementPlan, PathAccess, PathMetadata, PathRule, Policy, SignalScope, Status,
-        WindowsPolicy,
+        EnforcementPlan, ExposedPort, PathAccess, PathMetadata, PathRule, Policy, SignalScope,
+        Status, WindowsPolicy,
     };
 
     use super::*;
@@ -211,7 +250,22 @@ mod tests {
             outer_job_ui: Ok(None),
             firewall: Ok(()),
             loopback_exempt: Ok(false),
+            relay_program: Ok(sandy_exe(Path::new(r"C:\Program Files\sandy"))),
         }
+    }
+
+    /// `dir.join` keeps the path splittable into components on every host the tests run on.
+    fn sandy_exe(dir: &Path) -> PathBuf {
+        dir.join("sandy.exe")
+    }
+
+    fn exposing(mut policy: ResolvedPolicy) -> ResolvedPolicy {
+        policy.ip = NetworkAccess::All;
+        policy.expose = vec![ExposedPort {
+            listen: "127.0.0.1:18080".parse().unwrap(),
+            port: 8080,
+        }];
+        policy
     }
 
     fn policy() -> ResolvedPolicy {
@@ -458,6 +512,64 @@ mod tests {
             ..host()
         };
         assert!(!enforceable_on(&unreadable));
+    }
+
+    #[test]
+    fn exposed_ports_are_relayed_by_sandy() {
+        let policy = exposing(policy());
+        assert!(plan(&policy, &host()).is_enforceable());
+        match status(&policy, &host(), Requirement::ExposedPortsRelayed) {
+            Status::Enforced { mechanism } => {
+                assert!(mechanism.contains("sandy __relay"), "{mechanism}");
+                assert!(mechanism.contains("sandy.exe"), "{mechanism}");
+            }
+            Status::Unavailable { reason } => panic!("unavailable: {reason}"),
+        }
+    }
+
+    #[test]
+    fn relays_need_an_executable_sandy() {
+        let host = HostCapabilities {
+            relay_program: Err("the current user may not change its permissions".into()),
+            ..host()
+        };
+        let reason = unavailable(status(
+            &exposing(policy()),
+            &host,
+            Requirement::ExposedPortsRelayed,
+        ));
+        assert!(reason.contains("permissions"), "{reason}");
+        // Policies without exposed ports do not need it.
+        assert!(plan(&policy(), &host).is_enforceable());
+    }
+
+    #[test]
+    fn relays_refuse_a_writable_sandy() {
+        let data = Path::new(r"C:\data");
+        let host = HostCapabilities {
+            relay_program: Ok(sandy_exe(&data.join("bin"))),
+            ..host()
+        };
+        let writable = exposing(with_rule(policy(), PathAccess::ReadWrite));
+        let reason = unavailable(status(&writable, &host, Requirement::ExposedPortsRelayed));
+        assert!(reason.contains("read-write"), "{reason}");
+        // Read access to the directory gives the program nothing it could replace sandy with.
+        let readable = exposing(with_rule(policy(), PathAccess::Read));
+        assert!(plan(&readable, &host).is_enforceable());
+    }
+
+    #[test]
+    fn relays_need_sandys_job() {
+        let nested = HostCapabilities {
+            outer_job_ui: Ok(Some(0x1)),
+            ..host()
+        };
+        let reason = unavailable(status(
+            &exposing(policy()),
+            &nested,
+            Requirement::ExposedPortsRelayed,
+        ));
+        assert!(reason.contains("UI restrictions"), "{reason}");
     }
 
     #[test]

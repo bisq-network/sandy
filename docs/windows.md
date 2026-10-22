@@ -24,6 +24,7 @@ nothing about isolation.
 | `IpNetworkDenied` | No network capabilities, no loopback exemption | AppContainer exempt from loopback isolation; firewall service not running |
 | `UnixSocketsDenied` | No write access to socket files outside read-write paths | no AppContainer |
 | `SignalsIsolated` | Own console; AppContainer access checks; job UI restrictions | no AppContainer |
+| `ExposedPortsRelayed` | Listening socket created outside the AppContainer; `sandy __relay` in the program's AppContainer and job | no AppContainer; outer job with UI restrictions; sandy cannot grant read and execute on `sandy.exe`; `sandy.exe` lies in a read-write path |
 
 Every requirement also needs `windows.appcontainer_name` (or `--appcontainer NAME`). Without it,
 or with an invalid name, the plan reports the requirements that need the AppContainer as
@@ -64,6 +65,26 @@ access anywhere.
 PACKAGES (`S-1-15-2-2`) [STIG], which LPAC processes keep. sandy does not use LPAC: it would not
 make `system = "none"` possible, and ordinary programs need extra capabilities under LPAC; for
 example `cmd.exe` needs `lpacCom` and `registryRead` [LaunchAppContainer].
+
+### The AppContainer profile folder
+
+Windows gives every AppContainer a private folder, `%LOCALAPPDATA%\Packages\<name>\AC`, and
+redirects the program's `LOCALAPPDATA`, `TEMP` and `TMP` there [Implementing an AppContainer].
+The folder is always present, the program can write it, and it survives runs: Windows creates it
+and sandy cannot remove it without breaking the program's `TEMP`.
+
+Windows creates the folder with an inheritable allow entry that grants the AppContainer SID full
+access, including `FILE_EXECUTE`. That would let the program write a file there and then execute
+it, which the writable-never-executable rule forbids for policy paths. On every run sandy removes
+`FILE_EXECUTE` from that allow entry (`SetNamedSecurityInfoW` re-propagates it to existing files
+too), so the program can use the folder for data but cannot run what it writes. A deny entry does
+not work here: the AppContainer access check ignores a deny ACE for the package SID, measured on
+Windows 11; reducing the allow entry is what the check honors. The change is idempotent.
+
+The folder holds no user data. It is the program's own scratch space, writable in every policy,
+also one with no writable path. `escape_windows` and `review_windows` confirm that the program
+can write and read it but cannot execute a file in it (`load-library` is denied while `read`
+succeeds).
 
 ## File grants
 
@@ -149,7 +170,7 @@ access away.
 
 Old grants grant nothing, so removing them is cleanup, not a security step.
 
-- File grants: `icacls PATH` lists the grants as `*S-1-15-3-1024-...`. `icacls PATH /remove:g
+- File grants, including the relay grant on `sandy.exe`: `icacls PATH` lists the grants as `*S-1-15-3-1024-...`. `icacls PATH /remove:g
   *SID` removes one. The SID cannot be mapped back to its name, and other software (for example
   Chromium) also uses capability SIDs, so remove only SIDs you know belong to sandy.
 - The AppContainer profile and its folder: `DeleteAppContainerProfile`, for example from
@@ -207,24 +228,59 @@ with `ip = "all"` and the exemption. Options, tested on Windows 11 build 26200:
 |---|---|---|
 | `CheckNetIsolation LoopbackExempt -is -n=NAME` (debugging mode) | Does not help: connections still time out while it runs | Needs a running elevated helper; meant for debugging |
 | AF_UNIX socket in a read-write path | Works: the program listens, outside clients connect (`unix_socket_server_in_a_writable_path_is_reachable_from_outside`) | Clients must speak AF_UNIX; no change to sandy |
-| Listening TCP socket created outside the AppContainer and inherited | Works, even with `ip = "none"`: the program accepted a connection from an outside client | sandy would need a policy option, for example `listen = ["127.0.0.1:8080"]`, to create the socket and pass it with the handle list |
-| Relay inside the AppContainer: a process holding the inherited listening socket forwards each connection over loopback to the server process in the same AppContainer | Works with `ip = "none"` and `ip = "all"`, with and without exemption (temporary experiment) | sandy would start the relay as a second process in the AppContainer; the server keeps listening on loopback |
+| Listening TCP socket created outside the AppContainer and inherited | Works, even with `ip = "none"`: the program accepted a connection from an outside client | The program would have to accept on an inherited socket instead of its own |
+| Relay inside the AppContainer: a process holding the inherited listening socket forwards each connection over loopback to the server process in the same AppContainer | Works with `ip = "none"` and `ip = "all"`, with and without exemption | Implemented as `network.expose`, see "Exposed ports" |
 | Firewall rule for the package SID | Not tested; the AppContainer filters sit in the Windows Service Hardening sublayer, which ordinary firewall rules do not override [Project Zero 2021] | Administrator rights |
 
 Processes in the same AppContainer reach each other over loopback in every configuration
-measured, also with `ip = "none"` and without exemption. So a generic "forward an outside port
-to a loopback port of the program" works on Windows: sandy creates the listening socket outside
-the AppContainer and passes it to a relay process in the AppContainer, which connects to the
-program's loopback port. Neither the inherited socket nor the relay is implemented.
+measured, also with `ip = "none"` and without exemption. `network.expose` builds on this fact.
 
 Because of the same fact, two sandboxes that use the same AppContainer name can talk over
 loopback, also when their policies differ (for example one with `ip = "all"`). Use one
 AppContainer name per policy.
 
+### Exposed ports
+
+For each entry of `network.expose`, sandy relays connections from `listen` to the program's
+port:
+
+1. sandy binds a TCP socket to `listen` outside the AppContainer and makes it inheritable.
+2. Before the program, sandy starts `sandy.exe __relay <handle> <target>` in the program's
+   AppContainer and job, created suspended and assigned to the job like the program. The handle
+   list holds only the socket, the NUL device (standard input and output) and the program's
+   standard error. The environment holds only `SystemRoot` and `LOCALAPPDATA`.
+3. The relay's token has no network capability and one file capability: read and execute on
+   `sandy.exe`, granted with the same ACE mechanism as policy paths.
+4. sandy closes its own handle of the socket, starts the program and waits only for the
+   program. When the program exits, sandy ends the job and with it the relays. If sandy dies,
+   kill-on-close ends them.
+
+The relay accepts on the socket because a socket keeps the security context of the process that
+created it. It reaches the program over loopback because both run in the same AppContainer. It
+connects only to the program's address, `target()`, and it connects from inside the
+AppContainer, so loopback isolation applies to it as to the program: without the exemption, a
+relay cannot reach a listener outside the sandbox, also when the policy exposes that listener's
+port number (`relays_reach_only_the_program`).
+
+The relay runs in the program's AppContainer, so the program can open and control the relay
+process: processes in one AppContainer can open each other. That gives the program no more than
+the exposed listener itself, which `network.expose` grants anyway, and read and execute access to
+`sandy.exe`, which is not secret. The relay's token has no network capability and no access to
+policy paths.
+
+The grant on `sandy.exe` needs the right to change its DACL. A user who cannot change the DACL
+of an installed `sandy.exe`, for example under `C:\Program Files`, can let an administrator run
+`sandy setup` with the same policy, including `--expose`, once; the grant is per AppContainer
+name. Without the grant, the plan reports `ExposedPortsRelayed` as unavailable. The plan also
+refuses when `sandy.exe` lies in a read-write path: the program could replace the file that the
+relays execute (writable-and-executable rule), and sandy must stay out of the program's reach in
+any case.
+
 ### The setup step
 
-`sandy setup` makes the loopback exemption of the policy's AppContainer match the policy. Run it
-once per machine as administrator:
+`sandy setup` makes the loopback exemption of the policy's AppContainer match the policy. With
+`--expose`, it also grants the relays read and execute on `sandy.exe` (see "Exposed ports"). Run
+it once per machine as administrator:
 
 ```text
 sandy setup --appcontainer example.app --ip all     # add the exemption
@@ -291,7 +347,8 @@ messages that reach processes outside the sandbox.
 ## Handles, environment and command line
 
 - **Handles.** `bInheritHandles` is TRUE, but `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` limits
-  inheritance to three handles [UpdateProcThreadAttribute]. sandy duplicates each standard
+  inheritance to three handles [UpdateProcThreadAttribute]. A relay of an exposed port inherits
+  its listening socket in addition. sandy duplicates each standard
   handle as an inheritable handle. A missing standard handle becomes the NUL device, and a
   console becomes a relayed pipe. A standard handle that is a socket gives the program network
   access through that socket, also with `ip = "none"`: AppContainer network isolation applies to
@@ -301,7 +358,9 @@ messages that reach processes outside the sandbox.
   "without regard to locale" [Environment]. It sets two variables, which replace policy values:
   - `SystemRoot`, from `GetSystemWindowsDirectoryW`. System DLLs need it; without it, for
     example, Winsock initialization fails.
-  - `LOCALAPPDATA`, from `SHGetKnownFolderPath`. Without it, `CreateProcessW` fails for an
+  - `LOCALAPPDATA`, from `SHGetKnownFolderPath`. sandy loads `shell32.dll` for it at run time:
+    `shell32.dll` loads `user32.dll`, which cannot initialize in some sessions (limitation 13),
+    and the relays run `sandy.exe` in the AppContainer. Without the variable, `CreateProcessW` fails for an
     AppContainer process with `ERROR_ENVVAR_NOT_FOUND` (203). Windows replaces it with
     `<LOCALAPPDATA>\Packages\<name>\AC` and sets `TEMP` and `TMP` to the `Temp` folder below,
     also when the policy sets them. Microsoft documents the redirection [Implementing an
@@ -342,8 +401,10 @@ messages that reach processes outside the sandbox.
 1. `system = "none"` is unavailable (see above).
 2. Loopback TCP connections from outside to the program are not possible, also with `ip = "all"`
    (see "Local servers in the sandbox").
-3. The program can write its AppContainer profile folder, and can connect to Unix sockets in it
-   and in its read-write paths.
+3. The program can write its AppContainer profile folder (which holds `TEMP`), and can connect
+   to Unix sockets in it and in its read-write paths. It cannot execute a file it writes there
+   (see "The AppContainer profile folder"). The folder is private scratch space, holds no user
+   data, and persists across runs.
 4. Windows sets `LOCALAPPDATA`, `TEMP` and `TMP` of the program; policy values for them have no
    effect.
 5. Children of a directory that have a protected DACL do not receive the grant.
@@ -368,13 +429,19 @@ messages that reach processes outside the sandbox.
 12. `std::fs::canonicalize` and `GetFinalPathNameByHandleW` with DOS names fail with
     `ERROR_ACCESS_DENIED` inside an AppContainer (Windows 11 and Server 2025); NT names work.
     Programs that canonicalize their paths need a fallback such as `std::path::absolute`.
+13. In a session whose window station does not admit AppContainers, such as an SSH session,
+    `user32.dll` cannot initialize in an AppContainer process, and a program that loads it ends
+    with `STATUS_DLL_INIT_FAILED` (`0xC0000142`) before its first instruction. Measured on
+    Windows 11 over SSH; the same programs start from an interactive scheduled task. Programs
+    without `user32.dll`, and the relays, are not affected.
 
 ## Verified on Windows 11
 
-Host: Windows 11 build 26200 (VM), binaries built for `x86_64-pc-windows-gnu`. The tests ran three
-times in an elevated session and three times from a scheduled task with `/RL LIMITED` (medium
-integrity, Administrators deny-only). Every run: `sandy_windows` 46 of 46, `escape` 10 of 10 (the
-Unix socket test is Unix-only), `escape_windows` 22 of 22.
+Host: Windows 11 build 26200 (VM), binaries built for `x86_64-pc-windows-gnu`. The tests run in
+an elevated SSH session and from a scheduled task with `/RL LIMITED` (medium integrity,
+Administrators deny-only). Latest runs, both ways: `sandy_windows` 60 of 60, `escape` 10 of 10
+(the Unix socket test is Unix-only), `escape_windows` 23 of 23, `expose` 3 of 3,
+`review_windows` 3 of 3.
 
 Facts these runs established:
 
@@ -390,6 +457,12 @@ Facts these runs established:
 - The program cannot open other processes of the user (`PROCESS_VM_READ`, `PROCESS_TERMINATE`),
   write to the registry autostart key, open a named pipe with the default DACL, or receive
   inherited handles other than the standard ones.
+- A process in the AppContainer can open a relay in the same AppContainer with
+  `PROCESS_VM_READ` and `PROCESS_TERMINATE`, but not `sandy.exe` outside it.
+- A relay without network capabilities reaches the program over loopback. Without the loopback
+  exemption it cannot reach a listener outside; with the exemption it can, like the program.
+- A user without the right to change the DACL of `sandy.exe` gets `ExposedPortsRelayed` as
+  unavailable; after `sandy setup` with the policy, run as administrator, the plan enforces it.
 
 ## Sources
 
