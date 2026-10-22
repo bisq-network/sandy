@@ -43,7 +43,7 @@ read_write = ["/var/lib/app"] # read, list, create, change, delete; never execut
 
 [network]
 ip = "none"                   # "none" | "all"; IPv4 and IPv6 including loopback
-unix_sockets = "none"         # "none" | "all"
+unix_sockets = "none"         # "none" | "all"; "none" reaches no socket outside read_write
 
 [process]
 signals = "any"               # "any" | "isolated"
@@ -114,6 +114,11 @@ Rules:
 | `UnixSocketsDenied` | `network.unix_sockets = "none"` |
 | `SignalsIsolated` | `process.signals = "isolated"` |
 | `MetadataConfined` | `linux.path_metadata = "deny"` (default) |
+
+A requirement is a lower bound. A backend may deny more, but never less. For example,
+`UnixSocketsDenied` guarantees that the program cannot connect to Unix sockets outside its
+`read_write` paths; Linux and macOS deny Unix sockets completely, while Windows allows sockets
+inside `read_write` paths, because Windows checks access to a socket through its file.
 
 The backend reports each requirement as enforced (naming the mechanism) or unavailable (naming the
 reason). `EnforcementPlan::new` treats a requirement without a report as unavailable, so a backend

@@ -19,7 +19,10 @@ pub enum Requirement {
     EnvironmentControlled,
     /// IPv4 and IPv6 networking is denied, including loopback.
     IpNetworkDenied,
-    /// Unix domain sockets that lead outside the sandbox cannot be created or connected.
+    /// The target cannot connect to Unix domain sockets outside its read_write paths, so it
+    /// cannot reach local services (session bus, service managers, resolvers). This is a lower
+    /// bound: Linux and macOS deny Unix sockets completely; Windows, where access to a socket
+    /// follows the file's access control list, allows sockets inside read_write paths.
     UnixSocketsDenied,
     /// Signals cannot reach processes outside the sandbox.
     SignalsIsolated,
@@ -39,7 +42,7 @@ impl Requirement {
             }
             Requirement::EnvironmentControlled => "environment limited to policy",
             Requirement::IpNetworkDenied => "IP networking denied",
-            Requirement::UnixSocketsDenied => "Unix sockets denied",
+            Requirement::UnixSocketsDenied => "Unix sockets outside writable paths denied",
             Requirement::SignalsIsolated => "signals limited to the sandbox",
             Requirement::MetadataConfined => "metadata of files outside policy paths protected",
         }
