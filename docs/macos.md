@@ -23,6 +23,7 @@ reports it and sandy refuses to run.
 5. `sandbox_init_with_parameters` compiles the profile and applies it to the sandy process.
    `sandbox_check(getpid(), NULL, 0)` must then report that the process is sandboxed.
 6. `posix_spawn` with `POSIX_SPAWN_SETEXEC` replaces sandy with the target, like `execve`.
+   `argv[0]` is the program name as the caller gave it (`TargetCommand::arg0`).
 
 If any step fails, `run` returns an error and sandy exits with status 125. The target never starts
 with a weaker sandbox.
@@ -60,9 +61,9 @@ compiler fail, and sandy fails closed.
 
 | Requirement | Mechanism |
 |---|---|
-| `FilesystemConfined` | Profile: `(deny default)`; `file-read*` for every policy path and the system set; `file-write*` only for `read_write` paths; `process-exec*` and `file-map-executable` only for `read_exec` paths, the program and system code. No hard links or clones. No Mach or XPC service, so no other process acts on files for the target. Policy paths cannot be deleted or replaced. |
+| `FilesystemConfined` | Profile: `(deny default)`; `file-read*` for every policy path and the system set; `file-write*` only for `read_write` paths; `process-exec*` and `file-map-executable` only for `read_exec` paths, the program and system code. No hard links; clones only into `read_write` paths and only from files the target may read. No Mach or XPC service, so no other process acts on files for the target. Policy paths cannot be deleted or replaced. |
 | `NoPrivilegeEscalation` | Only policy paths execute. Sandbox.kext refuses to execute setuid or setgid files from any sandboxed process, and the profile also denies `process-exec*` for files with mode bit `#o4000` or `#o2000`. No Mach service (authorization, privileged helpers, launchd). |
-| `ProcessMemoryIsolated` | Profile: `process-info*` (allowed by default) is denied and then allowed only for `(target self)`; task ports are denied (`mach-priv*`, `mach-task-name`, `mach-task-read`, `mach-task-inspect`). |
+| `ProcessMemoryIsolated` | Profile: `process-info*` (allowed by default) is denied and then allowed only for `(target self)`; task ports are denied (`mach-priv*`, `mach-task-name`, `mach-task-read`, `mach-task-inspect`); `ptrace` attach, which Seatbelt checks as `system-debug`, is denied. |
 | `InheritedHandlesClosed` | `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`; descriptors 0, 1 and 2 are named with `posix_spawn_file_actions_addinherit_np`. The kernel closes every other descriptor during the exec. |
 | `EnvironmentControlled` | `posix_spawn` receives exactly `command.env`. The backend adds no variable. |
 | `IpNetworkDenied` | Profile: no `network-*` rule for IP. The name resolver is unreachable unless `unix_sockets = "all"`. |
@@ -119,25 +120,33 @@ of earlier definitions"), so the protections come last. The unit test
    |---|---|
    | `read` | `file-read*`, `file-test-existence` |
    | `read_exec` and the program | the above, `file-map-executable`, `process-exec*` |
-   | `read_write` | `file-read*`, `file-test-existence`, `file-write*` |
+   | `read_write` | `file-read*`, `file-test-existence`, `file-write*`, `file-clone` |
 
    `file-test-existence` is a separate operation (used by `access(2)`), not part of `file-read*`.
+   `file-clone` is not part of `file-write*` either; without it `clonefile(2)` and therefore
+   Rust's `std::fs::copy` (which tries `fclonefileat` first and does not fall back on `EPERM`)
+   fail. XNU passes both the source and the destination to the single MAC check of a clone, and
+   Apple does not document which one the filter matches. The escape test
+   `clones_and_links_stay_inside_the_policy` measured it on macOS 15.7: copies and clones inside a
+   `read_write` path and from a `read` path into it work; a clone of a file outside the policy
+   into a `read_write` path, and a clone out of a `read_write` path to a place that is not
+   writable, are denied.
 
 8. Networking (see below).
 9. Ancestors of every granted path: `file-read-metadata` and `file-test-existence` on each
    directory above it, so `realpath`, `getcwd` and `mkdir -p` can reach the granted path. This
    reveals no directory contents, because listing a directory needs `file-read-data`.
 10. Protections:
-    - Anchors: `(deny file-write-unlink file-write-create (literal ...))` for every `read_write`
-      path and every path between a `read_write` path and a policy path inside it. Without it the
-      target could delete a policy path and put a symbolic link in its place. The next `sandy run`
-      resolves symbolic links, so it would grant access to the link's target, for example the
-      home directory. The OpenAI Codex CLI found and fixed the same problem (commit f6950546e5).
-    - `(deny file-link file-clone nvram* iokit-get-properties mach-priv* mach-task-name
-      mach-task-read mach-task-inspect)`. `file-link` and `file-clone` are not part of
-      `file-write*`, and Apple's `maild.sb` denies `file-link` explicitly after `(deny default)`.
-      Which path Sandbox.kext checks for a link or a clone is not documented; a link or clone of a
-      file from outside into a writable path would make it readable there, so both are denied.
+    - Anchors: `(deny file-write-unlink file-write-create (literal ...))` for the root of every
+      `read_write` path. Without it the target could delete the root and put a symbolic link in
+      its place. The next `sandy run` resolves symbolic links, so it would grant access to the
+      link's target, for example the home directory. The OpenAI Codex CLI found and fixed the same
+      problem (commit f6950546e5). Policy paths inside writable paths need no rule: sandy-core
+      rejects them for the same reason.
+    - `(deny file-link nvram* iokit-get-properties mach-priv* mach-task-name mach-task-read
+      mach-task-inspect system-debug)`. `file-link` is not part of `file-write*`, and Apple's `maild.sb` denies
+      it explicitly after `(deny default)`. A hard link to a file outside the policy would make it
+      reachable through a writable path, so links are denied everywhere.
     - `(deny file-ioctl (ioctl-command TIOCSTI))`: also covered by step 2, written out so that no
       later change can allow it by accident.
     - Setuid and setgid files (see [Privilege escalation](#privilege-escalation)).
@@ -168,6 +177,7 @@ sandbox matches the path after resolving symbolic links. None contains user data
 
 | Path | Access | Reason |
 |---|---|---|
+| `/` (the directory itself) | read | dyld opens the root directory while libignition locates the cryptex with the shared cache (macOS 13 and later); without it dyld aborts in `ignition_halt` before libSystem loads. This lists the names in `/`, nothing below. |
 | `/usr/lib` | read, map executable | dyld itself (`/usr/lib/dyld`) and system libraries outside the shared cache |
 | `/System/Library/dyld` | read, map executable | dyld shared cache on macOS 11 and 12 |
 | `/System/Volumes/Preboot/Cryptexes/OS` | read, map executable | dyld shared cache since macOS 13; listed in Apple's `dyld-support.sb` |
@@ -292,8 +302,9 @@ allowing it, and expects a refusal.
 - `file-ioctl` allows only four requests. Programs that change terminal modes (raw mode, echo) or
   use other device ioctls fail. The reason: `TIOCSTI` on the controlling terminal would let the
   target type commands into the shell that started sandy.
-- `link(2)` and `clonefile(2)` fail. `std::fs::copy` in Rust uses `fclonefileat` on macOS and
-  reports this error; `cp` without `-c` copies normally.
+- `link(2)` fails everywhere (see the hard link rule above).
+- With `system = "none"` no program starts on macOS: every program is linked dynamically, and dyld
+  itself needs the root directory and the shared cache from the system set.
 - A program that needs a framework resource, ICU data, a Mach service or user lookups does not work
   with `system = "minimal"` alone. Add the paths with `--read`; there is no way to allow Mach
   services.
@@ -303,13 +314,10 @@ allowing it, and expects a refusal.
 - `getcwd` fails when the working directory is outside the policy.
 - sandy cannot run inside another Seatbelt sandbox; `sandy check` reports this.
 - With `signals = "any"`, the target can signal every process of the user, as on other platforms.
-- Open questions that need a Mac to answer:
+- Open questions that the escape tests do not answer:
   - Apple does not document whether `(target same-sandbox)` means the same sandbox instance or any
     process with the same profile. In the second case, two sandy runs with the same policy could
     signal each other.
-  - Which SBPL operation, if any, checks `ptrace(PT_ATTACH)` is not known. On macOS, `ptrace`
-    cannot read or write memory (that needs a task port, which the profile denies), but an attached
-    process can be stopped and killed.
   - Whether `(deny default)` covers every other operation that the profile never mentions. Chromium
     and WebKit name a few exceptions, and the profile denies all of those explicitly.
 
@@ -333,6 +341,23 @@ To see what the sandbox denies on a Mac:
 ```sh
 log stream --style compact --predicate 'sender == "Sandbox"'
 ```
+
+Every sandboxed start logs a few denials that are expected and harmless: dyld reads the sysctls
+`kern.bootargs` and `security.mac.lockdown_mode_state` and opens `/dev/dtracehelper`, and libSystem
+tries to connect to `/private/var/run/syslog`. The program starts without them.
+
+### What CI measured
+
+On the macOS 15.7 runner (arm64), these results came from the escape tests and from a diagnostic
+step that ran sandy and the probe directly:
+
+- Before the root directory was readable, dyld aborted in `ignition_halt` (CI of commit
+  597cb90); with it, `/usr/bin/true` and the probe start (run 39759350954).
+- `ptrace(PT_ATTACHEXC)` from the probe to a process signed with `get-task-allow` works outside
+  the sandbox and fails with `EPERM` inside it; the Sandbox log names the operation:
+  `deny(1) system-debug pgrp [victim(4208)]` (run 39760116281). Without `get-task-allow`, macOS
+  refuses the attach even outside the sandbox.
+- Clones and copies behave as described above (run 39759350954).
 
 ## Sources
 

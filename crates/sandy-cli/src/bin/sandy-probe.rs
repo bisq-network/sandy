@@ -109,7 +109,17 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
         "copy-self" => {
             fs::copy(std::env::current_exe()?, target).map(|bytes| format!("{bytes} bytes"))
         }
+        "copy" => {
+            let (from, to) = pair(target)?;
+            fs::copy(from, to).map(|bytes| format!("{bytes} bytes"))
+        }
+        "hardlink" => {
+            let (from, to) = pair(target)?;
+            fs::hard_link(from, to).map(|()| String::new())
+        }
+        "signal-disposition" => initial_signals::disposition(target),
         action if linux::ACTIONS.contains(&action) => linux::perform(action, target),
+        action if macos::ACTIONS.contains(&action) => macos::perform(action, target),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "unknown action",
@@ -145,6 +155,13 @@ fn spawn(target: &str) -> io::Result<String> {
         let first_line = stderr.lines().next().unwrap_or_default();
         Err(io::Error::other(format!("{}: {first_line}", output.status)))
     }
+}
+
+/// Splits a target of the form `FROM<U+001F>TO`.
+fn pair(target: &str) -> io::Result<(&str, &str)> {
+    target
+        .split_once(ARGUMENT_SEPARATOR)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "expected FROM U+001F TO"))
 }
 
 /// Reads an inherited file descriptor to its end.
@@ -878,5 +895,138 @@ mod windows_actions {
 
     pub fn ctrl_break_console() -> io::Result<String> {
         unsupported()
+    }
+}
+
+/// Actions for the macOS escape tests (`tests/escape_macos.rs`).
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::ffi::{CString, c_char};
+    use std::io;
+    use std::ptr;
+
+    pub const ACTIONS: &[&str] = &["clone", "ptrace-attach"];
+
+    pub fn perform(action: &str, target: &str) -> io::Result<String> {
+        match action {
+            "clone" => clone(target),
+            "ptrace-attach" => ptrace_attach(target),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unknown action",
+            )),
+        }
+    }
+
+    /// clonefile(2) with a source path, which the kernel does not open for reading first.
+    fn clone(target: &str) -> io::Result<String> {
+        let (from, to) = super::pair(target)?;
+        let c = |path: &str| {
+            CString::new(path).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL"))
+        };
+        let (from, to) = (c(from)?, c(to)?);
+        // SAFETY: both arguments are NUL-terminated strings that outlive the call.
+        if unsafe { libc::clonefile(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+            Ok(String::new())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// Attaches with PT_ATTACHEXC, as debuggers do, and detaches at once.
+    fn ptrace_attach(target: &str) -> io::Result<String> {
+        let pid: libc::pid_t = target
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"))?;
+        // SAFETY: PT_ATTACHEXC reads no memory through its pointer argument.
+        if unsafe { libc::ptrace(libc::PT_ATTACHEXC, pid, ptr::null_mut(), 0) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: PT_DETACH with address 1 resumes the process where it stopped; no memory is
+        // accessed.
+        unsafe {
+            libc::ptrace(
+                libc::PT_DETACH,
+                pid,
+                ptr::without_provenance_mut::<c_char>(1),
+                0,
+            )
+        };
+        Ok("attached".to_string())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod macos {
+    use std::io;
+
+    pub const ACTIONS: &[&str] = &[];
+
+    pub fn perform(_action: &str, _target: &str) -> io::Result<String> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported"))
+    }
+}
+
+/// Signal dispositions as the program inherited them. The Rust runtime ignores SIGPIPE before
+/// main runs, so a load-time initializer records them first.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod initial_signals {
+    use std::io;
+    use std::mem::MaybeUninit;
+    use std::ptr;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    const SIGNALS: usize = 32;
+    const DEFAULT: u8 = 1;
+    const IGNORE: u8 = 2;
+    const HANDLER: u8 = 3;
+
+    static DISPOSITIONS: [AtomicU8; SIGNALS] = [const { AtomicU8::new(0) }; SIGNALS];
+
+    #[used]
+    #[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+    #[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
+    static RECORD: extern "C" fn() = record;
+
+    extern "C" fn record() {
+        for (signal, slot) in DISPOSITIONS.iter().enumerate().skip(1) {
+            let mut action = MaybeUninit::<libc::sigaction>::zeroed();
+            // SAFETY: a null new action only reads the current one into a valid buffer.
+            if unsafe { libc::sigaction(signal as libc::c_int, ptr::null(), action.as_mut_ptr()) }
+                == 0
+            {
+                // SAFETY: sigaction succeeded and filled the buffer.
+                let handler = unsafe { action.assume_init() }.sa_sigaction;
+                let value = match handler {
+                    libc::SIG_DFL => DEFAULT,
+                    libc::SIG_IGN => IGNORE,
+                    _ => HANDLER,
+                };
+                slot.store(value, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn disposition(target: &str) -> io::Result<String> {
+        let signal: usize = target
+            .parse()
+            .ok()
+            .filter(|signal| (1..SIGNALS).contains(signal))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid signal"))?;
+        match DISPOSITIONS[signal].load(Ordering::Relaxed) {
+            DEFAULT => Ok("default".to_string()),
+            IGNORE => Ok("ignore".to_string()),
+            HANDLER => Ok("handler".to_string()),
+            _ => Err(io::Error::other("not recorded")),
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod initial_signals {
+    use std::io;
+
+    pub fn disposition(_target: &str) -> io::Result<String> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported"))
     }
 }

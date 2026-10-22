@@ -14,8 +14,9 @@ mod common;
 use std::fs;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::*;
@@ -189,13 +190,9 @@ fn osascript_cannot_start_applications() {
     let fixture = home_fixture("osascript");
     let marker = fixture.path("osascript-marker");
     let app = marker_app(&fixture, "SandyOsascriptMarker", &marker);
-    let script = format!("Application({:?}).activate()", app.to_str().unwrap());
+    let script = format!("tell application {:?} to launch", app.to_str().unwrap());
     let args = with(home_args(&fixture), &["--read-exec", "/usr/bin/osascript"]);
-    assert_route_closed(
-        &args,
-        &["/usr/bin/osascript", "-l", "JavaScript", "-e", &script],
-        &marker,
-    );
+    assert_route_closed(&args, &["/usr/bin/osascript", "-e", &script], &marker);
 }
 
 #[test]
@@ -329,4 +326,153 @@ fn children_inherit_the_sandbox() {
     let lines = probe_inside(&home_args(&fixture), &[("spawn", &target)]);
     lines[0].assert_ok();
     assert!(!fixture.path("secret/new").exists());
+}
+
+/// Copies and clones work inside writable paths and from readable ones, but never bring a file
+/// from outside the policy into a writable path or create one outside it. Hard links are denied
+/// everywhere. All results are collected first, so one run shows the whole picture.
+#[test]
+fn clones_and_links_stay_inside_the_policy() {
+    let fixture = home_fixture("clone");
+    let pair = |from: &str, to: &str| {
+        format!(
+            "{}{ARGUMENT_SEPARATOR}{}",
+            fixture.arg(from),
+            fixture.arg(to)
+        )
+    };
+    let cases = [
+        ("copy", pair("rw/file", "rw/copied"), true),
+        ("copy", pair("ro/file", "rw/copied-from-ro"), true),
+        ("clone", pair("rw/file", "rw/cloned"), true),
+        ("clone", pair("secret/file", "rw/stolen"), false),
+        ("clone", pair("rw/file", "secret/planted"), false),
+        ("clone", pair("ro/file", "ro/planted"), false),
+        ("hardlink", pair("secret/file", "rw/linked-secret"), false),
+        ("hardlink", pair("rw/file", "rw/linked"), false),
+    ];
+    let actions: Vec<(&str, &str)> = cases
+        .iter()
+        .map(|(action, target, _)| (*action, target.as_str()))
+        .collect();
+    for line in probe_outside(&actions) {
+        line.assert_ok();
+    }
+    fixture.reset();
+    add_home(&fixture);
+
+    let lines = probe_inside(&home_args(&fixture), &actions);
+    let wrong: Vec<String> = cases
+        .iter()
+        .zip(&lines)
+        .filter(|((_, _, allowed), line)| (line.result == "ok") != *allowed)
+        .map(|((action, target, allowed), line)| {
+            let target = target.replace(ARGUMENT_SEPARATOR, " -> ");
+            format!(
+                "{action} {target}: expected allowed={allowed}, got {} {}",
+                line.result, line.detail
+            )
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    for leaked in [
+        "rw/stolen",
+        "secret/planted",
+        "ro/planted",
+        "rw/linked-secret",
+    ] {
+        assert!(!fixture.path(leaked).exists(), "{leaked} exists");
+    }
+}
+
+/// A process outside the sandbox, attached the way debuggers attach. macOS lets a process of the
+/// same user attach only to a program signed with the get-task-allow entitlement, so the victim
+/// is a copy of the probe signed that way. If the host refuses the attach outside the sandbox
+/// anyway, there is nothing to check.
+#[test]
+fn ptrace_cannot_attach_outside_the_sandbox() {
+    let fixture = home_fixture("ptrace");
+    let victim_path = fixture.copy_probe("secret");
+    let entitlements = fixture.path("secret/entitlements.plist");
+    fs::write(
+        &entitlements,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>com.apple.security.get-task-allow</key><true/></dict></plist>
+"#,
+    )
+    .unwrap();
+    let signed = Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-", "--entitlements"])
+        .arg(&entitlements)
+        .arg(&victim_path)
+        .output()
+        .unwrap();
+    assert!(signed.status.success(), "codesign failed: {signed:?}");
+    let victim = || {
+        Command::new(&victim_path)
+            .args(["sleep", "60000"])
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+
+    let mut outside_victim = victim();
+    let outside = probe_outside(&[("ptrace-attach", &outside_victim.id().to_string())]);
+    let _ = outside_victim.kill();
+    let _ = outside_victim.wait();
+    if outside[0].result != "ok" {
+        eprintln!(
+            "control: this host refuses ptrace attach outside the sandbox ({}); nothing to check",
+            outside[0].detail
+        );
+        return;
+    }
+
+    let mut inside_victim = victim();
+    let lines = probe_inside(
+        &home_args(&fixture),
+        &[("ptrace-attach", &inside_victim.id().to_string())],
+    );
+    let _ = inside_victim.kill();
+    let _ = inside_victim.wait();
+    lines[0].assert_blocked();
+}
+
+/// sandy's Rust runtime ignores SIGPIPE; the target must start with the default action again.
+/// Every other disposition the caller set (here SIGHUP ignored, as nohup does) must survive.
+/// The probe records its dispositions before its own Rust runtime changes SIGPIPE.
+#[test]
+fn signal_dispositions_pass_through_except_sigpipe() {
+    let fixture = home_fixture("dispositions");
+    let actions = [("signal-disposition", "1"), ("signal-disposition", "13")];
+    let ignoring_sighup = |program: String, args: Vec<String>| {
+        let mut command = Command::new(program);
+        command.args(args);
+        // SAFETY: signal(2) is async-signal-safe, so it may run between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        command.output().unwrap()
+    };
+
+    let outside = parse(&ignoring_sighup(probe_path(), probe_args(&actions)));
+    assert_eq!(outside[0].detail, "ignore", "control: {outside:?}");
+
+    let output = ignoring_sighup(sandy_path(), run_args(&home_args(&fixture), &actions));
+    assert!(output.status.success(), "{output:?}");
+    let lines = parse(&output);
+    assert_eq!(
+        (lines[0].result.as_str(), lines[0].detail.as_str()),
+        ("ok", "ignore"),
+        "SIGHUP ignored by the caller must stay ignored"
+    );
+    assert_eq!(
+        (lines[1].result.as_str(), lines[1].detail.as_str()),
+        ("ok", "default"),
+        "SIGPIPE must start with the default action"
+    );
 }

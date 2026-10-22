@@ -31,7 +31,7 @@ pub struct Target {
 impl Target {
     pub fn new(command: &TargetCommand) -> Result<Target, SandboxError> {
         let program = c_string(command.program.as_os_str().as_bytes(), "the program path")?;
-        let mut argv = vec![program.clone()];
+        let mut argv = vec![c_string(command.arg0.as_bytes(), "argv[0]")?];
         for arg in &command.args {
             argv.push(c_string(arg.as_bytes(), "an argument")?);
         }

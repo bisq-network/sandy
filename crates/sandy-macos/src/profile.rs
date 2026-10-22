@@ -122,7 +122,13 @@ const READ_EXEC: &[&str] = &[
     "file-map-executable",
     "process-exec*",
 ];
-const READ_WRITE: &[&str] = &["file-read*", "file-test-existence", "file-write*"];
+/// `file-clone` lets `clonefile` and `std::fs::copy` work inside writable paths.
+const READ_WRITE: &[&str] = &[
+    "file-read*",
+    "file-test-existence",
+    "file-write*",
+    "file-clone",
+];
 const CODE: &[&str] = &["file-read*", "file-test-existence", "file-map-executable"];
 const READ_WRITE_DEVICE: &[&str] = &["file-read*", "file-test-existence", "file-write-data"];
 const METADATA: &[&str] = &["file-read-metadata", "file-test-existence"];
@@ -258,13 +264,15 @@ fn ancestor_rules(writer: &mut Writer) {
 
 fn protection_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
     writer.comment(
-        "A policy path, and every directory between it and an enclosing writable path, cannot be\n\
-         deleted or replaced. Otherwise the target could swap in a symbolic link, and the next\n\
-         run would resolve the policy path to a different object.",
+        "The root of a writable path cannot be deleted or replaced. Otherwise the target could\n\
+         put a symbolic link in its place, and the next run would resolve the path to the\n\
+         link's target. (Policy paths inside writable paths are rejected before this.)",
     );
-    let filters: Vec<String> = anchors(policy)
+    let filters: Vec<String> = policy
+        .paths
         .iter()
-        .map(|path| literal(writer.param("ANCHOR", path)))
+        .filter(|rule| rule.access == PathAccess::ReadWrite)
+        .map(|rule| literal(writer.param("ANCHOR", &rule.path)))
         .collect();
     writer.rule(
         "deny",
@@ -274,12 +282,12 @@ fn protection_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
 
     writer.comment(
         "Operations that (deny default) may not cover and that nothing allows again: hard links\n\
-         and clones (they could bring a file from outside into a writable path), NVRAM and IOKit\n\
-         properties, and task ports of other processes.",
+         (a link would make a file from outside reachable through a writable path), NVRAM and\n\
+         IOKit properties, task ports of other processes, and ptrace attach (system-debug).",
     );
     writer.line(
-        "(deny file-link file-clone nvram* iokit-get-properties mach-priv* mach-task-name \
-         mach-task-read mach-task-inspect)",
+        "(deny file-link nvram* iokit-get-properties mach-priv* mach-task-name mach-task-read \
+         mach-task-inspect system-debug)",
     );
 
     writer.comment("TIOCSTI would type commands into the terminal of the caller.");
@@ -299,32 +307,6 @@ fn protection_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
 
     writer.comment("No Mach or XPC services, also not the services of application bundles.");
     writer.line("(deny mach-lookup (xpc-service-name-prefix \"\"))");
-}
-
-/// The paths a sandboxed process could otherwise delete or replace and thereby redirect the
-/// next run: every writable policy path, and every path between an enclosing writable policy
-/// path and a policy path inside it.
-fn anchors(policy: &ResolvedPolicy) -> BTreeSet<PathBuf> {
-    let writable: Vec<&Path> = policy
-        .paths
-        .iter()
-        .filter(|rule| rule.access == PathAccess::ReadWrite)
-        .map(|rule| rule.path.as_path())
-        .collect();
-    let mut anchors = BTreeSet::new();
-    for rule in &policy.paths {
-        for root in &writable {
-            if rule.path.starts_with(root) {
-                anchors.extend(
-                    rule.path
-                        .ancestors()
-                        .take_while(|path| path.starts_with(root))
-                        .map(Path::to_path_buf),
-                );
-            }
-        }
-    }
-    anchors
 }
 
 #[cfg(test)]
@@ -359,7 +341,7 @@ mod tests {
         let mut policy = policy(vec![
             rule(&format!("{root}/bin/program"), PathAccess::ReadExec, false),
             rule(&format!("{root}/data"), PathAccess::ReadWrite, true),
-            rule(&format!("{root}/data/config"), PathAccess::Read, false),
+            rule(&format!("{root}/etc/config"), PathAccess::Read, false),
             rule(&format!("{root}/share"), PathAccess::Read, true),
         ]);
         policy.program = Some(PathBuf::from(format!("{root}/bin/program")));
@@ -419,7 +401,7 @@ mod tests {
   (subpath (param "READ_1")))
 (allow file-read* file-test-existence file-map-executable process-exec*
   (literal (param "READ_EXEC_0")))
-(allow file-read* file-test-existence file-write*
+(allow file-read* file-test-existence file-write* file-clone
   (subpath (param "READ_WRITE_0")))
 
 ; Networking. A Unix socket can be created, but not bound or connected.
@@ -432,17 +414,16 @@ mod tests {
   (literal (param "ANCESTOR_2"))
   (literal (param "ANCESTOR_3")))
 
-; A policy path, and every directory between it and an enclosing writable path, cannot be
-; deleted or replaced. Otherwise the target could swap in a symbolic link, and the next
-; run would resolve the policy path to a different object.
+; The root of a writable path cannot be deleted or replaced. Otherwise the target could
+; put a symbolic link in its place, and the next run would resolve the path to the
+; link's target. (Policy paths inside writable paths are rejected before this.)
 (deny file-write-unlink file-write-create
-  (literal (param "ANCHOR_0"))
-  (literal (param "ANCHOR_1")))
+  (literal (param "ANCHOR_0")))
 
 ; Operations that (deny default) may not cover and that nothing allows again: hard links
-; and clones (they could bring a file from outside into a writable path), NVRAM and IOKit
-; properties, and task ports of other processes.
-(deny file-link file-clone nvram* iokit-get-properties mach-priv* mach-task-name mach-task-read mach-task-inspect)
+; (a link would make a file from outside reachable through a writable path), NVRAM and
+; IOKit properties, task ports of other processes, and ptrace attach (system-debug).
+(deny file-link nvram* iokit-get-properties mach-priv* mach-task-name mach-task-read mach-task-inspect system-debug)
 
 ; TIOCSTI would type commands into the terminal of the caller.
 (deny file-ioctl (ioctl-command 2147578994))
@@ -467,16 +448,15 @@ mod tests {
         assert_eq!(
             parameters,
             vec![
-                ("READ_0", "/srv/data/config"),
+                ("READ_0", "/srv/etc/config"),
                 ("READ_1", "/srv/share"),
                 ("READ_EXEC_0", "/srv/bin/program"),
                 ("READ_WRITE_0", "/srv/data"),
                 ("ANCESTOR_0", "/"),
                 ("ANCESTOR_1", "/srv"),
                 ("ANCESTOR_2", "/srv/bin"),
-                ("ANCESTOR_3", "/srv/data"),
+                ("ANCESTOR_3", "/srv/etc"),
                 ("ANCHOR_0", "/srv/data"),
-                ("ANCHOR_1", "/srv/data/config"),
             ]
         );
     }
@@ -515,24 +495,28 @@ mod tests {
     #[test]
     fn path_characters_cannot_change_the_profile() {
         let benign = generate(&typical("/srv"));
-        // One path component each, so the policy keeps the shape of the benign one.
+        // One path component each, so the policy keeps the shape of the benign one. A backslash
+        // is a separator on Windows, so that case runs only where macOS paths behave the same.
+        let backslash = cfg!(unix).then_some("a\\\"b");
         for component in [
             "a\"b",
             "a)(allow default)(b",
             "a\n(allow default)\n;",
             "a;b",
             "a#\"b\"",
-            "a\\\"b",
             "a b(param \"READ_0\")",
             "\u{e9}\u{301}\u{202e}",
-        ] {
+        ]
+        .into_iter()
+        .chain(backslash)
+        {
             let hostile = format!("/{component}");
             let profile = generate(&typical(&hostile));
             assert_eq!(profile.text, benign.text, "path {hostile:?}");
             let read = profile.parameters.iter().find(|(name, _)| name == "READ_0");
             assert_eq!(
                 read.map(|(_, path)| path.clone()),
-                Some(PathBuf::from(format!("{hostile}/data/config")))
+                Some(PathBuf::from(format!("{hostile}/etc/config")))
             );
         }
     }
@@ -592,20 +576,23 @@ mod tests {
     }
 
     #[test]
-    fn writable_paths_and_paths_inside_them_are_anchored() {
-        let policy = policy(vec![
-            rule("/w", PathAccess::ReadWrite, true),
-            rule("/w/a/b/c", PathAccess::Read, true),
-            rule("/w/d", PathAccess::ReadWrite, true),
+    fn writable_roots_cannot_be_deleted_or_replaced() {
+        let profile = generate(&policy(vec![
             rule("/r", PathAccess::Read, true),
-            rule("/r/e", PathAccess::Read, true),
-        ]);
-        let anchors: Vec<PathBuf> = anchors(&policy).into_iter().collect();
-        let expected: Vec<PathBuf> = ["/w", "/w/a", "/w/a/b", "/w/a/b/c", "/w/d"]
+            rule("/r/w", PathAccess::ReadWrite, true),
+            rule("/w", PathAccess::ReadWrite, false),
+        ]));
+        let anchors: Vec<&str> = profile
+            .parameters
             .iter()
-            .map(PathBuf::from)
+            .filter(|(name, _)| name.starts_with("ANCHOR_"))
+            .map(|(_, path)| path.to_str().unwrap())
             .collect();
-        assert_eq!(anchors, expected);
+        assert_eq!(anchors, vec!["/r/w", "/w"]);
+        assert!(profile.text.contains(
+            "(deny file-write-unlink file-write-create\n  (literal (param \"ANCHOR_0\"))\n  \
+             (literal (param \"ANCHOR_1\")))"
+        ));
     }
 
     #[test]
@@ -684,7 +671,11 @@ mod tests {
         assert!(!text.contains("(allow iokit"));
         assert!(!text.contains("(allow ipc"));
         assert!(!text.contains("(allow file-link"));
-        assert!(!text.contains("(allow file-clone"));
+        let clone: Vec<&str> = text.lines().filter(|l| l.contains("file-clone")).collect();
+        assert_eq!(
+            clone,
+            vec!["(allow file-read* file-test-existence file-write* file-clone"]
+        );
     }
 
     #[test]

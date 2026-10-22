@@ -171,8 +171,12 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   `POSIX_SPAWN_CLOEXEC_DEFAULT` makes the kernel close every descriptor except 0, 1 and 2.
 - No Mach or XPC service. This closes LaunchServices, Apple events, launchd jobs and the
   pasteboard, through which another process could act for the target.
-- Setuid and setgid files never execute. Policy paths cannot be deleted or replaced, so the target
-  cannot redirect the next run with a symbolic link.
+- Setuid and setgid files never execute. The root of a writable path cannot be deleted or
+  replaced, so the target cannot redirect the next run with a symbolic link.
+- Hard links are denied; clones (`std::fs::copy`) work only into writable paths and only from
+  files the target may read. ptrace attach is denied (Seatbelt checks it as `system-debug`).
+- dyld needs the root directory itself (only the names in `/`) to find the shared cache, so the
+  minimal system set contains it; with `system = "none"` no program can start on macOS.
 - Name resolution is part of `ip = "all"`: the profile allows exactly the Unix socket of
   mDNSResponder, so DNS does not need `unix_sockets = "all"`.
 - Metadata (mode, owner, flags, times, extended attributes, ACLs) can change only on `read_write`

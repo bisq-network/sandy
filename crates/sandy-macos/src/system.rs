@@ -29,6 +29,12 @@ pub struct SystemPath {
 /// What dyld and libSystem need to start a program. No entry contains user data.
 pub const MINIMAL: &[SystemPath] = &[
     SystemPath {
+        path: "/",
+        access: SystemAccess::ReadFile,
+        reason: "dyld opens the root directory while it locates the shared cache (libignition, \
+                 macOS 13 and later); this lists the names in /, nothing below",
+    },
+    SystemPath {
         path: "/usr/lib",
         access: SystemAccess::CodeTree,
         reason: "dyld itself (/usr/lib/dyld) and system libraries outside the shared cache",
@@ -179,14 +185,17 @@ pub const ALLOWED_IOCTLS: &[u64] = &[FIONBIO, FIOASYNC, TIOCGETA, TIOCGWINSZ];
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
     fn system_paths_are_absolute_real_paths() {
         for entry in MINIMAL {
-            let path = Path::new(entry.path);
-            assert!(path.is_absolute(), "{}", entry.path);
-            assert!(!entry.path.ends_with('/'), "{}", entry.path);
+            // Checked as text: on Windows, Path::is_absolute needs a drive letter.
+            assert!(entry.path.starts_with('/'), "{}", entry.path);
+            assert!(
+                entry.path == "/" || !entry.path.ends_with('/'),
+                "{}",
+                entry.path
+            );
             let symlink = entry.access == SystemAccess::Symlink;
             let below_link = ["/etc/", "/tmp/", "/var/"]
                 .iter()
