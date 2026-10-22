@@ -91,6 +91,24 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
             let addresses = (target, 0).to_socket_addrs()?.count();
             Ok(format!("{addresses} addresses"))
         }
+        "tcp-accept" => tcp_accept(target),
+        "pipe-connect" => fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(target)
+            .map(|_| String::new()),
+        "open-process-read" => windows_actions::open_process(target, false),
+        "open-process-terminate" => windows_actions::open_process(target, true),
+        "handle-path" => windows_actions::handle_path(target),
+        "write-dac" => windows_actions::write_dac(target),
+        "reg-set-hkcu" => windows_actions::registry_set(target),
+        "reg-get-hkcu" => windows_actions::registry_get(target),
+        "reg-delete-hkcu" => windows_actions::registry_delete(target),
+        "afunix-connect" => windows_actions::afunix_connect(target),
+        "ctrl-break-console" => windows_actions::ctrl_break_console(),
+        "copy-self" => {
+            fs::copy(std::env::current_exe()?, target).map(|bytes| format!("{bytes} bytes"))
+        }
         action if linux::ACTIONS.contains(&action) => linux::perform(action, target),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -480,5 +498,284 @@ mod linux {
 
     pub fn perform(_action: &str, _target: &str) -> io::Result<String> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported"))
+    }
+}
+
+/// Accepts one TCP connection on `target` within `ACCEPT_TIMEOUT`. The escape tests connect from
+/// outside the sandbox while this action waits.
+fn tcp_accept(target: &str) -> io::Result<String> {
+    const ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
+    let listener = TcpListener::bind(socket_address(target)?)?;
+    listener.set_nonblocking(true)?;
+    let deadline = std::time::Instant::now() + ACCEPT_TIMEOUT;
+    loop {
+        match listener.accept() {
+            Ok((_, peer)) => return Ok(format!("accepted {peer}")),
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "no connection"));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Windows-specific actions. They report `Unsupported` elsewhere.
+#[cfg(windows)]
+mod windows_actions {
+    use std::fs;
+    use std::io;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::ptr;
+    use std::time::Duration;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, TRUE};
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_UNIX, INVALID_SOCKET, SOCK_STREAM, SOCKADDR, SOCKADDR_UN, WSADATA, WSAGetLastError,
+        WSAStartup, closesocket, connect, socket,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, GetFinalPathNameByHandleW, WRITE_DAC,
+    };
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
+    };
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, RRF_RT_REG_SZ, RegCloseKey,
+        RegDeleteKeyValueW, RegGetValueW, RegOpenKeyExW, RegSetValueExW,
+    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, PROCESS_VM_READ};
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn invalid(message: &str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidInput, message.to_string())
+    }
+
+    /// Opens the process with `PROCESS_VM_READ` or `PROCESS_TERMINATE`. It never reads memory
+    /// and never terminates anything.
+    pub fn open_process(target: &str, terminate: bool) -> io::Result<String> {
+        let pid: u32 = target.parse().map_err(|_| invalid("invalid pid"))?;
+        let access = if terminate {
+            PROCESS_TERMINATE
+        } else {
+            PROCESS_VM_READ
+        };
+        // SAFETY: OpenProcess has no memory safety preconditions.
+        let handle = unsafe { OpenProcess(access, FALSE, pid) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: handle is a new handle owned by this function.
+        unsafe { CloseHandle(handle) };
+        Ok(String::new())
+    }
+
+    /// Prints the file a handle value refers to in this process. A handle that was not
+    /// inherited is invalid here, or refers to another object.
+    pub fn handle_path(target: &str) -> io::Result<String> {
+        let value: usize = target.parse().map_err(|_| invalid("invalid handle"))?;
+        let mut buffer = [0u16; 1024];
+        // SAFETY: the kernel validates the handle value; the buffer length is passed.
+        let len = unsafe {
+            GetFinalPathNameByHandleW(value as HANDLE, buffer.as_mut_ptr(), buffer.len() as u32, 0)
+        } as usize;
+        if len == 0 || len >= buffer.len() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(String::from_utf16_lossy(&buffer[..len]))
+    }
+
+    /// Opens a file or directory for changing its DACL.
+    pub fn write_dac(target: &str) -> io::Result<String> {
+        fs::OpenOptions::new()
+            .access_mode(WRITE_DAC)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(target)
+            .map(|_| String::new())
+    }
+
+    /// `KEY\VALUE` below HKEY_CURRENT_USER.
+    fn registry_target(target: &str) -> io::Result<(Vec<u16>, Vec<u16>)> {
+        let (key, value) = target
+            .rsplit_once('\\')
+            .ok_or_else(|| invalid("expected KEY\\VALUE"))?;
+        Ok((wide(key), wide(value)))
+    }
+
+    fn status(code: u32) -> io::Result<()> {
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(code as i32))
+        }
+    }
+
+    pub fn registry_set(target: &str) -> io::Result<String> {
+        let (key, value) = registry_target(target)?;
+        let mut handle: HKEY = ptr::null_mut();
+        // SAFETY: key is NUL-terminated and handle is a valid out pointer.
+        status(unsafe {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                key.as_ptr(),
+                0,
+                KEY_SET_VALUE,
+                &mut handle,
+            )
+        })?;
+        let data = wide("probe");
+        // SAFETY: handle is open; data is NUL-terminated and its size in bytes is passed.
+        let result = status(unsafe {
+            RegSetValueExW(
+                handle,
+                value.as_ptr(),
+                0,
+                REG_SZ,
+                data.as_ptr().cast(),
+                (data.len() * 2) as u32,
+            )
+        });
+        // SAFETY: handle is open and closed exactly once.
+        unsafe { RegCloseKey(handle) };
+        result.map(|()| String::new())
+    }
+
+    pub fn registry_get(target: &str) -> io::Result<String> {
+        let (key, value) = registry_target(target)?;
+        let mut buffer = [0u16; 256];
+        let mut size = (buffer.len() * 2) as u32;
+        // SAFETY: key and value are NUL-terminated; size holds the buffer size in bytes.
+        status(unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_SZ,
+                ptr::null_mut(),
+                buffer.as_mut_ptr().cast(),
+                &mut size,
+            )
+        })?;
+        let units = (size as usize / 2).saturating_sub(1);
+        Ok(String::from_utf16_lossy(&buffer[..units]))
+    }
+
+    pub fn registry_delete(target: &str) -> io::Result<String> {
+        let (key, value) = registry_target(target)?;
+        // SAFETY: key and value are NUL-terminated.
+        status(unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), value.as_ptr()) })
+            .map(|()| String::new())
+    }
+
+    /// Connects to an AF_UNIX socket file.
+    pub fn afunix_connect(target: &str) -> io::Result<String> {
+        // SAFETY: WSADATA is plain data; WSAStartup fills it.
+        let mut data: WSADATA = unsafe { std::mem::zeroed() };
+        // SAFETY: data is a valid out pointer.
+        let code = unsafe { WSAStartup(0x0202, &mut data) };
+        if code != 0 {
+            return Err(io::Error::from_raw_os_error(code));
+        }
+        let mut address = SOCKADDR_UN {
+            sun_family: AF_UNIX,
+            sun_path: [0; 108],
+        };
+        if target.len() >= address.sun_path.len() {
+            return Err(invalid("path too long"));
+        }
+        for (slot, byte) in address.sun_path.iter_mut().zip(target.bytes()) {
+            *slot = byte as i8;
+        }
+        // SAFETY: socket has no memory safety preconditions.
+        let handle = unsafe { socket(i32::from(AF_UNIX), SOCK_STREAM, 0) };
+        if handle == INVALID_SOCKET {
+            // SAFETY: WSAGetLastError has no preconditions.
+            return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+        }
+        // SAFETY: address is a SOCKADDR_UN and its size is passed.
+        let result = unsafe {
+            connect(
+                handle,
+                (&address as *const SOCKADDR_UN).cast::<SOCKADDR>(),
+                std::mem::size_of::<SOCKADDR_UN>() as i32,
+            )
+        };
+        let outcome = if result == 0 {
+            Ok(String::new())
+        } else {
+            // SAFETY: WSAGetLastError has no preconditions.
+            Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+        };
+        // SAFETY: handle is an open socket, closed exactly once.
+        unsafe { closesocket(handle) };
+        outcome
+    }
+
+    /// Sends Ctrl+Break to every process attached to the console of this process, and
+    /// survives it itself.
+    pub fn ctrl_break_console() -> io::Result<String> {
+        unsafe extern "system" fn ignore(_event: u32) -> windows_sys::core::BOOL {
+            TRUE
+        }
+        // SAFETY: ignore has the signature of a HandlerRoutine and lives for the whole process.
+        if unsafe { SetConsoleCtrlHandler(Some(ignore), TRUE) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: GenerateConsoleCtrlEvent has no memory safety preconditions.
+        if unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Handlers run on new threads in each process; give them time before this one exits.
+        std::thread::sleep(Duration::from_millis(500));
+        Ok(String::new())
+    }
+}
+
+#[cfg(not(windows))]
+mod windows_actions {
+    use std::io;
+
+    fn unsupported() -> io::Result<String> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported"))
+    }
+
+    pub fn open_process(_target: &str, _terminate: bool) -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn handle_path(_target: &str) -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn write_dac(_target: &str) -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn registry_set(_target: &str) -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn registry_get(_target: &str) -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn registry_delete(_target: &str) -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn afunix_connect(_target: &str) -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn ctrl_break_console() -> io::Result<String> {
+        unsupported()
     }
 }

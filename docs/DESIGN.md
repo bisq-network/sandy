@@ -179,12 +179,28 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
 
 ### Windows
 
-- AppContainer with a stable profile name. Access to policy paths through access control entries
-  for the AppContainer SID. Read access excludes `FILE_EXECUTE`.
-- Network capabilities only when `ip = "all"`; loopback traffic with processes outside the
-  container needs an exemption, which `sandy setup` installs with admin rights.
-- Job object with kill-on-close. Handle inheritance limited to standard handles with
-  `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`.
+Details, limitations and sources: `docs/windows.md`.
+
+- AppContainer named by `windows.appcontainer_name`; sandy creates its profile on first use.
+- File grants: one capability per policy path (named after the AppContainer, the level and the
+  file ID), with one inheritable ACE on the path. The program starts with the capabilities of the
+  current policy only, so grants of older policies grant nothing. sandy never removes grants and
+  serializes its DACL changes with a named mutex, so concurrent runs do not conflict. Read and read-write never contain `FILE_EXECUTE`; read levels
+  contain no right that changes metadata. sandy refuses to propagate a grant through junctions or
+  symbolic links. The system set is what Windows grants ALL APPLICATION PACKAGES; `system =
+  "none"` is unavailable.
+- Network capabilities `internetClientServer` and `privateNetworkClientServer` only with
+  `ip = "all"`. Connections from the program to loopback listeners outside need the loopback
+  exemption, which `sandy setup` installs (administrator rights); connections from outside to
+  the program are always blocked. An exempt AppContainer reaches loopback without capabilities,
+  so `ip = "none"` refuses it.
+- `unix_sockets = "none"` is unavailable with read-write paths: AF_UNIX connect needs only write
+  access to the socket file.
+- Job object with kill-on-close, no breakaway and all UI restrictions. The program is created
+  suspended and assigned before it runs.
+- Handle inheritance limited to the standard handles with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`.
+  The program gets its own console and never a console handle of sandy; sandy relays its console
+  through pipes and ends the job on Ctrl+C.
 
 ## Exit status
 

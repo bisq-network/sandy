@@ -1,27 +1,19 @@
-//! Windows backend of sandy. The crate is empty on other platforms.
-#![cfg(windows)]
+//! Windows backend of sandy.
+//!
+//! The target runs in an AppContainer and a job object. See `docs/windows.md` for the mechanisms
+//! and their limits.
+//!
+//! The modules below build on every platform, so their unit tests run everywhere. Only `sys`
+//! calls the Windows API, and `WindowsBackend` exists only on Windows.
 
-use sandy_core::{Backend, PlanItem, ResolvedPolicy, SandboxError, TargetCommand};
+pub mod access;
+pub mod cmdline;
+pub mod envblock;
+pub mod name;
+pub mod plan;
 
-#[derive(Debug, Default)]
-pub struct WindowsBackend;
+#[cfg(windows)]
+mod sys;
 
-impl Backend for WindowsBackend {
-    fn name(&self) -> &'static str {
-        "windows"
-    }
-
-    fn plan(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
-        policy
-            .requirements()
-            .into_iter()
-            .map(|requirement| PlanItem::unavailable(requirement, "not implemented yet"))
-            .collect()
-    }
-
-    fn run(&self, _policy: &ResolvedPolicy, _command: &TargetCommand) -> Result<i32, SandboxError> {
-        Err(SandboxError::new(
-            "the Windows backend is not implemented yet",
-        ))
-    }
-}
+#[cfg(windows)]
+pub use sys::WindowsBackend;

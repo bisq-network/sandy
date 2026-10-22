@@ -126,13 +126,67 @@ impl ProbeLine {
     }
 }
 
+/// AppContainer of the Windows test runs without IP networking. It must not be exempt from
+/// loopback isolation, or sandy refuses policies without IP networking.
+pub const APPCONTAINER: &str = "sandy.escape-tests";
+
+/// AppContainer of the Windows test runs with `--ip all`. `prepare_loopback_exemption` exempts
+/// it from loopback isolation, so the program can connect to listeners on 127.0.0.1.
+pub const APPCONTAINER_LOOPBACK: &str = "sandy.escape-tests.loopback";
+
 /// Options every sandbox run needs on this platform.
+///
+/// On Windows, a policy with read-write paths cannot deny Unix sockets: connecting to an
+/// AF_UNIX socket needs only write access to the socket file (see docs/windows.md). The shared
+/// tests do not test Unix sockets on Windows, so they allow them there.
 pub fn platform_args() -> Vec<String> {
     if cfg!(windows) {
-        vec!["--appcontainer".into(), "sandy.escape-tests".into()]
+        vec![
+            "--appcontainer".into(),
+            APPCONTAINER.into(),
+            "--unix-sockets".into(),
+            "all".into(),
+        ]
     } else {
         Vec::new()
     }
+}
+
+/// On Windows, a run with `--ip all` uses the AppContainer with the loopback exemption, unless
+/// the test names an AppContainer itself. These options go after the sandbox options, because
+/// the last --appcontainer wins.
+fn loopback_args(sandbox_args: &[String]) -> Vec<String> {
+    let allows_ip = sandbox_args
+        .windows(2)
+        .any(|pair| pair[0] == "--ip" && pair[1] == "all");
+    let names_container = sandbox_args.iter().any(|arg| arg == "--appcontainer");
+    if cfg!(windows) && allows_ip && !names_container {
+        prepare_loopback_exemption();
+        vec!["--appcontainer".into(), APPCONTAINER_LOOPBACK.into()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Installs the loopback exemption for `APPCONTAINER_LOOPBACK` once per test process. It needs
+/// administrator rights; `sandy setup` does nothing when the exemption is already there.
+pub fn prepare_loopback_exemption() {
+    static SETUP: std::sync::Once = std::sync::Once::new();
+    SETUP.call_once(|| {
+        let output = sandy([
+            "setup",
+            "--appcontainer",
+            APPCONTAINER_LOOPBACK,
+            "--ip",
+            "all",
+        ]);
+        assert!(
+            output.status.success(),
+            "`sandy setup --appcontainer {APPCONTAINER_LOOPBACK} --ip all` failed; it needs \
+             administrator rights once per machine: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    });
 }
 
 pub fn sandy<I, S>(args: I) -> Output
@@ -180,6 +234,7 @@ pub fn run_args(sandbox_args: &[String], actions: &[(&str, &str)]) -> Vec<String
     let mut args = vec!["run".to_string()];
     args.extend(platform_args());
     args.extend_from_slice(sandbox_args);
+    args.extend(loopback_args(sandbox_args));
     args.push("--".into());
     args.push(probe_path());
     args.extend(probe_args(actions));
