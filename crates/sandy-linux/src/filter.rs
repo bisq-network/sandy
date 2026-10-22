@@ -88,8 +88,11 @@ pub const ARCH_SUPPORTED: bool = arch::TARGET.is_some();
 const SYS_FCHMODAT2: i64 = 452;
 const SYS_SETXATTRAT: i64 = 463;
 const SYS_REMOVEXATTRAT: i64 = 466;
+const SYS_STATMOUNT: i64 = 457;
+const SYS_LISTMOUNT: i64 = 458;
 const SYS_OPEN_TREE_ATTR: i64 = 467;
 const SYS_FILE_SETATTR: i64 = 469;
+const SYS_LISTNS: i64 = 470;
 
 /// Denied with EPERM under every policy.
 const DENIED: &[i64] = &[
@@ -140,6 +143,11 @@ const DENIED: &[i64] = &[
     libc::SYS_open_tree,
     SYS_OPEN_TREE_ATTR,
     libc::SYS_mount_setattr,
+    // Mount and namespace topology of the host, which leaving out /proc otherwise hides
+    // (/proc/self/mountinfo, /proc/*/ns).
+    SYS_STATMOUNT,
+    SYS_LISTMOUNT,
+    SYS_LISTNS,
     // Kernel attack surface that exploits often use.
     libc::SYS_bpf,
     libc::SYS_perf_event_open,
@@ -725,6 +733,9 @@ mod tests {
                 libc::SYS_shmat,
                 libc::SYS_mq_open,
                 libc::SYS_init_module,
+                SYS_STATMOUNT,
+                SYS_LISTMOUNT,
+                SYS_LISTNS,
             ] {
                 assert_eq!(call(&config, nr, [0; 6]), RET_EPERM, "system call {nr}");
             }

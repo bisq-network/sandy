@@ -14,13 +14,14 @@ use landlock::{
 use sandy_core::{SandboxError, TargetCommand};
 
 use crate::filter;
+use crate::host::THREADS_DIR;
 use crate::plan::{LandlockConfig, Sandbox};
 
 /// Applies `sandbox` to this process and executes the target. Returns only on failure.
 ///
-/// Landlock and seccomp restrict the calling thread. sandy does not start threads, the filters
-/// are installed with TSYNC, and execve ends every other thread, so the target runs with exactly
-/// the restrictions applied here.
+/// Landlock and seccomp restrict the calling thread. sandy verifies right before Landlock that
+/// it has a single thread, the filters are installed with TSYNC, and execve ends every other
+/// thread, so the target runs with exactly the restrictions applied here.
 pub fn launch(sandbox: &Sandbox, command: &TargetCommand) -> Result<Infallible, SandboxError> {
     let ruleset = prepare_ruleset(&sandbox.landlock)?;
     let filters = filter::build(&sandbox.filter, std::process::id())
@@ -35,6 +36,7 @@ pub fn launch(sandbox: &Sandbox, command: &TargetCommand) -> Result<Infallible, 
 
     mark_descriptors_close_on_exec()?;
     set_no_new_privs()?;
+    ensure_single_thread()?;
     restrict(ruleset)?;
     filter::install(&filters).map_err(|error| {
         SandboxError::new(format!("cannot install the seccomp filter: {error}"))
@@ -71,6 +73,25 @@ fn prepare_ruleset(config: &LandlockConfig) -> Result<RulesetCreated, SandboxErr
             .map_err(landlock_error)?;
     }
     Ok(ruleset)
+}
+
+/// Landlock restricts only the calling thread. Another thread would keep running without the
+/// file system rules until execve ends it. sandy starts no threads; this check makes that a
+/// verified fact instead of an assumption. LANDLOCK_RESTRICT_SELF_TSYNC (ABI 8) would cover such
+/// a thread instead, but only on new kernels, and it would hide a thread that should not exist.
+fn ensure_single_thread() -> Result<(), SandboxError> {
+    let list_error = |error| SandboxError::io(format!("cannot list {THREADS_DIR}"), error);
+    let threads = std::fs::read_dir(THREADS_DIR)
+        .map_err(list_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(list_error)?
+        .len();
+    if threads != 1 {
+        return Err(SandboxError::new(format!(
+            "sandy has {threads} threads, but Landlock would restrict only one of them"
+        )));
+    }
+    Ok(())
 }
 
 fn restrict(ruleset: RulesetCreated) -> Result<(), SandboxError> {
@@ -215,4 +236,20 @@ impl Exec {
 fn c_string(value: &OsStr) -> Result<CString, SandboxError> {
     CString::new(value.as_bytes())
         .map_err(|_| SandboxError::new(format!("{value:?} contains a NUL byte")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn a_second_thread_stops_the_launch() {
+        let (stop, wait) = mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || wait.recv());
+        let error = ensure_single_thread().unwrap_err();
+        assert!(error.to_string().contains("threads"), "{error}");
+        drop(stop);
+        let _ = thread.join();
+    }
 }

@@ -31,13 +31,17 @@ Then sandy restricts itself, in this order:
    Linux 5.11 through the list in `/proc/self/fd`). Closing them now would also close the
    Landlock ruleset, which is still needed.
 5. Set no_new_privs.
-6. `landlock_restrict_self`. sandy checks that the ruleset is fully enforced.
+6. Verify that the process has exactly one thread (one entry in `/proc/self/task`), then
+   `landlock_restrict_self`. sandy checks that the ruleset is fully enforced.
 7. Install the allowlist filter and then the denylist filter, both with `SECCOMP_FILTER_FLAG_TSYNC`.
 8. `execve`. Only this call remains after the filters are in place.
 
-Landlock and seccomp restrict the calling thread. sandy starts no threads, the filters use TSYNC,
-and `execve` ends every other thread, so the program runs with exactly these restrictions. Every
-child inherits them.
+Landlock and seccomp restrict the calling thread. sandy starts no threads and verifies this before
+step 6, the filters use TSYNC, and `execve` ends every other thread, so the program runs with
+exactly these restrictions. Every child inherits them. sandy does not use Landlock's
+`LANDLOCK_RESTRICT_SELF_TSYNC` (ABI 8): with a verified single thread it changes nothing, it exists
+only on new kernels, and it would hide a thread that should not exist. If `/proc/self/task` cannot
+be listed, the Landlock-based requirements are unavailable.
 
 ## Mechanism per requirement
 
@@ -155,6 +159,7 @@ their low 32 bits only, because the kernel ignores the high bits.
 | `ptrace`, `process_vm_readv`, `process_vm_writev`, `pidfd_getfd`, `kcmp`, `process_madvise` | always | Second layer to Landlock. Debuggers do not work inside the sandbox. |
 | System V IPC (12 calls), POSIX message queues (6 calls) | always | These objects belong to all processes of the user and Landlock does not cover them. `shmat` would give access to the memory of processes outside the sandbox. |
 | `mount`, `umount2`, `pivot_root`, `chroot`, new mount API, `open_tree_attr`, `mount_setattr` | always | Second layer; Landlock denies mounts already. |
+| `statmount`, `listmount`, `listns` | always | They show the mount and namespace topology of the host, which leaving out `/proc` otherwise hides (`/proc/self/mountinfo`, `/proc/*/ns`). |
 | `bpf`, `perf_event_open`, `userfaultfd` | always | Kernel attack surface. |
 | `keyctl`, `add_key`, `request_key` | always | The keyrings of the user are shared by all its processes. |
 | `kexec_*`, module calls, `reboot`, `swapon`, `swapoff`, `acct`, `quotactl`, `quotactl_fd`, `syslog`, `open_by_handle_at`, `settimeofday`, `clock_settime`; on x86_64 `iopl`, `ioperm`, `modify_ldt`, `uselib` | always | They need capabilities, which sandy never passes on. A second layer. |
@@ -267,10 +272,15 @@ secrets passed on command lines, and `/proc/net` of the network namespace. `/pro
 
 ## Known limitations
 
-- **Paths outside the policy are visible.** `stat`, `access`, `readlink` and `inotify` watches
-  work on every path the user can reach (tested: an inotify watch on a directory outside the
-  policy succeeded). The program can learn which files exist, their sizes and times, and when
-  other programs touch them.
+- **Paths outside the policy are visible.** `stat`, `access`, `readlink`, `getxattr`,
+  `getxattrat`, `listxattrat`, `file_getattr` and `inotify` watches work on every path the user
+  can reach (tested: an inotify watch on a directory outside the policy succeeded). The program
+  can learn which files exist, their sizes, times and attributes, and when other programs touch
+  them.
+- **System information.** `uname`, `sysinfo`, `statfs` and `lsm_list_modules` stay allowed. They
+  show the kernel version, load and memory, file system statistics, and the active security
+  modules (which `/sys/kernel/security/lsm` shows to every user). The mount and namespace listing
+  calls are denied.
 - **Metadata through open files.** `fchmod`, `fchown`, `fsetxattr` and `futimens` work on every
   file the program may open, also in `read` paths, except for setuid and setgid bits.
 - **Signals.** With `signals = "any"` the program can kill other processes of the user.

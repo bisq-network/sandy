@@ -447,6 +447,27 @@ fn other_processes_cannot_be_changed() {
 }
 
 #[test]
+fn mount_and_namespace_listing_is_denied() {
+    // statmount, listmount and listns. With null arguments a kernel that has the call fails
+    // with EFAULT, which shows the call reached it; the filter fails it with EPERM first.
+    let calls = ["457", "458", "470"];
+    let actions: Vec<(&str, &str)> = calls.iter().map(|nr| ("raw-syscall", *nr)).collect();
+    for control in probe_outside(&actions) {
+        if control.detail.contains("os error 38") {
+            skip(&format!(
+                "system call {} is not in this kernel",
+                control.target
+            ));
+        } else {
+            assert!(control.detail.contains("os error 14"), "{control:?}");
+        }
+    }
+    for line in probe_inside(&[], &actions) {
+        assert_eq!(line.result, "denied", "{line:?}");
+    }
+}
+
+#[test]
 fn opening_for_ioctl_only_is_denied() {
     let fixture = Fixture::new("linux-ioctlopen");
     let lines = controlled(

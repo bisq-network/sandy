@@ -260,6 +260,16 @@ mod linux {
         "prlimit-same",
         "affinity-same",
         "ioprio-same",
+        "sigio-signal",
+        "pidfd-signal",
+        "fanotify-init",
+        "await-signal",
+        "symlink",
+        "mkfifo",
+        "opath-read",
+        "rename-in",
+        "raw-syscall",
+        "move-pages",
     ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
@@ -293,6 +303,16 @@ mod linux {
             "prlimit-same" => prlimit_same(pid(target)?),
             "affinity-same" => affinity_same(pid(target)?),
             "ioprio-same" => ioprio_same(pid(target)?),
+            "sigio-signal" => sigio_signal(target),
+            "pidfd-signal" => pidfd_signal(target),
+            "fanotify-init" => fanotify_init(target),
+            "await-signal" => await_signal(target),
+            "symlink" => symlink(target),
+            "mkfifo" => mkfifo(target),
+            "opath-read" => opath_read(target),
+            "rename-in" => rename_in(target),
+            "raw-syscall" => raw_syscall(target),
+            "move-pages" => move_pages(target),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "unknown action",
@@ -387,6 +407,132 @@ mod linux {
         target
             .parse()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid number"))
+    }
+
+    /// Delivers a signal to another process through the F_SETOWN / F_SETSIG / SIGIO path.
+    ///
+    /// `target` is `PID` or `PID:SIGNUM` (default signal is SIGKILL). The kernel delivers the
+    /// signal from `send_sigio_to_task`, which checks `security_file_send_sigiotask` rather than
+    /// the `task_kill` hook that Landlock's signal scope implements. `kill(PID, SIGNUM)` would be
+    /// refused under `signals = "isolated"`; this path is a separate route.
+    fn sigio_signal(target: &str) -> io::Result<String> {
+        let (pid_str, sig_str) = target.split_once(':').unwrap_or((target, "9"));
+        let pid: libc::pid_t = number(pid_str)?;
+        let signum: libc::c_int = number(sig_str)?;
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe2 writes two descriptors into `fds`.
+        check(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) })?;
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let result = (|| {
+            // F_SETSIG (10) chooses the signal that SIGIO delivery sends; libc lacks the constant.
+            const F_SETSIG: libc::c_int = 10;
+            // SAFETY: F_SETOWN takes an int argument, no pointers.
+            check(unsafe { libc::fcntl(read_fd, libc::F_SETOWN, pid) })?;
+            // SAFETY: F_SETSIG takes an int argument, no pointers.
+            check(unsafe { libc::fcntl(read_fd, F_SETSIG, signum) })?;
+            // SAFETY: F_GETFL takes no argument.
+            let flags = check(unsafe { libc::fcntl(read_fd, libc::F_GETFL) })?;
+            // SAFETY: F_SETFL takes an int argument, no pointers.
+            check(unsafe { libc::fcntl(read_fd, libc::F_SETFL, flags | libc::O_ASYNC) })?;
+            // Making the read end readable generates SIGIO, delivered to `pid` as `signum`.
+            let byte = *b"x";
+            // SAFETY: writes one byte from a valid buffer to the pipe.
+            if unsafe { libc::write(write_fd, byte.as_ptr().cast(), 1) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // Give the kernel a moment to deliver the signal before the descriptors close.
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(format!("delivered signal {signum} to {pid}"))
+        })();
+        close(read_fd);
+        close(write_fd);
+        result
+    }
+
+    /// Opens a pidfd for another process and sends it signal 0 (permission check, no delivery).
+    fn pidfd_signal(target: &str) -> io::Result<String> {
+        let pid: libc::pid_t = number(target)?;
+        // SAFETY: pidfd_open takes a pid and flags, no pointers.
+        let pidfd = check(unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int })?;
+        // SAFETY: pidfd_send_signal with a null siginfo sends the bare signal.
+        let result = check(unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd,
+                0,
+                ptr::null::<libc::c_void>(),
+                0,
+            ) as libc::c_int
+        });
+        close(pidfd);
+        result.map(|_| String::new())
+    }
+
+    /// Tries to create an fanotify group and mark `target`. Unprivileged callers normally fail
+    /// with EPERM; success would allow watching (and, in some classes, reading) files by path
+    /// outside the policy.
+    fn fanotify_init(target: &str) -> io::Result<String> {
+        const FAN_CLOEXEC: libc::c_uint = 0x0000_0001;
+        const FAN_CLASS_NOTIF: libc::c_uint = 0x0000_0000;
+        // SAFETY: fanotify_init takes two ints, no pointers.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_fanotify_init,
+                FAN_CLOEXEC | FAN_CLASS_NOTIF,
+                libc::O_RDONLY as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = fd as libc::c_int;
+        const FAN_MARK_ADD: libc::c_uint = 0x0000_0001;
+        const FAN_ACCESS: u64 = 0x0000_0001;
+        const FAN_MODIFY: u64 = 0x0000_0002;
+        let path = CString::new(target)?;
+        // SAFETY: fanotify_mark reads the NUL-terminated path; dirfd AT_FDCWD is -100.
+        let marked = unsafe {
+            libc::syscall(
+                libc::SYS_fanotify_mark,
+                fd,
+                FAN_MARK_ADD,
+                FAN_ACCESS | FAN_MODIFY,
+                libc::AT_FDCWD,
+                path.as_ptr(),
+            )
+        };
+        let outcome = if marked < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(format!("fanotify group watching {target}"))
+        };
+        close(fd);
+        outcome
+    }
+
+    /// Installs a handler for `SIGNUM` and waits up to five seconds for it. Exits with code 42 on
+    /// delivery. Used as the victim of `sigio-signal` in the escape test.
+    fn await_signal(target: &str) -> io::Result<String> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static GOT: AtomicBool = AtomicBool::new(false);
+        extern "C" fn handler(_sig: libc::c_int) {
+            GOT.store(true, Ordering::SeqCst);
+        }
+        let signum: libc::c_int = number(target)?;
+        // SAFETY: installs a signal handler with an empty mask and no flags.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = handler as *const () as usize;
+            check(libc::sigaction(signum, &action, ptr::null_mut()))?;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if GOT.load(Ordering::SeqCst) {
+                std::process::exit(42);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Err(io::Error::new(io::ErrorKind::TimedOut, "no signal"))
     }
 
     fn check(result: libc::c_int) -> io::Result<libc::c_int> {
@@ -577,6 +723,107 @@ mod linux {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Queries, through `move_pages`, the NUMA node of one page of another process. The kernel
+    /// gates cross-process access with `mm_access` (a ptrace-mode check), which Landlock's ptrace
+    /// scope hooks. A permission error means the sandbox blocks it; `ok` means it is reachable.
+    fn move_pages(target: &str) -> io::Result<String> {
+        let pid: libc::pid_t = number(target)?;
+        let page: *const libc::c_void = 0x1000 as *const libc::c_void;
+        let pages = [page];
+        let mut status = [0i32; 1];
+        // SAFETY: move_pages reads one page pointer and writes one status int; nodes is null, so
+        // it only queries. A bad page address yields a per-page status, not undefined behavior.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_move_pages,
+                pid,
+                1usize,
+                pages.as_ptr(),
+                ptr::null::<libc::c_int>(),
+                status.as_mut_ptr(),
+                0,
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(format!("queried process {pid}, status {}", status[0]))
+    }
+
+    /// `NR` or `NR:A0:A1:...`: invokes the raw system call `NR` with up to six integer arguments
+    /// (default 0). Reports the return value, or `denied`/`error` from errno. Used to see whether
+    /// the seccomp filter lets a given call through to the kernel.
+    fn raw_syscall(target: &str) -> io::Result<String> {
+        let mut parts = target.split(':');
+        let nr: libc::c_long = number(parts.next().unwrap_or_default())?;
+        let mut args = [0 as libc::c_long; 6];
+        for (slot, value) in args.iter_mut().zip(parts) {
+            *slot = number(value)?;
+        }
+        // SAFETY: a raw syscall with integer arguments has no memory safety requirement here;
+        // callers pass 0 for pointer arguments.
+        let result =
+            unsafe { libc::syscall(nr, args[0], args[1], args[2], args[3], args[4], args[5]) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(format!("ret {result}"))
+    }
+
+    /// `LINK::DEST`: creates a symbolic link at `LINK` that points to `DEST`.
+    fn symlink(target: &str) -> io::Result<String> {
+        let (link, dest) = target
+            .split_once("::")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "expected LINK::DEST"))?;
+        std::os::unix::fs::symlink(dest, link).map(|()| format!("{link} -> {dest}"))
+    }
+
+    /// Creates a FIFO at `target`.
+    fn mkfifo(target: &str) -> io::Result<String> {
+        let path = CString::new(target)?;
+        // SAFETY: mknod reads the NUL-terminated path; S_IFIFO needs no device number.
+        check(unsafe { libc::mknod(path.as_ptr(), libc::S_IFIFO | 0o600, 0) })?;
+        Ok(String::new())
+    }
+
+    /// `SRC::DST`: creates a hard link `DST` to the existing file `SRC`. If `SRC` is outside the
+    /// policy and `DST` is in a writable path, a success would bring the outside inode into a
+    /// readable location.
+    /// Opens `target` with O_PATH (needs no Landlock right), then tries to reopen it readable
+    /// through the O_PATH descriptor with AT_EMPTY_PATH and read its first bytes.
+    fn opath_read(target: &str) -> io::Result<String> {
+        let path = CString::new(target)?;
+        // SAFETY: open with a valid C string path.
+        let dirfd = check(unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) })?;
+        let empty = CString::new("").unwrap();
+        // SAFETY: openat with AT_EMPTY_PATH reopens the file the O_PATH fd refers to.
+        let reopened = unsafe {
+            libc::openat(
+                dirfd,
+                empty.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::AT_EMPTY_PATH,
+            )
+        };
+        if reopened < 0 {
+            let error = io::Error::last_os_error();
+            close(dirfd);
+            return Err(error);
+        }
+        let result = read_fd(reopened);
+        close(reopened);
+        close(dirfd);
+        result
+    }
+
+    /// `SRC::DST`: renames `SRC` to `DST` (rename brings no new inode in, but tests the Refer
+    /// boundary for moving an outside file into a writable directory).
+    fn rename_in(target: &str) -> io::Result<String> {
+        let (src, dst) = target
+            .split_once("::")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "expected SRC::DST"))?;
+        fs::rename(src, dst).map(|()| format!("{src} -> {dst}"))
     }
 
     /// getpid through the 32-bit system call entry (number 20 in the i386 table).

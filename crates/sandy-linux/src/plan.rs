@@ -43,7 +43,8 @@ pub struct PathRights {
     pub access: BitFlags<AccessFs>,
 }
 
-const FILTER_BASELINE: &str = "seccomp denies namespaces, mounts, bpf, perf_event_open, io_uring, \
+const FILTER_BASELINE: &str = "seccomp denies namespaces, mounts and their listing (statmount, \
+    listmount, listns), bpf, perf_event_open, io_uring, \
     keyrings, userfaultfd, calls that need capabilities, setuid and setgid mode bits, and unknown \
     or foreign system calls";
 const FILTER_METADATA: &str = "seccomp denies chmod, chown, utime and xattr calls that take a \
@@ -53,11 +54,12 @@ const FILTER_PROCESSES: &str = "seccomp denies ptrace, process_vm_readv, process
     limits, priority and CPU affinity of other processes";
 
 pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
-    let abi = host
-        .landlock
-        .as_ref()
-        .map(|&version| ABI::from(version))
-        .map_err(String::as_str);
+    // Landlock restricts only the calling thread, so it is only usable when sandy can verify
+    // that it is single-threaded.
+    let abi = match (&host.landlock, &host.thread_count) {
+        (Err(reason), _) | (Ok(_), Err(reason)) => Err(reason.as_str()),
+        (Ok(version), Ok(())) => Ok(ABI::from(*version)),
+    };
     let conflict = executable_conflict(policy, &host.system_paths);
     let items: Vec<PlanItem> = policy
         .requirements()
@@ -316,6 +318,7 @@ mod tests {
         };
         HostCapabilities {
             landlock: abi.ok_or_else(|| "no Landlock here".to_string()),
+            thread_count: Ok(()),
             seccomp: Ok(()),
             no_new_privs: Ok(()),
             unprivileged: Ok(()),
@@ -459,6 +462,22 @@ mod tests {
                 .all(|i| i.requirement != Requirement::MetadataConfined)
         );
         assert!(!plan.sandbox.unwrap().filter.deny_path_metadata);
+    }
+
+    #[test]
+    fn landlock_needs_a_way_to_count_threads() {
+        let mut host = host(Some(9));
+        host.thread_count = Err("no /proc".to_string());
+        let plan = plan_for(&policy(), &host);
+        assert_eq!(
+            unavailable(&plan),
+            vec![
+                Requirement::FilesystemConfined,
+                Requirement::ProcessMemoryIsolated,
+                Requirement::SignalsIsolated,
+            ]
+        );
+        assert!(plan.sandbox.is_none());
     }
 
     #[test]

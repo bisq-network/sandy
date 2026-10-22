@@ -16,6 +16,8 @@ pub type Support = Result<(), String>;
 pub struct HostCapabilities {
     /// The Landlock ABI version the kernel reports.
     pub landlock: Result<i32, String>,
+    /// Whether sandy can count its threads, which it must do before Landlock restricts it.
+    pub thread_count: Support,
     /// Seccomp filters with the actions the filter uses, for this CPU architecture.
     pub seccomp: Support,
     pub no_new_privs: Support,
@@ -29,6 +31,7 @@ impl HostCapabilities {
     pub fn detect() -> Self {
         HostCapabilities {
             landlock: landlock_abi(),
+            thread_count: thread_count_support(),
             seccomp: seccomp_support(),
             no_new_privs: no_new_privs_support(),
             unprivileged: unprivileged(),
@@ -64,6 +67,18 @@ fn landlock_abi() -> Result<i32, String> {
              Landlock system calls"
             .to_string(),
         _ => format!("cannot query the Landlock ABI: {error}"),
+    })
+}
+
+/// The directory that lists the threads of this process.
+pub const THREADS_DIR: &str = "/proc/self/task";
+
+fn thread_count_support() -> Support {
+    std::fs::read_dir(THREADS_DIR).map(|_| ()).map_err(|error| {
+        format!(
+            "cannot list {THREADS_DIR}, which sandy needs to verify that it is single-threaded \
+             before Landlock restricts it: {error}"
+        )
     })
 }
 
@@ -201,6 +216,7 @@ mod tests {
         // The test machine runs as an ordinary user with a Landlock kernel; detection must not
         // report spurious errors there.
         assert!(host.no_new_privs.is_ok(), "{host:?}");
+        assert!(host.thread_count.is_ok(), "{host:?}");
         assert!(host.seccomp.is_ok(), "{host:?}");
     }
 }
