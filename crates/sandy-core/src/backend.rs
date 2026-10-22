@@ -20,6 +20,10 @@ pub struct TargetCommand {
     pub env: Vec<(OsString, OsString)>,
     /// Working directory; `None` keeps the current one.
     pub cwd: Option<PathBuf>,
+    /// For `process.end_with_parent`: the process ID of the process that started sandy. On Unix
+    /// sandy reads it as its first step, or the caller names it and sandy checks it then; on
+    /// Windows only the caller names it. `None` lets the backend find the parent itself.
+    pub parent: Option<u32>,
 }
 
 /// One operating system sandbox implementation.

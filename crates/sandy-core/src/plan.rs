@@ -41,6 +41,10 @@ pub enum Requirement {
     /// Every process the target starts, directly or through its children, ends when the target
     /// ends, and also when sandy itself is killed. The target cannot move a process out of reach.
     ChildProcessesContained,
+    /// When the process that started sandy ends, the target ends too: it gets a request to end
+    /// and, if it has not ended after a grace period, is killed. The target cannot keep this from
+    /// happening; the policy also requires isolated signals for that.
+    EndsWithParent,
 }
 
 impl Requirement {
@@ -61,6 +65,7 @@ impl Requirement {
             Requirement::ForwardedPortsRelayed => "forwarded ports relayed out of the sandbox",
             Requirement::ChildProcessesDenied => "no child processes",
             Requirement::ChildProcessesContained => "child processes end with the program",
+            Requirement::EndsWithParent => "the program ends when sandy's parent ends",
         }
     }
 }

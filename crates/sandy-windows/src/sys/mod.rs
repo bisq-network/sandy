@@ -3,6 +3,7 @@ mod appcontainer;
 mod forward;
 mod host;
 mod network;
+mod parent;
 mod process;
 mod relay;
 mod singleton;
@@ -73,6 +74,12 @@ impl Backend for WindowsBackend {
                 "batch files run in cmd.exe with other argument rules; run cmd.exe /c explicitly",
             ));
         }
+        // Opened first, so a parent that has already ended stops the run before anything starts.
+        let parent = if policy.end_with_parent {
+            Some(parent::open_parent(command.parent)?)
+        } else {
+            None
+        };
 
         // Refuse a concurrent run that shares this AppContainer name with a different policy.
         // Held until the program exits, so an overlapping weaker policy cannot join the sandbox.
@@ -148,6 +155,7 @@ impl Backend for WindowsBackend {
             program,
             relays,
             deny_children: policy.children == ChildProcesses::None,
+            parent,
         })?;
         if let Some(forwarding) = forwarding {
             forwarding.stop(ended.deadline);

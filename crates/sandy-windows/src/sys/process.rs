@@ -48,7 +48,7 @@ use windows_sys::Win32::System::Threading::{
     LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
     PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
 };
 
 use super::util::{Sid, last_error, wide_nul};
@@ -61,6 +61,9 @@ pub struct Launch<'a> {
     pub relays: Vec<Relay<'a>>,
     /// `process.children = "none"`: the program's job admits no process besides the program.
     pub deny_children: bool,
+    /// `process.end_with_parent`: the process that started sandy. When it ends, sandy ends the
+    /// program's job.
+    pub parent: Option<OwnedHandle>,
 }
 
 /// What a started process is, for the way it starts and for error messages.
@@ -152,6 +155,7 @@ fn start_and_wait(
         mut program,
         relays: port_relays,
         deny_children: _,
+        parent,
     } = launch;
     // The relays start before the program, so a relay that cannot start ends the run before the
     // program runs. They run in a job of their own, so that sandy can end the processes the
@@ -181,11 +185,7 @@ fn start_and_wait(
     // from seeing the end of the output.
     drop(child);
 
-    // SAFETY: process is a valid process handle owned by this function.
-    let waited = unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) };
-    if waited != WAIT_OBJECT_0 {
-        return Err(last_error("cannot wait for the program"));
-    }
+    wait_for_program(&process, parent.as_ref(), job)?;
     let deadline = Instant::now() + sandy_relay::DRAIN;
     let mut code = 0u32;
     // SAFETY: process is valid and code is a writable u32.
@@ -208,6 +208,39 @@ fn start_and_wait(
         code: code as i32,
         deadline,
     })
+}
+
+/// The exit code of a program whose job sandy ended because sandy's parent ended.
+const PARENT_ENDED: u32 = 1;
+
+/// Waits until the program exits. With `parent`, also until that process ends; then sandy ends
+/// the program's job and waits for the program.
+fn wait_for_program(
+    process: &OwnedHandle,
+    parent: Option<&OwnedHandle>,
+    job: &OwnedHandle,
+) -> Result<(), SandboxError> {
+    let waited = match parent {
+        // SAFETY: process is a valid process handle.
+        None => unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) },
+        Some(parent) => {
+            let handles = [process.as_raw_handle(), parent.as_raw_handle()];
+            // SAFETY: both handles are valid and have SYNCHRONIZE access.
+            unsafe { WaitForMultipleObjects(2, handles.as_ptr(), FALSE, INFINITE) }
+        }
+    };
+    if waited == WAIT_OBJECT_0 + 1 {
+        // SAFETY: job is a valid job handle.
+        if unsafe { TerminateJobObject(job.as_raw_handle(), PARENT_ENDED) } == 0 {
+            // The caller closes the job then, and kill-on-close ends the program.
+            return Err(last_error("cannot end the program's job"));
+        }
+        // SAFETY: process is a valid process handle.
+        unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) };
+    } else if waited != WAIT_OBJECT_0 {
+        return Err(last_error("cannot wait for the program"));
+    }
+    Ok(())
 }
 
 /// A started relay: its process and the write end of its standard input.

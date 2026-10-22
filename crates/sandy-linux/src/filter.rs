@@ -59,7 +59,7 @@ mod arch {
     pub const OPEN_CALLS: &[(i64, u8)] = &[(libc::SYS_open, 1), (libc::SYS_openat, 2)];
     /// chmod variants that only x86_64 has, with the index of their mode argument.
     pub const CHMOD_CALLS: &[(i64, u8)] = &[(libc::SYS_chmod, 1)];
-    /// Calls the relay needs that only x86_64 has (arm64 has only ppoll).
+    /// Calls the relay and the watcher need that only x86_64 has (arm64 has only ppoll).
     pub const RELAY_CALLS: &[i64] = &[libc::SYS_poll];
     /// System calls that create a process without arguments to check; arm64 has only clone.
     pub const FORK_CALLS: &[i64] = &[libc::SYS_fork, libc::SYS_vfork];
@@ -530,6 +530,48 @@ const RELAY_CALLS: &[i64] = &[
     libc::SYS_exit_group,
 ];
 
+/// What the watcher of `end_with_parent` needs: poll two pidfds, signal the program through its
+/// pidfd, write the readiness report, and end. The memory calls cover allocations of the Rust
+/// runtime. Everything else fails with EPERM.
+const WATCHER_CALLS: &[i64] = &[
+    libc::SYS_ppoll,
+    libc::SYS_pidfd_send_signal,
+    libc::SYS_write,
+    libc::SYS_close,
+    libc::SYS_clock_gettime,
+    libc::SYS_mmap,
+    libc::SYS_munmap,
+    libc::SYS_brk,
+    libc::SYS_madvise,
+    libc::SYS_mprotect,
+    libc::SYS_rt_sigprocmask,
+    libc::SYS_rt_sigreturn,
+    libc::SYS_restart_syscall,
+    libc::SYS_exit,
+    libc::SYS_exit_group,
+];
+
+/// Builds the filters of the watcher: the shared allowlist and a list that allows only
+/// `WATCHER_CALLS`.
+pub fn watcher() -> Result<Filters, BackendError> {
+    let target = arch::TARGET
+        .ok_or_else(|| BackendError::InvalidTargetArch(std::env::consts::ARCH.to_string()))?;
+    let mut rules = Rules::default();
+    for &call in WATCHER_CALLS.iter().chain(arch::RELAY_CALLS) {
+        rules.add(call, Vec::new());
+    }
+    let filter = SeccompFilter::new(
+        rules.0,
+        SeccompAction::Errno(libc::EPERM as u32),
+        SeccompAction::Allow,
+        target,
+    )?;
+    Ok(Filters {
+        allowlist: allowlist(target)?,
+        denylist: filter.try_into()?,
+    })
+}
+
 /// Builds the filters of the relay: the shared allowlist and the relay's own list, which allows
 /// only `RELAY_CALLS`, TCP sockets, thread creation without namespaces, and FIONBIO.
 pub fn relay() -> Result<Filters, BackendError> {
@@ -966,6 +1008,32 @@ mod tests {
             for which in groups {
                 assert_eq!(call(&open(), nr, args(&[which, 0])), RET_EPERM, "{nr}");
             }
+        }
+    }
+
+    #[test]
+    fn the_watcher_can_only_watch_and_signal() {
+        let filters = watcher().unwrap();
+        let watcher = |nr: i64| decide_with(&filters, NATIVE, nr, [0; 6]);
+        for nr in [
+            libc::SYS_ppoll,
+            libc::SYS_pidfd_send_signal,
+            libc::SYS_write,
+            libc::SYS_close,
+            libc::SYS_exit_group,
+        ] {
+            assert_eq!(watcher(nr), RET_ALLOW, "system call {nr}");
+        }
+        for nr in [
+            libc::SYS_openat,
+            libc::SYS_socket,
+            libc::SYS_kill,
+            libc::SYS_clone,
+            libc::SYS_execve,
+            libc::SYS_pidfd_open,
+            libc::SYS_read,
+        ] {
+            assert_eq!(watcher(nr), RET_EPERM, "system call {nr}");
         }
     }
 

@@ -323,6 +323,7 @@ mod linux {
         "setpgid",
         "signal-parent",
         "stop-self",
+        "ignore-signal",
     ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
@@ -376,6 +377,11 @@ mod linux {
                 check(unsafe { libc::kill(libc::getppid(), 0) }).map(|_| String::new())
             }
             "stop-self" => stop_self(target),
+            // SAFETY: setting a signal to SIG_IGN has no memory safety requirements.
+            "ignore-signal" => match unsafe { libc::signal(number(target)?, libc::SIG_IGN) } {
+                libc::SIG_ERR => Err(io::Error::last_os_error()),
+                _ => Ok(String::new()),
+            },
             "fork" => fork_raw(),
             "vfork" => vfork_raw(),
             "clone-process" => clone_process(),

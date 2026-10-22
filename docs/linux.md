@@ -59,6 +59,7 @@ be listed, the Landlock-based requirements are unavailable.
 | MetadataConfined | The denylist denies the metadata calls that take a path (see "Metadata"). |
 | ChildProcessesDenied | The denylist denies `fork`, `vfork` and `clone` without `CLONE_THREAD`; `clone3` fails with `ENOSYS` (see "Child processes"). |
 | ChildProcessesContained | sandy stays the parent and ends the program's process group; the denylist denies `setsid` and `setpgid` (see "Contained child processes"). |
+| EndsWithParent | A watcher process outside the sandbox ends the program when sandy's parent ends (see "Ending with the parent"). |
 | ExposedPortsRelayed, ForwardedPortsRelayed | One relay process outside the program's sandbox, confined by its own Landlock domain and seccomp filters (see "Exposed and forwarded ports"). |
 
 ## Exposed and forwarded ports
@@ -75,7 +76,10 @@ One relay process serves all pairs. sandy starts it before it confines itself:
    program's process group has ended (see "Contained child processes").
 2. sandy verifies that it has one thread and forks twice. The intermediate process exits at once,
    so the relay is not a child of the program and the program's `wait` never reaps it. The relay
-   is a fork of sandy, not a new program; a single-threaded parent makes this safe.
+   is a fork of sandy, not a new program; a single-threaded parent makes this safe. It starts a
+   session of its own and blocks every signal except the fault signals, so that no process group
+   or terminal signal (for example Ctrl+C) ends it while the program runs (see "Ending with the
+   parent" for why these signals matter).
 3. The relay closes every descriptor except its listeners, the pidfd, standard error and a
    readiness pipe. It then confines itself:
    - no_new_privs;
@@ -183,6 +187,54 @@ Costs and differences from the exec model:
   which sandy keeps until it exits, that is after the group has ended.
 - If both sandy and the guard are killed with `SIGKILL`, nothing ends the group. Both run sandy's
   command line, so `pkill -9 -f sandy` does this. Killing sandy alone is safe.
+
+## Ending with the parent
+
+With `process.end_with_parent = true` a watcher process ends the program when the process that
+started sandy ends:
+
+1. sandy reads its parent's process ID (`getppid`) as the first step of `main`. With
+   `--parent-pid`, the caller names its own process ID, and sandy refuses when its parent is
+   another process, for example because the caller has already ended and sandy was re-parented.
+   Without `--parent-pid`, a parent that ends before this first step cannot be detected: sandy
+   then already has another parent, the process it was re-parented to. "Parent" is always the
+   direct parent; a wrapper such as `sh -c`, `timeout` or `systemd-run` between the application
+   and sandy is the parent instead.
+2. Before it starts the watcher, sandy opens a pidfd for that process ID and checks that
+   `getppid` still returns it. If it does not, the parent ended in between, and sandy refuses to
+   start the program. A process ID that another process got in between fails this check too.
+3. sandy opens a pidfd for its own process ID. The program keeps this ID after `execve`; with
+   `children = "contained"` it stays the supervising sandy's.
+4. sandy starts the watcher like the relay: it forks twice, so the watcher is not a child of the
+   program, and continues only after the watcher has reported that it is confined. The watcher
+   starts a session of its own (`setsid`) and blocks every signal except the fault signals. It
+   keeps only the two pidfds and the readiness pipe, and confines itself with no_new_privs,
+   Landlock without file access and without TCP (from ABI 6 also the abstract socket scope), and
+   a seccomp filter that allows only polling, `pidfd_send_signal`, the readiness report, ending,
+   and the memory and clock calls of the Rust runtime. It has no Landlock signal scope: it must
+   signal the program, which runs in another Landlock domain.
+5. The watcher polls both pidfds. When the program ends first, the watcher ends. When the parent
+   ends, the watcher sends SIGTERM and SIGCONT through the program's pidfd (SIGCONT, so that a
+   stopped program gets the request), waits at most 5 seconds for the program to end, and then
+   sends SIGKILL. A pidfd always names the same process, so a reused process ID cannot redirect
+   the signals. If polling fails, the watcher ends the program the same way, because it can no
+   longer see the parent.
+
+With `contained`, the supervising sandy forwards SIGTERM to the program and ends the group when the
+program ends; SIGKILL to the supervising sandy makes the guard end the group.
+
+Two rules keep the program from stopping the watcher. The policy requires `signals = "isolated"`,
+so the program cannot signal the watcher, which is outside its Landlock domain. And the watcher is
+in a session and process group of its own with its signals blocked: the kernel sends some signals
+to a whole process group or to a terminal's foreground group (Ctrl+C, a hangup, SIGTTIN, SIGHUP
+and SIGCONT to an orphaned group with a stopped member) without the permission check that
+Landlock hooks, and the program can cause some of them. The relay starts the same way for the same
+reason.
+
+Residual risk: if the watcher itself is killed from outside the sandbox, for example by the
+out-of-memory killer, nothing ends the program with its parent. The watcher uses about 2 MB, so the
+killer chooses it only after larger processes; an unprivileged process cannot lower its own
+priority for the killer.
 
 ## Landlock
 

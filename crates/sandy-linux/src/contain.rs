@@ -34,24 +34,14 @@ use std::ptr;
 
 use sandy_core::SandboxError;
 
+use crate::helper::{block_signals, close_descriptors_except, pipe};
 use crate::launch::ensure_single_thread;
-use crate::relay::{close_descriptors_except, pipe};
 
 /// Shells report a program that a signal ended with this status plus the signal number.
 const SIGNALED: i32 = 128;
 /// The forked child's exit status when it cannot start the program. sandy reports the message
 /// from the pipe instead.
 const START_FAILED: i32 = 125;
-/// Signals that report a fault of sandy itself. sandy does not block them, so a fault ends it.
-const FAULTS: [libc::c_int; 7] = [
-    libc::SIGSEGV,
-    libc::SIGBUS,
-    libc::SIGILL,
-    libc::SIGFPE,
-    libc::SIGTRAP,
-    libc::SIGSYS,
-    libc::SIGABRT,
-];
 
 /// Starts the program in a process group that sandy ends when the program ends, and returns the
 /// exit status for sandy. `start` runs in the forked child: it confines the child and executes
@@ -419,23 +409,9 @@ impl Signals {
     /// Blocks every signal except the faults. Blocked signals stay pending until sandy waits for
     /// them, also when their action is to ignore them.
     fn block() -> Result<Signals, SandboxError> {
-        // SAFETY: sigset_t is plain data; sigfillset and sigdelset initialize and change it, and
-        // sigprocmask writes the previous mask into `previous`.
-        unsafe {
-            let mut blocked: libc::sigset_t = mem::zeroed();
-            libc::sigfillset(&mut blocked);
-            for fault in FAULTS {
-                libc::sigdelset(&mut blocked, fault);
-            }
-            let mut previous: libc::sigset_t = mem::zeroed();
-            if libc::sigprocmask(libc::SIG_BLOCK, &blocked, &mut previous) != 0 {
-                return Err(SandboxError::io(
-                    "cannot block signals",
-                    io::Error::last_os_error(),
-                ));
-            }
-            Ok(Signals { blocked, previous })
-        }
+        let (blocked, previous) =
+            block_signals().map_err(|error| SandboxError::io("cannot block signals", error))?;
+        Ok(Signals { blocked, previous })
     }
 
     /// Restores the mask sandy had before `block`. execve keeps the mask.

@@ -100,6 +100,12 @@ fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
             "file-write* (mode, owner, flags, times, extended attributes, ACLs) only on read_write \
              paths, by path and through open descriptors alike"
         }
+        Requirement::EndsWithParent => {
+            return Mechanism::Missing(
+                "not implemented on macOS yet: sandy replaces itself with the program, and no \
+                 process of sandy watches its parent",
+            );
+        }
         Requirement::ChildProcessesContained => {
             return Mechanism::Missing(
                 "not implemented on macOS yet: sandy replaces itself with the program, so nothing \
@@ -150,6 +156,7 @@ mod tests {
             forward: Vec::new(),
             signals,
             children: sandy_core::ChildProcesses::Allowed,
+            end_with_parent: false,
             path_metadata: PathMetadata::Deny,
             environment: EnvironmentPolicy::default(),
             windows: WindowsPolicy::default(),

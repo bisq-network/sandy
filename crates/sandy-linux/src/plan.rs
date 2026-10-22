@@ -31,6 +31,8 @@ pub struct Sandbox {
     /// `process.children = "contained"`: sandy stays the program's parent and ends its process
     /// group when the program ends, instead of replacing itself with the program.
     pub contain: bool,
+    /// `process.end_with_parent`: a watcher ends the program when sandy's parent ends.
+    pub end_with_parent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -86,6 +88,7 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
             },
             relay: RelayConfig::new(&policy.expose, &policy.forward, abi),
             contain: policy.children == ChildProcesses::Contained,
+            end_with_parent: policy.end_with_parent,
         }),
         _ => None,
     };
@@ -196,6 +199,18 @@ fn plan_item(
                  SIGKILL when the program ends and reaps it as child subreaper"
                     .to_string(),
             ),
+        },
+        Requirement::EndsWithParent => match (&host.landlock, &host.seccomp, &host.pidfd) {
+            (Err(reason), _, _) | (_, Err(reason), _) | (_, _, Err(reason)) => unavailable(reason),
+            _ => enforced(format!(
+                "a watcher process outside the sandbox, not a child of the program, polls pidfds \
+                 for sandy's parent and the program; when the parent ends it sends SIGTERM to the \
+                 program (with children = \"contained\": to the supervising sandy) and SIGKILL \
+                 {} s later; in a session of its own with its signals blocked; confined by \
+                 no_new_privs, Landlock ABI {abi} without file access or TCP, and a seccomp \
+                 filter that allows only polling, pidfd_send_signal, ending and memory calls",
+                crate::watch::GRACE.as_secs()
+            )),
         },
         Requirement::ExposedPortsRelayed | Requirement::ForwardedPortsRelayed => {
             match (&host.landlock, &host.seccomp, &host.pidfd) {
@@ -414,6 +429,7 @@ mod tests {
             forward: Vec::new(),
             signals: SignalScope::Isolated,
             children: sandy_core::ChildProcesses::Allowed,
+            end_with_parent: false,
             path_metadata: PathMetadata::Deny,
             environment: EnvironmentPolicy::default(),
             windows: WindowsPolicy::default(),
@@ -635,6 +651,29 @@ mod tests {
             assert!(!sandbox.contain);
             assert!(!sandbox.filter.keep_process_group);
         }
+    }
+
+    #[test]
+    fn ending_with_the_parent_needs_landlock_seccomp_and_pidfd() {
+        let mut policy = policy();
+        policy.end_with_parent = true;
+        let plan = plan_for(&policy, &host(Some(9)));
+        assert_eq!(unavailable(&plan), vec![]);
+        status(&plan, Requirement::EndsWithParent);
+        assert!(plan.sandbox.unwrap().end_with_parent);
+
+        let mut no_pidfd = host(Some(9));
+        no_pidfd.pidfd = Err("no pidfd_open".to_string());
+        let plan = plan_for(&policy, &no_pidfd);
+        assert!(unavailable(&plan).contains(&Requirement::EndsWithParent));
+
+        policy.end_with_parent = false;
+        assert!(
+            !plan_for(&policy, &host(Some(9)))
+                .sandbox
+                .unwrap()
+                .end_with_parent
+        );
     }
 
     #[test]

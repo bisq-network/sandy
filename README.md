@@ -306,6 +306,8 @@ matters only on Windows (see [Windows](#windows)); on Linux and macOS it does no
 | `--ip all\|none` | IPv4 and IPv6 networking, including loopback. | `none` |
 | `--unix-sockets all\|none` | Unix domain sockets. Read the warning below before using `all`. | `none` |
 | `--signals any\|isolated` | Whether the program may signal processes outside its sandbox. | `any` |
+| `--end-with-parent` | End the program when the process that started sandy ends. Needs `--signals isolated`. See [Processes](#processes). | off |
+| `--parent-pid PID` | With `--end-with-parent`: the caller's own process ID. sandy refuses to start if its parent is another process. | |
 | `--children allowed\|none\|contained` | Whether the program may start other processes, and whether they may outlive it. See [Processes](#processes). | `allowed` |
 | `--expose ADDRESS=PORT` | Relay connections on the loopback `ADDRESS` to the program's loopback `PORT`. Needs `--ip all`. | |
 | `--forward PORT=ADDRESS` | Relay the program's connections to its loopback `PORT` to the loopback `ADDRESS` outside the sandbox. Needs `--ip all`. | |
@@ -348,6 +350,7 @@ forward = [{ port = 18081, to = "127.0.0.1:8081" }]
 [process]
 signals = "any"                 # "any" | "isolated"
 children = "allowed"            # "allowed" | "none" | "contained"
+end_with_parent = false         # end the program when sandy's parent ends
 
 [environment]
 pass = ["LANG"]                 # copied from sandy's environment, if set
@@ -430,6 +433,15 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
   On Linux, a program can also start a readable file through the dynamic loader, so there this
   limits which files can be executed directly, not which code runs. Every process stays in the
   sandbox either way.
+- `end_with_parent = true` ends the program when the process that started sandy ends, for
+  example when your application crashes while its helper runs in the sandbox. sandy asks the
+  program to end (SIGTERM on Linux) and kills it 5 seconds later if it is still running; on
+  Windows it ends the program at once. Unlike a program's own check of its parent, this works
+  also when the program is compromised. It needs `signals = "isolated"`. Combine it with
+  `children = "contained"` so that the processes the program started end too. The parent is the
+  process that starts sandy directly, so start sandy from your application itself, not through a
+  shell or another wrapper, and pass your process ID with `--parent-pid`: otherwise a crash in
+  the moment sandy starts goes unnoticed. macOS does not support it yet and refuses it.
 - Debugging and reading the memory of processes outside the sandbox are always denied, and the
   program can never gain privileges, for example through setuid programs.
 

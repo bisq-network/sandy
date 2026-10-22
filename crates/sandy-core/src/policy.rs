@@ -166,6 +166,9 @@ pub struct ProcessPolicy {
     pub signals: SignalScope,
     #[serde(default)]
     pub children: ChildProcesses,
+    /// End the target when the process that started sandy ends.
+    #[serde(default)]
+    pub end_with_parent: bool,
 }
 
 /// Whether the target may start other processes. Threads are always allowed, and so is replacing
@@ -278,6 +281,7 @@ pub enum PolicyError {
     },
     ChildrenNeedUnixSocketsDenied(ChildProcesses),
     ContainedChildrenNeedIsolatedSignals,
+    EndWithParentNeedsIsolatedSignals,
     ProgramNotAFile(PathBuf),
     InvalidEnvironmentName(String),
     InvalidEnvironmentValue(String),
@@ -316,6 +320,9 @@ impl fmt::Display for PolicyError {
                 f,
                 "children = \"{}\" needs unix_sockets = \"none\": through a Unix socket the program could ask a service of the user to start a process that outlives it",
                 children.name()
+            ),
+            PolicyError::EndWithParentNeedsIsolatedSignals => f.write_str(
+                "end_with_parent needs signals = \"isolated\": otherwise the program could kill the process that ends it",
             ),
             PolicyError::ContainedChildrenNeedIsolatedSignals => f.write_str(
                 "children = \"contained\" needs signals = \"isolated\": otherwise the program could kill sandy, and the processes it started would outlive it",

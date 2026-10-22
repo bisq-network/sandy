@@ -70,6 +70,7 @@ compiler fail, and sandy fails closed.
 | `UnixSocketsDenied` | Profile: no `network-bind` or `network-outbound` for Unix sockets. With `ip = "all"`, the resolver socket is the one exception. |
 | `SignalsIsolated` | Profile: `(allow signal (target self) (target same-sandbox))` instead of `(allow signal)`. |
 | `ChildProcessesDenied` | Profile: no `(allow process-fork)`, and an explicit `(deny process-fork)` at the end. Seatbelt checks `fork`, `vfork` and `posix_spawn` without `POSIX_SPAWN_SETEXEC` as `process-fork`; all three fail with `EPERM` (CI run 39857337279 logged `deny(1) process-fork` for each). Threads are no operation, and `execve` of an allowed program, which replaces the image without creating a process, stays covered by `process-exec*`. sandy's own final `posix_spawn` with `POSIX_SPAWN_SETEXEC` is not a `process-fork`, and the relay is forked before the profile applies, so both still work. |
+| `EndsWithParent` | Not implemented; the plan reports it unavailable and sandy refuses. See "Known limitations". |
 | `ChildProcessesContained` | Not implemented; the plan reports it unavailable and sandy refuses. See "Known limitations". |
 | `MetadataConfined` | Profile: `file-write*`, which includes `file-write-mode`, `-owner`, `-flags`, `-times`, `-xattr`, `-acl` and `-setugid`, is denied explicitly and allowed again only on `read_write` paths. XNU runs the same MAC check for the path and the descriptor variant of each call (`chmod_vnode`, `vn_chown_internal`, `setutimes` and `vn_setxattr` serve both), so descriptors do not bypass the rule, and unlike on Linux the target keeps full metadata access inside writable paths. `linux.path_metadata = "allow"` only drops the requirement; the profile is the same. |
 
@@ -389,6 +390,9 @@ no privilege, and closing them would break ordinary programs:
   by renaming another file over it. Programs must write such a file in place.
 - `getcwd` fails when the working directory is outside the policy.
 - sandy cannot run inside another Seatbelt sandbox; `sandy check` reports this.
+- `process.end_with_parent` is not implemented: no process of sandy watches the parent. A possible
+  design, not verified: a watcher forked twice like the relay, with kqueue `NOTE_EXIT` on the
+  parent and the program.
 - `process.children = "contained"` is not implemented. sandy replaces itself with the program, so
   nothing would end the processes the program leaves behind; launchd adopts them. A possible
   design, not verified: keep sandy as the parent like on Linux, deny `setsid` and `setpgid` with

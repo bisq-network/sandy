@@ -375,6 +375,66 @@ pub fn appcontainer_children_blocked() -> bool {
     blocked
 }
 
+/// How long a process may take to end after sandy has ended it.
+pub const END_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(unix)]
+pub fn is_running(pid: u32) -> bool {
+    // SAFETY: signal 0 only checks whether the process exists.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(windows)]
+pub fn is_running(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+    // SAFETY: the handle is checked before use and closed afterwards.
+    unsafe {
+        let process = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if process.is_null() {
+            return false;
+        }
+        let running = WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
+        CloseHandle(process);
+        running
+    }
+}
+
+/// Whether process `pid` ends within `timeout`.
+pub fn ends_soon(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !is_running(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+/// Ends process `pid`, which a test started and left running.
+#[cfg(unix)]
+pub fn kill_process(pid: u32) {
+    // SAFETY: kill takes a process ID and a signal.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+}
+
+#[cfg(windows)]
+pub fn kill_process(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    // SAFETY: the handle is checked before use and closed afterwards.
+    unsafe {
+        let process = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if !process.is_null() {
+            TerminateProcess(process, 1);
+            CloseHandle(process);
+        }
+    }
+}
+
 /// Helpers for the Linux tests.
 #[cfg(target_os = "linux")]
 pub mod linux {

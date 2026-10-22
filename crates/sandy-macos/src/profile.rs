@@ -420,6 +420,7 @@ mod tests {
             forward: Vec::new(),
             signals: SignalScope::Any,
             children: sandy_core::ChildProcesses::Allowed,
+            end_with_parent: false,
             path_metadata: PathMetadata::Deny,
             environment: EnvironmentPolicy::default(),
             windows: WindowsPolicy::default(),

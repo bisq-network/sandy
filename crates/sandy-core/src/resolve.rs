@@ -38,6 +38,7 @@ pub struct ResolvedPolicy {
     pub forward: Vec<ForwardedPort>,
     pub signals: SignalScope,
     pub children: ChildProcesses,
+    pub end_with_parent: bool,
     pub path_metadata: PathMetadata,
     pub environment: EnvironmentPolicy,
     pub windows: WindowsPolicy,
@@ -74,6 +75,9 @@ impl ResolvedPolicy {
         validate_environment(&policy.environment)?;
         validate_expose(&policy.network.expose, policy.network.ip)?;
         validate_children(&policy.process, policy.network.unix_sockets)?;
+        if policy.process.end_with_parent && policy.process.signals != SignalScope::Isolated {
+            return Err(PolicyError::EndWithParentNeedsIsolatedSignals);
+        }
         validate_forward(
             &policy.network.forward,
             &policy.network.expose,
@@ -90,6 +94,7 @@ impl ResolvedPolicy {
             forward: policy.network.forward.clone(),
             signals: policy.process.signals,
             children: policy.process.children,
+            end_with_parent: policy.process.end_with_parent,
             path_metadata: policy.linux.path_metadata,
             environment: policy.environment.clone(),
             windows: policy.windows.clone(),
@@ -119,6 +124,9 @@ impl ResolvedPolicy {
             ChildProcesses::Allowed => {}
             ChildProcesses::None => requirements.push(Requirement::ChildProcessesDenied),
             ChildProcesses::Contained => requirements.push(Requirement::ChildProcessesContained),
+        }
+        if self.end_with_parent {
+            requirements.push(Requirement::EndsWithParent);
         }
         if self.path_metadata == PathMetadata::Deny {
             requirements.push(Requirement::MetadataConfined);
@@ -657,6 +665,33 @@ mod tests {
         assert!(requirements.contains(&Requirement::ChildProcessesContained));
         assert!(requirements.contains(&Requirement::SignalsIsolated));
         assert!(!requirements.contains(&Requirement::ChildProcessesDenied));
+    }
+
+    #[test]
+    fn end_with_parent_needs_isolated_signals() {
+        let mut policy = Policy::default();
+        policy.process.end_with_parent = true;
+        let error = ResolvedPolicy::resolve(&policy, None).unwrap_err();
+        assert!(matches!(
+            error,
+            PolicyError::EndWithParentNeedsIsolatedSignals
+        ));
+        assert!(
+            error.to_string().contains("signals = \"isolated\""),
+            "{error}"
+        );
+
+        policy.process.signals = SignalScope::Isolated;
+        let requirements = ResolvedPolicy::resolve(&policy, None)
+            .unwrap()
+            .requirements();
+        assert!(requirements.contains(&Requirement::EndsWithParent));
+
+        policy.process.end_with_parent = false;
+        let requirements = ResolvedPolicy::resolve(&policy, None)
+            .unwrap()
+            .requirements();
+        assert!(!requirements.contains(&Requirement::EndsWithParent));
     }
 
     #[test]

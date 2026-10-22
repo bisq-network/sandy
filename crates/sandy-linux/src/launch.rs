@@ -17,7 +17,7 @@ use sandy_core::{SandboxError, TargetCommand};
 use crate::filter::{FilterConfig, Filters};
 use crate::host::THREADS_DIR;
 use crate::plan::{LandlockConfig, Sandbox};
-use crate::{contain, filter, relay};
+use crate::{contain, filter, relay, watch};
 
 /// Applies `sandbox` and executes the target. Without `contain`, sandy applies it to itself and
 /// returns only on failure. With `contain`, a forked child does, and sandy returns the exit
@@ -29,6 +29,13 @@ use crate::{contain, filter, relay};
 pub fn launch(sandbox: &Sandbox, command: &TargetCommand) -> Result<i32, SandboxError> {
     if let Some(relay) = &sandbox.relay {
         relay::start(relay)?;
+    }
+    if sandbox.end_with_parent {
+        // SAFETY: getppid has no preconditions.
+        let parent = command
+            .parent
+            .map_or_else(|| unsafe { libc::getppid() }, |pid| pid as _);
+        watch::start(parent, sandbox.landlock.abi)?;
     }
     let ruleset = prepare_ruleset(&sandbox.landlock)?;
     // The filter is built again in the forked child, whose process ID it needs, but a policy it

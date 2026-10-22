@@ -29,6 +29,10 @@ Options (they extend the policy file):
   --children allowed|none|contained
                              whether the program may start other processes; contained ends
                              them all when the program ends (default: allowed)
+  --end-with-parent          end the program when the process that started sandy ends
+                             (needs --signals isolated)
+  --parent-pid PID           with --end-with-parent: the process ID of the caller; sandy
+                             refuses to start if its parent is another process
   --expose ADDRESS=PORT      relay connections on the loopback ADDRESS to the program's
                              loopback PORT, for example 127.0.0.1:18080=8080 (repeatable;
                              needs --ip all)
@@ -65,6 +69,7 @@ pub struct Overrides {
     unix_sockets: Option<NetworkAccess>,
     signals: Option<SignalScope>,
     children: Option<ChildProcesses>,
+    end_with_parent: bool,
     path_metadata: Option<PathMetadata>,
     pass_env: Vec<String>,
     set_env: Vec<(String, String)>,
@@ -93,6 +98,9 @@ impl Overrides {
         }
         if let Some(children) = self.children {
             policy.process.children = children;
+        }
+        if self.end_with_parent {
+            policy.process.end_with_parent = true;
         }
         if let Some(path_metadata) = self.path_metadata {
             policy.linux.path_metadata = path_metadata;
@@ -138,6 +146,7 @@ pub struct Invocation {
     pub policy_file: Option<PathBuf>,
     pub overrides: Overrides,
     pub cwd: Option<PathBuf>,
+    pub parent_pid: Option<u32>,
     pub program: Option<PathBuf>,
     pub args: Vec<OsString>,
 }
@@ -182,6 +191,7 @@ where
         policy_file: None,
         overrides: Overrides::default(),
         cwd: None,
+        parent_pid: None,
         program: None,
         args: Vec::new(),
     };
@@ -219,6 +229,7 @@ where
                     other => return Err(format!("invalid --signals value {other:?}").into()),
                 })
             }
+            Long("end-with-parent") => overrides.end_with_parent = true,
             Long("linux-path-metadata") => {
                 overrides.path_metadata = Some(match parser.value()?.string()?.as_str() {
                     "deny" => PathMetadata::Deny,
@@ -266,6 +277,7 @@ where
                 overrides.expose.push(ExposedPort { listen, port });
             }
             Long("cwd") => invocation.cwd = Some(parser.value()?.into()),
+            Long("parent-pid") => invocation.parent_pid = Some(parser.value()?.parse()?),
             Value(program) => {
                 invocation.program = Some(program.into());
                 invocation.args = parser.raw_args()?.collect();
@@ -340,6 +352,7 @@ mod tests {
             "isolated",
             "--children",
             "none",
+            "--end-with-parent",
             "--linux-path-metadata",
             "allow",
             "--set-env",
@@ -362,6 +375,7 @@ mod tests {
         assert_eq!(policy.network.ip, NetworkAccess::All);
         assert_eq!(policy.process.signals, SignalScope::Isolated);
         assert_eq!(policy.process.children, ChildProcesses::None);
+        assert!(policy.process.end_with_parent);
         assert_eq!(policy.linux.path_metadata, PathMetadata::Allow);
         assert_eq!(policy.environment.set["A"], "b=c");
         assert_eq!(policy.windows.appcontainer_name.as_deref(), Some("name"));

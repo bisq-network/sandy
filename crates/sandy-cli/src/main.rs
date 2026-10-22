@@ -14,6 +14,9 @@ const EXIT_FAILURE: u8 = 125;
 const EXIT_NOT_ENFORCEABLE: u8 = 1;
 
 fn main() -> ExitCode {
+    // First, so that the window in which sandy's parent can end unseen stays as short as possible
+    // (`process.end_with_parent`).
+    let parent_at_start = parent_process_id();
     let command = match args::parse(std::env::args_os().skip(1)) {
         Ok(command) => command,
         Err(message) => {
@@ -32,7 +35,7 @@ fn main() -> ExitCode {
         }
         Command::Relay { listener, target } => relay(listener, target),
         Command::Forward { listen, socket } => forward(listen, &socket),
-        Command::Sandbox(invocation) => match execute(*invocation) {
+        Command::Sandbox(invocation) => match execute(*invocation, parent_at_start) {
             Ok(code) => code,
             Err(message) => {
                 eprintln!("sandy: {message}");
@@ -145,7 +148,38 @@ fn forward(_listen: std::net::SocketAddr, _socket: &std::path::Path) -> ExitCode
     ExitCode::from(EXIT_FAILURE)
 }
 
-fn execute(invocation: Invocation) -> Result<ExitCode, String> {
+/// The process ID of sandy's parent. Windows does not re-parent processes, so the backend finds
+/// the parent there.
+#[cfg(unix)]
+fn parent_process_id() -> Option<u32> {
+    // SAFETY: getppid has no preconditions.
+    Some(unsafe { libc::getppid() } as u32)
+}
+
+#[cfg(not(unix))]
+fn parent_process_id() -> Option<u32> {
+    None
+}
+
+/// The parent for `end_with_parent`: the one the caller named with `--parent-pid`, which must be
+/// the parent sandy saw at its start, or else that parent.
+fn parent_for(
+    named: Option<u32>,
+    at_start: Option<u32>,
+    end_with_parent: bool,
+) -> Result<Option<u32>, String> {
+    match (named, at_start) {
+        (Some(_), _) if !end_with_parent => Err("--parent-pid needs end_with_parent".to_string()),
+        (Some(named), Some(actual)) if named != actual => Err(format!(
+            "the process that started sandy is {actual}, not {named} (--parent-pid); \
+             {named} may have ended already"
+        )),
+        (Some(named), _) => Ok(Some(named)),
+        (None, at_start) => Ok(at_start),
+    }
+}
+
+fn execute(invocation: Invocation, parent_at_start: Option<u32>) -> Result<ExitCode, String> {
     let mut policy = match &invocation.policy_file {
         Some(path) => {
             let text = std::fs::read_to_string(path)
@@ -194,6 +228,11 @@ fn execute(invocation: Invocation) -> Result<ExitCode, String> {
                 args: invocation.args,
                 env: target_environment(&resolved.environment, std::env::vars_os()),
                 cwd: invocation.cwd,
+                parent: parent_for(
+                    invocation.parent_pid,
+                    parent_at_start,
+                    resolved.end_with_parent,
+                )?,
             };
             let code = backend
                 .run(&resolved, &command)
@@ -266,5 +305,22 @@ impl Backend for UnsupportedBackend {
         Err(sandy_core::SandboxError::new(
             "this operating system is not supported",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_named_parent_must_be_the_parent_at_start() {
+        assert_eq!(parent_for(None, Some(7), true), Ok(Some(7)));
+        assert_eq!(parent_for(None, None, true), Ok(None));
+        assert_eq!(parent_for(Some(7), Some(7), true), Ok(Some(7)));
+        // Windows reads no parent at start; the backend checks the named one.
+        assert_eq!(parent_for(Some(7), None, true), Ok(Some(7)));
+        let error = parent_for(Some(7), Some(1), true).unwrap_err();
+        assert!(error.contains("is 1, not 7"), "{error}");
+        assert!(parent_for(Some(7), Some(7), false).is_err());
     }
 }

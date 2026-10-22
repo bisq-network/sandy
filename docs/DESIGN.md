@@ -50,6 +50,7 @@ forward = [{ port = 18081, to = "127.0.0.1:8081" }]     # relay out to a local s
 [process]
 signals = "any"               # "any" | "isolated"
 children = "allowed"          # "allowed" | "none" | "contained"; see rule 9
+end_with_parent = false       # end the program when sandy's parent ends; see rule 11
 
 [environment]
 pass = ["LANG"]               # copied from sandy's environment if present
@@ -118,6 +119,18 @@ Rules:
    requirement for programs that change metadata by path (`tar`, `cp -p`, `install`); they can
    then change the metadata of every file the user owns. macOS and Windows protect metadata
    outside the writable paths in every case.
+11. `process.end_with_parent = true` ends the program when the process that started sandy ends,
+   for example when the application that runs a helper in the sandbox crashes. The program gets a
+   request to end (SIGTERM on Linux) and is killed if it has not ended 5 seconds later; Windows
+   ends the program's job at once. With `children = "allowed"` on Linux, processes the program
+   started can outlive it, as with any end of the program; use `children = "contained"` to end
+   them too. The option needs `signals = "isolated"`, so that the program cannot kill the process
+   that ends it. "Parent" means sandy's direct parent: a wrapper between the application and
+   sandy (`sh -c 'a; sandy ...'`, `timeout`, `systemd-run`) is the parent instead. sandy reads
+   the parent's process ID as its first step; a parent that ends before that cannot be
+   detected. The caller closes this gap with `--parent-pid` and its own process ID: sandy then
+   refuses when its parent is another process. sandy also refuses when it sees that its parent
+   has already ended. macOS cannot enforce the option yet, so sandy refuses there.
 
 ## Exposed ports
 
@@ -188,6 +201,7 @@ Rules:
 | `ForwardedPortsRelayed` | `network.forward` is not empty |
 | `ChildProcessesDenied` | `process.children = "none"` |
 | `ChildProcessesContained` | `process.children = "contained"` |
+| `EndsWithParent` | `process.end_with_parent = true` |
 
 A requirement is a lower bound. A backend may deny more, but never less. For example,
 `UnixSocketsDenied` guarantees that the program cannot connect to Unix sockets outside its
@@ -246,6 +260,14 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   leave the group. The guard watches the program with a pidfd and sandy through a pipe, and kills
   the group when either ends, so the group ends with the program even while sandy is stopped.
   sandy also kills the group when the program exits and waits until the group is gone.
+- `process.end_with_parent`: a watcher process, forked twice like the relay, polls pidfds for
+  sandy's parent and for the program (with `contained`: the supervising sandy). When the parent
+  ends, it sends SIGTERM and SIGCONT and, 5 seconds later, SIGKILL. Like the relay, it runs in a
+  session of its own with every signal except the fault signals blocked, so no process group or
+  terminal signal reaches it. It confines itself with no_new_privs, Landlock without file access
+  or TCP, and a seccomp filter limited to polling, `pidfd_send_signal`, the readiness report,
+  ending and the memory and clock calls of the Rust runtime; it has no Landlock signal scope,
+  because it must signal the program.
 - Exposed and forwarded ports: one relay forked twice before sandy confines itself, so it is not
   a child of the program. It watches the program with a pidfd and ends at most one second after
   it (rule 5 of "Forwarded ports"). It confines itself with no_new_privs, Landlock without file
@@ -286,6 +308,8 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
 - `process.children = "contained"` is not implemented: sandy replaces itself with the program, so
   nothing would end the processes the program leaves behind. The plan reports it unavailable, and
   sandy refuses.
+- `process.end_with_parent` is not implemented: no process of sandy watches the parent. The plan
+  reports it unavailable, and sandy refuses.
 - `sandy check` compiles the profile without applying it, so it reports operations or filters that
   this macOS does not know.
 - `docs/macos.md` describes the profile, the system set with a reason per entry, and the known
@@ -344,6 +368,10 @@ Details, limitations and sources: `docs/windows.md`.
 - `process.children = "contained"` needs nothing beyond the job: every child joins the program's
   job (no breakaway), sandy ends the job when the program exits, and kill-on-close ends it when
   sandy dies. `allowed` behaves the same on Windows.
+- `process.end_with_parent`: sandy finds its parent in a process snapshot, opens it and checks
+  that it was created before sandy (Windows records only the parent's process ID, which another
+  process can have once the parent has ended). sandy waits for the program and the parent, and
+  ends the program's job when the parent ends.
 - Relay lifetime (rule 5): when the program exits, sandy ends its job at once and closes the
   relays' standard input; the relays accept what already waits in the backlog, close their
   listeners, drain for at most one second and end; sandy ends the relay job one second after

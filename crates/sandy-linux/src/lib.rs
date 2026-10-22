@@ -5,11 +5,13 @@
 
 mod contain;
 mod filter;
+mod helper;
 mod host;
 mod launch;
 mod plan;
 mod relay;
 mod system;
+mod watch;
 
 use sandy_core::{Backend, PlanItem, ResolvedPolicy, SandboxError, TargetCommand};
 

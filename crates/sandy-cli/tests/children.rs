@@ -3,12 +3,10 @@
 
 mod common;
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use common::*;
 
-/// How long a process may take to end after sandy has ended it.
-const END_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the processes the program starts would run on their own, in milliseconds: much
 /// longer than the test.
 const LONG_SLEEP: &str = "60000";
@@ -51,41 +49,6 @@ fn unsupported() -> Option<&'static str> {
     None
 }
 
-#[cfg(unix)]
-fn is_running(pid: u32) -> bool {
-    // SAFETY: signal 0 only checks whether the process exists.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-}
-
-#[cfg(windows)]
-fn is_running(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
-    };
-    // SAFETY: the handle is checked before use and closed afterwards.
-    unsafe {
-        let process = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
-        if process.is_null() {
-            return false;
-        }
-        let running = WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
-        CloseHandle(process);
-        running
-    }
-}
-
-fn ends_soon(pid: u32) -> bool {
-    let deadline = Instant::now() + END_TIMEOUT;
-    while Instant::now() < deadline {
-        if !is_running(pid) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
-}
-
 #[test]
 fn children_contained_ends_what_the_program_leaves_behind() {
     #[cfg(windows)]
@@ -110,8 +73,7 @@ fn children_contained_ends_what_the_program_leaves_behind() {
         lines[0].assert_ok();
         let pid: u32 = lines[0].detail.parse().unwrap();
         let survived = is_running(pid);
-        // SAFETY: ends the process the control run left behind.
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        kill_process(pid);
         assert!(survived, "control: process {pid} ended with the program");
     }
 
@@ -125,7 +87,10 @@ fn children_contained_ends_what_the_program_leaves_behind() {
     );
     lines[0].assert_ok();
     let pid: u32 = lines[0].detail.parse().unwrap();
-    assert!(ends_soon(pid), "process {pid} outlived the program");
+    assert!(
+        ends_soon(pid, END_TIMEOUT),
+        "process {pid} outlived the program"
+    );
 }
 
 #[test]

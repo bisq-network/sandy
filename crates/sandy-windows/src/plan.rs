@@ -115,7 +115,8 @@ fn contained(
         | Requirement::ExposedPortsRelayed
         | Requirement::ForwardedPortsRelayed
         | Requirement::ChildProcessesDenied
-        | Requirement::ChildProcessesContained,
+        | Requirement::ChildProcessesContained
+        | Requirement::EndsWithParent,
         Some(reason),
     ) = (requirement, job_problem(host))
     {
@@ -147,6 +148,12 @@ fn contained(
              the job and cannot change the limit; the relays run without a console and with \
              PROCESS_CREATION_CHILD_PROCESS_RESTRICTED, so the program cannot start processes \
              through them either"
+                .to_string(),
+        ),
+        Requirement::EndsWithParent => enforced(
+            "sandy waits for the process that started it (found in a process snapshot and \
+             checked by its creation time) and ends the program's job when that process ends; \
+             the AppContainer cannot open sandy"
                 .to_string(),
         ),
         Requirement::ChildProcessesContained => enforced(
