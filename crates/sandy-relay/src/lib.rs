@@ -240,10 +240,44 @@ pub unsafe fn inherited_listener(raw: u64) -> io::Result<TcpListener> {
     use std::os::fd::FromRawFd;
     let fd = i32::try_from(raw)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "descriptor out of range"))?;
-    // SAFETY: the caller guarantees that `fd` is an open socket nobody else owns.
+    // Check before taking ownership: an owned descriptor that turns out to be closed makes the
+    // standard library abort when it is dropped.
+    check_stream_socket(fd)?;
+    // SAFETY: the caller guarantees that `fd` is an open socket nobody else owns, and the check
+    // above confirmed that it is an open stream socket.
     let listener = unsafe { TcpListener::from_raw_fd(fd) };
     listener.local_addr()?;
     Ok(listener)
+}
+
+#[cfg(unix)]
+fn check_stream_socket(fd: i32) -> io::Result<()> {
+    // SAFETY: F_GETFD only reads the descriptor flags.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut kind: libc::c_int = 0;
+    let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: kind and length are valid, correctly sized out pointers.
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&mut kind as *mut libc::c_int).cast(),
+            &mut length,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if kind != libc::SOCK_STREAM {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "descriptor is not a stream socket",
+        ));
+    }
+    Ok(())
 }
 
 /// Takes ownership of a listening socket that the parent process passed by descriptor or handle
