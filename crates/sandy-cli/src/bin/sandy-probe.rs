@@ -1234,23 +1234,316 @@ mod windows_actions {
     }
 }
 
-/// Actions for the macOS escape tests (`tests/escape_macos.rs`).
+/// Actions for the macOS escape tests (`tests/escape_macos.rs`) and the macOS security review
+/// (`tests/review_macos.rs`).
 #[cfg(target_os = "macos")]
 mod macos {
     use std::ffi::{CString, c_char};
-    use std::io;
+    use std::fs;
+    use std::io::{self, Read};
     use std::ptr;
 
-    pub const ACTIONS: &[&str] = &["clone", "ptrace-attach"];
+    pub const ACTIONS: &[&str] = &[
+        "clone",
+        "ptrace-attach",
+        "vol-read",
+        "fsgetpath",
+        "socket-family",
+        "nstat-open",
+        "chflags-set",
+        "utimes-set",
+        "setxattr-set",
+        "getxattr-get",
+        "host-vm-stats",
+        "symlink",
+        "sysctl-proc-cputype",
+    ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
         match action {
             "clone" => clone(target),
             "ptrace-attach" => ptrace_attach(target),
+            "vol-read" => vol_read(target),
+            "fsgetpath" => fsgetpath_action(target),
+            "socket-family" => socket_family(target),
+            "nstat-open" => nstat_open(),
+            "chflags-set" => chflags_set(target),
+            "utimes-set" => utimes_set(target),
+            "setxattr-set" => setxattr_set(target),
+            "getxattr-get" => getxattr_get(target),
+            "host-vm-stats" => host_vm_stats(),
+            "symlink" => symlink(target),
+            "sysctl-proc-cputype" => sysctl_proc_cputype(target),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "unknown action",
             )),
+        }
+    }
+
+    /// `LINK::DEST`: creates a symbolic link at LINK that points to DEST. macOS, unlike Landlock,
+    /// has no separate symlink-creation right, so this works inside a writable path. The review
+    /// checks that reading through such a link does not reach DEST.
+    fn symlink(target: &str) -> io::Result<String> {
+        let (link, dest) = target
+            .split_once("::")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "expected LINK::DEST"))?;
+        std::os::unix::fs::symlink(dest, link).map(|()| format!("{link} -> {dest}"))
+    }
+
+    /// Reads `sysctl.proc_cputype` for another process id. The sandbox gates sysctl reads by name,
+    /// and this name is in the allowlist, so it may act as a per-pid existence and architecture
+    /// oracle even though process listing (kern.proc.*) is denied.
+    fn sysctl_proc_cputype(target: &str) -> io::Result<String> {
+        let mut pid: libc::pid_t = target
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"))?;
+        let name = c"sysctl.proc_cputype";
+        let mut cpu: libc::cpu_type_t = 0;
+        let mut len = std::mem::size_of::<libc::cpu_type_t>();
+        // SAFETY: sysctlbyname reads the NUL-terminated name and `pid` (newlen bytes), and writes
+        // up to `len` bytes into `cpu`, updating `len`. The newp pointer is not written.
+        let result = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                (&mut cpu as *mut libc::cpu_type_t).cast(),
+                &mut len,
+                (&mut pid as *mut libc::pid_t).cast(),
+                std::mem::size_of::<libc::pid_t>(),
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(format!("cputype {cpu}"))
+    }
+
+    fn cstr(value: &str) -> io::Result<CString> {
+        CString::new(value).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL byte"))
+    }
+
+    /// Parses `DEV:INODE` (the st_dev and st_ino the test read outside the sandbox).
+    fn dev_inode(target: &str) -> io::Result<(u64, u64)> {
+        let (dev, inode) = target
+            .split_once(':')
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "expected DEV:INODE"))?;
+        let parse = |value: &str| {
+            value
+                .parse::<u64>()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid DEV:INODE"))
+        };
+        Ok((parse(dev)?, parse(inode)?))
+    }
+
+    /// Opens a file by device and inode through the volfs path `/.vol/<dev>/<inode>`, which names
+    /// a file without walking its directory path. If the sandbox checks only the textual path, a
+    /// file outside the policy could be reachable this way.
+    fn vol_read(target: &str) -> io::Result<String> {
+        let (dev, inode) = dev_inode(target)?;
+        let path = format!("/.vol/{dev}/{inode}");
+        let mut content = Vec::new();
+        fs::File::open(&path)?.read_to_end(&mut content)?;
+        Ok(format!("{} bytes via {path}", content.len()))
+    }
+
+    /// A file system id, as fsgetpath expects it: `val[0]` is the device number.
+    #[repr(C)]
+    struct Fsid {
+        val: [i32; 2],
+    }
+
+    unsafe extern "C" {
+        /// Public since macOS 10.13: resolves the path of a file named by device and inode.
+        fn fsgetpath(
+            buffer: *mut c_char,
+            size: libc::size_t,
+            fsid: *const Fsid,
+            objid: u64,
+        ) -> libc::ssize_t;
+    }
+
+    /// Asks the kernel for the path of a file named only by device and inode (fsgetpath). A
+    /// success reveals the location of a file the policy does not grant.
+    fn fsgetpath_action(target: &str) -> io::Result<String> {
+        let (dev, inode) = dev_inode(target)?;
+        let fsid = Fsid {
+            val: [dev as i32, 0],
+        };
+        let mut buffer = [0 as c_char; 1024];
+        // SAFETY: fsgetpath reads the two-int fsid and writes up to buffer.len() bytes into
+        // buffer, which outlives the call.
+        let length = unsafe { fsgetpath(buffer.as_mut_ptr(), buffer.len(), &fsid, inode) };
+        if length < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let end = (length as usize).min(buffer.len()).saturating_sub(1);
+        let bytes: Vec<u8> = buffer[..end].iter().map(|c| *c as u8).collect();
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Creates a socket of a non-Unix family. `(deny default)` should refuse socket creation of
+    /// every family except AF_UNIX, which the profile re-allows for socketpair.
+    fn socket_family(target: &str) -> io::Result<String> {
+        let (family, kind, protocol) = match target {
+            "route" => (libc::PF_ROUTE, libc::SOCK_RAW, 0),
+            "system" => (libc::PF_SYSTEM, libc::SOCK_DGRAM, libc::SYSPROTO_CONTROL),
+            "ndrv" => (libc::PF_NDRV, libc::SOCK_RAW, 0),
+            "key" => (libc::PF_KEY, libc::SOCK_RAW, 2),
+            "inet" => (libc::AF_INET, libc::SOCK_STREAM, 0),
+            "inet6" => (libc::AF_INET6, libc::SOCK_STREAM, 0),
+            "vsock" => (libc::AF_VSOCK, libc::SOCK_STREAM, 0),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unknown family",
+                ));
+            }
+        };
+        // SAFETY: socket takes no pointers.
+        let fd = unsafe { libc::socket(family, kind, protocol) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: closing a descriptor this function owns.
+        unsafe { libc::close(fd) };
+        Ok(format!("fd {fd}"))
+    }
+
+    /// Creates a PF_SYSTEM kernel control socket and resolves the network statistics control by
+    /// name with CTLIOCGINFO. The name resolution is a file-ioctl, which the profile denies except
+    /// for four harmless requests, so even a created socket cannot reach the statistics control.
+    fn nstat_open() -> io::Result<String> {
+        // SAFETY: socket takes no pointers.
+        let fd = unsafe { libc::socket(libc::PF_SYSTEM, libc::SOCK_DGRAM, libc::SYSPROTO_CONTROL) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut info: libc::ctl_info = libc::ctl_info {
+            ctl_id: 0,
+            ctl_name: [0; libc::MAX_KCTL_NAME],
+        };
+        let name = b"com.apple.network.statistics";
+        for (slot, byte) in info.ctl_name.iter_mut().zip(name.iter()) {
+            *slot = *byte as c_char;
+        }
+        // SAFETY: CTLIOCGINFO reads ctl_name and writes ctl_id, both inside the valid `info`.
+        let result = unsafe { libc::ioctl(fd, libc::CTLIOCGINFO, &mut info) };
+        let outcome = if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(format!("ctl_id {}", info.ctl_id))
+        };
+        // SAFETY: closing a descriptor this function owns.
+        unsafe { libc::close(fd) };
+        outcome
+    }
+
+    /// Changes file flags by path (chflags). file-write-flags is part of file-write*, denied
+    /// outside writable paths.
+    fn chflags_set(target: &str) -> io::Result<String> {
+        let path = cstr(target)?;
+        // SAFETY: chflags reads the NUL-terminated path; UF_HIDDEN is a plain flag.
+        if unsafe { libc::chflags(path.as_ptr(), libc::UF_HIDDEN) } == 0 {
+            Ok(String::new())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// Changes access and modification times by path (utimes). file-write-times is part of
+    /// file-write*.
+    fn utimes_set(target: &str) -> io::Result<String> {
+        let path = cstr(target)?;
+        let times = [
+            libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+        ];
+        // SAFETY: utimes reads the path and two timevals.
+        if unsafe { libc::utimes(path.as_ptr(), times.as_ptr()) } == 0 {
+            Ok(String::new())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// Writes an extended attribute by path (setxattr). file-write-xattr is part of file-write*.
+    fn setxattr_set(target: &str) -> io::Result<String> {
+        let path = cstr(target)?;
+        let name = c"user.sandy.review";
+        let value = b"x";
+        // SAFETY: setxattr reads the path, the name and `value` of the given length.
+        let result = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+                0,
+            )
+        };
+        if result == 0 {
+            Ok(String::new())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// Reads an extended attribute by path (getxattr). It needs read access to the file, so a file
+    /// outside the policy must be unreachable.
+    fn getxattr_get(target: &str) -> io::Result<String> {
+        let path = cstr(target)?;
+        let name = c"com.apple.FinderInfo";
+        let mut buffer = [0u8; 32];
+        // SAFETY: getxattr reads the path and name and writes up to buffer.len() bytes.
+        let read = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0,
+                0,
+            )
+        };
+        if read < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(format!("{read} bytes"))
+        }
+    }
+
+    /// Reads system-wide virtual memory statistics through the host name port (mach_host_self).
+    /// This needs no mach-lookup: the port is a task special port inherited across exec.
+    fn host_vm_stats() -> io::Result<String> {
+        // mach_host_self is the documented way to get the host name port; the libc binding is
+        // marked deprecated but is the only one available.
+        #[allow(deprecated)]
+        // SAFETY: mach_host_self returns a send right and takes no arguments.
+        let host = unsafe { libc::mach_host_self() };
+        // SAFETY: vm_statistics64 is plain integer data; all zeros is a valid starting value.
+        let mut info: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+        let mut count = libc::HOST_VM_INFO64_COUNT;
+        // SAFETY: host_statistics64 writes a vm_statistics64 into `info`; `count` bounds the write
+        // and is updated in place.
+        let kr = unsafe {
+            libc::host_statistics64(
+                host,
+                libc::HOST_VM_INFO64,
+                (&mut info as *mut libc::vm_statistics64).cast(),
+                &mut count,
+            )
+        };
+        if kr == 0 {
+            Ok(format!("free_count {}", info.free_count))
+        } else {
+            Err(io::Error::other(format!("host_statistics64 returned {kr}")))
         }
     }
 
