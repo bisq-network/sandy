@@ -8,10 +8,15 @@ use std::fmt;
 const NUL: u16 = 0;
 const EQUALS: u16 = b'=' as u16;
 
-/// The one variable sandy adds when the policy does not set it: the Windows directory. System
-/// DLLs locate the Windows directory through it; without it, for example, Winsock
-/// initialization and the random number generator of the C runtime fail.
+/// The Windows directory. System DLLs locate it through this variable; without it, for example,
+/// Winsock initialization and the random number generator of the C runtime fail.
 pub const SYSTEM_ROOT: &str = "SystemRoot";
+
+/// The local application data folder of the user. `CreateProcessW` fails with
+/// `ERROR_ENVVAR_NOT_FOUND` for an AppContainer process whose environment lacks it. Windows then
+/// replaces it with `<value>\Packages\<AppContainer name>\AC` and sets `TEMP` and `TMP` to
+/// the `Temp` folder below that, also when the policy sets them.
+pub const LOCAL_APP_DATA: &str = "LOCALAPPDATA";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentError {
@@ -38,18 +43,18 @@ impl fmt::Display for EnvironmentError {
 
 impl std::error::Error for EnvironmentError {}
 
-/// Builds the block from `vars` (UTF-16 name and value). `required` lists variables to add when
-/// `vars` does not contain them; the policy keeps precedence.
+/// Builds the block from `vars` (UTF-16 name and value) and `fixed`, the variables Windows needs
+/// to start the program. A fixed variable replaces a variable of `vars` with the same name: its
+/// value must name the real folder, and a policy has no reason to change it.
 pub fn environment_block(
     vars: &[(Vec<u16>, Vec<u16>)],
-    required: &[(Vec<u16>, Vec<u16>)],
+    fixed: &[(Vec<u16>, Vec<u16>)],
 ) -> Result<Vec<u16>, EnvironmentError> {
-    let mut entries: Vec<&(Vec<u16>, Vec<u16>)> = vars.iter().collect();
-    for variable in required {
-        if !vars.iter().any(|(name, _)| same_name(name, &variable.0)) {
-            entries.push(variable);
-        }
-    }
+    let mut entries: Vec<&(Vec<u16>, Vec<u16>)> = vars
+        .iter()
+        .filter(|(name, _)| !fixed.iter().any(|(fixed, _)| same_name(name, fixed)))
+        .collect();
+    entries.extend(fixed);
     for (name, value) in &entries {
         // A leading `=` would be a hidden per-drive variable, and an inner `=` would split the
         // entry at the wrong place.
@@ -145,13 +150,13 @@ mod tests {
     }
 
     #[test]
-    fn adds_required_variables_unless_set() {
-        let required = vars(&[("SystemRoot", r"C:\Windows")]);
-        let block = environment_block(&vars(&[("LANG", "C")]), &required).unwrap();
+    fn fixed_variables_replace_the_policy() {
+        let fixed = vars(&[("SystemRoot", r"C:\Windows")]);
+        let block = environment_block(&vars(&[("LANG", "C")]), &fixed).unwrap();
         assert_eq!(text(&block), "LANG=C\0SystemRoot=C:\\Windows\0\0");
 
-        let block = environment_block(&vars(&[("SYSTEMROOT", r"D:\Win")]), &required).unwrap();
-        assert_eq!(text(&block), "SYSTEMROOT=D:\\Win\0\0");
+        let block = environment_block(&vars(&[("SYSTEMROOT", r"D:\Win")]), &fixed).unwrap();
+        assert_eq!(text(&block), "SystemRoot=C:\\Windows\0\0");
     }
 
     #[test]

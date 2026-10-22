@@ -204,8 +204,10 @@ Details, limitations and sources: `docs/windows.md`.
   exemption, which `sandy setup` installs (administrator rights); connections from outside to
   the program are always blocked. An exempt AppContainer reaches loopback without capabilities,
   so `ip = "none"` refuses it.
-- `unix_sockets = "none"` is unavailable with read-write paths: AF_UNIX connect needs only write
-  access to the socket file.
+- `UnixSocketsDenied` through the file ACL: AF_UNIX connect needs write access to the socket
+  file, which the program has only in read-write paths and its profile folder.
+- sandy sets `SystemRoot` and `LOCALAPPDATA`; without the latter Windows refuses to create an
+  AppContainer process. Windows sets `LOCALAPPDATA`, `TEMP` and `TMP` to the profile folder.
 - Job object with kill-on-close, no breakaway and all UI restrictions. The program is created
   suspended and assigned before it runs.
 - Handle inheritance limited to the standard handles with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`.

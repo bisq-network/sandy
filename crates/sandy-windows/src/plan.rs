@@ -1,7 +1,7 @@
 //! The enforcement plan: how this backend enforces each requirement of a policy on a given host.
 //! `plan_for` is pure; `sys` detects the host capabilities.
 
-use sandy_core::{NetworkAccess, PathAccess, PlanItem, Requirement, ResolvedPolicy, SystemAccess};
+use sandy_core::{NetworkAccess, PlanItem, Requirement, ResolvedPolicy, SystemAccess};
 
 use crate::name::validate_appcontainer_name;
 
@@ -22,11 +22,6 @@ const SYSTEM_NONE: &str = "Windows grants every AppContainer read and execute ac
      system directories (C:\\Windows, C:\\Program Files) through the ALL APPLICATION PACKAGES \
      group, and a Less Privileged AppContainer keeps it through ALL RESTRICTED APPLICATION \
      PACKAGES; sandy cannot remove these grants, so system = \"none\" cannot be enforced";
-
-const SOCKETS_IN_WRITABLE_PATHS: &str = "connecting to an AF_UNIX socket on Windows needs only \
-     write access to the socket file, so the program could reach sockets that processes outside \
-     the sandbox create in its read-write paths; sandy cannot tell socket files from other files. \
-     Use a policy without read-write paths or with unix_sockets = \"all\"";
 
 /// Reports every requirement of `policy` as enforced or unavailable on `host`.
 pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<PlanItem> {
@@ -112,20 +107,11 @@ fn contained(
                  exemption"
             )),
         },
-        Requirement::UnixSocketsDenied => {
-            if policy
-                .paths
-                .iter()
-                .any(|rule| rule.access == PathAccess::ReadWrite)
-            {
-                unavailable(SOCKETS_IN_WRITABLE_PATHS.into())
-            } else {
-                enforced(format!(
-                    "connecting to an AF_UNIX socket needs write access to the socket file, and \
-                     AppContainer {name:?} has no write access to any policy path"
-                ))
-            }
-        }
+        Requirement::UnixSocketsDenied => enforced(format!(
+            "connecting to an AF_UNIX socket needs write access to the socket file; \
+             AppContainer {name:?} can write only in read-write paths and in its profile folder, \
+             where Windows also puts TEMP"
+        )),
         Requirement::SignalsIsolated => enforced(format!(
             "own console for the program; AppContainer {name:?} cannot open processes outside \
              it; job UI restrictions and low integrity block window messages"
@@ -161,7 +147,8 @@ mod tests {
     use std::path::PathBuf;
 
     use sandy_core::{
-        EnforcementPlan, PathMetadata, PathRule, Policy, SignalScope, Status, WindowsPolicy,
+        EnforcementPlan, PathAccess, PathMetadata, PathRule, Policy, SignalScope, Status,
+        WindowsPolicy,
     };
 
     use super::*;
@@ -304,14 +291,12 @@ mod tests {
     }
 
     #[test]
-    fn unix_sockets_need_no_writable_paths() {
+    fn unix_sockets_are_enforced_with_writable_paths() {
         let writable = with_rule(policy(), PathAccess::ReadWrite);
-        let reason = unavailable(status(&writable, &host(), Requirement::UnixSocketsDenied));
-        assert!(reason.contains("AF_UNIX"), "{reason}");
-
-        let mut sockets_allowed = writable;
-        sockets_allowed.unix_sockets = NetworkAccess::All;
-        assert!(plan(&sockets_allowed, &host()).is_enforceable());
+        assert!(matches!(
+            status(&writable, &host(), Requirement::UnixSocketsDenied),
+            Status::Enforced { .. }
+        ));
     }
 
     #[test]

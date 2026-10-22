@@ -104,12 +104,17 @@ fn ip_networking_is_denied_by_default() {
     let fixture = Fixture::new("ipdeny");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
-    let lines = controlled(
-        &fixture.access_args(),
-        &[("tcp-connect", &address), ("tcp-listen", "127.0.0.1:0")],
-    );
+    let lines = controlled(&fixture.access_args(), &[("tcp-connect", &address)]);
     lines[0].assert_blocked();
-    lines[1].assert_blocked();
+
+    // Inbound: no connection from outside may reach a listener of the program, whether the
+    // sandbox refuses the bind (Linux) or drops the incoming traffic (Windows).
+    let (connected, line) = inbound_tcp(None);
+    assert!(connected, "control: {line:?}");
+    line.assert_ok();
+    let (connected, line) = inbound_tcp(Some(&fixture.access_args()));
+    assert!(!connected, "connected to the program: {line:?}");
+    line.assert_blocked();
 }
 
 #[test]

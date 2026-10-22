@@ -5,11 +5,11 @@ Windows Store apps: the process gets a token with an AppContainer SID, runs at l
 every access check also has to grant access to that SID or to one of its capabilities. Microsoft
 treats the AppContainer as a security boundary that it services with security updates [MSRC].
 
-Status: the code builds for `x86_64-pc-windows-msvc` and `x86_64-pc-windows-gnu`, and its
-platform-independent parts are unit-tested. **Nothing has run on a real Windows host yet.** Wine
-does not implement AppContainers, so Wine runs prove nothing about isolation. Statements below
-that depend on Windows behavior come from the cited sources; the escape tests in
-`crates/sandy-cli/tests/escape_windows.rs` check them once they run on Windows.
+Status: the shared escape tests (`crates/sandy-cli/tests/escape.rs`) and the Windows escape
+tests (`escape_windows.rs`) pass on Windows 11 build 26200, both elevated and with a filtered
+(non-elevated, medium integrity) token; see "Verified on Windows 11". Statements that no test
+checks come from the cited sources. Wine does not implement AppContainers, so Wine runs prove
+nothing about isolation.
 
 ## Requirements and mechanisms
 
@@ -20,9 +20,9 @@ that depend on Windows behavior come from the cited sources; the escape tests in
 | `NoPrivilegeEscalation` | AppContainer token, inherited by every child; job object without breakaway | no AppContainer |
 | `ProcessMemoryIsolated` | Processes outside the AppContainer grant its SID no access | no AppContainer |
 | `InheritedHandlesClosed` | `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` with the three standard handles | never |
-| `EnvironmentControlled` | Environment block built from the policy, plus `SystemRoot` | never |
+| `EnvironmentControlled` | Environment block built from the policy, plus `SystemRoot` and `LOCALAPPDATA` | never |
 | `IpNetworkDenied` | No network capabilities, no loopback exemption | AppContainer exempt from loopback isolation; firewall service not running |
-| `UnixSocketsDenied` | No write access to any socket file | the policy has read-write paths |
+| `UnixSocketsDenied` | No write access to socket files outside read-write paths | no AppContainer |
 | `SignalsIsolated` | Own console; AppContainer access checks; job UI restrictions | no AppContainer |
 
 Every requirement also needs `windows.appcontainer_name` (or `--appcontainer NAME`). Without it,
@@ -33,14 +33,22 @@ unavailable. A name has at most 64 characters from `A-Z a-z 0-9 - _ .` and space
 ## The AppContainer
 
 `sandy run` creates the AppContainer profile of the name for the current user on first use, with
-`CreateAppContainerProfile`. If the profile exists, sandy derives its SID with
-`DeriveAppContainerSidFromAppContainerName`. Microsoft documents a profile as the precondition for
-creating a process in an AppContainer [Legacy apps], and Chromium's sandbox notes that process
-creation fails without one [Chromium policy].
+`CreateAppContainerProfile`. Microsoft documents a profile as the precondition for creating a
+process in an AppContainer [Legacy apps], and Chromium's sandbox notes that process creation
+fails without one [Chromium policy]. Later runs derive the SID with
+`DeriveAppContainerSidFromAppContainerName` and do not call `CreateAppContainerProfile` again: on
+Windows 11, calling it for an existing profile while other runs started processes in the same
+AppContainer made it fail with `E_UNEXPECTED`, and made a concurrent `CreateProcessW` fail with
+`ERROR_FILE_NOT_FOUND`. sandy recognizes a registered profile by the key
+`HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\<SID>`,
+which Windows creates for it. The location is not documented; if it changes, sandy calls
+`CreateAppContainerProfile` on every run again, which reports an existing profile. A named mutex
+(`Local\sandy-appcontainer-profiles`) keeps two first runs from creating the profile at once.
 
 The profile creates a folder for the AppContainer below `%LOCALAPPDATA%\Packages\<name>`. The
-program can read, write and execute files there. The folder belongs to this AppContainer name
-only and keeps its content between runs.
+program can read, write and execute files there; Windows points its `TEMP` and `TMP` to the
+`AC\Temp` folder there. The folder belongs to this AppContainer name only and keeps its content
+between runs.
 
 ### What every AppContainer can read (the system set)
 
@@ -182,12 +190,28 @@ accept layer, so a blocked connection times out instead of failing at once [Proj
   Microsoft documents only a debugging mode for it (`CheckNetIsolation LoopbackExempt -is`, which
   must keep running) [IPC]. sandy does not support it.
 - **Listening itself** works without capabilities; only the incoming connections are dropped
-  [Project Zero 2021].
+  [Project Zero 2021]. On Windows 11, `tcp-listen` inside the sandbox succeeds, and an outside
+  client that connects to it times out, with and without the exemption.
 
 The exemption is bound to the AppContainer SID and does not need any network capability: an
 exempt AppContainer can reach `127.0.0.1` with no capabilities at all [Project Zero 2021]. The
 plan therefore refuses `ip = "none"` for an exempt AppContainer. Use separate AppContainer names
 for policies with and without IP networking.
+
+### Local servers in the sandbox
+
+A program in the sandbox cannot accept loopback TCP connections from processes outside it, also
+with `ip = "all"` and the exemption. Options, tested on Windows 11 build 26200:
+
+| Option | Result | Cost |
+|---|---|---|
+| `CheckNetIsolation LoopbackExempt -is -n=NAME` (debugging mode) | Does not help: connections still time out while it runs | Needs a running elevated helper; meant for debugging |
+| AF_UNIX socket in a read-write path | Works: the program listens, outside clients connect (`unix_socket_server_in_a_writable_path_is_reachable_from_outside`) | Clients must speak AF_UNIX; no change to sandy |
+| Listening TCP socket created outside the AppContainer and inherited | Works, even with `ip = "none"`: the program accepted a connection from an outside client | sandy would need a policy option, for example `listen = ["127.0.0.1:8080"]`, to create the socket and pass it with the handle list |
+| Relay in sandy that forwards one configured port | Not tested | sandy copies all traffic; more code |
+| Firewall rule for the package SID | Not tested; the AppContainer filters sit in the Windows Service Hardening sublayer, which ordinary firewall rules do not override [Project Zero 2021] | Administrator rights |
+
+The inherited socket is the simplest general solution; it is not implemented.
 
 ### The setup step
 
@@ -209,18 +233,15 @@ exemption.
 
 Windows has AF_UNIX sockets. Connecting needs write permission on the socket file, which is a
 file system object with an ACL [AF_UNIX]. The program can therefore connect only to sockets whose
-file it may write:
+file it may write: sockets in its read-write paths and in its AppContainer profile folder.
+`UnixSocketsDenied` guarantees that the program cannot connect to Unix sockets outside its
+read-write paths (a lower bound, see DESIGN.md), so the backend enforces it through the ACL.
 
-- Without read-write paths it can write no socket file, and `UnixSocketsDenied` is enforced.
-- In read-write paths, a socket that a process outside the sandbox created inherits the ACE of
-  the directory, and the program can connect to it. sandy cannot tell socket files from other
-  files. `UnixSocketsDenied` is therefore unavailable for policies with read-write paths; such
-  policies need `unix_sockets = "all"`.
-
-With `unix_sockets = "all"`, the program still reaches only sockets it may write, not "every Unix
-socket the user can reach". Abstract AF_UNIX addresses do not seem to work on current Windows
-[PostgreSQL]. Whether AppContainer processes can use AF_UNIX at all is not documented; the escape
-test `unix_sockets_in_writable_paths_are_reachable` finds out.
+Inside read-write paths the program can connect to every socket, also to one that a process
+outside the sandbox created there. AppContainer processes can use AF_UNIX; the escape test
+`unix_sockets_in_writable_paths_are_reachable` shows it. With `unix_sockets = "all"`, the program
+still reaches only sockets it may write, not "every Unix socket the user can reach". Abstract
+AF_UNIX addresses do not seem to work on current Windows [PostgreSQL].
 
 Named pipes are not Unix sockets, but the same access check protects them: the default DACL of a
 pipe grants nothing to AppContainers [CreateNamedPipeW] [Implementing an AppContainer].
@@ -264,11 +285,19 @@ messages that reach processes outside the sandbox.
 - **Handles.** `bInheritHandles` is TRUE, but `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` limits
   inheritance to three handles [UpdateProcThreadAttribute]. sandy duplicates each standard
   handle as an inheritable handle. A missing standard handle becomes the NUL device, and a
-  console becomes a relayed pipe.
+  console becomes a relayed pipe. A standard handle that is a socket gives the program network
+  access through that socket, also with `ip = "none"`: AppContainer network isolation applies to
+  sockets the AppContainer creates, not to sockets created outside it (verified on Windows 11
+  with a listening socket). This holds on every platform for inherited sockets.
 - **Environment.** sandy builds the block from the policy, sorted by name, case-insensitive,
-  "without regard to locale" [Environment]. It adds one variable when the policy does not set it:
-  `SystemRoot`, from `GetSystemWindowsDirectoryW`. System DLLs need it; without it, for example,
-  Winsock initialization fails.
+  "without regard to locale" [Environment]. It sets two variables, which replace policy values:
+  - `SystemRoot`, from `GetSystemWindowsDirectoryW`. System DLLs need it; without it, for
+    example, Winsock initialization fails.
+  - `LOCALAPPDATA`, from `SHGetKnownFolderPath`. Without it, `CreateProcessW` fails for an
+    AppContainer process with `ERROR_ENVVAR_NOT_FOUND` (203). Windows replaces it with
+    `<LOCALAPPDATA>\Packages\<name>\AC` and sets `TEMP` and `TMP` to the `Temp` folder below,
+    also when the policy sets them. Both facts were observed on Windows 11 build 26200; Microsoft
+    does not document them.
 - **Command line.** sandy quotes each argument so that `CommandLineToArgvW` and the C runtime
   read it back unchanged [Parsing arguments], and refuses command lines longer than 32,767
   characters [CreateProcessW]. It refuses `.bat` and `.cmd` programs: `CreateProcessW` runs them
@@ -281,9 +310,12 @@ messages that reach processes outside the sandbox.
 ## Known limitations
 
 1. `system = "none"` is unavailable (see above).
-2. `unix_sockets = "none"` is unavailable with read-write paths (see above).
-3. Loopback connections from outside to the program are not possible, also with `ip = "all"`.
-4. The program can write its AppContainer profile folder.
+2. Loopback TCP connections from outside to the program are not possible, also with `ip = "all"`
+   (see "Local servers in the sandbox").
+3. The program can write its AppContainer profile folder, and can connect to Unix sockets in it
+   and in its read-write paths.
+4. Windows sets `LOCALAPPDATA`, `TEMP` and `TMP` of the program; policy values for them have no
+   effect.
 5. Children of a directory that have a protected DACL do not receive the grant.
 6. sandy refuses to grant a directory that contains junctions or symbolic links.
 7. Ctrl+C ends the program; it cannot handle it.
@@ -294,16 +326,27 @@ messages that reach processes outside the sandbox.
    security descriptor of the volume device and is not verified.
 10. sandy cannot remove its grants (see "Removing the changes").
 
-## Open questions for the first Windows run
+## Verified on Windows 11
 
-- Can a process start in an AppContainer with `CREATE_NO_WINDOW` (own console host)?
-- Do writes in read-write paths work without a low integrity label?
-- Can AppContainer processes use AF_UNIX at all?
-- Does `NetworkIsolationGetAppContainerConfig` work without administrator rights? The plan
-  needs it for `ip = "none"`.
-- The shared test `ip_networking_is_denied_by_default` expects that `tcp-listen` fails. On
-  Windows, listening probably succeeds and only incoming connections are dropped.
-- Does a current directory outside the policy prevent the program from starting?
+Host: Windows 11 build 26200 (VM), binaries built for `x86_64-pc-windows-gnu`. The tests ran three
+times in an elevated session and three times from a scheduled task with `/RL LIMITED` (medium
+integrity, Administrators deny-only). Every run: `sandy_windows` 46 of 46, `escape` 10 of 10 (the
+Unix socket test is Unix-only), `escape_windows` 21 of 21.
+
+Facts these runs established:
+
+- A program starts in an AppContainer with `CREATE_NO_WINDOW` and gets its own console.
+- Writes, deletes and directory creation in read-write paths work without an integrity label.
+- AppContainer processes can use AF_UNIX.
+- `NetworkIsolationGetAppContainerConfig` works without administrator rights.
+- Listening on loopback succeeds without capabilities; incoming connections time out, also with
+  the exemption. Outbound connections to the internet fail with `WSAEACCES` (10013).
+- A working directory outside the policy does not prevent the start; the program cannot list it.
+- `DeleteAppContainerProfile` from the PowerShell snippet above removes a profile and its
+  folder.
+- The program cannot open other processes of the user (`PROCESS_VM_READ`, `PROCESS_TERMINATE`),
+  write to the registry autostart key, open a named pipe with the default DACL, or receive
+  inherited handles other than the standard ones.
 
 ## Sources
 

@@ -8,9 +8,7 @@ use std::path::Path;
 use std::ptr;
 
 use sandy_core::{PathAccess, PathRule, SandboxError};
-use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, FALSE, INVALID_HANDLE_VALUE, WAIT_ABANDONED, WAIT_OBJECT_0,
-};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::Authorization::{
     EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SET_ACCESS,
     SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
@@ -26,11 +24,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandleEx, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
-use windows_sys::Win32::System::Threading::{
-    CreateMutexW, INFINITE, ReleaseMutex, WaitForSingleObject,
-};
 
-use super::util::{LocalBox, Sid, last_error, wide_nul, win32_error};
+use super::util::{LocalBox, SessionLock, Sid, last_error, wide_nul, win32_error};
 use crate::access::{
     ALL_APPLICATION_PACKAGES, Ace, AceKind, access_mask, ace_flags, grants, has_explicit_ace,
 };
@@ -62,7 +57,11 @@ pub fn grant(appcontainer: &str, rule: &PathRule) -> Result<Sid, SandboxError> {
     if !lacks_grant(&Dacl::read(&path, &rule.path)?)? {
         return Ok(capability);
     }
-    let _lock = ChangeLock::acquire()?;
+    // A change reads the DACL, adds one ACE and writes the whole DACL back. Without the lock,
+    // two runs that add different ACEs to the same object at the same time could each overwrite
+    // the ACE of the other. If a run died while it held the lock during propagation, some
+    // children may lack the inherited ACE, which denies access, never grants it.
+    let _lock = SessionLock::acquire(r"Local\sandy-dacl-changes")?;
     // Another run may have changed the DACL while this one waited for the lock.
     let dacl = Dacl::read(&path, &rule.path)?;
     if lacks_grant(&dacl)? {
@@ -72,43 +71,6 @@ pub fn grant(appcontainer: &str, rule: &PathRule) -> Result<Sid, SandboxError> {
         add_ace(&path, &rule.path, &dacl, &capability, mask, flags)?;
     }
     Ok(capability)
-}
-
-/// Serializes the DACL changes of sandy processes in this logon session. A change reads the
-/// DACL, adds one ACE and writes the whole DACL back. Without the lock, two runs that add
-/// different ACEs to the same object at the same time could each overwrite the ACE of the
-/// other. The program cannot hold the lock: an AppContainer has its own `Local\` namespace.
-struct ChangeLock(OwnedHandle);
-
-impl ChangeLock {
-    fn acquire() -> Result<ChangeLock, SandboxError> {
-        let name = wide_nul(r"Local\sandy-dacl-changes".as_ref());
-        // SAFETY: the name is NUL-terminated; null attributes give a handle that is not
-        // inheritable.
-        let handle = unsafe { CreateMutexW(ptr::null(), FALSE, name.as_ptr()) };
-        if handle.is_null() {
-            return Err(last_error("cannot create the lock for permission changes"));
-        }
-        // SAFETY: CreateMutexW succeeded, so the handle is new and owned by nobody else.
-        let lock = ChangeLock(unsafe { OwnedHandle::from_raw_handle(handle) });
-        // SAFETY: the handle is a valid mutex handle.
-        match unsafe { WaitForSingleObject(lock.0.as_raw_handle(), INFINITE) } {
-            // An abandoned mutex belonged to a sandy process that died while it held it; the
-            // lock passes to this process. If that process died during propagation, some
-            // children may lack the inherited ACE, which denies access, never grants it.
-            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(lock),
-            _ => Err(last_error(
-                "cannot wait for the lock for permission changes",
-            )),
-        }
-    }
-}
-
-impl Drop for ChangeLock {
-    fn drop(&mut self) {
-        // SAFETY: this process owns the mutex since `acquire` returned.
-        unsafe { ReleaseMutex(self.0.as_raw_handle()) };
-    }
 }
 
 fn file_identity(path: &[u16], display: &Path) -> Result<FileIdentity, SandboxError> {

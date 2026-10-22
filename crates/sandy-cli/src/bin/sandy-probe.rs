@@ -106,6 +106,7 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
         "reg-delete-hkcu" => windows_actions::registry_delete(target),
         "afunix-connect" => windows_actions::afunix_connect(target),
         "ctrl-break-console" => windows_actions::ctrl_break_console(),
+        "afunix-accept" => windows_actions::afunix_accept(target),
         "copy-self" => {
             fs::copy(std::env::current_exe()?, target).map(|bytes| format!("{bytes} bytes"))
         }
@@ -911,8 +912,8 @@ mod windows_actions {
         CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
     };
     use windows_sys::Win32::System::Registry::{
-        HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, RRF_RT_REG_SZ, RegCloseKey,
-        RegDeleteKeyValueW, RegGetValueW, RegOpenKeyExW, RegSetValueExW,
+        HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_SZ,
+        RegCloseKey, RegCreateKeyExW, RegDeleteKeyValueW, RegGetValueW, RegSetValueExW,
     };
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, PROCESS_VM_READ};
 
@@ -983,17 +984,23 @@ mod windows_actions {
         }
     }
 
+    /// Sets the value, and creates the key if a fresh user profile does not have it yet.
     pub fn registry_set(target: &str) -> io::Result<String> {
         let (key, value) = registry_target(target)?;
         let mut handle: HKEY = ptr::null_mut();
-        // SAFETY: key is NUL-terminated and handle is a valid out pointer.
+        // SAFETY: key is NUL-terminated; handle is a valid out pointer; the class, security
+        // attributes and disposition are optional and null.
         status(unsafe {
-            RegOpenKeyExW(
+            RegCreateKeyExW(
                 HKEY_CURRENT_USER,
                 key.as_ptr(),
                 0,
+                ptr::null(),
+                REG_OPTION_NON_VOLATILE,
                 KEY_SET_VALUE,
+                ptr::null(),
                 &mut handle,
+                ptr::null_mut(),
             )
         })?;
         let data = wide("probe");
@@ -1084,6 +1091,84 @@ mod windows_actions {
         outcome
     }
 
+    /// Listens on an AF_UNIX socket file and accepts one connection within 10 seconds. The
+    /// escape tests connect from outside the sandbox while this action waits.
+    pub fn afunix_accept(target: &str) -> io::Result<String> {
+        use windows_sys::Win32::Networking::WinSock::{
+            FD_SET, SOCKET, TIMEVAL, accept, bind, listen, select,
+        };
+
+        // SAFETY: WSADATA is plain data; WSAStartup fills it.
+        let mut data: WSADATA = unsafe { std::mem::zeroed() };
+        // SAFETY: data is a valid out pointer.
+        let code = unsafe { WSAStartup(0x0202, &mut data) };
+        if code != 0 {
+            return Err(io::Error::from_raw_os_error(code));
+        }
+        let mut address = SOCKADDR_UN {
+            sun_family: AF_UNIX,
+            sun_path: [0; 108],
+        };
+        if target.len() >= address.sun_path.len() {
+            return Err(invalid("path too long"));
+        }
+        for (slot, byte) in address.sun_path.iter_mut().zip(target.bytes()) {
+            *slot = byte as i8;
+        }
+        let last_error = || {
+            // SAFETY: WSAGetLastError has no preconditions.
+            io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
+        };
+        // SAFETY: socket has no memory safety preconditions.
+        let listener: SOCKET = unsafe { socket(i32::from(AF_UNIX), SOCK_STREAM, 0) };
+        if listener == INVALID_SOCKET {
+            return Err(last_error());
+        }
+        let outcome = (|| {
+            // SAFETY: address is a SOCKADDR_UN and its size is passed.
+            let bound = unsafe {
+                bind(
+                    listener,
+                    (&address as *const SOCKADDR_UN).cast::<SOCKADDR>(),
+                    std::mem::size_of::<SOCKADDR_UN>() as i32,
+                )
+            };
+            // SAFETY: listener is a bound socket.
+            if bound != 0 || unsafe { listen(listener, 1) } != 0 {
+                return Err(last_error());
+            }
+            let mut ready = FD_SET {
+                fd_count: 1,
+                fd_array: [0; 64],
+            };
+            ready.fd_array[0] = listener;
+            let timeout = TIMEVAL {
+                tv_sec: 10,
+                tv_usec: 0,
+            };
+            // SAFETY: ready holds one valid socket; the other sets are null.
+            let count =
+                unsafe { select(0, &mut ready, ptr::null_mut(), ptr::null_mut(), &timeout) };
+            match count {
+                0 => Err(io::Error::new(io::ErrorKind::TimedOut, "no connection")),
+                n if n < 0 => Err(last_error()),
+                _ => {
+                    // SAFETY: listener has a pending connection; the peer address is not needed.
+                    let peer = unsafe { accept(listener, ptr::null_mut(), ptr::null_mut()) };
+                    if peer == INVALID_SOCKET {
+                        return Err(last_error());
+                    }
+                    // SAFETY: peer is an open socket, closed exactly once.
+                    unsafe { closesocket(peer) };
+                    Ok("accepted".to_string())
+                }
+            }
+        })();
+        // SAFETY: listener is an open socket, closed exactly once.
+        unsafe { closesocket(listener) };
+        outcome
+    }
+
     /// Sends Ctrl+Break to every process attached to the console of this process, and
     /// survives it itself.
     pub fn ctrl_break_console() -> io::Result<String> {
@@ -1141,6 +1226,10 @@ mod windows_actions {
     }
 
     pub fn ctrl_break_console() -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn afunix_accept(_target: &str) -> io::Result<String> {
         unsupported()
     }
 }

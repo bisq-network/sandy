@@ -6,8 +6,11 @@ use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{FreeSid, PSID};
+use windows_sys::Win32::System::Registry::{
+    HKEY, HKEY_CURRENT_USER, KEY_READ, RegCloseKey, RegOpenKeyExW,
+};
 
-use super::util::{Sid, hresult_error, wide_nul};
+use super::util::{SessionLock, Sid, hresult_error, wide_nul};
 
 /// The AppContainer SID for `name`. Deriving it is a computation; it registers nothing.
 pub fn sid(name: &str) -> Result<Sid, SandboxError> {
@@ -24,11 +27,50 @@ pub fn sid(name: &str) -> Result<Sid, SandboxError> {
     take_sid(psid, name)
 }
 
-/// Registers the AppContainer profile of `name` for the current user, unless it exists, and
-/// returns its SID. Microsoft documents a profile as the precondition for creating a process in
-/// an AppContainer. The profile also creates a folder for the AppContainer below
+/// Registers the AppContainer profile of `name` for the current user, unless it is registered,
+/// and returns its SID. Microsoft documents a profile as the precondition for creating a process
+/// in an AppContainer. The profile also creates a folder for the AppContainer below
 /// `%LOCALAPPDATA%\Packages`.
+///
+/// `CreateAppContainerProfile` is called only when the profile is missing, under a lock. On
+/// Windows 11, calling it for an existing profile while other runs started processes in the
+/// same AppContainer made it fail with E_UNEXPECTED and made a concurrent `CreateProcessW` fail
+/// with ERROR_FILE_NOT_FOUND.
 pub fn ensure_profile(name: &str) -> Result<Sid, SandboxError> {
+    let container = sid(name)?;
+    if is_registered(&container) {
+        return Ok(container);
+    }
+    let _lock = SessionLock::acquire(r"Local\sandy-appcontainer-profiles")?;
+    if is_registered(&container) {
+        return Ok(container);
+    }
+    create_profile(name)
+}
+
+/// Whether the profile of `container` is registered for the current user. Windows records the
+/// registration under this key. Microsoft does not document the location; if it changes, this
+/// returns false and sandy calls `CreateAppContainerProfile`, which reports an existing profile.
+fn is_registered(container: &Sid) -> bool {
+    let key = wide_nul(
+        format!(
+            r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\{container}"
+        )
+        .as_ref(),
+    );
+    let mut handle: HKEY = std::ptr::null_mut();
+    // SAFETY: the key name is NUL-terminated and handle is a valid out pointer.
+    let status =
+        unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, key.as_ptr(), 0, KEY_READ, &mut handle) };
+    if status != 0 {
+        return false;
+    }
+    // SAFETY: the key is open and closed exactly once.
+    unsafe { RegCloseKey(handle) };
+    true
+}
+
+fn create_profile(name: &str) -> Result<Sid, SandboxError> {
     let wide = wide_nul(name.as_ref());
     let description = wide_nul("Created by sandy".as_ref());
     let mut psid: PSID = std::ptr::null_mut();

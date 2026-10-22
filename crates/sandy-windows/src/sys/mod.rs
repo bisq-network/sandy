@@ -13,10 +13,12 @@ use windows_sys::Win32::Security::{
     WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientServerSid,
     WinCapabilityPrivateNetworkClientServerSid,
 };
+use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
 
 use crate::cmdline::{command_line, is_batch_file, without_verbatim_prefix};
-use crate::envblock::{SYSTEM_ROOT, environment_block};
+use crate::envblock::{LOCAL_APP_DATA, SYSTEM_ROOT, environment_block};
 use crate::name::validate_appcontainer_name;
 use crate::plan::{HostCapabilities, NetworkCapability, network_capabilities, plan_for};
 use util::{Sid, wide, wide_nul};
@@ -121,8 +123,11 @@ fn environment(vars: &[(OsString, OsString)]) -> Result<Vec<u16>, SandboxError> 
         .iter()
         .map(|(name, value)| (wide(name), wide(value)))
         .collect();
-    let required = [(wide(SYSTEM_ROOT.as_ref()), windows_directory()?)];
-    environment_block(&vars, &required).map_err(|error| SandboxError::new(error.to_string()))
+    let fixed = [
+        (wide(SYSTEM_ROOT.as_ref()), windows_directory()?),
+        (wide(LOCAL_APP_DATA.as_ref()), local_app_data()?),
+    ];
+    environment_block(&vars, &fixed).map_err(|error| SandboxError::new(error.to_string()))
 }
 
 fn windows_directory() -> Result<Vec<u16>, SandboxError> {
@@ -140,6 +145,35 @@ fn windows_directory() -> Result<Vec<u16>, SandboxError> {
         }
         buffer.resize(len, 0);
     }
+}
+
+fn local_app_data() -> Result<Vec<u16>, SandboxError> {
+    let mut path: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: the folder ID is a valid GUID, a null token selects the current user, and path is
+    // a valid out pointer.
+    let hresult = unsafe {
+        SHGetKnownFolderPath(
+            &FOLDERID_LocalAppData,
+            KF_FLAG_DEFAULT as u32,
+            std::ptr::null_mut(),
+            &mut path,
+        )
+    };
+    let result = if hresult < 0 {
+        Err(util::hresult_error(
+            "cannot find the local application data folder",
+            hresult,
+        ))
+    } else {
+        // SAFETY: on success path is a NUL-terminated string from the function.
+        let len = (0..).take_while(|&i| unsafe { *path.add(i) } != 0).count();
+        // SAFETY: path holds `len` units before its NUL.
+        Ok(unsafe { std::slice::from_raw_parts(path, len) }.to_vec())
+    };
+    // SAFETY: the function allocated path with the COM allocator, also on failure, and it is
+    // freed exactly once; CoTaskMemFree accepts null.
+    unsafe { CoTaskMemFree(path.cast()) };
+    result
 }
 
 fn network_capability_sid(capability: NetworkCapability) -> Result<Sid, SandboxError> {

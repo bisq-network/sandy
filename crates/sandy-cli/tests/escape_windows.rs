@@ -9,11 +9,11 @@
 mod common;
 
 use std::fs;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::*;
@@ -157,6 +157,10 @@ fn cannot_open_processes_outside() {
 #[test]
 fn inherits_no_handles_but_the_standard_ones() {
     use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    // A process with strict handle checks ends with this status when it uses a value that is
+    // not a handle. The CI runners enable these checks; then the crash shows that nothing was
+    // inherited.
+    const STATUS_INVALID_HANDLE: i32 = 0xC000_0008_u32 as i32;
 
     let fixture = Fixture::new("handles");
     let file = fs::File::open(fixture.path("secret/file")).unwrap();
@@ -175,7 +179,12 @@ fn inherits_no_handles_but_the_standard_ones() {
     outside[0].assert_ok();
     assert!(outside[0].detail.ends_with(r"secret\file"), "{outside:?}");
 
-    let inside = probe_inside(&fixture.access_args(), &[("handle-path", &value)]);
+    let output = sandy(run_args(&fixture.access_args(), &[("handle-path", &value)]));
+    if output.status.code() == Some(STATUS_INVALID_HANDLE) {
+        return;
+    }
+    assert!(output.status.success(), "{output:?}");
+    let inside = parse(&output);
     assert!(
         inside[0].result != "ok" || inside[0].detail != outside[0].detail,
         "the program inherited a handle to the secret file: {inside:?}"
@@ -268,62 +277,25 @@ fn loopback_from_the_program_needs_the_exemption() {
     probe_inside(&exempt, &[("tcp-connect", &address)])[0].assert_ok();
 }
 
-fn free_loopback_address() -> SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-}
-
-/// Connects to `address` from this process while `child` waits for a connection there.
-fn connects_while_running(child: &mut Child, address: SocketAddr) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while Instant::now() < deadline {
-        if TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok() {
-            return true;
-        }
-        if child.try_wait().unwrap().is_some() {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    false
-}
-
 /// Microsoft documents that the loopback exemption covers only connections from the
 /// AppContainer; connections to it need a debugging mode of CheckNetIsolation.
 #[test]
 fn loopback_to_the_program_is_blocked_with_and_without_exemption() {
-    let address = free_loopback_address();
-    let target = address.to_string();
-    let mut control = Command::new(probe_path())
-        .args(["tcp-accept", &target])
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    assert!(connects_while_running(&mut control, address));
-    let _ = control.wait_with_output();
+    let (connected, line) = inbound_tcp(None);
+    assert!(connected, "control: {line:?}");
+    line.assert_ok();
 
     prepare_loopback_exemption();
     let fixture = Fixture::new("loopin");
     for container in [APPCONTAINER, APPCONTAINER_LOOPBACK] {
-        let address = free_loopback_address();
-        let target = address.to_string();
         let mut sandbox_args = fixture.access_args();
         sandbox_args.extend(args(&["--ip", "all", "--appcontainer", container]));
-        let mut child = Command::new(sandy_path())
-            .args(run_args(&sandbox_args, &[("tcp-accept", &target)]))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let connected = connects_while_running(&mut child, address);
-        let output = child.wait_with_output().unwrap();
+        let (connected, line) = inbound_tcp(Some(&sandbox_args));
         assert!(
             !connected,
-            "connected to the program in {container}: {output:?}"
+            "connected to the program in {container}: {line:?}"
         );
-        parse(&output)[0].assert_blocked();
+        line.assert_blocked();
     }
 }
 
@@ -421,38 +393,53 @@ impl Drop for UnixListener {
     }
 }
 
-/// Without read-write paths the program has write access to no socket file, so sandy can deny
-/// Unix sockets.
+/// The program can write no socket file outside its read-write paths, so it cannot connect to
+/// sockets there, also when the policy has read-write paths.
 #[test]
-fn unix_sockets_outside_the_policy_are_unreachable() {
+fn unix_sockets_outside_writable_paths_are_unreachable() {
     let fixture = Fixture::new("afunix");
     let socket = plain_path(&fixture.path("secret/socket"));
     let _listener = UnixListener::bind(&socket);
     probe_outside(&[("afunix-connect", &socket)])[0].assert_ok();
-
-    let read_only = args(&["--read", &fixture.arg("ro"), "--unix-sockets", "none"]);
-    probe_inside(&read_only, &[("afunix-connect", &socket)])[0].assert_blocked();
+    probe_inside(&fixture.access_args(), &[("afunix-connect", &socket)])[0].assert_blocked();
 }
 
-/// A socket in a read-write path is reachable, which is why sandy refuses a policy with
-/// read-write paths and unix_sockets = "none". If this test fails, AppContainers cannot use
-/// AF_UNIX at all, and that refusal could be lifted.
+/// A socket in a read-write path is reachable: Windows checks only write access to the socket
+/// file. UnixSocketsDenied is a lower bound that allows this. If this test fails, AppContainers
+/// cannot use AF_UNIX at all.
 #[test]
 fn unix_sockets_in_writable_paths_are_reachable() {
     let fixture = Fixture::new("afunixrw");
     let socket = plain_path(&fixture.path("rw/socket"));
     let _listener = UnixListener::bind(&socket);
     probe_inside(&fixture.access_args(), &[("afunix-connect", &socket)])[0].assert_ok();
+}
 
-    let mut check = vec!["check".to_string()];
-    check.extend(fixture.access_args());
-    check.extend(args(&["--appcontainer", APPCONTAINER]));
-    let output = sandy(&check);
-    assert_eq!(
-        output.status.code(),
-        Some(EXIT_NOT_ENFORCEABLE),
-        "{output:?}"
-    );
+/// A program that serves on an AF_UNIX socket in a read-write path is reachable from outside the
+/// sandbox. Inbound loopback TCP is always blocked for AppContainers, so this is the way a
+/// sandboxed server can take local connections on Windows.
+#[test]
+fn unix_socket_server_in_a_writable_path_is_reachable_from_outside() {
+    let fixture = Fixture::new("afunixserver");
+    let socket = plain_path(&fixture.path("rw/server"));
+    let mut child = Command::new(sandy_path())
+        .args(run_args(
+            &fixture.access_args(),
+            &[("afunix-accept", &socket)],
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut connected = false;
+    while !connected && Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        connected = probe_outside(&[("afunix-connect", &socket)])[0].result == "ok";
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(connected, "no connection to the program: {output:?}");
+    parse(&output)[0].assert_ok();
 }
 
 /// cmd.exe lies in the system set, whose permissions the user cannot change; sandy must run it

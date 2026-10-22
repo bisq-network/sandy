@@ -5,8 +5,10 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 pub const EXIT_FAILURE: i32 = 125;
 
@@ -135,18 +137,9 @@ pub const APPCONTAINER: &str = "sandy.escape-tests";
 pub const APPCONTAINER_LOOPBACK: &str = "sandy.escape-tests.loopback";
 
 /// Options every sandbox run needs on this platform.
-///
-/// On Windows, a policy with read-write paths cannot deny Unix sockets: connecting to an
-/// AF_UNIX socket needs only write access to the socket file (see docs/windows.md). The shared
-/// tests do not test Unix sockets on Windows, so they allow them there.
 pub fn platform_args() -> Vec<String> {
     if cfg!(windows) {
-        vec![
-            "--appcontainer".into(),
-            APPCONTAINER.into(),
-            "--unix-sockets".into(),
-            "all".into(),
-        ]
+        vec!["--appcontainer".into(), APPCONTAINER.into()]
     } else {
         Vec::new()
     }
@@ -260,4 +253,53 @@ pub fn controlled(sandbox_args: &[String], actions: &[(&str, &str)]) -> Vec<Prob
         line.assert_ok();
     }
     probe_inside(sandbox_args, actions)
+}
+
+/// Starts the probe's `tcp-accept` on a free loopback port, outside the sandbox when
+/// `sandbox_args` is `None`, and connects to it from this process while it waits. Returns
+/// whether a connection was made and the probe's report.
+pub fn inbound_tcp(sandbox_args: Option<&[String]>) -> (bool, ProbeLine) {
+    let address = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let target = address.to_string();
+    let actions = [("tcp-accept", target.as_str())];
+    let mut command = match sandbox_args {
+        None => {
+            let mut command = Command::new(probe_path());
+            command.args(probe_args(&actions));
+            command
+        }
+        Some(sandbox_args) => {
+            let mut command = Command::new(sandy_path());
+            command.args(run_args(sandbox_args, &actions));
+            command
+        }
+    };
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let connected = connects_while_running(&mut child, address);
+    let output = child.wait_with_output().unwrap();
+    let mut lines = parse(&output);
+    assert_eq!(lines.len(), 1, "{output:?}");
+    (connected, lines.remove(0))
+}
+
+/// Connects to `address` from this process while `child` runs, for at most 8 seconds.
+fn connects_while_running(child: &mut Child, address: SocketAddr) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        if TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok() {
+            return true;
+        }
+        if child.try_wait().unwrap().is_some() {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
 }
