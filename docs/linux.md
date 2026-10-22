@@ -254,9 +254,6 @@ secrets passed on command lines, and `/proc/net` of the network namespace. `/pro
 - **Replaced files.** Landlock rules bind to the inode that existed when sandy started. A file
   that is later replaced by rename (for example `/etc/resolv.conf` after a network change)
   becomes unreadable for a running program.
-- **Program name.** `argv[0]` is the canonical path of the program, because the backend contract
-  passes only that path. A multi-call program (for example busybox) started through a symbolic
-  link sees its real name.
 - **What fails inside the sandbox:** 32-bit programs (killed), user namespace sandboxes of
   browsers (they fall back or fail), io_uring, debuggers, System V IPC, datagram socket pairs,
   `mkfifo` and symbolic links in writable paths, metadata changes by path with the default

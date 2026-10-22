@@ -11,6 +11,9 @@ use crate::resolve::ResolvedPolicy;
 pub struct TargetCommand {
     /// Canonical absolute path of the executable.
     pub program: PathBuf,
+    /// The program as the caller named it, passed as `argv[0]`. Multi-call programs choose
+    /// their behavior by this name, which can differ from the resolved `program`.
+    pub arg0: OsString,
     pub args: Vec<OsString>,
     /// The complete environment of the target, already filtered by the policy. A backend may
     /// add variables the platform needs to start any process (documented per backend).

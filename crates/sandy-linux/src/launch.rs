@@ -170,7 +170,7 @@ struct Exec {
 impl Exec {
     fn new(command: &TargetCommand) -> Result<Exec, SandboxError> {
         let program = c_string(command.program.as_os_str())?;
-        let mut args = vec![program.clone()];
+        let mut args = vec![c_string(&command.arg0)?];
         for arg in &command.args {
             args.push(c_string(arg)?);
         }

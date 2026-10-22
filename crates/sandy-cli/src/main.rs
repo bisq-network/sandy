@@ -78,8 +78,14 @@ fn execute(invocation: Invocation) -> Result<ExitCode, String> {
                 .program
                 .clone()
                 .ok_or_else(|| "run needs a PROGRAM".to_string())?;
+            let arg0 = invocation
+                .program
+                .clone()
+                .map(|p| p.into_os_string())
+                .unwrap_or_else(|| program.clone().into_os_string());
             let command = TargetCommand {
                 program,
+                arg0,
                 args: invocation.args,
                 env: target_environment(&resolved.environment, std::env::vars_os()),
                 cwd: invocation.cwd,
