@@ -53,16 +53,16 @@ fn volfs_content_read_stays_inside_the_policy() {
     lines[0].assert_blocked();
 }
 
-/// Confirmed finding: `fsgetpath` resolves the path of a file named only by device and inode
-/// without a file-read check, so it discloses the location of files outside the policy. The file
-/// contents stay protected (see `volfs_content_read_stays_inside_the_policy`); only the path
-/// leaks. This proof of concept documents the behavior and will flag a future fix.
+/// Finding 1.1 of the review: `fsgetpath` resolves the path of a file named only by device and
+/// inode, and no file operation checks it. The profile now denies the by-id system calls
+/// (`syscall-unix`), so the path of a file outside the policy stays hidden.
 #[test]
-fn fsgetpath_discloses_out_of_policy_paths() {
+fn fsgetpath_does_not_disclose_out_of_policy_paths() {
     let fixture = Fixture::new("macos-fsgetpath");
     let secret = dev_inode(&fixture.path("secret/file"));
+    let actions = [("fsgetpath", secret.as_str())];
 
-    let outside = probe_outside(&[("fsgetpath", &secret)]);
+    let outside = probe_outside(&actions);
     if outside[0].result != "ok" {
         eprintln!(
             "control: fsgetpath does not work on this host ({}); nothing to check",
@@ -71,15 +71,11 @@ fn fsgetpath_discloses_out_of_policy_paths() {
         return;
     }
 
-    let lines = probe_inside(&fixture.access_args(), &[("fsgetpath", &secret)]);
-    assert_eq!(
-        lines[0].result, "ok",
-        "fsgetpath was expected to disclose the path: {}",
-        lines[0].detail
-    );
+    let lines = probe_inside(&fixture.access_args(), &actions);
+    lines[0].assert_blocked();
     assert!(
-        lines[0].detail.ends_with("/secret/file"),
-        "fsgetpath disclosed the out-of-policy path: {}",
+        !lines[0].detail.contains("/secret/"),
+        "fsgetpath disclosed the path: {}",
         lines[0].detail
     );
 }

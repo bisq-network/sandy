@@ -147,6 +147,17 @@ of earlier definitions"), so the protections come last. The unit test
       mach-task-inspect system-debug)`. `file-link` is not part of `file-write*`, and Apple's `maild.sb` denies
       it explicitly after `(deny default)`. A hard link to a file outside the policy would make it
       reachable through a writable path, so links are denied everywhere.
+    - `(deny syscall-unix (syscall-number 427) (syscall-number 217) (syscall-number 479)
+      (syscall-number 225))`: `fsgetpath`, `fsgetpath_ext`, `openbyid_np` and `searchfs` find a
+      file by volume id and inode number. `fsgetpath` builds the path in the kernel without
+      reaching any Seatbelt file operation, so the target could learn the path of any file on the
+      data volume from its device and inode number (finding 1.1 of
+      `docs/reviews/2026-10-22-macos.md`; contents stayed protected). Seatbelt allows
+      `syscall-unix` by default and filters it by number (WebKit's profiles use the same
+      operation). The numbers come from XNU's `bsd/kern/syscalls.master`, because older profile
+      compilers do not know every `SYS_` name. dyld or libSystem calls `fsgetpath` once while a
+      program starts; the call fails, the Sandbox log records `deny(1) syscall-unix 427`, and the
+      program starts normally (CI run 39767043700).
     - `(deny file-ioctl (ioctl-command TIOCSTI))`: also covered by step 2, written out so that no
       later change can allow it by accident.
     - Setuid and setgid files (see [Privilege escalation](#privilege-escalation)).
@@ -216,8 +227,14 @@ their arguments and environment.
 
 ## Networking
 
-- `socket(AF_UNIX)` is always allowed (`system-socket`), so `socketpair` works. Binding and
-  connecting are separate operations.
+- Creating a socket (`system-socket`) is a separate operation from binding and connecting it.
+  `socket(AF_UNIX)` is always allowed, so `socketpair` works; binding and connecting follow
+  `unix_sockets`.
+- Seatbelt never checks the creation of `AF_INET` and `AF_INET6` sockets: with `ip = "none"` a
+  program can still create one, but it cannot bind, listen, connect or send with it (finding 1.2
+  of the review). An explicit `(deny system-socket (socket-domain AF_INET))` has no effect; CI run
+  39767043700 created the socket anyway and logged no denial. All other families (routing,
+  kernel control, raw link layer, key management) are checked and stay denied by `(deny default)`.
 - `ip = "all"`: `(allow network-outbound (remote ip))` and `(allow network-bind network-inbound
   (local ip))`. `ip` covers IPv4 and IPv6 (SBPL has `ip4` and `ip6` for one family), including
   loopback. Apple's `appsandbox-common.sb` uses the same bare `(remote ip)`.
@@ -291,6 +308,21 @@ the setuid bit on its own files in a `read_write` path (`file-write-setugid` is 
 `file-write*`), but such a file belongs to the user, grants no privilege, and is not executable in
 the sandbox. The escape test `setuid_programs_do_not_start` executes `/usr/bin/sudo` with the policy
 allowing it, and expects a refusal.
+
+## Information the target can still read
+
+These are known and accepted, because they reveal no file contents, no other process's data and
+no privilege, and closing them would break ordinary programs:
+
+- The hardware and operating system facts in the readable sysctls, including the host name.
+- The names in the root directory `/` (dyld needs to open it) and the metadata of the
+  directories above each granted path.
+- Machine-wide statistics through the host name port: `mach_host_self()` is a special port that
+  every process inherits, and `host_statistics64` (free, active and wired page counts) and
+  similar non-privileged host routines work on it (finding 1.3 of the review). Seatbelt could deny
+  the routines with `syscall-mig`, but runtimes use them for memory heuristics (for example the
+  JVM and libuv's `uv_get_free_memory`), so the profile leaves them open, as Chromium's and the
+  Codex CLI's profiles do. The privileged host port stays denied (`mach-priv*`).
 
 ## Known limitations
 

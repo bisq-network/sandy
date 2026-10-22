@@ -223,7 +223,11 @@ fn policy_path_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
 }
 
 fn network_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
-    writer.comment("Networking. A Unix socket can be created, but not bound or connected.");
+    writer.comment(
+        "Networking. Creating a socket is separate from binding and connecting it. A Unix socket\n\
+         can always be created (socketpair). Seatbelt never checks the creation of IP sockets, so\n\
+         they can be created in any case; binding and connecting them follow the rules below.",
+    );
     writer.line("(allow system-socket (socket-domain AF_UNIX))");
     if policy.ip == NetworkAccess::All {
         writer.comment(
@@ -289,6 +293,16 @@ fn protection_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
         "(deny file-link nvram* iokit-get-properties mach-priv* mach-task-name mach-task-read \
          mach-task-inspect system-debug)",
     );
+
+    writer.comment(
+        "Calls that find a file by volume id and inode number reach no file operation, so the\n\
+         rules above cannot stop them: fsgetpath, fsgetpath_ext, openbyid_np, searchfs.",
+    );
+    let filters: Vec<String> = system::BY_ID_SYSCALLS
+        .iter()
+        .map(|(_, number)| format!("(syscall-number {number})"))
+        .collect();
+    writer.rule("deny", &["syscall-unix"], &filters);
 
     writer.comment("TIOCSTI would type commands into the terminal of the caller.");
     writer.line(&format!(
@@ -404,7 +418,9 @@ mod tests {
 (allow file-read* file-test-existence file-write* file-clone
   (subpath (param "READ_WRITE_0")))
 
-; Networking. A Unix socket can be created, but not bound or connected.
+; Networking. Creating a socket is separate from binding and connecting it. A Unix socket
+; can always be created (socketpair). Seatbelt never checks the creation of IP sockets, so
+; they can be created in any case; binding and connecting them follow the rules below.
 (allow system-socket (socket-domain AF_UNIX))
 
 ; Ancestors of granted paths: metadata only.
@@ -424,6 +440,14 @@ mod tests {
 ; (a link would make a file from outside reachable through a writable path), NVRAM and
 ; IOKit properties, task ports of other processes, and ptrace attach (system-debug).
 (deny file-link nvram* iokit-get-properties mach-priv* mach-task-name mach-task-read mach-task-inspect system-debug)
+
+; Calls that find a file by volume id and inode number reach no file operation, so the
+; rules above cannot stop them: fsgetpath, fsgetpath_ext, openbyid_np, searchfs.
+(deny syscall-unix
+  (syscall-number 427)
+  (syscall-number 217)
+  (syscall-number 479)
+  (syscall-number 225))
 
 ; TIOCSTI would type commands into the terminal of the caller.
 (deny file-ioctl (ioctl-command 2147578994))
@@ -632,6 +656,23 @@ mod tests {
         // All Unix sockets include the resolver, as on every platform.
         assert_eq!(rules(None, All), [false, true, false, false]);
         assert_eq!(rules(All, All), [true, true, true, false]);
+    }
+
+    #[test]
+    fn by_id_syscalls_are_denied_after_every_allow() {
+        let mut policy = typical("/srv");
+        policy.ip = NetworkAccess::All;
+        policy.unix_sockets = NetworkAccess::All;
+        let text = generate(&policy).text;
+        let deny = text.find("(deny syscall-unix").unwrap();
+        assert!(deny > text.rfind("(allow").unwrap());
+        assert!(!text.contains("(allow syscall"));
+        for (name, number) in system::BY_ID_SYSCALLS {
+            assert!(
+                text.contains(&format!("(syscall-number {number})")),
+                "{name}"
+            );
+        }
     }
 
     #[test]

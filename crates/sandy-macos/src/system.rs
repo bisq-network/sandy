@@ -182,6 +182,17 @@ pub const TIOCSTI: u64 = 0x8001_7472;
 /// stays denied, among them TIOCSTI, which would type into the terminal of the caller.
 pub const ALLOWED_IOCTLS: &[u64] = &[FIONBIO, FIOASYNC, TIOCGETA, TIOCGWINSZ];
 
+/// System calls that find a file by volume id and inode number, without any path the profile
+/// could check: fsgetpath and fsgetpath_ext return the file's path, openbyid_np opens it, and
+/// searchfs searches a volume's catalog. Numbers from XNU `bsd/kern/syscalls.master`; older
+/// profile compilers do not know every SYS_ name.
+pub const BY_ID_SYSCALLS: &[(&str, u32)] = &[
+    ("fsgetpath", 427),
+    ("fsgetpath_ext", 217),
+    ("openbyid_np", 479),
+    ("searchfs", 225),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
