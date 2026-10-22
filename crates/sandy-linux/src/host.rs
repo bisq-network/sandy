@@ -1,0 +1,206 @@
+//! Detection of the kernel features and process state the backend depends on. Every function
+//! here only reads state, so `plan` can call it.
+
+use std::io;
+use std::ptr;
+
+use crate::filter;
+use crate::system::{self, SystemPath};
+
+/// `Ok` when a feature can be used, otherwise the reason why it cannot.
+pub type Support = Result<(), String>;
+
+/// What this host and this process offer. `plan_for` turns it into a plan without further I/O,
+/// so tests can describe any host.
+#[derive(Debug, Clone)]
+pub struct HostCapabilities {
+    /// The Landlock ABI version the kernel reports.
+    pub landlock: Result<i32, String>,
+    /// Seccomp filters with the actions the filter uses, for this CPU architecture.
+    pub seccomp: Support,
+    pub no_new_privs: Support,
+    /// `Err` when the process runs as root or holds capabilities.
+    pub unprivileged: Support,
+    /// The candidates of the minimal system set that exist on this host.
+    pub system_paths: Vec<SystemPath>,
+}
+
+impl HostCapabilities {
+    pub fn detect() -> Self {
+        HostCapabilities {
+            landlock: landlock_abi(),
+            seccomp: seccomp_support(),
+            no_new_privs: no_new_privs_support(),
+            unprivileged: unprivileged(),
+            system_paths: system::detect(),
+        }
+    }
+}
+
+const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
+
+fn landlock_abi() -> Result<i32, String> {
+    // SAFETY: with a null attribute, size 0 and the VERSION flag, the kernel only returns the ABI
+    // version and creates nothing.
+    let version = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            ptr::null::<libc::c_void>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    if version >= 1 {
+        return i32::try_from(version).map_err(|_| format!("invalid Landlock ABI {version}"));
+    }
+    let error = io::Error::last_os_error();
+    Err(match error.raw_os_error() {
+        Some(libc::EOPNOTSUPP) => "Landlock is built into this kernel but not enabled. On RHEL 9, \
+             update to 9.6 or newer. On SLES 15 and openSUSE Leap 15, add landlock to the lsm= \
+             boot parameter"
+            .to_string(),
+        Some(libc::ENOSYS) => "this kernel has no Landlock. Linux 5.13 or newer with Landlock is \
+             required (RHEL 8 has none). In a container, the seccomp profile may block the \
+             Landlock system calls"
+            .to_string(),
+        _ => format!("cannot query the Landlock ABI: {error}"),
+    })
+}
+
+fn seccomp_support() -> Support {
+    if !filter::ARCH_SUPPORTED {
+        return Err("sandy has no seccomp filter for this CPU architecture".to_string());
+    }
+    for action in [libc::SECCOMP_RET_ERRNO, libc::SECCOMP_RET_KILL_PROCESS] {
+        // SAFETY: SECCOMP_GET_ACTION_AVAIL reads one u32 through the pointer and changes nothing.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                libc::SECCOMP_GET_ACTION_AVAIL,
+                0,
+                &action as *const u32,
+            )
+        };
+        if result != 0 {
+            return Err(format!(
+                "this kernel does not support the seccomp filter actions sandy uses (Linux 4.14 or \
+                 newer is required): {}",
+                io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn no_new_privs_support() -> Support {
+    // SAFETY: PR_GET_NO_NEW_PRIVS only reads a process flag.
+    if unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } < 0 {
+        return Err(format!(
+            "this kernel does not support no_new_privs: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+/// A program that starts with root or with capabilities keeps them under no_new_privs. Landlock
+/// does not restrict chmod or chown, so root could, for example, add the setuid bit to a shell.
+fn unprivileged() -> Support {
+    let (mut real, mut effective, mut saved) = (0, 0, 0);
+    // SAFETY: getresuid writes three uid_t values through valid pointers.
+    if unsafe { libc::getresuid(&mut real, &mut effective, &mut saved) } != 0 {
+        return Err(format!(
+            "cannot read the user IDs: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    if real == 0 || effective == 0 || saved == 0 {
+        return Err(
+            "sandy runs as root (user ID 0); the program would keep root privileges".to_string(),
+        );
+    }
+    let capabilities = capability_sets()?;
+    if capabilities.effective != 0 || capabilities.permitted != 0 {
+        return Err("sandy holds capabilities; the program could keep them".to_string());
+    }
+    if has_ambient_capability() {
+        return Err("sandy holds ambient capabilities; the program would inherit them".to_string());
+    }
+    Ok(())
+}
+
+struct CapabilitySets {
+    effective: u64,
+    permitted: u64,
+}
+
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+fn capability_sets() -> Result<CapabilitySets, String> {
+    let mut header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapData::default(); 2];
+    // SAFETY: version 3 of capget writes two CapData entries, which `data` provides.
+    let result = unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) };
+    if result != 0 {
+        return Err(format!(
+            "cannot read the capability sets: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let join = |low: u32, high: u32| u64::from(low) | (u64::from(high) << 32);
+    Ok(CapabilitySets {
+        effective: join(data[0].effective, data[1].effective),
+        permitted: join(data[0].permitted, data[1].permitted),
+    })
+}
+
+fn has_ambient_capability() -> bool {
+    // Capability numbers the kernel does not know fail with EINVAL and count as not set.
+    (0..64).any(|capability: libc::c_ulong| {
+        // SAFETY: PR_CAP_AMBIENT_IS_SET only reads a process flag.
+        let result = unsafe {
+            libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_IS_SET,
+                capability,
+                0,
+                0,
+            )
+        };
+        if result < 0 {
+            return false;
+        }
+        result == 1
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detection_does_not_fail_on_this_host() {
+        let host = HostCapabilities::detect();
+        // The test machine runs as an ordinary user with a Landlock kernel; detection must not
+        // report spurious errors there.
+        assert!(host.no_new_privs.is_ok(), "{host:?}");
+        assert!(host.seccomp.is_ok(), "{host:?}");
+    }
+}

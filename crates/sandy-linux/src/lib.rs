@@ -1,7 +1,17 @@
-//! Linux backend of sandy. The crate is empty on other platforms.
+//! Linux backend of sandy: Landlock, a seccomp filter and no_new_privs, applied to sandy's own
+//! process before it executes the target. The crate is empty on other platforms. See
+//! `docs/linux.md`.
 #![cfg(target_os = "linux")]
 
+mod filter;
+mod host;
+mod launch;
+mod plan;
+mod system;
+
 use sandy_core::{Backend, PlanItem, ResolvedPolicy, SandboxError, TargetCommand};
+
+use host::HostCapabilities;
 
 #[derive(Debug, Default)]
 pub struct LinuxBackend;
@@ -12,16 +22,14 @@ impl Backend for LinuxBackend {
     }
 
     fn plan(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
-        policy
-            .requirements()
-            .into_iter()
-            .map(|requirement| PlanItem::unavailable(requirement, "not implemented yet"))
-            .collect()
+        plan::plan_for(policy, &HostCapabilities::detect()).items
     }
 
-    fn run(&self, _policy: &ResolvedPolicy, _command: &TargetCommand) -> Result<i32, SandboxError> {
-        Err(SandboxError::new(
-            "the Linux backend is not implemented yet",
-        ))
+    fn run(&self, policy: &ResolvedPolicy, command: &TargetCommand) -> Result<i32, SandboxError> {
+        let plan = plan::plan_for(policy, &HostCapabilities::detect());
+        let sandbox = plan
+            .sandbox
+            .ok_or_else(|| SandboxError::new("this host cannot enforce the policy"))?;
+        match launch::launch(&sandbox, command)? {}
     }
 }

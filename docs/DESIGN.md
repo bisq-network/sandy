@@ -134,17 +134,25 @@ continue if any mechanism fails while it is applied.
 
 ### Linux
 
-- `PR_SET_NO_NEW_PRIVS` against privilege escalation.
-- Landlock for the filesystem rules (and ptrace isolation, which every Landlock domain gets).
-- A seccomp-bpf filter: deny `socket(AF_UNIX)` unless allowed (Landlock does not cover connecting
-  to pathname Unix sockets, and the D-Bus session bus allows starting arbitrary commands through
-  systemd), deny `socket(AF_INET/AF_INET6)` unless allowed, deny `ptrace`, `process_vm_*`,
-  namespace, mount, `bpf`, `keyctl`, `io_uring` and `TIOCSTI`/`TIOCLINUX`, block foreign
-  system call architectures.
-- Landlock ABI 6 scoping for signals and abstract Unix sockets where available.
-- Close every inherited file descriptor except 0, 1 and 2.
-- Hosts without Landlock: refused when the policy needs filesystem confinement (it always does in
-  version 1). See `docs/research/linux-mechanisms.md` for the availability analysis.
+Details, the minimal system set and the known limitations are in [linux.md](linux.md).
+
+- Order: mark descriptors above 2 close-on-exec, `PR_SET_NO_NEW_PRIVS`, Landlock
+  `restrict_self`, two seccomp filters (TSYNC), `execve`. Everything that can fail on bad input
+  is prepared before the first step.
+- Landlock (ABI 1 or newer, read from the kernel at run time) handles every file system right of
+  the ABI. Writable paths never get execute, symbolic link, named pipe or device rights. ABI 6
+  scopes signals (required for `signals = "isolated"`) and abstract Unix sockets; ABI 9 denies
+  pathname Unix sockets when `unix_sockets = "none"`; ABI 4 denies TCP when `ip = "none"`.
+- Seccomp allowlist: the reviewed system call table of Linux 7.2; every other number, x32 numbers,
+  `clone3` and `openat2` fail with `ENOSYS`; other CPU architectures are killed.
+- Seccomp denylist (`EPERM`): socket families outside the policy (an allowlist), datagram socket
+  pairs when Unix sockets are denied, io_uring, ptrace and `process_vm_*`, System V IPC, POSIX
+  message queues, namespaces, mounts, `bpf`, `perf_event_open`, `userfaultfd`, keyrings,
+  `TIOCSTI`/`TIOCLINUX`, calls that need capabilities, `open` with access mode 3 (Landlock does
+  not check it), the path-based metadata calls when `path_metadata = "deny"`, and before
+  Landlock ABI 3 truncation without write access.
+- Refused: no Landlock (the reason names the fix), no seccomp, root or any capability, a writable
+  path that contains the dynamic loader.
 
 ### macOS
 
