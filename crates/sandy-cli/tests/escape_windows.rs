@@ -507,3 +507,133 @@ fn system_none_is_not_enforceable() {
         "{output:?}"
     );
 }
+
+/// Starts sandy with `sandy_args` inside a new job with UI restrictions `ui`, like a CI agent or
+/// an IDE that runs it in a job. Returns the exit code and the standard output.
+fn sandy_in_job(ui: u32, sandy_args: &[String]) -> (u32, String) {
+    use std::io::Read;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_BASIC_UI_RESTRICTIONS,
+        JobObjectBasicUIRestrictions, SetInformationJobObject,
+    };
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_SUSPENDED, CreateProcessW, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION,
+        ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW, WaitForSingleObject,
+    };
+
+    let (mut read, mut write): (HANDLE, HANDLE) = (std::ptr::null_mut(), std::ptr::null_mut());
+    // SAFETY: both out pointers are valid.
+    let piped = unsafe { CreatePipe(&mut read, &mut write, std::ptr::null(), 0) };
+    assert_ne!(piped, 0);
+    // SAFETY: CreatePipe returned two new handles that this function owns.
+    let (read, write) = unsafe {
+        (
+            OwnedHandle::from_raw_handle(read),
+            OwnedHandle::from_raw_handle(write),
+        )
+    };
+    // SAFETY: write is a valid handle; only its inherit flag changes.
+    unsafe {
+        SetHandleInformation(
+            write.as_raw_handle(),
+            HANDLE_FLAG_INHERIT,
+            HANDLE_FLAG_INHERIT,
+        )
+    };
+
+    // SAFETY: null attributes and name create an unnamed job.
+    let job = unsafe {
+        OwnedHandle::from_raw_handle(CreateJobObjectW(std::ptr::null(), std::ptr::null()))
+    };
+    if ui != 0 {
+        let restrictions = JOBOBJECT_BASIC_UI_RESTRICTIONS {
+            UIRestrictionsClass: ui,
+        };
+        // SAFETY: the structure matches the information class and outlives the call.
+        let ok = unsafe {
+            SetInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectBasicUIRestrictions,
+                (&restrictions as *const JOBOBJECT_BASIC_UI_RESTRICTIONS).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>() as u32,
+            )
+        };
+        assert_ne!(ok, 0);
+    }
+
+    let mut line = format!("\"{}\"", sandy_path());
+    for arg in sandy_args {
+        line.push_str(&format!(" \"{arg}\""));
+    }
+    let mut line: Vec<u16> = line.encode_utf16().chain([0]).collect();
+    // SAFETY: the structure is plain data; zero is a valid value for every field.
+    let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdOutput = write.as_raw_handle();
+    startup.hStdError = write.as_raw_handle();
+    // SAFETY: the structure is plain data; zero is a valid value for every field.
+    let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: line is NUL-terminated and writable; startup and info outlive the call.
+    let created = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            CREATE_SUSPENDED,
+            std::ptr::null(),
+            std::ptr::null(),
+            &startup,
+            &mut info,
+        )
+    };
+    assert_ne!(created, 0, "{}", std::io::Error::last_os_error());
+    // SAFETY: CreateProcessW returned two new handles that this function owns.
+    let (process, thread) = unsafe {
+        (
+            OwnedHandle::from_raw_handle(info.hProcess),
+            OwnedHandle::from_raw_handle(info.hThread),
+        )
+    };
+    // SAFETY: the job and the suspended process are valid handles.
+    let assigned =
+        unsafe { AssignProcessToJobObject(job.as_raw_handle(), process.as_raw_handle()) };
+    assert_ne!(assigned, 0);
+    // SAFETY: thread is the suspended main thread of sandy.
+    unsafe { ResumeThread(thread.as_raw_handle()) };
+    drop(write);
+    let mut output = String::new();
+    let _ = std::fs::File::from(read).read_to_string(&mut output);
+    let mut code = 0u32;
+    // SAFETY: process is valid; code is a writable u32.
+    unsafe {
+        WaitForSingleObject(process.as_raw_handle(), INFINITE);
+        GetExitCodeProcess(process.as_raw_handle(), &mut code);
+    }
+    (code, output)
+}
+
+/// A job with UI restrictions cannot hold sandy's job, which sets UI restrictions too. `check`
+/// must predict this, so that it agrees with `run`; sandy must not break away from the job.
+#[test]
+fn check_and_run_agree_inside_a_job_with_ui_restrictions() {
+    const READ_CLIPBOARD: u32 = 0x2;
+    let check = args(&["check", "--appcontainer", APPCONTAINER]);
+    let run = run_args(&[], &[("env", "SystemRoot")]);
+
+    let (code, output) = sandy_in_job(0, &check);
+    assert_eq!(code, 0, "check in a job without UI restrictions: {output}");
+    let (code, output) = sandy_in_job(0, &run);
+    assert_eq!(code, 0, "run in a job without UI restrictions: {output}");
+
+    let (code, output) = sandy_in_job(READ_CLIPBOARD, &check);
+    assert_eq!(code as i32, EXIT_NOT_ENFORCEABLE, "{output}");
+    assert!(output.contains("UI restrictions"), "{output}");
+    let (code, output) = sandy_in_job(READ_CLIPBOARD, &run);
+    assert_eq!(code as i32, EXIT_FAILURE, "{output}");
+}

@@ -87,10 +87,10 @@ access check]. The program therefore cannot change the DACL of files it creates,
 user's SID owns them. The escape test `read_write_paths_are_not_executable` checks this.
 
 AppContainer processes run at low integrity, and files without a label count as medium. sandy
-sets no integrity label: the AppContainer access check ignores the integrity level of objects at
-medium and below [Forshaw 2014], and Chromium's network sandbox writes to unlabeled directories
-with a capability ACE alone [Chromium network]. If writes in read-write paths fail on Windows,
-this assumption is wrong.
+sets no integrity label. Microsoft: "if a resource has a mandatory label of Medium IL or lower
+and the DACL grants access through to the AppContainer (through a Package SID or Capability
+SID) then the AppContainer can read, write, or execute depending on the access granted" [Implementing
+an AppContainer]. The escape tests write, create and delete in read-write paths on Windows 11.
 
 ### One capability per path
 
@@ -208,10 +208,18 @@ with `ip = "all"` and the exemption. Options, tested on Windows 11 build 26200:
 | `CheckNetIsolation LoopbackExempt -is -n=NAME` (debugging mode) | Does not help: connections still time out while it runs | Needs a running elevated helper; meant for debugging |
 | AF_UNIX socket in a read-write path | Works: the program listens, outside clients connect (`unix_socket_server_in_a_writable_path_is_reachable_from_outside`) | Clients must speak AF_UNIX; no change to sandy |
 | Listening TCP socket created outside the AppContainer and inherited | Works, even with `ip = "none"`: the program accepted a connection from an outside client | sandy would need a policy option, for example `listen = ["127.0.0.1:8080"]`, to create the socket and pass it with the handle list |
-| Relay in sandy that forwards one configured port | Not tested | sandy copies all traffic; more code |
+| Relay inside the AppContainer: a process holding the inherited listening socket forwards each connection over loopback to the server process in the same AppContainer | Works with `ip = "none"` and `ip = "all"`, with and without exemption (temporary experiment) | sandy would start the relay as a second process in the AppContainer; the server keeps listening on loopback |
 | Firewall rule for the package SID | Not tested; the AppContainer filters sit in the Windows Service Hardening sublayer, which ordinary firewall rules do not override [Project Zero 2021] | Administrator rights |
 
-The inherited socket is the simplest general solution; it is not implemented.
+Processes in the same AppContainer reach each other over loopback in every configuration
+measured, also with `ip = "none"` and without exemption. So a generic "forward an outside port
+to a loopback port of the program" works on Windows: sandy creates the listening socket outside
+the AppContainer and passes it to a relay process in the AppContainer, which connects to the
+program's loopback port. Neither the inherited socket nor the relay is implemented.
+
+Because of the same fact, two sandboxes that use the same AppContainer name can talk over
+loopback, also when their policies differ (for example one with `ip = "all"`). Use one
+AppContainer name per policy.
 
 ### The setup step
 
@@ -296,8 +304,9 @@ messages that reach processes outside the sandbox.
   - `LOCALAPPDATA`, from `SHGetKnownFolderPath`. Without it, `CreateProcessW` fails for an
     AppContainer process with `ERROR_ENVVAR_NOT_FOUND` (203). Windows replaces it with
     `<LOCALAPPDATA>\Packages\<name>\AC` and sets `TEMP` and `TMP` to the `Temp` folder below,
-    also when the policy sets them. Both facts were observed on Windows 11 build 26200; Microsoft
-    does not document them.
+    also when the policy sets them. Microsoft documents the redirection [Implementing an
+    AppContainer]; that the variable is required is not documented, it was observed on Windows 11
+    build 26200.
 - **Command line.** sandy quotes each argument so that `CommandLineToArgvW` and the C runtime
   read it back unchanged [Parsing arguments], and refuses command lines longer than 32,767
   characters [CreateProcessW]. It refuses `.bat` and `.cmd` programs: `CreateProcessW` runs them
@@ -306,6 +315,27 @@ messages that reach processes outside the sandbox.
 - **Program path.** `std::fs::canonicalize` returns `\\?\C:\...` paths. sandy passes the
   ordinary form when it names the same file, so the program sees an ordinary path as its own
   name.
+
+## Supported Windows versions
+
+- **Required:** Windows 10 version 1809 (build 17763) or later, or Windows Server 2019 or
+  later. Earlier builds do not export `DeriveCapabilitySidsFromName`, and none of them receives
+  security updates any more. sandy resolves that function at run time, so `sandy check` still
+  starts on older builds and reports why it cannot enforce the policy.
+- **Network isolation:** `IpNetworkDenied` also needs the fix for CVE-2021-41338, a bypass of the
+  AppContainer firewall rules. The plan refuses builds without it: 17763 before .2237, 18362
+  (never fixed), 18363 before .1854, 19041 to 19043 before .1288, 20348 before .288 and 22000
+  before .258 [CVE-2021-41338]. The table lives in `crates/sandy-windows/src/version.rs`.
+- **Expected to work, not tested:** Windows 10 1809 (LTSC 2019), 21H2 (LTSC 2021) and 22H2.
+- **Tested:** Windows 11 build 26200 (VM, all tests), Windows Server 2022 and Windows Server
+  2025 (GitHub Actions; all tests except `executes_only_executable_paths`, see limitation 11).
+- **Nested jobs:** when sandy runs inside a job with UI restrictions, Windows refuses to put the
+  program into sandy's own job (`ERROR_NOT_SUPPORTED`, measured on Windows 11), and the plan
+  reports `NoPrivilegeEscalation` and `SignalsIsolated` as unavailable. Inside a job without UI
+  restrictions, with or without breakaway, the jobs nest. sandy never breaks away from the outer
+  job. Microsoft documents a stricter rule ("neither job sets UI limits") [Nested jobs], which
+  the measurements on Windows 11, Server 2022 and Server 2025 do not show; Windows 10 is
+  untested.
 
 ## Known limitations
 
@@ -325,13 +355,26 @@ messages that reach processes outside the sandbox.
    there. Whether the AppContainer can access such volumes outside the policy depends on the
    security descriptor of the volume device and is not verified.
 10. sandy cannot remove its grants (see "Removing the changes").
+11. On the GitHub Actions images `windows-2022` and `windows-2025` (Windows Server 2022 and 2025
+    Datacenter), a process in an AppContainer cannot start child processes: `CreateProcessW`
+    fails with `ERROR_ACCESS_DENIED` for every program, while the console host still starts.
+    This holds for sandy and for a minimal launcher without job, capabilities or special flags,
+    from the runner's process tree and from a scheduled task, elevated and not elevated. Ruled
+    out: file ACLs, the working directory, the console, job objects, process mitigation
+    policies, Defender, attack surface reduction, AppLocker, Code Integrity and UAC. The cause in
+    the configuration of these images is not known. On Windows 11 build 26200 child processes
+    work. The shared test `executes_only_executable_paths` therefore cannot pass on these
+    runners.
+12. `std::fs::canonicalize` and `GetFinalPathNameByHandleW` with DOS names fail with
+    `ERROR_ACCESS_DENIED` inside an AppContainer (Windows 11 and Server 2025); NT names work.
+    Programs that canonicalize their paths need a fallback such as `std::path::absolute`.
 
 ## Verified on Windows 11
 
 Host: Windows 11 build 26200 (VM), binaries built for `x86_64-pc-windows-gnu`. The tests ran three
 times in an elevated session and three times from a scheduled task with `/RL LIMITED` (medium
 integrity, Administrators deny-only). Every run: `sandy_windows` 46 of 46, `escape` 10 of 10 (the
-Unix socket test is Unix-only), `escape_windows` 21 of 21.
+Unix socket test is Unix-only), `escape_windows` 22 of 22.
 
 Facts these runs established:
 
@@ -355,7 +398,6 @@ Facts these runs established:
 - [Capabilities] App capability declarations: https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/app-capability-declarations
 - [Chromium design] Sandbox design: https://chromium.googlesource.com/chromium/src/+/main/docs/design/sandbox.md
 - [Chromium install] configure_app_container_sandbox.cc: https://chromium.googlesource.com/chromium/src/+/main/chrome/installer/setup/configure_app_container_sandbox.cc
-- [Chromium network] network_sandbox.cc: https://chromium.googlesource.com/chromium/src/+/main/content/browser/network_sandbox.cc
 - [Chromium policy] sandbox_policy.h (create_profile): https://chromium.googlesource.com/chromium/src/+/refs/tags/100.0.4896.60/sandbox/win/src/sandbox_policy.h
 - [Console security] Console buffer security and access rights: https://learn.microsoft.com/en-us/windows/console/console-buffer-security-and-access-rights
 - [CreateAppContainerProfile] https://learn.microsoft.com/en-us/windows/win32/api/userenv/nf-userenv-createappcontainerprofile
@@ -363,11 +405,11 @@ Facts these runs established:
 - [CreateProcessW] https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw
 - [CVE-2021-41338] https://msrc.microsoft.com/update-guide/vulnerability/CVE-2021-41338
 - [Environment] Changing environment variables: https://learn.microsoft.com/en-us/windows/win32/procthread/changing-environment-variables
-- [Forshaw 2014] Internet Explorer EPM sandbox escape: https://projectzero.google/2014/12/internet-explorer-epm-sandbox-escape.html
 - [Forshaw access check] Windows Security Internals, access check implementation: https://github.com/tyranid/windows-security-internals/blob/main/chapter_7/chapter_7_access_check_impl.psm1
 - [Implementing an AppContainer] https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer
 - [Integrity] Windows Integrity Mechanism Design: https://learn.microsoft.com/en-us/previous-versions/dotnet/articles/bb625963(v=msdn.10)
 - [IPC] Interprocess communication (loopback): https://learn.microsoft.com/en-us/windows/apps/develop/communication/interprocess-communication
+- [Nested jobs] https://learn.microsoft.com/en-us/windows/win32/procthread/nested-jobs
 - [Kanthak] SetNamedSecurityInfo drops SE_DACL_PROTECTED: https://seclists.org/fulldisclosure/2012/Jun/317
 - [LaunchAppContainer] Microsoft SandboxSecurityTools: https://github.com/microsoft/SandboxSecurityTools/blob/HEAD/LaunchAppContainer/README.md
 - [Legacy apps] AppContainer for legacy applications: https://learn.microsoft.com/en-us/windows/win32/secauthz/appcontainer-for-legacy-applications-

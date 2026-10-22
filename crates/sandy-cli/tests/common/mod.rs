@@ -303,3 +303,28 @@ fn connects_while_running(child: &mut Child, address: SocketAddr) -> bool {
     }
     false
 }
+
+/// Windows: whether this host refuses child processes of AppContainer processes. The GitHub
+/// Actions images windows-2022 and windows-2025 do (docs/windows.md, limitation 11). The canary
+/// starts a system program that every AppContainer may read and execute, outside and inside the
+/// sandbox; only a denial inside, with success outside, counts. The message goes to stderr
+/// directly, so it shows also when the test harness captures output.
+#[cfg(windows)]
+pub fn appcontainer_children_blocked() -> bool {
+    use std::io::Write;
+
+    let system = std::env::var("SystemRoot").expect("SystemRoot is set");
+    let canary = format!(r"{system}\System32\whoami.exe");
+    if probe_outside(&[("exec", &canary)])[0].result != "ok" {
+        return false;
+    }
+    let blocked = probe_inside(&[], &[("exec", &canary)])[0].result == "denied";
+    if blocked {
+        let _ = writeln!(
+            std::io::stderr(),
+            "skipped: this host does not let AppContainer processes start child processes \
+             (see docs/windows.md limitation 11)"
+        );
+    }
+    blocked
+}

@@ -11,6 +11,7 @@ pub mod cmdline;
 pub mod envblock;
 pub mod name;
 pub mod plan;
+pub mod version;
 
 #[cfg(windows)]
 mod sys;

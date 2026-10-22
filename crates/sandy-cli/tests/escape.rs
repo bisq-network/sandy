@@ -86,6 +86,10 @@ fn writes_only_writable_paths() {
 
 #[test]
 fn executes_only_executable_paths() {
+    #[cfg(windows)]
+    if appcontainer_children_blocked() {
+        return;
+    }
     let fixture = Fixture::new("exec");
     let allowed = fixture.copy_probe("bin");
     let secret = fixture.copy_probe("secret");

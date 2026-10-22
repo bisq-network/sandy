@@ -1,5 +1,6 @@
 mod acl;
 mod appcontainer;
+mod host;
 mod network;
 mod process;
 mod util;
@@ -113,6 +114,9 @@ fn detect(policy: &ResolvedPolicy) -> HostCapabilities {
         .and_then(|name| appcontainer::sid(name).map_err(|error| error.to_string()));
     HostCapabilities {
         appcontainer: container.as_ref().map(|_| ()).map_err(Clone::clone),
+        windows: host::windows_version(),
+        capability_sids: host::derive_capability_sids().map(|_| ()),
+        outer_job_ui: host::outer_job_ui(),
         firewall: network::firewall_running(),
         loopback_exempt: container.and_then(|sid| network::is_loopback_exempt(&sid)),
     }

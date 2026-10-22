@@ -4,6 +4,7 @@
 use sandy_core::{NetworkAccess, PlanItem, Requirement, ResolvedPolicy, SystemAccess};
 
 use crate::name::validate_appcontainer_name;
+use crate::version::{WindowsVersion, below_minimum, firewall_bypass};
 
 /// What the host offers. Each field is `Err(reason)` when it could not be determined or the
 /// mechanism is missing.
@@ -11,6 +12,13 @@ use crate::name::validate_appcontainer_name;
 pub struct HostCapabilities {
     /// The AppContainer API works on this host.
     pub appcontainer: Result<(), String>,
+    /// Build and update revision of Windows.
+    pub windows: Result<WindowsVersion, String>,
+    /// `DeriveCapabilitySidsFromName` exists. sandy resolves it at run time, so `sandy.exe`
+    /// still starts and can explain the problem on builds that lack it.
+    pub capability_sids: Result<(), String>,
+    /// The UI restrictions of the job sandy runs in, or `None` outside a job.
+    pub outer_job_ui: Result<Option<u32>, String>,
     /// The Windows Firewall service runs. It installs the filters that isolate AppContainers
     /// from the network.
     pub firewall: Result<(), String>,
@@ -37,7 +45,8 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<PlanIte
             ),
             (Requirement::EnvironmentControlled, _) => PlanItem::enforced(
                 requirement,
-                "Unicode environment block built from the policy, plus SystemRoot",
+                "Unicode environment block built from the policy, plus SystemRoot and \
+                 LOCALAPPDATA",
             ),
             (_, Err(reason)) => PlanItem::unavailable(requirement, reason.clone()),
             (_, Ok(name)) => contained(requirement, policy, host, name),
@@ -56,7 +65,29 @@ fn appcontainer(policy: &ResolvedPolicy, host: &HostCapabilities) -> Result<Stri
     host.appcontainer
         .clone()
         .map_err(|reason| format!("AppContainers are not available: {reason}"))?;
+    let version = host
+        .windows
+        .clone()
+        .map_err(|reason| format!("cannot read the Windows version: {reason}"))?;
+    if let Some(reason) = below_minimum(version) {
+        return Err(reason);
+    }
     Ok(name.to_string())
+}
+
+/// Why sandy cannot put the program into its job, or `None`. Measured on Windows 11 build 26200:
+/// a process already in a job with UI restrictions cannot join a second job with UI
+/// restrictions (`ERROR_NOT_SUPPORTED`); an outer job without UI restrictions nests, with or
+/// without breakaway. sandy does not break away from the outer job: that would escape the limits
+/// its owner set.
+fn job_problem(host: &HostCapabilities) -> Option<String> {
+    match &host.outer_job_ui {
+        Err(reason) => Some(format!("cannot read the job sandy runs in: {reason}")),
+        Ok(Some(ui)) if *ui != 0 => Some(format!(
+            "sandy runs inside a job with UI restrictions ({ui:#x}); Windows does not nest              sandy's job, which sets UI restrictions too, so the program cannot be put into              it; start sandy outside that job"
+        )),
+        Ok(_) => None,
+    }
 }
 
 /// Requirements that the AppContainer enforces.
@@ -68,10 +99,26 @@ fn contained(
 ) -> PlanItem {
     let enforced = |mechanism: String| PlanItem::enforced(requirement, mechanism);
     let unavailable = |reason: String| PlanItem::unavailable(requirement, reason);
+    // The job carries the no-breakaway rule and the UI restrictions.
+    if let (Requirement::NoPrivilegeEscalation | Requirement::SignalsIsolated, Some(reason)) =
+        (requirement, job_problem(host))
+    {
+        return unavailable(reason);
+    }
+    let bypass = host
+        .windows
+        .as_ref()
+        .ok()
+        .copied()
+        .and_then(firewall_bypass);
+    if let (Requirement::IpNetworkDenied, Some(reason)) = (requirement, bypass) {
+        return unavailable(reason);
+    }
     match requirement {
-        Requirement::FilesystemConfined => match policy.system {
-            SystemAccess::None => unavailable(SYSTEM_NONE.into()),
-            SystemAccess::Minimal => enforced(format!(
+        Requirement::FilesystemConfined => match (policy.system, &host.capability_sids) {
+            (SystemAccess::None, _) => unavailable(SYSTEM_NONE.into()),
+            (SystemAccess::Minimal, Err(reason)) => unavailable(reason.clone()),
+            (SystemAccess::Minimal, Ok(())) => enforced(format!(
                 "AppContainer {name:?}: one capability per policy path with an access control \
                  entry on the path (no FILE_EXECUTE on read and read-write paths); besides, what \
                  Windows grants all AppContainers and the AppContainer profile folder"
@@ -156,6 +203,12 @@ mod tests {
     fn host() -> HostCapabilities {
         HostCapabilities {
             appcontainer: Ok(()),
+            windows: Ok(WindowsVersion {
+                build: 26200,
+                revision: Some(7000),
+            }),
+            capability_sids: Ok(()),
+            outer_job_ui: Ok(None),
             firewall: Ok(()),
             loopback_exempt: Ok(false),
         }
@@ -312,6 +365,99 @@ mod tests {
                 .iter()
                 .any(|item| item.requirement == Requirement::MetadataConfined)
         );
+    }
+
+    fn enforceable_on(host: &HostCapabilities) -> bool {
+        plan(&policy(), host).is_enforceable()
+    }
+
+    #[test]
+    fn old_windows_enforces_nothing_contained() {
+        let old = HostCapabilities {
+            windows: Ok(WindowsVersion {
+                build: 17134,
+                revision: Some(2208),
+            }),
+            ..host()
+        };
+        let reason = unavailable(status(&policy(), &old, Requirement::FilesystemConfined));
+        assert!(reason.contains("1809"), "{reason}");
+        let unknown = HostCapabilities {
+            windows: Err("RtlGetVersion failed".into()),
+            ..host()
+        };
+        assert!(!enforceable_on(&unknown));
+    }
+
+    #[test]
+    fn unpatched_windows_cannot_deny_ip() {
+        let unpatched = HostCapabilities {
+            windows: Ok(WindowsVersion {
+                build: 19043,
+                revision: Some(1287),
+            }),
+            ..host()
+        };
+        let reason = unavailable(status(&policy(), &unpatched, Requirement::IpNetworkDenied));
+        assert!(reason.contains("CVE-2021-41338"), "{reason}");
+
+        let mut allowed = policy();
+        allowed.ip = NetworkAccess::All;
+        assert!(plan(&allowed, &unpatched).is_enforceable());
+    }
+
+    #[test]
+    fn missing_capability_sids_block_the_filesystem_only() {
+        let host = HostCapabilities {
+            capability_sids: Err("DeriveCapabilitySidsFromName is missing".into()),
+            ..host()
+        };
+        let reason = unavailable(status(&policy(), &host, Requirement::FilesystemConfined));
+        assert!(reason.contains("DeriveCapabilitySidsFromName"), "{reason}");
+        assert!(matches!(
+            status(&policy(), &host, Requirement::ProcessMemoryIsolated),
+            Status::Enforced { .. }
+        ));
+    }
+
+    #[test]
+    fn an_outer_job_with_ui_restrictions_blocks_the_job() {
+        let nested = HostCapabilities {
+            outer_job_ui: Ok(Some(0x1)),
+            ..host()
+        };
+        let reason = unavailable(status(
+            &policy(),
+            &nested,
+            Requirement::NoPrivilegeEscalation,
+        ));
+        assert!(reason.contains("UI restrictions"), "{reason}");
+        let mut isolated = policy();
+        isolated.signals = SignalScope::Isolated;
+        assert!(matches!(
+            status(&isolated, &nested, Requirement::SignalsIsolated),
+            Status::Unavailable { .. }
+        ));
+        assert!(matches!(
+            status(&policy(), &nested, Requirement::FilesystemConfined),
+            Status::Enforced { .. }
+        ));
+    }
+
+    #[test]
+    fn an_outer_job_without_ui_restrictions_nests() {
+        for outer in [Ok(None), Ok(Some(0))] {
+            let host = HostCapabilities {
+                outer_job_ui: outer,
+                ..host()
+            };
+            assert!(enforceable_on(&host));
+        }
+        let unreadable = HostCapabilities {
+            outer_job_ui: Err("access denied".into()),
+            ..host()
+        };
+        assert!(!enforceable_on(&unreadable));
     }
 
     #[test]

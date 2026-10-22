@@ -191,6 +191,9 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
 
 Details, limitations and sources: `docs/windows.md`.
 
+- Requires Windows 10 1809 (build 17763) or later; `IpNetworkDenied` also requires the fix for
+  CVE-2021-41338. `sandy.exe` starts on older builds and the plan names the reason.
+
 - AppContainer named by `windows.appcontainer_name`; sandy creates its profile on first use.
 - File grants: one capability per policy path (named after the AppContainer, the level and the
   file ID), with one inheritable ACE on the path. The program starts with the capabilities of the
@@ -209,7 +212,8 @@ Details, limitations and sources: `docs/windows.md`.
 - sandy sets `SystemRoot` and `LOCALAPPDATA`; without the latter Windows refuses to create an
   AppContainer process. Windows sets `LOCALAPPDATA`, `TEMP` and `TMP` to the profile folder.
 - Job object with kill-on-close, no breakaway and all UI restrictions. The program is created
-  suspended and assigned before it runs.
+  suspended and assigned before it runs. Inside an outer job with UI restrictions Windows cannot
+  nest this job, so the plan refuses; sandy never breaks away from an outer job.
 - Handle inheritance limited to the standard handles with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`.
   The program gets its own console and never a console handle of sandy; sandy relays its console
   through pipes and ends the job on Ctrl+C.

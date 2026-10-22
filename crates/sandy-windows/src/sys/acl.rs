@@ -14,10 +14,9 @@ use windows_sys::Win32::Security::Authorization::{
     SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
-    ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION,
-    DeriveCapabilitySidsFromName, GetAce, GetAclInformation, GetSecurityDescriptorControl,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
-    UNPROTECTED_DACL_SECURITY_INFORMATION,
+    ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION, GetAce,
+    GetAclInformation, GetSecurityDescriptorControl, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
@@ -25,6 +24,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 
+use super::host;
 use super::util::{LocalBox, SessionLock, Sid, last_error, wide_nul, win32_error};
 use crate::access::{
     ALL_APPLICATION_PACKAGES, Ace, AceKind, access_mask, ace_flags, grants, has_explicit_ace,
@@ -120,9 +120,10 @@ fn capability_sid(name: &str) -> Result<Sid, SandboxError> {
     let wide = wide_nul(name.as_ref());
     let (mut groups, mut group_count): (*mut PSID, u32) = (ptr::null_mut(), 0);
     let (mut capabilities, mut capability_count): (*mut PSID, u32) = (ptr::null_mut(), 0);
+    let derive = host::derive_capability_sids().map_err(SandboxError::new)?;
     // SAFETY: wide is NUL-terminated and all out pointers are valid.
     let ok = unsafe {
-        DeriveCapabilitySidsFromName(
+        derive(
             wide.as_ptr(),
             &mut groups,
             &mut group_count,
