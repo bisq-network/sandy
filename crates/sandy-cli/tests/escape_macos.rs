@@ -498,7 +498,12 @@ fn free_port() -> u16 {
 
 /// The probe as a server on `inner` in the sandbox, with sandy relaying `outer` to it.
 fn start_exposed_server(fixture: &Fixture, inner: u16, outer: u16) -> Child {
-    let args = with(
+    start_exposed_server_with(fixture, inner, outer, &[])
+}
+
+/// Like `start_exposed_server`, with more sandbox options.
+fn start_exposed_server_with(fixture: &Fixture, inner: u16, outer: u16, extra: &[&str]) -> Child {
+    let mut args = with(
         home_args(fixture),
         &[
             "--ip",
@@ -507,6 +512,7 @@ fn start_exposed_server(fixture: &Fixture, inner: u16, outer: u16) -> Child {
             &format!("127.0.0.1:{outer}={inner}"),
         ],
     );
+    args.extend(extra.iter().map(|arg| arg.to_string()));
     let accept = format!("127.0.0.1:{inner}");
     Command::new(sandy_path())
         .args(run_args(&args, &[("tcp-accept", &accept)]))
@@ -826,6 +832,76 @@ fn forward_relay_delivers_data_sent_just_before_exit() {
         &[
             "--ip",
             "all",
+            "--forward",
+            &format!("{inner}=127.0.0.1:{target}"),
+        ],
+    );
+    let lines = probe_inside(&args, &[("tcp-send", &format!("127.0.0.1:{inner}"))]);
+    lines[0].assert_ok();
+    assert_eq!(received.join().unwrap(), TCP_SEND_PAYLOAD);
+}
+
+/// `process.children = "none"`: fork, vfork and posix_spawn (without POSIX_SPAWN_SETEXEC) all
+/// fail, while threads still work. The control runs the same actions with children allowed.
+#[test]
+fn children_none_denies_every_way_to_create_a_process() {
+    let fixture = home_fixture("children-none");
+    let child = fixture.copy_probe("bin");
+    let actions = [
+        ("fork", "-"),
+        ("vfork", "-"),
+        ("posix-spawn", child.as_str()),
+        ("exec", child.as_str()),
+        ("thread", "-"),
+    ];
+    for line in probe_inside(&home_args(&fixture), &actions) {
+        line.assert_ok();
+    }
+    let none = with(home_args(&fixture), &["--children", "none"]);
+    let lines = probe_inside(&none, &actions);
+    for line in &lines[..4] {
+        line.assert_blocked();
+    }
+    lines[4].assert_ok();
+}
+
+/// Replacing the program's own image creates no process, so it stays allowed: the new image runs
+/// and prints the line of its own action.
+#[test]
+fn children_none_still_lets_the_program_replace_itself() {
+    let fixture = home_fixture("children-exec");
+    let none = with(home_args(&fixture), &["--children", "none"]);
+    let target = spawn_target(&[&probe_path(), "sleep", "0"]);
+    let output = sandy(run_args(&none, &[("execve", &target)]));
+    assert!(output.status.success(), "{output:?}");
+    let lines = parse(&output);
+    assert_eq!(lines.len(), 1, "{output:?}");
+    assert_eq!(lines[0].action, "sleep", "{output:?}");
+    lines[0].assert_ok();
+}
+
+/// sandy forks the relay before it applies the program's profile, so the relays of exposed and
+/// forwarded ports keep working with `process.children = "none"`.
+#[test]
+fn children_none_keeps_the_relays_working() {
+    let fixture = home_fixture("children-relay");
+    let (inner, outer) = (free_port(), free_port());
+    let server = start_exposed_server_with(&fixture, inner, outer, &["--children", "none"]);
+    let output = finish_server(server, outer);
+    assert!(output.status.success(), "{output:?}");
+    parse(&output)[0].assert_ok();
+
+    let service = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = service.local_addr().unwrap().port();
+    let received = receive_one(service);
+    let inner = free_port();
+    let args = with(
+        home_args(&fixture),
+        &[
+            "--ip",
+            "all",
+            "--children",
+            "none",
             "--forward",
             &format!("{inner}=127.0.0.1:{target}"),
         ],

@@ -49,6 +49,7 @@ forward = [{ port = 18081, to = "127.0.0.1:8081" }]     # relay out to a local s
 
 [process]
 signals = "any"               # "any" | "isolated"
+children = "allowed"          # "allowed" | "none"; "none": the program cannot start processes
 
 [environment]
 pass = ["LANG"]               # copied from sandy's environment if present
@@ -91,7 +92,12 @@ Rules:
    through which the systemd user manager starts arbitrary commands outside the sandbox. On macOS
    it includes mDNSResponder, so even with `ip = "none"` the program can send data out in DNS
    queries. Use it only for programs you would also run without a sandbox.
-9. Children of the program inherit the sandbox on every platform.
+9. Children of the program inherit the sandbox on every platform. With `process.children =
+   "none"` the program cannot create processes at all (threads stay allowed, and so does replacing
+   its own program image with `execve`), so nothing it starts can outlive it. This needs
+   `unix_sockets = "none"`: through a Unix socket the program could ask a service of the user (for
+   example the systemd user manager over D-Bus) to start a process, which is not its child. sandy
+   rejects `children = "none"` together with `unix_sockets = "all"`.
 10. `linux.path_metadata = "deny"` (the default) requires that permissions, owner, timestamps and
    extended attributes of files outside the policy paths cannot change. Landlock does not
    control these calls, so the Linux backend denies the path-based variants (`chmod`, `chown`,
@@ -166,6 +172,7 @@ Rules:
 | `MetadataConfined` | `linux.path_metadata = "deny"` (default) |
 | `ExposedPortsRelayed` | `network.expose` is not empty |
 | `ForwardedPortsRelayed` | `network.forward` is not empty |
+| `ChildProcessesDenied` | `process.children = "none"` |
 
 A requirement is a lower bound. A backend may deny more, but never less. For example,
 `UnixSocketsDenied` guarantees that the program cannot connect to Unix sockets outside its
@@ -209,6 +216,8 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   not check it), the path-based metadata calls when `path_metadata = "deny"`, setuid and setgid
   mode bits, changes of the limits, priority and CPU affinity of other processes, and before
   Landlock ABI 3 truncation without write access.
+- `process.children = "none"`: the seccomp denylist allows `clone` only with `CLONE_THREAD` and
+  denies `fork` and `vfork`; `clone3` fails with `ENOSYS`, so threads use `clone`.
 - Exposed and forwarded ports: one relay forked twice before sandy confines itself, so it is not
   a child of the program. It watches the program with a pidfd and ends at most one second after
   it (rule 5 of "Forwarded ports"). It confines itself with no_new_privs, Landlock without file
@@ -244,6 +253,8 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   kqueue (`NOTE_EXIT`). The relay has its own profile: accept on its listeners, connect only to
   the targets (the program's ports for `expose`, `to` for `forward`), no files, no Mach services.
   sandy execs only after the relay reports ready.
+- `process.children = "none"`: the profile denies `process-fork`, which Seatbelt checks for
+  `fork`, `vfork` and `posix_spawn`; threads and `execve` stay allowed.
 - `sandy check` compiles the profile without applying it, so it reports operations or filters that
   this macOS does not know.
 - `docs/macos.md` describes the profile, the system set with a reason per entry, and the known
@@ -295,6 +306,10 @@ Details, limitations and sources: `docs/windows.md`.
   creates the program's listener itself and passes each connection over an AF_UNIX socket that
   only the relays may open to sandy, which connects to the target. No loopback exemption is
   needed. The plan also refuses when AF_UNIX is missing or the socket paths exceed 107 bytes.
+- `process.children = "none"`: the program's job has an active-process limit of 1, which the
+  program cannot change; its console host is not counted. The relays always run without a
+  console and with `PROCESS_CREATION_CHILD_PROCESS_RESTRICTED`, so the program cannot start
+  processes through them.
 - Relay lifetime (rule 5): when the program exits, sandy ends its job at once and closes the
   relays' standard input; the relays accept what already waits in the backlog, close their
   listeners, drain for at most one second and end; sandy ends the relay job one second after

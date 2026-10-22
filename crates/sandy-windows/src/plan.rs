@@ -113,7 +113,8 @@ fn contained(
         Requirement::NoPrivilegeEscalation
         | Requirement::SignalsIsolated
         | Requirement::ExposedPortsRelayed
-        | Requirement::ForwardedPortsRelayed,
+        | Requirement::ForwardedPortsRelayed
+        | Requirement::ChildProcessesDenied,
         Some(reason),
     ) = (requirement, job_problem(host))
     {
@@ -138,6 +139,15 @@ fn contained(
                  Windows grants all AppContainers and the AppContainer profile folder"
             )),
         },
+        Requirement::ChildProcessesDenied => enforced(
+            "the program's job admits one active process (JOB_OBJECT_LIMIT_ACTIVE_PROCESS = \
+             1), so Windows refuses every process that would join it, and every child of the \
+             program joins it because the job allows no breakaway; the program holds no handle to \
+             the job and cannot change the limit; the relays run without a console and with \
+             PROCESS_CREATION_CHILD_PROCESS_RESTRICTED, so the program cannot start processes \
+             through them either"
+                .to_string(),
+        ),
         Requirement::ExposedPortsRelayed => match relay_program(policy, host) {
             Err(reason) => unavailable(reason),
             Ok(sandy) => enforced(format!(
@@ -264,8 +274,8 @@ mod tests {
     use std::path::PathBuf;
 
     use sandy_core::{
-        EnforcementPlan, ExposedPort, ForwardedPort, PathAccess, PathMetadata, PathRule, Policy,
-        SignalScope, Status, WindowsPolicy,
+        ChildProcesses, EnforcementPlan, ExposedPort, ForwardedPort, PathAccess, PathMetadata,
+        PathRule, Policy, SignalScope, Status, WindowsPolicy,
     };
 
     use super::*;
@@ -353,6 +363,7 @@ mod tests {
     fn reports_every_requirement_once() {
         let mut policy = policy();
         policy.signals = SignalScope::Isolated;
+        policy.children = ChildProcesses::None;
         let items = plan_for(&policy, &host());
         let mut reported: Vec<_> = items.iter().map(|item| item.requirement).collect();
         reported.sort();
@@ -597,6 +608,33 @@ mod tests {
         // Read access to the directory gives the program nothing it could replace sandy with.
         let readable = exposing(with_rule(policy(), PathAccess::Read));
         assert!(plan(&readable, &host).is_enforceable());
+    }
+
+    #[test]
+    fn child_processes_are_denied_by_the_job() {
+        let mut policy = policy();
+        policy.children = ChildProcesses::None;
+        assert!(plan(&policy, &host()).is_enforceable());
+        match status(&policy, &host(), Requirement::ChildProcessesDenied) {
+            Status::Enforced { mechanism } => {
+                assert!(
+                    mechanism.contains("JOB_OBJECT_LIMIT_ACTIVE_PROCESS"),
+                    "{mechanism}"
+                );
+                assert!(
+                    mechanism.contains("CHILD_PROCESS_RESTRICTED"),
+                    "{mechanism}"
+                );
+            }
+            Status::Unavailable { reason } => panic!("unavailable: {reason}"),
+        }
+        // The limit lives in sandy's job, which an outer job with UI restrictions prevents.
+        let nested = HostCapabilities {
+            outer_job_ui: Ok(Some(0x1)),
+            ..host()
+        };
+        let reason = unavailable(status(&policy, &nested, Requirement::ChildProcessesDenied));
+        assert!(reason.contains("UI restrictions"), "{reason}");
     }
 
     #[test]

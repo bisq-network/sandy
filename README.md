@@ -16,7 +16,7 @@ sandy run \
   -- /srv/app/bin/server --port 8080
 ```
 
-Version 1.0.0. Policies use format `version = 1`.
+Version 1.1.0. Policies use format `version = 1`.
 
 ## Contents
 
@@ -306,6 +306,7 @@ matters only on Windows (see [Windows](#windows)); on Linux and macOS it does no
 | `--ip all\|none` | IPv4 and IPv6 networking, including loopback. | `none` |
 | `--unix-sockets all\|none` | Unix domain sockets. Read the warning below before using `all`. | `none` |
 | `--signals any\|isolated` | Whether the program may signal processes outside its sandbox. | `any` |
+| `--children allowed\|none` | Whether the program may start other processes. With `none`, nothing it starts can outlive it. | `allowed` |
 | `--expose ADDRESS=PORT` | Relay connections on the loopback `ADDRESS` to the program's loopback `PORT`. Needs `--ip all`. | |
 | `--forward PORT=ADDRESS` | Relay the program's connections to its loopback `PORT` to the loopback `ADDRESS` outside the sandbox. Needs `--ip all`. | |
 | `--linux-path-metadata deny\|allow` | On Linux, whether `chmod`, `chown`, `utimensat` and `setxattr` by path are allowed. | `deny` |
@@ -345,6 +346,7 @@ forward = [{ port = 18081, to = "127.0.0.1:8081" }]
 
 [process]
 signals = "any"                 # "any" | "isolated"
+children = "allowed"            # "allowed" | "none"
 
 [environment]
 pass = ["LANG"]                 # copied from sandy's environment, if set

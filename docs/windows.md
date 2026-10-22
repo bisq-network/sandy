@@ -25,6 +25,7 @@ nothing about isolation.
 | `UnixSocketsDenied` | No write access to socket files outside read-write paths | no AppContainer |
 | `SignalsIsolated` | Own console; AppContainer access checks; job UI restrictions | no AppContainer |
 | `ExposedPortsRelayed` | Listening socket created outside the AppContainer; `sandy __relay` in the program's AppContainer and a job of its own | no AppContainer; outer job with UI restrictions; sandy cannot grant read and execute on `sandy.exe`; `sandy.exe` lies in a read-write path |
+| `ChildProcessesDenied` | The program's job admits one active process (`JOB_OBJECT_LIMIT_ACTIVE_PROCESS` = 1); the relays run without a console and with `PROCESS_CREATION_CHILD_PROCESS_RESTRICTED` | outer job with UI restrictions; no AppContainer |
 | `ForwardedPortsRelayed` | `sandy __forward` in the program's AppContainer and a job of its own listens on the program's port and passes each connection over an AF_UNIX socket to sandy, which connects to the target; no loopback exemption | as for `ExposedPortsRelayed`; AF_UNIX missing; socket paths longer than 107 bytes |
 
 Every requirement also needs `windows.appcontainer_name` (or `--appcontainer NAME`). Without it,
@@ -269,9 +270,10 @@ port:
 1. sandy binds a TCP socket to `listen` outside the AppContainer and makes it inheritable.
 2. Before the program, sandy starts `sandy.exe __relay <handle> <target>` in the program's
    AppContainer and in a job of its own (the relay job: kill-on-close, the same limits as the
-   program's job), created suspended and assigned to that job like the program. The handle list
-   holds only the socket, a pipe as standard input (sandy keeps the other end), the NUL device as
-   standard output and the program's standard error. The environment holds only `SystemRoot` and
+   program's job), created suspended and assigned to that job like the program, but without a
+   console and unable to create processes (see "Child processes"). The handle list holds only
+   the socket, a pipe as standard input (sandy keeps the other end), the NUL device as standard
+   output and the program's standard error. The environment holds only `SystemRoot` and
    `LOCALAPPDATA`.
 3. The relay's token has no network capability and one file capability: read and execute on
    `sandy.exe`, granted with the same ACE mechanism as policy paths.
@@ -392,6 +394,23 @@ pipe grants nothing to AppContainers [CreateNamedPipeW] [Implementing an AppCont
   program exits, sandy ends the processes it left behind, so they do not outlive it. The relays
   of exposed and forwarded ports run in a second job with the same limits, which sandy ends at
   most one second later (see "How the relays end").
+- **Child processes.** With `process.children = "none"` the program's job has an active-process
+  limit of 1. The program is that one process; every child it creates would join the job (the
+  job allows no breakaway), so Windows refuses it: `CreateProcess` fails with
+  `ERROR_NOT_ENOUGH_QUOTA` (1816), and `cmd.exe` reports "Access is denied". The program holds no
+  handle to the job, so it cannot raise the limit. Threads are not affected. The program's
+  console host (conhost) also runs in the job, but Windows does not count it against the limit
+  (measured on Windows 11). The relays never need a console or a child: sandy starts them
+  detached (`DETACHED_PROCESS`) and with `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY` set to
+  `PROCESS_CREATION_CHILD_PROCESS_RESTRICTED`, which Windows fixes when the process is created.
+  The program can open the relays (one AppContainer), so this keeps them from being a way
+  around the rule. Why not the same policy for the program: a console program with it cannot
+  start its own console host and ends with `STATUS_DLL_INIT_FAILED` (`0xC0000142`) before it
+  runs. Why not a job limit for the relays: with two relays, the program could end one to free a
+  slot and use the other. Processes that a service outside starts on request are not children
+  of the program; an AppContainer cannot activate out-of-process COM servers
+  (`out_of_process_com_service_activation_is_blocked`), and sandy refuses `children = "none"`
+  together with `unix_sockets = "all"`.
 - **UI restrictions.** The job sets all documented UI restrictions: desktops, display settings,
   `ExitWindows`, global atoms, USER handles of other processes, the clipboard (read and write),
   and system parameters [UI restrictions]. Low integrity already blocks window messages, hooks
@@ -518,9 +537,10 @@ messages that reach processes outside the sandbox.
 ## Verified on Windows 11
 
 Host: Windows 11 build 26200 (VM), binaries built for `x86_64-pc-windows-gnu`. The tests run in
-an elevated SSH session and without administrator rights. Latest elevated run: `sandy_windows` 62
-of 62, `sandy_relay` 8 of 8, `escape` 10 of 10 (the Unix socket test is Unix-only),
-`escape_windows` 29 of 29, `expose` 3 of 3, `forward` 2 of 2, `review_windows` 3 of 3. Earlier
+an elevated SSH session and without administrator rights. Latest elevated run: `sandy_windows` 63
+of 63, `sandy_relay` 8 of 8, `escape` 10 of 10 (the Unix socket test is Unix-only),
+`escape_windows` 32 of 32, `expose` 3 of 3, `forward` 2 of 2, `children` 1 of 1,
+`review_windows` 3 of 3. Earlier
 non-administrator runs used a scheduled task with `/RL LIMITED` (medium integrity, Administrators
 deny-only). The latest one used `runas /trustlevel:0x20000` (Administrators deny-only, high
 integrity), because the VM had no interactive logon session for an `/IT` task: every test
@@ -553,6 +573,8 @@ Facts these runs established:
   writing and the half close; `sun_path` is read as UTF-8; a socket file and its directory can be
   deleted while the socket listens, after which connections fail.
 - The program cannot connect to the forward socket (`WSAEACCES`); the relay and the user can.
+- With `children = "none"` the program and `cmd.exe` start, and starting `whoami.exe` fails;
+  the relays report `NoChildProcessCreation` through `GetProcessMitigationPolicy` and still relay.
 
 ## Sources
 

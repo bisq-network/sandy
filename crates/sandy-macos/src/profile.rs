@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use sandy_core::{NetworkAccess, PathAccess, ResolvedPolicy, SignalScope, SystemAccess};
+use sandy_core::{
+    ChildProcesses, NetworkAccess, PathAccess, ResolvedPolicy, SignalScope, SystemAccess,
+};
 
 use crate::system::{self, SystemAccess as Grant};
 
@@ -34,7 +36,7 @@ pub fn generate(policy: &ResolvedPolicy) -> Profile {
          ioctls. file-write* includes mode, owner, flags, times, extended attributes and ACLs.",
     );
     writer.line("(deny process-info* file-map-executable file-ioctl file-write*)");
-    process_rules(&mut writer, policy.signals);
+    process_rules(&mut writer, policy.signals, policy.children);
     ioctl_rules(&mut writer);
     sysctl_rules(&mut writer);
     if policy.system == SystemAccess::Minimal {
@@ -191,9 +193,11 @@ const CODE: &[&str] = &["file-read*", "file-test-existence", "file-map-executabl
 const READ_WRITE_DEVICE: &[&str] = &["file-read*", "file-test-existence", "file-write-data"];
 const METADATA: &[&str] = &["file-read-metadata", "file-test-existence"];
 
-fn process_rules(writer: &mut Writer, signals: SignalScope) {
+fn process_rules(writer: &mut Writer, signals: SignalScope, children: ChildProcesses) {
     writer.comment("Processes. Children inherit the sandbox.");
-    writer.line("(allow process-fork)");
+    if children == ChildProcesses::Allowed {
+        writer.line("(allow process-fork)");
+    }
     writer.line("(allow process-info* (target self))");
     match signals {
         SignalScope::Any => writer.line("(allow signal)"),
@@ -341,6 +345,13 @@ fn protection_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
         &["file-write-unlink", "file-write-create"],
         &filters,
     );
+    if policy.children == ChildProcesses::None {
+        writer.comment(
+            "process.children = \"none\": no fork, vfork or posix_spawn. Threads, and replacing\n\
+             the program's own image, stay possible.",
+        );
+        writer.line("(deny process-fork)");
+    }
     hardening_rules(writer);
 }
 
@@ -408,6 +419,7 @@ mod tests {
             expose: Vec::new(),
             forward: Vec::new(),
             signals: SignalScope::Any,
+            children: sandy_core::ChildProcesses::Allowed,
             path_metadata: PathMetadata::Deny,
             environment: EnvironmentPolicy::default(),
             windows: WindowsPolicy::default(),
@@ -809,6 +821,20 @@ mod tests {
         policy.expose.clear();
         policy.forward.clear();
         assert!(relay_pairs(&policy).is_empty());
+    }
+
+    #[test]
+    fn children_none_denies_process_fork() {
+        let mut policy = typical("/srv");
+        let allowed = generate(&policy).text;
+        assert!(allowed.contains("\n(allow process-fork)\n"));
+        assert!(!allowed.contains("(deny process-fork)"));
+        policy.children = ChildProcesses::None;
+        let denied = generate(&policy).text;
+        assert!(!denied.contains("(allow process-fork)"));
+        let deny = denied.find("\n(deny process-fork)\n").unwrap();
+        assert!(deny > denied.rfind("(allow").unwrap());
+        assert!(denied.contains("process-exec*"));
     }
 
     #[test]

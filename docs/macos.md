@@ -69,6 +69,7 @@ compiler fail, and sandy fails closed.
 | `IpNetworkDenied` | Profile: no `network-*` rule for IP. The name resolver is unreachable unless `unix_sockets = "all"`. |
 | `UnixSocketsDenied` | Profile: no `network-bind` or `network-outbound` for Unix sockets. With `ip = "all"`, the resolver socket is the one exception. |
 | `SignalsIsolated` | Profile: `(allow signal (target self) (target same-sandbox))` instead of `(allow signal)`. |
+| `ChildProcessesDenied` | Profile: no `(allow process-fork)`, and an explicit `(deny process-fork)` at the end. Seatbelt checks `fork`, `vfork` and `posix_spawn` without `POSIX_SPAWN_SETEXEC` as `process-fork`; all three fail with `EPERM` (CI run 39857337279 logged `deny(1) process-fork` for each). Threads are no operation, and `execve` of an allowed program, which replaces the image without creating a process, stays covered by `process-exec*`. sandy's own final `posix_spawn` with `POSIX_SPAWN_SETEXEC` is not a `process-fork`, and the relay is forked before the profile applies, so both still work. |
 | `MetadataConfined` | Profile: `file-write*`, which includes `file-write-mode`, `-owner`, `-flags`, `-times`, `-xattr`, `-acl` and `-setugid`, is denied explicitly and allowed again only on `read_write` paths. XNU runs the same MAC check for the path and the descriptor variant of each call (`chmod_vnode`, `vn_chown_internal`, `setutimes` and `vn_setxattr` serve both), so descriptors do not bypass the rule, and unlike on Linux the target keeps full metadata access inside writable paths. `linux.path_metadata = "allow"` only drops the requirement; the profile is the same. |
 
 ### Inherited descriptors
@@ -104,8 +105,10 @@ of earlier definitions"), so the protections come last. The unit test
    default", and Apple's own strict profiles deny `file-map-executable` explicitly. No public
    source lists all such operations, so the profile also denies `file-write*` here. The next
    sections allow these operations again narrowly.
-3. Processes: `(allow process-fork)`, `(allow process-info* (target self))`, and signals:
-   `(allow signal)` or `(allow signal (target self) (target same-sandbox))`.
+3. Processes: `(allow process-fork)` unless `process.children = "none"`,
+   `(allow process-info* (target self))`, and signals: `(allow signal)` or
+   `(allow signal (target self) (target same-sandbox))`. With `children = "none"` the protections
+   at the end also contain `(deny process-fork)`.
 4. ioctls: `(allow file-ioctl (ioctl-command N) ...)` for `FIONBIO` and `FIOASYNC` (XNU issues
    them for `fcntl(F_SETFL)`, and `vn_ioctl` checks every request) and for `TIOCGETA` and
    `TIOCGWINSZ` (they only read terminal state, so `isatty` and stdio line buffering work). The

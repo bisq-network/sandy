@@ -97,6 +97,10 @@ fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
             "file-write* (mode, owner, flags, times, extended attributes, ACLs) only on read_write \
              paths, by path and through open descriptors alike"
         }
+        Requirement::ChildProcessesDenied => {
+            "process-fork denied, so fork, vfork and posix_spawn fail; threads and replacing the \
+             program's own image (execve) stay allowed"
+        }
         Requirement::ForwardedPortsRelayed => {
             "the relay process of the exposed ports with the direction mirrored: it listens on \
              the target's loopback port outside the sandbox and connects only to the forwarded \
@@ -135,6 +139,7 @@ mod tests {
             expose: Vec::new(),
             forward: Vec::new(),
             signals,
+            children: sandy_core::ChildProcesses::Allowed,
             path_metadata: PathMetadata::Deny,
             environment: EnvironmentPolicy::default(),
             windows: WindowsPolicy::default(),

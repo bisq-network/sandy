@@ -114,6 +114,7 @@ mod tests {
             expose: Vec::new(),
             forward: Vec::new(),
             signals: SignalScope::Any,
+            children: sandy_core::ChildProcesses::Allowed,
             path_metadata: PathMetadata::Deny,
             environment: EnvironmentPolicy::default(),
             windows: WindowsPolicy::default(),
@@ -128,12 +129,17 @@ mod tests {
                             ip,
                             unix_sockets,
                             signals,
+                            children: sandy_core::ChildProcesses::Allowed,
                             ..base.clone()
                         });
                     }
                 }
             }
         }
+        policies.push(ResolvedPolicy {
+            children: sandy_core::ChildProcesses::None,
+            ..base.clone()
+        });
         policies
     }
 

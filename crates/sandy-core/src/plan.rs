@@ -36,6 +36,8 @@ pub enum Requirement {
     /// Every forwarded port is relayed from inside the sandbox to its loopback service outside,
     /// and the relay ends with the target. Like `ExposedPortsRelayed`, a promise of function.
     ForwardedPortsRelayed,
+    /// The target cannot create child processes (threads stay allowed).
+    ChildProcessesDenied,
 }
 
 impl Requirement {
@@ -54,6 +56,7 @@ impl Requirement {
             Requirement::MetadataConfined => "metadata of files outside policy paths protected",
             Requirement::ExposedPortsRelayed => "exposed ports relayed into the sandbox",
             Requirement::ForwardedPortsRelayed => "forwarded ports relayed out of the sandbox",
+            Requirement::ChildProcessesDenied => "no child processes",
         }
     }
 }

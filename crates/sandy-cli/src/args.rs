@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use lexopt::prelude::*;
 use sandy_core::{
-    ExposedPort, ForwardedPort, NetworkAccess, PathMetadata, Policy, SignalScope, SystemAccess,
+    ChildProcesses, ExposedPort, ForwardedPort, NetworkAccess, PathMetadata, Policy, SignalScope,
+    SystemAccess,
 };
 
 pub const USAGE: &str = "\
@@ -25,6 +26,7 @@ Options (they extend the policy file):
   --ip all|none              IP networking (default: none)
   --unix-sockets all|none    Unix domain sockets (default: none)
   --signals any|isolated     who the program may signal (default: any)
+  --children allowed|none    whether the program may start other processes (default: allowed)
   --expose ADDRESS=PORT      relay connections on the loopback ADDRESS to the program's
                              loopback PORT, for example 127.0.0.1:18080=8080 (repeatable;
                              needs --ip all)
@@ -60,6 +62,7 @@ pub struct Overrides {
     ip: Option<NetworkAccess>,
     unix_sockets: Option<NetworkAccess>,
     signals: Option<SignalScope>,
+    children: Option<ChildProcesses>,
     path_metadata: Option<PathMetadata>,
     pass_env: Vec<String>,
     set_env: Vec<(String, String)>,
@@ -85,6 +88,9 @@ impl Overrides {
         }
         if let Some(signals) = self.signals {
             policy.process.signals = signals;
+        }
+        if let Some(children) = self.children {
+            policy.process.children = children;
         }
         if let Some(path_metadata) = self.path_metadata {
             policy.linux.path_metadata = path_metadata;
@@ -195,6 +201,13 @@ where
             Long("ip") => overrides.ip = Some(network_access(&mut parser, "--ip")?),
             Long("unix-sockets") => {
                 overrides.unix_sockets = Some(network_access(&mut parser, "--unix-sockets")?)
+            }
+            Long("children") => {
+                overrides.children = Some(match parser.value()?.string()?.as_str() {
+                    "allowed" => ChildProcesses::Allowed,
+                    "none" => ChildProcesses::None,
+                    other => return Err(format!("invalid --children value {other:?}").into()),
+                })
             }
             Long("signals") => {
                 overrides.signals = Some(match parser.value()?.string()?.as_str() {
@@ -322,6 +335,8 @@ mod tests {
             "all",
             "--signals",
             "isolated",
+            "--children",
+            "none",
             "--linux-path-metadata",
             "allow",
             "--set-env",
@@ -343,6 +358,7 @@ mod tests {
         assert_eq!(policy.filesystem.read_write, vec![PathBuf::from("/b")]);
         assert_eq!(policy.network.ip, NetworkAccess::All);
         assert_eq!(policy.process.signals, SignalScope::Isolated);
+        assert_eq!(policy.process.children, ChildProcesses::None);
         assert_eq!(policy.linux.path_metadata, PathMetadata::Allow);
         assert_eq!(policy.environment.set["A"], "b=c");
         assert_eq!(policy.windows.appcontainer_name.as_deref(), Some("name"));

@@ -13,7 +13,8 @@ use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::AsRawSocket;
 
 use sandy_core::{
-    Backend, NetworkAccess, PlanItem, ResolvedPolicy, SandboxError, Status, TargetCommand,
+    Backend, ChildProcesses, NetworkAccess, PlanItem, ResolvedPolicy, SandboxError, Status,
+    TargetCommand,
 };
 use windows_sys::Win32::Security::{
     WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientServerSid,
@@ -146,6 +147,7 @@ impl Backend for WindowsBackend {
             appcontainer: &container,
             program,
             relays,
+            deny_children: policy.children == ChildProcesses::None,
         })?;
         if let Some(forwarding) = forwarding {
             forwarding.stop(ended.deadline);

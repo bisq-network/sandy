@@ -733,6 +733,95 @@ fn forward_relay_delivers_data_sent_just_before_exit() {
     assert_eq!(received.join().unwrap(), TCP_SEND_PAYLOAD);
 }
 
+/// Every way to create a process, as probe actions. fork and vfork exist only on x86_64.
+fn process_actions(program: &str) -> Vec<(&'static str, String)> {
+    let mut actions = vec![
+        ("clone-process", "-".to_string()),
+        ("posix-spawn", program.to_string()),
+        ("exec", program.to_string()),
+    ];
+    if cfg!(target_arch = "x86_64") {
+        actions.extend([("fork", "-".to_string()), ("vfork", "-".to_string())]);
+    }
+    actions
+}
+
+#[test]
+fn children_none_denies_every_way_to_create_a_process() {
+    let fixture = Fixture::new("linux-children");
+    let program = fixture.copy_probe("bin");
+    let owned = process_actions(&program);
+    let mut actions: Vec<(&str, &str)> = owned.iter().map(|(a, t)| (*a, t.as_str())).collect();
+    actions.push(("thread", "-"));
+    // Control: outside and inside without the option, every action works.
+    controlled(&fixture.access_args(), &actions)
+        .iter()
+        .for_each(ProbeLine::assert_ok);
+    let mut none = fixture.access_args();
+    none.extend(args(&["--children", "none"]));
+    let lines = probe_inside(&none, &actions);
+    let (thread, processes) = lines.split_last().unwrap();
+    for line in processes {
+        assert_eq!(line.result, "denied", "{line:?}");
+    }
+    thread.assert_ok();
+}
+
+#[test]
+fn relays_work_with_children_none() {
+    use std::io::Read;
+    // Forward: the program's data reaches a service outside.
+    let service = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = service.local_addr().unwrap();
+    let received = std::thread::spawn(move || {
+        service.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if let Ok((mut stream, _)) = service.accept() {
+                stream.set_nonblocking(false).unwrap();
+                let mut data = Vec::new();
+                let _ = stream.read_to_end(&mut data);
+                return data;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Vec::new()
+    });
+    let inner = free_port();
+    let forward = format!("{inner}={target}");
+    let sandbox_args = args(&["--ip", "all", "--children", "none", "--forward", &forward]);
+    let lines = probe_inside(
+        &sandbox_args,
+        &[("tcp-send", &format!("127.0.0.1:{inner}"))],
+    );
+    lines[0].assert_ok();
+    assert_eq!(received.join().unwrap(), TCP_SEND_PAYLOAD);
+
+    // Expose: a client outside reaches the program.
+    let (inner, outer) = (free_port(), free_port());
+    let expose = format!("127.0.0.1:{outer}={inner}");
+    let sandbox_args = args(&["--ip", "all", "--children", "none", "--expose", &expose]);
+    let mut server = Command::new(sandy_path())
+        .args(run_args(
+            &sandbox_args,
+            &[("tcp-accept", &format!("127.0.0.1:{inner}"))],
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let address = format!("127.0.0.1:{outer}").parse().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while server.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the server never accepted");
+        let _ = TcpStream::connect_timeout(&address, Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let output = server.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    parse(&output)[0].assert_ok();
+}
+
 #[test]
 fn opening_for_ioctl_only_is_denied() {
     let fixture = Fixture::new("linux-ioctlopen");

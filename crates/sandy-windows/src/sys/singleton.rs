@@ -141,7 +141,9 @@ fn fingerprint(policy: &ResolvedPolicy) -> Result<Vec<u8>, SandboxError> {
     use std::os::windows::ffi::OsStrExt;
 
     let mut out = vec![
-        1u8, // format version
+        // Format version. 2 adds forwarded ports and `children`; a run of another sandy version
+        // then never matches by accident and is refused, which is the safe outcome.
+        2u8,
         match policy.system {
             sandy_core::SystemAccess::Minimal => 0,
             sandy_core::SystemAccess::None => 1,
@@ -155,6 +157,11 @@ fn fingerprint(policy: &ResolvedPolicy) -> Result<Vec<u8>, SandboxError> {
         match policy.path_metadata {
             sandy_core::PathMetadata::Deny => 0,
             sandy_core::PathMetadata::Allow => 1,
+        },
+        // A program that may start processes could use a sibling that may not, and the reverse.
+        match policy.children {
+            sandy_core::ChildProcesses::Allowed => 0,
+            sandy_core::ChildProcesses::None => 1,
         },
     ];
 

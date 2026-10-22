@@ -25,6 +25,8 @@ pub struct FilterConfig {
     pub restrict_truncate: bool,
     /// Deny the metadata calls that take a path.
     pub deny_path_metadata: bool,
+    /// Deny creating processes; threads stay allowed.
+    pub deny_children: bool,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -56,6 +58,8 @@ mod arch {
     pub const CHMOD_CALLS: &[(i64, u8)] = &[(libc::SYS_chmod, 1)];
     /// Calls the relay needs that only x86_64 has (arm64 has only ppoll).
     pub const RELAY_CALLS: &[i64] = &[libc::SYS_poll];
+    /// System calls that create a process without arguments to check; arm64 has only clone.
+    pub const FORK_CALLS: &[i64] = &[libc::SYS_fork, libc::SYS_vfork];
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -71,6 +75,7 @@ mod arch {
     pub const OPEN_CALLS: &[(i64, u8)] = &[(libc::SYS_openat, 2)];
     pub const CHMOD_CALLS: &[(i64, u8)] = &[];
     pub const RELAY_CALLS: &[i64] = &[];
+    pub const FORK_CALLS: &[i64] = &[];
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -82,6 +87,7 @@ mod arch {
     pub const OPEN_CALLS: &[(i64, u8)] = &[];
     pub const CHMOD_CALLS: &[(i64, u8)] = &[];
     pub const RELAY_CALLS: &[i64] = &[];
+    pub const FORK_CALLS: &[i64] = &[];
 }
 
 /// Whether sandy has a filter for the CPU architecture it was built for.
@@ -294,7 +300,18 @@ fn denylist(
     rules.add(libc::SYS_ioctl, ioctl_rules()?);
     rules.add(libc::SYS_socket, socket_rules(config)?);
     rules.add(libc::SYS_socketpair, socketpair_rules(config)?);
-    rules.add(libc::SYS_clone, namespace_rules(CLONE_NAMESPACES)?);
+    let mut clone = namespace_rules(CLONE_NAMESPACES)?;
+    if config.deny_children {
+        // Only a thread (CLONE_THREAD) stays possible. The flags are the first argument of clone
+        // on x86_64 and arm64. clone3 already fails with ENOSYS, so libc falls back to clone,
+        // also for posix_spawn (CLONE_VM | CLONE_VFORK), which this denies.
+        let thread = libc::CLONE_THREAD as u64;
+        clone.push(rule(vec![low(0, SeccompCmpOp::MaskedEq(thread), 0)?])?);
+        for &call in arch::FORK_CALLS {
+            rules.add(call, Vec::new());
+        }
+    }
+    rules.add(libc::SYS_clone, clone);
     let unshare: Vec<i32> = [CLONE_NAMESPACES, &[libc::CLONE_NEWTIME]].concat();
     rules.add(libc::SYS_unshare, namespace_rules(&unshare)?);
     let personality = PERSONALITIES
@@ -649,6 +666,7 @@ mod tests {
             allow_unix: false,
             restrict_truncate: false,
             deny_path_metadata: true,
+            deny_children: true,
         }
     }
 
@@ -658,6 +676,7 @@ mod tests {
             allow_unix: true,
             restrict_truncate: false,
             deny_path_metadata: false,
+            deny_children: false,
         }
     }
 
@@ -990,6 +1009,35 @@ mod tests {
         assert_eq!(relay(libc::SYS_ioctl, tiocsti), RET_EPERM);
         // The shared allowlist still decides clone3, so threads fall back to clone.
         assert_eq!(relay(libc::SYS_clone3, [0; 6]), RET_ENOSYS);
+    }
+
+    #[test]
+    fn children_none_allows_only_threads() {
+        let thread = (libc::CLONE_VM
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_THREAD
+            | libc::CLONE_SYSVSEM
+            | libc::CLONE_SETTLS
+            | libc::CLONE_PARENT_SETTID
+            | libc::CLONE_CHILD_CLEARTID) as u64;
+        let fork = libc::SIGCHLD as u64;
+        let spawn = (libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD) as u64;
+        assert_eq!(call(&strict(), libc::SYS_clone, args(&[thread])), RET_ALLOW);
+        for flags in [fork, spawn] {
+            assert_eq!(call(&strict(), libc::SYS_clone, args(&[flags])), RET_EPERM);
+            assert_eq!(call(&open(), libc::SYS_clone, args(&[flags])), RET_ALLOW);
+        }
+        // High bits do not hide a missing CLONE_THREAD: the kernel uses the low 32 bits.
+        let high = args(&[(1 << 32) | fork]);
+        assert_eq!(call(&strict(), libc::SYS_clone, high), RET_EPERM);
+        for &nr in arch::FORK_CALLS {
+            assert_eq!(call(&strict(), nr, [0; 6]), RET_EPERM, "system call {nr}");
+            assert_eq!(call(&open(), nr, [0; 6]), RET_ALLOW, "system call {nr}");
+        }
+        assert_eq!(call(&strict(), libc::SYS_clone3, [0; 6]), RET_ENOSYS);
+        assert_eq!(call(&strict(), libc::SYS_execve, [0; 6]), RET_ALLOW);
     }
 
     #[test]

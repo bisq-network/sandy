@@ -31,9 +31,9 @@ use windows_sys::Win32::System::Console::{
     STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_UILIMIT_DESKTOP,
-    JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
     JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES, JOB_OBJECT_UILIMIT_READCLIPBOARD,
     JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS, JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
     JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -43,8 +43,9 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
-    GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    DETACHED_PROCESS, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    GetCurrentProcess, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
     PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
     UpdateProcThreadAttribute, WaitForSingleObject,
@@ -58,7 +59,30 @@ pub struct Launch<'a> {
     pub program: Process<'a>,
     /// One relay per exposed or forwarded port.
     pub relays: Vec<Relay<'a>>,
+    /// `process.children = "none"`: the program's job admits no process besides the program.
+    pub deny_children: bool,
 }
+
+/// What a started process is, for the way it starts and for error messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Program,
+    Relay,
+}
+
+impl Role {
+    fn name(self) -> &'static str {
+        match self {
+            Role::Program => "program",
+            Role::Relay => "relay",
+        }
+    }
+}
+
+/// `PROCESS_CREATION_CHILD_PROCESS_RESTRICTED` for `PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY`
+/// (Windows 10 1607 and later): the process cannot create child processes. windows-sys defines it
+/// in a module that this crate does not otherwise need.
+const CHILD_PROCESS_RESTRICTED: u32 = 0x01;
 
 /// A relay process: `sandy __relay` for an exposed port or `sandy __forward` for a forwarded
 /// port. Its standard input is a pipe that sandy closes when the program ends; the relay then
@@ -100,7 +124,10 @@ pub struct Process<'a> {
 static CONSOLE_JOB: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 pub fn run(launch: Launch<'_>) -> Result<Ended, SandboxError> {
-    let job = create_job()?;
+    // With an active-process limit of 1 the job admits the program and refuses every process
+    // that would join it later; children of a job process join the job, and the job allows no
+    // breakaway. The program's console host is not counted (measured on Windows 11).
+    let job = create_job(launch.deny_children.then_some(1))?;
     let stdio = StandardHandles::prepare()?;
 
     CONSOLE_JOB.store(job.as_raw_handle(), Ordering::SeqCst);
@@ -124,6 +151,7 @@ fn start_and_wait(
         appcontainer,
         mut program,
         relays: port_relays,
+        deny_children: _,
     } = launch;
     // The relays start before the program, so a relay that cannot start ends the run before the
     // program runs. They run in a job of their own, so that sandy can end the processes the
@@ -131,7 +159,7 @@ fn start_and_wait(
     let relay_job = if port_relays.is_empty() {
         None
     } else {
-        Some(create_job()?)
+        Some(create_job(None)?)
     };
     let mut running = Vec::with_capacity(port_relays.len());
     if let Some(relay_job) = &relay_job {
@@ -146,7 +174,7 @@ fn start_and_wait(
         job,
         stdio_handles,
         &[],
-        "program",
+        Role::Program,
     )?;
     let StandardHandles { child, relays } = stdio;
     // The target owns its copies now. sandy's copies of the pipe ends would keep the relays
@@ -220,7 +248,7 @@ fn start_relay(
         relay_job,
         relay_stdio,
         socket.as_slice(),
-        "relay",
+        Role::Relay,
     )?;
     // The relay holds its own handles now. Without sandy's copies, the relay sees the end of its
     // input when sandy closes `input`, and clients of an exposed port are refused once the relay
@@ -288,7 +316,9 @@ unsafe extern "system" fn on_console_control(event: u32) -> windows_sys::core::B
     }
 }
 
-fn create_job() -> Result<OwnedHandle, SandboxError> {
+/// A job with kill-on-close, no breakaway and all UI restrictions, and with
+/// `active_process_limit` if given.
+fn create_job(active_process_limit: Option<u32>) -> Result<OwnedHandle, SandboxError> {
     // SAFETY: null attributes and name create an unnamed job with a handle that is not
     // inheritable.
     let raw = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
@@ -303,6 +333,10 @@ fn create_job() -> Result<OwnedHandle, SandboxError> {
     // No JOB_OBJECT_LIMIT_BREAKAWAY_OK: every child of the target stays in the job.
     limits.BasicLimitInformation.LimitFlags =
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+    if let Some(limit) = active_process_limit {
+        limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        limits.BasicLimitInformation.ActiveProcessLimit = limit;
+    }
     set_job_information(
         &job,
         JobObjectExtendedLimitInformation,
@@ -349,14 +383,21 @@ fn set_job_information<T>(
 /// Creates the process suspended in the AppContainer, puts it into the job, then lets it run.
 /// It cannot run any code before it is in the job. It inherits `stdio` and `extra`, which must
 /// be inheritable, and no other handle.
+///
+/// A relay starts without a console and with `CHILD_PROCESS_RESTRICTED`: it never needs either,
+/// and the program, which can open the relay because both run in one AppContainer, then cannot
+/// start processes through it. The policy is fixed when the process is created. A console
+/// program cannot have it: its console host is a child process, and without it the program ends
+/// with `STATUS_DLL_INIT_FAILED` before it runs (measured on Windows 11).
 fn start(
     launch: &mut Process<'_>,
     appcontainer: &Sid,
     job: &OwnedHandle,
     stdio: [HANDLE; 3],
     extra: &[HANDLE],
-    what: &str,
+    role: Role,
 ) -> Result<OwnedHandle, SandboxError> {
+    let what = role.name();
     let mut capabilities: Vec<SID_AND_ATTRIBUTES> = launch
         .capabilities
         .iter()
@@ -383,13 +424,19 @@ fn start(
         }
     }
 
-    let mut attributes = AttributeList::new(2)?;
+    let mut attributes = AttributeList::new(3)?;
     attributes.set(
         PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
         &security_capabilities,
     )?;
     // The handle list limits inheritance to these handles, although bInheritHandles is TRUE.
     attributes.set(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited.as_slice())?;
+    if role == Role::Relay {
+        attributes.set(
+            PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
+            &CHILD_PROCESS_RESTRICTED,
+        )?;
+    }
 
     // SAFETY: the structure is plain data; zero is a valid value for every field.
     let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
@@ -403,11 +450,13 @@ fn start(
     // CREATE_NO_WINDOW gives a console program its own console without a window instead of
     // the console of sandy. A shared console would let the target write keystrokes into the
     // console input that the shell reads after sandy exits, and send Ctrl+C to every process on
-    // it.
-    let flags = EXTENDED_STARTUPINFO_PRESENT
-        | CREATE_SUSPENDED
-        | CREATE_UNICODE_ENVIRONMENT
-        | CREATE_NO_WINDOW;
+    // it. A relay gets no console at all (see above).
+    let console = match role {
+        Role::Program => CREATE_NO_WINDOW,
+        Role::Relay => DETACHED_PROCESS,
+    };
+    let flags =
+        EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | console;
     // SAFETY: the structure is plain data; zero is a valid value for every field.
     let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: all strings are NUL-terminated (application, command_line, cwd) or a

@@ -164,6 +164,20 @@ pub enum NetworkAccess {
 pub struct ProcessPolicy {
     #[serde(default)]
     pub signals: SignalScope,
+    #[serde(default)]
+    pub children: ChildProcesses,
+}
+
+/// Whether the target may start other processes. Threads are always allowed, and so is replacing
+/// the target's own program image with `execve`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChildProcesses {
+    /// Children are allowed; they inherit the sandbox.
+    #[default]
+    Allowed,
+    /// The target cannot create processes. Nothing it starts can outlive it in the sandbox.
+    None,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -247,6 +261,7 @@ pub enum PolicyError {
         forward: ForwardedPort,
         reason: &'static str,
     },
+    ChildrenNeedUnixSocketsDenied,
     ProgramNotAFile(PathBuf),
     InvalidEnvironmentName(String),
     InvalidEnvironmentValue(String),
@@ -280,6 +295,9 @@ impl fmt::Display for PolicyError {
                 "policy path {} lies inside writable path {}; the program could replace it with a symbolic link before the next start",
                 path.display(),
                 writable.display()
+            ),
+            PolicyError::ChildrenNeedUnixSocketsDenied => f.write_str(
+                "children = \"none\" needs unix_sockets = \"none\": through a Unix socket the program could ask a service of the user to start a process that outlives it",
             ),
             PolicyError::InvalidForward { forward, reason } => write!(
                 f,
@@ -325,6 +343,7 @@ mod tests {
         assert_eq!(policy.network.unix_sockets, NetworkAccess::None);
         assert_eq!(policy.filesystem.system, SystemAccess::Minimal);
         assert_eq!(policy.linux.path_metadata, PathMetadata::Deny);
+        assert_eq!(policy.process.children, ChildProcesses::Allowed);
     }
 
     #[test]
@@ -344,6 +363,7 @@ mod tests {
             forward = [{ port = 18081, to = "127.0.0.1:8081" }]
             [process]
             signals = "isolated"
+            children = "none"
             [environment]
             pass = ["LANG"]
             set = { HOME = "/c" }
@@ -380,6 +400,7 @@ mod tests {
             "127.0.0.1:18081".parse().unwrap()
         );
         assert_eq!(policy.process.signals, SignalScope::Isolated);
+        assert_eq!(policy.process.children, ChildProcesses::None);
         assert_eq!(policy.environment.set["HOME"], "/c");
         assert_eq!(policy.linux.path_metadata, PathMetadata::Allow);
         assert_eq!(policy.windows.appcontainer_name.as_deref(), Some("example"));

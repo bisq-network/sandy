@@ -1152,7 +1152,7 @@ fn relay_processes(parent: u32) -> Vec<std::os::windows::io::OwnedHandle> {
         TH32CS_SNAPPROCESS,
     };
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE,
     };
 
     // SAFETY: a process snapshot needs no process id.
@@ -1175,7 +1175,7 @@ fn relay_processes(parent: u32) -> Vec<std::os::windows::io::OwnedHandle> {
             // SAFETY: OpenProcess has no memory preconditions.
             let handle = unsafe {
                 OpenProcess(
-                    PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                    PROCESS_SYNCHRONIZE | PROCESS_QUERY_INFORMATION,
                     0,
                     entry.th32ProcessID,
                 )
@@ -1191,4 +1191,123 @@ fn relay_processes(parent: u32) -> Vec<std::os::windows::io::OwnedHandle> {
     // SAFETY: snapshot is a handle this function owns.
     unsafe { CloseHandle(snapshot) };
     handles
+}
+
+/// `--children none`: the program cannot start even a system program that every AppContainer may
+/// run; the same policy without the option can.
+#[test]
+fn children_none_denies_starting_a_system_program() {
+    if appcontainer_children_blocked() {
+        return;
+    }
+    let fixture = Fixture::new("children-system");
+    let system = std::env::var("SystemRoot").expect("SystemRoot is set");
+    let whoami = format!(r"{system}\System32\whoami.exe");
+    probe_inside(&fixture.access_args(), &[("exec", &whoami)])[0].assert_ok();
+    let mut denied = fixture.access_args();
+    denied.extend(args(&["--children", "none"]));
+    probe_inside(&denied, &[("exec", &whoami)])[0].assert_blocked();
+}
+
+/// With `--children none` the relays still work, and they cannot start processes themselves:
+/// the program can open them (one AppContainer), so they must not be a way around the rule.
+/// Their child-process policy is read from outside.
+#[test]
+fn relays_work_with_children_none_and_cannot_start_processes() {
+    let fixture = Fixture::new("children-relay");
+    let (service, received) = one_shot_service();
+    let inner = free_port();
+    let mut sandbox_args = forward_args(&fixture, inner, service);
+    sandbox_args.extend(args(&["--children", "none"]));
+    let run = Command::new(sandy_path())
+        .args(run_args(
+            &sandbox_args,
+            &[
+                ("sleep", "1500"),
+                ("tcp-send", &format!("127.0.0.1:{inner}")),
+            ],
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let relays = loop {
+        let relays = relay_processes(run.id());
+        if !relays.is_empty() {
+            break relays;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no relay process of sandy {}",
+            run.id()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    for relay in &relays {
+        assert!(
+            cannot_create_children(relay),
+            "a relay may start child processes"
+        );
+    }
+    let output = run.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    parse(&output)[1].assert_ok();
+    assert_eq!(received.join().unwrap().as_deref(), Some(TCP_SEND_PAYLOAD));
+}
+
+/// An exposed port works with `--children none` too.
+#[test]
+fn exposed_port_works_with_children_none() {
+    let fixture = Fixture::new("children-expose");
+    let (inner, outer) = (free_port(), free_port());
+    let mut sandbox_args = fixture.access_args();
+    sandbox_args.extend(args(&[
+        "--children",
+        "none",
+        "--ip",
+        "all",
+        "--expose",
+        &format!("127.0.0.1:{outer}={inner}"),
+    ]));
+    let mut run = Command::new(sandy_path())
+        .args(run_args(
+            &sandbox_args,
+            &[("tcp-accept", &format!("127.0.0.1:{inner}"))],
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let address = format!("127.0.0.1:{outer}").parse().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while run.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the program never accepted");
+        let _ = TcpStream::connect_timeout(&address, Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let output = run.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    parse(&output)[0].assert_ok();
+}
+
+/// Whether the process may not create child processes (`ProcessChildProcessPolicy`,
+/// `NoChildProcessCreation`, bit 0 of the policy flags).
+fn cannot_create_children(process: &std::os::windows::io::OwnedHandle) -> bool {
+    use windows_sys::Win32::System::Threading::{
+        GetProcessMitigationPolicy, ProcessChildProcessPolicy,
+    };
+    let mut flags = 0u32;
+    // SAFETY: process is a valid handle with query access; flags is a writable 4-byte buffer,
+    // the size of PROCESS_MITIGATION_CHILD_PROCESS_POLICY.
+    let ok = unsafe {
+        GetProcessMitigationPolicy(
+            process.as_raw_handle(),
+            ProcessChildProcessPolicy,
+            (&mut flags as *mut u32).cast(),
+            std::mem::size_of::<u32>(),
+        )
+    };
+    assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+    flags & 1 != 0
 }

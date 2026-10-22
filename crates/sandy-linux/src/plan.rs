@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use landlock::{ABI, Access, AccessFs, AccessNet, BitFlags, Scope, make_bitflags};
 use sandy_core::{
-    NetworkAccess, PathAccess, PathMetadata, PlanItem, Requirement, ResolvedPolicy, SignalScope,
-    SystemAccess,
+    ChildProcesses, NetworkAccess, PathAccess, PathMetadata, PlanItem, Requirement, ResolvedPolicy,
+    SignalScope, SystemAccess,
 };
 
 use crate::filter::FilterConfig;
@@ -78,6 +78,7 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
                 allow_unix: policy.unix_sockets == NetworkAccess::All,
                 restrict_truncate: abi < ABI::V3,
                 deny_path_metadata: policy.path_metadata == PathMetadata::Deny,
+                deny_children: policy.children == ChildProcesses::None,
             },
             relay: RelayConfig::new(&policy.expose, &policy.forward, abi),
         }),
@@ -171,6 +172,14 @@ fn plan_item(
                 }
                 enforced(mechanism)
             }
+        },
+        Requirement::ChildProcessesDenied => match &host.seccomp {
+            Err(reason) => unavailable(reason),
+            Ok(()) => enforced(
+                "seccomp denies fork, vfork and clone without CLONE_THREAD (clone3 fails with \
+                 ENOSYS); threads and execve stay allowed"
+                    .to_string(),
+            ),
         },
         Requirement::ExposedPortsRelayed | Requirement::ForwardedPortsRelayed => {
             match (&host.landlock, &host.seccomp, &host.pidfd) {
@@ -388,6 +397,7 @@ mod tests {
             expose: Vec::new(),
             forward: Vec::new(),
             signals: SignalScope::Isolated,
+            children: sandy_core::ChildProcesses::Allowed,
             path_metadata: PathMetadata::Deny,
             environment: EnvironmentPolicy::default(),
             windows: WindowsPolicy::default(),
@@ -560,6 +570,25 @@ mod tests {
         policy.forward.clear();
         let plan = plan_for(&policy, &host(Some(9)));
         assert!(plan.sandbox.unwrap().relay.is_none());
+    }
+
+    #[test]
+    fn denying_children_needs_seccomp() {
+        let mut policy = policy();
+        policy.children = ChildProcesses::None;
+        let plan = plan_for(&policy, &host(Some(9)));
+        assert_eq!(unavailable(&plan), vec![]);
+        status(&plan, Requirement::ChildProcessesDenied);
+        assert!(plan.sandbox.unwrap().filter.deny_children);
+
+        let mut no_seccomp = host(Some(9));
+        no_seccomp.seccomp = Err("no seccomp".to_string());
+        let plan = plan_for(&policy, &no_seccomp);
+        assert!(unavailable(&plan).contains(&Requirement::ChildProcessesDenied));
+
+        policy.children = ChildProcesses::Allowed;
+        let plan = plan_for(&policy, &host(Some(9)));
+        assert!(!plan.sandbox.unwrap().filter.deny_children);
     }
 
     #[test]

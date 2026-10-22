@@ -201,10 +201,19 @@ fn relay_does_not_outlive_the_program_beyond_the_drain() {
     // The open connection must be closed within the drain, not kept alive by the client.
     held.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut buffer = [0u8; 16];
+    // A reset is as much an end as a clean close: the relay may close a socket with unread data,
+    // and the kernel then answers with RST. Only a connection that stays open fails the test.
     let closed_at = match held.read(&mut buffer) {
-        Ok(0) => killed.elapsed(),
         Ok(_) => killed.elapsed(),
-        Err(error) => panic!("the held connection neither closed nor stayed open cleanly: {error}"),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ) =>
+        {
+            killed.elapsed()
+        }
+        Err(error) => panic!("the held connection was not closed: {error}"),
     };
 
     let _ = held.shutdown(Shutdown::Both);

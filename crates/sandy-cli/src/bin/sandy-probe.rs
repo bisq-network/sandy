@@ -289,6 +289,11 @@ mod linux {
         "rename-in",
         "raw-syscall",
         "move-pages",
+        "fork",
+        "vfork",
+        "clone-process",
+        "posix-spawn",
+        "thread",
     ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
@@ -332,6 +337,14 @@ mod linux {
             "rename-in" => rename_in(target),
             "raw-syscall" => raw_syscall(target),
             "move-pages" => move_pages(target),
+            "fork" => fork_raw(),
+            "vfork" => vfork_raw(),
+            "clone-process" => clone_process(),
+            "posix-spawn" => posix_spawn(target),
+            "thread" => std::thread::spawn(|| 42)
+                .join()
+                .map(|value| format!("joined {value}"))
+                .map_err(|_| io::Error::other("the thread panicked")),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "unknown action",
@@ -420,6 +433,102 @@ mod linux {
             libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, pid, priority)
         })?;
         Ok(String::new())
+    }
+
+    /// Waits for `child` and reports its exit status.
+    fn reap(child: libc::pid_t) -> io::Result<String> {
+        let mut status = 0;
+        // SAFETY: waits for a child this process created.
+        if unsafe { libc::waitpid(child, &mut status, 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(format!("child {child} exited with {status}"))
+    }
+
+    /// The fork system call itself (glibc's fork() uses clone).
+    #[cfg(target_arch = "x86_64")]
+    fn fork_raw() -> io::Result<String> {
+        // SAFETY: the child only calls _exit.
+        match unsafe { libc::syscall(libc::SYS_fork) } {
+            -1 => Err(io::Error::last_os_error()),
+            // SAFETY: ends the child at once.
+            0 => unsafe { libc::_exit(0) },
+            child => reap(child as libc::pid_t),
+        }
+    }
+
+    /// The vfork system call. The child shares the parent's memory and stack, so it calls exit in
+    /// the same assembly block and never returns into Rust code.
+    #[cfg(target_arch = "x86_64")]
+    fn vfork_raw() -> io::Result<String> {
+        let result: i64;
+        // SAFETY: the child runs only the exit system call; the parent continues with the result
+        // of vfork in rax. rcx and r11 are clobbered by the syscall instruction.
+        unsafe {
+            std::arch::asm!(
+                "syscall",
+                "test rax, rax",
+                "jnz 2f",
+                "mov eax, 60",
+                "xor edi, edi",
+                "syscall",
+                "2:",
+                inlateout("rax") libc::SYS_vfork => result,
+                out("rcx") _,
+                out("r11") _,
+                out("rdi") _,
+                options(nostack),
+            );
+        }
+        if result < 0 {
+            return Err(io::Error::from_raw_os_error(-result as i32));
+        }
+        reap(result as libc::pid_t)
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn fork_raw() -> io::Result<String> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "x86_64 only"))
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn vfork_raw() -> io::Result<String> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "x86_64 only"))
+    }
+
+    /// clone without CLONE_THREAD and without CLONE_VM: a new process with its own memory.
+    fn clone_process() -> io::Result<String> {
+        // SAFETY: without CLONE_VM the child has its own copy of the memory and only calls _exit.
+        match unsafe { libc::syscall(libc::SYS_clone, libc::SIGCHLD, 0, 0, 0, 0) } {
+            -1 => Err(io::Error::last_os_error()),
+            // SAFETY: ends the child at once.
+            0 => unsafe { libc::_exit(0) },
+            child => reap(child as libc::pid_t),
+        }
+    }
+
+    /// posix_spawn of `target` without arguments, as the C library does it (clone with
+    /// CLONE_VM | CLONE_VFORK).
+    fn posix_spawn(target: &str) -> io::Result<String> {
+        let path = CString::new(target)?;
+        let argv = [path.as_ptr().cast_mut(), ptr::null_mut()];
+        let envp = [ptr::null_mut::<libc::c_char>()];
+        let mut child: libc::pid_t = 0;
+        // SAFETY: path, argv and envp are valid, null-terminated, and outlive the call.
+        let error = unsafe {
+            libc::posix_spawn(
+                &mut child,
+                path.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                argv.as_ptr(),
+                envp.as_ptr(),
+            )
+        };
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error));
+        }
+        reap(child)
     }
 
     fn number<T: FromStr>(target: &str) -> io::Result<T> {
@@ -1419,10 +1528,23 @@ mod macos {
         "host-vm-stats",
         "symlink",
         "sysctl-proc-cputype",
+        "fork",
+        "vfork",
+        "posix-spawn",
+        "execve",
+        "thread",
     ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
         match action {
+            "fork" => fork(false),
+            "vfork" => fork(true),
+            "posix-spawn" => posix_spawn(target),
+            "execve" => execve(target),
+            "thread" => std::thread::spawn(|| 1 + 1)
+                .join()
+                .map(|_| String::new())
+                .map_err(|_| io::Error::other("the thread panicked")),
             "clone" => clone(target),
             "ptrace-attach" => ptrace_attach(target),
             "vol-read" => vol_read(target),
@@ -1441,6 +1563,76 @@ mod macos {
                 "unknown action",
             )),
         }
+    }
+
+    unsafe extern "C" {
+        /// Not in the libc crate for macOS. The child may only call _exit.
+        fn vfork() -> libc::pid_t;
+    }
+
+    /// fork or vfork; the child exits at once.
+    fn fork(shared: bool) -> io::Result<String> {
+        // SAFETY: the child calls only _exit, which is allowed after fork and after vfork.
+        let pid = unsafe { if shared { vfork() } else { libc::fork() } };
+        if pid == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if pid == 0 {
+            // SAFETY: ends the child without touching the parent's state.
+            unsafe { libc::_exit(0) };
+        }
+        wait(pid)
+    }
+
+    /// posix_spawn without POSIX_SPAWN_SETEXEC, so it creates a new process.
+    fn posix_spawn(program: &str) -> io::Result<String> {
+        let program = c_string(program)?;
+        let argv = [program.as_ptr().cast_mut(), ptr::null_mut()];
+        let envp = [ptr::null_mut()];
+        let mut pid = 0;
+        // SAFETY: program and both arrays are valid and NULL-terminated; null file actions and
+        // attributes mean defaults.
+        let error = unsafe {
+            libc::posix_spawn(
+                &mut pid,
+                program.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                argv.as_ptr(),
+                envp.as_ptr(),
+            )
+        };
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error));
+        }
+        wait(pid)
+    }
+
+    /// Replaces this process with `PROGRAM<U+001F>ARG...`. Returns only on failure; on success
+    /// the new image prints the lines of its own actions.
+    fn execve(target: &str) -> io::Result<String> {
+        let parts: Vec<CString> = target
+            .split(super::ARGUMENT_SEPARATOR)
+            .map(c_string)
+            .collect::<io::Result<_>>()?;
+        let mut argv: Vec<*const c_char> = parts.iter().map(|part| part.as_ptr()).collect();
+        argv.push(ptr::null());
+        // SAFETY: the program and every argument are NUL-terminated and argv ends with NULL.
+        unsafe { libc::execv(argv[0], argv.as_ptr()) };
+        Err(io::Error::last_os_error())
+    }
+
+    fn wait(pid: libc::pid_t) -> io::Result<String> {
+        let mut status = 0;
+        // SAFETY: waits for the child this process just created.
+        if unsafe { libc::waitpid(pid, &mut status, 0) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(format!("child {pid} ended"))
+    }
+
+    fn c_string(text: &str) -> io::Result<CString> {
+        CString::new(text).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL"))
     }
 
     /// `LINK::DEST`: creates a symbolic link at LINK that points to DEST. macOS, unlike Landlock,

@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use crate::plan::Requirement;
 use crate::policy::{
-    EnvironmentPolicy, ExposedPort, ForwardedPort, NetworkAccess, PathMetadata, Policy,
-    PolicyError, SignalScope, SystemAccess, WindowsPolicy,
+    ChildProcesses, EnvironmentPolicy, ExposedPort, ForwardedPort, NetworkAccess, PathMetadata,
+    Policy, PolicyError, SignalScope, SystemAccess, WindowsPolicy,
 };
 
 /// Access to one path and everything beneath it.
@@ -37,6 +37,7 @@ pub struct ResolvedPolicy {
     pub expose: Vec<ExposedPort>,
     pub forward: Vec<ForwardedPort>,
     pub signals: SignalScope,
+    pub children: ChildProcesses,
     pub path_metadata: PathMetadata,
     pub environment: EnvironmentPolicy,
     pub windows: WindowsPolicy,
@@ -72,6 +73,11 @@ impl ResolvedPolicy {
         check_nothing_inside_writable(&paths)?;
         validate_environment(&policy.environment)?;
         validate_expose(&policy.network.expose, policy.network.ip)?;
+        if policy.process.children == ChildProcesses::None
+            && policy.network.unix_sockets == NetworkAccess::All
+        {
+            return Err(PolicyError::ChildrenNeedUnixSocketsDenied);
+        }
         validate_forward(
             &policy.network.forward,
             &policy.network.expose,
@@ -87,6 +93,7 @@ impl ResolvedPolicy {
             expose: policy.network.expose.clone(),
             forward: policy.network.forward.clone(),
             signals: policy.process.signals,
+            children: policy.process.children,
             path_metadata: policy.linux.path_metadata,
             environment: policy.environment.clone(),
             windows: policy.windows.clone(),
@@ -111,6 +118,9 @@ impl ResolvedPolicy {
         }
         if self.signals == SignalScope::Isolated {
             requirements.push(Requirement::SignalsIsolated);
+        }
+        if self.children == ChildProcesses::None {
+            requirements.push(Requirement::ChildProcessesDenied);
         }
         if self.path_metadata == PathMetadata::Deny {
             requirements.push(Requirement::MetadataConfined);
@@ -588,6 +598,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_children_none_with_unix_sockets() {
+        let mut policy = Policy::default();
+        policy.process.children = ChildProcesses::None;
+        policy.network.unix_sockets = NetworkAccess::All;
+        let error = ResolvedPolicy::resolve(&policy, None).unwrap_err();
+        assert!(matches!(error, PolicyError::ChildrenNeedUnixSocketsDenied));
+        policy.network.unix_sockets = NetworkAccess::None;
+        assert!(ResolvedPolicy::resolve(&policy, None).is_ok());
+    }
+
+    #[test]
     fn requirements_follow_denials() {
         let mut policy = Policy::default();
         let baseline = [
@@ -605,6 +626,7 @@ mod tests {
         assert!(all_denied.contains(&Requirement::IpNetworkDenied));
         assert!(all_denied.contains(&Requirement::UnixSocketsDenied));
         assert!(!all_denied.contains(&Requirement::SignalsIsolated));
+        assert!(!all_denied.contains(&Requirement::ChildProcessesDenied));
         assert!(all_denied.contains(&Requirement::MetadataConfined));
 
         policy.network.ip = NetworkAccess::All;
@@ -619,5 +641,13 @@ mod tests {
         assert!(!allowed.contains(&Requirement::UnixSocketsDenied));
         assert!(allowed.contains(&Requirement::SignalsIsolated));
         assert!(!allowed.contains(&Requirement::MetadataConfined));
+
+        // children = "none" needs unix_sockets = "none" (see rejects_children_none_with_unix_sockets).
+        policy.network.unix_sockets = NetworkAccess::None;
+        policy.process.children = ChildProcesses::None;
+        let no_children = ResolvedPolicy::resolve(&policy, None)
+            .unwrap()
+            .requirements();
+        assert!(no_children.contains(&Requirement::ChildProcessesDenied));
     }
 }

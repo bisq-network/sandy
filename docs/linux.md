@@ -56,6 +56,7 @@ be listed, the Landlock-based requirements are unavailable.
 | UnixSocketsDenied | The allowlist has no `AF_UNIX`, and socket pairs are limited to stream and seqpacket. From ABI 6, Landlock scopes abstract sockets; from ABI 9 it denies connections to pathname sockets. |
 | SignalsIsolated | Landlock signal scope (ABI 6). Unavailable on older ABIs. |
 | MetadataConfined | The denylist denies the metadata calls that take a path (see "Metadata"). |
+| ChildProcessesDenied | The denylist denies `fork`, `vfork` and `clone` without `CLONE_THREAD`; `clone3` fails with `ENOSYS` (see "Child processes"). |
 | ExposedPortsRelayed, ForwardedPortsRelayed | One relay process outside the program's sandbox, confined by its own Landlock domain and seccomp filters (see "Exposed and forwarded ports"). |
 
 ## Exposed and forwarded ports
@@ -211,6 +212,7 @@ their low 32 bits only, because the kernel ignores the high bits.
 | `keyctl`, `add_key`, `request_key` | always | The keyrings of the user are shared by all its processes. |
 | `kexec_*`, module calls, `reboot`, `swapon`, `swapoff`, `acct`, `quotactl`, `quotactl_fd`, `syslog`, `open_by_handle_at`, `settimeofday`, `clock_settime`; on x86_64 `iopl`, `ioperm`, `modify_ldt`, `uselib` | always | They need capabilities, which sandy never passes on. A second layer. |
 | metadata calls by path | with `linux.path_metadata = "deny"` | See "Metadata". |
+| `clone`; on x86_64 also `fork`, `vfork` | with `process.children = "none"`: `clone` without `CLONE_THREAD`, `fork` and `vfork` always | See "Child processes". |
 | `fchmod`; with `path_metadata = "allow"` also `chmod`, `fchmodat`, `fchmodat2` | mode with `S_ISUID` or `S_ISGID` | A file with these bits runs with the rights of this user when another local user runs it. See "Setuid and setgid bits". |
 | `prlimit64`, `sched_setaffinity`, `sched_setscheduler`, `sched_setparam`, `sched_setattr` | process ID other than 0 and the target's own | See "Other processes". |
 | `setpriority`, `ioprio_set` | a process group or user, or a process ID other than 0 and the target's own | Same. |
@@ -244,6 +246,17 @@ Creating a file with these bits (`open` with `O_CREAT` and mode 4755, `mknod`) s
 Tested on Linux 7.2: `write` and `ftruncate` (which `mmap` writes need first) clear both bits, so
 such a file stays empty or loses the bits. Programs that set the setgid bit on directories, for
 example `git init --shared`, fail.
+
+### Child processes
+
+With `process.children = "none"` the denylist allows `clone` only when its flags contain
+`CLONE_THREAD`, and on x86_64 it denies `fork` and `vfork`. The flags are the first argument of
+`clone` on x86_64 and arm64, and the filter compares their low 32 bits, which the kernel uses.
+`clone3` fails with `ENOSYS` in every policy, so the C library creates threads with `clone` and
+`CLONE_THREAD`, and `posix_spawn` falls back to `clone` with `CLONE_VM | CLONE_VFORK`, which is
+denied. Threads therefore keep working, and so does `execve`, which replaces the program's own
+image. Programs that start helpers, shells or other programs fail with `EPERM`. The relay of
+exposed and forwarded ports is forked before the program's filter exists, so it is not affected.
 
 ### Other processes
 
@@ -331,6 +344,10 @@ secrets passed on command lines, and `/proc/net` of the network namespace. `/pro
 - **Metadata through open files.** `fchmod`, `fchown`, `fsetxattr` and `futimens` work on every
   file the program may open, also in `read` paths, except for setuid and setgid bits.
 - **Signals.** With `signals = "any"` the program can kill other processes of the user.
+- **Processes started for the program.** `process.children = "none"` stops the program from
+  creating processes. With `unix_sockets = "all"` it can still ask a service of the user, for
+  example the systemd user manager over D-Bus, to start one outside the sandbox; such a process is
+  not its child and can outlive it.
 - **The terminal.** If standard input or output is the user's terminal, the program can read
   input, write escape sequences and change terminal modes. Only `TIOCSTI` and `TIOCLINUX` are
   denied.
