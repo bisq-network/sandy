@@ -16,7 +16,7 @@ sandy run \
   -- /srv/app/bin/server --port 8080
 ```
 
-Status: under development. The interfaces may still change.
+Version 1.0.0. Policies use format `version = 1`.
 
 ## Contents
 
@@ -82,14 +82,19 @@ cargo build --release --target x86_64-unknown-linux-musl -p sandy-cli --bin sand
 ```
 
 Release archives for each platform are built by the `release` workflow (see
-[Building and testing](#building-and-testing)). Approximate binary sizes:
+[Building and testing](#building-and-testing)). Sizes:
 
-| Target | Size |
-|---|---|
-| Linux x86_64, static musl | 0.9 MB |
-| Linux arm64, static musl | 0.8 MB |
-| Windows x86_64 | 0.8 MB |
-| macOS arm64 and x86_64 | see the release archives |
+| Target | Binary | Archive |
+|---|---|---|
+| `x86_64-unknown-linux-musl` (static PIE) | 909 KiB | 434 KiB |
+| `aarch64-unknown-linux-musl` (static, not position-independent) | 772 KiB | 401 KiB |
+| `aarch64-apple-darwin` | 654 KiB | 318 KiB |
+| `x86_64-apple-darwin` | 713 KiB | 350 KiB |
+| `x86_64-pc-windows-msvc` (static C runtime) | 734 KiB | 336 KiB |
+| `aarch64-pc-windows-msvc` (built, not tested) | 632 KiB | 308 KiB |
+
+The macOS binaries are not signed or notarized. A program that ships sandy inside a signed macOS
+app signs it together with the app.
 
 **Where to install sandy.** Put the `sandy` binary, and your policy files, where the sandboxed
 program cannot write: not inside any `read_write` path of any policy. Otherwise a compromised

@@ -264,7 +264,12 @@ fn loopback_from_the_program_needs_the_exemption() {
     probe_outside(&[("tcp-connect", &address)])[0].assert_ok();
 
     let mut not_exempt = fixture.access_args();
-    not_exempt.extend(args(&["--ip", "all", "--appcontainer", APPCONTAINER]));
+    not_exempt.extend(args(&[
+        "--ip",
+        "all",
+        "--appcontainer",
+        &appcontainer_name(),
+    ]));
     probe_inside(&not_exempt, &[("tcp-connect", &address)])[0].assert_blocked();
 
     prepare_loopback_exemption();
@@ -273,7 +278,7 @@ fn loopback_from_the_program_needs_the_exemption() {
         "--ip",
         "all",
         "--appcontainer",
-        APPCONTAINER_LOOPBACK,
+        &appcontainer_loopback_name(),
     ]));
     probe_inside(&exempt, &[("tcp-connect", &address)])[0].assert_ok();
 }
@@ -288,9 +293,9 @@ fn loopback_to_the_program_is_blocked_with_and_without_exemption() {
 
     prepare_loopback_exemption();
     let fixture = Fixture::new("loopin");
-    for container in [APPCONTAINER, APPCONTAINER_LOOPBACK] {
+    for container in [appcontainer_name(), appcontainer_loopback_name()] {
         let mut sandbox_args = fixture.access_args();
-        sandbox_args.extend(args(&["--ip", "all", "--appcontainer", container]));
+        sandbox_args.extend(args(&["--ip", "all", "--appcontainer", &container]));
         let (connected, line) = inbound_tcp(Some(&sandbox_args));
         assert!(
             !connected,
@@ -305,7 +310,7 @@ fn loopback_to_the_program_is_blocked_with_and_without_exemption() {
 #[test]
 fn an_exempt_appcontainer_cannot_deny_ip() {
     prepare_loopback_exemption();
-    let output = sandy(["check", "--appcontainer", APPCONTAINER_LOOPBACK]);
+    let output = sandy(["check", "--appcontainer", &appcontainer_loopback_name()]);
     assert_eq!(
         output.status.code(),
         Some(EXIT_NOT_ENFORCEABLE),
@@ -456,6 +461,7 @@ fn passes_the_32_bit_exit_code_of_a_system_program() {
         &["/c", "exit", "305419896"],
     ));
     assert_eq!(output.status.code(), Some(0x1234_5678), "{output:?}");
+    delete_test_profiles();
 }
 
 #[test]
@@ -501,7 +507,13 @@ fn needs_an_appcontainer_name() {
 
 #[test]
 fn system_none_is_not_enforceable() {
-    let output = sandy(["check", "--appcontainer", APPCONTAINER, "--system", "none"]);
+    let output = sandy([
+        "check",
+        "--appcontainer",
+        &appcontainer_name(),
+        "--system",
+        "none",
+    ]);
     assert_eq!(
         output.status.code(),
         Some(EXIT_NOT_ENFORCEABLE),
@@ -624,7 +636,7 @@ fn sandy_in_job(ui: u32, sandy_args: &[String]) -> (u32, String) {
 #[test]
 fn check_and_run_agree_inside_a_job_with_ui_restrictions() {
     const READ_CLIPBOARD: u32 = 0x2;
-    let check = args(&["check", "--appcontainer", APPCONTAINER]);
+    let check = args(&["check", "--appcontainer", &appcontainer_name()]);
     let run = run_args(&[], &[("env", "SystemRoot")]);
 
     let (code, output) = sandy_in_job(0, &check);
@@ -637,6 +649,8 @@ fn check_and_run_agree_inside_a_job_with_ui_restrictions() {
     assert!(output.contains("UI restrictions"), "{output}");
     let (code, output) = sandy_in_job(READ_CLIPBOARD, &run);
     assert_eq!(code as i32, EXIT_FAILURE, "{output}");
+
+    delete_test_profiles();
 }
 
 fn free_port() -> u16 {
@@ -693,7 +707,7 @@ fn relays_reach_only_the_program() {
     // Without the loopback exemption, which would let the program itself reach the listener.
     sandbox_args.extend(args(&[
         "--appcontainer",
-        APPCONTAINER,
+        &appcontainer_name(),
         "--ip",
         "all",
         "--expose",
@@ -732,4 +746,109 @@ fn relays_reach_only_the_program() {
     assert!(!accepts_within(&outside, Duration::from_millis(200)));
     let _control = TcpStream::connect(("127.0.0.1", outside_port)).unwrap();
     assert!(accepts_within(&outside, Duration::from_secs(3)));
+}
+
+/// Deletes an AppContainer profile and its folder. Best effort, so a repeated run starts clean.
+fn delete_profile(name: &str) {
+    use windows_sys::Win32::Security::Isolation::DeleteAppContainerProfile;
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: the name is NUL-terminated.
+    unsafe { DeleteAppContainerProfile(wide.as_ptr()) };
+}
+
+/// `sandy run` arguments with an explicit AppContainer name (not the shared test name), extra
+/// options, and the probe with `actions`.
+fn named_run(name: &str, extra: &[&str], actions: &[(&str, &str)]) -> Vec<String> {
+    let mut run = vec![
+        "run".to_string(),
+        "--appcontainer".to_string(),
+        name.to_string(),
+    ];
+    run.extend(extra.iter().map(|option| option.to_string()));
+    run.push("--".to_string());
+    run.push(probe_path());
+    run.extend(
+        actions
+            .iter()
+            .flat_map(|(action, target)| [action.to_string(), target.to_string()]),
+    );
+    run
+}
+
+/// Two runs that share one AppContainer name share one sandbox: processes in it reach and control
+/// each other. So a second run with the same name must match the first run's resolved policy
+/// while the first is active. The same policy may run at the same time; a different one is
+/// refused until the first run ends, then allowed. The coordination uses a named kernel object
+/// the sandboxed program cannot reach, and the first run holds it only while it runs, so a
+/// crashed run does not block the name forever.
+#[test]
+fn a_concurrent_run_must_match_the_active_policy() {
+    let name = "sandy.concurrency-test";
+    delete_profile(name);
+    let fixture = Fixture::new("concurrency");
+    let writable = ["--read-write", &fixture.arg("rw")];
+    let other_policy = [
+        "--read-write",
+        &fixture.arg("rw"),
+        "--read",
+        &fixture.arg("ro"),
+    ];
+    let ready = fixture.path("rw/ready");
+    let ready_arg = ready.to_str().unwrap();
+
+    // The first run holds the name. It writes a marker, then stays alive, so the test knows the
+    // run is active (its coordination object is held before the program starts).
+    let mut first = Command::new(sandy_path())
+        .args(named_run(
+            name,
+            &writable,
+            &[("write", ready_arg), ("sleep", "20000")],
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !ready.exists() {
+        if let Some(status) = first.try_wait().unwrap() {
+            panic!("the first run exited early: {status:?}");
+        }
+        assert!(Instant::now() < deadline, "the first run never started");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // The same policy (same options, different probe action) runs concurrently.
+    let same = sandy(named_run(name, &writable, &[("env", "PATH")]));
+    assert!(
+        same.status.success(),
+        "a same-policy concurrent run was refused: {}",
+        String::from_utf8_lossy(&same.stderr)
+    );
+
+    // A different policy under the same name is refused while the first run is active.
+    let different = sandy(named_run(name, &other_policy, &[("env", "PATH")]));
+    assert_eq!(different.status.code(), Some(EXIT_FAILURE), "{different:?}");
+    let reason = String::from_utf8_lossy(&different.stderr);
+    assert!(reason.contains("different policy"), "{reason}");
+
+    // End the first run. Its coordination object closes with it.
+    first.kill().unwrap();
+    first.wait().unwrap();
+
+    // The different policy now runs: the name is free once no run holds it.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let sequential = sandy(named_run(name, &other_policy, &[("env", "PATH")]));
+        if sequential.status.success() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a different policy stayed blocked after the first run ended: {}",
+            String::from_utf8_lossy(&sequential.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    delete_profile(name);
 }

@@ -236,8 +236,27 @@ Processes in the same AppContainer reach each other over loopback in every confi
 measured, also with `ip = "none"` and without exemption. `network.expose` builds on this fact.
 
 Because of the same fact, two sandboxes that use the same AppContainer name can talk over
-loopback, also when their policies differ (for example one with `ip = "all"`). Use one
-AppContainer name per policy.
+loopback, also when their policies differ (for example one with `ip = "all"`). Processes in one
+AppContainer can also open each other's processes. A program with a weaker policy could therefore
+take over a program with a stronger policy that runs at the same time under the same name.
+
+sandy enforces one policy per name at a time (`crates/sandy-windows/src/sys/singleton.rs`):
+
+- While a program runs, sandy holds a named file mapping in the `Local\` object namespace that
+  stores a fingerprint of the resolved policy: the path rules (including the program's own read
+  and execute rule), the system set, `ip`, `unix_sockets`, the exposed ports, `signals` and
+  `path_metadata`. Arguments, working directory and environment are not part of it. A named mutex
+  serializes the check.
+- A second run under the same name with the same fingerprint may run at the same time. A run with
+  a different fingerprint is refused with exit status 125 and the reason, until every run of the
+  first policy has ended.
+- An AppContainer process sees its own object namespace, so the program cannot open or change the
+  mapping. The kernel removes the mapping when the last run that holds it exits, also after a
+  crash, so no stale state blocks later runs. Runs with different policies one after the other
+  stay allowed.
+
+Use one AppContainer name per policy anyway: file grants and the loopback exemption belong to the
+name, and two policies that share a name cannot run at the same time.
 
 ### Exposed ports
 

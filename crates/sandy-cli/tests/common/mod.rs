@@ -99,6 +99,11 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
+        // On Windows each test uses its own AppContainer name (see `appcontainer_name`). Remove
+        // the profile so runs do not accumulate profiles on CI and the VM. Best effort: deleting
+        // a name that was never created does nothing.
+        #[cfg(windows)]
+        delete_test_profiles();
     }
 }
 
@@ -128,26 +133,61 @@ impl ProbeLine {
     }
 }
 
-/// AppContainer of the Windows test runs without IP networking. It must not be exempt from
-/// loopback isolation, or sandy refuses policies without IP networking.
-pub const APPCONTAINER: &str = "sandy.escape-tests";
+/// The AppContainer name for the current test, without the loopback exemption. sandy enforces
+/// one AppContainer name per resolved policy while runs overlap, so every test uses its own
+/// name; a shared name would make tests that run different policies in parallel refuse each
+/// other. The name is a hash of the test binary and the test's thread name, so it is unique per
+/// test and stable across runs of the same build (the elevated and the limited VM phase use the
+/// same name). It must stay out of the loopback exemption, or sandy refuses policies without IP
+/// networking.
+pub fn appcontainer_name() -> String {
+    format!("sandy.escape-tests.{}", test_tag())
+}
 
-/// AppContainer of the Windows test runs with `--ip all`. `prepare_loopback_exemption` exempts
-/// it from loopback isolation, so the program can connect to listeners on 127.0.0.1.
-pub const APPCONTAINER_LOOPBACK: &str = "sandy.escape-tests.loopback";
+/// The AppContainer name for the current test with the loopback exemption (see
+/// `prepare_loopback_exemption`), so the program can connect to listeners on 127.0.0.1.
+pub fn appcontainer_loopback_name() -> String {
+    format!("sandy.escape-tests.lb.{}", test_tag())
+}
+
+/// A short, stable, per-test identifier. libtest names each test's thread after the test, so the
+/// thread name is unique within a binary and the same on every run; the binary name keeps names
+/// from different test binaries apart. Hashed to keep the AppContainer name within its 64
+/// character limit.
+fn test_tag() -> String {
+    let binary = std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
+    let thread = std::thread::current()
+        .name()
+        .unwrap_or("shared")
+        .to_string();
+    // FNV-1a, 64 bits. A stable, dependency-free hash; collisions across the test set are
+    // negligible and would only make two tests share a name.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in format!("{binary}\u{0}{thread}").bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
 
 /// Options every sandbox run needs on this platform.
 pub fn platform_args() -> Vec<String> {
     if cfg!(windows) {
-        vec!["--appcontainer".into(), APPCONTAINER.into()]
+        vec!["--appcontainer".into(), appcontainer_name()]
     } else {
         Vec::new()
     }
 }
 
-/// On Windows, a run with `--ip all` uses the AppContainer with the loopback exemption, unless
-/// the test names an AppContainer itself. These options go after the sandbox options, because
-/// the last --appcontainer wins.
+/// On Windows, a run with `--ip all` uses this test's AppContainer with the loopback exemption,
+/// unless the test names an AppContainer itself. These options go after the sandbox options,
+/// because the last --appcontainer wins.
 fn loopback_args(sandbox_args: &[String]) -> Vec<String> {
     let allows_ip = sandbox_args
         .windows(2)
@@ -155,31 +195,37 @@ fn loopback_args(sandbox_args: &[String]) -> Vec<String> {
     let names_container = sandbox_args.iter().any(|arg| arg == "--appcontainer");
     if cfg!(windows) && allows_ip && !names_container {
         prepare_loopback_exemption();
-        vec!["--appcontainer".into(), APPCONTAINER_LOOPBACK.into()]
+        vec!["--appcontainer".into(), appcontainer_loopback_name()]
     } else {
         Vec::new()
     }
 }
 
-/// Installs the loopback exemption for `APPCONTAINER_LOOPBACK` once per test process. It needs
-/// administrator rights; `sandy setup` does nothing when the exemption is already there.
+/// Installs the loopback exemption for this test's `appcontainer_loopback_name`. It needs
+/// administrator rights, which the elevated VM phase and the CI runners have; `sandy setup` does
+/// nothing and needs no rights when the exemption is already there, so the limited VM phase
+/// reuses the exemption the elevated phase created for the same name.
 pub fn prepare_loopback_exemption() {
-    static SETUP: std::sync::Once = std::sync::Once::new();
-    SETUP.call_once(|| {
-        let output = sandy([
-            "setup",
-            "--appcontainer",
-            APPCONTAINER_LOOPBACK,
-            "--ip",
-            "all",
-        ]);
-        assert!(
-            output.status.success(),
-            "`sandy setup --appcontainer {APPCONTAINER_LOOPBACK} --ip all` failed; it needs \
-             administrator rights once per machine: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    });
+    let name = appcontainer_loopback_name();
+    let output = sandy(["setup", "--appcontainer", &name, "--ip", "all"]);
+    assert!(
+        output.status.success(),
+        "`sandy setup --appcontainer {name} --ip all` failed; it needs administrator rights, so \
+         the elevated phase or a CI runner must create the exemption before a non-admin run \
+         reuses it: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Removes this test's AppContainer profiles (both the plain and the loopback name). Best effort.
+#[cfg(windows)]
+pub fn delete_test_profiles() {
+    use windows_sys::Win32::Security::Isolation::DeleteAppContainerProfile;
+    for name in [appcontainer_name(), appcontainer_loopback_name()] {
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: the name is NUL-terminated.
+        unsafe { DeleteAppContainerProfile(wide.as_ptr()) };
+    }
 }
 
 pub fn sandy<I, S>(args: I) -> Output

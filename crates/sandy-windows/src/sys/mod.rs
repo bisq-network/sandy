@@ -4,6 +4,7 @@ mod host;
 mod network;
 mod process;
 mod relay;
+mod singleton;
 mod util;
 
 use std::ffi::{OsStr, OsString};
@@ -70,6 +71,10 @@ impl Backend for WindowsBackend {
                 "batch files run in cmd.exe with other argument rules; run cmd.exe /c explicitly",
             ));
         }
+
+        // Refuse a concurrent run that shares this AppContainer name with a different policy.
+        // Held until the program exits, so an overlapping weaker policy cannot join the sandbox.
+        let _singleton = singleton::hold(name, policy)?;
 
         let container = appcontainer::ensure_profile(name)?;
         // Windows gives the AppContainer a private, persistent, writable folder (its profile,

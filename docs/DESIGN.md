@@ -228,6 +228,9 @@ Details, limitations and sources: `docs/windows.md`.
   CVE-2021-41338. `sandy.exe` starts on older builds and the plan names the reason.
 
 - AppContainer named by `windows.appcontainer_name`; sandy creates its profile on first use.
+  While a program runs, a second run under the same name with a different policy is refused,
+  because processes in one AppContainer can reach and control each other (see "Local servers in the
+  sandbox" in `docs/windows.md`).
 - File grants: one capability per policy path (named after the AppContainer, the level and the
   file ID), with one inheritable ACE on the path. The program starts with the capabilities of the
   current policy only, so grants of older policies grant nothing. sandy never removes grants and
