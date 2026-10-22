@@ -8,7 +8,7 @@ mod seatbelt;
 use sandy_core::{Backend, PlanItem, ResolvedPolicy, SandboxError, TargetCommand};
 
 use crate::plan::{HostCapabilities, plan_for};
-use crate::profile::{generate, relay_profile};
+use crate::profile::{generate, relay_pairs, relay_profile};
 use seatbelt::Seatbelt;
 
 // The profile is generated on every platform, so it carries its own copy of these numbers.
@@ -44,8 +44,9 @@ impl Backend for MacosBackend {
             })?;
         }
         let seatbelt = Seatbelt::load().map_err(SandboxError::new)?;
-        if !policy.expose.is_empty() {
-            relay::start(&policy.expose, &seatbelt)?;
+        let pairs = relay_pairs(policy);
+        if !pairs.is_empty() {
+            relay::start(&pairs, &seatbelt)?;
         }
         seatbelt.apply(&profile).map_err(|message| {
             SandboxError::new(format!("cannot apply the Seatbelt profile: {message}"))
@@ -58,18 +59,19 @@ impl Backend for MacosBackend {
     }
 }
 
-/// Loads Seatbelt and compiles the profiles of `policy` (the program's and, with exposed ports,
-/// the relay's) without applying them. Neither step changes the sandbox state of the process.
+/// Loads Seatbelt and compiles the profiles of `policy` (the program's and, with exposed or
+/// forwarded ports, the relay's) without applying them. Neither step changes the sandbox state of the process.
 fn detect(policy: &ResolvedPolicy) -> HostCapabilities {
     match Seatbelt::load() {
         Ok(seatbelt) => HostCapabilities {
             seatbelt: Ok(()),
             profile: seatbelt.compile(&generate(policy)).and_then(|()| {
-                if policy.expose.is_empty() {
+                let pairs = relay_pairs(policy);
+                if pairs.is_empty() {
                     return Ok(());
                 }
                 seatbelt
-                    .compile(&relay_profile(&policy.expose))
+                    .compile(&relay_profile(&pairs))
                     .map_err(|message| format!("relay profile: {message}"))
             }),
             already_sandboxed: seatbelt.is_sandboxed(),
@@ -110,6 +112,7 @@ mod tests {
             ip: NetworkAccess::None,
             unix_sockets: NetworkAccess::None,
             expose: Vec::new(),
+            forward: Vec::new(),
             signals: SignalScope::Any,
             path_metadata: PathMetadata::Deny,
             environment: EnvironmentPolicy::default(),
@@ -150,13 +153,13 @@ mod tests {
     fn this_macos_compiles_the_relay_profile() {
         let seatbelt = Seatbelt::load().expect("Seatbelt functions");
         let profile = relay_profile(&[
-            sandy_core::ExposedPort {
+            crate::profile::RelayPair {
                 listen: "127.0.0.1:18080".parse().unwrap(),
-                port: 8080,
+                target: "127.0.0.1:8080".parse().unwrap(),
             },
-            sandy_core::ExposedPort {
+            crate::profile::RelayPair {
                 listen: "[::1]:18081".parse().unwrap(),
-                port: 8081,
+                target: "[::1]:8081".parse().unwrap(),
             },
         ]);
         if let Err(message) = seatbelt.compile(&profile) {

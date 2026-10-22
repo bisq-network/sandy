@@ -24,7 +24,8 @@ nothing about isolation.
 | `IpNetworkDenied` | No network capabilities, no loopback exemption | AppContainer exempt from loopback isolation; firewall service not running |
 | `UnixSocketsDenied` | No write access to socket files outside read-write paths | no AppContainer |
 | `SignalsIsolated` | Own console; AppContainer access checks; job UI restrictions | no AppContainer |
-| `ExposedPortsRelayed` | Listening socket created outside the AppContainer; `sandy __relay` in the program's AppContainer and job | no AppContainer; outer job with UI restrictions; sandy cannot grant read and execute on `sandy.exe`; `sandy.exe` lies in a read-write path |
+| `ExposedPortsRelayed` | Listening socket created outside the AppContainer; `sandy __relay` in the program's AppContainer and a job of its own | no AppContainer; outer job with UI restrictions; sandy cannot grant read and execute on `sandy.exe`; `sandy.exe` lies in a read-write path |
+| `ForwardedPortsRelayed` | `sandy __forward` in the program's AppContainer and a job of its own listens on the program's port and passes each connection over an AF_UNIX socket to sandy, which connects to the target; no loopback exemption | as for `ExposedPortsRelayed`; AF_UNIX missing; socket paths longer than 107 bytes |
 
 Every requirement also needs `windows.appcontainer_name` (or `--appcontainer NAME`). Without it,
 or with an invalid name, the plan reports the requirements that need the AppContainer as
@@ -206,8 +207,10 @@ accept layer, so a blocked connection times out instead of failing at once [Proj
 
 - **Program connects to a listener outside:** needs the loopback exemption of the AppContainer
   (`NetworkIsolationSetAppContainerConfig`, the API behind `CheckNetIsolation LoopbackExempt
-  -a`). `sandy setup` installs it.
-- **Process outside connects to a listener of the program:** blocked, also with the exemption.
+  -a`), which `sandy setup` installs, or a forwarded port, which needs no administrator step
+  (see "Forwarded ports").
+- **Process outside connects to a listener of the program:** blocked, also with the exemption;
+  an exposed port relays it (see "Exposed ports").
   Microsoft documents only a debugging mode for it (`CheckNetIsolation LoopbackExempt -is`, which
   must keep running) [IPC]. sandy does not support it.
 - **Listening itself** works without capabilities; only the incoming connections are dropped
@@ -265,14 +268,16 @@ port:
 
 1. sandy binds a TCP socket to `listen` outside the AppContainer and makes it inheritable.
 2. Before the program, sandy starts `sandy.exe __relay <handle> <target>` in the program's
-   AppContainer and job, created suspended and assigned to the job like the program. The handle
-   list holds only the socket, the NUL device (standard input and output) and the program's
-   standard error. The environment holds only `SystemRoot` and `LOCALAPPDATA`.
+   AppContainer and in a job of its own (the relay job: kill-on-close, the same limits as the
+   program's job), created suspended and assigned to that job like the program. The handle list
+   holds only the socket, a pipe as standard input (sandy keeps the other end), the NUL device as
+   standard output and the program's standard error. The environment holds only `SystemRoot` and
+   `LOCALAPPDATA`.
 3. The relay's token has no network capability and one file capability: read and execute on
    `sandy.exe`, granted with the same ACE mechanism as policy paths.
 4. sandy closes its own handle of the socket, starts the program and waits only for the
-   program. When the program exits, sandy ends the job and with it the relays. If sandy dies,
-   kill-on-close ends them.
+   program. The relay ends as "How the relays end" describes. If sandy dies, kill-on-close ends
+   it.
 
 The relay accepts on the socket because a socket keeps the security context of the process that
 created it. It reaches the program over loopback because both run in the same AppContainer. It
@@ -294,6 +299,56 @@ name. Without the grant, the plan reports `ExposedPortsRelayed` as unavailable. 
 refuses when `sandy.exe` lies in a read-write path: the program could replace the file that the
 relays execute (writable-and-executable rule), and sandy must stay out of the program's reach in
 any case.
+
+### Forwarded ports
+
+For each entry of `network.forward`, the program reaches the loopback service `to` by connecting
+to `port` on its own loopback address, without the loopback exemption:
+
+1. sandy creates a directory with a random name below `%LOCALAPPDATA%\sandy\forward` and adds one
+   inherit-only entry to it that lets the relays' capability (read and execute on `sandy.exe`)
+   open the files in it with read and write data access. `%LOCALAPPDATA%` grants nothing to
+   AppContainers, so the program, which does not hold that capability, cannot open them.
+2. sandy binds one AF_UNIX socket per port in that directory, named after the port, and serves
+   each on a thread: it connects every accepted connection to `to` over TCP.
+3. Before the program, sandy starts `sandy.exe __forward <listen> <socket>` in the program's
+   AppContainer and the relay job, like an exposed-port relay but without a socket: the relay
+   creates the program's listener on `listen` itself and writes "ready" to its standard output
+   (a pipe to sandy) once it listens. sandy starts the program only after that line, so the
+   program's first connection cannot come too early.
+4. The relay passes each connection it accepts to the AF_UNIX socket.
+
+Why this works: a listener that sandy creates outside the AppContainer is outside it, and the
+program's connection to it is blocked like any connection to a loopback listener outside. A
+listener that the relay creates inside the AppContainer takes the program's connection, because
+processes in one AppContainer reach each other over loopback. AF_UNIX is not subject to loopback
+isolation; AppContainer processes can connect to an AF_UNIX socket outside when they may write
+its file (`unix_sockets_in_writable_paths_are_reachable`).
+
+Like the exposed-port relay, the forward relay runs in the program's AppContainer, so the program
+can open and control it. That gives the program no more than `to`, which `network.forward`
+grants anyway, plus read and execute access to `sandy.exe`. The socket path must fit into the
+107 bytes of `sun_path` (UTF-8); the plan checks the longest path under the directory and reports
+`ForwardedPortsRelayed` as unavailable otherwise. sandy removes the directory when the run ends;
+Windows deletes a socket file also while its socket still listens.
+
+### How the relays end
+
+The relays follow docs/DESIGN.md "Forwarded ports" rule 5. When the program exits:
+
+1. sandy ends the program's job at once, so the processes the program left behind end and
+   nothing in the sandbox can make a new connection.
+2. sandy closes each relay's standard input. The relay then stops waiting for connections,
+   still accepts those that already wait in its listen backlog (their handshake is complete, so
+   the client counts them as made), closes its listener, waits up to one second for the accepted
+   connections to finish, and ends. It checks for the stop at least every 50 ms, so it never has
+   to close its listener under a thread that waits in `accept`.
+3. One second after the program's end, sandy ends the relay job, stops its own forward sockets
+   the same way and removes the socket directory.
+
+A program that connects, sends and exits at once therefore does not lose its data
+(`forward_relay_delivers_data_sent_just_before_exit`), and a relay takes no new connection after
+the program's end (`relay_stops_listening_as_soon_as_the_program_ends`).
 
 ### The setup step
 
@@ -334,7 +389,9 @@ pipe grants nothing to AppContainers [CreateNamedPipeW] [Implementing an AppCont
 - **Job object.** sandy creates the program suspended, assigns it to a job, then resumes it. The
   job has kill-on-close and die-on-unhandled-exception, and allows no breakaway, so every child
   stays in the job. When sandy exits or dies, the job closes and its processes end. When the
-  program exits, sandy ends the processes it left behind, so they do not outlive it.
+  program exits, sandy ends the processes it left behind, so they do not outlive it. The relays
+  of exposed and forwarded ports run in a second job with the same limits, which sandy ends at
+  most one second later (see "How the relays end").
 - **UI restrictions.** The job sets all documented UI restrictions: desktops, display settings,
   `ExitWindows`, global atoms, USER handles of other processes, the clipboard (read and write),
   and system parameters [UI restrictions]. Low integrity already blocks window messages, hooks
@@ -453,14 +510,22 @@ messages that reach processes outside the sandbox.
     with `STATUS_DLL_INIT_FAILED` (`0xC0000142`) before its first instruction. Measured on
     Windows 11 over SSH; the same programs start from an interactive scheduled task. Programs
     without `user32.dll`, and the relays, are not affected.
+14. If sandy itself is killed during a run with forwarded ports, its socket directory below
+    `%LOCALAPPDATA%\sandy\forward` stays behind. Its sockets have no listener, so nobody can
+    connect through them; the directory can be deleted. sandy does not remove such directories
+    of other runs, because one of them may belong to a run that is still active.
 
 ## Verified on Windows 11
 
 Host: Windows 11 build 26200 (VM), binaries built for `x86_64-pc-windows-gnu`. The tests run in
-an elevated SSH session and from a scheduled task with `/RL LIMITED` (medium integrity,
-Administrators deny-only). Latest runs, both ways: `sandy_windows` 60 of 60, `escape` 10 of 10
-(the Unix socket test is Unix-only), `escape_windows` 23 of 23, `expose` 3 of 3,
-`review_windows` 3 of 3.
+an elevated SSH session and without administrator rights. Latest elevated run: `sandy_windows` 62
+of 62, `sandy_relay` 8 of 8, `escape` 10 of 10 (the Unix socket test is Unix-only),
+`escape_windows` 29 of 29, `expose` 3 of 3, `forward` 2 of 2, `review_windows` 3 of 3. Earlier
+non-administrator runs used a scheduled task with `/RL LIMITED` (medium integrity, Administrators
+deny-only). The latest one used `runas /trustlevel:0x20000` (Administrators deny-only, high
+integrity), because the VM had no interactive logon session for an `/IT` task: every test
+passed except two outside controls of `review_windows` (BITS activation and listing
+`C:\Users\Public`), which that token may not do, so those tests correctly refuse to judge.
 
 Facts these runs established:
 
@@ -482,6 +547,12 @@ Facts these runs established:
   exemption it cannot reach a listener outside; with the exemption it can, like the program.
 - A user without the right to change the DACL of `sandy.exe` gets `ExposedPortsRelayed` as
   unavailable; after `sandy setup` with the policy, run as administrator, the plan enforces it.
+- A program in an AppContainer without the loopback exemption reaches a loopback service outside
+  through `network.forward`, while its direct connection to a listener outside times out.
+- An AF_UNIX stream socket works through the standard library's `TcpStream` for reading,
+  writing and the half close; `sun_path` is read as UTF-8; a socket file and its directory can be
+  deleted while the socket listens, after which connections fail.
+- The program cannot connect to the forward socket (`WSAEACCES`); the relay and the user can.
 
 ## Sources
 

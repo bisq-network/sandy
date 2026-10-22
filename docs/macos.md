@@ -262,13 +262,21 @@ allow it, so only `getaddrinfo` and the dns_sd API work.
   a resolver or proxy daemon can listen on a Unix socket too. The plan says so for
   `IpNetworkDenied`.
 
-## Exposed ports
+## Exposed and forwarded ports
 
-`network.expose` makes a loopback port of the program reachable from outside (see "Exposed ports"
-in `DESIGN.md`). On macOS the relay is a process of its own, outside the program's sandbox and
-confined by its own profile:
+`network.expose` makes a loopback port of the program reachable from outside, and
+`network.forward` is the mirror: it lets the program reach a loopback service outside (see
+"Exposed ports" and "Forwarded ports" in `DESIGN.md`). On macOS one relay process serves both. It
+works on pairs of a listen address and a target (`profile::relay_pairs`):
 
-1. sandy binds every `listen` address before it applies the program's profile.
+| Kind | The relay listens on | and connects to |
+|---|---|---|
+| `expose` | `listen`, reachable from outside | the program's loopback `port` |
+| `forward` | the program's loopback `port` | `to`, the service outside |
+
+The relay is a process of its own, outside the program's sandbox and confined by its own profile:
+
+1. sandy binds every listen address before it applies the program's profile.
 2. sandy checks that it runs a single thread (`proc_pidinfo(PROC_PIDTASKINFO)`), because only then
    is `fork` safe, and forks twice. The intermediate process exits at once, so launchd adopts the
    relay. The program takes over sandy's process ID after the exec; the relay is not its child,
@@ -279,15 +287,18 @@ confined by its own profile:
 4. It registers `EVFILT_PROC` with `NOTE_EXIT` for sandy's process ID in a kqueue, before its
    profile denies process information about others.
 5. It applies its own Seatbelt profile (`profile::relay_profile`): deny by default,
-   `network-inbound` only on the exposed listen ports, `network-outbound` only to the program's
-   loopback ports, the `FIONBIO` and `FIOASYNC` ioctls, and the same closing denials as the
-   program's profile. It needs no file at all, because it keeps running the code sandy already
+   `network-inbound` only on its listen ports, `network-outbound` only to the target ports, the
+   `FIONBIO` and `FIOASYNC` ioctls, and the same closing denials as the program's profile. It needs no file at all, because it keeps running the code sandy already
    loaded and executes nothing.
 6. Only then does it write one byte to the readiness pipe. sandy waits for it (10 seconds at most)
    and refuses to start the program if the byte does not come. sandy closes its own copies of the
    listeners before the exec, and `POSIX_SPAWN_CLOEXEC_DEFAULT` would close them anyway.
-7. The relay serves with `sandy_relay::serve` and exits when the kqueue reports that the program
-   ended, also after `SIGKILL`.
+7. The relay waits on the same kqueue for new connections (`EVFILT_READ` on each listener) and
+   for the end of the program, and relays each accepted connection with `sandy_relay::relay` in
+   a thread of its own. When the program ends, also after `SIGKILL`, the relay closes its
+   listeners at once, gives the connections it already accepted at most one second to deliver
+   what is left, and exits (rule 5 of "Forwarded ports" in `DESIGN.md`). A program that connects,
+   writes and exits immediately therefore does not lose its data.
 
 `sandy check` compiles the relay's profile together with the program's.
 

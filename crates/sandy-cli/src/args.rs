@@ -3,7 +3,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use lexopt::prelude::*;
-use sandy_core::{ExposedPort, NetworkAccess, PathMetadata, Policy, SignalScope, SystemAccess};
+use sandy_core::{
+    ExposedPort, ForwardedPort, NetworkAccess, PathMetadata, Policy, SignalScope, SystemAccess,
+};
 
 pub const USAGE: &str = "\
 Usage:
@@ -26,6 +28,9 @@ Options (they extend the policy file):
   --expose ADDRESS=PORT      relay connections on the loopback ADDRESS to the program's
                              loopback PORT, for example 127.0.0.1:18080=8080 (repeatable;
                              needs --ip all)
+  --forward PORT=ADDRESS     relay connections from the program to its loopback PORT to the
+                             loopback ADDRESS outside, for example 18081=127.0.0.1:8081
+                             (repeatable; needs --ip all)
   --linux-path-metadata deny|allow
                              metadata changes by path on Linux (default: deny)
   --pass-env NAME            copy variable NAME into the program environment (repeatable)
@@ -60,6 +65,7 @@ pub struct Overrides {
     set_env: Vec<(String, String)>,
     appcontainer: Option<String>,
     expose: Vec<ExposedPort>,
+    forward: Vec<ForwardedPort>,
 }
 
 impl Overrides {
@@ -86,6 +92,7 @@ impl Overrides {
         policy.environment.pass.extend(self.pass_env);
         policy.environment.set.extend(self.set_env);
         policy.network.expose.extend(self.expose);
+        policy.network.forward.extend(self.forward);
         if let Some(name) = self.appcontainer {
             policy.windows.appcontainer_name = Some(name);
         }
@@ -103,10 +110,19 @@ pub enum Command {
         listener: u64,
         target: SocketAddr,
     },
+    /// Internal: serve a forwarded port. A backend starts sandy this way inside the sandbox; it
+    /// listens on `listen` and passes each connection to the Unix domain socket at `socket`.
+    Forward {
+        listen: SocketAddr,
+        socket: PathBuf,
+    },
 }
 
 /// The internal command that runs a relay. It is not part of the documented interface.
 pub const RELAY_COMMAND: &str = "__relay";
+
+/// The internal command that runs a forward relay. It is not part of the documented interface.
+pub const FORWARD_COMMAND: &str = "__forward";
 
 #[derive(Debug)]
 pub struct Invocation {
@@ -141,6 +157,11 @@ where
                 let listener = parser.value()?.parse()?;
                 let target = parser.value()?.parse()?;
                 return Ok(Command::Relay { listener, target });
+            }
+            Some(FORWARD_COMMAND) => {
+                let listen = parser.value()?.parse()?;
+                let socket = PathBuf::from(parser.value()?);
+                return Ok(Command::Forward { listen, socket });
             }
             _ => return Err(format!("unknown command {value:?}").into()),
         },
@@ -202,6 +223,19 @@ where
                     .push((name.to_string(), value.to_string()));
             }
             Long("appcontainer") => overrides.appcontainer = Some(parser.value()?.string()?),
+            Long("forward") => {
+                let value = parser.value()?.string()?;
+                let (port, to) = value
+                    .split_once('=')
+                    .ok_or_else(|| format!("--forward needs PORT=ADDRESS, got {value:?}"))?;
+                let port = port
+                    .parse()
+                    .map_err(|_| format!("invalid --forward port {port:?}"))?;
+                let to = to
+                    .parse()
+                    .map_err(|_| format!("invalid --forward address {to:?}"))?;
+                overrides.forward.push(ForwardedPort { port, to });
+            }
             Long("expose") => {
                 let value = parser.value()?.string()?;
                 let (listen, port) = value
@@ -296,6 +330,8 @@ mod tests {
             "name",
             "--expose",
             "127.0.0.1:18080=8080",
+            "--forward",
+            "18081=127.0.0.1:8081",
         ]);
         let mut policy = Policy::default();
         policy.filesystem.read.push("/z".into());
@@ -310,6 +346,13 @@ mod tests {
         assert_eq!(policy.linux.path_metadata, PathMetadata::Allow);
         assert_eq!(policy.environment.set["A"], "b=c");
         assert_eq!(policy.windows.appcontainer_name.as_deref(), Some("name"));
+        assert_eq!(
+            policy.network.forward,
+            vec![ForwardedPort {
+                port: 18081,
+                to: "127.0.0.1:8081".parse().unwrap()
+            }]
+        );
         assert_eq!(
             policy.network.expose,
             vec![ExposedPort {
@@ -332,6 +375,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_internal_forward_command() {
+        match parse_strs(&[FORWARD_COMMAND, "127.0.0.1:8081", r"C:\sockets\s"]).unwrap() {
+            Command::Forward { listen, socket } => {
+                assert_eq!(listen, "127.0.0.1:8081".parse().unwrap());
+                assert_eq!(socket, PathBuf::from(r"C:\sockets\s"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(parse_strs(&[FORWARD_COMMAND, "8081", "socket"]).is_err());
+        assert!(parse_strs(&[FORWARD_COMMAND, "127.0.0.1:8081"]).is_err());
+    }
+
+    #[test]
     fn run_needs_a_program() {
         assert!(parse_strs(&["run", "--ip", "all"]).is_err());
     }
@@ -341,6 +397,8 @@ mod tests {
         assert!(parse_strs(&["check", "--ip", "some"]).is_err());
         assert!(parse_strs(&["check", "--set-env", "NOVALUE"]).is_err());
         assert!(parse_strs(&["check", "--expose", "127.0.0.1:18080"]).is_err());
+        assert!(parse_strs(&["check", "--forward", "18081"]).is_err());
+        assert!(parse_strs(&["check", "--forward", "x=127.0.0.1:1"]).is_err());
         assert!(parse_strs(&["check", "--expose", "localhost:1=2"]).is_err());
         assert!(parse_strs(&["unknown"]).is_err());
     }

@@ -1,8 +1,10 @@
-//! The relays of `network.expose`. Windows drops every inbound loopback connection into an
-//! AppContainer, so sandy listens outside the AppContainer and starts `sandy __relay` inside it.
+//! The relays of `network.expose` and `network.forward`. For `expose`: Windows drops every
+//! inbound loopback connection into an AppContainer, so sandy listens outside the AppContainer
+//! and starts `sandy __relay` inside it.
 //! A socket created outside the AppContainer keeps the security context of its creator and
 //! accepts outside connections; the relay reaches the program over loopback because both run in
-//! the same AppContainer.
+//! the same AppContainer. For `forward`, the relay `sandy __forward` creates the program's
+//! listener inside the AppContainer itself (see `forward`).
 
 use std::net::{SocketAddr, TcpListener};
 use std::os::windows::io::AsRawSocket;
@@ -15,6 +17,9 @@ use super::util::last_error;
 
 /// The internal command of the sandy command line that runs a relay.
 pub const RELAY_COMMAND: &str = "__relay";
+
+/// The internal command of the sandy command line that runs a forward relay.
+pub const FORWARD_COMMAND: &str = "__forward";
 
 /// The rule that lets the relays run sandy's own executable. The backend runs inside the sandy
 /// command line, so this is `sandy.exe`.

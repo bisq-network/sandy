@@ -26,9 +26,11 @@ pub struct HostCapabilities {
     pub firewall: Result<(), String>,
     /// Whether the AppContainer of the policy is exempt from loopback isolation.
     pub loopback_exempt: Result<bool, String>,
-    /// sandy's own executable, which runs the relays of exposed ports, if sandy can allow the
-    /// AppContainer to run it.
+    /// sandy's own executable, which runs the relays of exposed and forwarded ports, if sandy can
+    /// allow the AppContainer to run it.
     pub relay_program: Result<PathBuf, String>,
+    /// AF_UNIX sockets work and the socket paths of forwarded ports fit into `sun_path`.
+    pub forward_sockets: Result<(), String>,
 }
 
 const SYSTEM_NONE: &str = "Windows grants every AppContainer read and execute access to the \
@@ -106,11 +108,12 @@ fn contained(
 ) -> PlanItem {
     let enforced = |mechanism: String| PlanItem::enforced(requirement, mechanism);
     let unavailable = |reason: String| PlanItem::unavailable(requirement, reason);
-    // The job carries the no-breakaway rule and the UI restrictions, and ends the relays.
+    // The jobs carry the no-breakaway rule and the UI restrictions, and end the relays.
     if let (
         Requirement::NoPrivilegeEscalation
         | Requirement::SignalsIsolated
-        | Requirement::ExposedPortsRelayed,
+        | Requirement::ExposedPortsRelayed
+        | Requirement::ForwardedPortsRelayed,
         Some(reason),
     ) = (requirement, job_problem(host))
     {
@@ -135,23 +138,29 @@ fn contained(
                  Windows grants all AppContainers and the AppContainer profile folder"
             )),
         },
-        Requirement::ExposedPortsRelayed => match &host.relay_program {
-            Err(reason) => unavailable(reason.clone()),
-            Ok(sandy) => match writable_parent(policy, sandy) {
-                Some(writable) => unavailable(format!(
-                    "the relays run sandy's executable {}, which lies in the read-write path {}; \
-                     the program could replace it",
-                    sandy.display(),
-                    writable.display()
-                )),
-                None => enforced(format!(
-                    "`sandy __relay` in AppContainer {name:?} and the program's job, on a \
-                     listening socket that sandy creates outside the AppContainer; the relay \
-                     has no network capability and only read and execute access to {}",
+        Requirement::ExposedPortsRelayed => match relay_program(policy, host) {
+            Err(reason) => unavailable(reason),
+            Ok(sandy) => enforced(format!(
+                "`sandy __relay` in AppContainer {name:?} and a job of its own, on a listening \
+                 socket that sandy creates outside the AppContainer; the relay has no network \
+                 capability and only read and execute access to {}; {RELAY_END}",
+                sandy.display()
+            )),
+        },
+        Requirement::ForwardedPortsRelayed => {
+            match (relay_program(policy, host), &host.forward_sockets) {
+                (Err(reason), _) => unavailable(reason),
+                (_, Err(reason)) => unavailable(reason.clone()),
+                (Ok(sandy), Ok(())) => enforced(format!(
+                    "`sandy __forward` in AppContainer {name:?} and a job of its own listens on \
+                     the program's loopback port and passes each connection over an AF_UNIX \
+                     socket that only the relays may open to sandy outside, which connects to \
+                     the target; no loopback exemption is needed; the relay has no network \
+                     capability and only read and execute access to {}; {RELAY_END}",
                     sandy.display()
                 )),
-            },
-        },
+            }
+        }
         Requirement::MetadataConfined => enforced(format!(
             "AppContainer {name:?} holds no WRITE_DAC, WRITE_OWNER, FILE_WRITE_ATTRIBUTES or \
              FILE_WRITE_EA outside read-write paths, and the AppContainer access check grants \
@@ -197,6 +206,28 @@ fn contained(
     }
 }
 
+/// How the relays end, docs/DESIGN.md "Forwarded ports" rule 5.
+const RELAY_END: &str = "when the program ends, the relay takes no new connection, lets \
+     accepted ones finish, and ends within one second";
+
+/// sandy's executable for the relays, unless sandy cannot let the AppContainer run it or it lies
+/// in a read-write path.
+fn relay_program<'a>(
+    policy: &ResolvedPolicy,
+    host: &'a HostCapabilities,
+) -> Result<&'a Path, String> {
+    let sandy = host.relay_program.as_ref().map_err(Clone::clone)?;
+    match writable_parent(policy, sandy) {
+        Some(writable) => Err(format!(
+            "the relays run sandy's executable {}, which lies in the read-write path {}; the \
+             program could replace it",
+            sandy.display(),
+            writable.display()
+        )),
+        None => Ok(sandy),
+    }
+}
+
 /// The read-write path of `policy` that contains `path`. The relays get read and execute access
 /// to sandy's executable, so it must not be writable (writable-and-executable rule), and sandy
 /// itself must stay out of the program's reach.
@@ -233,8 +264,8 @@ mod tests {
     use std::path::PathBuf;
 
     use sandy_core::{
-        EnforcementPlan, ExposedPort, PathAccess, PathMetadata, PathRule, Policy, SignalScope,
-        Status, WindowsPolicy,
+        EnforcementPlan, ExposedPort, ForwardedPort, PathAccess, PathMetadata, PathRule, Policy,
+        SignalScope, Status, WindowsPolicy,
     };
 
     use super::*;
@@ -251,7 +282,17 @@ mod tests {
             firewall: Ok(()),
             loopback_exempt: Ok(false),
             relay_program: Ok(sandy_exe(Path::new(r"C:\Program Files\sandy"))),
+            forward_sockets: Ok(()),
         }
+    }
+
+    fn forwarding(mut policy: ResolvedPolicy) -> ResolvedPolicy {
+        policy.ip = NetworkAccess::All;
+        policy.forward = vec![ForwardedPort {
+            port: 18081,
+            to: "127.0.0.1:8081".parse().unwrap(),
+        }];
+        policy
     }
 
     /// `dir.join` keeps the path splittable into components on every host the tests run on.
@@ -570,6 +611,55 @@ mod tests {
             Requirement::ExposedPortsRelayed,
         ));
         assert!(reason.contains("UI restrictions"), "{reason}");
+        let reason = unavailable(status(
+            &forwarding(policy()),
+            &nested,
+            Requirement::ForwardedPortsRelayed,
+        ));
+        assert!(reason.contains("UI restrictions"), "{reason}");
+    }
+
+    #[test]
+    fn forwarded_ports_are_relayed_through_af_unix() {
+        let policy = forwarding(policy());
+        assert!(plan(&policy, &host()).is_enforceable());
+        match status(&policy, &host(), Requirement::ForwardedPortsRelayed) {
+            Status::Enforced { mechanism } => {
+                assert!(mechanism.contains("sandy __forward"), "{mechanism}");
+                assert!(mechanism.contains("AF_UNIX"), "{mechanism}");
+                assert!(mechanism.contains("no loopback exemption"), "{mechanism}");
+            }
+            Status::Unavailable { reason } => panic!("unavailable: {reason}"),
+        }
+    }
+
+    #[test]
+    fn forwarding_needs_af_unix_sockets_and_an_executable_sandy() {
+        let no_sockets = HostCapabilities {
+            forward_sockets: Err("AF_UNIX sockets are not available".into()),
+            ..host()
+        };
+        let reason = unavailable(status(
+            &forwarding(policy()),
+            &no_sockets,
+            Requirement::ForwardedPortsRelayed,
+        ));
+        assert!(reason.contains("AF_UNIX"), "{reason}");
+        // Exposed ports do not need AF_UNIX.
+        assert!(plan(&exposing(policy()), &no_sockets).is_enforceable());
+
+        let data = Path::new(r"C:\data");
+        let writable_sandy = HostCapabilities {
+            relay_program: Ok(sandy_exe(&data.join("bin"))),
+            ..host()
+        };
+        let writable = forwarding(with_rule(policy(), PathAccess::ReadWrite));
+        let reason = unavailable(status(
+            &writable,
+            &writable_sandy,
+            Requirement::ForwardedPortsRelayed,
+        ));
+        assert!(reason.contains("read-write"), "{reason}");
     }
 
     #[test]

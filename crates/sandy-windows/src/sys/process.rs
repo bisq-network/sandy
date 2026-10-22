@@ -1,5 +1,6 @@
-//! Starts the target and the relays of its exposed ports in the AppContainer and a job object,
-//! and waits for the target.
+//! Starts the target and the relays of its exposed and forwarded ports in the AppContainer,
+//! waits for the target, and ends the relays by the lifetime rule (docs/DESIGN.md, "Forwarded
+//! ports", rule 5).
 
 use std::ffi::c_void;
 use std::fs::File;
@@ -9,7 +10,9 @@ use std::net::TcpListener;
 use std::os::windows::io::{AsRawHandle, AsRawSocket, FromRawHandle, OwnedHandle};
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::mpsc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use sandy_core::SandboxError;
 use windows_sys::Win32::Foundation::{
@@ -53,9 +56,33 @@ use super::util::{Sid, last_error, wide_nul};
 pub struct Launch<'a> {
     pub appcontainer: &'a Sid,
     pub program: Process<'a>,
-    /// One relay per exposed port, with the listening socket it receives.
-    pub relays: Vec<(Process<'a>, TcpListener)>,
+    /// One relay per exposed or forwarded port.
+    pub relays: Vec<Relay<'a>>,
 }
+
+/// A relay process: `sandy __relay` for an exposed port or `sandy __forward` for a forwarded
+/// port. Its standard input is a pipe that sandy closes when the program ends; the relay then
+/// stops taking connections and ends within `sandy_relay::DRAIN`.
+pub struct Relay<'a> {
+    pub process: Process<'a>,
+    /// The listening socket an exposed-port relay receives.
+    pub socket: Option<TcpListener>,
+    /// The relay writes the line "ready" to standard output once it listens, and the program
+    /// starts only after that. A forwarded-port relay creates its listener itself.
+    pub reports_ready: bool,
+}
+
+/// How a run ended: the program's exit code, and the time by which everything that served the
+/// program must have ended (the program's end plus `sandy_relay::DRAIN`).
+pub struct Ended {
+    pub code: i32,
+    pub deadline: Instant,
+}
+
+/// The line a forwarded-port relay writes once it listens. It matches the sandy command line.
+const RELAY_READY: &str = "ready";
+/// How long a relay may take to report that it listens.
+const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Everything `CreateProcessW` needs for one process.
 pub struct Process<'a> {
@@ -72,7 +99,7 @@ pub struct Process<'a> {
 /// The job that `on_console_control` terminates. Only a raw handle fits into a static.
 static CONSOLE_JOB: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
-pub fn run(launch: Launch<'_>) -> Result<i32, SandboxError> {
+pub fn run(launch: Launch<'_>) -> Result<Ended, SandboxError> {
     let job = create_job()?;
     let stdio = StandardHandles::prepare()?;
 
@@ -92,36 +119,24 @@ fn start_and_wait(
     launch: Launch<'_>,
     job: &OwnedHandle,
     stdio: StandardHandles,
-) -> Result<i32, SandboxError> {
+) -> Result<Ended, SandboxError> {
     let Launch {
         appcontainer,
         mut program,
         relays: port_relays,
     } = launch;
     // The relays start before the program, so a relay that cannot start ends the run before the
-    // program runs. A relay uses only its socket; its error messages go to the program's
-    // standard error.
-    if !port_relays.is_empty() {
-        let null = open_null("input and output of the relays")?;
-        for (mut relay, listener) in port_relays {
-            let relay_stdio = [
-                null.as_raw_handle(),
-                null.as_raw_handle(),
-                stdio.child[2].as_raw_handle(),
-            ];
-            let socket = listener.as_raw_socket() as HANDLE;
-            // sandy waits only for the program; the job ends the relays with it.
-            start(
-                &mut relay,
-                appcontainer,
-                job,
-                relay_stdio,
-                &[socket],
-                "relay",
-            )?;
-            // The relay holds its own handle of the socket. Once sandy closes its handle,
-            // clients are refused as soon as the relay ends.
-            drop(listener);
+    // program runs. They run in a job of their own, so that sandy can end the processes the
+    // program left behind at once while the relays still deliver accepted connections.
+    let relay_job = if port_relays.is_empty() {
+        None
+    } else {
+        Some(create_job()?)
+    };
+    let mut running = Vec::with_capacity(port_relays.len());
+    if let Some(relay_job) = &relay_job {
+        for relay in port_relays {
+            running.push(start_relay(relay, appcontainer, relay_job, &stdio)?);
         }
     }
     let stdio_handles = stdio.child.each_ref().map(|handle| handle.as_raw_handle());
@@ -143,21 +158,118 @@ fn start_and_wait(
     if waited != WAIT_OBJECT_0 {
         return Err(last_error("cannot wait for the program"));
     }
+    let deadline = Instant::now() + sandy_relay::DRAIN;
     let mut code = 0u32;
     // SAFETY: process is valid and code is a writable u32.
     if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) } == 0 {
         return Err(last_error("cannot read the exit code of the program"));
     }
-    // Processes the program left behind, and the relays of exposed ports, would die when sandy
-    // exits and the job closes. Ending them now also closes their copies of the output pipes, so
-    // the console relays finish.
+    // Processes the program left behind would die when sandy exits and the job closes. Ending
+    // them now also closes their copies of the output pipes, so the console relays finish, and
+    // nothing in the sandbox can make a new connection while the relays drain.
     // SAFETY: job is a valid job handle.
     unsafe { TerminateJobObject(job.as_raw_handle(), code) };
+    if let Some(relay_job) = relay_job {
+        end_relays(running, &relay_job, deadline, code);
+    }
     for relay in relays {
         let _ = relay.join();
     }
     // Windows exit codes are 32 bits wide; the caller passes them on unchanged.
-    Ok(code as i32)
+    Ok(Ended {
+        code: code as i32,
+        deadline,
+    })
+}
+
+/// A started relay: its process and the write end of its standard input.
+struct RunningRelay {
+    process: OwnedHandle,
+    input: OwnedHandle,
+}
+
+/// Starts `relay` suspended in `relay_job` like the program, with a pipe as standard input,
+/// "ready" reporting on standard output if it asks for it, and the program's standard error.
+fn start_relay(
+    mut relay: Relay<'_>,
+    appcontainer: &Sid,
+    relay_job: &OwnedHandle,
+    stdio: &StandardHandles,
+) -> Result<RunningRelay, SandboxError> {
+    let (input_read, input) = pipe("input of a relay")?;
+    make_inheritable(&input_read, "input of a relay")?;
+    let (ready_read, output) = if relay.reports_ready {
+        let (read, write) = pipe("output of a relay")?;
+        make_inheritable(&write, "output of a relay")?;
+        (Some(read), write)
+    } else {
+        (None, open_null("output of a relay")?)
+    };
+    let relay_stdio = [
+        input_read.as_raw_handle(),
+        output.as_raw_handle(),
+        stdio.child[2].as_raw_handle(),
+    ];
+    let socket = relay
+        .socket
+        .as_ref()
+        .map(|socket| socket.as_raw_socket() as HANDLE);
+    let process = start(
+        &mut relay.process,
+        appcontainer,
+        relay_job,
+        relay_stdio,
+        socket.as_slice(),
+        "relay",
+    )?;
+    // The relay holds its own handles now. Without sandy's copies, the relay sees the end of its
+    // input when sandy closes `input`, and clients of an exposed port are refused once the relay
+    // closes its socket.
+    drop((input_read, output, relay.socket));
+    if let Some(ready_read) = ready_read {
+        wait_until_ready(ready_read)?;
+    }
+    Ok(RunningRelay { process, input })
+}
+
+/// Waits until the relay writes "ready", ends, or `READY_TIMEOUT` passes.
+fn wait_until_ready(output: OwnedHandle) -> Result<(), SandboxError> {
+    let (sender, receiver) = mpsc::channel();
+    // The thread ends when the relay writes a line or ends; if the relay hangs, the job closes
+    // when the run fails, which ends the relay and with it the thread.
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let read = io::BufRead::read_line(&mut io::BufReader::new(File::from(output)), &mut line);
+        let _ = sender.send(read.map(|_| line));
+    });
+    match receiver.recv_timeout(READY_TIMEOUT) {
+        Ok(Ok(line)) if line.trim_end() == RELAY_READY => Ok(()),
+        Ok(_) => Err(SandboxError::new(
+            "a forwarded-port relay ended before it listened; its error is on standard error",
+        )),
+        Err(_) => Err(SandboxError::new(format!(
+            "a forwarded-port relay did not listen within {} seconds",
+            READY_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+/// Ends the relays by the lifetime rule: closing their input tells them to take no new
+/// connection and to let accepted ones finish; at `deadline` sandy ends whatever still runs.
+fn end_relays(running: Vec<RunningRelay>, relay_job: &OwnedHandle, deadline: Instant, code: u32) {
+    let mut processes = Vec::with_capacity(running.len());
+    for relay in running {
+        drop(relay.input);
+        processes.push(relay.process);
+    }
+    for process in &processes {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let millis = u32::try_from(left.as_millis()).unwrap_or(u32::MAX);
+        // SAFETY: process is a valid process handle; a timeout only limits the wait.
+        unsafe { WaitForSingleObject(process.as_raw_handle(), millis) };
+    }
+    // SAFETY: relay_job is a valid job handle.
+    unsafe { TerminateJobObject(relay_job.as_raw_handle(), code) };
 }
 
 /// Kills the job on Ctrl+C and Ctrl+Break. The target has its own console (see `start`), so the

@@ -2,11 +2,10 @@
 //! tested on every platform.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use sandy_core::{
-    ExposedPort, NetworkAccess, PathAccess, ResolvedPolicy, SignalScope, SystemAccess,
-};
+use sandy_core::{NetworkAccess, PathAccess, ResolvedPolicy, SignalScope, SystemAccess};
 
 use crate::system::{self, SystemAccess as Grant};
 
@@ -51,25 +50,48 @@ pub fn generate(policy: &ResolvedPolicy) -> Profile {
     }
 }
 
-/// The profile of the relay behind `network.expose`. The relay keeps running the code that sandy
-/// has already loaded and never executes anything, so it needs no file at all: it accepts on the
-/// listeners sandy passed it and connects to the target's loopback ports. Ports are numbers, so
-/// the text needs no parameters.
-pub fn relay_profile(exposures: &[ExposedPort]) -> Profile {
+/// One path through the relay: it accepts connections on `listen` and connects each one to
+/// `target`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayPair {
+    pub listen: SocketAddr,
+    pub target: SocketAddr,
+}
+
+/// The relay pairs of `policy`. An exposed port leads from outside into the program; a forwarded
+/// port is the mirror and leads from the program to a loopback service outside. One relay
+/// process serves both kinds.
+pub fn relay_pairs(policy: &ResolvedPolicy) -> Vec<RelayPair> {
+    let exposed = policy.expose.iter().map(|exposure| RelayPair {
+        listen: exposure.listen,
+        target: exposure.target(),
+    });
+    let forwarded = policy.forward.iter().map(|forward| RelayPair {
+        listen: forward.listen(),
+        target: forward.to,
+    });
+    exposed.chain(forwarded).collect()
+}
+
+/// The profile of the relay process. The relay keeps running the code that sandy has already
+/// loaded and never executes anything, so it needs no file at all: it accepts on the listeners
+/// sandy passed it and connects only to the targets. Every address is loopback and every port a
+/// number, so the text needs no parameters.
+pub fn relay_profile(pairs: &[RelayPair]) -> Profile {
     let mut writer = Writer::default();
     writer.line("(version 1)");
     writer.line("(deny default)");
     writer.comment("(deny default) does not cover these operations, and the relay needs none.");
     writer.line("(deny process-info* file-map-executable file-ioctl file-write*)");
-    writer.comment("Accept on the exposed listeners; connect only to the target's loopback ports.");
-    let inbound: Vec<String> = exposures
+    writer.comment("Accept on the relay's listeners; connect only to the targets.");
+    let inbound: Vec<String> = pairs
         .iter()
-        .map(|exposure| format!("(local ip \"localhost:{}\")", exposure.listen.port()))
+        .map(|pair| format!("(local ip \"localhost:{}\")", pair.listen.port()))
         .collect();
     writer.rule("allow", &["network-inbound"], &inbound);
-    let outbound: Vec<String> = exposures
+    let outbound: Vec<String> = pairs
         .iter()
-        .map(|exposure| format!("(remote ip \"localhost:{}\")", exposure.port))
+        .map(|pair| format!("(remote ip \"localhost:{}\")", pair.target.port()))
         .collect();
     writer.rule("allow", &["network-outbound"], &outbound);
     writer.comment("Non-blocking mode for the sockets (connect with a timeout).");
@@ -384,6 +406,7 @@ mod tests {
             ip: NetworkAccess::None,
             unix_sockets: NetworkAccess::None,
             expose: Vec::new(),
+            forward: Vec::new(),
             signals: SignalScope::Any,
             path_metadata: PathMetadata::Deny,
             environment: EnvironmentPolicy::default(),
@@ -717,18 +740,18 @@ mod tests {
     }
 
     #[test]
-    fn relay_profile_allows_only_the_exposed_ports() {
-        let exposures = [
-            ExposedPort {
+    fn relay_profile_allows_only_the_relay_ports() {
+        let pairs = [
+            RelayPair {
                 listen: "127.0.0.1:18080".parse().unwrap(),
-                port: 8080,
+                target: "127.0.0.1:8080".parse().unwrap(),
             },
-            ExposedPort {
+            RelayPair {
                 listen: "[::1]:18081".parse().unwrap(),
-                port: 8081,
+                target: "[::1]:8081".parse().unwrap(),
             },
         ];
-        let profile = relay_profile(&exposures);
+        let profile = relay_profile(&pairs);
         assert!(profile.parameters.is_empty());
         let allows: Vec<&str> = profile
             .text
@@ -757,6 +780,35 @@ mod tests {
                 .contains("(deny mach-lookup (xpc-service-name-prefix \"\"))")
         );
         assert!(!profile.text.contains("file-read"));
+    }
+
+    #[test]
+    fn exposed_and_forwarded_ports_are_mirrored_pairs() {
+        let mut policy = typical("/srv");
+        policy.expose = vec![sandy_core::ExposedPort {
+            listen: "127.0.0.1:18080".parse().unwrap(),
+            port: 8080,
+        }];
+        policy.forward = vec![sandy_core::ForwardedPort {
+            port: 18082,
+            to: "[::1]:8082".parse().unwrap(),
+        }];
+        assert_eq!(
+            relay_pairs(&policy),
+            vec![
+                RelayPair {
+                    listen: "127.0.0.1:18080".parse().unwrap(),
+                    target: "127.0.0.1:8080".parse().unwrap(),
+                },
+                RelayPair {
+                    listen: "[::1]:18082".parse().unwrap(),
+                    target: "[::1]:8082".parse().unwrap(),
+                },
+            ]
+        );
+        policy.expose.clear();
+        policy.forward.clear();
+        assert!(relay_pairs(&policy).is_empty());
     }
 
     #[test]

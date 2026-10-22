@@ -174,11 +174,18 @@ fn fingerprint(policy: &ResolvedPolicy) -> Result<Vec<u8>, SandboxError> {
         }
     }
 
-    // Exposed ports are order independent; sort their encodings for a stable result.
+    // Exposed and forwarded ports are order independent; sort their encodings for a stable
+    // result. The prefixes keep an exposed and a forwarded port with the same numbers apart.
     let mut ports: Vec<String> = policy
         .expose
         .iter()
-        .map(|port| format!("{}={}", port.listen, port.port))
+        .map(|port| format!("expose {}={}", port.listen, port.port))
+        .chain(
+            policy
+                .forward
+                .iter()
+                .map(|port| format!("forward {}={}", port.port, port.to)),
+        )
         .collect();
     ports.sort();
     out.extend((ports.len() as u32).to_le_bytes());

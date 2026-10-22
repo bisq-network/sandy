@@ -11,6 +11,7 @@ license.workspace = true
 sandy-core.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+sandy-relay.workspace = true
 windows-sys = { version = "0.61", features = [
     "Wdk_System_SystemServices",
     "Win32_Foundation",

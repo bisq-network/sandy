@@ -45,6 +45,7 @@ read_write = ["/var/lib/app"] # read, list, create, change, delete; never execut
 ip = "none"                   # "none" | "all"; IPv4 and IPv6 including loopback
 unix_sockets = "none"         # "none" | "all"; "none" reaches no socket outside read_write
 expose = [{ listen = "127.0.0.1:18080", port = 8080 }]  # relay into the program's port 8080
+forward = [{ port = 18081, to = "127.0.0.1:8081" }]     # relay out to a local service
 
 [process]
 signals = "any"               # "any" | "isolated"
@@ -123,6 +124,31 @@ Rules:
    sandbox with no file access.
 5. At most `sandy_relay::MAX_CONNECTIONS` connections are relayed at the same time.
 
+## Forwarded ports
+
+`network.forward` is the mirror of `expose`: it lets the program reach a loopback service outside
+the sandbox. The program connects to `port` on the loopback address of the same family as `to`;
+sandy relays each connection to `to`.
+
+Windows needs this: an AppContainer cannot connect to loopback services outside it unless an
+administrator installs a loopback exemption. A relay inside the AppContainer accepts the
+program's connection over loopback (allowed inside one AppContainer) and passes it to sandy
+outside through a Unix domain socket, which the loopback isolation does not filter; sandy then
+connects to `to`. No administrator step is needed. Linux and macOS relay through the same kind of
+confined relay process as `expose`, so a policy means the same on every platform.
+
+Rules:
+
+1. `to` must be a loopback address; the program's address (`port`) must differ from it.
+2. The program needs `ip = "all"` to connect in this version.
+3. No address may be used by two relays (`expose` or `forward`), and `to` must not lead back into
+   the sandbox (an exposed address).
+4. The relay ends with the program and is confined like the `expose` relay.
+5. Lifetime of both relays: when the program ends, the relay closes its listeners at once, gives
+   connections it already accepted at most one second to deliver their remaining data, and then
+   ends. A program that connects, writes and exits immediately therefore does not lose its data,
+   and no relay outlives the program by more than one second.
+
 ## Requirements and the enforcement plan
 
 `ResolvedPolicy::requirements` derives the guarantees a policy needs:
@@ -139,6 +165,7 @@ Rules:
 | `SignalsIsolated` | `process.signals = "isolated"` |
 | `MetadataConfined` | `linux.path_metadata = "deny"` (default) |
 | `ExposedPortsRelayed` | `network.expose` is not empty |
+| `ForwardedPortsRelayed` | `network.forward` is not empty |
 
 A requirement is a lower bound. A backend may deny more, but never less. For example,
 `UnixSocketsDenied` guarantees that the program cannot connect to Unix sockets outside its
@@ -182,10 +209,11 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   not check it), the path-based metadata calls when `path_metadata = "deny"`, setuid and setgid
   mode bits, changes of the limits, priority and CPU affinity of other processes, and before
   Landlock ABI 3 truncation without write access.
-- Exposed ports: a relay forked twice before sandy confines itself, so it is not a child of the
-  program. It watches the program with a pidfd and exits when the program ends. It confines
-  itself with no_new_privs, Landlock without file access (TCP connect only to the exposed ports
-  from ABI 4) and a seccomp filter limited to TCP, copying and threads.
+- Exposed and forwarded ports: one relay forked twice before sandy confines itself, so it is not
+  a child of the program. It watches the program with a pidfd and ends at most one second after
+  it (rule 5 of "Forwarded ports"). It confines itself with no_new_privs, Landlock without file
+  access (TCP connect only to the relay targets from ABI 4) and a seccomp filter limited to TCP,
+  copying and threads.
 - Refused: no Landlock (the reason names the fix), no seccomp, root or any capability, a writable
   path that contains the dynamic loader.
 
@@ -211,10 +239,11 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
 - Metadata (mode, owner, flags, times, extended attributes, ACLs) can change only on `read_write`
   paths, through paths and open descriptors alike. `linux.path_metadata = "allow"` only drops the
   requirement; the profile is the same.
-- Exposed ports: sandy binds the listeners, forks the relay twice so that launchd adopts it (it
-  is not the program's child), and the relay watches the program's process ID with kqueue
-  (`NOTE_EXIT`). The relay has its own profile: accept on the listeners, connect to the program's
-  loopback ports, no files, no Mach services. sandy execs only after the relay reports ready.
+- Exposed and forwarded ports: sandy binds the listeners, forks one relay twice so that launchd
+  adopts it (it is not the program's child), and the relay watches the program's process ID with
+  kqueue (`NOTE_EXIT`). The relay has its own profile: accept on its listeners, connect only to
+  the targets (the program's ports for `expose`, `to` for `forward`), no files, no Mach services.
+  sandy execs only after the relay reports ready.
 - `sandy check` compiles the profile without applying it, so it reports operations or filters that
   this macOS does not know.
 - `docs/macos.md` describes the profile, the system set with a reason per entry, and the known
@@ -257,10 +286,19 @@ Details, limitations and sources: `docs/windows.md`.
   suspended and assigned before it runs. Inside an outer job with UI restrictions Windows cannot
   nest this job, so the plan refuses; sandy never breaks away from an outer job.
 - `network.expose`: sandy binds the listening socket outside the AppContainer and starts
-  `sandy.exe __relay` in the program's AppContainer and job before the program. The relay has no
-  network capability and only read and execute on `sandy.exe`; the program can control the relay,
-  which gives it nothing beyond the exposed listener. The plan refuses when `sandy.exe` cannot be
-  granted or lies in a read-write path; `sandy setup` with the policy adds the grant.
+  `sandy.exe __relay` in the program's AppContainer and a job of its own before the program. The
+  relay has no network capability and only read and execute on `sandy.exe`; the program can
+  control the relay, which gives it nothing beyond the exposed listener. The plan refuses when
+  `sandy.exe` cannot be granted or lies in a read-write path; `sandy setup` with the policy adds
+  the grant.
+- `network.forward`: `sandy.exe __forward` in the program's AppContainer and the relay job
+  creates the program's listener itself and passes each connection over an AF_UNIX socket that
+  only the relays may open to sandy, which connects to the target. No loopback exemption is
+  needed. The plan also refuses when AF_UNIX is missing or the socket paths exceed 107 bytes.
+- Relay lifetime (rule 5): when the program exits, sandy ends its job at once and closes the
+  relays' standard input; the relays accept what already waits in the backlog, close their
+  listeners, drain for at most one second and end; sandy ends the relay job one second after
+  the program's end.
 - Handle inheritance limited to the standard handles with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`.
   The program gets its own console and never a console handle of sandy; sandy relays its console
   through pipes and ends the job on Ctrl+C.
@@ -286,5 +324,6 @@ routes get additional tests.
 | Crate | Role | May depend on |
 |---|---|---|
 | `sandy-core` | policy, validation, requirements, plan, backend trait | nothing platform-specific |
-| `sandy-linux`, `sandy-macos`, `sandy-windows` | one backend each; empty on other platforms | `sandy-core` |
+| `sandy-linux`, `sandy-macos`, `sandy-windows` | one backend each; empty on other platforms | `sandy-core`, `sandy-relay` |
+| `sandy-relay` | byte relay behind `expose` and `forward` | nothing platform-specific |
 | `sandy-cli` | command line, backend selection, test probe | all of the above |

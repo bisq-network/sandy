@@ -307,6 +307,7 @@ matters only on Windows (see [Windows](#windows)); on Linux and macOS it does no
 | `--unix-sockets all\|none` | Unix domain sockets. Read the warning below before using `all`. | `none` |
 | `--signals any\|isolated` | Whether the program may signal processes outside its sandbox. | `any` |
 | `--expose ADDRESS=PORT` | Relay connections on the loopback `ADDRESS` to the program's loopback `PORT`. Needs `--ip all`. | |
+| `--forward PORT=ADDRESS` | Relay the program's connections to its loopback `PORT` to the loopback `ADDRESS` outside the sandbox. Needs `--ip all`. | |
 | `--linux-path-metadata deny\|allow` | On Linux, whether `chmod`, `chown`, `utimensat` and `setxattr` by path are allowed. | `deny` |
 | `--pass-env NAME` | Copy the variable `NAME` into the program's environment, if it is set. | |
 | `--set-env NAME=VALUE` | Set a variable in the program's environment. Overrides `--pass-env`. | |
@@ -340,6 +341,7 @@ read_write = ["/path"]          # read, list, create, change, delete; never exec
 ip = "none"                     # "none" | "all"
 unix_sockets = "none"           # "none" | "all"
 expose = [{ listen = "127.0.0.1:18080", port = 8080 }]
+forward = [{ port = 18081, to = "127.0.0.1:8081" }]
 
 [process]
 signals = "any"                 # "any" | "isolated"

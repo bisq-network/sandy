@@ -1,5 +1,6 @@
 mod acl;
 mod appcontainer;
+mod forward;
 mod host;
 mod network;
 mod process;
@@ -90,29 +91,45 @@ impl Backend for WindowsBackend {
         }
 
         // The relays run sandy's own executable with one capability: read and execute access to
-        // that file.
-        let relay_capability = if policy.expose.is_empty() {
+        // that file. The same capability opens the sockets of forwarded ports.
+        let relay_capability = if policy.expose.is_empty() && policy.forward.is_empty() {
             None
         } else {
             let rule = relay::relay_program(name).map_err(SandboxError::new)?;
             Some((acl::grant(name, &rule)?, rule.path))
         };
         let mut relays = Vec::new();
+        let mut forwarding = None;
         if let Some((capability, sandy)) = &relay_capability {
+            let capability = std::slice::from_ref(capability);
             for (listener, target) in relay::listen(&policy.expose)? {
                 let args = [
                     wide(relay::RELAY_COMMAND.as_ref()),
                     wide(listener.as_raw_socket().to_string().as_ref()),
                     wide(target.to_string().as_ref()),
                 ];
-                let relay = process_for(
-                    sandy.as_os_str(),
-                    &args,
-                    &[],
-                    None,
-                    std::slice::from_ref(capability),
-                )?;
-                relays.push((relay, listener));
+                relays.push(process::Relay {
+                    process: process_for(sandy.as_os_str(), &args, &[], None, capability)?,
+                    socket: Some(listener),
+                    reports_ready: false,
+                });
+            }
+            if !policy.forward.is_empty() {
+                let (started, routes) =
+                    forward::Forwarding::start(&policy.forward, &capability[0])?;
+                forwarding = Some(started);
+                for route in routes {
+                    let args = [
+                        wide(relay::FORWARD_COMMAND.as_ref()),
+                        wide(route.listen.to_string().as_ref()),
+                        wide(route.socket.as_os_str()),
+                    ];
+                    relays.push(process::Relay {
+                        process: process_for(sandy.as_os_str(), &args, &[], None, capability)?,
+                        socket: None,
+                        reports_ready: true,
+                    });
+                }
             }
         }
 
@@ -125,17 +142,21 @@ impl Backend for WindowsBackend {
             cwd,
             &capabilities,
         )?;
-        process::run(process::Launch {
+        let ended = process::run(process::Launch {
             appcontainer: &container,
             program,
             relays,
-        })
+        })?;
+        if let Some(forwarding) = forwarding {
+            forwarding.stop(ended.deadline);
+        }
+        Ok(ended.code)
     }
 
     /// Makes the loopback exemption of the policy's AppContainer match the policy: present with
-    /// `ip = "all"`, absent otherwise. With exposed ports, also lets the relays run sandy's
-    /// executable, which a user without the right to change its permissions cannot do at run
-    /// time. Needs administrator rights when it changes something.
+    /// `ip = "all"`, absent otherwise. With exposed or forwarded ports, also lets the relays run
+    /// sandy's executable, which a user without the right to change its permissions cannot do at
+    /// run time. Needs administrator rights when it changes something.
     fn setup(&self, policy: &ResolvedPolicy) -> Result<(), SandboxError> {
         let name = policy.windows.appcontainer_name.as_deref().ok_or_else(|| {
             SandboxError::new("the policy names no AppContainer; pass --appcontainer NAME")
@@ -143,7 +164,7 @@ impl Backend for WindowsBackend {
         validate_appcontainer_name(name).map_err(SandboxError::new)?;
         let container = appcontainer::sid(name)?;
         network::set_loopback_exempt(&container, policy.ip == NetworkAccess::All)?;
-        if !policy.expose.is_empty() {
+        if !policy.expose.is_empty() || !policy.forward.is_empty() {
             acl::grant(name, &relay::relay_rule().map_err(SandboxError::new)?)?;
         }
         Ok(())
@@ -189,12 +210,17 @@ fn detect(policy: &ResolvedPolicy) -> HostCapabilities {
         outer_job_ui: host::outer_job_ui(),
         firewall: network::firewall_running(),
         loopback_exempt: container.and_then(|sid| network::is_loopback_exempt(&sid)),
-        // Only the requirement `ExposedPortsRelayed` reads it.
+        // Only the requirements `ExposedPortsRelayed` and `ForwardedPortsRelayed` read these.
         relay_program: match policy.windows.appcontainer_name.as_deref() {
-            Some(name) if !policy.expose.is_empty() => {
+            Some(name) if !policy.expose.is_empty() || !policy.forward.is_empty() => {
                 relay::relay_program(name).map(|rule| rule.path)
             }
             _ => Err("no relay is needed".into()),
+        },
+        forward_sockets: if policy.forward.is_empty() {
+            Err("no forwarded port".into())
+        } else {
+            forward::check()
         },
     }
 }

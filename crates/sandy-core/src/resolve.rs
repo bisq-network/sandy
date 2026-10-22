@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use crate::plan::Requirement;
 use crate::policy::{
-    EnvironmentPolicy, ExposedPort, NetworkAccess, PathMetadata, Policy, PolicyError, SignalScope,
-    SystemAccess, WindowsPolicy,
+    EnvironmentPolicy, ExposedPort, ForwardedPort, NetworkAccess, PathMetadata, Policy,
+    PolicyError, SignalScope, SystemAccess, WindowsPolicy,
 };
 
 /// Access to one path and everything beneath it.
@@ -35,6 +35,7 @@ pub struct ResolvedPolicy {
     pub ip: NetworkAccess,
     pub unix_sockets: NetworkAccess,
     pub expose: Vec<ExposedPort>,
+    pub forward: Vec<ForwardedPort>,
     pub signals: SignalScope,
     pub path_metadata: PathMetadata,
     pub environment: EnvironmentPolicy,
@@ -71,6 +72,11 @@ impl ResolvedPolicy {
         check_nothing_inside_writable(&paths)?;
         validate_environment(&policy.environment)?;
         validate_expose(&policy.network.expose, policy.network.ip)?;
+        validate_forward(
+            &policy.network.forward,
+            &policy.network.expose,
+            policy.network.ip,
+        )?;
 
         Ok(ResolvedPolicy {
             paths,
@@ -79,6 +85,7 @@ impl ResolvedPolicy {
             ip: policy.network.ip,
             unix_sockets: policy.network.unix_sockets,
             expose: policy.network.expose.clone(),
+            forward: policy.network.forward.clone(),
             signals: policy.process.signals,
             path_metadata: policy.linux.path_metadata,
             environment: policy.environment.clone(),
@@ -110,6 +117,9 @@ impl ResolvedPolicy {
         }
         if !self.expose.is_empty() {
             requirements.push(Requirement::ExposedPortsRelayed);
+        }
+        if !self.forward.is_empty() {
+            requirements.push(Requirement::ForwardedPortsRelayed);
         }
         requirements
     }
@@ -223,6 +233,46 @@ fn validate_expose(expose: &[ExposedPort], ip: NetworkAccess) -> Result<(), Poli
             |other: &ExposedPort| other.listen == entry.listen || other.target() == entry.listen;
         if expose[..index].iter().any(collides) {
             return Err(invalid(entry, "listen address is used twice"));
+        }
+    }
+    Ok(())
+}
+
+/// Forwarded ports reach loopback services only, so a relay never opens a way to other machines.
+/// The target connects over IP, which needs IP networking. No address may be used by two relays,
+/// and no relay may lead back into the sandbox.
+fn validate_forward(
+    forward: &[ForwardedPort],
+    expose: &[ExposedPort],
+    ip: NetworkAccess,
+) -> Result<(), PolicyError> {
+    let invalid = |forward: &ForwardedPort, reason| PolicyError::InvalidForward {
+        forward: *forward,
+        reason,
+    };
+    for (index, entry) in forward.iter().enumerate() {
+        if ip != NetworkAccess::All {
+            return Err(invalid(entry, "the program needs ip = \"all\" to connect"));
+        }
+        if !entry.to.ip().is_loopback() {
+            return Err(invalid(entry, "to must be a loopback address"));
+        }
+        if entry.port == 0 || entry.to.port() == 0 {
+            return Err(invalid(entry, "ports must not be 0"));
+        }
+        if entry.listen() == entry.to {
+            return Err(invalid(entry, "the program's port and to must differ"));
+        }
+        let taken_by_expose = |e: &ExposedPort| {
+            let addresses = [e.listen, e.target()];
+            addresses.contains(&entry.listen()) || addresses.contains(&entry.to)
+        };
+        if expose.iter().any(taken_by_expose) {
+            return Err(invalid(entry, "address is also used by an exposed port"));
+        }
+        let taken = |other: &ForwardedPort| other.listen() == entry.listen();
+        if forward[..index].iter().any(taken) {
+            return Err(invalid(entry, "port is used twice"));
         }
     }
     Ok(())
@@ -465,6 +515,75 @@ mod tests {
             !resolved
                 .requirements()
                 .contains(&Requirement::ExposedPortsRelayed)
+        );
+    }
+
+    fn forward(port: u16, to: &str) -> ForwardedPort {
+        ForwardedPort {
+            port,
+            to: to.parse().unwrap(),
+        }
+    }
+
+    fn with_forward(ip: NetworkAccess, entries: &[ForwardedPort]) -> Policy {
+        let mut policy = Policy::default();
+        policy.network.ip = ip;
+        policy.network.forward = entries.to_vec();
+        policy
+    }
+
+    #[test]
+    fn accepts_loopback_forward_with_ip() {
+        for to in ["127.0.0.1:8080", "[::1]:8080"] {
+            let policy = with_forward(NetworkAccess::All, &[forward(18080, to)]);
+            let resolved = ResolvedPolicy::resolve(&policy, None).unwrap();
+            let requirements = resolved.requirements();
+            assert!(requirements.contains(&Requirement::ForwardedPortsRelayed));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_forward() {
+        let mut cases = vec![
+            with_forward(NetworkAccess::None, &[forward(18080, "127.0.0.1:8080")]),
+            with_forward(NetworkAccess::All, &[forward(18080, "192.168.1.2:8080")]),
+            with_forward(NetworkAccess::All, &[forward(18080, "0.0.0.0:8080")]),
+            with_forward(NetworkAccess::All, &[forward(0, "127.0.0.1:8080")]),
+            with_forward(NetworkAccess::All, &[forward(18080, "127.0.0.1:0")]),
+            with_forward(NetworkAccess::All, &[forward(8080, "127.0.0.1:8080")]),
+            with_forward(
+                NetworkAccess::All,
+                &[
+                    forward(18080, "127.0.0.1:8080"),
+                    forward(18080, "127.0.0.1:8081"),
+                ],
+            ),
+        ];
+        let mut clashing = with_forward(NetworkAccess::All, &[forward(18080, "127.0.0.1:8080")]);
+        clashing.network.expose = vec![expose("127.0.0.1:18080", 9000)];
+        cases.push(clashing);
+        let mut looping = with_forward(NetworkAccess::All, &[forward(18081, "127.0.0.1:18080")]);
+        looping.network.expose = vec![expose("127.0.0.1:18080", 9000)];
+        cases.push(looping);
+        for policy in cases {
+            let error = ResolvedPolicy::resolve(&policy, None).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    PolicyError::InvalidForward { .. } | PolicyError::InvalidExpose { .. }
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_forward_no_relay_requirement() {
+        let resolved = ResolvedPolicy::resolve(&Policy::default(), None).unwrap();
+        assert!(
+            !resolved
+                .requirements()
+                .contains(&Requirement::ForwardedPortsRelayed)
         );
     }
 

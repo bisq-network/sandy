@@ -99,6 +99,18 @@ pub fn grantable(appcontainer: &str, rule: &PathRule) -> Result<(), String> {
     Ok(())
 }
 
+/// Allows `sid`, which the caller already holds as a capability, `mask` with `flags` on the
+/// directory `path` that sandy created. Used for the socket directory of forwarded ports, which
+/// only the relays may use.
+pub fn allow(path: &Path, sid: &Sid, mask: u32, flags: u8) -> Result<(), SandboxError> {
+    let wide = wide_nul(path.as_os_str());
+    let _lock = SessionLock::acquire(r"Local\sandy-dacl-changes")?;
+    let dacl = Dacl::read(&wide, path)?;
+    // A NULL DACL would be replaced by one that grants only `sid`; refuse it like `grant` does.
+    dacl.aces(path)?;
+    set_access(&wide, path, &dacl, sid, mask, flags)
+}
+
 /// Removes `FILE_EXECUTE` from the AppContainer's access to its profile folder, so the program
 /// cannot execute what it writes there.
 ///

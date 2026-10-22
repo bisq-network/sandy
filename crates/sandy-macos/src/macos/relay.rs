@@ -1,8 +1,9 @@
-//! The relay behind `network.expose`. sandy binds the listeners and then forks twice: the relay is
-//! a grandchild that launchd adopts, so the target, which takes over sandy's process ID, never
-//! sees it as a child and cannot reap it. The relay keeps only its listeners, watches sandy's
-//! process ID with kqueue, applies its own Seatbelt profile, and only then tells sandy that it is
-//! ready. It serves until the target ends.
+//! The relay behind `network.expose` and `network.forward`. sandy binds the listeners and then
+//! forks twice: the relay is a grandchild that launchd adopts, so the target, which takes over
+//! sandy's process ID, never sees it as a child and cannot reap it. The relay keeps only its
+//! listeners, watches sandy's process ID with kqueue, applies its own Seatbelt profile, and only
+//! then tells sandy that it is ready. It accepts connections until the target ends, then closes
+//! its listeners and lets the accepted connections finish for at most one second.
 
 use std::fs::File;
 use std::io;
@@ -10,27 +11,34 @@ use std::mem::{MaybeUninit, size_of};
 use std::net::{SocketAddr, TcpListener};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::ptr;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
-use sandy_core::{ExposedPort, SandboxError};
+use sandy_core::SandboxError;
 
 use super::seatbelt::Seatbelt;
-use crate::profile::{Profile, relay_profile};
+use crate::profile::{Profile, RelayPair, relay_profile};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// After the target ends, the relay closes its listeners at once and gives the connections it
+/// already accepted this long to deliver what is left (DESIGN.md, "Forwarded ports", rule 5).
+const DRAIN: Duration = Duration::from_secs(1);
+const DRAIN_POLL: Duration = Duration::from_millis(10);
+const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(50);
 const READY: u8 = 1;
 
-/// Starts the relay for `exposures`. Returns once the relay is confined, watches this process and
+/// Starts the relay for `pairs`. Returns once the relay is confined, watches this process and
 /// serves; any failure before that is an error, and then no relay serves.
-pub fn start(exposures: &[ExposedPort], seatbelt: &Seatbelt) -> Result<(), SandboxError> {
-    let mut listeners = Vec::with_capacity(exposures.len());
-    for exposure in exposures {
-        let listener = TcpListener::bind(exposure.listen).map_err(|error| {
-            SandboxError::io(format!("cannot listen on {}", exposure.listen), error)
+pub fn start(pairs: &[RelayPair], seatbelt: &Seatbelt) -> Result<(), SandboxError> {
+    let mut listeners = Vec::with_capacity(pairs.len());
+    for pair in pairs {
+        let listener = TcpListener::bind(pair.listen).map_err(|error| {
+            SandboxError::io(format!("cannot listen on {}", pair.listen), error)
         })?;
-        listeners.push((listener, exposure.target()));
+        listeners.push((listener, pair.target));
     }
-    let profile = relay_profile(exposures);
+    let profile = relay_profile(pairs);
     let null = File::options()
         .read(true)
         .write(true)
@@ -98,7 +106,12 @@ fn serve(
     close_all_except(&keep)?;
 
     // Registered before the profile is applied, which denies process information about others.
-    let queue = watch_exit(watched)?;
+    let queue = new_queue()?;
+    register(&queue, watched as usize, libc::EVFILT_PROC, libc::NOTE_EXIT)?;
+    for (listener, _) in &listeners {
+        listener.set_nonblocking(true)?;
+        register(&queue, listener.as_raw_fd() as usize, libc::EVFILT_READ, 0)?;
+    }
     seatbelt.apply(profile).map_err(io::Error::other)?;
     // SAFETY: writes one byte from a valid buffer to an open pipe.
     if unsafe { libc::write(ready.as_raw_fd(), [READY].as_ptr().cast(), 1) } != 1 {
@@ -106,29 +119,113 @@ fn serve(
     }
     drop(ready);
 
-    for (listener, target) in listeners {
-        std::thread::Builder::new().spawn(move || {
-            let _ = sandy_relay::serve(listener, target);
-        })?;
+    let active = Arc::new(AtomicUsize::new(0));
+    accept_until_exit(&queue, &listeners, &active);
+    // The program has ended: no new connections, and the accepted ones get a last moment to
+    // deliver what the program sent before it exited.
+    drop(listeners);
+    let start = Instant::now();
+    while active.load(Ordering::Acquire) > 0 && start.elapsed() < DRAIN {
+        std::thread::sleep(DRAIN_POLL);
     }
-    wait_for_exit(&queue);
     Ok(())
 }
 
-/// A kqueue that reports when process `pid` exits.
-fn watch_exit(pid: libc::pid_t) -> io::Result<OwnedFd> {
+/// Accepts connections on every listener whenever the kqueue reports one, until it reports that
+/// the watched process exited. An error of kevent also ends the loop, so the relay never
+/// outlives a watch it lost.
+fn accept_until_exit(
+    queue: &OwnedFd,
+    listeners: &[(TcpListener, SocketAddr)],
+    active: &Arc<AtomicUsize>,
+) {
+    let mut events = [libc::kevent {
+        ident: 0,
+        filter: 0,
+        flags: 0,
+        fflags: 0,
+        data: 0,
+        udata: ptr::null_mut(),
+    }; 16];
+    loop {
+        // SAFETY: no changes, room for events.len() events, no timeout.
+        let count = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                ptr::null(),
+                0,
+                events.as_mut_ptr(),
+                events.len() as libc::c_int,
+                ptr::null(),
+            )
+        };
+        if count == -1 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+        for event in &events[..count as usize] {
+            if event.filter == libc::EVFILT_PROC {
+                return;
+            }
+            let ready = listeners
+                .iter()
+                .find(|(listener, _)| listener.as_raw_fd() as usize == event.ident);
+            if let Some((listener, target)) = ready {
+                accept_pending(listener, *target, active);
+            }
+        }
+    }
+}
+
+/// Accepts every pending connection on `listener` and relays each one in a thread of its own.
+fn accept_pending(listener: &TcpListener, target: SocketAddr, active: &Arc<AtomicUsize>) {
+    loop {
+        let client = match listener.accept() {
+            Ok((client, _)) => client,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
+            // A connection reset before the accept, or descriptors exhausted: pause, so a
+            // listener that stays readable does not spin, and try again on the next event.
+            Err(_) => {
+                std::thread::sleep(ACCEPT_ERROR_PAUSE);
+                return;
+            }
+        };
+        if client.set_nonblocking(false).is_err() {
+            continue;
+        }
+        if active.fetch_add(1, Ordering::AcqRel) >= sandy_relay::MAX_CONNECTIONS {
+            active.fetch_sub(1, Ordering::AcqRel);
+            continue;
+        }
+        let counter = Arc::clone(active);
+        let spawned = std::thread::Builder::new().spawn(move || {
+            let _ = sandy_relay::relay(client, target);
+            counter.fetch_sub(1, Ordering::AcqRel);
+        });
+        if spawned.is_err() {
+            active.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+fn new_queue() -> io::Result<OwnedFd> {
     // SAFETY: kqueue has no arguments.
     let raw = unsafe { libc::kqueue() };
     if raw == -1 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: raw is a new descriptor that nothing else owns.
-    let queue = unsafe { OwnedFd::from_raw_fd(raw) };
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+fn register(queue: &OwnedFd, ident: usize, filter: i16, fflags: u32) -> io::Result<()> {
     let change = libc::kevent {
-        ident: pid as usize,
-        filter: libc::EVFILT_PROC,
+        ident,
+        filter,
         flags: libc::EV_ADD,
-        fflags: libc::NOTE_EXIT,
+        fflags,
         data: 0,
         udata: ptr::null_mut(),
     };
@@ -146,30 +243,7 @@ fn watch_exit(pid: libc::pid_t) -> io::Result<OwnedFd> {
     if result == -1 {
         return Err(io::Error::last_os_error());
     }
-    Ok(queue)
-}
-
-/// Blocks until the watched process exits. An error of kevent also ends the wait, so the relay
-/// never outlives a watch it lost.
-fn wait_for_exit(queue: &OwnedFd) {
-    loop {
-        let mut event = MaybeUninit::<libc::kevent>::zeroed();
-        // SAFETY: no changes, room for one event, no timeout.
-        let result = unsafe {
-            libc::kevent(
-                queue.as_raw_fd(),
-                ptr::null(),
-                0,
-                event.as_mut_ptr(),
-                1,
-                ptr::null(),
-            )
-        };
-        if result == -1 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        return;
-    }
+    Ok(())
 }
 
 /// Waits for the relay's ready byte. End of file or a timeout means that it did not start.
@@ -189,7 +263,7 @@ fn wait_until_ready(ready: &OwnedFd) -> Result<(), SandboxError> {
     };
     if ready_now != 1 {
         return Err(SandboxError::new(
-            "the relay for the exposed ports did not start in time",
+            "the relay for the exposed and forwarded ports did not start in time",
         ));
     }
     let mut byte = 0u8;
@@ -199,7 +273,7 @@ fn wait_until_ready(ready: &OwnedFd) -> Result<(), SandboxError> {
         Ok(())
     } else {
         Err(SandboxError::new(
-            "the relay for the exposed ports failed to start",
+            "the relay for the exposed and forwarded ports failed to start",
         ))
     }
 }

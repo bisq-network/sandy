@@ -852,3 +852,343 @@ fn a_concurrent_run_must_match_the_active_policy() {
 
     delete_profile(name);
 }
+
+/// What the probe's tcp-send action writes.
+const TCP_SEND_PAYLOAD: &[u8] = b"sent just before exit";
+
+/// A loopback service outside the sandbox that takes one connection and returns what the client
+/// sent, or `None` if no client came within 20 seconds.
+fn one_shot_service() -> (u16, std::thread::JoinHandle<Option<Vec<u8>>>) {
+    use std::io::Read;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let received = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut data = Vec::new();
+                    let _ = (&stream).read_to_end(&mut data);
+                    return Some(data);
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        None
+    });
+    (port, received)
+}
+
+/// `--forward` options for this test's AppContainer without the loopback exemption. The shared
+/// harness picks the exempt name for `--ip all`, so the name is set here explicitly.
+fn forward_args(fixture: &Fixture, inner: u16, target_port: u16) -> Vec<String> {
+    let mut sandbox_args = fixture.access_args();
+    sandbox_args.extend(args(&[
+        "--appcontainer",
+        &appcontainer_name(),
+        "--ip",
+        "all",
+        "--forward",
+        &format!("{inner}=127.0.0.1:{target_port}"),
+    ]));
+    sandbox_args
+}
+
+/// The socket file of the forwarded port `port` while a run serves it.
+fn forward_socket(port: u16) -> Option<PathBuf> {
+    let base = user_local_app_data().join("sandy").join("forward");
+    fs::read_dir(base)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join(port.to_string()))
+        .find(|socket| socket.exists())
+}
+
+fn user_local_app_data() -> PathBuf {
+    PathBuf::from(std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA is set"))
+}
+
+/// The point of `network.forward` on Windows: a program in an AppContainer without the loopback
+/// exemption reaches a loopback service outside. It cannot reach a listener outside directly,
+/// and the relay connects only to the forward target.
+#[test]
+fn forward_works_without_the_loopback_exemption() {
+    let fixture = Fixture::new("forward-plain");
+    let (service, received) = one_shot_service();
+    let outside = TcpListener::bind("127.0.0.1:0").unwrap();
+    outside.set_nonblocking(true).unwrap();
+    let outside_port = outside.local_addr().unwrap().port();
+    let inner = free_port();
+
+    let lines = probe_inside(
+        &forward_args(&fixture, inner, service),
+        &[
+            ("tcp-connect", &format!("127.0.0.1:{outside_port}")),
+            ("tcp-connect", &format!("127.0.0.1:{inner}")),
+        ],
+    );
+    lines[0].assert_blocked();
+    lines[1].assert_ok();
+    assert!(
+        received.join().unwrap().is_some(),
+        "the service saw no connection"
+    );
+    assert!(
+        !accepts_within(&outside, Duration::from_millis(200)),
+        "something reached the listener that the policy does not forward to"
+    );
+    // Control: the listener outside works.
+    let _control = TcpStream::connect(("127.0.0.1", outside_port)).unwrap();
+    assert!(accepts_within(&outside, Duration::from_secs(3)));
+}
+
+/// The drain of the relay lifetime rule: a program that connects through a forwarded port, writes
+/// and exits at once does not lose its data. Without the exemption, as above.
+#[test]
+fn forward_relay_delivers_data_sent_just_before_exit() {
+    let fixture = Fixture::new("forward-drain");
+    let (service, received) = one_shot_service();
+    let inner = free_port();
+    let lines = probe_inside(
+        &forward_args(&fixture, inner, service),
+        &[("tcp-send", &format!("127.0.0.1:{inner}"))],
+    );
+    lines[0].assert_ok();
+    assert_eq!(received.join().unwrap().as_deref(), Some(TCP_SEND_PAYLOAD));
+}
+
+/// The relay lifetime rule for an exposed port: when the program ends, the relay takes no new
+/// connection at once, also while it still lets an accepted connection finish. The test holds
+/// one accepted connection open, so sandy waits up to one second for it; a new connection in
+/// that window must be refused.
+#[test]
+fn relay_stops_listening_as_soon_as_the_program_ends() {
+    use std::io::BufRead;
+    let fixture = Fixture::new("relay-stop");
+    let (inner, outer) = (free_port(), free_port());
+    let mut sandbox_args = fixture.access_args();
+    sandbox_args.extend(args(&[
+        "--ip",
+        "all",
+        "--expose",
+        &format!("127.0.0.1:{outer}={inner}"),
+    ]));
+    let mut run = Command::new(sandy_path())
+        .args(run_args(
+            &sandbox_args,
+            &[("tcp-accept", &format!("127.0.0.1:{inner}"))],
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The program writes its result line to the pipe when it exits, so the line marks its end.
+    let (lines_sender, lines_receiver) = std::sync::mpsc::channel();
+    let stdout = run.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = lines_sender.send(line);
+        }
+    });
+
+    let address = format!("127.0.0.1:{outer}").parse().unwrap();
+    let mut held = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let line = loop {
+        if let Ok(line) = lines_receiver.recv_timeout(Duration::from_millis(200)) {
+            break line;
+        }
+        assert!(Instant::now() < deadline, "the program never accepted");
+        if let Ok(stream) = TcpStream::connect_timeout(&address, Duration::from_millis(500)) {
+            held.push(stream);
+        }
+    };
+    assert!(line.contains("\tok\t"), "{line}");
+    std::thread::sleep(Duration::from_millis(300));
+    let refused = TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_err();
+    let still_draining = run.try_wait().unwrap().is_none();
+    assert!(refused, "the relay still accepts after the program ended");
+    // Informative: the check above is strongest while sandy still drains the held connection.
+    if !still_draining {
+        eprintln!("note: sandy had already ended when the test connected again");
+    }
+    drop(held);
+    assert!(run.wait().unwrap().success());
+}
+
+/// The socket between the relay and sandy grants only the relays' capability: the program
+/// itself cannot connect to it, while the user outside and the relay can.
+#[test]
+fn forward_socket_is_reachable_only_by_the_relay() {
+    let fixture = Fixture::new("forward-socket");
+    let service = TcpListener::bind("127.0.0.1:0").unwrap();
+    let service_port = service.local_addr().unwrap().port();
+    let inner = free_port();
+    let path_file = fixture.arg("rw/socket-path");
+    let mut run = Command::new(sandy_path())
+        .args(run_args(
+            &forward_args(&fixture, inner, service_port),
+            &[
+                ("sleep", "5000"),
+                ("afunix-connect-file", &path_file),
+                ("tcp-connect", &format!("127.0.0.1:{inner}")),
+            ],
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let socket = loop {
+        if let Some(socket) = forward_socket(inner) {
+            break socket;
+        }
+        if run.try_wait().unwrap().is_some() {
+            panic!("sandy ended early: {:?}", run.wait_with_output());
+        }
+        assert!(Instant::now() < deadline, "no forward socket appeared");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let socket = plain_path(&socket);
+    // Control: the socket is live, and the user outside the sandbox can connect.
+    probe_outside(&[("afunix-connect", &socket)])[0].assert_ok();
+    fs::write(&path_file, &socket).unwrap();
+
+    let output = run.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let lines = parse(&output);
+    // Strictly "denied": an unreadable path file or a missing socket would be "error".
+    assert_eq!(lines[1].result, "denied", "{lines:?}");
+    lines[2].assert_ok();
+}
+
+/// The relay ends with the program and the socket directory goes away, also while a relayed
+/// connection stays open: the target holds it, so only the lifetime rule ends it.
+#[test]
+fn forward_relay_ends_with_the_program() {
+    let fixture = Fixture::new("forward-end");
+    let holder = TcpListener::bind("127.0.0.1:0").unwrap();
+    let holder_port = holder.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in holder.incoming() {
+            held.push(stream);
+        }
+    });
+    let inner = free_port();
+    let started = Instant::now();
+    let mut run = Command::new(sandy_path())
+        .args(run_args(
+            &forward_args(&fixture, inner, holder_port),
+            &[
+                ("sleep", "1000"),
+                ("tcp-connect", &format!("127.0.0.1:{inner}")),
+            ],
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let socket = loop {
+        if let Some(socket) = forward_socket(inner) {
+            break socket;
+        }
+        assert!(run.try_wait().unwrap().is_none(), "sandy ended early");
+        assert!(Instant::now() < deadline, "no forward socket appeared");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // sandy creates the socket before it starts the relay.
+    let relays = loop {
+        let relays = relay_processes(run.id());
+        if !relays.is_empty() {
+            break relays;
+        }
+        assert!(run.try_wait().unwrap().is_none(), "sandy ended early");
+        assert!(
+            Instant::now() < deadline,
+            "no relay process of sandy {}",
+            run.id()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let output = run.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    parse(&output)[1].assert_ok();
+    for relay in &relays {
+        // SAFETY: relay is a process handle this test owns; a zero timeout only polls it.
+        let state = unsafe {
+            windows_sys::Win32::System::Threading::WaitForSingleObject(relay.as_raw_handle(), 0)
+        };
+        assert_eq!(state, 0, "a relay outlived sandy");
+    }
+    assert!(!socket.exists(), "the forward socket outlived sandy");
+    assert!(socket.parent().is_some_and(|dir| !dir.exists()));
+    // A hang would show here; the exact one-second limit is a unit test of sandy-relay.
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// Handles of the `sandy.exe` processes whose parent is `parent`: the relays of that run.
+fn relay_processes(parent: u32) -> Vec<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
+
+    // SAFETY: a process snapshot needs no process id.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    assert_ne!(snapshot, INVALID_HANDLE_VALUE);
+    // SAFETY: the structure is plain data; dwSize is set before use.
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut handles = Vec::new();
+    // SAFETY: snapshot is valid and entry has its size set.
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while more {
+        let length = entry
+            .szExeFile
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(0);
+        let name = String::from_utf16_lossy(&entry.szExeFile[..length]);
+        if entry.th32ParentProcessID == parent && name.eq_ignore_ascii_case("sandy.exe") {
+            // SAFETY: OpenProcess has no memory preconditions.
+            let handle = unsafe {
+                OpenProcess(
+                    PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                    0,
+                    entry.th32ProcessID,
+                )
+            };
+            if !handle.is_null() {
+                // SAFETY: OpenProcess returned a new handle that this test owns.
+                handles.push(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) });
+            }
+        }
+        // SAFETY: as above.
+        more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: snapshot is a handle this function owns.
+    unsafe { CloseHandle(snapshot) };
+    handles
+}

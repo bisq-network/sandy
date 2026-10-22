@@ -31,6 +31,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Command::Relay { listener, target } => relay(listener, target),
+        Command::Forward { listen, socket } => forward(listen, &socket),
         Command::Sandbox(invocation) => match execute(*invocation) {
             Ok(code) => code,
             Err(message) => {
@@ -44,15 +45,104 @@ fn main() -> ExitCode {
 fn relay(listener: u64, target: std::net::SocketAddr) -> ExitCode {
     // SAFETY: a backend starts this command only with a listening socket it passed to this
     // process and that nothing else here owns.
-    let result = unsafe { sandy_relay::inherited_listener(listener) }
-        .and_then(|listener| sandy_relay::serve(listener, target));
-    match result {
+    let listener = match unsafe { sandy_relay::inherited_listener(listener) } {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("sandy: relay failed: {error}");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+    serve_relay(listener, target)
+}
+
+/// On Windows the backend keeps the relay's standard input open while the program runs and
+/// closes it when the program ends; the relay then ends by rule 5 (see `serve_until`).
+#[cfg(windows)]
+fn serve_relay(listener: std::net::TcpListener, target: std::net::SocketAddr) -> ExitCode {
+    if let Err(error) = listener.set_nonblocking(false) {
+        eprintln!("sandy: relay failed: {error}");
+        return ExitCode::from(EXIT_FAILURE);
+    }
+    sandy_relay::serve_until(
+        listener,
+        |listener| listener.accept().map(|(client, _)| client),
+        move || sandy_relay::connect(target),
+        &stop_at_end_of_input(),
+        sandy_relay::DRAIN,
+    );
+    ExitCode::SUCCESS
+}
+
+#[cfg(not(windows))]
+fn serve_relay(listener: std::net::TcpListener, target: std::net::SocketAddr) -> ExitCode {
+    match sandy_relay::serve(listener, target) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("sandy: relay failed: {error}");
             ExitCode::from(EXIT_FAILURE)
         }
     }
+}
+
+/// A stop request that this process's standard input triggers when it reaches its end. The
+/// backend that starts a relay holds the other end of that pipe; it closes it when the program
+/// ends, and its own exit closes it too.
+#[cfg(windows)]
+fn stop_at_end_of_input() -> sandy_relay::Stop {
+    use std::io::Read;
+
+    let stop = sandy_relay::Stop::new();
+    let request = stop.clone();
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; 64];
+        let mut input = std::io::stdin();
+        while matches!(input.read(&mut buffer), Ok(read) if read > 0) {}
+        request.request();
+    });
+    stop
+}
+
+/// The line the forward relay writes to standard output once it listens. The backend that starts
+/// it waits for this line before it starts the program, so the program's first connection does
+/// not race the relay. It matches the Windows backend.
+#[cfg(windows)]
+const FORWARD_READY: &str = "ready";
+
+#[cfg(windows)]
+fn forward(listen: std::net::SocketAddr, socket: &std::path::Path) -> ExitCode {
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    let listener = match TcpListener::bind(listen) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("sandy: forward relay cannot listen on {listen}: {error}");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+    let mut stdout = std::io::stdout().lock();
+    if writeln!(stdout, "{FORWARD_READY}")
+        .and_then(|()| stdout.flush())
+        .is_err()
+    {
+        return ExitCode::from(EXIT_FAILURE);
+    }
+    let socket = socket.to_path_buf();
+    sandy_relay::serve_until(
+        listener,
+        |listener| listener.accept().map(|(client, _)| client),
+        move || sandy_relay::unix::connect_to(&socket),
+        &stop_at_end_of_input(),
+        sandy_relay::DRAIN,
+    );
+    ExitCode::SUCCESS
+}
+
+/// Only the Windows backend starts the forward relay as a separate sandy process.
+#[cfg(not(windows))]
+fn forward(_listen: std::net::SocketAddr, _socket: &std::path::Path) -> ExitCode {
+    eprintln!("sandy: {} is used only on Windows", args::FORWARD_COMMAND);
+    ExitCode::from(EXIT_FAILURE)
 }
 
 fn execute(invocation: Invocation) -> Result<ExitCode, String> {

@@ -33,6 +33,9 @@ pub enum Requirement {
     /// the relay ends with the target. This is a promise of function, not a restriction; a
     /// backend without a relay must refuse rather than start a server nobody can reach.
     ExposedPortsRelayed,
+    /// Every forwarded port is relayed from inside the sandbox to its loopback service outside,
+    /// and the relay ends with the target. Like `ExposedPortsRelayed`, a promise of function.
+    ForwardedPortsRelayed,
 }
 
 impl Requirement {
@@ -50,6 +53,7 @@ impl Requirement {
             Requirement::SignalsIsolated => "signals limited to the sandbox",
             Requirement::MetadataConfined => "metadata of files outside policy paths protected",
             Requirement::ExposedPortsRelayed => "exposed ports relayed into the sandbox",
+            Requirement::ForwardedPortsRelayed => "forwarded ports relayed out of the sandbox",
         }
     }
 }

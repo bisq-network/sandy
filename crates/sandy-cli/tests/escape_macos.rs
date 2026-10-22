@@ -657,3 +657,180 @@ fn relay_ends_when_the_program_is_killed() {
     let address = format!("127.0.0.1:{outer}").parse().unwrap();
     assert!(TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_err());
 }
+
+/// A loopback service outside the sandbox that counts the connections it accepts.
+fn counting_service() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let count = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&count);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            if stream.is_ok() {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+    (port, count)
+}
+
+/// The forward relay leads only to the forwarded address: a second service outside, on another
+/// port, never sees a connection through it. The relay's profile allows network-outbound only to
+/// the target ports (unit-tested); sandbox_check has no filter for network addresses, so this
+/// test checks the routing.
+#[test]
+fn forward_relay_reaches_only_the_forward_target() {
+    use std::sync::atomic::Ordering;
+    let fixture = home_fixture("forward-only");
+    let (target, target_count) = counting_service();
+    let (other, other_count) = counting_service();
+    let inner = free_port();
+    let args = with(
+        home_args(&fixture),
+        &[
+            "--ip",
+            "all",
+            "--forward",
+            &format!("{inner}=127.0.0.1:{target}"),
+        ],
+    );
+    let inner_address = format!("127.0.0.1:{inner}");
+    let lines = probe_inside(
+        &args,
+        &[
+            ("tcp-connect", inner_address.as_str()),
+            ("tcp-connect", inner_address.as_str()),
+        ],
+    );
+    lines[0].assert_ok();
+    lines[1].assert_ok();
+    let start = Instant::now();
+    while target_count.load(Ordering::SeqCst) < 2 {
+        assert!(
+            start.elapsed() < WAIT,
+            "the forwarded service saw too few connections"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        other_count.load(Ordering::SeqCst),
+        0,
+        "port {other} was reached through the relay"
+    );
+}
+
+/// The forward relay listens on the program's loopback port outside the sandbox and ends with
+/// the program, also when the program is killed with SIGKILL.
+#[test]
+fn forward_relay_ends_when_the_program_is_killed() {
+    let fixture = home_fixture("forward-kill");
+    let (target, _) = counting_service();
+    let inner = free_port();
+    let args = with(
+        home_args(&fixture),
+        &[
+            "--ip",
+            "all",
+            "--forward",
+            &format!("{inner}=127.0.0.1:{target}"),
+        ],
+    );
+    let mut program = Command::new(sandy_path())
+        .args(run_args(&args, &[("sleep", "60000")]))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_program(program.id());
+    let relay = listener_pid(inner);
+    assert_ne!(
+        relay,
+        program.id() as libc::pid_t,
+        "the program holds the relay's listener"
+    );
+    assert_ne!(
+        parent_of(relay),
+        program.id() as libc::pid_t,
+        "the relay is the program's child"
+    );
+
+    program.kill().unwrap();
+    program.wait().unwrap();
+    let start = Instant::now();
+    // SAFETY: kill with signal 0 only checks that the process exists.
+    while unsafe { libc::kill(relay, 0) } == 0 {
+        assert!(start.elapsed() < WAIT, "the relay outlived the program");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let address = format!("127.0.0.1:{inner}").parse().unwrap();
+    assert!(TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_err());
+}
+
+/// Rule 5 of "Forwarded ports" in DESIGN.md: when the program ends, the relay closes its
+/// listeners at once. The drain of one second applies only to connections it already accepted,
+/// so a connection attempt shortly after the program ended must be refused.
+#[test]
+fn relay_stops_listening_as_soon_as_the_program_ends() {
+    let fixture = home_fixture("relay-stop");
+    let (inner, outer) = (free_port(), free_port());
+    let server = start_exposed_server(&fixture, inner, outer);
+    let output = finish_server(server, outer);
+    assert!(output.status.success(), "{output:?}");
+    std::thread::sleep(Duration::from_millis(300));
+    let address = format!("127.0.0.1:{outer}").parse().unwrap();
+    assert!(
+        TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_err(),
+        "the relay still accepts after the program ended"
+    );
+}
+
+/// What the probe's tcp-send action writes.
+const TCP_SEND_PAYLOAD: &[u8] = b"sent just before exit";
+
+/// Accepts one connection and returns everything it receives, or nothing after the deadline.
+fn receive_one(listener: TcpListener) -> std::thread::JoinHandle<Vec<u8>> {
+    use std::io::Read;
+    listener.set_nonblocking(true).unwrap();
+    std::thread::spawn(move || {
+        let start = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream.set_read_timeout(Some(WAIT)).unwrap();
+                    let mut data = Vec::new();
+                    let _ = stream.read_to_end(&mut data);
+                    return data;
+                }
+                Err(_) if start.elapsed() < WAIT => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => return Vec::new(),
+            }
+        }
+    })
+}
+
+/// The drain of rule 5: a program that connects through a forwarded port, writes and exits at
+/// once does not lose its data.
+#[test]
+fn forward_relay_delivers_data_sent_just_before_exit() {
+    let fixture = home_fixture("forward-drain");
+    let service = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = service.local_addr().unwrap().port();
+    let received = receive_one(service);
+    let inner = free_port();
+    let args = with(
+        home_args(&fixture),
+        &[
+            "--ip",
+            "all",
+            "--forward",
+            &format!("{inner}=127.0.0.1:{target}"),
+        ],
+    );
+    let lines = probe_inside(&args, &[("tcp-send", &format!("127.0.0.1:{inner}"))]);
+    lines[0].assert_ok();
+    assert_eq!(received.join().unwrap(), TCP_SEND_PAYLOAD);
+}

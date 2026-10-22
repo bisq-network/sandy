@@ -532,10 +532,23 @@ fn has_ended(pid: u32) -> bool {
 fn relay_is_confined_and_ends_with_the_program() {
     let (inner, outer) = (free_port(), free_port());
     let expose = format!("127.0.0.1:{outer}={inner}");
-    let sandbox_args = args(&["--ip", "all", "--expose", &expose]);
+    check_relay(&args(&["--ip", "all", "--expose", &expose]), outer);
+}
+
+#[test]
+fn forward_relay_is_confined_and_ends_with_the_program() {
+    let (inner, service) = (free_port(), free_port());
+    let forward = format!("{inner}=127.0.0.1:{service}");
+    // For a forwarded port the relay listens on the program's port.
+    check_relay(&args(&["--ip", "all", "--forward", &forward]), inner);
+}
+
+/// Runs a sleeping program with `sandbox_args`, finds the relay that listens on 127.0.0.1:`port`
+/// and checks its confinement, then kills the program and checks that the relay ends.
+fn check_relay(sandbox_args: &[String], port: u16) {
     let mut program = Victim(
         Command::new(sandy_path())
-            .args(run_args(&sandbox_args, &[("sleep", "600000")]))
+            .args(run_args(sandbox_args, &[("sleep", "600000")]))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -550,7 +563,7 @@ fn relay_is_confined_and_ends_with_the_program() {
     let relay = loop {
         let executed =
             read_proc(program_pid, "comm").is_some_and(|comm| comm.trim() == "sandy-probe");
-        let holders = listener_inode(outer)
+        let holders = listener_inode(port)
             .map(|inode| socket_holders(&inode))
             .unwrap_or_default();
         if let [relay] = holders[..]
@@ -562,7 +575,7 @@ fn relay_is_confined_and_ends_with_the_program() {
         let parents: Vec<_> = holders.iter().map(|&pid| parent_of(pid)).collect();
         assert!(
             Instant::now() < deadline,
-            "no ready relay for {expose}: program executed {executed}, listener holders \
+            "no ready relay on port {port}: program executed {executed}, listener holders \
              {holders:?} with parents {parents:?}, program {program_pid}"
         );
         std::thread::sleep(Duration::from_millis(20));
@@ -599,19 +612,125 @@ fn relay_is_confined_and_ends_with_the_program() {
         .count();
     assert_eq!(program_descriptors, 3);
 
-    let address = format!("127.0.0.1:{outer}").parse().unwrap();
+    let address = format!("127.0.0.1:{port}").parse().unwrap();
     assert!(TcpStream::connect_timeout(&address, Duration::from_secs(5)).is_ok());
     // SAFETY: kill takes no pointers.
     unsafe { libc::kill(program_pid as libc::pid_t, libc::SIGKILL) };
     program.0.wait().unwrap();
-    // The main thread of the relay can show as a zombie while its other threads, which share the
-    // listener, are still exiting. The port closes when the last one is gone.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let refused = || TcpStream::connect_timeout(&address, Duration::from_secs(1)).is_err();
+    // DESIGN.md: no relay outlives the program by more than one second. The margin covers slow
+    // test machines. The main thread of the relay can show as a zombie while its other threads,
+    // which share the listener, are still exiting, so the test also waits for the port to close.
+    let deadline = Instant::now() + Duration::from_secs(1) + Duration::from_secs(2);
+    let refused = || TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_err();
     while !(has_ended(relay) && refused()) {
-        assert!(Instant::now() < deadline, "the relay outlived the program");
+        assert!(
+            Instant::now() < deadline,
+            "the relay outlived the program by more than one second plus margin"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Accepts one connection on `listener` before the deadline.
+fn accepts_within(listener: &std::net::TcpListener, wait: Duration) -> bool {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + wait;
+    while Instant::now() < deadline {
+        if listener.accept().is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+#[test]
+fn forward_relay_reaches_only_its_target() {
+    let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let target_address = target.local_addr().unwrap();
+    let inner = free_port();
+    let forward = format!("{inner}={target_address}");
+    let sandbox_args = args(&["--ip", "all", "--forward", &forward]);
+    let lines = probe_inside(
+        &sandbox_args,
+        &[("tcp-connect", &format!("127.0.0.1:{inner}"))],
+    );
+    lines[0].assert_ok();
+    assert!(accepts_within(&target, Duration::from_secs(20)));
+    // The relay connects only to the target; the other listener sees nothing.
+    assert!(!accepts_within(&other, Duration::from_millis(500)));
+}
+
+/// Rule 5 of "Forwarded ports": the relay closes its listeners as soon as the program ends.
+#[test]
+fn relay_stops_listening_as_soon_as_the_program_ends() {
+    let (inner, outer) = (free_port(), free_port());
+    let expose = format!("127.0.0.1:{outer}={inner}");
+    let sandbox_args = args(&["--ip", "all", "--expose", &expose]);
+    let mut server = Command::new(sandy_path())
+        .args(run_args(
+            &sandbox_args,
+            &[("tcp-accept", &format!("127.0.0.1:{inner}"))],
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let address = format!("127.0.0.1:{outer}").parse().unwrap();
+    // Early attempts can reach the relay before the program listens; the relay closes them.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while server.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the server never accepted");
+        let _ = TcpStream::connect_timeout(&address, Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let output = server.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_err(),
+        "the relay still accepts after the program ended"
+    );
+}
+
+/// What the probe's tcp-send action writes.
+const TCP_SEND_PAYLOAD: &[u8] = b"sent just before exit";
+
+/// Rule 5 of "Forwarded ports": a program that connects through a forwarded port, writes and
+/// exits at once does not lose its data.
+#[test]
+fn forward_relay_delivers_data_sent_just_before_exit() {
+    use std::io::Read;
+    let service = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = service.local_addr().unwrap();
+    service.set_nonblocking(true).unwrap();
+    // Returns what the first connection sends, or nothing if none arrives before the deadline.
+    let received = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if let Ok((mut stream, _)) = service.accept() {
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(20)))
+                    .unwrap();
+                let mut data = Vec::new();
+                let _ = stream.read_to_end(&mut data);
+                return data;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Vec::new()
+    });
+    let inner = free_port();
+    let forward = format!("{inner}={target}");
+    let sandbox_args = args(&["--ip", "all", "--forward", &forward]);
+    let lines = probe_inside(
+        &sandbox_args,
+        &[("tcp-send", &format!("127.0.0.1:{inner}"))],
+    );
+    lines[0].assert_ok();
+    assert_eq!(received.join().unwrap(), TCP_SEND_PAYLOAD);
 }
 
 #[test]

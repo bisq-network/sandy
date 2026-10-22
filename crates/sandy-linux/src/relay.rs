@@ -1,4 +1,7 @@
-//! The relay for `network.expose`. sandy starts it before it confines itself:
+//! The relay for `network.expose` and `network.forward`. Both are pairs of a loopback address
+//! the relay listens on and a loopback address it connects to: `expose` listens outside for the
+//! program's port, `forward` listens on the program's port for a service outside. One relay
+//! process serves all pairs. sandy starts it before it confines itself:
 //!
 //! 1. Bind every listener and open a pidfd for sandy's own process ID, which the program keeps
 //!    after execve.
@@ -6,9 +9,11 @@
 //!    program and the program's wait never reaps it.
 //! 3. The relay closes every descriptor except the listeners, the pidfd, standard error and the
 //!    readiness pipe, then confines itself: no_new_privs, Landlock without any file access and
-//!    with TCP connect only to the exposed ports, and seccomp filters for its few system calls.
-//! 4. It starts serving and reports readiness. sandy continues only after that report.
-//! 5. It exits when the pidfd becomes readable, that is when the program ends, also by SIGKILL.
+//!    with TCP connect only to the target ports, and seccomp filters for its few system calls.
+//! 4. It reports readiness; sandy continues only after that report. It then polls the pidfd and
+//!    the listeners and relays each accepted connection in its own threads.
+//! 5. When the pidfd becomes readable, that is when the program ends (also by SIGKILL), it closes
+//!    the listeners at once, gives accepted connections at most one second, and exits.
 //!
 //! The relay is a fork, not a new program. sandy is single-threaded when it forks (checked), so
 //! the child can use the allocator and threads like any process.
@@ -17,22 +22,48 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use landlock::{
     ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, Ruleset,
     RulesetAttr, RulesetCreatedAttr, Scope,
 };
-use sandy_core::{ExposedPort, SandboxError};
+use sandy_core::{ExposedPort, ForwardedPort, SandboxError};
 
 use crate::filter;
 use crate::launch::{ensure_single_thread, restrict, set_no_new_privs};
 
+/// The relay accepts connections on `listen` and connects each one to `target`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayPair {
+    pub listen: SocketAddr,
+    pub target: SocketAddr,
+}
+
 /// What the relay needs from the plan.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RelayConfig {
-    pub expose: Vec<ExposedPort>,
+    pub pairs: Vec<RelayPair>,
     pub abi: ABI,
+}
+
+impl RelayConfig {
+    /// The relay for these ports, or `None` when there is nothing to relay.
+    pub fn new(expose: &[ExposedPort], forward: &[ForwardedPort], abi: ABI) -> Option<Self> {
+        let exposed = expose.iter().map(|expose| RelayPair {
+            listen: expose.listen,
+            target: expose.target(),
+        });
+        let forwarded = forward.iter().map(|forward| RelayPair {
+            listen: forward.listen(),
+            target: forward.to,
+        });
+        let pairs: Vec<RelayPair> = exposed.chain(forwarded).collect();
+        (!pairs.is_empty()).then_some(RelayConfig { pairs, abi })
+    }
 }
 
 const READY: &[u8] = b"ready";
@@ -40,13 +71,13 @@ const READY: &[u8] = b"ready";
 /// Starts the relay and returns once it is confined and serving.
 pub fn start(config: &RelayConfig) -> Result<(), SandboxError> {
     let listeners = config
-        .expose
+        .pairs
         .iter()
-        .map(|expose| {
-            let listener = TcpListener::bind(expose.listen).map_err(|error| {
-                SandboxError::io(format!("cannot listen on {}", expose.listen), error)
+        .map(|pair| {
+            let listener = TcpListener::bind(pair.listen).map_err(|error| {
+                SandboxError::io(format!("cannot listen on {}", pair.listen), error)
             })?;
-            Ok((listener, expose.target()))
+            Ok((listener, pair.target))
         })
         .collect::<Result<Vec<_>, SandboxError>>()?;
     let program = pidfd_open_self()?;
@@ -108,10 +139,20 @@ fn relay_main(
     keep.extend([program.as_raw_fd(), ready.as_raw_fd(), libc::STDERR_FILENO]);
     let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         confine(&keep, config)?;
-        for (listener, target) in listeners {
-            thread::Builder::new()
-                .spawn(move || sandy_relay::serve(listener, target))
-                .map_err(|error| SandboxError::io("cannot start a relay thread", error))?;
+        // Every connection gets its own threads. Starting one now shows that the filter allows
+        // it, so a missing system call fails the start instead of the first connection.
+        thread::Builder::new()
+            .spawn(|| ())
+            .and_then(|thread| {
+                thread
+                    .join()
+                    .map_err(|_| io::Error::other("the test thread panicked"))
+            })
+            .map_err(|error| SandboxError::io("cannot start a relay thread", error))?;
+        for (listener, _) in &listeners {
+            listener
+                .set_nonblocking(true)
+                .map_err(|error| SandboxError::io("cannot prepare a listener", error))?;
         }
         Ok::<(), SandboxError>(())
     }));
@@ -123,12 +164,95 @@ fn relay_main(
                 unsafe { libc::_exit(1) };
             }
             drop(ready);
-            wait_for_exit(&program);
+            serve_until_exit(listeners, &program);
             // SAFETY: as above.
             unsafe { libc::_exit(0) }
         }
         Ok(Err(error)) => report_and_exit(ready, &error.to_string()),
         Err(_) => report_and_exit(ready, "the relay panicked"),
+    }
+}
+
+/// How long accepted connections may outlive the program (rule 5 of "Forwarded ports" in
+/// DESIGN.md).
+const DRAIN: Duration = Duration::from_secs(1);
+const DRAIN_POLL: Duration = Duration::from_millis(10);
+const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(50);
+
+/// Accepts and relays connections until the program ends, then closes the listeners at once and
+/// gives the accepted connections at most `DRAIN` to deliver what is left. A program that
+/// connects, writes and exits therefore does not lose its data, as it would not without a relay.
+fn serve_until_exit(listeners: Vec<(TcpListener, SocketAddr)>, program: &OwnedFd) {
+    let active = Arc::new(AtomicUsize::new(0));
+    let mut polls: Vec<libc::pollfd> = [program.as_raw_fd()]
+        .into_iter()
+        .chain(listeners.iter().map(|(listener, _)| listener.as_raw_fd()))
+        .map(|fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    loop {
+        // SAFETY: `polls` holds `len` valid pollfd entries.
+        let ready = unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, -1) };
+        if ready < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            // Without poll the relay cannot see the program end; it must not outlive it.
+            break;
+        }
+        // Connections that completed together with the end of the program are still taken.
+        for (poll, (listener, target)) in polls[1..].iter().zip(&listeners) {
+            if poll.revents != 0 {
+                accept_all(listener, *target, &active);
+            }
+        }
+        if polls[0].revents != 0 {
+            break;
+        }
+    }
+    drop(listeners);
+    let ended = Instant::now();
+    while active.load(Ordering::Acquire) > 0 && ended.elapsed() < DRAIN {
+        thread::sleep(DRAIN_POLL);
+    }
+}
+
+/// Accepts every waiting connection on `listener` and relays each one in its own thread, up to
+/// `sandy_relay::MAX_CONNECTIONS` at the same time.
+fn accept_all(listener: &TcpListener, target: SocketAddr, active: &Arc<AtomicUsize>) {
+    loop {
+        let client = match listener.accept() {
+            Ok((client, _)) => client,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
+            // A connection reset before accept, or no descriptors left: try again on the next
+            // readiness report, after a pause so a lasting error does not spin.
+            Err(_) => {
+                thread::sleep(ACCEPT_ERROR_PAUSE);
+                return;
+            }
+        };
+        if active.fetch_add(1, Ordering::AcqRel) >= sandy_relay::MAX_CONNECTIONS {
+            active.fetch_sub(1, Ordering::AcqRel);
+            continue;
+        }
+        let slot = Slot(Arc::clone(active));
+        // If the thread cannot start, the closure and its slot are dropped, which frees the slot.
+        let _ = thread::Builder::new().spawn(move || {
+            let _slot = slot;
+            let _ = sandy_relay::relay(client, target);
+        });
+    }
+}
+
+/// One counted connection. Dropping it frees the count, also when its thread never started.
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -157,10 +281,10 @@ fn confine(keep: &[RawFd], config: &RelayConfig) -> Result<(), SandboxError> {
     }
     let mut ruleset = ruleset.create().map_err(landlock_error)?;
     if config.abi >= ABI::V4 {
-        for expose in &config.expose {
+        for pair in &config.pairs {
             let connect: BitFlags<AccessNet> = AccessNet::ConnectTcp.into();
             ruleset = ruleset
-                .add_rule(NetPort::new(expose.port, connect))
+                .add_rule(NetPort::new(pair.target.port(), connect))
                 .map_err(landlock_error)?;
         }
     }
@@ -201,22 +325,6 @@ fn close_range(first: u32, last: u32) -> Result<(), SandboxError> {
     Ok(())
 }
 
-/// Waits until the program ends. A pidfd becomes readable when its process exits.
-fn wait_for_exit(program: &OwnedFd) {
-    let mut poll = libc::pollfd {
-        fd: program.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    loop {
-        // SAFETY: `poll` points to one valid pollfd.
-        let result = unsafe { libc::poll(&mut poll, 1, -1) };
-        if result > 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            return;
-        }
-    }
-}
-
 fn pidfd_open_self() -> Result<OwnedFd, SandboxError> {
     // SAFETY: getpid has no preconditions; pidfd_open returns a new close-on-exec descriptor.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0u32) };
@@ -241,4 +349,75 @@ fn pipe() -> Result<(File, File), SandboxError> {
     }
     // SAFETY: both descriptors were just created and nothing else owns them.
     Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::HostCapabilities;
+    use std::net::TcpStream;
+
+    const OUTCOMES: [&str; 6] = [
+        "ok",
+        "confine failed",
+        "the target was unreachable",
+        "another port was reachable",
+        "a file could be opened",
+        "a new socket could be bound",
+    ];
+
+    /// What a compromised relay would try after `confine`. Returns an index into `OUTCOMES`.
+    fn try_escapes(config: &RelayConfig, other: SocketAddr) -> i32 {
+        if confine(&[libc::STDERR_FILENO], config).is_err() {
+            return 1;
+        }
+        if TcpStream::connect(config.pairs[0].target).is_err() {
+            return 2;
+        }
+        // Landlock checks TCP ports from ABI 4; older kernels allow every port.
+        if config.abi >= ABI::V4 && TcpStream::connect(other).is_ok() {
+            return 3;
+        }
+        if File::open("/proc/self/status").is_ok() {
+            return 4;
+        }
+        if TcpListener::bind("127.0.0.1:0").is_ok() {
+            return 5;
+        }
+        0
+    }
+
+    /// The child process applies the relay's confinement to itself. It never prints and leaves
+    /// through `_exit`; the allocator stays usable after fork in glibc and musl, also while other
+    /// test threads run.
+    #[test]
+    fn the_confined_relay_reaches_only_its_targets() {
+        let Ok(version) = HostCapabilities::detect().landlock else {
+            eprintln!("skipped: no Landlock");
+            return;
+        };
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let other = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = RelayConfig {
+            pairs: vec![RelayPair {
+                listen: "127.0.0.1:1".parse().unwrap(),
+                target: target.local_addr().unwrap(),
+            }],
+            abi: ABI::from(version),
+        };
+        let other = other.local_addr().unwrap();
+        // SAFETY: the child only runs `try_escapes` and leaves through `_exit`.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            let outcome = try_escapes(&config, other);
+            // SAFETY: ends the child without running the test harness's cleanup.
+            unsafe { libc::_exit(outcome) };
+        }
+        let mut status = 0;
+        // SAFETY: waits for the child created above.
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status), "wait status {status}");
+        let outcome = libc::WEXITSTATUS(status) as usize;
+        assert_eq!(outcome, 0, "{}", OUTCOMES[outcome.min(OUTCOMES.len() - 1)]);
+    }
 }

@@ -79,10 +79,7 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
                 restrict_truncate: abi < ABI::V3,
                 deny_path_metadata: policy.path_metadata == PathMetadata::Deny,
             },
-            relay: (!policy.expose.is_empty()).then(|| RelayConfig {
-                expose: policy.expose.clone(),
-                abi,
-            }),
+            relay: RelayConfig::new(&policy.expose, &policy.forward, abi),
         }),
         _ => None,
     };
@@ -175,23 +172,14 @@ fn plan_item(
                 enforced(mechanism)
             }
         },
-        Requirement::ExposedPortsRelayed => match (&host.landlock, &host.seccomp, &host.pidfd) {
-            (Err(reason), _, _) | (_, Err(reason), _) | (_, _, Err(reason)) => unavailable(reason),
-            _ => {
-                let mut mechanism = format!(
-                    "relay process outside the sandbox, not a child of the program, that \
-                         ends with it (pidfd); confined by no_new_privs, Landlock ABI {abi} \
-                         without file access"
-                );
-                if abi >= ABI::V4 {
-                    mechanism.push_str(", TCP connect only to the exposed ports and no bind");
+        Requirement::ExposedPortsRelayed | Requirement::ForwardedPortsRelayed => {
+            match (&host.landlock, &host.seccomp, &host.pidfd) {
+                (Err(reason), _, _) | (_, Err(reason), _) | (_, _, Err(reason)) => {
+                    unavailable(reason)
                 }
-                mechanism.push_str(
-                    ", and a seccomp filter that allows only TCP, copying bytes and threads",
-                );
-                enforced(mechanism)
+                _ => enforced(relay_mechanism(abi)),
             }
-        },
+        }
         Requirement::MetadataConfined => match &host.seccomp {
             Err(reason) => unavailable(reason),
             Ok(()) => enforced(FILTER_METADATA.to_string()),
@@ -207,6 +195,19 @@ fn plan_item(
             }
         }
     }
+}
+
+/// One relay process serves exposed and forwarded ports, so both requirements name it.
+fn relay_mechanism(abi: ABI) -> String {
+    let mut mechanism = format!(
+        "relay process outside the sandbox, not a child of the program, that ends with it \
+         (pidfd); confined by no_new_privs, Landlock ABI {abi} without file access"
+    );
+    if abi >= ABI::V4 {
+        mechanism.push_str(", TCP connect only to the relay targets and no bind");
+    }
+    mechanism.push_str(", and a seccomp filter that allows only TCP, copying bytes and threads");
+    mechanism
 }
 
 /// The policy check for writable and executable paths does not see the system set. A writable
@@ -330,7 +331,10 @@ fn system_rights(usage: SystemUse) -> BitFlags<AccessFs> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sandy_core::{EnvironmentPolicy, ExposedPort, PathRule, Status, WindowsPolicy};
+    use crate::relay::RelayPair;
+    use sandy_core::{
+        EnvironmentPolicy, ExposedPort, ForwardedPort, PathRule, Status, WindowsPolicy,
+    };
     use std::path::Path;
 
     fn host(abi: Option<i32>) -> HostCapabilities {
@@ -382,6 +386,7 @@ mod tests {
             ip: NetworkAccess::None,
             unix_sockets: NetworkAccess::None,
             expose: Vec::new(),
+            forward: Vec::new(),
             signals: SignalScope::Isolated,
             path_metadata: PathMetadata::Deny,
             environment: EnvironmentPolicy::default(),
@@ -507,26 +512,52 @@ mod tests {
     }
 
     #[test]
-    fn exposed_ports_need_pidfd_landlock_and_seccomp() {
+    fn relayed_ports_need_pidfd_landlock_and_seccomp() {
         let mut policy = policy();
         policy.ip = NetworkAccess::All;
         policy.expose = vec![ExposedPort {
             listen: "127.0.0.1:18080".parse().unwrap(),
             port: 8080,
         }];
+        policy.forward = vec![ForwardedPort {
+            port: 18082,
+            to: "127.0.0.1:8082".parse().unwrap(),
+        }];
         let plan = plan_for(&policy, &host(Some(9)));
         assert_eq!(unavailable(&plan), vec![]);
         let relay = plan.sandbox.unwrap().relay.unwrap();
-        assert_eq!(relay.expose, policy.expose);
+        let pair = |listen: &str, target: &str| RelayPair {
+            listen: listen.parse().unwrap(),
+            target: target.parse().unwrap(),
+        };
+        // One relay serves both directions: exposed ports listen outside and connect to the
+        // program, forwarded ports listen on the program's port and connect outside.
+        assert_eq!(
+            relay.pairs,
+            vec![
+                pair("127.0.0.1:18080", "127.0.0.1:8080"),
+                pair("127.0.0.1:18082", "127.0.0.1:8082"),
+            ]
+        );
         assert_eq!(relay.abi, ABI::V9);
 
         let mut no_pidfd = host(Some(9));
         no_pidfd.pidfd = Err("old kernel".to_string());
         let plan = plan_for(&policy, &no_pidfd);
-        assert_eq!(unavailable(&plan), vec![Requirement::ExposedPortsRelayed]);
+        assert_eq!(
+            unavailable(&plan),
+            vec![
+                Requirement::ExposedPortsRelayed,
+                Requirement::ForwardedPortsRelayed
+            ]
+        );
         assert!(plan.sandbox.is_none());
 
         policy.expose.clear();
+        let plan = plan_for(&policy, &host(Some(9)));
+        assert_eq!(plan.sandbox.unwrap().relay.unwrap().pairs.len(), 1);
+
+        policy.forward.clear();
         let plan = plan_for(&policy, &host(Some(9)));
         assert!(plan.sandbox.unwrap().relay.is_none());
     }

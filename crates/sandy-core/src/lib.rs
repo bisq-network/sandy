@@ -14,8 +14,8 @@ pub use backend::{Backend, SandboxError, TargetCommand};
 pub use env::target_environment;
 pub use plan::{EnforcementPlan, PlanItem, Requirement, Status};
 pub use policy::{
-    EnvironmentPolicy, ExposedPort, FilesystemPolicy, LinuxPolicy, NetworkAccess, NetworkPolicy,
-    POLICY_VERSION, PathMetadata, Policy, PolicyError, ProcessPolicy, SignalScope, SystemAccess,
-    WindowsPolicy,
+    EnvironmentPolicy, ExposedPort, FilesystemPolicy, ForwardedPort, LinuxPolicy, NetworkAccess,
+    NetworkPolicy, POLICY_VERSION, PathMetadata, Policy, PolicyError, ProcessPolicy, SignalScope,
+    SystemAccess, WindowsPolicy,
 };
 pub use resolve::{PathAccess, PathRule, ResolvedPolicy};

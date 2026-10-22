@@ -7,12 +7,14 @@
 //! refused with a permission error) or `error` (any other failure).
 
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// What `tcp-send` writes before it exits.
+const TCP_SEND_PAYLOAD: &[u8] = b"sent just before exit";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -112,6 +114,11 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
         "afunix-accept" => windows_actions::afunix_accept(target),
         "com-activate" => windows_actions::com_activate(target),
         "load-library" => windows_actions::load_library(target),
+        // Connects to the AF_UNIX socket whose path the file `target` holds; the test writes the
+        // path there while the program runs.
+        "afunix-connect-file" => {
+            windows_actions::afunix_connect(fs::read_to_string(target)?.trim())
+        }
         "copy-self" => {
             fs::copy(std::env::current_exe()?, target).map(|bytes| format!("{bytes} bytes"))
         }
@@ -124,6 +131,12 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
             fs::hard_link(from, to).map(|()| String::new())
         }
         "signal-disposition" => initial_signals::disposition(target),
+        "tcp-send" => {
+            let mut stream = TcpStream::connect_timeout(&socket_address(target)?, CONNECT_TIMEOUT)?;
+            stream.write_all(TCP_SEND_PAYLOAD)?;
+            stream.shutdown(std::net::Shutdown::Write)?;
+            Ok(format!("{} bytes", TCP_SEND_PAYLOAD.len()))
+        }
         action if linux::ACTIONS.contains(&action) => linux::perform(action, target),
         action if macos::ACTIONS.contains(&action) => macos::perform(action, target),
         _ => Err(io::Error::new(

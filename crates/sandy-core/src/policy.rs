@@ -95,6 +95,9 @@ pub struct NetworkPolicy {
     /// Loopback ports of the target that clients outside the sandbox can reach through a relay.
     #[serde(default)]
     pub expose: Vec<ExposedPort>,
+    /// Loopback services outside the sandbox that the target can reach through a relay.
+    #[serde(default)]
+    pub forward: Vec<ForwardedPort>,
 }
 
 /// A relay that makes a loopback port of the target reachable from outside the sandbox.
@@ -114,6 +117,32 @@ impl ExposedPort {
     /// The address the relay connects to inside the sandbox.
     pub fn target(&self) -> SocketAddr {
         let ip: std::net::IpAddr = if self.listen.is_ipv4() {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        };
+        SocketAddr::new(ip, self.port)
+    }
+}
+
+/// A relay that lets the target reach a loopback service outside the sandbox.
+///
+/// The target connects to `port` on the loopback address of the same family as `to`, and sandy
+/// relays each connection to `to` outside the sandbox. Windows blocks loopback connections from an
+/// AppContainer to processes outside it unless an administrator installs an exemption; the relay
+/// needs no exemption. The other platforms relay the same way, so a policy means the same
+/// everywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardedPort {
+    pub port: u16,
+    pub to: SocketAddr,
+}
+
+impl ForwardedPort {
+    /// The address inside the sandbox that the target connects to.
+    pub fn listen(&self) -> SocketAddr {
+        let ip: std::net::IpAddr = if self.to.is_ipv4() {
             std::net::Ipv4Addr::LOCALHOST.into()
         } else {
             std::net::Ipv6Addr::LOCALHOST.into()
@@ -214,6 +243,10 @@ pub enum PolicyError {
         expose: ExposedPort,
         reason: &'static str,
     },
+    InvalidForward {
+        forward: ForwardedPort,
+        reason: &'static str,
+    },
     ProgramNotAFile(PathBuf),
     InvalidEnvironmentName(String),
     InvalidEnvironmentValue(String),
@@ -247,6 +280,11 @@ impl fmt::Display for PolicyError {
                 "policy path {} lies inside writable path {}; the program could replace it with a symbolic link before the next start",
                 path.display(),
                 writable.display()
+            ),
+            PolicyError::InvalidForward { forward, reason } => write!(
+                f,
+                "invalid forward port {} -> {}: {reason}",
+                forward.port, forward.to
             ),
             PolicyError::InvalidExpose { expose, reason } => write!(
                 f,
@@ -303,6 +341,7 @@ mod tests {
             ip = "all"
             unix_sockets = "none"
             expose = [{ listen = "127.0.0.1:18080", port = 8080 }]
+            forward = [{ port = 18081, to = "127.0.0.1:8081" }]
             [process]
             signals = "isolated"
             [environment]
@@ -328,6 +367,17 @@ mod tests {
         assert_eq!(
             policy.network.expose[0].target(),
             "127.0.0.1:8080".parse().unwrap()
+        );
+        assert_eq!(
+            policy.network.forward,
+            vec![ForwardedPort {
+                port: 18081,
+                to: "127.0.0.1:8081".parse().unwrap(),
+            }]
+        );
+        assert_eq!(
+            policy.network.forward[0].listen(),
+            "127.0.0.1:18081".parse().unwrap()
         );
         assert_eq!(policy.process.signals, SignalScope::Isolated);
         assert_eq!(policy.environment.set["HOME"], "/c");

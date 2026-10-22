@@ -139,6 +139,7 @@ name = "sandy-windows"
 version = "1.0.0"
 dependencies = [
  "sandy-core",
+ "sandy-relay",
  "windows-sys",
 ]
 
