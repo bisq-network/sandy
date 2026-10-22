@@ -91,6 +91,17 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
             Ok(String::new())
         }
         "spawn" => spawn(target),
+        "start" => start(target),
+        "exit" => std::process::exit(
+            target
+                .parse()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid status"))?,
+        ),
+        "read-line" => {
+            let mut line = String::new();
+            io::stdin().read_line(&mut line)?;
+            Ok(line.trim_end().to_string())
+        }
         "fd-read" => fd_read(target),
         "resolve" => {
             let addresses = (target, 0).to_socket_addrs()?.count();
@@ -174,6 +185,20 @@ fn spawn(target: &str) -> io::Result<String> {
         let first_line = stderr.lines().next().unwrap_or_default();
         Err(io::Error::other(format!("{}: {first_line}", output.status)))
     }
+}
+
+/// Starts a program with arguments (separated by U+001F) without waiting for it and reports its
+/// process ID. The program gets no standard streams, so it does not keep the caller's output open.
+fn start(target: &str) -> io::Result<String> {
+    let mut parts = target.split(ARGUMENT_SEPARATOR);
+    let program = parts.next().unwrap_or_default();
+    let child = Command::new(program)
+        .args(parts)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(child.id().to_string())
 }
 
 /// Splits a target of the form `FROM<U+001F>TO`.
@@ -294,6 +319,10 @@ mod linux {
         "clone-process",
         "posix-spawn",
         "thread",
+        "setsid",
+        "setpgid",
+        "signal-parent",
+        "stop-self",
     ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
@@ -337,6 +366,16 @@ mod linux {
             "rename-in" => rename_in(target),
             "raw-syscall" => raw_syscall(target),
             "move-pages" => move_pages(target),
+            // SAFETY: setsid has no arguments.
+            "setsid" => check(unsafe { libc::setsid() }).map(|_| String::new()),
+            // SAFETY: setpgid takes process IDs; 0 and 0 make the caller a group leader.
+            "setpgid" => check(unsafe { libc::setpgid(0, 0) }).map(|_| String::new()),
+            // Signal 0 only checks permission. The parent is sandy with children = "contained".
+            "signal-parent" => {
+                // SAFETY: kill and getppid take and return process IDs.
+                check(unsafe { libc::kill(libc::getppid(), 0) }).map(|_| String::new())
+            }
+            "stop-self" => stop_self(target),
             "fork" => fork_raw(),
             "vfork" => vfork_raw(),
             "clone-process" => clone_process(),
@@ -353,6 +392,30 @@ mod linux {
     }
 
     const SETUID_MODE: u32 = 0o4755;
+
+    /// Stops the probe with SIGSTOP. A child it forks first continues it after `target`
+    /// milliseconds, as a program that wants to leave its supervisor stopped would.
+    fn stop_self(target: &str) -> io::Result<String> {
+        let millis: u64 = target
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid duration"))?;
+        // SAFETY: getpid has no preconditions.
+        let parent = unsafe { libc::getpid() };
+        // SAFETY: the child only sleeps, signals the parent and calls _exit.
+        match unsafe { libc::fork() } {
+            -1 => Err(io::Error::last_os_error()),
+            0 => {
+                std::thread::sleep(Duration::from_millis(millis));
+                // SAFETY: kill and _exit take a process ID and a status.
+                unsafe {
+                    libc::kill(parent, libc::SIGCONT);
+                    libc::_exit(0)
+                }
+            }
+            // SAFETY: stops the probe itself.
+            _ => check(unsafe { libc::kill(parent, libc::SIGSTOP) }).map(|_| String::new()),
+        }
+    }
 
     /// A process ID, or `self` for the probe's own one.
     fn pid(target: &str) -> io::Result<libc::pid_t> {

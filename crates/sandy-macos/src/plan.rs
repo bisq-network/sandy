@@ -38,6 +38,7 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<PlanIte
                 Err(reason) => PlanItem::unavailable(requirement, reason.clone()),
             },
             Mechanism::Exec(text) => PlanItem::enforced(requirement, text),
+            Mechanism::Missing(reason) => PlanItem::unavailable(requirement, reason),
         })
         .collect()
 }
@@ -47,6 +48,8 @@ enum Mechanism {
     Profile(String),
     /// Enforced by how sandy starts the target. Needs no host capability beyond posix_spawn.
     Exec(String),
+    /// Not implemented on macOS.
+    Missing(&'static str),
 }
 
 fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
@@ -96,6 +99,13 @@ fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
         Requirement::MetadataConfined => {
             "file-write* (mode, owner, flags, times, extended attributes, ACLs) only on read_write \
              paths, by path and through open descriptors alike"
+        }
+        Requirement::ChildProcessesContained => {
+            return Mechanism::Missing(
+                "not implemented on macOS yet: sandy replaces itself with the program, so nothing \
+                 ends the processes the program leaves behind; use children = \"none\", or \
+                 \"allowed\" if they may outlive the program",
+            );
         }
         Requirement::ChildProcessesDenied => {
             "process-fork denied, so fork, vfork and posix_spawn fail; threads and replacing the \

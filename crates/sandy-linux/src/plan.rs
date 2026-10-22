@@ -28,6 +28,9 @@ pub struct Sandbox {
     pub filter: FilterConfig,
     /// The relay for exposed ports, when the policy has any.
     pub relay: Option<RelayConfig>,
+    /// `process.children = "contained"`: sandy stays the program's parent and ends its process
+    /// group when the program ends, instead of replacing itself with the program.
+    pub contain: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -79,8 +82,10 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
                 restrict_truncate: abi < ABI::V3,
                 deny_path_metadata: policy.path_metadata == PathMetadata::Deny,
                 deny_children: policy.children == ChildProcesses::None,
+                keep_process_group: policy.children == ChildProcesses::Contained,
             },
             relay: RelayConfig::new(&policy.expose, &policy.forward, abi),
+            contain: policy.children == ChildProcesses::Contained,
         }),
         _ => None,
     };
@@ -178,6 +183,17 @@ fn plan_item(
             Ok(()) => enforced(
                 "seccomp denies fork, vfork and clone without CLONE_THREAD (clone3 fails with \
                  ENOSYS); threads and execve stay allowed"
+                    .to_string(),
+            ),
+        },
+        Requirement::ChildProcessesContained => match (&host.seccomp, &host.pidfd) {
+            (Err(reason), _) | (_, Err(reason)) => unavailable(reason),
+            (Ok(()), Ok(())) => enforced(
+                "sandy stays the program's parent and puts it in a process group of its own, \
+                 whose leader is a guard process of sandy; seccomp denies setsid and setpgid, so \
+                 every process the program starts stays in that group; the guard kills the \
+                 group when the program ends (pidfd) or sandy dies, and sandy kills it with \
+                 SIGKILL when the program ends and reaps it as child subreaper"
                     .to_string(),
             ),
         },
@@ -589,6 +605,36 @@ mod tests {
         policy.children = ChildProcesses::Allowed;
         let plan = plan_for(&policy, &host(Some(9)));
         assert!(!plan.sandbox.unwrap().filter.deny_children);
+    }
+
+    #[test]
+    fn containing_children_needs_seccomp_and_pidfd() {
+        let mut policy = policy();
+        policy.children = ChildProcesses::Contained;
+        let plan = plan_for(&policy, &host(Some(9)));
+        assert_eq!(unavailable(&plan), vec![]);
+        status(&plan, Requirement::ChildProcessesContained);
+        let sandbox = plan.sandbox.unwrap();
+        assert!(sandbox.contain);
+        assert!(sandbox.filter.keep_process_group);
+        assert!(!sandbox.filter.deny_children);
+
+        let mut no_seccomp = host(Some(9));
+        no_seccomp.seccomp = Err("no seccomp".to_string());
+        let plan = plan_for(&policy, &no_seccomp);
+        assert!(unavailable(&plan).contains(&Requirement::ChildProcessesContained));
+
+        let mut no_pidfd = host(Some(9));
+        no_pidfd.pidfd = Err("no pidfd_open".to_string());
+        let plan = plan_for(&policy, &no_pidfd);
+        assert!(unavailable(&plan).contains(&Requirement::ChildProcessesContained));
+
+        for children in [ChildProcesses::Allowed, ChildProcesses::None] {
+            policy.children = children;
+            let sandbox = plan_for(&policy, &host(Some(9))).sandbox.unwrap();
+            assert!(!sandbox.contain);
+            assert!(!sandbox.filter.keep_process_group);
+        }
     }
 
     #[test]

@@ -306,7 +306,7 @@ matters only on Windows (see [Windows](#windows)); on Linux and macOS it does no
 | `--ip all\|none` | IPv4 and IPv6 networking, including loopback. | `none` |
 | `--unix-sockets all\|none` | Unix domain sockets. Read the warning below before using `all`. | `none` |
 | `--signals any\|isolated` | Whether the program may signal processes outside its sandbox. | `any` |
-| `--children allowed\|none` | Whether the program may start other processes. With `none`, nothing it starts can outlive it. | `allowed` |
+| `--children allowed\|none\|contained` | Whether the program may start other processes, and whether they may outlive it. See [Processes](#processes). | `allowed` |
 | `--expose ADDRESS=PORT` | Relay connections on the loopback `ADDRESS` to the program's loopback `PORT`. Needs `--ip all`. | |
 | `--forward PORT=ADDRESS` | Relay the program's connections to its loopback `PORT` to the loopback `ADDRESS` outside the sandbox. Needs `--ip all`. | |
 | `--linux-path-metadata deny\|allow` | On Linux, whether `chmod`, `chown`, `utimensat` and `setxattr` by path are allowed. | `deny` |
@@ -322,6 +322,7 @@ The options that take a path or a variable can be repeated.
 | Status | Meaning |
 |---|---|
 | the program's status | `sandy run` started the program |
+| 128 + signal number | Linux with `children = "contained"`: a signal ended the program |
 | 125 | sandy failed or refused: invalid policy, a requirement this host cannot enforce, a setup error |
 | 0 / 1 | `sandy check`: the policy is enforceable / not enforceable |
 
@@ -346,7 +347,7 @@ forward = [{ port = 18081, to = "127.0.0.1:8081" }]
 
 [process]
 signals = "any"                 # "any" | "isolated"
-children = "allowed"            # "allowed" | "none"
+children = "allowed"            # "allowed" | "none" | "contained"
 
 [environment]
 pass = ["LANG"]                 # copied from sandy's environment, if set
@@ -399,6 +400,36 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
 
 - `signals = "isolated"` limits signals to processes in the same sandbox. On Linux this needs
   Landlock ABI 6 (kernel 6.12 or newer); older kernels refuse such a policy.
+- `children` decides whether the program may start processes:
+  - `allowed` (the default): yes. On Linux and macOS these processes can outlive the program; on
+    Windows they end with it.
+  - `none`: the program cannot start processes at all. Threads still work.
+  - `contained`: the program may start processes, and sandy ends all of them when the program
+    ends, also when sandy itself is killed. Use it for a program that starts helpers, so that no
+    helper keeps running after the program has stopped. On Linux, sandy then stays the parent of
+    the program instead of becoming the program: it forwards signals, gives the program the
+    terminal when the program uses it, and exits with the program's status (128 plus the signal
+    number if a signal ended the program). Processes in the sandbox cannot call `setsid` or
+    `setpgid`. macOS does not support `contained` yet and refuses it.
+
+  `none` and `contained` need `unix_sockets = "none"`, and `contained` also needs
+  `signals = "isolated"`; otherwise the program could have a process started outside the sandbox,
+  or kill sandy before sandy ends its processes. To allow only some programs, give `read_exec`
+  to those files instead of their whole directory:
+
+  ```toml
+  [filesystem]
+  read = ["/opt/app/bin"]                      # libraries and data next to the programs
+  read_exec = ["/opt/app/bin/app", "/opt/app/bin/helper"]
+
+  [process]
+  signals = "isolated"
+  children = "contained"
+  ```
+
+  On Linux, a program can also start a readable file through the dynamic loader, so there this
+  limits which files can be executed directly, not which code runs. Every process stays in the
+  sandbox either way.
 - Debugging and reading the memory of processes outside the sandbox are always denied, and the
   program can never gain privileges, for example through setuid programs.
 

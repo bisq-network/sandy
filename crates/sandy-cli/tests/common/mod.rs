@@ -374,3 +374,79 @@ pub fn appcontainer_children_blocked() -> bool {
     }
     blocked
 }
+
+/// Helpers for the Linux tests.
+#[cfg(target_os = "linux")]
+pub mod linux {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    /// The Landlock ABI of the running kernel, 0 without Landlock.
+    pub fn landlock_abi() -> i64 {
+        // SAFETY: with a null attribute, size 0 and the VERSION flag the kernel only returns the
+        // ABI.
+        let abi = unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                std::ptr::null::<libc::c_void>(),
+                0usize,
+                1u32,
+            )
+        };
+        abi.max(0)
+    }
+
+    /// A pseudo-terminal pair. The child that gets the slave as standard input makes it its
+    /// controlling terminal, so TIOCSTI is not refused for a foreign terminal.
+    pub struct Pty {
+        pub master: OwnedFd,
+        pub slave: OwnedFd,
+    }
+
+    pub fn open_pty() -> Option<Pty> {
+        // SAFETY: the calls get valid flags and buffers; every descriptor is owned right away.
+        unsafe {
+            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
+            if master < 0 {
+                return None;
+            }
+            let master = OwnedFd::from_raw_fd(master);
+            if libc::grantpt(master.as_raw_fd()) != 0 || libc::unlockpt(master.as_raw_fd()) != 0 {
+                return None;
+            }
+            let mut name = [0 as libc::c_char; 128];
+            if libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) != 0 {
+                return None;
+            }
+            let slave = libc::open(
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+            );
+            if slave < 0 {
+                return None;
+            }
+            Some(Pty {
+                master,
+                slave: OwnedFd::from_raw_fd(slave),
+            })
+        }
+    }
+
+    /// Makes the pseudo-terminal the standard input and the controlling terminal of a new
+    /// session for `command`.
+    pub fn with_terminal(pty: &Pty) -> impl Fn(&mut Command) + '_ {
+        move |command| {
+            command.stdin(Stdio::from(pty.slave.try_clone().unwrap()));
+            // SAFETY: setsid and ioctl are async-signal-safe.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
+}

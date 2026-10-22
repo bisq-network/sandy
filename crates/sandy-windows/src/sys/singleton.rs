@@ -162,6 +162,7 @@ fn fingerprint(policy: &ResolvedPolicy) -> Result<Vec<u8>, SandboxError> {
         match policy.children {
             sandy_core::ChildProcesses::Allowed => 0,
             sandy_core::ChildProcesses::None => 1,
+            sandy_core::ChildProcesses::Contained => 2,
         },
     ];
 

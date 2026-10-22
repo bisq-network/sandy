@@ -27,6 +27,9 @@ pub struct FilterConfig {
     pub deny_path_metadata: bool,
     /// Deny creating processes; threads stay allowed.
     pub deny_children: bool,
+    /// Deny setsid and setpgid, so every process the program starts stays in the process group
+    /// that sandy ends as a whole (`process.children = "contained"`).
+    pub keep_process_group: bool,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -251,7 +254,7 @@ pub struct Filters {
 }
 
 /// Builds the filters for `config` and the CPU architecture sandy was built for. `own_pid` is
-/// the process ID of sandy, which the target keeps after execve.
+/// the process ID of the process that executes the target, which the target keeps after execve.
 pub fn build(config: &FilterConfig, own_pid: u32) -> Result<Filters, BackendError> {
     let target = arch::TARGET
         .ok_or_else(|| BackendError::InvalidTargetArch(std::env::consts::ARCH.to_string()))?;
@@ -312,6 +315,10 @@ fn denylist(
         }
     }
     rules.add(libc::SYS_clone, clone);
+    if config.keep_process_group {
+        rules.add(libc::SYS_setsid, Vec::new());
+        rules.add(libc::SYS_setpgid, Vec::new());
+    }
     let unshare: Vec<i32> = [CLONE_NAMESPACES, &[libc::CLONE_NEWTIME]].concat();
     rules.add(libc::SYS_unshare, namespace_rules(&unshare)?);
     let personality = PERSONALITIES
@@ -667,6 +674,7 @@ mod tests {
             restrict_truncate: false,
             deny_path_metadata: true,
             deny_children: true,
+            keep_process_group: true,
         }
     }
 
@@ -677,6 +685,7 @@ mod tests {
             restrict_truncate: false,
             deny_path_metadata: false,
             deny_children: false,
+            keep_process_group: false,
         }
     }
 
@@ -1038,6 +1047,15 @@ mod tests {
         }
         assert_eq!(call(&strict(), libc::SYS_clone3, [0; 6]), RET_ENOSYS);
         assert_eq!(call(&strict(), libc::SYS_execve, [0; 6]), RET_ALLOW);
+    }
+
+    #[test]
+    fn contained_children_keep_their_process_group() {
+        for nr in [libc::SYS_setsid, libc::SYS_setpgid] {
+            assert_eq!(call(&strict(), nr, [0; 6]), RET_EPERM, "system call {nr}");
+            assert_eq!(call(&open(), nr, [0; 6]), RET_ALLOW, "system call {nr}");
+        }
+        assert_eq!(call(&strict(), libc::SYS_getpgid, [0; 6]), RET_ALLOW);
     }
 
     #[test]

@@ -197,7 +197,9 @@ fn execute(invocation: Invocation) -> Result<ExitCode, String> {
             };
             let code = backend
                 .run(&resolved, &command)
-                .map_err(|error| format!("cannot start the program in the sandbox: {error}"))?;
+                // Also after the program started: with children = "contained" on Linux, sandy
+                // supervises it and can fail while it runs.
+                .map_err(|error| format!("run failed: {error}"))?;
             // Exit codes on Windows are 32 bits wide; ExitCode only carries 8.
             std::process::exit(code)
         }

@@ -26,7 +26,9 @@ Options (they extend the policy file):
   --ip all|none              IP networking (default: none)
   --unix-sockets all|none    Unix domain sockets (default: none)
   --signals any|isolated     who the program may signal (default: any)
-  --children allowed|none    whether the program may start other processes (default: allowed)
+  --children allowed|none|contained
+                             whether the program may start other processes; contained ends
+                             them all when the program ends (default: allowed)
   --expose ADDRESS=PORT      relay connections on the loopback ADDRESS to the program's
                              loopback PORT, for example 127.0.0.1:18080=8080 (repeatable;
                              needs --ip all)
@@ -206,6 +208,7 @@ where
                 overrides.children = Some(match parser.value()?.string()?.as_str() {
                     "allowed" => ChildProcesses::Allowed,
                     "none" => ChildProcesses::None,
+                    "contained" => ChildProcesses::Contained,
                     other => return Err(format!("invalid --children value {other:?}").into()),
                 })
             }
@@ -376,6 +379,21 @@ mod tests {
                 port: 8080
             }]
         );
+    }
+
+    #[test]
+    fn parses_every_children_value() {
+        for (value, expected) in [
+            ("allowed", ChildProcesses::Allowed),
+            ("none", ChildProcesses::None),
+            ("contained", ChildProcesses::Contained),
+        ] {
+            let invocation = invocation(&["check", "--children", value]);
+            let mut policy = Policy::default();
+            invocation.overrides.apply(&mut policy);
+            assert_eq!(policy.process.children, expected);
+        }
+        assert!(parse_strs(&["check", "--children", "some"]).is_err());
     }
 
     #[test]

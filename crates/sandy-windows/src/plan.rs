@@ -114,7 +114,8 @@ fn contained(
         | Requirement::SignalsIsolated
         | Requirement::ExposedPortsRelayed
         | Requirement::ForwardedPortsRelayed
-        | Requirement::ChildProcessesDenied,
+        | Requirement::ChildProcessesDenied
+        | Requirement::ChildProcessesContained,
         Some(reason),
     ) = (requirement, job_problem(host))
     {
@@ -146,6 +147,12 @@ fn contained(
              the job and cannot change the limit; the relays run without a console and with \
              PROCESS_CREATION_CHILD_PROCESS_RESTRICTED, so the program cannot start processes \
              through them either"
+                .to_string(),
+        ),
+        Requirement::ChildProcessesContained => enforced(
+            "every child of the program joins the program's job, which allows no breakaway; \
+             sandy ends the job when the program exits, and the job's kill-on-close ends it when \
+             sandy dies; the program holds no handle to the job"
                 .to_string(),
         ),
         Requirement::ExposedPortsRelayed => match relay_program(policy, host) {

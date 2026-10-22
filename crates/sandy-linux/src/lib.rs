@@ -3,6 +3,7 @@
 //! `docs/linux.md`.
 #![cfg(target_os = "linux")]
 
+mod contain;
 mod filter;
 mod host;
 mod launch;
@@ -31,6 +32,6 @@ impl Backend for LinuxBackend {
         let sandbox = plan
             .sandbox
             .ok_or_else(|| SandboxError::new("this host cannot enforce the policy"))?;
-        match launch::launch(&sandbox, command)? {}
+        launch::launch(&sandbox, command)
     }
 }

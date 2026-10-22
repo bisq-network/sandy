@@ -173,11 +173,26 @@ pub struct ProcessPolicy {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChildProcesses {
-    /// Children are allowed; they inherit the sandbox.
+    /// Children are allowed; they inherit the sandbox. Whether they can outlive the target
+    /// depends on the platform.
     #[default]
     Allowed,
     /// The target cannot create processes. Nothing it starts can outlive it in the sandbox.
     None,
+    /// Children are allowed and inherit the sandbox. When the target ends, sandy ends every
+    /// process the target started, directly or through its children.
+    Contained,
+}
+
+impl ChildProcesses {
+    /// The value as the policy writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            ChildProcesses::Allowed => "allowed",
+            ChildProcesses::None => "none",
+            ChildProcesses::Contained => "contained",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -261,7 +276,8 @@ pub enum PolicyError {
         forward: ForwardedPort,
         reason: &'static str,
     },
-    ChildrenNeedUnixSocketsDenied,
+    ChildrenNeedUnixSocketsDenied(ChildProcesses),
+    ContainedChildrenNeedIsolatedSignals,
     ProgramNotAFile(PathBuf),
     InvalidEnvironmentName(String),
     InvalidEnvironmentValue(String),
@@ -296,8 +312,13 @@ impl fmt::Display for PolicyError {
                 path.display(),
                 writable.display()
             ),
-            PolicyError::ChildrenNeedUnixSocketsDenied => f.write_str(
-                "children = \"none\" needs unix_sockets = \"none\": through a Unix socket the program could ask a service of the user to start a process that outlives it",
+            PolicyError::ChildrenNeedUnixSocketsDenied(children) => write!(
+                f,
+                "children = \"{}\" needs unix_sockets = \"none\": through a Unix socket the program could ask a service of the user to start a process that outlives it",
+                children.name()
+            ),
+            PolicyError::ContainedChildrenNeedIsolatedSignals => f.write_str(
+                "children = \"contained\" needs signals = \"isolated\": otherwise the program could kill sandy, and the processes it started would outlive it",
             ),
             PolicyError::InvalidForward { forward, reason } => write!(
                 f,

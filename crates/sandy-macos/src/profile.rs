@@ -195,7 +195,7 @@ const METADATA: &[&str] = &["file-read-metadata", "file-test-existence"];
 
 fn process_rules(writer: &mut Writer, signals: SignalScope, children: ChildProcesses) {
     writer.comment("Processes. Children inherit the sandbox.");
-    if children == ChildProcesses::Allowed {
+    if children != ChildProcesses::None {
         writer.line("(allow process-fork)");
     }
     writer.line("(allow process-info* (target self))");

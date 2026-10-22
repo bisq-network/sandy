@@ -1,8 +1,9 @@
 # Linux backend
 
 The Linux backend restricts sandy's own process and then replaces it with the program
-(`execve`). The program keeps sandy's process ID, signals and exit status. Three kernel features
-do the work:
+(`execve`). The program keeps sandy's process ID, signals and exit status. With
+`process.children = "contained"` a forked child does this instead, and sandy stays its parent
+(see "Contained child processes"). Three kernel features do the work:
 
 - **Landlock** confines the file system, isolates the process from ptrace, and (from ABI 6)
   scopes signals and abstract Unix sockets.
@@ -57,6 +58,7 @@ be listed, the Landlock-based requirements are unavailable.
 | SignalsIsolated | Landlock signal scope (ABI 6). Unavailable on older ABIs. |
 | MetadataConfined | The denylist denies the metadata calls that take a path (see "Metadata"). |
 | ChildProcessesDenied | The denylist denies `fork`, `vfork` and `clone` without `CLONE_THREAD`; `clone3` fails with `ENOSYS` (see "Child processes"). |
+| ChildProcessesContained | sandy stays the parent and ends the program's process group; the denylist denies `setsid` and `setpgid` (see "Contained child processes"). |
 | ExposedPortsRelayed, ForwardedPortsRelayed | One relay process outside the program's sandbox, confined by its own Landlock domain and seccomp filters (see "Exposed and forwarded ports"). |
 
 ## Exposed and forwarded ports
@@ -68,7 +70,9 @@ One relay process serves all pairs. sandy starts it before it confines itself:
 
 1. sandy binds every listen address (for `forward` the program's own loopback port, which is
    therefore taken before the program starts) and opens a pidfd for its own process ID. The
-   program keeps this ID after `execve`, so the pidfd refers to the program.
+   program keeps this ID after `execve`, so the pidfd refers to the program. With
+   `process.children = "contained"` it refers to the supervising sandy, which ends after the
+   program's process group has ended (see "Contained child processes").
 2. sandy verifies that it has one thread and forks twice. The intermediate process exits at once,
    so the relay is not a child of the program and the program's `wait` never reaps it. The relay
    is a fork of sandy, not a new program; a single-threaded parent makes this safe.
@@ -91,8 +95,9 @@ One relay process serves all pairs. sandy starts it before it confines itself:
    accepts the connections reported in the same round, closes its listeners, waits while accepted
    connections deliver their data, at most one second, and exits (DESIGN.md rule 5 of "Forwarded
    ports"). A program that connects, writes and exits at once therefore does not
-   lose its data, and the relay never outlives the program by more than one second. If sandy
-   fails after starting the relay, sandy's process ends and the relay with it.
+   lose its data, and the relay never outlives the program (with `contained`: sandy) by more than
+   one second. If sandy fails after starting the relay, sandy's process ends and the relay with
+   it.
 
 The listeners and the pidfd are close-on-exec, and sandy closes its copies before it confines
 itself, so the program never holds them. The relay keeps standard error to report errors; a
@@ -104,6 +109,80 @@ ptrace the other. With `signals = "any"` the program can kill the relay. Any loc
 connect to the relay's listeners, like to any loopback port: through an exposed port it reaches
 the program, through a forwarded port it reaches `to`, which it could reach directly.
 
+
+## Contained child processes
+
+With `process.children = "contained"` the program may start processes, and sandy ends all of them
+when the program ends. sandy does not replace itself with the program:
+
+1. After it has started the relay, if any, sandy makes itself a child subreaper
+   (`PR_SET_CHILD_SUBREAPER`): a process whose parent ends is re-parented to sandy instead of
+   init. sandy sets `SIGCHLD` to its default action, so that it can wait for children even if
+   its caller ignored the signal, and blocks every signal except the fault signals.
+2. sandy forks the guard. The guard creates a process group of its own and closes every
+   descriptor except the read end of a pipe. sandy holds the write end; the forked program in
+   step 3 has a copy only until `execve` closes it.
+3. sandy forks the program and writes its process ID into the guard's pipe. The guard opens a
+   pidfd for the program and polls it and the pipe. When the program ends, or when the pipe ends
+   because sandy died (also by `SIGKILL`), the guard checks that it leads its group and kills the
+   group with `SIGKILL`. The group therefore ends with the program even while sandy is stopped.
+4. The forked program joins the guard's group, restores `SIGCHLD` and the signal mask that sandy's
+   caller set, and then runs steps 4 to 8 of the launch sequence. The denylist filter names the
+   child's process ID. If a step fails, the child writes the error into a close-on-exec pipe and
+   exits; sandy reads the pipe until `execve` closes it, and refuses with that error.
+5. sandy waits for signals with `sigwaitinfo`. It forwards every signal to the program except
+   `SIGCHLD`, `SIGCONT`, `SIGTTIN` and `SIGTTOU`, reaps processes that were re-parented to it,
+   and refuses to continue if the guard ends before the program. With a terminal (one of sandy's
+   standard descriptors is its controlling terminal), sandy follows job control:
+   - The program's group starts in the background. When the program stops because it read or
+     wrote the terminal (`SIGTTIN`, `SIGTTOU`) and sandy's group is the foreground group, sandy
+     gives the terminal to the program's group and continues it. Then Ctrl+C and Ctrl+Z reach the
+     program and every process it started.
+   - When another process of sandy's job (for example `less` in `sandy run ... | less`) uses the
+     terminal while the program's group has it, the kernel stops it and sends `SIGTTIN` or
+     `SIGTTOU` to sandy's group. sandy takes the terminal back and continues its job.
+   - Any other stop of the program stops sandy too, after it has taken the terminal back, so that
+     the shell sees the job stop. `SIGCONT` to sandy gives the terminal to the program's group
+     again if it had it, and continues that group.
+6. When the program has exited, sandy gives the terminal back to its own group, kills the group
+   with `SIGKILL`, kills the guard and the program by process ID as well, and waits for the
+   members of the group (`waitpid` with the negative group ID) until none is left. Other children
+   of sandy, for example processes its caller started before it executed sandy, are not waited
+   for. sandy exits with the program's exit status, or 128 plus the signal number if a signal
+   ended the program.
+
+Two rules keep every process the program starts inside the group. The denylist denies `setsid`
+and `setpgid`, the only system calls that move a process to another group. The policy must have
+`signals = "isolated"`, so the Landlock signal scope keeps the program from signaling sandy and the
+guard, which are outside its domain. The guard, not sandy, ends the group when the program ends,
+so the program cannot keep its processes alive by stopping sandy (with a terminal it can make
+sandy stop, see step 5). sandy reaps neither the guard nor the program before it has killed the
+group, so the group ID (the guard's process ID) cannot belong to another process while sandy can
+still signal it. Killing a process group with `SIGKILL` reaches every member in one operation; the
+kernel lets no member fork a new process past it. A member whose parent ends is re-parented to
+sandy before that parent can be reaped, so waiting for the group's members ends only when none is
+left.
+
+Costs and differences from the exec model:
+
+- The program has another process ID than sandy. The caller's process handle refers to sandy,
+  which forwards signals and reports the exit status.
+- A signal death becomes the exit status 128 plus the signal number, which a caller cannot tell
+  from a program that exits with that status.
+- Programs that call `setsid` or `setpgid` get `EPERM`: programs that turn themselves into
+  daemons, and shells with job control, which then run without it.
+- Without a terminal, sandy does not stop when the program stops. There is no job control to
+  follow, and a stopped sandy cannot forward signals.
+- With a terminal, the program can stop sandy: it stops itself, and one of its processes continues
+  it. sandy then stays stopped until it receives `SIGCONT` (a shell's `fg`). The guard still ends
+  the group when the program ends.
+- Only one process group can own a terminal. While the program's group has it, the rest of
+  sandy's job gets it back only when it uses the terminal (see step 5). Two processes that read
+  the terminal at the same time pass it back and forth.
+- sandy and the guard hold no descriptor of the program except standard input, output and error,
+  which sandy keeps until it exits, that is after the group has ended.
+- If both sandy and the guard are killed with `SIGKILL`, nothing ends the group. Both run sandy's
+  command line, so `pkill -9 -f sandy` does this. Killing sandy alone is safe.
 
 ## Landlock
 
@@ -344,10 +423,13 @@ secrets passed on command lines, and `/proc/net` of the network namespace. `/pro
 - **Metadata through open files.** `fchmod`, `fchown`, `fsetxattr` and `futimens` work on every
   file the program may open, also in `read` paths, except for setuid and setgid bits.
 - **Signals.** With `signals = "any"` the program can kill other processes of the user.
-- **Processes started for the program.** `process.children = "none"` stops the program from
-  creating processes. With `unix_sockets = "all"` it can still ask a service of the user, for
-  example the systemd user manager over D-Bus, to start one outside the sandbox; such a process is
-  not its child and can outlive it.
+- **Processes that outlive the program.** With `process.children = "allowed"` (the default) a
+  process the program starts can outlive it. `none` and `contained` prevent this for processes the
+  program starts itself or through its children. Both need `unix_sockets = "none"`, because
+  through a Unix socket the program could ask a service of the user, for example the systemd user
+  manager over D-Bus, to start a process outside the sandbox. A service that starts processes on
+  requests over TCP is still reachable with `ip = "all"` or through a `forward` target; such
+  processes are not the program's and are not covered.
 - **The terminal.** If standard input or output is the user's terminal, the program can read
   input, write escape sequences and change terminal modes. Only `TIOCSTI` and `TIOCLINUX` are
   denied.

@@ -7,7 +7,7 @@ mod common;
 
 use std::fs;
 use std::net::TcpStream;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{SocketAddr, UnixListener};
@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use common::linux::*;
 use common::*;
 
 fn args(values: &[&str]) -> Vec<String> {
@@ -24,20 +25,6 @@ fn args(values: &[&str]) -> Vec<String> {
 
 fn skip(reason: &str) {
     eprintln!("skipped: {reason}");
-}
-
-/// The Landlock ABI of the running kernel, 0 without Landlock.
-fn landlock_abi() -> i64 {
-    // SAFETY: with a null attribute, size 0 and the VERSION flag the kernel only returns the ABI.
-    let abi = unsafe {
-        libc::syscall(
-            libc::SYS_landlock_create_ruleset,
-            std::ptr::null::<libc::c_void>(),
-            0usize,
-            1u32,
-        )
-    };
-    abi.max(0)
 }
 
 /// Runs the probe outside the sandbox with `configure` applied to the command.
@@ -208,57 +195,6 @@ fn signals_to_outside_processes_follow_the_policy() {
     }
     controlled(&isolated, &[("signal", &parent)])[0].assert_blocked();
     probe_inside(&[], &[("signal", &parent)])[0].assert_ok();
-}
-
-/// A pseudo-terminal pair. The child that gets the slave as standard input makes it its
-/// controlling terminal, so TIOCSTI is not refused for a foreign terminal.
-struct Pty {
-    _master: OwnedFd,
-    slave: OwnedFd,
-}
-
-fn open_pty() -> Option<Pty> {
-    // SAFETY: the calls get valid flags and buffers; every descriptor is owned right away.
-    unsafe {
-        let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
-        if master < 0 {
-            return None;
-        }
-        let master = OwnedFd::from_raw_fd(master);
-        if libc::grantpt(master.as_raw_fd()) != 0 || libc::unlockpt(master.as_raw_fd()) != 0 {
-            return None;
-        }
-        let mut name = [0 as libc::c_char; 128];
-        if libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) != 0 {
-            return None;
-        }
-        let slave = libc::open(
-            name.as_ptr(),
-            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
-        );
-        if slave < 0 {
-            return None;
-        }
-        Some(Pty {
-            _master: master,
-            slave: OwnedFd::from_raw_fd(slave),
-        })
-    }
-}
-
-fn with_terminal(pty: &Pty) -> impl Fn(&mut Command) + '_ {
-    move |command| {
-        command.stdin(Stdio::from(pty.slave.try_clone().unwrap()));
-        // SAFETY: setsid and ioctl are async-signal-safe.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
 }
 
 #[test]

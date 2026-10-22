@@ -26,6 +26,7 @@ nothing about isolation.
 | `SignalsIsolated` | Own console; AppContainer access checks; job UI restrictions | no AppContainer |
 | `ExposedPortsRelayed` | Listening socket created outside the AppContainer; `sandy __relay` in the program's AppContainer and a job of its own | no AppContainer; outer job with UI restrictions; sandy cannot grant read and execute on `sandy.exe`; `sandy.exe` lies in a read-write path |
 | `ChildProcessesDenied` | The program's job admits one active process (`JOB_OBJECT_LIMIT_ACTIVE_PROCESS` = 1); the relays run without a console and with `PROCESS_CREATION_CHILD_PROCESS_RESTRICTED` | outer job with UI restrictions; no AppContainer |
+| `ChildProcessesContained` | Every child joins the program's job, which allows no breakaway; sandy ends the job when the program exits, and kill-on-close ends it when sandy dies | outer job with UI restrictions; no AppContainer |
 | `ForwardedPortsRelayed` | `sandy __forward` in the program's AppContainer and a job of its own listens on the program's port and passes each connection over an AF_UNIX socket to sandy, which connects to the target; no loopback exemption | as for `ExposedPortsRelayed`; AF_UNIX missing; socket paths longer than 107 bytes |
 
 Every requirement also needs `windows.appcontainer_name` (or `--appcontainer NAME`). Without it,
@@ -411,6 +412,13 @@ pipe grants nothing to AppContainers [CreateNamedPipeW] [Implementing an AppCont
   of the program; an AppContainer cannot activate out-of-process COM servers
   (`out_of_process_com_service_activation_is_blocked`), and sandy refuses `children = "none"`
   together with `unix_sockets = "all"`.
+- **Contained child processes.** `process.children = "contained"` needs nothing beyond the job
+  described above: the program's children join the job, sandy ends the job when the program
+  exits, and the job closes when sandy dies. The program holds no handle to the job, and the
+  AppContainer cannot open sandy, so it can neither leave the job nor end sandy early. `allowed`
+  behaves the same on Windows; `contained` states the guarantee in the policy, so that the same
+  policy is refused on platforms that cannot give it. The policy rules for `contained`
+  (`unix_sockets = "none"`, `signals = "isolated"`) apply on Windows too.
 - **UI restrictions.** The job sets all documented UI restrictions: desktops, display settings,
   `ExitWindows`, global atoms, USER handles of other processes, the clipboard (read and write),
   and system parameters [UI restrictions]. Low integrity already blocks window messages, hooks

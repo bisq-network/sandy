@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::plan::Requirement;
 use crate::policy::{
     ChildProcesses, EnvironmentPolicy, ExposedPort, ForwardedPort, NetworkAccess, PathMetadata,
-    Policy, PolicyError, SignalScope, SystemAccess, WindowsPolicy,
+    Policy, PolicyError, ProcessPolicy, SignalScope, SystemAccess, WindowsPolicy,
 };
 
 /// Access to one path and everything beneath it.
@@ -73,11 +73,7 @@ impl ResolvedPolicy {
         check_nothing_inside_writable(&paths)?;
         validate_environment(&policy.environment)?;
         validate_expose(&policy.network.expose, policy.network.ip)?;
-        if policy.process.children == ChildProcesses::None
-            && policy.network.unix_sockets == NetworkAccess::All
-        {
-            return Err(PolicyError::ChildrenNeedUnixSocketsDenied);
-        }
+        validate_children(&policy.process, policy.network.unix_sockets)?;
         validate_forward(
             &policy.network.forward,
             &policy.network.expose,
@@ -119,8 +115,10 @@ impl ResolvedPolicy {
         if self.signals == SignalScope::Isolated {
             requirements.push(Requirement::SignalsIsolated);
         }
-        if self.children == ChildProcesses::None {
-            requirements.push(Requirement::ChildProcessesDenied);
+        match self.children {
+            ChildProcesses::Allowed => {}
+            ChildProcesses::None => requirements.push(Requirement::ChildProcessesDenied),
+            ChildProcesses::Contained => requirements.push(Requirement::ChildProcessesContained),
         }
         if self.path_metadata == PathMetadata::Deny {
             requirements.push(Requirement::MetadataConfined);
@@ -284,6 +282,26 @@ fn validate_forward(
         if forward[..index].iter().any(taken) {
             return Err(invalid(entry, "port is used twice"));
         }
+    }
+    Ok(())
+}
+
+/// Both `none` and `contained` promise that nothing the program starts outlives it. Through a
+/// Unix socket the program could ask a service of the user (for example the systemd user manager
+/// over D-Bus) to start a process that is not its child. With `contained`, a program that can
+/// signal sandy could kill it before it ends the program's processes.
+fn validate_children(
+    process: &ProcessPolicy,
+    unix_sockets: NetworkAccess,
+) -> Result<(), PolicyError> {
+    if process.children == ChildProcesses::Allowed {
+        return Ok(());
+    }
+    if unix_sockets == NetworkAccess::All {
+        return Err(PolicyError::ChildrenNeedUnixSocketsDenied(process.children));
+    }
+    if process.children == ChildProcesses::Contained && process.signals != SignalScope::Isolated {
+        return Err(PolicyError::ContainedChildrenNeedIsolatedSignals);
     }
     Ok(())
 }
@@ -603,9 +621,42 @@ mod tests {
         policy.process.children = ChildProcesses::None;
         policy.network.unix_sockets = NetworkAccess::All;
         let error = ResolvedPolicy::resolve(&policy, None).unwrap_err();
-        assert!(matches!(error, PolicyError::ChildrenNeedUnixSocketsDenied));
+        assert!(matches!(
+            error,
+            PolicyError::ChildrenNeedUnixSocketsDenied(ChildProcesses::None)
+        ));
         policy.network.unix_sockets = NetworkAccess::None;
         assert!(ResolvedPolicy::resolve(&policy, None).is_ok());
+    }
+
+    #[test]
+    fn contained_children_need_unix_sockets_denied_and_isolated_signals() {
+        let mut policy = Policy::default();
+        policy.process.children = ChildProcesses::Contained;
+        policy.process.signals = SignalScope::Isolated;
+        policy.network.unix_sockets = NetworkAccess::All;
+        let error = ResolvedPolicy::resolve(&policy, None).unwrap_err();
+        assert!(matches!(
+            error,
+            PolicyError::ChildrenNeedUnixSocketsDenied(ChildProcesses::Contained)
+        ));
+        assert!(error.to_string().contains("\"contained\""), "{error}");
+
+        policy.network.unix_sockets = NetworkAccess::None;
+        policy.process.signals = SignalScope::Any;
+        let error = ResolvedPolicy::resolve(&policy, None).unwrap_err();
+        assert!(matches!(
+            error,
+            PolicyError::ContainedChildrenNeedIsolatedSignals
+        ));
+
+        policy.process.signals = SignalScope::Isolated;
+        let requirements = ResolvedPolicy::resolve(&policy, None)
+            .unwrap()
+            .requirements();
+        assert!(requirements.contains(&Requirement::ChildProcessesContained));
+        assert!(requirements.contains(&Requirement::SignalsIsolated));
+        assert!(!requirements.contains(&Requirement::ChildProcessesDenied));
     }
 
     #[test]
@@ -627,6 +678,7 @@ mod tests {
         assert!(all_denied.contains(&Requirement::UnixSocketsDenied));
         assert!(!all_denied.contains(&Requirement::SignalsIsolated));
         assert!(!all_denied.contains(&Requirement::ChildProcessesDenied));
+        assert!(!all_denied.contains(&Requirement::ChildProcessesContained));
         assert!(all_denied.contains(&Requirement::MetadataConfined));
 
         policy.network.ip = NetworkAccess::All;

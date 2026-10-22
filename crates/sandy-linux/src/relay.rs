@@ -4,7 +4,8 @@
 //! process serves all pairs. sandy starts it before it confines itself:
 //!
 //! 1. Bind every listener and open a pidfd for sandy's own process ID, which the program keeps
-//!    after execve.
+//!    after execve. With `children = "contained"` the ID stays sandy's, which ends after the
+//!    program's process group.
 //! 2. Fork twice. The intermediate process exits at once, so the relay is not a child of the
 //!    program and the program's wait never reaps it.
 //! 3. The relay closes every descriptor except the listeners, the pidfd, standard error and the
@@ -12,8 +13,9 @@
 //!    with TCP connect only to the target ports, and seccomp filters for its few system calls.
 //! 4. It reports readiness; sandy continues only after that report. It then polls the pidfd and
 //!    the listeners and relays each accepted connection in its own threads.
-//! 5. When the pidfd becomes readable, that is when the program ends (also by SIGKILL), it closes
-//!    the listeners at once, gives accepted connections at most one second, and exits.
+//! 5. When the pidfd becomes readable, that is when the program (with `contained`: sandy) ends,
+//!    also by SIGKILL, it closes the listeners at once, gives accepted connections at most one
+//!    second, and exits.
 //!
 //! The relay is a fork, not a new program. sandy is single-threaded when it forks (checked), so
 //! the child can use the allocator and threads like any process.
@@ -81,7 +83,7 @@ pub fn start(config: &RelayConfig) -> Result<(), SandboxError> {
         })
         .collect::<Result<Vec<_>, SandboxError>>()?;
     let program = pidfd_open_self()?;
-    let (mut ready_read, ready_write) = pipe()?;
+    let (mut ready_read, ready_write) = pipe("the relay's pipe")?;
     ensure_single_thread()?;
 
     // SAFETY: sandy is single-threaded (checked above), so the child may run any code. Both
@@ -301,7 +303,7 @@ fn landlock_error(error: landlock::RulesetError) -> SandboxError {
 }
 
 /// Closes every descriptor that is not in `keep`, so the relay holds nothing of sandy's.
-fn close_descriptors_except(keep: &[RawFd]) -> Result<(), SandboxError> {
+pub(crate) fn close_descriptors_except(keep: &[RawFd]) -> Result<(), SandboxError> {
     let mut keep: Vec<u32> = keep.iter().map(|&fd| fd as u32).collect();
     keep.sort_unstable();
     let mut first = 0u32;
@@ -338,12 +340,13 @@ fn pidfd_open_self() -> Result<OwnedFd, SandboxError> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
 }
 
-fn pipe() -> Result<(File, File), SandboxError> {
+/// A close-on-exec pipe: (read end, write end). `name` names it in the error.
+pub(crate) fn pipe(name: &str) -> Result<(File, File), SandboxError> {
     let mut fds = [0; 2];
     // SAFETY: pipe2 writes two new descriptors into `fds`.
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return Err(SandboxError::io(
-            "cannot create the relay's pipe",
+            format!("cannot create {name}"),
             io::Error::last_os_error(),
         ));
     }

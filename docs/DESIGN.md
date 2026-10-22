@@ -49,7 +49,7 @@ forward = [{ port = 18081, to = "127.0.0.1:8081" }]     # relay out to a local s
 
 [process]
 signals = "any"               # "any" | "isolated"
-children = "allowed"          # "allowed" | "none"; "none": the program cannot start processes
+children = "allowed"          # "allowed" | "none" | "contained"; see rule 9
 
 [environment]
 pass = ["LANG"]               # copied from sandy's environment if present
@@ -92,12 +92,24 @@ Rules:
    through which the systemd user manager starts arbitrary commands outside the sandbox. On macOS
    it includes mDNSResponder, so even with `ip = "none"` the program can send data out in DNS
    queries. Use it only for programs you would also run without a sandbox.
-9. Children of the program inherit the sandbox on every platform. With `process.children =
-   "none"` the program cannot create processes at all (threads stay allowed, and so does replacing
-   its own program image with `execve`), so nothing it starts can outlive it. This needs
-   `unix_sockets = "none"`: through a Unix socket the program could ask a service of the user (for
-   example the systemd user manager over D-Bus) to start a process, which is not its child. sandy
-   rejects `children = "none"` together with `unix_sockets = "all"`.
+9. Children of the program inherit the sandbox on every platform. `process.children` decides
+   whether the program may start processes and whether they may outlive it:
+   - `allowed` (the default): the program may start processes. On Linux and macOS they can
+     outlive the program. On Windows the program's job ends them when the program ends.
+   - `none`: the program cannot create processes at all (threads stay allowed, and so does
+     replacing its own program image with `execve`), so nothing it starts can outlive it.
+   - `contained`: the program may start processes, and sandy ends every one of them when the
+     program ends, also when sandy itself is killed. On Linux, sandy then stays the program's
+     parent instead of replacing itself with it (see "Process model"). macOS cannot enforce it
+     yet, so sandy refuses there.
+
+   `none` and `contained` cover the processes the program starts itself or through its
+   children. Both need `unix_sockets = "none"`: through a Unix socket the program could ask a
+   service of the user (for example the systemd user manager over D-Bus) to start a process,
+   which is not its child. A service that starts processes on requests over TCP stays reachable
+   with `ip = "all"` or through a `forward` target, and its processes are not covered.
+   `contained` also needs `signals = "isolated"`: otherwise the program could kill sandy and the
+   process that ends the group. sandy rejects the policy when either condition is missing.
 10. `linux.path_metadata = "deny"` (the default) requires that permissions, owner, timestamps and
    extended attributes of files outside the policy paths cannot change. Landlock does not
    control these calls, so the Linux backend denies the path-based variants (`chmod`, `chown`,
@@ -153,7 +165,9 @@ Rules:
 5. Lifetime of both relays: when the program ends, the relay closes its listeners at once, gives
    connections it already accepted at most one second to deliver their remaining data, and then
    ends. A program that connects, writes and exits immediately therefore does not lose its data,
-   and no relay outlives the program by more than one second.
+   and no relay outlives the program by more than one second. With
+   `process.children = "contained"` on Linux, the relay watches the supervising sandy instead,
+   which ends after the program's process group.
 
 ## Requirements and the enforcement plan
 
@@ -173,6 +187,7 @@ Rules:
 | `ExposedPortsRelayed` | `network.expose` is not empty |
 | `ForwardedPortsRelayed` | `network.forward` is not empty |
 | `ChildProcessesDenied` | `process.children = "none"` |
+| `ChildProcessesContained` | `process.children = "contained"` |
 
 A requirement is a lower bound. A backend may deny more, but never less. For example,
 `UnixSocketsDenied` guarantees that the program cannot connect to Unix sockets outside its
@@ -190,6 +205,12 @@ continue if any mechanism fails while it is applied.
 - Linux and macOS: sandy restricts itself, then calls `execve` on the program. The program keeps
   sandy's process ID, so the caller's process handle, signals and exit status refer to the program
   directly.
+- Linux with `process.children = "contained"`: sandy forks the program and stays its parent. sandy
+  forwards every signal it receives to the program, except `SIGCHLD`, `SIGCONT`, `SIGTTIN`,
+  `SIGTTOU` and the fault signals, and exits with the program's exit status, or 128 plus the signal number when a signal
+  ended the program. With a terminal, sandy follows job control: the program's process group gets
+  the terminal when the program uses it, and the rest of sandy's job gets it back when it uses
+  it; any other stop of the program stops sandy, and `SIGCONT` to sandy continues the group.
 - Windows: there is no `execve`. sandy creates the program inside the AppContainer and a job
   object with kill-on-close, waits, and exits with the program's exit code. If sandy dies, the job
   closes and the program dies with it.
@@ -218,6 +239,13 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   Landlock ABI 3 truncation without write access.
 - `process.children = "none"`: the seccomp denylist allows `clone` only with `CLONE_THREAD` and
   denies `fork` and `vfork`; `clone3` fails with `ENOSYS`, so threads use `clone`.
+- `process.children = "contained"`: sandy becomes a child subreaper and forks a guard process,
+  which leads a new process group, and then the program, which joins that group and confines
+  itself as above. The seccomp denylist denies `setsid` and `setpgid`, and the Landlock signal
+  scope keeps the program from signaling sandy or the guard, so no process the program starts can
+  leave the group. The guard watches the program with a pidfd and sandy through a pipe, and kills
+  the group when either ends, so the group ends with the program even while sandy is stopped.
+  sandy also kills the group when the program exits and waits until the group is gone.
 - Exposed and forwarded ports: one relay forked twice before sandy confines itself, so it is not
   a child of the program. It watches the program with a pidfd and ends at most one second after
   it (rule 5 of "Forwarded ports"). It confines itself with no_new_privs, Landlock without file
@@ -255,6 +283,9 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   sandy execs only after the relay reports ready.
 - `process.children = "none"`: the profile denies `process-fork`, which Seatbelt checks for
   `fork`, `vfork` and `posix_spawn`; threads and `execve` stay allowed.
+- `process.children = "contained"` is not implemented: sandy replaces itself with the program, so
+  nothing would end the processes the program leaves behind. The plan reports it unavailable, and
+  sandy refuses.
 - `sandy check` compiles the profile without applying it, so it reports operations or filters that
   this macOS does not know.
 - `docs/macos.md` describes the profile, the system set with a reason per entry, and the known
@@ -310,6 +341,9 @@ Details, limitations and sources: `docs/windows.md`.
   program cannot change; its console host is not counted. The relays always run without a
   console and with `PROCESS_CREATION_CHILD_PROCESS_RESTRICTED`, so the program cannot start
   processes through them.
+- `process.children = "contained"` needs nothing beyond the job: every child joins the program's
+  job (no breakaway), sandy ends the job when the program exits, and kill-on-close ends it when
+  sandy dies. `allowed` behaves the same on Windows.
 - Relay lifetime (rule 5): when the program exits, sandy ends its job at once and closes the
   relays' standard input; the relays accept what already waits in the backlog, close their
   listeners, drain for at most one second and end; sandy ends the relay job one second after
@@ -323,6 +357,7 @@ Details, limitations and sources: `docs/windows.md`.
 | Status | Meaning |
 |---|---|
 | program's status | `sandy run` started the program |
+| 128 + signal number | Linux with `process.children = "contained"`: a signal ended the program |
 | 125 | sandy failed or refused (invalid policy, unenforceable policy, setup failure) |
 | 0 / 1 | `sandy check`: enforceable / not enforceable |
 

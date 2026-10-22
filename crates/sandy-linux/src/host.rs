@@ -23,7 +23,8 @@ pub struct HostCapabilities {
     pub no_new_privs: Support,
     /// `Err` when the process runs as root or holds capabilities.
     pub unprivileged: Support,
-    /// pidfd_open, which the relay of exposed ports uses to watch the program.
+    /// pidfd_open, which the relay uses to watch the program and the guard of
+    /// `children = "contained"` uses to watch the program.
     pub pidfd: Support,
     /// The candidates of the minimal system set that exist on this host.
     pub system_paths: Vec<SystemPath>,

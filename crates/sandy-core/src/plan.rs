@@ -38,6 +38,9 @@ pub enum Requirement {
     ForwardedPortsRelayed,
     /// The target cannot create child processes (threads stay allowed).
     ChildProcessesDenied,
+    /// Every process the target starts, directly or through its children, ends when the target
+    /// ends, and also when sandy itself is killed. The target cannot move a process out of reach.
+    ChildProcessesContained,
 }
 
 impl Requirement {
@@ -57,6 +60,7 @@ impl Requirement {
             Requirement::ExposedPortsRelayed => "exposed ports relayed into the sandbox",
             Requirement::ForwardedPortsRelayed => "forwarded ports relayed out of the sandbox",
             Requirement::ChildProcessesDenied => "no child processes",
+            Requirement::ChildProcessesContained => "child processes end with the program",
         }
     }
 }

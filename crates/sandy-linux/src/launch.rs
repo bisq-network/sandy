@@ -1,7 +1,8 @@
 //! The launch sequence of `run`. Everything that can fail on bad input is prepared first. Then the
-//! process restricts itself step by step and replaces itself with the target.
+//! process restricts itself step by step and replaces itself with the target. With
+//! `process.children = "contained"` a forked child does that, and sandy supervises it (see
+//! `contain`).
 
-use std::convert::Infallible;
 use std::ffi::{CString, OsStr};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -13,22 +14,26 @@ use landlock::{
 };
 use sandy_core::{SandboxError, TargetCommand};
 
+use crate::filter::{FilterConfig, Filters};
 use crate::host::THREADS_DIR;
 use crate::plan::{LandlockConfig, Sandbox};
-use crate::{filter, relay};
+use crate::{contain, filter, relay};
 
-/// Applies `sandbox` to this process and executes the target. Returns only on failure.
+/// Applies `sandbox` and executes the target. Without `contain`, sandy applies it to itself and
+/// returns only on failure. With `contain`, a forked child does, and sandy returns the exit
+/// status when the target has ended.
 ///
 /// Landlock and seccomp restrict the calling thread. sandy verifies right before Landlock that
 /// it has a single thread, the filters are installed with TSYNC, and execve ends every other
 /// thread, so the target runs with exactly the restrictions applied here.
-pub fn launch(sandbox: &Sandbox, command: &TargetCommand) -> Result<Infallible, SandboxError> {
+pub fn launch(sandbox: &Sandbox, command: &TargetCommand) -> Result<i32, SandboxError> {
     if let Some(relay) = &sandbox.relay {
         relay::start(relay)?;
     }
     let ruleset = prepare_ruleset(&sandbox.landlock)?;
-    let filters = filter::build(&sandbox.filter, std::process::id())
-        .map_err(|error| SandboxError::new(format!("cannot build the seccomp filter: {error}")))?;
+    // The filter is built again in the forked child, whose process ID it needs, but a policy it
+    // cannot express fails here, before anything starts.
+    build_filters(&sandbox.filter)?;
     let exec = Exec::new(command)?;
     if let Some(cwd) = &command.cwd {
         std::env::set_current_dir(cwd).map_err(|error| {
@@ -36,15 +41,32 @@ pub fn launch(sandbox: &Sandbox, command: &TargetCommand) -> Result<Infallible, 
         })?;
     }
     restore_sigpipe()?;
+    let start = || match confine(ruleset, &sandbox.filter) {
+        Ok(()) => exec.execute(),
+        Err(error) => error,
+    };
+    if sandbox.contain {
+        contain::run(start)
+    } else {
+        Err(start())
+    }
+}
 
+/// The filters for this process. The denylist names the caller's process ID.
+fn build_filters(config: &FilterConfig) -> Result<Filters, SandboxError> {
+    filter::build(config, std::process::id())
+        .map_err(|error| SandboxError::new(format!("cannot build the seccomp filter: {error}")))
+}
+
+/// Restricts this process step by step: descriptors, no_new_privs, Landlock, seccomp.
+fn confine(ruleset: RulesetCreated, filter: &FilterConfig) -> Result<(), SandboxError> {
+    let filters = build_filters(filter)?;
     mark_descriptors_close_on_exec()?;
     set_no_new_privs()?;
     ensure_single_thread()?;
     restrict(ruleset)?;
-    filter::install(&filters).map_err(|error| {
-        SandboxError::new(format!("cannot install the seccomp filter: {error}"))
-    })?;
-    Err(exec.execute())
+    filter::install(&filters)
+        .map_err(|error| SandboxError::new(format!("cannot install the seccomp filter: {error}")))
 }
 
 fn landlock_error(error: RulesetError) -> SandboxError {
