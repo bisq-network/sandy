@@ -148,10 +148,26 @@ continue if any mechanism fails while it is applied.
 
 ### macOS
 
-- Seatbelt profile (SBPL) generated from the policy, applied with `sandbox_init_with_parameters`
-  (loaded at run time from `libsandbox`) or `/usr/bin/sandbox-exec`, then `execve`.
-- Deny by default; allow the policy paths, the system set, network when allowed.
-- Close inherited descriptors.
+- A Seatbelt profile (SBPL) generated from the policy: deny by default, then the policy paths, the
+  minimal system set, a list of readable sysctls, and networking when the policy allows it. Every
+  path is a profile parameter, so no character in a path can change the profile.
+- sandy applies the profile to itself with `sandbox_init_with_parameters`, loaded at run time from
+  `libsandbox` with `dlopen`, and checks with `sandbox_check` that it took effect. Then
+  `posix_spawn` with `POSIX_SPAWN_SETEXEC` replaces sandy with the target, like `execve`.
+  `POSIX_SPAWN_CLOEXEC_DEFAULT` makes the kernel close every descriptor except 0, 1 and 2.
+- No Mach or XPC service. This closes LaunchServices, Apple events, launchd jobs and the
+  pasteboard, through which another process could act for the target.
+- Setuid and setgid files never execute. Policy paths cannot be deleted or replaced, so the target
+  cannot redirect the next run with a symbolic link.
+- Name resolution is part of `ip = "all"`: the profile allows exactly the Unix socket of
+  mDNSResponder, so DNS does not need `unix_sockets = "all"`.
+- Metadata (mode, owner, flags, times, extended attributes, ACLs) can change only on `read_write`
+  paths, through paths and open descriptors alike. `linux.path_metadata = "allow"` only drops the
+  requirement; the profile is the same.
+- `sandy check` compiles the profile without applying it, so it reports operations or filters that
+  this macOS does not know.
+- `docs/macos.md` describes the profile, the system set with a reason per entry, and the known
+  limitations.
 
 ### Windows
 

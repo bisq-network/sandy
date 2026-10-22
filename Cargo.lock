@@ -85,6 +85,7 @@ dependencies = [
 name = "sandy-macos"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "sandy-core",
 ]
 

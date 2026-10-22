@@ -8,7 +8,7 @@
 
 use std::fs;
 use std::io::{self, Read};
-use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -85,6 +85,12 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
             std::thread::sleep(Duration::from_millis(millis));
             Ok(String::new())
         }
+        "spawn" => spawn(target),
+        "fd-read" => fd_read(target),
+        "resolve" => {
+            let addresses = (target, 0).to_socket_addrs()?.count();
+            Ok(format!("{addresses} addresses"))
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "unknown action",
@@ -98,6 +104,52 @@ fn set_readonly(target: &str, readonly: bool) -> io::Result<String> {
     #[allow(clippy::permissions_set_readonly_false)]
     permissions.set_readonly(readonly);
     fs::set_permissions(target, permissions).map(|()| String::new())
+}
+
+/// Separates the program and its arguments in the target of `spawn`.
+const ARGUMENT_SEPARATOR: char = '\u{1f}';
+
+/// Runs a program with arguments (separated by U+001F) and succeeds when it exits with 0.
+fn spawn(target: &str) -> io::Result<String> {
+    let mut parts = target.split(ARGUMENT_SEPARATOR);
+    let program = parts.next().unwrap_or_default();
+    let output = Command::new(program)
+        .args(parts)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()?;
+    if output.status.success() {
+        Ok(String::new())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let first_line = stderr.lines().next().unwrap_or_default();
+        Err(io::Error::other(format!("{}: {first_line}", output.status)))
+    }
+}
+
+/// Reads an inherited file descriptor to its end.
+#[cfg(unix)]
+fn fd_read(target: &str) -> io::Result<String> {
+    use std::os::fd::FromRawFd;
+
+    let fd: i32 = target
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid descriptor"))?;
+    // SAFETY: fcntl(F_GETFD) only checks that fd is open; it has no memory safety requirements.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is open and nothing else in this process uses it; the File owns it from here.
+    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    let mut content = Vec::new();
+    file.read_to_end(&mut content)?;
+    Ok(format!("{} bytes", content.len()))
+}
+
+#[cfg(not(unix))]
+fn fd_read(_target: &str) -> io::Result<String> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported"))
 }
 
 fn socket_address(target: &str) -> io::Result<SocketAddr> {

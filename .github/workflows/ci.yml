@@ -22,7 +22,17 @@ jobs:
         run: cargo run --bin sandy -- check ${{ runner.os == 'Windows' && '--appcontainer sandy.escape-tests' || '' }}
         continue-on-error: true
       - name: Test
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --no-fail-fast
+      - name: Show sandbox denials (macOS)
+        if: failure() && runner.os == 'macOS'
+        run: log show --last 10m --style compact --predicate 'sender == "Sandbox" OR eventMessage CONTAINS "Sandbox"' | tail -n 300
+      - name: Show crash reports (macOS)
+        if: failure() && runner.os == 'macOS'
+        run: |
+          for f in ~/Library/Logs/DiagnosticReports/*.ips; do
+            [ -e "$f" ] || continue
+            echo "== $f"; head -c 6000 "$f"; echo
+          done | tail -n 400
 
   lint:
     runs-on: ubuntu-24.04

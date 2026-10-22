@@ -1,27 +1,16 @@
-//! macOS backend of sandy. The crate is empty on other platforms.
-#![cfg(target_os = "macos")]
+//! macOS backend of sandy: a Seatbelt profile generated from the policy, applied in-process with
+//! `sandbox_init_with_parameters`, after which the target replaces sandy. `docs/macos.md`
+//! describes the mechanisms.
+//!
+//! Profile generation and planning are pure and build on every platform, so their unit tests run
+//! everywhere. Only the code that calls macOS is limited to macOS.
 
-use sandy_core::{Backend, PlanItem, ResolvedPolicy, SandboxError, TargetCommand};
+pub mod plan;
+pub mod profile;
+pub mod system;
 
-#[derive(Debug, Default)]
-pub struct MacosBackend;
+#[cfg(target_os = "macos")]
+mod macos;
 
-impl Backend for MacosBackend {
-    fn name(&self) -> &'static str {
-        "macos"
-    }
-
-    fn plan(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
-        policy
-            .requirements()
-            .into_iter()
-            .map(|requirement| PlanItem::unavailable(requirement, "not implemented yet"))
-            .collect()
-    }
-
-    fn run(&self, _policy: &ResolvedPolicy, _command: &TargetCommand) -> Result<i32, SandboxError> {
-        Err(SandboxError::new(
-            "the macOS backend is not implemented yet",
-        ))
-    }
-}
+#[cfg(target_os = "macos")]
+pub use macos::MacosBackend;
