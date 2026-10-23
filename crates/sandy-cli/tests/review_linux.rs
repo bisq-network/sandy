@@ -1,6 +1,6 @@
 //! Tests written during the Linux sandbox security review. They encode invariants that were
 //! checked by hand and held, so a future change that breaks one is caught. Each denial has a
-//! control run outside the sandbox, like the other escape tests. See `docs/reviews/2026-10-22-linux.md`.
+//! control run outside the sandbox, like the other escape tests.
 #![cfg(target_os = "linux")]
 
 mod common;

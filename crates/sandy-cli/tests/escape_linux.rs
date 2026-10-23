@@ -863,3 +863,25 @@ fn common_programs_run_under_the_default_policy() {
         );
     }
 }
+
+/// A writable path that overlaps the minimal system set would let the program change code or
+/// configuration that other programs trust, here /etc/ld.so.cache, /etc/ld.so.preload (also when
+/// it does not exist) and /etc/hosts. sandy refuses before the program starts.
+#[test]
+fn a_writable_path_over_the_system_set_is_refused() {
+    let output = sandy(run_args(
+        &args(&["--read-write", "/etc"]),
+        &[("env", "PATH")],
+    ));
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    assert!(output.stdout.is_empty(), "the program ran: {output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("overlaps"), "{stderr}");
+
+    // With system = "none" sandy adds no system paths, so nothing overlaps.
+    let check = sandy(["check", "--system", "none", "--read-write", "/etc"]);
+    assert!(
+        !String::from_utf8_lossy(&check.stdout).contains("overlaps"),
+        "{check:?}"
+    );
+}

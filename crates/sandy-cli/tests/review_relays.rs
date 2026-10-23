@@ -1,5 +1,4 @@
-//! Security review of the port relays (`network.expose` and `network.forward`), see
-//! docs/reviews/2026-10-23-relays.md.
+//! Security review of the port relays (`network.expose` and `network.forward`).
 //!
 //! These tests probe the relay lifetime, the fail-closed behaviour when a relay cannot bind, and
 //! the internal `__relay`/`__forward` commands when an attacker runs them directly on the host.
@@ -173,6 +172,9 @@ fn relay_does_not_outlive_the_program_beyond_the_drain() {
         thread::sleep(Duration::from_millis(50));
     };
     held.write_all(b"review").unwrap();
+    // Set while the connection is surely open: macOS refuses socket options (EINVAL) once the
+    // peer has reset the connection, and the relay may reset it before the read below.
+    held.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
     // Kill the program (SIGKILL), then measure the relay's end from the client side.
     let killed = Instant::now();
@@ -199,7 +201,6 @@ fn relay_does_not_outlive_the_program_beyond_the_drain() {
     let stop_accept = stop_accept.expect("the relay kept accepting after the program was killed");
 
     // The open connection must be closed within the drain, not kept alive by the client.
-    held.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut buffer = [0u8; 16];
     // A reset is as much an end as a clean close: the relay may close a socket with unread data,
     // and the kernel then answers with RST. Only a connection that stays open fails the test.

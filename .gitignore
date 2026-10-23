@@ -1,2 +1,4 @@
 /target
 /.worktrees
+# Review records are kept locally only.
+/docs/reviews

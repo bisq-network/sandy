@@ -156,8 +156,8 @@ of earlier definitions"), so the protections come last. The unit test
       (syscall-number 225))`: `fsgetpath`, `fsgetpath_ext`, `openbyid_np` and `searchfs` find a
       file by volume id and inode number. `fsgetpath` builds the path in the kernel without
       reaching any Seatbelt file operation, so the target could learn the path of any file on the
-      data volume from its device and inode number (finding 1.1 of
-      `docs/reviews/2026-10-22-macos.md`; contents stayed protected). Seatbelt allows
+      data volume from its device and inode number (a finding of the macOS security review;
+      contents stayed protected). Seatbelt allows
       `syscall-unix` by default and filters it by number (WebKit's profiles use the same
       operation). The numbers come from XNU's `bsd/kern/syscalls.master`, because older profile
       compilers do not know every `SYS_` name. dyld or libSystem calls `fsgetpath` once while a
@@ -190,6 +190,14 @@ checks that the sysctl names contain only letters, digits, dots and underscores.
 `system = "minimal"` adds the paths below (`system::MINIMAL`). All are real paths, because the
 sandbox matches the path after resolving symbolic links. None contains user data: no path below
 `/Users`, `~/Library` or a keychain.
+
+No writable policy path may overlap the set: the plan reports FilesystemConfined as unavailable
+when a writable path contains an entry, or lies inside a directory entry (`ReadTree`,
+`CodeTree`). The resolver files of `ip = "all"` (`/private/etc/hosts` and the mDNSResponder
+socket) count as entries. `/dev/null` and the links `/etc`, `/tmp` and `/var` (only their own
+metadata is readable) are exempt. Most entries are on the sealed system volume or belong to root,
+so file permissions forbid writing them anyway; the check keeps the guarantee independent of
+that.
 
 | Path | Access | Reason |
 |---|---|---|

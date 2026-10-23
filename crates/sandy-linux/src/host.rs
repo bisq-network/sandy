@@ -28,6 +28,8 @@ pub struct HostCapabilities {
     pub pidfd: Support,
     /// The candidates of the minimal system set that exist on this host.
     pub system_paths: Vec<SystemPath>,
+    /// Where every candidate of the minimal system set is or would be, also missing ones.
+    pub system_locations: Vec<SystemPath>,
 }
 
 impl HostCapabilities {
@@ -40,6 +42,7 @@ impl HostCapabilities {
             no_new_privs: no_new_privs_support(),
             unprivileged: unprivileged(),
             system_paths: system::detect(),
+            system_locations: system::locations(),
         }
     }
 }

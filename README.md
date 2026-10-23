@@ -16,7 +16,7 @@ sandy run \
   -- /srv/app/bin/server --port 8080
 ```
 
-Version 1.1.0. Policies use format `version = 1`.
+Version 1.2.0. Policies use format `version = 1`.
 
 ## Contents
 
@@ -379,10 +379,17 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
    shared libraries, the dynamic loader, time zone data, `/dev/null` and the random devices. It
    never contains user data. Each platform documents its exact list. Programs that need more
    (locale files, configuration in `/etc`, framework resources) need `--read` for those paths.
+   No writable path may overlap this set (for example `--read-write /etc`); sandy refuses such a
+   policy.
 6. **The environment** contains only `pass` and `set` variables, plus what a platform must add
    for any program to start (on Windows `SystemRoot` and `LOCALAPPDATA`).
 7. **Children inherit the sandbox.** A program that starts other programs needs them in a
    `read_exec` path; they run with the same restrictions.
+8. **A writable path gives the program your write rights there.** sandy cannot know which of your
+   files other programs trust. Never make a directory writable that holds files other programs run
+   or read as configuration, such as shell startup files (`~/.bashrc`, `~/.profile`), autostart
+   entries, or the configuration of other applications. A compromised program could change them,
+   and they would run outside the sandbox.
 
 ### Network
 
@@ -560,8 +567,8 @@ What remains visible from inside the sandbox differs by platform; for example, o
 program can see which paths exist outside the policy, but not their contents. Each platform
 document lists these limitations.
 
-Independent reviews tried to escape the sandbox on every platform; none succeeded. The reviews,
-their tests and the fixes that followed are in [docs/reviews](docs/reviews).
+Independent reviews tried to escape the sandbox on every platform. Their findings were fixed, and
+their tests are part of the test suite (`crates/sandy-cli/tests/review_*.rs`).
 
 ## Building and testing
 
@@ -605,7 +612,6 @@ compiled but not tested.
 - [docs/linux.md](docs/linux.md), [docs/macos.md](docs/macos.md),
   [docs/windows.md](docs/windows.md): mechanisms, system sets, limitations, sources
 - [docs/research](docs/research): background research (Linux mechanisms, Windows 10 support)
-- [docs/reviews](docs/reviews): independent security reviews
 
 ## License
 

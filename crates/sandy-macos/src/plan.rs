@@ -1,7 +1,11 @@
 //! The enforcement plan for a host with known capabilities. Pure code, so it runs and is tested on
 //! every platform.
 
-use sandy_core::{NetworkAccess, PlanItem, Requirement, ResolvedPolicy};
+use std::path::Path;
+
+use sandy_core::{NetworkAccess, PathAccess, PlanItem, Requirement, ResolvedPolicy, SystemAccess};
+
+use crate::system::{self, SystemAccess as Grant};
 
 /// What the host offers. `MacosBackend` detects it; tests use fixed values.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,10 +33,14 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<PlanIte
         )),
         (Ok(()), false, Ok(())) => Ok(()),
     };
+    let conflict = system_conflict(policy);
     policy
         .requirements()
         .into_iter()
         .map(|requirement| match mechanism(requirement, policy) {
+            _ if requirement == Requirement::FilesystemConfined && conflict.is_some() => {
+                PlanItem::unavailable(requirement, conflict.clone().unwrap_or_default())
+            }
             Mechanism::Profile(text) => match &profile {
                 Ok(()) => PlanItem::enforced(requirement, format!("Seatbelt profile: {text}")),
                 Err(reason) => PlanItem::unavailable(requirement, reason.clone()),
@@ -41,6 +49,49 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<PlanIte
             Mechanism::Missing(reason) => PlanItem::unavailable(requirement, reason),
         })
         .collect()
+}
+
+/// The policy checks for writable paths (never executable, nothing inside a writable path) see
+/// only the policy paths; the minimal system set is added by the profile. Its entries are code
+/// (dyld, system libraries) and configuration that programs trust (time zone and locale data, the
+/// name resolver files). A writable policy path that contains an entry, or lies inside a directory
+/// entry, would let the program change them for the next start and for programs outside the
+/// sandbox, as far as the user may write there. /dev/null is writable in the set itself, and the
+/// entries for /etc, /tmp and /var allow only reading the links.
+fn system_conflict(policy: &ResolvedPolicy) -> Option<String> {
+    if policy.system != SystemAccess::Minimal {
+        return None;
+    }
+    let entries = system::MINIMAL
+        .iter()
+        .filter(|entry| !matches!(entry.access, Grant::ReadWriteDevice | Grant::Symlink))
+        .map(|entry| {
+            let tree = matches!(entry.access, Grant::ReadTree | Grant::CodeTree);
+            (entry.path, tree)
+        })
+        .chain([
+            (system::HOSTS_FILE, false),
+            (system::DNS_RESOLVER_SOCKET, false),
+        ]);
+    let writable = policy
+        .paths
+        .iter()
+        .filter(|rule| rule.access == PathAccess::ReadWrite);
+    for rule in writable {
+        for (entry, tree) in entries.clone() {
+            let entry = Path::new(entry);
+            if entry.starts_with(&rule.path) || (tree && rule.path.starts_with(entry)) {
+                return Some(format!(
+                    "writable path {} overlaps {} of the minimal system set; the program could \
+                     change code or configuration that the next start and programs outside the \
+                     sandbox use",
+                    rule.path.display(),
+                    entry.display()
+                ));
+            }
+        }
+    }
+    None
 }
 
 enum Mechanism {
@@ -185,6 +236,48 @@ mod tests {
         let items = plan_for(&policy, &capable());
         let reported: Vec<Requirement> = items.iter().map(|item| item.requirement).collect();
         assert_eq!(reported, policy.requirements());
+    }
+
+    #[test]
+    fn a_writable_path_must_not_overlap_the_system_set() {
+        let unavailable_with = |path: &str, system: SystemAccess| {
+            let mut policy = strictest();
+            policy.system = system;
+            policy.paths.push(sandy_core::PathRule {
+                path: path.into(),
+                access: PathAccess::ReadWrite,
+                is_dir: true,
+            });
+            plan_for(&policy, &capable())
+                .into_iter()
+                .filter(|item| !item.is_enforced())
+                .map(|item| item.requirement)
+                .collect::<Vec<_>>()
+        };
+        let refused = vec![Requirement::FilesystemConfined];
+        // Contains a tree or a file of the set.
+        assert_eq!(
+            unavailable_with("/private/var/db", SystemAccess::Minimal),
+            refused
+        );
+        assert_eq!(
+            unavailable_with("/private/etc", SystemAccess::Minimal),
+            refused
+        );
+        // Lies inside a tree of the set.
+        assert_eq!(
+            unavailable_with("/usr/lib/app", SystemAccess::Minimal),
+            refused
+        );
+        assert_eq!(
+            unavailable_with("/usr/share/locale/x", SystemAccess::Minimal),
+            refused
+        );
+        // Not part of the set, or the set itself allows writing.
+        assert!(unavailable_with("/Users/someone/data", SystemAccess::Minimal).is_empty());
+        assert!(unavailable_with("/dev/null", SystemAccess::Minimal).is_empty());
+        // Without the system set there is nothing to overlap.
+        assert!(unavailable_with("/private/var/db", SystemAccess::None).is_empty());
     }
 
     #[test]

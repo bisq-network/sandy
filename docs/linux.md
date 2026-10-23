@@ -458,8 +458,15 @@ secrets passed on command lines, and `/proc/net` of the network namespace. `/pro
   ambient capability: NoPrivilegeEscalation is unavailable. no_new_privs removes nothing that is
   already held, and Landlock does not restrict `chmod`, so root could, for example, set the
   setuid bit on a shell.
-- A writable policy path that contains the dynamic loader: FilesystemConfined is unavailable,
-  because the loader would be writable and executable.
+- A writable policy path that overlaps the minimal system set, with `system = "minimal"`:
+  FilesystemConfined is unavailable. The path contains an entry of the set, or lies inside one of
+  its directories. Entries that do not exist on this host count too (their location with the
+  symbolic links of the existing part resolved), because the program could create them, for
+  example `/etc/ld.so.preload`. Only `/dev/null` is exempt. Otherwise the program could change the
+  dynamic loader, shared libraries, the loader configuration or files such as `/etc/hosts`, which
+  the next start and programs outside the sandbox use. File permissions usually forbid this
+  anyway, because these files belong to root and sandy refuses to run as root; the check keeps
+  the guarantee independent of them.
 
 ## Known limitations
 

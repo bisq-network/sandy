@@ -2,7 +2,7 @@
 //! the sandbox, like the other escape tests, so a test cannot pass because the action was
 //! impossible anyway. Tests whose name says "stays", "cannot" or "does not" encode an invariant
 //! that held; `fsgetpath_discloses_out_of_policy_paths` is a proof of concept for a confirmed
-//! finding and documents the current (insecure) behavior. See `docs/reviews/2026-10-22-macos.md`.
+//! finding and documents the current (insecure) behavior.
 #![cfg(target_os = "macos")]
 
 mod common;

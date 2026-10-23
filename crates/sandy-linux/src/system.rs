@@ -107,16 +107,17 @@ const CANDIDATES: &[(&str, SystemUse, Needed)] = &[
     ),
 ];
 
-/// Returns the candidates that exist, with canonical paths. A candidate that cannot be resolved
-/// is left out, which only removes access.
-pub fn detect() -> Vec<SystemPath> {
+fn candidates() -> impl Iterator<Item = (&'static str, SystemUse, Needed)> {
     let arch = ARCH_CANDIDATES
         .iter()
         .map(|&(path, usage)| (path, usage, Needed::Always));
-    let mut found: Vec<SystemPath> = CANDIDATES
-        .iter()
-        .copied()
-        .chain(arch)
+    CANDIDATES.iter().copied().chain(arch)
+}
+
+/// Returns the candidates that exist, with canonical paths. A candidate that cannot be resolved
+/// is left out, which only removes access.
+pub fn detect() -> Vec<SystemPath> {
+    let mut found: Vec<SystemPath> = candidates()
         .filter_map(|(path, usage, needed)| {
             let path = Path::new(path).canonicalize().ok()?;
             let is_dir = path.metadata().ok()?.is_dir();
@@ -134,6 +135,45 @@ pub fn detect() -> Vec<SystemPath> {
     found
 }
 
+/// Returns every candidate, also those that do not exist, where it is or would be: symbolic links
+/// in the existing part of the path are resolved. A missing candidate such as /etc/ld.so.preload
+/// matters too, because a program that can write its directory can create it.
+pub fn locations() -> Vec<SystemPath> {
+    candidates()
+        .map(|(path, usage, needed)| {
+            let path = resolve_existing_part(Path::new(path));
+            let is_dir = path.metadata().is_ok_and(|metadata| metadata.is_dir());
+            SystemPath {
+                path,
+                is_dir,
+                usage,
+                needed,
+            }
+        })
+        .collect()
+}
+
+/// `path` with its longest existing prefix replaced by that prefix's canonical form.
+fn resolve_existing_part(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(canonical) = existing.canonicalize() {
+            return rest
+                .iter()
+                .rev()
+                .fold(canonical, |path, name| path.join(name));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +188,21 @@ mod tests {
         for pair in found.windows(2) {
             assert!(pair[0] != pair[1]);
         }
+    }
+
+    #[test]
+    fn locations_include_missing_candidates() {
+        let locations = locations();
+        assert_eq!(locations.len(), candidates().count());
+        let preload = locations
+            .iter()
+            .find(|entry| entry.path.ends_with("ld.so.preload"))
+            .unwrap();
+        // /etc exists everywhere sandy runs; the file itself usually does not.
+        assert_eq!(
+            preload.path.parent().unwrap(),
+            Path::new("/etc").canonicalize().unwrap()
+        );
     }
 
     #[test]

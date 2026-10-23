@@ -1,4 +1,4 @@
-//! Regression tests for the Windows security review (docs/reviews/2026-10-22-windows.md).
+//! Regression tests for the Windows security review.
 //!
 //! Like `escape_windows.rs`, they run `sandy-probe` inside the sandbox and, for every denial,
 //! check a control run outside it, so a test cannot pass because the action was impossible

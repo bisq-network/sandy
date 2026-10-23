@@ -68,7 +68,7 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
         (Err(reason), _) | (Ok(_), Err(reason)) => Err(reason.as_str()),
         (Ok(version), Ok(())) => Ok(ABI::from(*version)),
     };
-    let conflict = executable_conflict(policy, &host.system_paths);
+    let conflict = system_conflict(policy, &host.system_locations);
     let items: Vec<PlanItem> = policy
         .requirements()
         .into_iter()
@@ -250,9 +250,14 @@ fn relay_mechanism(abi: ABI) -> String {
     mechanism
 }
 
-/// The policy check for writable and executable paths does not see the system set. A writable
-/// policy path that contains the dynamic loader would make the loader writable and executable.
-fn executable_conflict(policy: &ResolvedPolicy, system: &[SystemPath]) -> Option<String> {
+/// The policy checks for writable paths (never executable, nothing inside a writable path) see
+/// only the policy paths; the minimal system set is added here. Its entries are code and
+/// configuration that programs trust: the dynamic loader, shared libraries, /etc/ld.so.cache and
+/// /etc/ld.so.preload, which decide which code runs, and files such as /etc/hosts. A writable policy path that contains an entry, or lies
+/// inside a directory entry, would let the program change them for the next start and for
+/// programs outside the sandbox. Missing entries count, because the program could create them.
+/// /dev/null is writable in the set itself.
+fn system_conflict(policy: &ResolvedPolicy, system: &[SystemPath]) -> Option<String> {
     if policy.system != SystemAccess::Minimal {
         return None;
     }
@@ -261,12 +266,15 @@ fn executable_conflict(policy: &ResolvedPolicy, system: &[SystemPath]) -> Option
         .iter()
         .filter(|rule| rule.access == PathAccess::ReadWrite);
     for rule in writable {
-        let executable = system.iter().filter(|s| s.usage == SystemUse::Execute);
-        for entry in executable {
-            if entry.path.starts_with(&rule.path) {
+        let protected = system.iter().filter(|s| s.usage != SystemUse::Discard);
+        for entry in protected {
+            let inside_writable = entry.path.starts_with(&rule.path);
+            let inside_entry = entry.is_dir && rule.path.starts_with(&entry.path);
+            if inside_writable || inside_entry {
                 return Some(format!(
-                    "writable path {} contains the dynamic loader {}, which the minimal system \
-                     set makes executable",
+                    "writable path {} overlaps {} of the minimal system set; the program could \
+                     change code or configuration that the next start and programs outside the \
+                     sandbox use",
                     rule.path.display(),
                     entry.path.display()
                 ));
@@ -384,6 +392,19 @@ mod tests {
             usage,
             needed,
         };
+        let existing = vec![
+            system("/usr/lib", true, SystemUse::Read, Needed::Always),
+            system(
+                "/usr/lib64/ld-linux-x86-64.so.2",
+                false,
+                SystemUse::Execute,
+                Needed::Always,
+            ),
+            system("/dev/null", false, SystemUse::Discard, Needed::Always),
+            system("/etc/hosts", false, SystemUse::Read, Needed::WithIpNetwork),
+        ];
+        // A candidate that does not exist on this host still has a location.
+        let missing = system("/etc/ld.so.preload", false, SystemUse::Read, Needed::Always);
         HostCapabilities {
             landlock: abi.ok_or_else(|| "no Landlock here".to_string()),
             thread_count: Ok(()),
@@ -391,17 +412,8 @@ mod tests {
             no_new_privs: Ok(()),
             unprivileged: Ok(()),
             pidfd: Ok(()),
-            system_paths: vec![
-                system("/usr/lib", true, SystemUse::Read, Needed::Always),
-                system(
-                    "/usr/lib64/ld-linux-x86-64.so.2",
-                    false,
-                    SystemUse::Execute,
-                    Needed::Always,
-                ),
-                system("/dev/null", false, SystemUse::Discard, Needed::Always),
-                system("/etc/hosts", false, SystemUse::Read, Needed::WithIpNetwork),
-            ],
+            system_locations: [existing.clone(), vec![missing]].concat(),
+            system_paths: existing,
         }
     }
 
@@ -809,6 +821,39 @@ mod tests {
         let plan = plan_for(&no_system, &host(Some(9)));
         let landlock = plan.sandbox.unwrap().landlock;
         assert_eq!(landlock.rules.len(), no_system.paths.len());
+    }
+
+    #[test]
+    fn a_writable_path_must_not_overlap_the_system_set() {
+        let conflicts = |path: &str, is_dir: bool| {
+            let mut policy = policy();
+            policy.paths.push(rule(path, PathAccess::ReadWrite, is_dir));
+            let plan = plan_for(&policy, &host(Some(9)));
+            unavailable(&plan) == vec![Requirement::FilesystemConfined]
+        };
+        // Contains a library directory, a configuration file, or a missing candidate.
+        assert!(conflicts("/usr", true));
+        assert!(conflicts("/etc", true));
+        // Lies inside a directory of the set.
+        assert!(conflicts("/usr/lib/app/state", true));
+        // The set itself makes /dev/null writable.
+        assert!(!conflicts("/dev/null", false));
+        assert!(!conflicts("/srv/state", true));
+
+        // A candidate that does not exist counts: the program could create it.
+        let mut policy = policy();
+        policy.paths.push(rule("/etc", PathAccess::ReadWrite, true));
+        let mut without_hosts = host(Some(9));
+        without_hosts
+            .system_locations
+            .retain(|entry| entry.path != Path::new("/etc/hosts"));
+        let plan = plan_for(&policy, &without_hosts);
+        match status(&plan, Requirement::FilesystemConfined) {
+            Status::Unavailable { reason } => {
+                assert!(reason.contains("/etc/ld.so.preload"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

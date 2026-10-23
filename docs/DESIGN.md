@@ -80,7 +80,13 @@ Rules:
 5. The program file itself gets read and execute access automatically.
 6. `system = "minimal"` adds a backend-defined read-only set of system paths that programs need to
    start: shared libraries, loader configuration, time zone data, random devices. Each backend
-   documents its set and the reason for every entry. The set never contains user data.
+   documents its set and the reason for every entry. The set never contains user data. No
+   writable policy path may overlap the set: contain one of its entries (also one that does not
+   exist yet, such as `/etc/ld.so.preload`) or lie inside one of its directories. The entries are
+   code and configuration that the next start and programs outside the sandbox trust, so rules 3
+   and 4 apply to them as to policy paths. The only exception is `/dev/null`, which the set makes
+   writable. The backend checks this, because only it knows its set; with `system = "none"` it
+   adds nothing, and every writable path is the policy's own choice.
 7. The environment of the program contains only `pass` and `set` variables, plus variables a
    backend must add for any process to start (documented per backend).
 8. `unix_sockets = "all"` allows every Unix socket the user can reach, independent of the
@@ -274,7 +280,7 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   access (TCP connect only to the relay targets from ABI 4) and a seccomp filter limited to TCP,
   copying and threads.
 - Refused: no Landlock (the reason names the fix), no seccomp, root or any capability, a writable
-  path that contains the dynamic loader.
+  path that overlaps the minimal system set (rule 6).
 
 ### macOS
 
