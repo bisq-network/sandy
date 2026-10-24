@@ -20,21 +20,30 @@ pub struct HostCapabilities {
     pub profile: Result<(), String>,
     /// sandy itself already runs in a Seatbelt sandbox. macOS then refuses another profile.
     pub already_sandboxed: bool,
+    /// Why the program would run as x86_64 code through Rosetta, if it would. Rosetta cannot load
+    /// its runtime inside the sandbox, so such a program never starts.
+    pub rosetta: Option<String>,
 }
 
 /// Reports every requirement of `policy` exactly once, as enforced (with its mechanism) or
 /// unavailable (with the reason).
 pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<PlanItem> {
-    let profile = match (&host.seatbelt, host.already_sandboxed, &host.profile) {
-        (Err(reason), _, _) => Err(format!("Seatbelt is not available: {reason}")),
-        (Ok(()), true, _) => Err(
+    let profile = match (
+        &host.seatbelt,
+        host.already_sandboxed,
+        &host.rosetta,
+        &host.profile,
+    ) {
+        (Err(reason), _, _, _) => Err(format!("Seatbelt is not available: {reason}")),
+        (Ok(()), true, _, _) => Err(
             "sandy already runs in a Seatbelt sandbox, and macOS refuses a second profile"
                 .to_string(),
         ),
-        (Ok(()), false, Err(message)) => Err(format!(
+        (Ok(()), false, Some(reason), _) => Err(reason.clone()),
+        (Ok(()), false, None, Err(message)) => Err(format!(
             "this macOS rejects the generated Seatbelt profile: {message}"
         )),
-        (Ok(()), false, Ok(())) => Ok(()),
+        (Ok(()), false, None, Ok(())) => Ok(()),
     };
     let conflict = system_conflict(policy);
     policy
@@ -234,6 +243,7 @@ mod tests {
             seatbelt: Ok(()),
             profile: Ok(()),
             already_sandboxed: false,
+            rosetta: None,
         }
     }
 
@@ -326,6 +336,7 @@ mod tests {
             seatbelt: Err("dlsym(sandbox_init_with_parameters): symbol not found".into()),
             profile: Err("not compiled".into()),
             already_sandboxed: false,
+            rosetta: None,
         };
         let items = plan_for(&policy, &host);
         let plan = EnforcementPlan::new(&policy.requirements(), items.clone());
@@ -349,6 +360,7 @@ mod tests {
             seatbelt: Ok(()),
             profile: Err("unbound variable: file-test-existence".into()),
             already_sandboxed: false,
+            rosetta: None,
         };
         let items = plan_for(&policy, &host);
         let filesystem = items
@@ -381,6 +393,28 @@ mod tests {
         let without = format!("{:?}", mechanism_of(&without_ip));
         assert!(with.contains("mDNSResponder"), "{with}");
         assert!(!without.contains("mDNSResponder"), "{without}");
+    }
+
+    #[test]
+    fn code_that_needs_rosetta_refuses() {
+        let policy = strictest();
+        let host = HostCapabilities {
+            rosetta: Some("the program has no arm64 code".into()),
+            ..capable()
+        };
+        let items = plan_for(&policy, &host);
+        let plan = EnforcementPlan::new(&policy.requirements(), items.clone());
+        assert!(!plan.is_enforceable());
+        let filesystem = items
+            .iter()
+            .find(|item| item.requirement == Requirement::FilesystemConfined)
+            .unwrap();
+        assert_eq!(
+            filesystem.status,
+            Status::Unavailable {
+                reason: "the program has no arm64 code".into()
+            }
+        );
     }
 
     #[test]

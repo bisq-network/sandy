@@ -910,3 +910,71 @@ fn children_none_keeps_the_relays_working() {
     lines[0].assert_ok();
     assert_eq!(received.join().unwrap(), TCP_SEND_PAYLOAD);
 }
+
+/// Whether the integer sysctl `name` is 1. A name this Mac does not know counts as 0.
+fn sysctl_flag(name: &str) -> bool {
+    let name = CString::new(name).unwrap();
+    let mut value: c_int = 0;
+    let mut size = std::mem::size_of::<c_int>();
+    // SAFETY: name is a C string; value and size describe a buffer of size bytes; no new value.
+    let result = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&raw mut value).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    result == 0 && value == 1
+}
+
+/// On Apple silicon, code without an arm64 version runs through Rosetta, which cannot load its
+/// runtime inside the sandbox. sandy refuses such a program before it starts, instead of starting
+/// it to abort. A translated sandy refuses every program, because it would execute even universal
+/// programs as x86_64.
+#[test]
+fn code_that_needs_rosetta_is_refused_before_it_starts() {
+    if !sysctl_flag("hw.optional.arm64") {
+        eprintln!("skipped: not Apple silicon");
+        return;
+    }
+    let fixture = Fixture::new("macos-rosetta");
+    // A thin x86_64 Mach-O header is enough: sandy decides before it executes the file.
+    let program = fixture.path("bin").join("x86_64-only");
+    let mut header = vec![0xcf, 0xfa, 0xed, 0xfe, 0x07, 0x00, 0x00, 0x01];
+    header.resize(32, 0);
+    fs::write(&program, header).unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    // The tests and sandy are built for the same architecture.
+    let reason = if sysctl_flag("sysctl.proc_translated") {
+        "sandy runs as x86_64 code through Rosetta"
+    } else {
+        "has no arm64 code"
+    };
+
+    let with = |mode: &str, program: &str| {
+        let mut args = vec![mode.to_string()];
+        args.extend(fixture.access_args());
+        args.extend(["--".to_string(), program.to_string()]);
+        sandy(args)
+    };
+    let output = with("check", program.to_str().unwrap());
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(reason),
+        "{output:?}"
+    );
+    let output = with("run", program.to_str().unwrap());
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(reason),
+        "{output:?}"
+    );
+
+    // Control: a native sandy accepts the probe, which has arm64 code.
+    if reason == "has no arm64 code" {
+        let output = with("check", &probe_path());
+        assert!(output.status.success(), "{output:?}");
+    }
+}

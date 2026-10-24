@@ -16,7 +16,7 @@ sandy run \
   -- /srv/app/bin/server --port 8080
 ```
 
-Version 1.3.0. Policies use format `version = 1`.
+Version 1.3.1. Policies use format `version = 1`.
 
 ## Contents
 
@@ -486,10 +486,10 @@ program can change the metadata of every file the user owns.
 ### macOS
 
 - **Tested** on macOS 15 (arm64) through GitHub Actions, and on macOS 26 (arm64).
-- **Not on Apple silicon through Rosetta:** an x86_64 program, and every program that sandy's
-  x86_64 build starts, fails in the sandbox with "rosetta error: Failed to open
-  libRosettaRuntime", because the profile does not allow the Rosetta runtime. Use the arm64 build
-  and arm64 programs on Apple silicon. The x86_64 build has not run on an Intel Mac yet.
+- **Not through Rosetta:** x86_64 code cannot run in the sandbox on Apple silicon, because Rosetta
+  cannot load its runtime there. sandy refuses a program without arm64 code on Apple silicon,
+  and its x86_64 build refuses every program there. Use the arm64 build and arm64 or universal
+  programs. The x86_64 build has not run on an Intel Mac yet.
 - sandy uses `sandbox_init_with_parameters`, which Apple does not document. Chromium and WebKit
   use the same function.
 - `system = "none"` cannot start any program on macOS, because every program needs the dynamic

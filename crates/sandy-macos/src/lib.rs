@@ -5,6 +5,7 @@
 //! Profile generation and planning are pure and build on every platform, so their unit tests run
 //! everywhere. Only the code that calls macOS is limited to macOS.
 
+pub mod binary;
 pub mod plan;
 pub mod profile;
 pub mod system;

@@ -10,6 +10,10 @@ mod watch;
 
 use sandy_core::{Backend, ChildProcesses, PlanItem, ResolvedPolicy, SandboxError, TargetCommand};
 
+use std::ffi::CStr;
+use std::io::Read;
+
+use crate::binary;
 use crate::plan::{HostCapabilities, plan_for};
 use crate::profile::{generate, relay_pairs, relay_profile, watcher_profile};
 use seatbelt::Seatbelt;
@@ -108,13 +112,65 @@ fn detect(policy: &ResolvedPolicy) -> HostCapabilities {
                         .map_err(|message| format!("watcher profile: {message}"))
                 }),
             already_sandboxed: seatbelt.is_sandboxed(),
+            rosetta: rosetta(policy),
         },
         Err(reason) => HostCapabilities {
             seatbelt: Err(reason),
             profile: Err("not compiled".to_string()),
             already_sandboxed: false,
+            rosetta: rosetta(policy),
         },
     }
+}
+
+/// Why the program would run as x86_64 code through Rosetta, if it would. Rosetta loads its
+/// runtime into every translated process, and the profile does not allow it, so the program would
+/// abort at its start. A process that runs translated executes universal programs as x86_64 too.
+fn rosetta(policy: &ResolvedPolicy) -> Option<String> {
+    if sysctl_flag(c"sysctl.proc_translated") {
+        return Some(
+            "sandy runs as x86_64 code through Rosetta, which cannot load its runtime inside the \
+             sandbox, so no program would start; use the arm64 build of sandy"
+                .to_string(),
+        );
+    }
+    if !sysctl_flag(c"hw.optional.arm64") {
+        return None;
+    }
+    let program = policy.program.as_ref()?;
+    let mut header = Vec::with_capacity(binary::HEADER_SIZE);
+    // A file that cannot be read is left to the exec, which reports its own error.
+    std::fs::File::open(program)
+        .and_then(|file| {
+            file.take(binary::HEADER_SIZE as u64)
+                .read_to_end(&mut header)
+        })
+        .ok()?;
+    match binary::has_arm64_code(&header) {
+        Some(false) => Some(format!(
+            "{} has no arm64 code, so it would run through Rosetta, which cannot load its \
+             runtime inside the sandbox; use an arm64 or universal build of the program",
+            program.display()
+        )),
+        _ => None,
+    }
+}
+
+/// Whether the integer sysctl `name` is 1. A name this Mac does not know counts as 0.
+fn sysctl_flag(name: &CStr) -> bool {
+    let mut value: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    // SAFETY: name is a C string; value and size describe a buffer of size bytes; no new value.
+    let result = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&raw mut value).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    result == 0 && value == 1
 }
 
 #[cfg(test)]

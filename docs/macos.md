@@ -34,11 +34,13 @@ If any step fails, `run` returns an error and sandy exits with status 125. The t
 with a weaker sandbox.
 
 `sandy check` performs steps 2 and 3, asks `sandbox_check` whether sandy already runs in a sandbox,
-and compiles the profile with `sandbox_compile_string` without applying it. The plan reports every
-requirement that depends on the profile as unavailable when a function is missing, when sandy is
-already sandboxed (macOS ignores a second profile and returns an error, see `sandbox.h`), or when
-this macOS rejects the profile (with the compiler's message). `plan_for(policy, &HostCapabilities)`
-contains this decision and is pure; only the detection does I/O.
+checks whether the program would run through Rosetta (see "Known limitations"), and compiles the
+profile with `sandbox_compile_string` without applying it. The plan reports every requirement that
+depends on the profile as unavailable when a function is missing, when sandy is already sandboxed
+(macOS ignores a second profile and returns an error, see `sandbox.h`), when the code would run
+through Rosetta, or when this macOS rejects the profile (with the compiler's message).
+`plan_for(policy, &HostCapabilities)` contains this decision and is pure; only the detection does
+I/O.
 
 ## Why in-process `sandbox_init_with_parameters` and not `sandbox-exec`
 
@@ -494,12 +496,14 @@ no privilege, and closing them would break ordinary programs:
 - sandy cannot run inside another Seatbelt sandbox; `sandy check` reports this.
 - x86_64 code does not run in the sandbox on Apple silicon. Rosetta loads its runtime
   (`libRosettaRuntime`) into every translated process, and the profile does not allow it, so the
-  program aborts with "rosetta error: Failed to open libRosettaRuntime". This hits x86_64
-  programs, and every program that sandy's x86_64 build starts: a translated process executes
-  universal binaries such as `/bin/echo` as x86_64 too. Rosetta also adds a thread to the
-  translated sandy, so its check for a single thread refuses the relay, the watcher and
-  `contained`. Measured on macOS 26; allowing Rosetta would need its runtime, its translation
-  cache and probably its Mach service in the profile, which has not been evaluated.
+  program would abort with "rosetta error: Failed to open libRosettaRuntime" (measured on macOS
+  26). A translated process executes universal programs such as `/bin/echo` as x86_64 too. The
+  plan therefore refuses, before anything starts, when sandy itself runs translated
+  (`sysctl.proc_translated`), and on Apple silicon (`hw.optional.arm64`) when the program is a
+  Mach-O file without arm64 code (`binary::has_arm64_code` reads its header). A program that
+  later executes an x86_64-only program still meets the error. Allowing Rosetta would need its
+  runtime, its translation cache and probably its Mach service in the profile, which has not been
+  evaluated.
 - With `process.children = "contained"` the target cannot use `posix_spawn`, so programs that
   start processes through it (Rust's `std::process::Command`, Java, Node.js, `system()`,
   `popen()`) fail to start them (see [Contained child processes](#contained-child-processes)).
