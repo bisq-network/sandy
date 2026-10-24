@@ -239,17 +239,19 @@ where
 pub fn parse(output: &Output) -> Vec<ProbeLine> {
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .map(|line| {
-            let mut fields = line.splitn(4, '\t');
-            let mut next = || fields.next().unwrap_or_default().to_string();
-            ProbeLine {
-                action: next(),
-                target: next(),
-                result: next(),
-                detail: next(),
-            }
-        })
+        .map(parse_line)
         .collect()
+}
+
+pub fn parse_line(line: &str) -> ProbeLine {
+    let mut fields = line.splitn(4, '\t');
+    let mut next = || fields.next().unwrap_or_default().to_string();
+    ProbeLine {
+        action: next(),
+        target: next(),
+        result: next(),
+        detail: next(),
+    }
 }
 
 pub fn probe_args(actions: &[(&str, &str)]) -> Vec<String> {

@@ -85,6 +85,7 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
                 deny_path_metadata: policy.path_metadata == PathMetadata::Deny,
                 deny_children: policy.children == ChildProcesses::None,
                 keep_process_group: policy.children == ChildProcesses::Contained,
+                isolate_signals: policy.signals == SignalScope::Isolated,
             },
             relay: RelayConfig::new(&policy.expose, &policy.forward, abi),
             contain: policy.children == ChildProcesses::Contained,
@@ -224,16 +225,19 @@ fn plan_item(
             Err(reason) => unavailable(reason),
             Ok(()) => enforced(FILTER_METADATA.to_string()),
         },
-        Requirement::SignalsIsolated => {
-            if abi >= ABI::V6 {
-                enforced("Landlock ABI 6 signal scope".to_string())
-            } else {
-                unavailable(&format!(
-                    "signal isolation needs Landlock ABI 6 (Linux 6.12); this kernel has ABI \
-                     {abi}"
-                ))
-            }
-        }
+        // The kernel sends the job control signals of a terminal without the check that the
+        // Landlock scope hooks, so the scope alone does not isolate signals.
+        Requirement::SignalsIsolated => match &host.seccomp {
+            Err(reason) => unavailable(reason),
+            Ok(()) if abi >= ABI::V6 => enforced(
+                "Landlock ABI 6 signal scope; seccomp denies setpgid into a process group that \
+                 exists and the terminal ioctls TIOCSPGRP and TIOCSWINSZ"
+                    .to_string(),
+            ),
+            Ok(()) => unavailable(&format!(
+                "signal isolation needs Landlock ABI 6 (Linux 6.12); this kernel has ABI {abi}"
+            )),
+        },
     }
 }
 
@@ -511,8 +515,13 @@ mod tests {
         any_signals.signals = SignalScope::Any;
         let plan = plan_for(&any_signals, &host(Some(5)));
         assert_eq!(unavailable(&plan), vec![]);
-        let landlock = plan.sandbox.unwrap().landlock;
-        assert!(landlock.scopes.is_empty());
+        let sandbox = plan.sandbox.unwrap();
+        assert!(sandbox.landlock.scopes.is_empty());
+        assert!(!sandbox.filter.isolate_signals);
+
+        let sandbox = plan_for(&policy(), &host(Some(6))).sandbox.unwrap();
+        assert!(sandbox.landlock.scopes.contains(Scope::Signal));
+        assert!(sandbox.filter.isolate_signals);
     }
 
     #[test]
@@ -528,6 +537,7 @@ mod tests {
                 Requirement::ProcessMemoryIsolated,
                 Requirement::IpNetworkDenied,
                 Requirement::UnixSocketsDenied,
+                Requirement::SignalsIsolated,
                 Requirement::MetadataConfined,
             ]
         );

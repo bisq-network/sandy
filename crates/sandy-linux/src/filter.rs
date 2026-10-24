@@ -1,11 +1,15 @@
-//! The seccomp filters. sandy installs two filters; the kernel applies the stricter result:
+//! The seccomp filters. sandy installs three filters; the kernel applies the stricter result,
+//! and among equal results the one of the filter installed last:
 //!
 //! 1. The allowlist allows the system calls of the reviewed kernel table. Every other number,
 //!    including x32 numbers and system calls of newer kernels, fails with ENOSYS. Programs treat
 //!    that like an older kernel. A call of another CPU architecture kills the process.
 //! 2. The denylist checks arguments and denies single system calls with EPERM.
+//! 3. The socket family filter fails `socket` with EAFNOSUPPORT for the families the policy
+//!    denies. Programs treat that like a kernel without the family and fall back; EPERM reads
+//!    like a temporary failure and often ends the program instead.
 //!
-//! seccompiler compiles both. Numbers come from `libc::SYS_*`, so sandy controls the table.
+//! seccompiler compiles all three. Numbers come from `libc::SYS_*`, so sandy controls the table.
 
 use std::collections::BTreeMap;
 
@@ -30,6 +34,10 @@ pub struct FilterConfig {
     /// Deny setsid and setpgid, so every process the program starts stays in the process group
     /// that sandy ends as a whole (`process.children = "contained"`).
     pub keep_process_group: bool,
+    /// Deny joining another process group and the terminal ioctls that make the kernel signal
+    /// one (`signals = "isolated"`). The kernel sends the job control signals of a terminal to a
+    /// whole process group without the check that the Landlock signal scope hooks.
+    pub isolate_signals: bool,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -106,6 +114,9 @@ const SYS_LISTMOUNT: i64 = 458;
 const SYS_OPEN_TREE_ATTR: i64 = 467;
 const SYS_FILE_SETATTR: i64 = 469;
 const SYS_LISTNS: i64 = 470;
+const SYS_LSM_GET_SELF_ATTR: i64 = 459;
+const SYS_LSM_SET_SELF_ATTR: i64 = 460;
+const SYS_LSM_LIST_MODULES: i64 = 461;
 
 /// Denied with EPERM under every policy.
 const DENIED: &[i64] = &[
@@ -161,6 +172,11 @@ const DENIED: &[i64] = &[
     SYS_STATMOUNT,
     SYS_LISTMOUNT,
     SYS_LISTNS,
+    // Which security modules the host runs and the program's own attributes, which
+    // lsm_set_self_attr changes. Without /proc and /sys/kernel/security it sees neither.
+    SYS_LSM_GET_SELF_ATTR,
+    SYS_LSM_SET_SELF_ATTR,
+    SYS_LSM_LIST_MODULES,
     // Kernel attack surface that exploits often use.
     libc::SYS_bpf,
     libc::SYS_perf_event_open,
@@ -222,8 +238,20 @@ const CLONE_NAMESPACES: &[i32] = &[
 ];
 
 /// The personality values that Docker's default profile allows: PER_LINUX, PER_LINUX32,
-/// UNAME26, PER_LINUX32 | UNAME26, and the query value.
-const PERSONALITIES: &[u64] = &[0, 0x8, 0x2_0000, 0x2_0008, 0xffff_ffff];
+/// UNAME26, PER_LINUX32 | UNAME26, and the query value. ADDR_NO_RANDOMIZE, alone and with those
+/// two flags, is allowed as well: `setarch -R`, rr and the thread sanitizer need it, and it
+/// weakens address space randomization only inside the sandbox.
+const PERSONALITIES: &[u64] = &[
+    0,
+    0x8,
+    0x2_0000,
+    0x2_0008,
+    0x4_0000,
+    0x4_0008,
+    0x6_0000,
+    0x6_0008,
+    0xffff_ffff,
+];
 
 /// System calls that change another process, with the index of their process ID argument.
 /// Process ID 0 means the caller.
@@ -246,11 +274,50 @@ const IOPRIO_WHO_PROCESS: u64 = 1;
 const NETLINK_ROUTE: u64 = 0;
 const SOCK_TYPE_MASK: u64 = 0xf;
 
-/// The two compiled filters, in the order they are installed.
+/// F_SETDELEG of Linux 7, which the libc crate does not have yet.
+const F_SETDELEG: u64 = 1040;
+
+/// File system ioctls that change a file or a directory through a descriptor opened read-only.
+/// Landlock checks ioctls only on device files, so they reach everything the program may open,
+/// also in `read` paths. The libc crate has none of these numbers; they are the same on x86_64
+/// and arm64.
+///
+/// - FS_IOC_SETFLAGS, its 32-bit form, and FS_IOC_FSSETXATTR change inode flags and attributes,
+///   which is metadata like chmod (`chattr`).
+/// - FS_IOC_SETVERSION and its 32-bit form change the version a file carries, which is metadata
+///   the policy denies by path.
+/// - FS_IOC_ENABLE_VERITY makes the content of a file permanently read-only.
+/// - FS_IOC_SET_ENCRYPTION_POLICY encrypts what the user later writes into an empty directory,
+///   with a key the program chose. FS_IOC_REMOVE_ENCRYPTION_KEY and its all-users form lock
+///   encrypted directories the user has unlocked, outside the policy.
+/// - The btrfs ioctls create, snapshot and delete subvolumes, or make them read-only, which
+///   changes directories without the Landlock checks for creating and removing entries.
+const FILE_SYSTEM_IOCTLS: &[u32] = &[
+    0x4008_6602,
+    0x4004_6602,
+    0x401c_5820,
+    0x4008_7602,
+    0x4004_7602,
+    0x4080_6685,
+    0x800c_6613,
+    0xc040_6618,
+    0xc040_6619,
+    0x5000_9401,
+    0x5000_940e,
+    0x5000_940f,
+    0x5000_9417,
+    0x5000_9418,
+    0x5000_943f,
+    0x4008_941a,
+];
+
+/// The compiled filters, in the order they are installed. The relay and the watcher have no
+/// socket family filter: their denylist allows only the sockets they need.
 #[derive(Debug)]
 pub struct Filters {
     pub allowlist: BpfProgram,
     pub denylist: BpfProgram,
+    pub families: Option<BpfProgram>,
 }
 
 /// Builds the filters for `config` and the CPU architecture sandy was built for. `own_pid` is
@@ -261,7 +328,22 @@ pub fn build(config: &FilterConfig, own_pid: u32) -> Result<Filters, BackendErro
     Ok(Filters {
         allowlist: allowlist(target)?,
         denylist: denylist(config, own_pid, target)?,
+        families: Some(family_filter(config, target)?),
     })
+}
+
+/// The third filter: `socket` with a family the policy denies fails with EAFNOSUPPORT instead of
+/// EPERM, so that a program which probes for a family falls back as it would on a kernel without
+/// it. Installed last, because the kernel takes the newest filter's result among equal actions.
+fn family_filter(config: &FilterConfig, target: TargetArch) -> Result<BpfProgram, BackendError> {
+    let rules = BTreeMap::from([(libc::SYS_socket, socket_rules(config)?)]);
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EAFNOSUPPORT as u32),
+        target,
+    )?;
+    filter.try_into()
 }
 
 fn allowlist(target: TargetArch) -> Result<BpfProgram, BackendError> {
@@ -300,8 +382,8 @@ fn denylist(
     for &call in DENIED.iter().chain(arch::DENIED) {
         rules.add(call, Vec::new());
     }
-    rules.add(libc::SYS_ioctl, ioctl_rules()?);
-    rules.add(libc::SYS_socket, socket_rules(config)?);
+    rules.add(libc::SYS_ioctl, ioctl_rules(config)?);
+    rules.add(libc::SYS_fcntl, lease_rules()?);
     rules.add(libc::SYS_socketpair, socketpair_rules(config)?);
     if !config.allow_ip && !config.allow_unix {
         // The only sockets left are connected pairs, which need none of these. bind would let
@@ -332,6 +414,13 @@ fn denylist(
     if config.keep_process_group {
         rules.add(libc::SYS_setsid, Vec::new());
         rules.add(libc::SYS_setpgid, Vec::new());
+    } else if config.isolate_signals {
+        // Group 0 makes the process a group leader. Every other group ID joins a group that
+        // exists, and a terminal then stops or signals that whole group with the program in it.
+        rules.add(
+            libc::SYS_setpgid,
+            vec![rule(vec![low(1, SeccompCmpOp::Ne, 0)?])?],
+        );
     }
     let unshare: Vec<i32> = [CLONE_NAMESPACES, &[libc::CLONE_NEWTIME]].concat();
     rules.add(libc::SYS_unshare, namespace_rules(&unshare)?);
@@ -395,12 +484,40 @@ impl Rules {
 }
 
 /// TIOCSTI and TIOCLINUX can push input into the terminal of the user, where a shell outside the
-/// sandbox would run it.
-fn ioctl_rules() -> Result<Vec<SeccompRule>, BackendError> {
-    [libc::TIOCSTI as u32, libc::TIOCLINUX as u32]
+/// sandbox would run it. TIOCSETD changes the line discipline of the terminal, and the kernel
+/// loads the module of a discipline on demand (dev.tty.ldisc_autoload). The file system ioctls
+/// change files through descriptors that Landlock opened for reading. With isolated signals,
+/// TIOCSPGRP and TIOCSWINSZ are denied too: the first gives the terminal to another job of the
+/// session, which then stops at its next read, and the second makes the kernel send SIGWINCH to
+/// the foreground group.
+fn ioctl_rules(config: &FilterConfig) -> Result<Vec<SeccompRule>, BackendError> {
+    let mut commands = vec![
+        libc::TIOCSTI as u32,
+        libc::TIOCLINUX as u32,
+        libc::TIOCSETD as u32,
+    ];
+    commands.extend(FILE_SYSTEM_IOCTLS);
+    if config.isolate_signals {
+        commands.extend([libc::TIOCSPGRP as u32, libc::TIOCSWINSZ as u32]);
+    }
+    commands
         .into_iter()
         .map(|command| rule(vec![low(1, SeccompCmpOp::Eq, u64::from(command))?]))
         .collect()
+}
+
+/// A lease or a delegation needs only a read descriptor of a file the user owns, and Landlock
+/// does not cover fcntl. While the program holds one, a process outside that opens the file for
+/// writing, or changes the directory of a delegation, waits until the program gives it up or
+/// /proc/sys/fs/lease-break-time passes (45 seconds by default). Giving one up (F_UNLCK) stays
+/// allowed; the argument of F_SETDELEG is a pointer, so that command is denied as a whole.
+fn lease_rules() -> Result<Vec<SeccompRule>, BackendError> {
+    let lease = rule(vec![
+        low(1, SeccompCmpOp::Eq, libc::F_SETLEASE as u64)?,
+        low(2, SeccompCmpOp::Ne, libc::F_UNLCK as u64)?,
+    ])?;
+    let delegation = rule(vec![low(1, SeccompCmpOp::Eq, F_SETDELEG)?])?;
+    Ok(vec![lease, delegation])
 }
 
 /// An allowlist of socket families. A denylist of AF_INET and AF_INET6 is not enough: other
@@ -611,6 +728,7 @@ pub fn watcher(program: i32) -> Result<Filters, BackendError> {
     Ok(Filters {
         allowlist: allowlist(target)?,
         denylist: filter.try_into()?,
+        families: None,
     })
 }
 
@@ -653,14 +771,19 @@ pub fn relay() -> Result<Filters, BackendError> {
     Ok(Filters {
         allowlist: allowlist(target)?,
         denylist: filter.try_into()?,
+        families: None,
     })
 }
 
-/// Installs the allowlist and then the denylist on every thread of the process. Both stay in
-/// force across execve and are inherited by every child.
+/// Installs the filters on every thread of the process, in order. They stay in force across
+/// execve and are inherited by every child.
 pub fn install(filters: &Filters) -> Result<(), seccompiler::Error> {
     seccompiler::apply_filter_all_threads(&filters.allowlist)?;
-    seccompiler::apply_filter_all_threads(&filters.denylist)
+    seccompiler::apply_filter_all_threads(&filters.denylist)?;
+    match &filters.families {
+        Some(families) => seccompiler::apply_filter_all_threads(families),
+        None => Ok(()),
+    }
 }
 
 #[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -672,6 +795,7 @@ mod tests {
     const RET_KILL_PROCESS: u32 = libc::SECCOMP_RET_KILL_PROCESS;
     const RET_EPERM: u32 = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
     const RET_ENOSYS: u32 = libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32;
+    const RET_NO_FAMILY: u32 = libc::SECCOMP_RET_ERRNO | libc::EAFNOSUPPORT as u32;
 
     #[cfg(target_arch = "x86_64")]
     const NATIVE: u32 = 62 | 0x8000_0000 | 0x4000_0000;
@@ -738,7 +862,12 @@ mod tests {
     fn decide_with(filters: &Filters, arch: u32, nr: i64, args: [u64; 6]) -> u32 {
         let rank = |action: u32| (action & libc::SECCOMP_RET_ACTION_FULL) as i32;
         let mut result = RET_ALLOW;
-        for program in [&filters.denylist, &filters.allowlist] {
+        // Newest first, as the kernel walks the list.
+        let installed = filters
+            .families
+            .iter()
+            .chain([&filters.denylist, &filters.allowlist]);
+        for program in installed {
             let action = evaluate(program, arch, nr, args);
             if rank(action) < rank(result) {
                 result = action;
@@ -759,6 +888,7 @@ mod tests {
             deny_path_metadata: true,
             deny_children: true,
             keep_process_group: true,
+            isolate_signals: true,
         }
     }
 
@@ -770,12 +900,22 @@ mod tests {
             deny_path_metadata: false,
             deny_children: false,
             keep_process_group: false,
+            isolate_signals: false,
         }
     }
 
+    /// `children = "contained"` requires `signals = "isolated"`.
     fn contained() -> FilterConfig {
         FilterConfig {
             keep_process_group: true,
+            isolate_signals: true,
+            ..open()
+        }
+    }
+
+    fn isolated() -> FilterConfig {
+        FilterConfig {
+            isolate_signals: true,
             ..open()
         }
     }
@@ -794,8 +934,13 @@ mod tests {
     fn programs_fit_the_kernel_limit() {
         for config in [strict(), open()] {
             let filters = build(&config, OWN_PID).unwrap();
-            assert!(filters.allowlist.len() < 4096);
-            assert!(filters.denylist.len() < 4096);
+            let programs = filters
+                .families
+                .iter()
+                .chain([&filters.allowlist, &filters.denylist]);
+            for program in programs {
+                assert!(program.len() < 4096);
+            }
         }
     }
 
@@ -832,6 +977,8 @@ mod tests {
         assert_eq!(call(&open(), libc::SYS_openat2, [0; 6]), RET_ENOSYS);
     }
 
+    /// A denied family fails with EAFNOSUPPORT, which programs treat as "this kernel does not
+    /// have it".
     #[test]
     fn socket_families_follow_the_policy() {
         for family in [
@@ -841,7 +988,7 @@ mod tests {
             libc::AF_NETLINK,
         ] {
             let args = socket(family, 1, 0);
-            assert_eq!(call(&strict(), libc::SYS_socket, args), RET_EPERM);
+            assert_eq!(call(&strict(), libc::SYS_socket, args), RET_NO_FAMILY);
             assert_eq!(call(&open(), libc::SYS_socket, args), RET_ALLOW);
         }
         const AF_ALG: i32 = 38;
@@ -849,31 +996,31 @@ mod tests {
         const AF_SMC: i32 = 43;
         for family in [libc::AF_PACKET, AF_VSOCK, AF_ALG, AF_SMC, 0] {
             let args = socket(family, 1, 0);
-            assert_eq!(call(&open(), libc::SYS_socket, args), RET_EPERM);
+            assert_eq!(call(&open(), libc::SYS_socket, args), RET_NO_FAMILY);
         }
         const NETLINK_SOCK_DIAG: i32 = 4;
         let diag = socket(libc::AF_NETLINK, 2, NETLINK_SOCK_DIAG);
-        assert_eq!(call(&open(), libc::SYS_socket, diag), RET_EPERM);
+        assert_eq!(call(&open(), libc::SYS_socket, diag), RET_NO_FAMILY);
         let ip_only = FilterConfig {
             allow_unix: false,
             ..open()
         };
         let unix = socket(libc::AF_UNIX, 1, 0);
-        assert_eq!(call(&ip_only, libc::SYS_socket, unix), RET_EPERM);
+        assert_eq!(call(&ip_only, libc::SYS_socket, unix), RET_NO_FAMILY);
         let unix_only = FilterConfig {
             allow_ip: false,
             ..open()
         };
         assert_eq!(call(&unix_only, libc::SYS_socket, unix), RET_ALLOW);
         let inet = socket(libc::AF_INET, 1, 0);
-        assert_eq!(call(&unix_only, libc::SYS_socket, inet), RET_EPERM);
+        assert_eq!(call(&unix_only, libc::SYS_socket, inet), RET_NO_FAMILY);
     }
 
     #[test]
     fn socket_family_check_uses_the_low_32_bits() {
         let high_bits = (1u64 << 32) | libc::AF_UNIX as u64;
         let args = args(&[high_bits, 1]);
-        assert_eq!(call(&strict(), libc::SYS_socket, args), RET_EPERM);
+        assert_eq!(call(&strict(), libc::SYS_socket, args), RET_NO_FAMILY);
     }
 
     /// Without IP and Unix sockets the program has only connected socket pairs, which need no
@@ -960,15 +1107,63 @@ mod tests {
     }
 
     #[test]
-    fn terminal_injection_is_denied_also_with_high_bits_set() {
-        for command in [libc::TIOCSTI as u32, libc::TIOCLINUX as u32].map(u64::from) {
+    fn terminal_ioctls_are_denied_also_with_high_bits_set() {
+        let denied = [libc::TIOCSTI, libc::TIOCLINUX, libc::TIOCSETD];
+        for command in denied.map(|command| u64::from(command as u32)) {
             for high in [0, 0xffff_ffff_0000_0000] {
                 let args = args(&[0, high | command]);
                 assert_eq!(call(&open(), libc::SYS_ioctl, args), RET_EPERM);
             }
         }
-        let window_size = args(&[0, u64::from(libc::TIOCGWINSZ as u32)]);
-        assert_eq!(call(&strict(), libc::SYS_ioctl, window_size), RET_ALLOW);
+        for command in [libc::TIOCGWINSZ, libc::TIOCGETD].map(|c| u64::from(c as u32)) {
+            let args = args(&[0, command]);
+            assert_eq!(call(&strict(), libc::SYS_ioctl, args), RET_ALLOW);
+        }
+    }
+
+    #[test]
+    fn file_system_ioctls_that_change_files_are_denied() {
+        const HIGH: u64 = 0xffff_ffff_0000_0000;
+        for &command in FILE_SYSTEM_IOCTLS {
+            let args = args(&[3, HIGH | u64::from(command)]);
+            for config in [strict(), open()] {
+                assert_eq!(
+                    call(&config, libc::SYS_ioctl, args),
+                    RET_EPERM,
+                    "{command:#x}"
+                );
+            }
+        }
+        // The forms that only read stay allowed: FS_IOC_GETFLAGS and FS_IOC_FSGETXATTR.
+        for command in [0x8008_6601u32, 0x801c_581f] {
+            let args = args(&[3, u64::from(command)]);
+            assert_eq!(
+                call(&open(), libc::SYS_ioctl, args),
+                RET_ALLOW,
+                "{command:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn leases_and_delegations_are_denied() {
+        const HIGH: u64 = 0xffff_ffff_0000_0000;
+        let fcntl = |command: u64, argument: u64| args(&[3, HIGH | command, HIGH | argument]);
+        for config in [strict(), open()] {
+            for kind in [libc::F_RDLCK, libc::F_WRLCK].map(|kind| kind as u64) {
+                let lease = fcntl(libc::F_SETLEASE as u64, kind);
+                assert_eq!(call(&config, libc::SYS_fcntl, lease), RET_EPERM);
+            }
+            let delegation = fcntl(F_SETDELEG, 0);
+            assert_eq!(call(&config, libc::SYS_fcntl, delegation), RET_EPERM);
+            // Giving a lease up, reading one, and the locks that readers need.
+            let unlock = fcntl(libc::F_SETLEASE as u64, libc::F_UNLCK as u64);
+            assert_eq!(call(&config, libc::SYS_fcntl, unlock), RET_ALLOW);
+            for command in [libc::F_GETLEASE, libc::F_OFD_SETLK, libc::F_SETLK] {
+                let args = fcntl(command as u64, 0);
+                assert_eq!(call(&config, libc::SYS_fcntl, args), RET_ALLOW, "{command}");
+            }
+        }
     }
 
     #[test]
@@ -1016,6 +1211,9 @@ mod tests {
                 SYS_STATMOUNT,
                 SYS_LISTMOUNT,
                 SYS_LISTNS,
+                SYS_LSM_GET_SELF_ATTR,
+                SYS_LSM_SET_SELF_ATTR,
+                SYS_LSM_LIST_MODULES,
             ] {
                 assert_eq!(call(&config, nr, [0; 6]), RET_EPERM, "system call {nr}");
             }
@@ -1260,14 +1458,73 @@ mod tests {
         assert_eq!(call(&strict(), libc::SYS_getpgid, [0; 6]), RET_ALLOW);
     }
 
+    /// With isolated signals the program may lead a group of its own, but not join one that
+    /// exists and not steer the terminal's job control.
+    #[test]
+    fn isolated_signals_allow_only_a_process_group_of_the_program_s_own() {
+        const HIGH: u64 = 0xffff_ffff_0000_0000;
+        let child = u64::from(OWN_PID) + 1;
+        for own_group in [args(&[0, 0]), args(&[child, 0]), args(&[0, HIGH])] {
+            assert_eq!(call(&isolated(), libc::SYS_setpgid, own_group), RET_ALLOW);
+            assert_eq!(call(&contained(), libc::SYS_setpgid, own_group), RET_EPERM);
+        }
+        // seccomp cannot compare two arguments, so setpgid(pid, pid) is denied as well.
+        for existing_group in [args(&[0, child]), args(&[child, child])] {
+            assert_eq!(
+                call(&isolated(), libc::SYS_setpgid, existing_group),
+                RET_EPERM
+            );
+            assert_eq!(call(&open(), libc::SYS_setpgid, existing_group), RET_ALLOW);
+        }
+        assert_eq!(call(&isolated(), libc::SYS_setsid, [0; 6]), RET_ALLOW);
+        for command in [libc::TIOCSPGRP, libc::TIOCSWINSZ].map(|c| u64::from(c as u32)) {
+            for high in [0, HIGH] {
+                let args = args(&[0, high | command]);
+                for config in [isolated(), contained()] {
+                    assert_eq!(
+                        call(&config, libc::SYS_ioctl, args),
+                        RET_EPERM,
+                        "{command:#x}"
+                    );
+                }
+                assert_eq!(
+                    call(&open(), libc::SYS_ioctl, args),
+                    RET_ALLOW,
+                    "{command:#x}"
+                );
+            }
+        }
+        for command in [libc::TIOCGPGRP, libc::TIOCGWINSZ].map(|c| u64::from(c as u32)) {
+            let args = args(&[0, command]);
+            assert_eq!(call(&isolated(), libc::SYS_ioctl, args), RET_ALLOW);
+        }
+    }
+
     #[test]
     fn personality_allows_only_harmless_values() {
-        assert_eq!(call(&open(), libc::SYS_personality, [0; 6]), RET_ALLOW);
-        let query = args(&[0xffff_ffff]);
-        assert_eq!(call(&open(), libc::SYS_personality, query), RET_ALLOW);
+        const ADDR_NO_RANDOMIZE: u64 = 0x4_0000;
+        for value in [
+            0,
+            0xffff_ffff,
+            ADDR_NO_RANDOMIZE,
+            ADDR_NO_RANDOMIZE | 0x2_0000,
+        ] {
+            let args = args(&[value]);
+            assert_eq!(
+                call(&open(), libc::SYS_personality, args),
+                RET_ALLOW,
+                "{value:#x}"
+            );
+        }
         const READ_IMPLIES_EXEC: u64 = 0x040_0000;
-        let exec = args(&[READ_IMPLIES_EXEC]);
-        assert_eq!(call(&open(), libc::SYS_personality, exec), RET_EPERM);
+        for value in [READ_IMPLIES_EXEC, READ_IMPLIES_EXEC | ADDR_NO_RANDOMIZE] {
+            let args = args(&[value]);
+            assert_eq!(
+                call(&open(), libc::SYS_personality, args),
+                RET_EPERM,
+                "{value:#x}"
+            );
+        }
     }
 
     #[test]

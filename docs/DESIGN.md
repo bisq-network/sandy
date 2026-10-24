@@ -308,7 +308,7 @@ continue if any mechanism fails while it is applied.
 Details, the minimal system set and the known limitations are in [linux.md](linux.md).
 
 - Order: mark descriptors above 2 close-on-exec, `PR_SET_NO_NEW_PRIVS`, Landlock
-  `restrict_self`, two seccomp filters (TSYNC), `execve`. Everything that can fail on bad input
+  `restrict_self`, three seccomp filters (TSYNC), `execve`. Everything that can fail on bad input
   is prepared before the first step.
 - Landlock (ABI 1 or newer, read from the kernel at run time) handles every file system right of
   the ABI. Writable paths never get execute, symbolic link, named pipe or device rights. ABI 6
@@ -316,13 +316,18 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   pathname Unix sockets when `unix_sockets = "none"`; ABI 4 denies TCP when `ip = "none"`.
 - Seccomp allowlist: the reviewed system call table of Linux 7.2; every other number, x32 numbers,
   `clone3` and `openat2` fail with `ENOSYS`; other CPU architectures are killed.
-- Seccomp denylist (`EPERM`): socket families outside the policy (an allowlist), datagram socket
-  pairs when Unix sockets are denied, io_uring, ptrace and `process_vm_*`, System V IPC, POSIX
-  message queues, namespaces, mounts, `bpf`, `perf_event_open`, `userfaultfd`, keyrings,
-  `TIOCSTI`/`TIOCLINUX`, calls that need capabilities, `open` with access mode 3 (Landlock does
-  not check it), the path-based metadata calls when `path_metadata = "deny"`, setuid and setgid
-  mode bits, changes of the limits, priority and CPU affinity of other processes, and before
-  Landlock ABI 3 truncation without write access.
+- Seccomp socket family filter: `socket` with a family outside the policy (an allowlist) fails
+  with `EAFNOSUPPORT`, so that programs fall back as they would on a kernel without the family.
+- Seccomp denylist (`EPERM`): datagram socket pairs when Unix sockets are denied, io_uring,
+  ptrace and `process_vm_*`, System V IPC, POSIX message queues, namespaces, mounts, `bpf`,
+  `perf_event_open`, `userfaultfd`, keyrings, the security module calls,
+  `TIOCSTI`/`TIOCLINUX`/`TIOCSETD`, the file system ioctls that change a file through a
+  read-only descriptor (inode flags, fs-verity, fscrypt policies, btrfs subvolumes), file leases
+  and delegations (`F_SETLEASE`, `F_SETDELEG`), with `signals = "isolated"` also `TIOCSPGRP`,
+  `TIOCSWINSZ` and `setpgid` into a process group that exists, calls that need capabilities,
+  `open` with access mode 3 (Landlock does not check it), the path-based metadata calls when
+  `path_metadata = "deny"`, setuid and setgid mode bits, changes of the limits, priority and CPU
+  affinity of other processes, and before Landlock ABI 3 truncation without write access.
 - `process.children = "none"`: the seccomp denylist allows `clone` only with `CLONE_THREAD` and
   denies `fork` and `vfork`; `clone3` fails with `ENOSYS`, so threads use `clone`.
 - `process.children = "contained"`: sandy becomes a child subreaper and forks a guard process,

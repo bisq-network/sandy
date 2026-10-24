@@ -6,6 +6,7 @@
 mod common;
 
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
 use std::os::fd::AsRawFd;
 use std::os::linux::net::SocketAddrExt;
@@ -13,7 +14,8 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{SocketAddr, UnixListener};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use common::linux::*;
@@ -134,6 +136,19 @@ fn only_route_netlink_is_available_with_ip() {
     lines[1].assert_blocked();
 }
 
+/// A denied family fails with `EAFNOSUPPORT`, as on a kernel that does not have it, so that a
+/// program which probes for a family falls back instead of treating the failure as fatal.
+#[test]
+fn denied_socket_families_look_unsupported() {
+    let unsupported = "os error 97";
+    let lines = controlled(&args(&["--ip", "all"]), &[("socket", "unix")]);
+    assert!(lines[0].detail.contains(unsupported), "{lines:?}");
+    let lines = controlled(&[], &[("socket", "inet"), ("socket", "unix")]);
+    for line in lines {
+        assert!(line.detail.contains(unsupported), "{line:?}");
+    }
+}
+
 /// Yama's ptrace_scope. From 1 up it limits ptrace and `/proc/<pid>/mem` to descendants, also
 /// outside the sandbox. `None` when Yama is not active.
 fn yama_ptrace_scope() -> Option<u32> {
@@ -214,6 +229,258 @@ fn terminal_input_injection_is_denied() {
     // The terminal was opened before the sandbox, so ordinary terminal ioctls still work.
     lines[0].assert_ok();
     assert_eq!(lines[1].result, "denied", "{lines:?}");
+}
+
+/// A lease or a delegation needs only a read descriptor of a file or directory the user owns.
+/// While the program held one, a process outside that opens the file for writing, or changes
+/// the directory, would wait for up to `/proc/sys/fs/lease-break-time` (45 seconds by default).
+#[test]
+fn leases_and_delegations_are_denied() {
+    let fixture = Fixture::new("linux-lease");
+    let (file, dir) = (fixture.arg("ro/file"), fixture.arg("ro"));
+    let mut actions = vec![("lease-read", file.as_str())];
+    let delegations = [("delegation", file.as_str()), ("delegation", dir.as_str())];
+    let control = probe_outside(&delegations[..1]);
+    if control[0].result == "ok" {
+        actions.extend(delegations);
+    } else {
+        skip(&format!("no delegations here: {}", control[0].detail));
+    }
+    for line in controlled(&fixture.access_args(), &actions) {
+        assert_eq!(line.result, "denied", "{line:?}");
+    }
+}
+
+/// A line discipline other than the terminal's own can come from a kernel module that the
+/// kernel loads on demand (`dev.tty.ldisc_autoload`). The probe sets the discipline the terminal
+/// already has, so the control run loads nothing; the filter denies the request either way.
+#[test]
+fn the_terminal_line_discipline_cannot_change() {
+    let Some(pty) = open_pty() else {
+        return skip("no pseudo-terminal available");
+    };
+    let actions = [("tiocsetd", "0")];
+    parse(&probe_outside_with(&actions, with_terminal(&pty)))[0].assert_ok();
+    let lines = probe_inside_with(&[], &actions, with_terminal(&pty));
+    assert_eq!(lines[0].result, "denied", "{lines:?}");
+}
+
+/// A terminal session like a shell's. A session leader owns a pseudo-terminal and keeps its
+/// foreground group, and starts two background jobs, each in a process group of its own: a
+/// victim outside the sandbox that only sleeps, and then the job under test, in whose arguments
+/// `{job}` stands for the victim's process group. The kernel sends the job control signals of a
+/// terminal to a whole process group without the permission check that the Landlock signal scope
+/// hooks, so a session of this shape is what shows whether a program can reach another job.
+struct JobSession {
+    pty: Pty,
+    leader: Child,
+    victim: u32,
+    job: u32,
+    /// The probe lines of the jobs; the leader's own `start-job` lines are taken out.
+    lines: mpsc::Receiver<ProbeLine>,
+    /// Lines of the job that arrived while `start` still waited for a `start-job` line.
+    early: Vec<ProbeLine>,
+}
+
+impl JobSession {
+    /// `None` when the host has no pseudo-terminal.
+    fn start(job: &[String]) -> Option<JobSession> {
+        let pty = open_pty()?;
+        let victim = [probe_path(), "sleep".to_string(), "60000".to_string()];
+        let actions = [
+            ("start-job", job_target(&victim)),
+            ("start-job", job_target(job)),
+            ("sleep", "60000".to_string()),
+        ];
+        let actions: Vec<(&str, &str)> = actions
+            .iter()
+            .map(|(action, target)| (*action, target.as_str()))
+            .collect();
+        let mut command = Command::new(probe_path());
+        command
+            .args(probe_args(&actions))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        with_terminal(&pty)(&mut command);
+        let mut leader = command.spawn().unwrap();
+        let output = BufReader::new(leader.stdout.take().unwrap());
+        let (sender, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in output.lines().map_while(Result::ok) {
+                if sender.send(parse_line(&line)).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut started = Vec::new();
+        let mut early = Vec::new();
+        while started.len() < 2 {
+            let line = lines.recv_timeout(Duration::from_secs(10)).unwrap();
+            // The job can report before the leader reports having started it.
+            if line.action == "start-job" {
+                line.assert_ok();
+                started.push(line.detail.parse().unwrap());
+            } else {
+                early.push(line);
+            }
+        }
+        Some(JobSession {
+            pty,
+            leader,
+            victim: started[0],
+            job: started[1],
+            lines,
+            early,
+        })
+    }
+
+    /// The job's probe line, or `None` if the victim stopped or ten seconds passed first.
+    fn job_line(&mut self) -> Option<ProbeLine> {
+        if !self.early.is_empty() {
+            return Some(self.early.remove(0));
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !self.victim_stopped() {
+            if let Ok(line) = self.lines.recv_timeout(Duration::from_millis(50)) {
+                return Some(line);
+            }
+        }
+        None
+    }
+
+    fn victim_stopped(&self) -> bool {
+        read_proc(self.victim, "status")
+            .is_some_and(|status| status_value(&status, "State").starts_with('T'))
+    }
+
+    /// The process group that owns the terminal.
+    fn foreground(&self) -> libc::pid_t {
+        // SAFETY: tcgetpgrp on the master reads the foreground group of the slave.
+        unsafe { libc::tcgetpgrp(self.pty.master.as_raw_fd()) }
+    }
+}
+
+impl Drop for JobSession {
+    fn drop(&mut self) {
+        // None of these processes forks, so one signal per group is enough. The leader goes
+        // last: its children are reaped once it has ended and they belong to process 1.
+        for group in [self.victim, self.job, self.leader.id()] {
+            // SAFETY: kill takes a process group ID and a signal.
+            unsafe { libc::kill(-(group as libc::pid_t), libc::SIGKILL) };
+        }
+        let _ = self.leader.kill();
+        let _ = self.leader.wait();
+    }
+}
+
+/// A command line for `start-job`: the program and its arguments, separated by U+001F.
+fn job_target(command: &[String]) -> String {
+    command.join("\u{1f}")
+}
+
+/// The `JobSession` job that runs the probe in the sandbox with isolated signals.
+fn isolated_job(actions: &[(&str, &str)]) -> Vec<String> {
+    let mut job = vec![sandy_path()];
+    job.extend(run_args(&args(&["--signals", "isolated"]), actions));
+    job
+}
+
+/// A background job that reads the terminal is stopped by the kernel, with every other process
+/// of its group. `signals = "isolated"` must therefore keep the program out of the groups of
+/// other jobs.
+#[test]
+fn other_jobs_of_the_terminal_cannot_be_stopped() {
+    if landlock_abi() < 6 {
+        return skip("Landlock ABI 6 is required for signal isolation");
+    }
+    let join = [("setpgid-join", "{job}")];
+    let mut outside = vec![probe_path()];
+    outside.extend(probe_args(&join));
+    let Some(mut control) = JobSession::start(&outside) else {
+        return skip("no pseudo-terminal available");
+    };
+    // The control stops itself together with the victim, so it reports no line.
+    assert!(control.job_line().is_none(), "the control was not stopped");
+    assert!(control.victim_stopped(), "the control stopped no job");
+    drop(control);
+
+    let mut session = JobSession::start(&isolated_job(&join)).unwrap();
+    let line = session.job_line();
+    assert!(!session.victim_stopped(), "the program stopped another job");
+    assert_eq!(
+        line.as_ref().map(|line| line.result.as_str()),
+        Some("denied")
+    );
+    // A process group of the program's own stays possible.
+    probe_inside(&args(&["--signals", "isolated"]), &[("setpgid", "-")])[0].assert_ok();
+}
+
+/// With the terminal's foreground, the program could stop the job that had it: that job is
+/// stopped as soon as it reads the terminal again.
+#[test]
+fn the_terminal_cannot_be_taken_from_the_foreground_job() {
+    if landlock_abi() < 6 {
+        return skip("Landlock ABI 6 is required for signal isolation");
+    }
+    let take = [("tcsetpgrp", "0")];
+    let mut outside = vec![probe_path()];
+    outside.extend(probe_args(&take));
+    let Some(mut control) = JobSession::start(&outside) else {
+        return skip("no pseudo-terminal available");
+    };
+    let line = control.job_line().unwrap();
+    line.assert_ok();
+    assert_eq!(
+        control.foreground().to_string(),
+        line.detail.replace("group ", "")
+    );
+    drop(control);
+
+    let mut session = JobSession::start(&isolated_job(&take)).unwrap();
+    assert_eq!(session.job_line().unwrap().result, "denied");
+    assert_eq!(session.foreground(), session.leader.id() as libc::pid_t);
+}
+
+/// Changing the window size of a terminal makes the kernel send SIGWINCH to its foreground
+/// group, which is outside the sandbox when the program inherited the user's terminal.
+#[test]
+fn terminal_resize_cannot_signal_outside() {
+    if landlock_abi() < 6 {
+        return skip("Landlock ABI 6 is required for signal isolation");
+    }
+    let Some(pty) = open_pty() else {
+        return skip("no pseudo-terminal available");
+    };
+    let resize = [("tiocswinsz", "0")];
+    let on_the_terminal = |command: &mut Command| {
+        command.stdin(Stdio::from(pty.slave.try_clone().unwrap()));
+    };
+    // SIGWINCH goes to the foreground group, so the victim owns the terminal and the probe does
+    // not: it only holds a descriptor of it, as a program that inherited the user's terminal.
+    let watch = || {
+        let mut command = Command::new(probe_path());
+        command
+            .args(probe_args(&[("await-signal", "28")]))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        with_terminal(&pty)(&mut command);
+        let mut victim = command.spawn().unwrap();
+        let mut ready = String::new();
+        BufReader::new(victim.stderr.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert!(ready.starts_with("await-signal ready"), "{ready:?}");
+        victim
+    };
+
+    let mut victim = watch();
+    parse(&probe_outside_with(&resize, on_the_terminal))[0].assert_ok();
+    assert_eq!(victim.wait().unwrap().code(), Some(42));
+
+    let mut victim = watch();
+    let lines = probe_inside_with(&args(&["--signals", "isolated"]), &resize, on_the_terminal);
+    assert_eq!(lines[0].result, "denied", "{lines:?}");
+    assert_ne!(victim.wait().unwrap().code(), Some(42));
 }
 
 #[test]

@@ -215,6 +215,10 @@ fn denylisted_calls_fail_with_eperm_on_the_kernel() {
         call(libc::SYS_add_key, &[0, 0, 0, 0, 0]),
         call(libc::SYS_request_key, &[0, 0, 0, 0]),
         call(libc::SYS_quotactl_fd, &[-1, 0, 0, 0]),
+        // The security module calls of Linux 6.8, which the libc crate does not have yet.
+        call(459, &[0, 0, 0, 0]),
+        call(460, &[0, 0, 0, 0]),
+        call(461, &[0, 0, 0]),
         call(
             libc::SYS_clock_settime,
             &[libc::CLOCK_REALTIME as libc::c_long, 0],
@@ -384,4 +388,88 @@ fn fanotify_watches_paths_outside_the_policy() {
         ));
     }
     probe_inside(&fixture.access_args(), &[("fanotify-init", &secret)])[0].assert_ok();
+}
+
+/// docs/linux.md, "Metadata": the file system ioctls that change a file or a directory are
+/// denied, so a `read` path grants none of them. They would otherwise work on every descriptor,
+/// because Landlock checks ioctls only on device files. fs-verity needs a file system that
+/// supports it, so that part runs in the build's temporary directory and is skipped elsewhere.
+#[test]
+fn file_system_ioctls_cannot_change_readable_files() {
+    let fixture = Fixture::new("conformance-fdioctl");
+    let (readable, writable) = (fixture.arg("ro/file"), fixture.arg("rw/file"));
+    for file in [&readable, &writable] {
+        let actions = [
+            ("setflags-ro", file.as_str()),
+            ("fsxattr-ro", file.as_str()),
+        ];
+        let outside = probe_outside(&actions);
+        let inside = probe_inside(&fixture.access_args(), &actions);
+        for (control, line) in outside.iter().zip(&inside) {
+            if control.result != "ok" {
+                skip(&format!(
+                    "{} fails outside: {}",
+                    control.action, control.detail
+                ));
+                continue;
+            }
+            assert!(is_eperm(line), "control {control:?}, inside {line:?}");
+        }
+    }
+
+    let Ok(parent) = Path::new(env!("CARGO_TARGET_TMPDIR")).canonicalize() else {
+        return skip("the temporary directory of the build is not on this host");
+    };
+    let fixture = Fixture::new_in(&parent, "conformance-verity");
+    let verity = [("enable-verity", fixture.arg("ro/file"))];
+    let verity: Vec<(&str, &str)> = verity
+        .iter()
+        .map(|(action, target)| (*action, target.as_str()))
+        .collect();
+    let outside = probe_outside(&verity);
+    if outside[0].result != "ok" {
+        return skip(&format!("no fs-verity here: {}", outside[0].detail));
+    }
+    // The control made the file permanently read-only, so the run inside needs a new one.
+    fixture.reset();
+    let inside = probe_inside(&fixture.access_args(), &verity);
+    assert!(is_eperm(&inside[0]), "{inside:?}");
+}
+
+/// Records a documented limitation (docs/linux.md, "Metadata through open files"): `fchmod`,
+/// `fsetxattr` and `futimens` work on a descriptor that a `read` path opened. seccomp sees only
+/// the descriptor number, not how the file was opened, and Landlock has no metadata right. If
+/// this test fails, sandy gained a way to tell the two apart and the limitation list should say
+/// so.
+#[test]
+fn metadata_calls_on_a_read_only_descriptor_still_work() {
+    let fixture = Fixture::new("conformance-fdmeta");
+    let file = fixture.arg("ro/file");
+    let actions = [
+        ("fchmod-ro", file.as_str()),
+        ("utime-ro", file.as_str()),
+        ("setxattr-fd", file.as_str()),
+    ];
+    let outside = probe_outside(&actions);
+    let inside = probe_inside(&fixture.access_args(), &actions);
+    for (control, line) in outside.iter().zip(&inside) {
+        if control.result != "ok" {
+            skip(&format!(
+                "{} fails outside: {}",
+                control.action, control.detail
+            ));
+            continue;
+        }
+        line.assert_ok();
+    }
+}
+
+/// docs/linux.md, "Denylist": the program may switch address space randomization off for
+/// itself, which `setarch -R` and record and replay debuggers need. Other personality values
+/// stay denied; `denylisted_calls_fail_with_eperm_on_the_kernel` checks `READ_IMPLIES_EXEC`.
+#[test]
+fn address_randomization_can_be_switched_off() {
+    const ADDR_NO_RANDOMIZE: libc::c_long = 0x4_0000;
+    let call = format!("{}:{ADDR_NO_RANDOMIZE}", libc::SYS_personality);
+    controlled(&[], &[("raw-syscall", &call)])[0].assert_ok();
 }

@@ -48,7 +48,7 @@ program sees the normal file system, but it can open only what the policy allows
 
 | Platform | Mechanism |
 |---|---|
-| Linux | Landlock (file access, TCP ports, scopes), two seccomp-bpf filters, `no_new_privs`, closing inherited descriptors, then `execve` |
+| Linux | Landlock (file access, TCP ports, scopes), three seccomp-bpf filters, `no_new_privs`, closing inherited descriptors, then `execve` |
 | macOS | A Seatbelt profile generated from the policy, applied with `sandbox_init_with_parameters`, then `execve` |
 | Windows | An AppContainer with one capability per policy path, a job object with UI restrictions, and a list of inherited handles |
 
@@ -423,7 +423,10 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
 ### Processes
 
 - `signals = "isolated"` limits signals to processes in the same sandbox. On Linux this needs
-  Landlock ABI 6 (kernel 6.12 or newer); older kernels refuse such a policy.
+  Landlock ABI 6 (kernel 6.12 or newer); older kernels refuse such a policy. The kernel also
+  signals whole process groups for terminal job control, without that check, so on Linux the
+  program can then neither join another job's process group nor take the terminal from the
+  foreground job nor resize it. A shell inside the sandbox therefore has no job control.
 - `children` decides whether the program may start processes:
   - `allowed` (the default): yes. On Linux and macOS these processes can outlive the program; on
     Windows they end with it.
@@ -474,9 +477,11 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
 
 Landlock does not control `chmod`, `chown`, `utimensat` and `setxattr`. With the default
 `path_metadata = "deny"`, sandy denies these calls when they take a path, everywhere, also inside
-writable paths. The calls on an open file (`fchmod`, `futimens`, `fsetxattr`) keep working. Tools
-that change metadata by path (`tar`, `cp -p`, `install`, `git checkout`) need `"allow"`; then the
-program can change the metadata of every file the user owns.
+writable paths. The calls on an open file (`fchmod`, `futimens`, `fsetxattr`) keep working, also
+on a file the program may only read. The file system ioctls that change a file the same way, and
+fs-verity, fscrypt and btrfs subvolume ioctls, are denied under every policy. Tools that change
+metadata by path (`tar`, `cp -p`, `install`, `git checkout`) need `"allow"`; then the program can
+change the metadata of every file the user owns.
 
 ## Platform notes
 
@@ -577,7 +582,8 @@ sandbox applies are trusted.
 sandy protects:
 
 - the user's files outside the policy (contents and metadata),
-- other processes of the user (memory, debugging; signals with `signals = "isolated"`),
+- other processes of the user (memory, debugging; signals, including the terminal's job control
+  signals, with `signals = "isolated"`),
 - the user's privileges (no setuid, no capabilities, no elevation),
 - the network, as far as `ip` and `unix_sockets` deny it,
 - the host's local services on Unix sockets.

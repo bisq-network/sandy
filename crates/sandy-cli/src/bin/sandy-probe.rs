@@ -412,6 +412,18 @@ mod linux {
         "utime-path",
         "utime-fd",
         "winsize-path",
+        "start-job",
+        "setpgid-join",
+        "tcsetpgrp",
+        "tiocswinsz",
+        "tiocsetd",
+        "lease-read",
+        "delegation",
+        "fchmod-ro",
+        "utime-ro",
+        "setflags-ro",
+        "fsxattr-ro",
+        "enable-verity",
     ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
@@ -423,6 +435,18 @@ mod linux {
             "utime-path" => utime_path(target),
             "utime-fd" => utime_fd(target),
             "winsize-path" => winsize_path(target),
+            "start-job" => start_job(target),
+            "setpgid-join" => setpgid_join(number(target)?),
+            "tcsetpgrp" => tcsetpgrp(number(target)?),
+            "tiocswinsz" => tiocswinsz(number(target)?),
+            "tiocsetd" => tiocsetd(number(target)?),
+            "lease-read" => lease_read(target),
+            "delegation" => delegation(target),
+            "fchmod-ro" => fchmod_ro(target),
+            "utime-ro" => utime_ro(target),
+            "setflags-ro" => setflags_ro(target),
+            "fsxattr-ro" => fsxattr_ro(target),
+            "enable-verity" => enable_verity(target),
             "open" => fs::File::open(target).map(|_| String::new()),
             "open-ioctl-only" => open_ioctl_only(target),
             "fchmod-readonly" => fchmod_readonly(target),
@@ -1030,6 +1054,11 @@ mod linux {
     }
 
     fn tiocgwinsz(fd: libc::c_int) -> io::Result<String> {
+        let size = window_size(fd)?;
+        Ok(format!("{}x{}", size.ws_row, size.ws_col))
+    }
+
+    fn window_size(fd: libc::c_int) -> io::Result<libc::winsize> {
         let mut size = libc::winsize {
             ws_row: 0,
             ws_col: 0,
@@ -1038,7 +1067,220 @@ mod linux {
         };
         // SAFETY: TIOCGWINSZ writes a winsize through the pointer.
         check(unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size as *mut libc::winsize) })?;
+        Ok(size)
+    }
+
+    /// Makes terminal `fd` one row taller. The kernel sends SIGWINCH to its foreground process
+    /// group, which is outside the sandbox when the program inherited the user's terminal.
+    fn tiocswinsz(fd: libc::c_int) -> io::Result<String> {
+        let mut size = window_size(fd)?;
+        size.ws_row += 1;
+        // SAFETY: TIOCSWINSZ reads a winsize through the pointer.
+        check(unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &size as *const libc::winsize) })?;
         Ok(format!("{}x{}", size.ws_row, size.ws_col))
+    }
+
+    // The `-ro` actions change metadata through a descriptor opened read-only, which a `read`
+    // path grants. Each writes back the value it read, so the kernel checks the permission but
+    // nothing changes.
+
+    fn fchmod_ro(target: &str) -> io::Result<String> {
+        use std::os::fd::AsRawFd;
+        let file = fs::File::open(target)?;
+        let mode = file.metadata()?.permissions().mode();
+        // SAFETY: fchmod takes a descriptor and a mode.
+        check(unsafe { libc::fchmod(file.as_raw_fd(), mode) })?;
+        Ok(format!("mode {:o}", mode & 0o7777))
+    }
+
+    /// futimens on a descriptor opened read-only; null times mean "now".
+    fn utime_ro(target: &str) -> io::Result<String> {
+        use std::os::fd::AsRawFd;
+        let file = fs::File::open(target)?;
+        // SAFETY: the times pointer may be null.
+        check(unsafe { libc::futimens(file.as_raw_fd(), ptr::null()) })?;
+        Ok(String::new())
+    }
+
+    /// FS_IOC_GETFLAGS and FS_IOC_SETFLAGS: the inode flags that `chattr` changes.
+    fn setflags_ro(target: &str) -> io::Result<String> {
+        use std::os::fd::AsRawFd;
+        const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
+        const FS_IOC_SETFLAGS: libc::c_ulong = 0x4008_6602;
+        let file = fs::File::open(target)?;
+        let mut flags: libc::c_long = 0;
+        // SAFETY: FS_IOC_GETFLAGS writes a long through the pointer.
+        check(unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_GETFLAGS as _, &mut flags) })?;
+        // SAFETY: FS_IOC_SETFLAGS reads a long through the pointer.
+        check(unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_SETFLAGS as _, &flags) })?;
+        Ok(format!("flags {flags:#x}"))
+    }
+
+    /// FS_IOC_FSGETXATTR and FS_IOC_FSSETXATTR: inode attributes and the project ID.
+    fn fsxattr_ro(target: &str) -> io::Result<String> {
+        use std::os::fd::AsRawFd;
+        const FS_IOC_FSGETXATTR: libc::c_ulong = 0x801c_581f;
+        const FS_IOC_FSSETXATTR: libc::c_ulong = 0x401c_5820;
+        /// struct fsxattr.
+        #[repr(C)]
+        #[derive(Default)]
+        struct FsXattr {
+            xflags: u32,
+            extent_size: u32,
+            extent_count: u32,
+            project_id: u32,
+            cow_extent_size: u32,
+            padding: [u8; 8],
+        }
+        let file = fs::File::open(target)?;
+        let mut attributes = FsXattr::default();
+        // SAFETY: FS_IOC_FSGETXATTR writes one fsxattr through the pointer.
+        check(unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_FSGETXATTR as _, &mut attributes) })?;
+        // SAFETY: FS_IOC_FSSETXATTR reads one fsxattr through the pointer.
+        check(unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_FSSETXATTR as _, &attributes) })?;
+        Ok(format!("xflags {:#x}", attributes.xflags))
+    }
+
+    /// Enables fs-verity on `target`, opened read-only. The content of the file is then
+    /// permanently read-only; the file can still be removed.
+    fn enable_verity(target: &str) -> io::Result<String> {
+        use std::os::fd::AsRawFd;
+        const FS_IOC_ENABLE_VERITY: libc::c_ulong = 0x4080_6685;
+        /// struct fsverity_enable_arg, with FS_VERITY_HASH_ALG_SHA256 and no salt or signature.
+        #[repr(C)]
+        struct EnableVerity {
+            version: u32,
+            hash_algorithm: u32,
+            block_size: u32,
+            salt_size: u32,
+            salt_ptr: u64,
+            signature_size: u32,
+            reserved1: u32,
+            signature_ptr: u64,
+            reserved2: [u64; 11],
+        }
+        let request = EnableVerity {
+            version: 1,
+            hash_algorithm: 1,
+            block_size: 4096,
+            salt_size: 0,
+            salt_ptr: 0,
+            signature_size: 0,
+            reserved1: 0,
+            signature_ptr: 0,
+            reserved2: [0; 11],
+        };
+        let file = fs::File::open(target)?;
+        // SAFETY: FS_IOC_ENABLE_VERITY reads one fsverity_enable_arg through the pointer; the
+        // salt and signature pointers are null with size 0.
+        check(unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_ENABLE_VERITY as _, &request) })?;
+        Ok(String::new())
+    }
+
+    /// Takes a read lease on `target`, opened read-only, and gives it up again. While the lease
+    /// is held, a process outside that opens the file for writing waits.
+    fn lease_read(target: &str) -> io::Result<String> {
+        use std::os::fd::AsRawFd;
+        let file = fs::File::open(target)?;
+        // SAFETY: F_SETLEASE takes an int argument.
+        check(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLEASE, libc::F_RDLCK) })?;
+        // SAFETY: as above.
+        check(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLEASE, libc::F_UNLCK) })?;
+        Ok(String::new())
+    }
+
+    /// Takes a read delegation (F_SETDELEG, Linux 7) on the file or directory `target`, opened
+    /// read-only. Closing the descriptor gives it up. While a directory is delegated, a process
+    /// outside that creates, renames or removes an entry in it waits.
+    fn delegation(target: &str) -> io::Result<String> {
+        use std::os::fd::AsRawFd;
+        const F_SETDELEG: libc::c_int = 1040;
+        /// struct delegation.
+        #[repr(C)]
+        struct Delegation {
+            flags: u32,
+            kind: u16,
+            padding: u16,
+        }
+        let request = Delegation {
+            flags: 0,
+            kind: libc::F_RDLCK as u16,
+            padding: 0,
+        };
+        let file = fs::File::open(target)?;
+        // SAFETY: F_SETDELEG reads one struct delegation through the pointer.
+        check(unsafe { libc::fcntl(file.as_raw_fd(), F_SETDELEG, &request as *const Delegation) })?;
+        Ok(String::new())
+    }
+
+    /// Sets the line discipline of terminal `fd` to the one it already has, so that the kernel
+    /// loads no discipline module outside the sandbox. Another value would, and the filter
+    /// denies the request whatever the value is.
+    fn tiocsetd(fd: libc::c_int) -> io::Result<String> {
+        let mut discipline: libc::c_int = 0;
+        // SAFETY: TIOCGETD writes an int through the pointer.
+        check(unsafe { libc::ioctl(fd, libc::TIOCGETD, &mut discipline as *mut libc::c_int) })?;
+        // SAFETY: TIOCSETD reads an int through the pointer.
+        check(unsafe { libc::ioctl(fd, libc::TIOCSETD, &discipline as *const libc::c_int) })?;
+        Ok(format!("discipline {discipline}"))
+    }
+
+    /// Makes the probe's process group the foreground group of terminal `fd`. The job that had
+    /// the foreground stops as soon as it reads the terminal again. SIGTTOU is ignored first, as
+    /// a shell does: the kernel sends it to a background group that changes the terminal, which
+    /// would otherwise stop the probe before the call takes effect.
+    fn tcsetpgrp(fd: libc::c_int) -> io::Result<String> {
+        // SAFETY: setting a signal to SIG_IGN has no memory safety requirements.
+        unsafe { libc::signal(libc::SIGTTOU, libc::SIG_IGN) };
+        // SAFETY: getpgrp takes no arguments.
+        let group = unsafe { libc::getpgrp() };
+        // SAFETY: tcsetpgrp takes a descriptor and a process group ID.
+        check(unsafe { libc::tcsetpgrp(fd, group) })?;
+        Ok(format!("group {group}"))
+    }
+
+    /// Joins process group `pgid` and then reads the terminal on standard input. The group is a
+    /// background job of the terminal, so the kernel stops every process in it, including the
+    /// ones that were there before. The read therefore does not return while the stop holds.
+    fn setpgid_join(pgid: libc::pid_t) -> io::Result<String> {
+        // SAFETY: setpgid takes process IDs.
+        check(unsafe { libc::setpgid(0, pgid) })?;
+        let mut byte = 0u8;
+        // SAFETY: the buffer is valid for one byte.
+        check_long(unsafe { libc::read(0, (&raw mut byte).cast(), 1) } as libc::c_long)?;
+        Ok(format!("joined {pgid}"))
+    }
+
+    /// The job that the last `start-job` started. Its process group is its process ID, because
+    /// `start-job` makes it a group leader.
+    static LAST_JOB: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+    /// Starts `PROGRAM ARGS...` (separated by U+001F) in a process group of its own, with the
+    /// standard streams of the probe, and reports its process ID. A terminal job control test
+    /// needs a background job: the probe that starts it keeps the terminal's foreground. In the
+    /// arguments, `{job}` stands for the job that the last `start-job` started, so one job can
+    /// act on another without the test knowing process IDs in advance.
+    fn start_job(target: &str) -> io::Result<String> {
+        use std::os::unix::process::CommandExt;
+        use std::sync::atomic::Ordering;
+        let last = LAST_JOB.load(Ordering::SeqCst).to_string();
+        let target = target.replace("{job}", &last);
+        let mut parts = target.split(super::ARGUMENT_SEPARATOR);
+        let program = parts.next().unwrap_or_default();
+        let mut command = Command::new(program);
+        command.args(parts);
+        // SAFETY: setpgid is async-signal-safe.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let job = command.spawn()?.id() as i32;
+        LAST_JOB.store(job, Ordering::SeqCst);
+        Ok(job.to_string())
     }
 
     fn shm_attach(id: libc::c_int) -> io::Result<String> {
