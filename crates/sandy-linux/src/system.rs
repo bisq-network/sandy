@@ -114,6 +114,16 @@ const CANDIDATES: &[(&str, SystemUse, Needed)] = &[
     ),
 ];
 
+/// The OpenSSL configuration files of the candidate list, whose `.include` directives decide
+/// which crypto settings the program sees (`openssl::missing_includes`).
+pub fn openssl_configs() -> Vec<PathBuf> {
+    CANDIDATES
+        .iter()
+        .map(|&(path, _, _)| PathBuf::from(path))
+        .filter(|path| path.ends_with("openssl.cnf"))
+        .collect()
+}
+
 fn candidates() -> impl Iterator<Item = (&'static str, SystemUse, Needed)> {
     let arch = ARCH_CANDIDATES
         .iter()

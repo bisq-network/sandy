@@ -366,24 +366,28 @@ fails with `ENOSYS`, because seccomp cannot read its flags.
 
 ### Structure
 
-sandy installs three filters, built with `seccompiler` from `libc::SYS_*` numbers:
+sandy installs up to four filters, built with `seccompiler` from `libc::SYS_*` numbers:
 
 1. **Allowlist.** Every number of the reviewed table is allowed: the Linux 7.2 table, on x86_64
    0 to 336 and 424 to 471, on arm64 0 to 243, 260 to 294 and 424 to 471. Every other number
    fails with `ENOSYS`: system calls of newer kernels until sandy reviews them, x32 numbers,
-   `clone3` and `openat2`. A system call of another architecture (for example `int 0x80` on
-   x86_64) kills the process.
+   `clone3`, `openat2` and `fanotify_init`. A system call of another architecture (for example
+   `int 0x80` on x86_64) kills the process.
 2. **Denylist.** Rules with argument checks return `EPERM`.
-3. **Socket families.** `socket` with a family the policy denies returns `EAFNOSUPPORT`.
+3. **Extended attribute reads.** With `path_metadata = "deny"`, the reads that take a path
+   return `ENOTSUP`.
+4. **Socket families.** `socket` with a family the policy denies returns `EAFNOSUPPORT`.
 
-The kernel applies the stricter result of the three, and among equal results the one of the
+The kernel applies the stricter result of all of them, and among equal results the one of the
 filter installed last, which is why the family filter comes after the denylist. Programs treat
-`ENOSYS` like an older kernel: glibc falls back from `clone3` to `clone`, and callers of
-`openat2` fall back to `openat`. They treat `EAFNOSUPPORT` like a kernel without the family, so
-a program that probes for IPv6 or for AF_UNIX falls back instead of ending; `EPERM` reads like a
-temporary failure. `socketpair` keeps `EPERM`, because its denials are about the socket type,
-not the family. Arguments of type int (socket family, ioctl command, clone flags, open flags)
-are compared on their low 32 bits only, because the kernel ignores the high bits.
+`ENOSYS` like an older kernel: glibc falls back from `clone3` to `clone`, callers of `openat2`
+fall back to `openat`, and a program that cannot create an fanotify group uses inotify. They
+treat `EAFNOSUPPORT` like a kernel without the family, so a program that probes for IPv6 or for
+AF_UNIX falls back instead of ending, and `ENOTSUP` like a file system without extended
+attributes, which every caller of `getxattr` handles; `EPERM` reads like a temporary failure.
+`socketpair` keeps `EPERM`, because its denials are about the socket type, not the family.
+Arguments of type int (socket family, ioctl command, clone flags, open flags) are compared on
+their low 32 bits only, because the kernel ignores the high bits.
 
 ### Denylist
 
@@ -411,6 +415,8 @@ The rules return `EPERM`, except where the table says otherwise.
 | `keyctl`, `add_key`, `request_key` | always | The keyrings of the user are shared by all its processes. |
 | `kexec_*`, module calls, `reboot`, `swapon`, `swapoff`, `acct`, `quotactl`, `quotactl_fd`, `syslog`, `open_by_handle_at`, `settimeofday`, `clock_settime`; on x86_64 `iopl`, `ioperm`, `modify_ldt`, `uselib` | always | They need capabilities, which sandy never passes on. A second layer. |
 | metadata calls by path | with `linux.path_metadata = "deny"` | See "Metadata". |
+| `getxattr`, `lgetxattr`, `listxattr`, `llistxattr`, `getxattrat`, `listxattrat`, `file_getattr` (`ENOTSUP`) | with `linux.path_metadata = "deny"` | They read extended attributes of every file the user can reach, outside the policy as well. See "Metadata". |
+| `fanotify_init` (`ENOSYS`, from the allowlist) | always | An unprivileged fanotify group reports which files change on every path the user can reach, outside the policy as well. Landlock has no hook for it. |
 | `clone`; on x86_64 also `fork`, `vfork` | with `process.children = "none"`: `clone` without `CLONE_THREAD`, `fork` and `vfork` always | See "Child processes". |
 | `setsid`, `setpgid` | with `process.children = "contained"`: always | See "Contained child processes". |
 | `setpgid` | with `signals = "isolated"`: a process group other than 0 | See "Signals and the terminal". |
@@ -434,6 +440,20 @@ descriptors, and access mode 3 is denied, so they only reach files that Landlock
 open for reading or writing, also read-only (see "Known limitations"). Programs that change
 metadata by path, for example `tar`, `cp -p` and `install`, need `path_metadata = "allow"`; then
 the program can change the metadata of every file the user owns.
+
+The same setting decides the reads. `getxattr`, `lgetxattr`, `listxattr` and `llistxattr` with
+a path, and `getxattrat`, `listxattrat` and `file_getattr`, fail with `ENOTSUP`, the error of a
+file system without extended attributes. Landlock has no hook for them, so they otherwise read
+the attributes of every file the user can reach, outside the policy as well: the names and
+values of user attributes, ACLs and, on a host with SELinux, the security label. `fgetxattr`
+and `flistxattr` stay allowed for the same reason as the calls that write metadata through a
+descriptor. `getxattrat`, `listxattrat` and `file_getattr` are denied completely, because they
+read the descriptor itself with `AT_EMPTY_PATH`.
+
+Cost: `cp -a` keeps the extended attributes of files, which it copies through descriptors, and
+loses those of directories; `rsync -X`, `tar --xattrs`, `getfacl` and `ls -Z` read by path and
+see none. `path_metadata = "allow"` brings both the reads and the writes back. The test
+`extended_attributes_by_path_are_unreadable` checks both settings.
 
 Under every policy the denylist also denies the file system ioctls that change a file or a
 directory. Landlock checks ioctls only on device files, so they reach every descriptor the
@@ -550,6 +570,14 @@ thread, and `nice` works only for the calling thread through ID 0.
 | `/sys/devices/system/cpu/online`, `/sys/devices/system/cpu/possible` | read | always | The number of CPUs for glibc, Go and Java. |
 | `/etc/hosts`, `/etc/resolv.conf`, `/etc/nsswitch.conf`, `/etc/host.conf`, `/etc/gai.conf`, `/etc/services`, `/etc/protocols` | read | `ip = "all"` | Name resolution. |
 | `/etc/ssl/certs`, `/usr/share/ca-certificates`, `/etc/pki/tls/certs`, `/etc/pki/ca-trust/extracted`, `/etc/ca-certificates/extracted`, `/var/lib/ca-certificates` | read | `ip = "all"` | CA certificates for TLS on Debian, Ubuntu, Fedora, RHEL, Arch and openSUSE. |
+| the loader of the program itself | read, execute | always | The file the program names in its ELF `PT_INTERP` header, with symbolic links resolved, when no other rule covers it. The entries above name the loaders of the FHS layout; this covers a host with another libc, another name, or a layout outside the FHS (NixOS, Guix). |
+
+The loader of the program is read from the program file, which is untrusted input, so sandy
+grants it only under `/usr`, `/lib`, `/lib64`, `/nix/store` and `/gnu/store`: the locations that
+belong to root and hold the loaders of the FHS layout and of the two package stores that do not
+follow it. It is never granted inside a writable path, where the program could replace what it
+executes. Every other loader is refused instead (see "Refusals"), so a program that names its
+own loader cannot gain execute on a file no policy rule covers.
 
 Left out on purpose:
 
@@ -557,12 +585,46 @@ Left out on purpose:
 - `/dev/tty` and `/dev/pts`: a program whose standard streams are redirected could otherwise open
   the terminal of the user.
 - `/etc/passwd` and `/etc/group`: not needed to start, and they list the accounts of the host.
-  `ls -l` shows numeric owners.
+  `ls -l` shows numeric owners, and `getpwuid` finds nothing (see below).
 - `/usr/bin` and other program directories: the program file is executable by policy rule 4.
   A program that starts other programs needs `--read-exec` for them.
 - `/usr/local/lib`: add it to the policy if a program needs libraries from there.
 
-Distributions outside the FHS layout (for example NixOS) need their store paths in the policy.
+Distributions outside the FHS layout (for example NixOS) need the store paths of the program's
+libraries in the policy; only its loader is covered.
+
+### What the set does not cover
+
+Three things work outside the sandbox and behave differently inside it without the program
+noticing. sandy reports the first two in `sandy check`, as `warning:` lines on standard error
+that change neither what it enforces nor the exit status.
+
+- **OpenSSL includes.** The set covers the configuration and the crypto policy files of Fedora
+  and RHEL. An administrator can include files from anywhere, and OpenSSL drops an include it
+  cannot read without an error, so the program then runs with weaker built-in defaults: measured
+  on Fedora with only `openssl.cnf` readable, `openssl ciphers -s -tls1_2` silently gained two
+  CBC suites and lost the CCM suites. sandy reads the `.include` lines of the configuration
+  files of the set, follows them, and names every target the policy does not cover, in every
+  policy and not only with `ip = "all"`, because the configuration is read for local
+  cryptography as well. It grants nothing on its own: the targets are chosen by the host, not by
+  sandy. The test is `unreadable_openssl_includes_are_reported`.
+- **cgroup limits.** `/proc` and `/sys/fs/cgroup` are not in the set, so a program cannot find
+  the memory and CPU limits of its cgroup and sizes its heap and its thread pool from the whole
+  host instead: measured in a 512 MB scope, a JVM reports "No metrics available for this
+  platform" and a 16 GB maximum heap, against 512 MB outside, which ends in an out-of-memory
+  kill. Resource limits are a non-goal (see [DESIGN.md](DESIGN.md)), so sandy sets none and
+  removes none. When sandy itself runs under a limit, `sandy check` names it and suggests
+  `--set-env GOMAXPROCS=N` or `--set-env JAVA_TOOL_OPTIONS=...`; it never sets them itself,
+  because the policy decides the environment of the program. Granting `--read /proc` is not
+  enough; a program needs the files under `/sys/fs/cgroup` too. The test is
+  `a_cgroup_limit_is_invisible_and_reported`.
+- **Accounts.** `getpwuid` and `getgrgid` find nothing without `/etc/passwd` and `/etc/group`,
+  so a program that asks for the name, home directory or shell of its user gets an error
+  (measured: Python's `pwd.getpwuid` raises `KeyError`, and glibc reports `EACCES`). Add
+  `--read /etc/passwd`, and `--read /etc/group` for groups, when a program needs them;
+  `/etc/nsswitch.conf` is not needed, because glibc falls back to the files back end. The set
+  never gets them: they are user data, and on a multi-user host they list every account. The
+  test is `the_user_account_needs_a_grant_for_etc_passwd`.
 
 ### /proc
 
@@ -571,8 +633,15 @@ directory of one process ID, so a rule cannot give each process only its own ent
 the program gets `EACCES`. A policy can add `--read /proc`. The program can then read
 `/proc/<pid>/cmdline`, `status` and `stat` of every process of the host, which can contain
 secrets passed on command lines, and `/proc/net` of the network namespace. `/proc/<pid>/mem` and
-`environ` of processes outside the sandbox stay denied by the Landlock ptrace check (tested). Without `/proc`, `std::env::current_exe` and similar calls fail; common runtimes
-(glibc, Rust, Python, Go, Java, Node.js) still start.
+`environ` of processes outside the sandbox stay denied by the Landlock ptrace check (tested).
+
+Without `/proc`, the program cannot read `/proc/self/maps`, `status`, `fd`, `cgroup` and
+`mountinfo`, which costs it `pthread_getattr_np` on the main thread, loops that close every open
+descriptor, and the cgroup limits (see "What the set does not cover").
+`readlink("/proc/self/exe")` still works, because `readlink` is not a Landlock right, so
+`std::env::current_exe` and everything built on it keeps working (measured; the test is
+`the_programs_own_path_is_readable_without_proc`). Common runtimes (glibc, Rust, Python, Go,
+Java, Node.js) still start.
 
 ## Links and the mount table
 
@@ -630,6 +699,14 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   another. sandy probes this by joining the process group it is already in, which changes
   nothing. A session leader cannot change its own group whatever a filter allows, so sandy skips
   the probe then; the group is led by the guard, which is no session leader.
+- A program whose loader no `read_exec` path and no entry of the minimal system set covers:
+  FilesystemConfined is unavailable. The kernel opens the loader of the program's ELF
+  `PT_INTERP` header for execution during `execve`, so it needs an execute right of its own.
+  Without the check, `execve` would fail with "Permission denied" after the sandbox is in place.
+  It happens with `system = "none"` and no `read_exec` path for the loader, and on a host whose
+  loader lies outside the locations above. The fix is in the message: `--read-exec` for the
+  loader. A statically linked program and a script have no loader; a script's interpreter is
+  checked by the rule below.
 - A program that is a script whose interpreter no `read_exec` path covers: FilesystemConfined is
   unavailable. The kernel reads the `#!` line and executes the interpreter, which needs execute
   access of its own, so `sandy check` reads that line too and follows up to four levels of it.
@@ -643,12 +720,24 @@ path rules is refused before that, with exit code 125 and the paths it compared.
 
 ## Known limitations
 
-- **Paths outside the policy are visible.** `stat`, `access`, `readlink`, `getxattr`,
-  `getxattrat`, `listxattrat`, `file_getattr`, `name_to_handle_at`, `inotify` watches and
-  unprivileged `fanotify` marks (`FAN_REPORT_FID` and related flags) work on every path the user
-  can reach (tested: an inotify watch and a fanotify mark on a directory outside the policy
-  succeeded). The program can learn which files exist, their sizes, times and attributes, and
-  when other programs touch them. It cannot open them: `open_by_handle_at` needs a capability.
+- **Paths outside the policy are visible.** `stat`, `access`, `readlink`, `name_to_handle_at`
+  and `inotify` watches work on every path the user can reach. The program can learn which files
+  exist, their sizes and times, and when other programs touch them. It cannot open them:
+  `open_by_handle_at` needs a capability. Landlock has no right for these calls, and seccomp
+  cannot read the path a call names, so only a mount namespace would hide them, which is a
+  non-goal (see "Threat model" in [DESIGN.md](DESIGN.md)). Two details are easy to miss:
+  - An `inotify` watch on a directory the program cannot list reports the **names** of the
+    entries that appear in it, not only that something changed (tested:
+    `inotify_reports_names_in_unlistable_directories` reads the name of a file that another
+    process creates in a directory outside the policy). A program that watches a directory of
+    the user therefore learns its new file names.
+  - A directory that the caller passes as standard input, output or error stays listable
+    (`a_directory_on_standard_input_stays_listable`). Landlock checks the directory right when a
+    path is opened, and such a descriptor was opened before the sandbox. The entries in it
+    cannot be opened; only their names are readable. Pass a directory on a standard stream only
+    when its listing may be seen.
+  The reads of extended attributes by path and `fanotify_init` are denied (see "Metadata" and
+  "Denylist").
 - **Abstract socket names with `ip = "all"`.** The program can bind one end of a socket pair to
   a free abstract name, because the filter cannot tell a socket's family from its descriptor and
   the Landlock scope checks connect and send, not bind. A service outside that binds the same
@@ -702,10 +791,10 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   and no execute right inside them.
 - **What fails inside the sandbox:** 32-bit programs (killed), user namespace sandboxes of
   browsers (they fall back or fail), io_uring, debuggers, System V IPC, datagram socket pairs,
-  `mkfifo` and symbolic links in writable paths, metadata changes by path with the default
-  setting, `chattr` and the other file system ioctls that change a file, file leases, `ldattach`,
-  job control in a shell and terminal resizing with `signals = "isolated"`, and system calls
-  newer than the reviewed table (`ENOSYS`).
+  `mkfifo` and symbolic links in writable paths, metadata changes and extended attribute reads
+  by path with the default setting, `fanotify`, `chattr` and the other file system ioctls that
+  change a file, file leases, `ldattach`, job control in a shell and terminal resizing with
+  `signals = "isolated"`, and system calls newer than the reviewed table (`ENOSYS`).
 - **Landlock errata.** sandy does not check the errata bitmask. A kernel without the fix for
   erratum 3 lets rights widen through renames of directories that a bind mount disconnected.
   The program cannot mount, and `refer` is granted only inside writable paths, so the practical

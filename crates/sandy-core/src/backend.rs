@@ -53,6 +53,16 @@ pub trait Backend {
 
     fn run(&self, policy: &ResolvedPolicy, command: &TargetCommand) -> Result<i32, SandboxError>;
 
+    /// What makes the program behave differently inside the sandbox than outside on this host,
+    /// beyond the requirements, for example a configuration file the policy does not cover.
+    /// `check` prints these as warnings next to the ones of the policy; they change neither what
+    /// sandy enforces nor the exit status, so a backend reports a fact here instead of refusing
+    /// when the program may well not be affected. Like `verify`, it may read host state and must
+    /// leave the host as it found it.
+    fn notes(&self, _policy: &ResolvedPolicy) -> Vec<String> {
+        Vec::new()
+    }
+
     /// One-time host preparation that needs elevated rights, for example on Windows. Must be
     /// idempotent.
     fn setup(&self, _policy: &ResolvedPolicy) -> Result<(), SandboxError> {

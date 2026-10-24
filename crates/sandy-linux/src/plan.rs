@@ -1,21 +1,24 @@
 //! The planning step. From a policy and the host capabilities it derives the plan items and the
 //! exact configuration that `run` applies. Both come from the same function, so `run` applies
-//! what the plan names. The only state it reads besides the host capabilities is the `#!` line of
-//! the program, which tells whether the kernel could execute it at all; that depends on the
-//! policy, so no detection step can answer it.
+//! what the plan names. The only state it reads besides the host capabilities is the `#!` line
+//! and the ELF interpreter of the program, which tell whether the kernel could execute it at
+//! all; that depends on the policy, so no detection step can answer it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use landlock::{ABI, Access, AccessFs, AccessNet, BitFlags, Scope, make_bitflags};
 use sandy_core::{
-    ChildProcesses, NetworkAccess, PathAccess, PathMetadata, PlanItem, Requirement, ResolvedPolicy,
-    SignalScope, SystemAccess,
+    ChildProcesses, NetworkAccess, PathAccess, PathMetadata, PathRule, PlanItem, Requirement,
+    ResolvedPolicy, SignalScope, SystemAccess,
 };
 
+use crate::cgroup;
 use crate::filter::FilterConfig;
 use crate::host::HostCapabilities;
+use crate::loader;
+use crate::openssl;
 use crate::relay::RelayConfig;
-use crate::system::{Needed, SystemPath, SystemUse};
+use crate::system::{self, Needed, SystemPath, SystemUse};
 
 #[derive(Debug)]
 pub struct LinuxPlan {
@@ -76,12 +79,15 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
         (Err(reason), _) | (Ok(_), Err(reason)) => Err(reason.as_str()),
         (Ok(version), Ok(())) => Ok(ABI::from(*version)),
     };
+    let loader = program_loader(policy);
     let landlock = abi
         .ok()
-        .map(|abi| landlock_config(policy, &host.system_paths, abi));
-    let conflict = system_conflict(policy, &host.system_locations).or_else(|| {
-        policy.interpreter_problem(SHEBANG_LEVELS, &executable_paths(landlock.as_ref()?))
-    });
+        .map(|abi| landlock_config(policy, &host.system_paths, loader.as_deref(), abi));
+    let conflict = system_conflict(policy, &host.system_locations)
+        .or_else(|| loader_problem(loader.as_deref(), &executable_paths(landlock.as_ref()?)))
+        .or_else(|| {
+            policy.interpreter_problem(SHEBANG_LEVELS, &executable_paths(landlock.as_ref()?))
+        });
     let items: Vec<PlanItem> = policy
         .requirements()
         .into_iter()
@@ -107,6 +113,51 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
         _ => None,
     };
     LinuxPlan { items, sandbox }
+}
+
+/// What makes the program behave differently inside the sandbox than outside, beyond the
+/// requirements: an OpenSSL include the policy does not cover, and a cgroup limit the program
+/// cannot see. `sandy check` prints these as warnings; they change nothing sandy enforces, and a
+/// program that uses neither TLS nor the limits runs as it is.
+pub fn notes(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
+    let Ok(&version) = host.landlock.as_ref() else {
+        // Without Landlock the policy is refused anyway, and there are no rules to compare with.
+        return Vec::new();
+    };
+    let loader = program_loader(policy);
+    let rules = landlock_config(
+        policy,
+        &host.system_paths,
+        loader.as_deref(),
+        ABI::from(version),
+    )
+    .rules;
+    let readable = |path: &Path| {
+        let covers = |rule: &PathRights| {
+            rule.access.contains(AccessFs::ReadFile) && path.starts_with(&rule.path)
+        };
+        rules.iter().any(covers)
+    };
+    let mut notes: Vec<String> = openssl::missing_includes(&system::openssl_configs(), &readable)
+        .into_iter()
+        .map(|missing| {
+            format!(
+                "the OpenSSL configuration {} includes {}, which this policy does not let the \
+                 program read: OpenSSL drops an include it cannot read without an error and then \
+                 runs with weaker built-in defaults, for example other TLS cipher suites. Add \
+                 --read {} unless the program needs no cryptography",
+                missing.config.display(),
+                missing.target.display(),
+                missing.target.display()
+            )
+        })
+        .collect();
+    let sees_own_cgroup =
+        readable(Path::new("/proc/self/cgroup")) && readable(Path::new("/sys/fs/cgroup"));
+    if !sees_own_cgroup {
+        notes.extend(cgroup::note(cgroup::limits()));
+    }
+    notes
 }
 
 fn plan_item(
@@ -305,6 +356,62 @@ fn system_conflict(policy: &ResolvedPolicy, system: &[SystemPath]) -> Option<Str
     None
 }
 
+/// Where the loader of the program is, with symbolic links resolved. A program that names none,
+/// or one that does not exist, is left to `execve` and its own error.
+fn program_loader(policy: &ResolvedPolicy) -> Option<PathBuf> {
+    loader::interpreter(policy.program.as_ref()?)?
+        .canonicalize()
+        .ok()
+}
+
+/// Why the kernel could not execute the program: the loader it names in its ELF header lies
+/// outside every path this configuration executes. Without this, `execve` would fail with
+/// "Permission denied" after the sandbox is in place, which looks like a broken program. It
+/// happens on a host whose loader the minimal system set does not name and that `loader_rule`
+/// does not grant either, or with `system = "none"` and no `read_exec` path for the loader.
+fn loader_problem(loader: Option<&Path>, executable: &[PathBuf]) -> Option<String> {
+    let loader = loader?;
+    if executable.iter().any(|allowed| loader.starts_with(allowed)) {
+        return None;
+    }
+    Some(format!(
+        "the kernel executes the loader {} of the program, which no read_exec path and no entry \
+         of the minimal system set covers; grant it with --read-exec",
+        loader.display()
+    ))
+}
+
+/// An execute rule for the program's loader, when no rule covers it yet. Only for a loader in a
+/// system location (`loader::is_system_loader`) and never inside a writable path, where the
+/// program could replace what it executes: the loader comes from the header of the program file,
+/// which is untrusted input. Every other case becomes the refusal of `loader_problem`.
+fn loader_rule(
+    policy: &ResolvedPolicy,
+    loader: Option<&Path>,
+    rules: &[PathRights],
+) -> Option<PathRights> {
+    let loader = loader?;
+    if policy.system != SystemAccess::Minimal || !loader::is_system_loader(loader) {
+        return None;
+    }
+    let covered = |rule: &PathRights| {
+        rule.access.contains(AccessFs::Execute) && loader.starts_with(&rule.path)
+    };
+    if rules.iter().any(covered) {
+        return None;
+    }
+    let inside_writable =
+        |rule: &PathRule| rule.access == PathAccess::ReadWrite && loader.starts_with(&rule.path);
+    if policy.paths.iter().any(inside_writable) {
+        return None;
+    }
+    Some(PathRights {
+        path: loader.to_path_buf(),
+        is_dir: false,
+        access: system_rights(SystemUse::Execute),
+    })
+}
+
 /// The paths this configuration executes, for `ResolvedPolicy::interpreter_problem`: the policy's
 /// `read_exec` paths and the entries of the system set that hold code, as the Landlock rules
 /// carry them.
@@ -317,7 +424,12 @@ fn executable_paths(landlock: &LandlockConfig) -> Vec<PathBuf> {
         .collect()
 }
 
-fn landlock_config(policy: &ResolvedPolicy, system: &[SystemPath], abi: ABI) -> LandlockConfig {
+fn landlock_config(
+    policy: &ResolvedPolicy,
+    system: &[SystemPath],
+    loader: Option<&Path>,
+    abi: ABI,
+) -> LandlockConfig {
     let unix_all = policy.unix_sockets == NetworkAccess::All;
     let mut handled_fs = AccessFs::from_all(abi);
     if unix_all {
@@ -367,6 +479,10 @@ fn landlock_config(policy: &ResolvedPolicy, system: &[SystemPath], abi: ABI) -> 
             access: fit(system_rights(entry.usage), entry.is_dir),
         }));
     }
+    if let Some(mut rule) = loader_rule(policy, loader, &rules) {
+        rule.access = fit(rule.access, rule.is_dir);
+        rules.push(rule);
+    }
     rules.retain(|rule| !rule.access.is_empty());
 
     LandlockConfig {
@@ -413,10 +529,7 @@ fn system_rights(usage: SystemUse) -> BitFlags<AccessFs> {
 mod tests {
     use super::*;
     use crate::relay::RelayPair;
-    use sandy_core::{
-        EnvironmentPolicy, ExposedPort, ForwardedPort, PathRule, Status, WindowsPolicy,
-    };
-    use std::path::Path;
+    use sandy_core::{EnvironmentPolicy, ExposedPort, ForwardedPort, Status, WindowsPolicy};
 
     fn host(abi: Option<i32>) -> HostCapabilities {
         let system = |path: &str, is_dir, usage, needed| SystemPath {
@@ -906,5 +1019,65 @@ mod tests {
         policy.system = SystemAccess::None;
         let plan = plan_for(&policy, &host(Some(9)));
         assert_eq!(unavailable(&plan), vec![]);
+    }
+
+    fn loader_rights(config: &LandlockConfig, path: &str) -> Option<BitFlags<AccessFs>> {
+        let rule = config.rules.iter().find(|r| r.path == Path::new(path));
+        rule.map(|rule| rule.access)
+    }
+
+    /// A loader the minimal system set does not name, as a distribution outside the FHS layout
+    /// has, gets an execute rule of its own when it lies in a system location. One somewhere
+    /// else is refused instead of granted, because it comes from the header of the program file.
+    #[test]
+    fn the_programs_loader_is_granted_only_in_a_system_location() {
+        let policy = policy();
+        let system = host(Some(9)).system_paths;
+        let config =
+            |loader: &str| landlock_config(&policy, &system, Some(Path::new(loader)), ABI::V9);
+        let problem = |loader: &str, config: &LandlockConfig| {
+            loader_problem(Some(Path::new(loader)), &executable_paths(config))
+        };
+
+        let store = "/nix/store/abc-glibc/lib/ld-linux-x86-64.so.2";
+        let granted = config(store);
+        assert_eq!(
+            loader_rights(&granted, store),
+            Some(AccessFs::ReadFile | AccessFs::Execute)
+        );
+        assert_eq!(problem(store, &granted), None);
+
+        let home = "/home/user/toolchain/lib/ld-linux-x86-64.so.2";
+        let refused = config(home);
+        assert_eq!(loader_rights(&refused, home), None);
+        assert!(problem(home, &refused).unwrap().contains(home));
+
+        // A loader a read_exec path of the policy already covers needs no rule of its own.
+        let inside = "/opt/app/lib/ld-linux-x86-64.so.2";
+        let covered = config(inside);
+        assert_eq!(loader_rights(&covered, inside), None);
+        assert_eq!(problem(inside, &covered), None);
+
+        // Without the system set, sandy adds no path of its own.
+        let mut no_system = policy.clone();
+        no_system.system = SystemAccess::None;
+        let config = landlock_config(&no_system, &system, Some(Path::new(store)), ABI::V9);
+        assert_eq!(loader_rights(&config, store), None);
+        assert!(problem(store, &config).is_some());
+    }
+
+    /// A writable path never becomes executable, whatever the program's header names.
+    #[test]
+    fn a_loader_inside_a_writable_path_is_refused() {
+        let mut policy = policy();
+        policy
+            .paths
+            .push(rule("/nix/store/abc", PathAccess::ReadWrite, true));
+        let loader = "/nix/store/abc/lib/ld-linux-x86-64.so.2";
+        let system = host(Some(9)).system_paths;
+        let config = landlock_config(&policy, &system, Some(Path::new(loader)), ABI::V9);
+        assert_eq!(loader_rights(&config, loader), None);
+        let problem = loader_problem(Some(Path::new(loader)), &executable_paths(&config));
+        assert!(problem.unwrap().contains(loader));
     }
 }

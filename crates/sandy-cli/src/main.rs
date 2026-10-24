@@ -219,6 +219,9 @@ fn execute(invocation: Invocation, parent_at_start: Option<u32>) -> Result<ExitC
             for warning in resolved.warnings(home_directory().as_deref()) {
                 eprintln!("{WARNING_PREFIX}{warning}");
             }
+            for warning in backend.notes(&resolved) {
+                eprintln!("{WARNING_PREFIX}{warning}");
+            }
             for warning in weakened {
                 eprintln!("{WARNING_PREFIX}{warning}");
             }

@@ -1,15 +1,18 @@
-//! The seccomp filters. sandy installs three filters; the kernel applies the stricter result,
-//! and among equal results the one of the filter installed last:
+//! The seccomp filters. sandy installs up to four filters; the kernel applies the stricter
+//! result, and among equal results the one of the filter installed last:
 //!
 //! 1. The allowlist allows the system calls of the reviewed kernel table. Every other number,
 //!    including x32 numbers and system calls of newer kernels, fails with ENOSYS. Programs treat
 //!    that like an older kernel. A call of another CPU architecture kills the process.
 //! 2. The denylist checks arguments and denies single system calls with EPERM.
-//! 3. The socket family filter fails `socket` with EAFNOSUPPORT for the families the policy
+//! 3. The extended attribute filter fails the reads that take a path with ENOTSUP. Programs
+//!    treat that like a file system without extended attributes and skip them.
+//! 4. The socket family filter fails `socket` with EAFNOSUPPORT for the families the policy
 //!    denies. Programs treat that like a kernel without the family and fall back; EPERM reads
 //!    like a temporary failure and often ends the program instead.
 //!
-//! seccompiler compiles all three. Numbers come from `libc::SYS_*`, so sandy controls the table.
+//! seccompiler compiles all of them. Numbers come from `libc::SYS_*`, so sandy controls the
+//! table.
 
 use std::collections::BTreeMap;
 
@@ -108,7 +111,10 @@ pub const ARCH_SUPPORTED: bool = arch::TARGET.is_some();
 // these yet for every target.
 const SYS_FCHMODAT2: i64 = 452;
 const SYS_SETXATTRAT: i64 = 463;
+const SYS_GETXATTRAT: i64 = 464;
+const SYS_LISTXATTRAT: i64 = 465;
 const SYS_REMOVEXATTRAT: i64 = 466;
+const SYS_FILE_GETATTR: i64 = 468;
 const SYS_STATMOUNT: i64 = 457;
 const SYS_LISTMOUNT: i64 = 458;
 const SYS_OPEN_TREE_ATTR: i64 = 467;
@@ -220,10 +226,29 @@ const PATH_METADATA: &[i64] = &[
     SYS_FILE_SETATTR,
 ];
 
-/// Not in the allowlist, so they fail with ENOSYS. Their arguments are in memory, where seccomp
-/// cannot check them, and programs fall back to another call on ENOSYS: glibc uses clone instead
-/// of clone3, and openat2 callers use openat.
-const ENOSYS_CALLS: &[i64] = &[libc::SYS_clone3, libc::SYS_openat2];
+/// Reads of extended attributes that take a path. Landlock has no hook for them, so they work on
+/// every file the user can reach, outside the policy as well, and they return contents: ACLs,
+/// SELinux labels and user attributes such as the download address of a file. The descriptor
+/// variants (fgetxattr, flistxattr) stay allowed, like the other metadata calls on a descriptor:
+/// they reject O_PATH descriptors (measured on Linux 7.2: EBADF), so they only reach files that
+/// Landlock let the program open. `getxattrat`, `listxattrat` and `file_getattr` are denied
+/// completely, because they read the descriptor itself with AT_EMPTY_PATH.
+const PATH_XATTR_READS: &[i64] = &[
+    libc::SYS_getxattr,
+    libc::SYS_lgetxattr,
+    libc::SYS_listxattr,
+    libc::SYS_llistxattr,
+    SYS_GETXATTRAT,
+    SYS_LISTXATTRAT,
+    SYS_FILE_GETATTR,
+];
+
+/// Not in the allowlist, so they fail with ENOSYS. Programs fall back on ENOSYS: glibc uses
+/// clone instead of clone3, openat2 callers use openat, and a program that cannot create an
+/// fanotify group uses inotify. The arguments of clone3 and openat2 are in memory, where seccomp
+/// cannot check them; an unprivileged fanotify group needs no argument check, because it reports
+/// paths outside the policy whatever its flags are.
+const ENOSYS_CALLS: &[i64] = &[libc::SYS_clone3, libc::SYS_openat2, libc::SYS_fanotify_init];
 
 /// The namespace flags of clone. CLONE_NEWTIME shares its bit with the exit signal of clone, so
 /// only unshare checks it.
@@ -312,11 +337,13 @@ const FILE_SYSTEM_IOCTLS: &[u32] = &[
 ];
 
 /// The compiled filters, in the order they are installed. The relay and the watcher have no
-/// socket family filter: their denylist allows only the sockets they need.
+/// extended attribute and no socket family filter: their denylist allows only the calls and the
+/// sockets they need.
 #[derive(Debug)]
 pub struct Filters {
     pub allowlist: BpfProgram,
     pub denylist: BpfProgram,
+    pub path_xattrs: Option<BpfProgram>,
     pub families: Option<BpfProgram>,
 }
 
@@ -325,14 +352,37 @@ pub struct Filters {
 pub fn build(config: &FilterConfig, own_pid: u32) -> Result<Filters, BackendError> {
     let target = arch::TARGET
         .ok_or_else(|| BackendError::InvalidTargetArch(std::env::consts::ARCH.to_string()))?;
+    let path_xattrs = config
+        .deny_path_metadata
+        .then(|| xattr_filter(target))
+        .transpose()?;
     Ok(Filters {
         allowlist: allowlist(target)?,
         denylist: denylist(config, own_pid, target)?,
+        path_xattrs,
         families: Some(family_filter(config, target)?),
     })
 }
 
-/// The third filter: `socket` with a family the policy denies fails with EAFNOSUPPORT instead of
+/// The third filter: the extended attribute reads that take a path fail with ENOTSUP, the error
+/// of a file system without extended attributes, so that `cp -a`, `rsync -X` and `tar --xattrs`
+/// skip them instead of reporting a failure. It follows `path_metadata`, which decides the same
+/// question for the calls that change metadata by path.
+fn xattr_filter(target: TargetArch) -> Result<BpfProgram, BackendError> {
+    let rules = PATH_XATTR_READS
+        .iter()
+        .map(|&call| (call, Vec::new()))
+        .collect();
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::ENOTSUP as u32),
+        target,
+    )?;
+    filter.try_into()
+}
+
+/// The fourth filter: `socket` with a family the policy denies fails with EAFNOSUPPORT instead of
 /// EPERM, so that a program which probes for a family falls back as it would on a kernel without
 /// it. Installed last, because the kernel takes the newest filter's result among equal actions.
 fn family_filter(config: &FilterConfig, target: TargetArch) -> Result<BpfProgram, BackendError> {
@@ -728,6 +778,7 @@ pub fn watcher(program: i32) -> Result<Filters, BackendError> {
     Ok(Filters {
         allowlist: allowlist(target)?,
         denylist: filter.try_into()?,
+        path_xattrs: None,
         families: None,
     })
 }
@@ -771,6 +822,7 @@ pub fn relay() -> Result<Filters, BackendError> {
     Ok(Filters {
         allowlist: allowlist(target)?,
         denylist: filter.try_into()?,
+        path_xattrs: None,
         families: None,
     })
 }
@@ -778,12 +830,16 @@ pub fn relay() -> Result<Filters, BackendError> {
 /// Installs the filters on every thread of the process, in order. They stay in force across
 /// execve and are inherited by every child.
 pub fn install(filters: &Filters) -> Result<(), seccompiler::Error> {
-    seccompiler::apply_filter_all_threads(&filters.allowlist)?;
-    seccompiler::apply_filter_all_threads(&filters.denylist)?;
-    match &filters.families {
-        Some(families) => seccompiler::apply_filter_all_threads(families),
-        None => Ok(()),
+    let programs = [
+        Some(&filters.allowlist),
+        Some(&filters.denylist),
+        filters.path_xattrs.as_ref(),
+        filters.families.as_ref(),
+    ];
+    for program in programs.into_iter().flatten() {
+        seccompiler::apply_filter_all_threads(program)?;
     }
+    Ok(())
 }
 
 #[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -796,6 +852,7 @@ mod tests {
     const RET_EPERM: u32 = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
     const RET_ENOSYS: u32 = libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32;
     const RET_NO_FAMILY: u32 = libc::SECCOMP_RET_ERRNO | libc::EAFNOSUPPORT as u32;
+    const RET_NO_XATTRS: u32 = libc::SECCOMP_RET_ERRNO | libc::ENOTSUP as u32;
 
     #[cfg(target_arch = "x86_64")]
     const NATIVE: u32 = 62 | 0x8000_0000 | 0x4000_0000;
@@ -851,7 +908,7 @@ mod tests {
         }
     }
 
-    /// Runs both filters like the kernel: the most restrictive action wins, and among equal
+    /// Runs every filter like the kernel: the most restrictive action wins, and among equal
     /// actions the most recently installed filter.
     const OWN_PID: u32 = 4242;
 
@@ -866,6 +923,7 @@ mod tests {
         let installed = filters
             .families
             .iter()
+            .chain(&filters.path_xattrs)
             .chain([&filters.denylist, &filters.allowlist]);
         for program in installed {
             let action = evaluate(program, arch, nr, args);
@@ -937,6 +995,7 @@ mod tests {
             let programs = filters
                 .families
                 .iter()
+                .chain(&filters.path_xattrs)
                 .chain([&filters.allowlist, &filters.denylist]);
             for program in programs {
                 assert!(program.len() < 4096);
@@ -1246,6 +1305,36 @@ mod tests {
         assert_eq!(call(&allow, libc::SYS_utimensat, path), RET_ALLOW);
         let descriptor = args(&[3, 0]);
         assert_eq!(call(&deny, libc::SYS_utimensat, descriptor), RET_ALLOW);
+    }
+
+    /// Reading extended attributes by path follows the same setting as changing metadata by
+    /// path, and fails with ENOTSUP, which programs read as "this file system has none". The
+    /// descriptor variants stay allowed: they reject O_PATH descriptors, so they only reach
+    /// files Landlock let the program open.
+    #[test]
+    fn extended_attribute_reads_by_path_follow_the_policy() {
+        for &nr in PATH_XATTR_READS {
+            assert_eq!(
+                call(&strict(), nr, [0; 6]),
+                RET_NO_XATTRS,
+                "system call {nr}"
+            );
+            assert_eq!(call(&open(), nr, [0; 6]), RET_ALLOW, "system call {nr}");
+        }
+        for nr in [libc::SYS_fgetxattr, libc::SYS_flistxattr] {
+            assert_eq!(call(&strict(), nr, [0; 6]), RET_ALLOW, "system call {nr}");
+        }
+        assert!(build(&open(), OWN_PID).unwrap().path_xattrs.is_none());
+    }
+
+    /// An unprivileged fanotify group reports events on every path the user can reach, which
+    /// Landlock cannot restrict. ENOSYS, so a program falls back to inotify.
+    #[test]
+    fn fanotify_groups_cannot_be_created() {
+        for config in [strict(), open()] {
+            assert_eq!(call(&config, libc::SYS_fanotify_init, [0; 6]), RET_ENOSYS);
+        }
+        assert_eq!(call(&open(), libc::SYS_inotify_init1, [0; 6]), RET_ALLOW);
     }
 
     #[test]

@@ -481,11 +481,23 @@ mod linux {
         "setflags-ro",
         "fsxattr-ro",
         "enable-verity",
+        "listxattr-path",
+        "getxattr-fd",
+        "inotify-name",
+        "list-fd",
+        "getpwuid",
+        "current-exe",
     ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
         match action {
             "socketpair-bind" => socketpair_bind(target),
+            "listxattr-path" => listxattr_path(target),
+            "getxattr-fd" => getxattr_fd(target),
+            "inotify-name" => inotify_name(target),
+            "list-fd" => list_fd(number(target)?),
+            "getpwuid" => getpwuid(),
+            "current-exe" => Ok(std::env::current_exe()?.display().to_string()),
             "setxattr-path" => setxattr_path(target),
             "setxattr-fd" => setxattr_fd(target),
             "chown-path" => chown_path(target),
@@ -639,6 +651,117 @@ mod linux {
             )
         })?;
         Ok(String::new())
+    }
+
+    /// listxattr through the path, which reads the names of the extended attributes of a file
+    /// the program may not open.
+    fn listxattr_path(target: &str) -> io::Result<String> {
+        let path = CString::new(target)?;
+        let mut names = [0u8; 1024];
+        // SAFETY: the path is NUL-terminated; the buffer has the length passed.
+        let size =
+            unsafe { libc::listxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
+        if size < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(format!("{size} bytes of names"))
+    }
+
+    /// fgetxattr through a descriptor opened for reading.
+    fn getxattr_fd(target: &str) -> io::Result<String> {
+        use std::os::fd::AsRawFd;
+        let file = fs::File::open(target)?;
+        let mut value = [0u8; 64];
+        // SAFETY: the name is NUL-terminated; the buffer has the length passed.
+        let size = unsafe {
+            libc::fgetxattr(
+                file.as_raw_fd(),
+                XATTR_NAME.as_ptr().cast(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        if size < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(format!("{size} bytes"))
+    }
+
+    /// Watches `target` with inotify and reports the name of the first entry that appears in it,
+    /// for at most five seconds. A caller creates entries in a loop, so the watch cannot miss
+    /// them all.
+    fn inotify_name(target: &str) -> io::Result<String> {
+        let path = CString::new(target)?;
+        // SAFETY: inotify_init1 takes flags only.
+        let fd = check(unsafe { libc::inotify_init1(libc::IN_CLOEXEC) })?;
+        // SAFETY: the path is NUL-terminated.
+        let watch = check(unsafe { libc::inotify_add_watch(fd, path.as_ptr(), libc::IN_CREATE) });
+        if let Err(error) = watch {
+            close(fd);
+            return Err(error);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut events = [0u8; 4096];
+        let name = loop {
+            if Instant::now() >= deadline {
+                break Err(io::Error::new(io::ErrorKind::TimedOut, "no entry appeared"));
+            }
+            let mut poll = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one descriptor, a timeout in milliseconds.
+            if unsafe { libc::poll(&mut poll, 1, 200) } <= 0 {
+                continue;
+            }
+            // SAFETY: the buffer has the length passed.
+            let read = unsafe { libc::read(fd, events.as_mut_ptr().cast(), events.len()) };
+            if read <= 0 {
+                break Err(io::Error::last_os_error());
+            }
+            // The name follows the event header and is padded with NUL bytes.
+            let header = std::mem::size_of::<libc::inotify_event>();
+            let name = &events[header..read as usize];
+            let end = name.iter().position(|&byte| byte == 0).unwrap_or(0);
+            break Ok(String::from_utf8_lossy(&name[..end]).into_owned());
+        };
+        close(fd);
+        name
+    }
+
+    /// Lists the directory an inherited descriptor refers to, for example a directory passed as
+    /// standard input.
+    fn list_fd(fd: libc::c_int) -> io::Result<String> {
+        // SAFETY: fdopendir takes over the descriptor, which closedir closes.
+        let dir = unsafe { libc::fdopendir(fd) };
+        if dir.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mut entries = 0;
+        // SAFETY: readdir returns a pointer into the stream until it is exhausted.
+        while !unsafe { libc::readdir(dir) }.is_null() {
+            entries += 1;
+        }
+        // SAFETY: the stream is open and not used afterwards.
+        unsafe { libc::closedir(dir) };
+        Ok(format!("{entries} entries"))
+    }
+
+    /// The account name of this user, which glibc reads from /etc/passwd.
+    fn getpwuid() -> io::Result<String> {
+        // SAFETY: getpwuid returns a pointer to static storage or null.
+        let entry = unsafe { libc::getpwuid(libc::getuid()) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            return Err(match error.raw_os_error() {
+                Some(0) => io::Error::new(io::ErrorKind::NotFound, "no entry for this user"),
+                _ => error,
+            });
+        }
+        // SAFETY: a non-null entry has a NUL-terminated name.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).pw_name) };
+        Ok(name.to_string_lossy().into_owned())
     }
 
     /// chown through the path, keeping owner and group (-1): the kernel performs the call but

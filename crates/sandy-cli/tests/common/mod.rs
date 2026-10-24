@@ -325,6 +325,27 @@ where
     Command::new(sandy_path()).args(args).output().unwrap()
 }
 
+/// Runs `program`, which a test has just copied into its fixture. The tests run in threads of one
+/// process, so a child another thread forked holds a copy of every descriptor open at that
+/// moment, including the one a `fs::copy` of this file was writing through. The kernel refuses to
+/// execute a file that someone may still write, so this waits out that window instead of failing.
+pub fn run_copied<I, S>(program: &Path, args: I) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args: Vec<_> = args.into_iter().collect();
+    for _ in 0..100 {
+        match Command::new(program).args(&args).output() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            result => return result.unwrap(),
+        }
+    }
+    panic!("{} stayed busy for two seconds", program.display());
+}
+
 pub fn parse(output: &Output) -> Vec<ProbeLine> {
     String::from_utf8_lossy(&output.stdout)
         .lines()

@@ -294,10 +294,12 @@ after the first argument that is not an option) belongs to the program.
 with the reason. Pass the program if the policy should include it.
 
 Settings that give up part of the isolation (`unix_sockets = "all"`, `signals = "any"`,
-`path_metadata = "allow"`, a writable path that holds your home directory), and options that
-replace a stricter value of the policy file, get a `warning:` line on standard error. Warnings do
-not change the exit status, and standard output keeps its one line per requirement, so a caller
-that reads it is not affected. `sandy run` prints no warnings: its standard error belongs to the
+`path_metadata = "allow"`, a writable path that holds your home directory), options that replace
+a stricter value of the policy file, and facts about the host that make the program behave
+differently inside the sandbox (on Linux an OpenSSL include the policy does not cover, or a
+cgroup limit the program cannot see), get a `warning:` line on standard error. Warnings do not
+change the exit status, and standard output keeps its one line per requirement, so a caller that
+reads it is not affected. `sandy run` prints no warnings: its standard error belongs to the
 program.
 
 `sandy setup` does the one-time host preparation that needs administrator rights. Today this
@@ -597,7 +599,7 @@ sandbox applies are trusted.
 
 sandy protects:
 
-- the user's files outside the policy (contents and metadata),
+- the user's files outside the policy (their contents, and their metadata against changes),
 - other processes of the user (memory, debugging; signals, including the terminal's job control
   signals, with `signals = "isolated"`),
 - the user's privileges (no setuid, no capabilities, no elevation),

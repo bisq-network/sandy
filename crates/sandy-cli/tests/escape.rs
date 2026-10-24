@@ -381,7 +381,7 @@ fn refuses_a_sandy_executable_a_writable_path_reaches() {
         let mut args = vec!["check".to_string()];
         args.extend(platform_args());
         args.extend(["--read-write".to_string(), fixture.arg("rw")]);
-        Command::new(program).args(&args).output().unwrap()
+        run_copied(program, &args)
     };
 
     // Control: sandy outside the writable path.

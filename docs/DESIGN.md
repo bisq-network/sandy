@@ -67,8 +67,10 @@ Command line options extend the policy file (`sandy --help`): path options add p
 other option replaces the file's value, also with a weaker one. The caller is trusted, so sandy
 obeys, but `sandy check` names every option that replaced a stricter value of the file in a
 `warning:` line on standard error, together with the settings of the policy that give up part of
-the isolation (`ResolvedPolicy::warnings`). Warnings do not change what sandy enforces or its
-exit status; `sandy run` prints none, because its standard error belongs to the program. sandy's
+the isolation (`ResolvedPolicy::warnings`) and what the backend found on this host that makes
+the program behave differently inside the sandbox (`Backend::notes`). Warnings do not change
+what sandy enforces or its exit status; `sandy run` prints none, because its standard error
+belongs to the program. sandy's
 own executable and the policy file get the checks of rules 3 and 4: sandy refuses to start when
 a writable path contains one of them, reaches one through a link or an alias, or holds a second
 name of one, because the program could then change what the next start runs or reads. The name
@@ -319,16 +321,19 @@ a moment later.
 Details, the minimal system set and the known limitations are in [linux.md](linux.md).
 
 - Order: mark descriptors above 2 close-on-exec, `PR_SET_NO_NEW_PRIVS`, Landlock
-  `restrict_self`, three seccomp filters (TSYNC), `execve`. Everything that can fail on bad input
+  `restrict_self`, up to four seccomp filters (TSYNC), `execve`. Everything that can fail on bad input
   is prepared before the first step.
 - Landlock (ABI 1 or newer, read from the kernel at run time) handles every file system right of
   the ABI. Writable paths never get execute, symbolic link, named pipe or device rights. ABI 6
   scopes signals (required for `signals = "isolated"`) and abstract Unix sockets; ABI 9 denies
   pathname Unix sockets when `unix_sockets = "none"`; ABI 4 denies TCP when `ip = "none"`.
 - Seccomp allowlist: the reviewed system call table of Linux 7.2; every other number, x32 numbers,
-  `clone3` and `openat2` fail with `ENOSYS`; other CPU architectures are killed.
+  `clone3`, `openat2` and `fanotify_init` fail with `ENOSYS`; other CPU architectures are killed.
 - Seccomp socket family filter: `socket` with a family outside the policy (an allowlist) fails
   with `EAFNOSUPPORT`, so that programs fall back as they would on a kernel without the family.
+- Seccomp extended attribute filter: with `path_metadata = "deny"`, the reads that take a path
+  fail with `ENOTSUP`, the error of a file system without extended attributes, so that programs
+  skip them instead of failing.
 - Seccomp denylist (`EPERM`): datagram socket pairs when Unix sockets are denied, io_uring,
   ptrace and `process_vm_*`, System V IPC, POSIX message queues, namespaces, mounts, `bpf`,
   `perf_event_open`, `userfaultfd`, keyrings, the security module calls,
@@ -369,7 +374,8 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   access (TCP connect only to the relay targets from ABI 4) and a seccomp filter limited to TCP,
   copying, threads and that timer. A forwarded port serves only sandy's own user (rule 6).
 - Refused: no Landlock (the reason names the fix), no seccomp, root or any capability, a writable
-  path that overlaps the minimal system set (rule 6).
+  path that overlaps the minimal system set (rule 6), a program whose ELF loader no executable
+  path covers (the kernel opens it during `execve`).
 
 ### macOS
 

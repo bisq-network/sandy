@@ -3,11 +3,14 @@
 //! `docs/linux.md`.
 #![cfg(target_os = "linux")]
 
+mod cgroup;
 mod contain;
 mod filter;
 mod helper;
 mod host;
 mod launch;
+mod loader;
+mod openssl;
 mod peer;
 mod plan;
 mod relay;
@@ -28,6 +31,10 @@ impl Backend for LinuxBackend {
 
     fn plan(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
         plan::plan_for(policy, &HostCapabilities::detect_for(policy)).items
+    }
+
+    fn notes(&self, policy: &ResolvedPolicy) -> Vec<String> {
+        plan::notes(policy, &HostCapabilities::detect_for(policy))
     }
 
     fn run(&self, policy: &ResolvedPolicy, command: &TargetCommand) -> Result<i32, SandboxError> {

@@ -48,6 +48,10 @@ fn is_eperm(line: &ProbeLine) -> bool {
     line.result == "denied" && line.detail.contains("os error 1)")
 }
 
+fn has_errno(line: &ProbeLine, errno: i32) -> bool {
+    line.result != "ok" && line.detail.contains(&format!("os error {errno})"))
+}
+
 /// The sandbox options of both process models: the exec model, and `children = "contained"`,
 /// in which a forked child confines itself. `contained` needs isolated signals (Landlock ABI 6).
 fn process_models(base: &[String]) -> Vec<Vec<String>> {
@@ -377,12 +381,88 @@ fn the_crypto_policy_files_are_readable() {
     }
 }
 
-/// Records a documented limitation (docs/linux.md, "Paths outside the policy are visible"): an
-/// unprivileged fanotify group can watch a directory outside the policy and learn when files in
-/// it change, like an inotify watch. It reports events, not contents. If this test fails, the
-/// kernel or the filter changed and the limitation list should say so.
+/// `sandy check` names every `.include` of the host's OpenSSL configuration that the policy does
+/// not cover, because OpenSSL drops an include it cannot read without an error and then runs
+/// with weaker built-in defaults. The minimal system set covers the includes of this host, so
+/// the default policy must warn about none; a policy that grants only the configuration file
+/// itself must warn about each target.
 #[test]
-fn fanotify_watches_paths_outside_the_policy() {
+fn unreadable_openssl_includes_are_reported() {
+    let configs = ["/etc/ssl/openssl.cnf", "/etc/pki/tls/openssl.cnf"];
+    let with_includes = configs.into_iter().find(|config| {
+        let text = fs::read_to_string(config).unwrap_or_default();
+        text.lines()
+            .any(|line| line.trim_start().starts_with(".include"))
+    });
+    let Some(config) = with_includes else {
+        return skip(
+            "openssl-includes",
+            "the OpenSSL configuration of this host includes no other file",
+        );
+    };
+    let probe = probe_path();
+    let covered = sandy(["check", probe.as_str()]);
+    let warnings = String::from_utf8_lossy(&covered.stderr);
+    assert!(
+        !warnings.contains("OpenSSL configuration"),
+        "the minimal system set should cover the includes of {config}: {warnings}"
+    );
+    // Only the configuration file, so its includes are out of reach. `check` reports this
+    // although it refuses the policy for another reason (no loader without the system set).
+    let alone = sandy([
+        "check",
+        "--system",
+        "none",
+        "--read",
+        config,
+        probe.as_str(),
+    ]);
+    let warnings = String::from_utf8_lossy(&alone.stderr);
+    assert!(warnings.contains("OpenSSL configuration"), "{warnings}");
+    // The remedy is in the message. It names the canonical target, which is what a rule binds
+    // to, so it can differ from the path the configuration file spells.
+    assert!(warnings.contains("Add --read /"), "{warnings}");
+}
+
+/// Records a documented limitation (docs/linux.md, "cgroup limits"): a program in the sandbox
+/// cannot see the limits of the cgroup it runs in, because neither /proc nor /sys/fs/cgroup is
+/// in the minimal system set. Resource limits are a non-goal, so sandy sets none; `sandy check`
+/// names the limit it found and what to pass to the program.
+#[test]
+fn a_cgroup_limit_is_invisible_and_reported() {
+    let probe = probe_path();
+    let limited = Command::new("systemd-run")
+        .args(["--user", "--scope", "-q", "-p", "MemoryMax=512M"])
+        .args(["-p", "CPUQuota=100%", "--", &sandy_path(), "check", &probe])
+        .output()
+        .unwrap();
+    if !limited.status.success() {
+        return skip(
+            "user-systemd-scope",
+            &format!(
+                "no user scope with a memory limit here: {}",
+                String::from_utf8_lossy(&limited.stderr).trim()
+            ),
+        );
+    }
+    let warnings = String::from_utf8_lossy(&limited.stderr);
+    assert!(warnings.contains("cgroup limit"), "{warnings}");
+    assert!(
+        warnings.contains("536870912 bytes from memory.max"),
+        "{warnings}"
+    );
+    assert!(warnings.contains("--set-env GOMAXPROCS=1"), "{warnings}");
+    // The program itself sees neither the value nor its own cgroup.
+    let inside = probe_inside(&[], &[("read", "/proc/self/cgroup")]);
+    inside[0].assert_blocked();
+}
+
+/// docs/linux.md, "Paths outside the policy are visible": an unprivileged fanotify group would
+/// watch a directory outside the policy and report the files in it that change. Landlock has no
+/// hook for it, so `fanotify_init` fails with `ENOSYS`, which is what a kernel without fanotify
+/// returns; a program falls back to inotify.
+#[test]
+fn fanotify_groups_cannot_be_created() {
     let fixture = Fixture::new("conformance-fanotify");
     let secret = fixture.arg("secret");
     let outside = probe_outside(&[("fanotify-init", &secret)]);
@@ -395,7 +475,158 @@ fn fanotify_watches_paths_outside_the_policy() {
             ),
         );
     }
-    probe_inside(&fixture.access_args(), &[("fanotify-init", &secret)])[0].assert_ok();
+    let inside = probe_inside(&fixture.access_args(), &[("fanotify-init", &secret)]);
+    assert!(has_errno(&inside[0], libc::ENOSYS), "{inside:?}");
+}
+
+/// docs/linux.md, "Metadata": the extended attribute reads that take a path fail with `ENOTSUP`,
+/// also for a file the policy allows, because the call names a path and Landlock does not check
+/// it. The descriptor variants keep working, so a program reads the attributes of the files it
+/// may open. With `path_metadata = "allow"` the path reads work again, like the path writes.
+#[test]
+fn extended_attributes_by_path_are_unreadable() {
+    let fixture = Fixture::new("conformance-getxattr");
+    let (secret, readable) = (fixture.arg("secret/file"), fixture.arg("ro/file"));
+    let prepare = [
+        ("setxattr-fd", secret.as_str()),
+        ("setxattr-fd", readable.as_str()),
+    ];
+    let prepared = probe_outside(&prepare);
+    if let Some(line) = prepared.iter().find(|line| line.result != "ok") {
+        // tmpfs before Linux 6.6 has no user extended attributes.
+        return skip(
+            "extended-attributes",
+            &format!("{} fails outside: {}", line.action, line.detail),
+        );
+    }
+    let actions = [
+        ("listxattr-path", secret.as_str()),
+        ("listxattr-path", readable.as_str()),
+        ("getxattr-fd", readable.as_str()),
+    ];
+    for line in probe_outside(&actions) {
+        line.assert_ok();
+    }
+    let inside = probe_inside(&fixture.access_args(), &actions);
+    assert!(has_errno(&inside[0], libc::ENOTSUP), "{inside:?}");
+    assert!(has_errno(&inside[1], libc::ENOTSUP), "{inside:?}");
+    inside[2].assert_ok();
+
+    let mut allow = fixture.access_args();
+    allow.extend(args(&["--linux-path-metadata", "allow"]));
+    for line in probe_inside(&allow, &actions) {
+        line.assert_ok();
+    }
+}
+
+/// Records a documented limitation (docs/linux.md, "Paths outside the policy are visible"): an
+/// inotify watch on a directory the program cannot list reports the names of the entries that
+/// appear in it. Landlock has no hook for `inotify_add_watch`, and closing this would need a
+/// mount namespace. The writer creates the entry again and again, so the watch cannot miss it
+/// however the two runs interleave.
+#[test]
+fn inotify_reports_names_in_unlistable_directories() {
+    let fixture = Fixture::new("conformance-inotify");
+    let secret = fixture.arg("secret");
+    let entry = fixture.path("secret/new-report-2026.pdf");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = fs::write(&entry, b"x");
+                let _ = fs::remove_file(&entry);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        })
+    };
+    let actions = [("inotify-name", secret.as_str()), ("list", secret.as_str())];
+    let lines = probe_inside(&fixture.access_args(), &actions);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    assert_eq!(lines[0].detail, "new-report-2026.pdf", "{lines:?}");
+    lines[1].assert_blocked();
+}
+
+/// Records a limitation that docs/linux.md, "Paths outside the policy are visible" now names: a
+/// directory that the caller passes as standard input stays listable, because Landlock checks
+/// the directory right when a path is opened and this descriptor was opened before the sandbox.
+/// Opening an entry through it still needs a policy path.
+#[test]
+fn a_directory_on_standard_input_stays_listable() {
+    let fixture = Fixture::new("conformance-dirfd");
+    let secret = fixture.path("secret");
+    // A fresh descriptor per run: two runs that share one would also share its directory
+    // position, and the second would see no entry.
+    let on_stdin = move |command: &mut Command| {
+        let directory = fs::File::open(&secret).unwrap();
+        command.stdin(std::process::Stdio::from(directory));
+    };
+    let file = fixture.arg("secret/file");
+    let actions = [("list-fd", "0"), ("read", file.as_str())];
+    let outside = parse(&run_with(probe_path(), probe_args(&actions), &on_stdin));
+    outside[0].assert_ok();
+    let lines = probe_inside_with(&fixture.access_args(), &actions, &on_stdin);
+    assert_eq!(lines[0].detail, outside[0].detail, "{lines:?}");
+    lines[1].assert_blocked();
+}
+
+/// docs/linux.md, "/proc": without a `/proc` grant the program cannot read `/proc/self/status`
+/// and the other files of its own process, but `readlink("/proc/self/exe")` works, because
+/// `readlink` is not a Landlock right. `std::env::current_exe` and the runtimes that use it
+/// therefore keep working, which the documentation used to deny.
+#[test]
+fn the_programs_own_path_is_readable_without_proc() {
+    let actions = [("current-exe", "-"), ("read", "/proc/self/status")];
+    let outside = probe_outside(&actions);
+    outside[0].assert_ok();
+    let inside = probe_inside(&[], &actions);
+    assert_eq!(inside[0].detail, outside[0].detail, "{inside:?}");
+    inside[1].assert_blocked();
+}
+
+/// docs/linux.md, "Refusals": the kernel opens the loader that a program names in its ELF
+/// header, so sandy refuses a policy that does not let the program execute it instead of letting
+/// `execve` fail with "Permission denied" after the sandbox is in place. `system = "none"` leaves
+/// the loaders of the minimal system set out, which is the case every host can show; a loader in
+/// a system location that the set does not name is covered by the unit tests of `sandy-linux`.
+#[test]
+fn a_program_whose_loader_is_not_granted_is_refused() {
+    let without_system = args(&["--system", "none"]);
+    let run = sandy(run_args(&without_system, &[("open", "/etc/hostname")]));
+    if run.status.success() {
+        return skip(
+            "dynamic-program",
+            "the probe runs without a loader grant on this host, so it needs no loader",
+        );
+    }
+    // The run cannot work, so `check` must say so instead of reporting every requirement as
+    // enforced and leaving the failure to the `execve`.
+    let probe = probe_path();
+    let refused = sandy(["check", "--system", "none", probe.as_str()]);
+    let report = String::from_utf8_lossy(&refused.stdout);
+    assert!(
+        report.contains("the kernel executes the loader"),
+        "{report}"
+    );
+    assert_eq!(refused.status.code(), Some(1), "{report}");
+    // The minimal system set grants the loader, so the same program is enforceable with it.
+    let granted = sandy(["check", probe.as_str()]);
+    assert!(granted.status.success(), "{granted:?}");
+}
+
+/// docs/linux.md, "Minimal system set": /etc/passwd is not in the set, so `getpwuid` finds no
+/// entry for the user. A policy that needs the account name, home directory or shell of the
+/// user adds `--read /etc/passwd`; /etc/nsswitch.conf is not needed, because glibc falls back
+/// to the files back end.
+#[test]
+fn the_user_account_needs_a_grant_for_etc_passwd() {
+    let actions = [("getpwuid", "-")];
+    let outside = probe_outside(&actions);
+    outside[0].assert_ok();
+    probe_inside(&[], &actions)[0].assert_blocked();
+    let granted = probe_inside(&args(&["--read", "/etc/passwd"]), &actions);
+    assert_eq!(granted[0].detail, outside[0].detail, "{granted:?}");
 }
 
 /// docs/linux.md, "Metadata": the file system ioctls that change a file or a directory are
