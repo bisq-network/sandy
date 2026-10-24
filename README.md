@@ -343,7 +343,7 @@ The options that take a path or a variable can be repeated.
 |---|---|
 | the program's status | `sandy run` started the program |
 | 128 + signal number | Linux and macOS with `children = "contained"`: a signal ended the program |
-| 125 | sandy failed or refused: invalid policy, a requirement this host cannot enforce, a setup error; with `children = "contained"` also a failure while sandy supervises the program |
+| 125 | sandy failed or refused: invalid policy, a requirement this host cannot enforce, a socket on a standard stream that the policy denies, a setup error; with `children = "contained"` also a failure while sandy supervises the program |
 | 0 / 1 | `sandy check`: the policy is enforceable / not enforceable |
 
 On Windows the program's 32-bit exit code is passed through unchanged.
@@ -436,6 +436,14 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
   systemd user manager starts arbitrary commands outside the sandbox. On macOS it includes the DNS
   resolver, so even with `ip = "none"` the program can send data out in DNS queries. Use it only
   for programs you would also run without a sandbox.
+- A socket on standard input, output or error keeps the access it was created with: it exists
+  before the sandbox, and no sandbox can take rights from what is already open. sandy therefore
+  refuses to start the program, with status 125 and the stream named, when a standard stream
+  carries an IP socket under `ip = "none"`, or an unconnected, datagram or listening Unix socket
+  under `unix_sockets = "none"`. A connected Unix stream or seqpacket socket is accepted: that is
+  how a parent passes a pipe. A service that is handed its connection on standard input
+  (inetd-style, systemd `Accept=yes`) needs `ip = "all"`. `sandy check` cannot report this,
+  because its own streams are not the streams of the later `run`.
 - `expose` entries: `listen` must be a loopback address, must differ from the program's own
   address, and may appear only once. They need `ip = "all"` in this version. At most 256
   connections per port are relayed at the same time. A connection that is still open when the
@@ -611,6 +619,10 @@ Recommendations:
 5. **Do not pass secrets in arguments or the environment** unless the program needs them.
 6. **On Windows**, choose a stable AppContainer name per policy, and run `sandy setup` with
    administrator rights during installation.
+7. **Give the program pipes, files or a terminal on its standard streams.** sandy passes
+   descriptors 0, 1 and 2 on as it got them, so a socket among them would keep its access; sandy
+   refuses to start the program then. The connected Unix stream socket that most runtimes pass
+   for a pipe (libuv, and so Node.js) is accepted.
 
 ## Security model
 

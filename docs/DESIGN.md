@@ -160,24 +160,42 @@ Rules:
    has already ended.
 12. No writable policy path may reach a location of this user whose content other programs read
    or execute later: the home directory (which it may not contain), the shell startup files,
-   autostart entries and user services, `~/.ssh`, the directories on sandy's `PATH`, and per
-   platform `~/Library/LaunchAgents`, the Startup folders, the PowerShell profile folders and
-   `WindowsApps`. A file the program leaves in one of them runs outside the sandbox with the
-   user's rights at the next login, the next shell or the next command, which would make the
-   whole policy pointless. The backend checks this, because only it knows the locations of its
-   platform, and it compares paths as rules 3 and 4 do. A path below the home directory, or
-   below a directory on `PATH`, stays writable: only the locations themselves and the trees of
-   those that hold code are protected.
+   autostart entries and user services, `~/.ssh`, and per platform `~/Library/LaunchAgents`, the
+   Startup folders, the PowerShell profile folders and `WindowsApps`. A file the program leaves
+   in one of them runs outside the sandbox with the user's rights at the next login or the next
+   shell, which would make the whole policy pointless. The backend checks this, because only it
+   knows the locations of its platform, and it compares paths as rules 3 and 4 do. A path below
+   the home directory stays writable: only the locations themselves and the trees of those that
+   hold code are protected.
+
+   A directory on sandy's `PATH` is **warned about, not refused**. The escape is the same, a
+   file the program leaves there runs when the user next types its name, but a writable path
+   that holds one is often what the caller means (a package cache whose `bin` directory is on
+   `PATH`, or `/usr/local`), so refusing it would turn away ordinary work. The warning names the
+   directory, and the answers are to grant the subdirectories the program needs or to start
+   sandy with a `PATH` that does not reach into the writable path.
 
    The set is a heuristic. No list knows which files the programs of a user trust, and the set
    covers the usual shell and desktop setups only. It also does not depend on the policy:
    `system = "none"` changes nothing about it. The home directory comes from the password
    database or the known-folder API and from the environment, because a program that starts
    sandy with a minimal environment sets neither; when no source names one, only the locations
-   that do not depend on it are checked. The trade-off is that a few policies that worked
-   before are refused now, a writable project tree whose `bin` directory the caller has on
-   `PATH` for example; the answer is to grant the directories the program needs, or to start
-   sandy with a `PATH` that does not reach into the writable path.
+   that do not depend on it are checked.
+
+13. The standard streams stay the caller's choice, except for the sockets among them. sandy
+   passes descriptors 0, 1 and 2 on as it received them and closes every other one, because a
+   program reads its input and writes its output through them. Nothing inside the sandbox can
+   take rights away from what is already open, so a socket on a standard stream keeps the access
+   it was created with, whatever the policy says about networking. `run` therefore looks at the
+   three streams before it applies the sandbox and refuses with status 125, naming the stream
+   and the socket, when one carries a socket the policy denies: an IP socket or one of another
+   family with `ip = "none"`, and an unconnected, datagram or listening Unix socket with
+   `unix_sockets = "none"`. A connected Unix stream or seqpacket socket is accepted, because it
+   talks only to the peer it already has, which is how a parent passes a pipe (libuv, journald,
+   `ssh` without a terminal); what that peer is stays the caller's choice, as with a file. A
+   service that is handed its connection on standard input, inetd-style or with systemd
+   `Accept=yes`, needs `ip = "all"`. `check` cannot report this: the streams it is given are not
+   the streams of the later `run`.
 
 ## Links and file identity
 

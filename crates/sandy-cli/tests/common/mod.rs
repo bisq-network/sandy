@@ -375,6 +375,23 @@ where
     panic!("{} stayed busy for two seconds", program.display());
 }
 
+/// A socket as the standard input of a child, so a test can hand the program a socket it opened
+/// itself. On Windows a socket is a kernel handle like any other, but its Rust type is not, so
+/// it takes the detour through the raw handle.
+#[cfg(unix)]
+pub fn stdin_from<T: Into<std::os::fd::OwnedFd>>(socket: T) -> Stdio {
+    Stdio::from(socket.into())
+}
+
+#[cfg(windows)]
+pub fn stdin_from<T: Into<std::os::windows::io::OwnedSocket>>(socket: T) -> Stdio {
+    use std::os::windows::io::{FromRawHandle, IntoRawSocket, OwnedHandle, RawHandle};
+
+    let handle = socket.into().into_raw_socket() as usize as RawHandle;
+    // SAFETY: into_raw_socket gave up the only owner of the handle, which OwnedHandle takes on.
+    Stdio::from(unsafe { OwnedHandle::from_raw_handle(handle) })
+}
+
 pub fn parse(output: &Output) -> Vec<ProbeLine> {
     String::from_utf8_lossy(&output.stdout)
         .lines()

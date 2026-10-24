@@ -404,7 +404,7 @@ with `ip = "all"` and the exemption. Options, tested on Windows 11 build 26200:
 |---|---|---|
 | `CheckNetIsolation LoopbackExempt -is -n=NAME` (debugging mode) | Does not help: connections still time out while it runs | Needs a running elevated helper; meant for debugging |
 | AF_UNIX socket in a read-write path | Works: the program listens, outside clients connect (`unix_socket_server_in_a_writable_path_is_reachable_from_outside`) | Clients must speak AF_UNIX; no change to sandy |
-| Listening TCP socket created outside the AppContainer and inherited | Works, even with `ip = "none"`: the program accepted a connection from an outside client | The program would have to accept on an inherited socket instead of its own |
+| Listening TCP socket created outside the AppContainer and passed on a standard handle | Worked, even with `ip = "none"`: the program accepted a connection from an outside client. sandy now refuses such a handle, so this needs `ip = "all"` | The program would have to accept on an inherited socket instead of its own |
 | Relay inside the AppContainer: a process holding the inherited listening socket forwards each connection over loopback to the server process in the same AppContainer | Works with `ip = "none"` and `ip = "all"`, with and without exemption | Implemented as `network.expose`, see "Exposed ports" |
 | Firewall rule for the package SID | Not tested; the AppContainer filters sit in the Windows Service Hardening sublayer, which ordinary firewall rules do not override [Project Zero 2021] | Administrator rights |
 
@@ -656,10 +656,20 @@ messages that reach processes outside the sandbox.
   inheritance to three handles [UpdateProcThreadAttribute]. A relay of an exposed port inherits
   its listening socket in addition. sandy duplicates each standard
   handle as an inheritable handle. A missing standard handle becomes the NUL device, and a
-  console becomes a relayed pipe. A standard handle that is a socket gives the program network
-  access through that socket, also with `ip = "none"`: AppContainer network isolation applies to
-  sockets the AppContainer creates, not to sockets created outside it (verified on Windows 11
-  with a listening socket). This holds on every platform for inherited sockets.
+  console becomes a relayed pipe. A standard handle that is a socket would give the program
+  network access through that socket, also with `ip = "none"`: AppContainer network isolation
+  applies to sockets the AppContainer creates, not to sockets created outside it (verified on
+  Windows 11 with a listening socket). This holds on every platform for inherited sockets, so
+  `run` looks at the three standard handles before it duplicates them and refuses with exit code
+  125, naming the handle and the socket, when one carries a socket the policy denies: an IP
+  socket or one of another family with `ip = "none"`, and an unconnected, datagram or listening
+  AF_UNIX socket with `unix_sockets = "none"`. A connected AF_UNIX stream socket is accepted,
+  because it reaches only the peer it already has. Winsock tells a socket from a file, a pipe and
+  a console: `GetFileType` reports `FILE_TYPE_PIPE` for a socket and a named pipe alike, while
+  `getsockopt` with `SO_PROTOCOL_INFOW` answers only for a socket and names its family and type.
+  `SO_ACCEPTCONN` exists only for sockets that can listen, so a datagram socket is named by what
+  Windows does tell about it: it has no peer. `sandy check` cannot report any of this, because
+  the handles it is given are not the handles of the later `run`.
 - **Environment.** sandy builds the block from the policy, sorted by name, case-insensitive,
   "without regard to locale" [Environment]. It sets two variables, which replace policy values:
   - `SystemRoot`, from `GetSystemWindowsDirectoryW`. System DLLs need it; without it, for
@@ -771,7 +781,7 @@ messages that reach processes outside the sandbox.
 
 Host: Windows 11 build 26200 (VM), binaries built for `x86_64-pc-windows-gnu`. The tests run in
 an elevated SSH session and without administrator rights. Latest elevated run, every test
-passing: `sandy_core` 39, `sandy_relay` 11, `sandy_windows` 70, `escape` 15, `escape_windows`
+passing: `sandy_core` 43, `sandy_relay` 11, `sandy_windows` 70, `escape` 17, `escape_windows`
 41, `expose` 4, `forward` 3, `children` 3, `parent` 3, `check` 4, `runner` 3, `review_windows`
 6. The COM check of `review_windows` is skipped there: the SSH session is session 0, where
 `ole32.dll` does not load in an AppContainer (limitation 13), so a denial would not be the COM
@@ -787,6 +797,9 @@ Facts these runs established:
 - A program starts in an AppContainer with `CREATE_NO_WINDOW` and gets its own console.
 - Writes, deletes and directory creation in read-write paths work without an integrity label.
 - AppContainer processes can use AF_UNIX.
+- A UDP socket and a listening TCP socket passed as the standard input of `sandy run` are
+  refused with exit code 125 before the program starts, and the outside control shows both
+  working without the sandbox (`a_socket_on_standard_input_gives_no_network_access`).
 - `NetworkIsolationGetAppContainerConfig` works without administrator rights.
 - Listening on loopback succeeds without capabilities; incoming connections time out, also with
   the exemption. Outbound connections to the internet fail with `WSAEACCES` (10013).

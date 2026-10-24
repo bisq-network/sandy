@@ -102,6 +102,17 @@ appear between a scan and the exec, and a descriptor above the current `RLIMIT_N
 too. Chromium starts all its child processes on macOS with the same two calls
 (`base/process/launch_mac.cc`).
 
+Descriptors 0, 1 and 2 keep what they were opened with, because the target reads its input and
+writes its output through them. Before it applies the profile, `run` therefore looks at the three
+streams and refuses with exit code 125, naming the stream and the socket, when one carries a
+socket the policy denies: an IP socket or one of another family with `ip = "none"`, and an
+unconnected, datagram or listening Unix socket with `unix_sockets = "none"`. A connected Unix
+stream socket is accepted, because it reaches only the peer it already has; macOS has no
+AF_UNIX seqpacket socket. macOS also has no `SO_ACCEPTCONN` (`getsockopt` answers ENOPROTOOPT for
+every socket), so the message names a listening socket by what the kernel does tell about it: it
+has no peer. `sandy check` cannot report any of this, because the streams it is given are not the
+streams of the later `run`.
+
 ### Inherited Mach port rights
 
 Mach port rights are not file descriptors, and the profile cannot close them: every lookup
@@ -347,6 +358,15 @@ gets them ignored unless the binary carries the `allow-dyld-environment-variable
 - `unix_sockets = "all"`: `(allow network-outbound (remote unix-socket))` and `(allow network-bind
   network-inbound (local unix-socket))`. This allows every Unix socket the user can reach,
   independent of the filesystem rules, as on every platform.
+- A socket on a standard stream was created before the profile, and the profile covers only part
+  of what such a socket still gives. Measured on macOS 26.5 with `ip = "none"`: `sendto` on an
+  inherited unconnected UDP socket was denied, because `network-outbound` is checked per
+  operation and not at creation; but `accept` on an inherited listening TCP socket succeeded and
+  the program took a connection from a client outside, and reading an inherited connected TCP
+  socket works like reading any other descriptor. `run` refuses a socket the policy denies on a
+  standard stream before it applies the profile (see "Inherited descriptors"), so for the
+  outbound case the profile is a second layer and for the inbound case the refusal is the only
+  one.
 
 ### Name resolution
 
@@ -681,6 +701,11 @@ no privilege, and closing them would break ordinary programs:
   job.
 - With `signals = "isolated"` the program gets no SIGIO, because `F_SETOWN` is denied (see
   [Signals the profile does not cover](#signals-the-profile-does-not-cover)).
+- Standard input, output and error keep what they were opened with, so a file outside the policy
+  on a standard stream can be read and written. A socket the policy denies is refused at the
+  start (see [Inherited descriptors](#inherited-descriptors)); a connected Unix stream socket is
+  accepted, and the program then reaches whatever its peer is, so pass one only from a process
+  that is the peer itself.
 - `link(2)` fails everywhere (see the hard link rule above).
 - With `system = "none"` no program starts on macOS: every program is linked dynamically, and dyld
   itself needs the root directory and the shared cache from the system set. sandy refuses such a

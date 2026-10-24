@@ -8,6 +8,7 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
+use std::mem::ManuallyDrop;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -15,6 +16,8 @@ use std::time::Duration;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// What `tcp-send` writes before it exits.
 const TCP_SEND_PAYLOAD: &[u8] = b"sent just before exit";
+/// What `udp-send-fd` sends through the socket it was passed.
+const UDP_SEND_PAYLOAD: &[u8] = b"sent through an inherited socket";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -210,6 +213,17 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
             stream.shutdown(std::net::Shutdown::Write)?;
             Ok(format!("{count} bytes"))
         }
+        // STREAM<U+001F>ADDRESS: sends a datagram to ADDRESS from the socket the caller passed as
+        // standard stream STREAM (0, 1 or 2), without creating a socket of its own.
+        "udp-send-fd" => {
+            let (stream, address) = pair(target)?;
+            let socket: ManuallyDrop<UdpSocket> = standard_socket(stream)?;
+            let sent = socket.send_to(UDP_SEND_PAYLOAD, socket_address(address)?)?;
+            Ok(format!("{sent} bytes"))
+        }
+        // Accepts one connection on the listening socket the caller passed as standard stream
+        // STREAM (0, 1 or 2).
+        "accept-fd" => accept_fd(target),
         action if unix::ACTIONS.contains(&action) => unix::perform(action, target),
         action if linux::ACTIONS.contains(&action) => linux::perform(action, target),
         action if macos::ACTIONS.contains(&action) => macos::perform(action, target),
@@ -1590,6 +1604,100 @@ fn tcp_accept(target: &str) -> io::Result<String> {
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Accepts one connection on the listening socket the caller passed as a standard stream. The
+/// socket was created outside the sandbox, so the program listens without binding a port itself.
+fn accept_fd(stream: &str) -> io::Result<String> {
+    const ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
+    let listener: ManuallyDrop<TcpListener> = standard_socket(stream)?;
+    listener.set_nonblocking(true)?;
+    let deadline = std::time::Instant::now() + ACCEPT_TIMEOUT;
+    loop {
+        match listener.accept() {
+            Ok((_, peer)) => return Ok(format!("accepted {peer}")),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "no connection"));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Which standard stream an action names: 0, 1 or 2.
+fn standard_stream(stream: &str) -> io::Result<u32> {
+    match stream {
+        "0" => Ok(0),
+        "1" => Ok(1),
+        "2" => Ok(2),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected the standard stream 0, 1 or 2",
+        )),
+    }
+}
+
+/// The socket a standard stream carries, borrowed: the returned value never closes it, because
+/// the stream stays in use. On Windows a standard handle has a number of its own, so the actions
+/// name the stream instead of the handle.
+#[cfg(unix)]
+fn standard_socket<T: std::os::fd::FromRawFd>(stream: &str) -> io::Result<ManuallyDrop<T>> {
+    let fd = standard_stream(stream)? as std::os::fd::RawFd;
+    // SAFETY: F_GETFD only checks that fd is open; it has no memory safety requirements.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor is open, and ManuallyDrop keeps the value from closing it, so the
+    // standard stream it belongs to stays untouched.
+    Ok(ManuallyDrop::new(unsafe { T::from_raw_fd(fd) }))
+}
+
+#[cfg(windows)]
+fn standard_socket<T: std::os::windows::io::FromRawSocket>(
+    stream: &str,
+) -> io::Result<ManuallyDrop<T>> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    // The standard library starts Winsock when it creates the first socket of the process. An
+    // inherited one is not created here, so nothing has started it yet.
+    // SAFETY: WSADATA is plain data; WSAStartup fills it.
+    let mut data: WSADATA = unsafe { std::mem::zeroed() };
+    // SAFETY: data is a valid out pointer.
+    let code = unsafe { WSAStartup(0x0202, &mut data) };
+    if code != 0 {
+        return Err(io::Error::from_raw_os_error(code));
+    }
+    let which = match standard_stream(stream)? {
+        0 => STD_INPUT_HANDLE,
+        1 => STD_OUTPUT_HANDLE,
+        _ => STD_ERROR_HANDLE,
+    };
+    // SAFETY: GetStdHandle has no preconditions.
+    let handle = unsafe { GetStdHandle(which) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the standard stream is closed",
+        ));
+    }
+    // SAFETY: the handle is open, and ManuallyDrop keeps the value from closing it, so the
+    // standard stream it belongs to stays untouched.
+    Ok(ManuallyDrop::new(unsafe {
+        T::from_raw_socket(handle as std::os::windows::io::RawSocket)
+    }))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn standard_socket<T>(stream: &str) -> io::Result<ManuallyDrop<T>> {
+    standard_stream(stream)?;
+    Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported"))
 }
 
 /// Windows-specific actions. They report `Unsupported` elsewhere.

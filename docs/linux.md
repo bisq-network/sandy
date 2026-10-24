@@ -301,8 +301,11 @@ sandy reads the ABI from the kernel each time (`landlock_create_ruleset` with th
 It never infers the ABI from the kernel version, because distributions backport Landlock. It uses
 the lower of the kernel ABI and ABI 9, the newest ABI that the `landlock` crate (0.4.7) knows. The
 crate runs with `CompatLevel::HardRequirement`, so a right that the kernel does not support is an
-error, not a silent omission. ABI 10 adds only UDP rights, which sandy does not need because the
-seccomp filter denies IP sockets.
+error, not a silent omission. ABI 10 adds only UDP rights, which sandy does not need: the seccomp
+filter denies IP sockets, so a program inside cannot create one, and a UDP socket created before
+the sandbox is refused on a standard stream and closed on every other descriptor. The crate's
+`AccessNet` knows only the two TCP rights, so handling the UDP rights would need a newer crate or
+a ruleset built with raw system calls.
 
 | ABI | Linux | What changes in sandy |
 |---|---|---|
@@ -761,6 +764,17 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   ForwardedPortsRelayed is unavailable. `sandy check` binds the same addresses for a moment and
   releases them again, so it reports what `run` refuses. The answer can be stale one moment
   later; `run` binds for real and stays the authoritative answer.
+- A standard stream that carries a socket the policy denies: `sandy run` refuses with exit code
+  125 and names the stream and the socket. Such a socket was created before the sandbox, so
+  neither Landlock nor the filter takes its access away: an unconnected UDP socket on standard
+  input delivered a datagram to a listener outside under `ip = "none"`, and a listening TCP
+  socket on standard input took a connection from outside with `unix_sockets = "all"`, which
+  leaves `accept` allowed (both measured on Linux 7.2). Refused are an IP socket or one of
+  another family with `ip = "none"`, and an unconnected, datagram or listening Unix socket with
+  `unix_sockets = "none"`; a connected Unix stream or seqpacket socket is accepted, because it
+  reaches only the peer it already has. `sandy check` cannot report this: the streams it is given
+  are not the streams of the later `run`. See
+  `a_socket_on_standard_input_gives_no_network_access`.
 
 ## Known limitations
 
@@ -826,6 +840,12 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   manager over D-Bus, to start a process outside the sandbox. A service that starts processes on
   requests over TCP is still reachable with `ip = "all"` or through a `forward` target; such
   processes are not the program's and are not covered.
+- **Standard streams.** sandy passes descriptors 0, 1 and 2 on as it got them, so whatever they
+  carry keeps working inside the sandbox: a file outside the policy can be read and written, a
+  directory stays listable, and the metadata calls on an open file work (see "Metadata through
+  open files"). A socket the policy denies is refused at the start instead (see "Refusals"). A
+  connected Unix stream or seqpacket socket is accepted, and the program then reaches whatever
+  its peer is, so pass one only from a process that is the peer itself.
 - **The terminal.** If standard input or output is the user's terminal, the program can read
   input, write escape sequences and change terminal modes. `TIOCSTI`, `TIOCLINUX` and `TIOCSETD`
   are always denied, and with `signals = "isolated"` also `TIOCSPGRP` and `TIOCSWINSZ`.

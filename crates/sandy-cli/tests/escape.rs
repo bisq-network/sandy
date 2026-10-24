@@ -11,8 +11,9 @@
 mod common;
 
 use std::fs;
-use std::net::TcpListener;
-use std::process::Command;
+use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 
 use common::*;
 
@@ -537,4 +538,180 @@ fn metadata_outside_writable_paths_cannot_change() {
         let permissions = fs::metadata(fixture.path(file)).unwrap().permissions();
         assert!(!permissions.readonly(), "{file} changed");
     }
+}
+
+/// What `udp-send-fd` sends through the socket it is given (see `sandy-probe`).
+const UDP_SEND_PAYLOAD: &[u8] = b"sent through an inherited socket";
+
+/// A socket on a standard stream was created before the sandbox, so the sandbox cannot take its
+/// access away: the program sends, receives and accepts through it whatever the policy says.
+/// sandy refuses to start the program instead.
+#[test]
+fn a_socket_on_standard_input_gives_no_network_access() {
+    let outside = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let target = format!("0\u{1f}{}", outside.local_addr().unwrap());
+    let actions = [("udp-send-fd", target.as_str())];
+    let sender = || UdpSocket::bind("127.0.0.1:0").unwrap();
+
+    let output = Command::new(probe_path())
+        .args(probe_args(&actions))
+        .stdin(stdin_from(sender()))
+        .output()
+        .unwrap();
+    parse(&output)[0].assert_ok();
+    assert_eq!(
+        datagram(&outside, Duration::from_secs(5)).as_deref(),
+        Some(UDP_SEND_PAYLOAD)
+    );
+
+    let refused = run_with_stdin(&run_args(&[], &actions), stdin_from(sender()));
+    assert_refused(
+        &refused,
+        "standard input carries an unconnected IP datagram socket",
+    );
+    assert_eq!(datagram(&outside, Duration::from_millis(500)), None);
+
+    // A listening socket on standard input lets the program accept connections from outside.
+    // With `unix_sockets = "all"` the Linux filter allows `accept`, so the socket alone decides.
+    let actions = [("accept-fd", "0")];
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = server.local_addr().unwrap();
+    // A connection that is complete as soon as it is in the backlog, so the client needs no
+    // accept to connect and the test does not race the program.
+    let waiting = TcpStream::connect(address).unwrap();
+    let output = Command::new(probe_path())
+        .args(probe_args(&actions))
+        .stdin(stdin_from(server.try_clone().unwrap()))
+        .output()
+        .unwrap();
+    parse(&output)[0].assert_ok();
+    drop(waiting);
+
+    let waiting = TcpStream::connect(address).unwrap();
+    let sandbox_args = ["--unix-sockets".to_string(), "all".to_string()];
+    let refused = run_with_stdin(&run_args(&sandbox_args, &actions), stdin_from(server));
+    // macOS has no SO_ACCEPTCONN, so there sandy names what the kernel does tell about the
+    // socket: it has no peer.
+    let state = if cfg!(target_os = "macos") {
+        "an unconnected"
+    } else {
+        "a listening"
+    };
+    assert_refused(
+        &refused,
+        &format!("standard input carries {state} IP stream socket"),
+    );
+    drop(waiting);
+}
+
+/// The one socket that gives no more than a pipe: a connected Unix stream or seqpacket socket,
+/// which is how libuv, journald and `ssh` without a terminal pass a standard stream. Refusing it
+/// would break those callers, so sandy starts the program. A datagram pair can be pointed
+/// elsewhere, so it is refused like any other Unix socket.
+#[test]
+fn a_connected_unix_socket_on_standard_input_still_runs() {
+    use std::io::Write;
+
+    const LINE: &[u8] = b"a line from the parent\n";
+    let actions = [("read-line", "0")];
+    let args = run_args(&[], &actions);
+    let mut skipped = Vec::new();
+    for kind in ["stream", "seqpacket"] {
+        let Some((mut ours, theirs)) = unix_pair(kind) else {
+            skipped.push(kind);
+            continue;
+        };
+        ours.write_all(LINE).unwrap();
+        let output = run_with_stdin(&args, theirs);
+        assert!(
+            output.status.success(),
+            "a connected Unix {kind} socket must stay allowed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let lines = parse(&output);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        lines[0].assert_ok();
+        assert_eq!(lines[0].detail, "a line from the parent");
+    }
+
+    match unix_pair("datagram") {
+        // The line is for the program that must not start: without it, a regression would let
+        // the probe wait for input instead of failing the test.
+        Some((mut ours, theirs)) => {
+            ours.write_all(LINE).unwrap();
+            assert_refused(
+                &run_with_stdin(&args, theirs),
+                "standard input carries a connected Unix datagram socket",
+            );
+        }
+        None => skipped.push("datagram"),
+    }
+    if !skipped.is_empty() {
+        skip(
+            "unix-socket-pair",
+            &format!(
+                "this host makes no connected AF_UNIX pair of these kinds: {}",
+                skipped.join(", ")
+            ),
+        );
+    }
+}
+
+/// A connected AF_UNIX socket pair: the end the test writes to and the end a child gets as its
+/// standard input. `None` when this host has no pair of that kind (macOS has no seqpacket
+/// socket, Windows has no `socketpair`).
+#[cfg(unix)]
+fn unix_pair(kind: &str) -> Option<(fs::File, Stdio)> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let kind = match kind {
+        "stream" => libc::SOCK_STREAM,
+        "seqpacket" => libc::SOCK_SEQPACKET,
+        "datagram" => libc::SOCK_DGRAM,
+        other => panic!("unknown socket kind {other}"),
+    };
+    let mut pair = [-1 as libc::c_int; 2];
+    // SAFETY: socketpair writes two descriptors into the array and reads nothing else.
+    if unsafe { libc::socketpair(libc::AF_UNIX, kind, 0, pair.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: both descriptors are new and nothing else in this process owns them.
+    let (ours, theirs) = unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
+    Some((fs::File::from(ours), Stdio::from(theirs)))
+}
+
+#[cfg(not(unix))]
+fn unix_pair(_kind: &str) -> Option<(fs::File, Stdio)> {
+    None
+}
+
+/// Runs sandy with `args` and `stdin` as its standard input.
+fn run_with_stdin(args: &[String], stdin: Stdio) -> Output {
+    Command::new(sandy_path())
+        .args(args)
+        .stdin(stdin)
+        .output()
+        .unwrap()
+}
+
+/// Checks that sandy refused to start the program, and why.
+#[track_caller]
+fn assert_refused(output: &Output, reason: &str) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(EXIT_FAILURE),
+        "sandy did not refuse the socket; it printed {stdout:?} and {stderr:?}"
+    );
+    assert!(stderr.contains(reason), "{stderr}");
+    assert!(stdout.is_empty(), "the program must not run: {stdout}");
+}
+
+/// The next datagram, or `None` when none arrives within `timeout`.
+fn datagram(listener: &UdpSocket, timeout: Duration) -> Option<Vec<u8>> {
+    listener.set_read_timeout(Some(timeout)).unwrap();
+    let mut buffer = [0u8; 128];
+    let (read, _) = listener.recv_from(&mut buffer).ok()?;
+    Some(buffer[..read].to_vec())
 }

@@ -8,3 +8,6 @@ review_macos sysctl_proc_cputype_is_not_a_cross_process_oracle sysctl-proc-cputy
 # refuses the catalog search outside the sandbox too, so neither call can show what the profile
 # adds.
 review_macos by_id_lookups_do_not_reach_files_outside_the_policy by-id-call
+# macOS has no AF_UNIX seqpacket socket, so only the stream pair of that test can be passed on a
+# standard stream here.
+escape a_connected_unix_socket_on_standard_input_still_runs unix-socket-pair

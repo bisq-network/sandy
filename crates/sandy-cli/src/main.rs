@@ -2,10 +2,12 @@
 //! platform backend. All enforcement lives in the backends.
 
 mod args;
+mod stdio;
 
 use std::process::ExitCode;
 
 use args::{Command, Invocation, Mode};
+use sandy_core::streams::StandardStream;
 use sandy_core::{
     Backend, EnforcementPlan, Policy, ResolvedPolicy, TargetCommand, target_environment,
 };
@@ -247,6 +249,7 @@ fn execute(invocation: Invocation, parent_at_start: Option<u32>) -> Result<ExitC
             if !plan.is_enforceable() {
                 return Err(refusal(&plan));
             }
+            refuse_sockets_on_standard_streams(&resolved)?;
             let program = resolved
                 .program
                 .clone()
@@ -316,6 +319,21 @@ fn refuse_writable_trusted_files(
     resolved
         .check_trusted(&trusted)
         .map_err(|error| error.to_string())
+}
+
+/// The program inherits standard input, output and error as they are, and a socket among them
+/// keeps the access it was created with (see `sandy_core::streams`). Only `run` can check this:
+/// the streams of a `check` are not the streams the later `run` gets.
+fn refuse_sockets_on_standard_streams(resolved: &ResolvedPolicy) -> Result<(), String> {
+    for stream in StandardStream::ALL {
+        let Some(socket) = stdio::socket_on(stream)? else {
+            continue;
+        };
+        if let Some(reason) = sandy_core::streams::refusal(resolved, stream, socket) {
+            return Err(reason);
+        }
+    }
+    Ok(())
 }
 
 /// The names sandy was started under. `current_exe` reads `/proc/self/exe` on Linux, which the
