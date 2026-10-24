@@ -3750,18 +3750,21 @@ mod unix {
             .map(|arg| arg.as_ptr())
             .chain([ptr::null()])
             .collect();
+        // Read before the fork. The child must not ask getppid for it: when the probe has
+        // already exited by the time the child first runs, getppid answers with the process
+        // the child was given to instead, and a wait for that value to change never ends.
+        // SAFETY: getpid has no preconditions.
+        let probe = unsafe { libc::getpid() };
         // SAFETY: the probe has one thread, so the child may run any code. It only waits for
         // its parent to end and then leaves through execv or `_exit`.
         let child = unsafe { libc::fork() };
         if child == 0 {
-            // SAFETY: getppid has no preconditions.
-            let parent = unsafe { libc::getppid() };
             let pause = libc::timespec {
                 tv_sec: 0,
                 tv_nsec: 1_000_000,
             };
-            // SAFETY: as above.
-            while unsafe { libc::getppid() } == parent {
+            // SAFETY: getppid has no preconditions.
+            while unsafe { libc::getppid() } == probe {
                 // SAFETY: nanosleep reads a valid timespec and writes nothing.
                 unsafe { libc::nanosleep(&pause, ptr::null_mut()) };
             }

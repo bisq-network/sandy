@@ -3,10 +3,10 @@
 ## Answer
 
 1. **Expected to work from Windows 10 version 1809 (build 17763) through 22H2 (build 19045).** This includes LTSC 2019 (1809) and LTSC 2021 (21H2). Nothing was run on a Windows 10 host. The evidence is Microsoft Learn, the Chromium sources, Project Zero, the import table of a fresh build, and CI on Server 2022 (build 20348).
-2. **On 1507 to 1803, `sandy.exe` most likely does not start at all.**
-   - The binary imports `DeriveCapabilitySidsFromName` at load time, through `api-ms-win-security-base-l1-2-2.dll`.
+2. **On 1507 to 1803, `sandy.exe` cannot enforce the policy.**
+   - It needs `DeriveCapabilitySidsFromName`, from `api-ms-win-security-base-l1-2-2.dll` (host: KernelBase).
    - Chromium's test code says Windows 10 versions older than 1809 do not implement this function. A Microsoft sample that calls it directly gives build 15063 (1703) as its minimum, so the exact first build is **unverified**.
-   - If the export is missing, the Windows loader stops the process before `main` runs. This fails closed, but even `sandy check` cannot explain the reason.
+   - The research found a load-time import, which would have stopped the process before `main` ran. sandy now resolves the function at run time (`crates/sandy-windows/src/sys/host.rs`), so `sandy.exe` starts on such a build and `sandy check` reports the requirements that need the function as unavailable, with the reason.
 3. **Every other API, flag and attribute the backend uses exists since Windows 8 or earlier.** The other version-dependent points are about security fixes and side features, not about missing APIs.
 4. **Security floor.** CVE-2021-41338 (a bypass of the AppContainer firewall rules) was fixed in October 2021 for 1507, 1607, 1809, 1909, 2004, 20H2 and 21H1. 1511, 1703, 1709, 1803 and 1903 never got the fix. A host without the fix cannot enforce `IpNetworkDenied`.
 5. **In October 2026, only these Windows 10 hosts get security updates:** 22H2 with ESU, LTSC 2021, LTSC 2019 and IoT LTSC 2021. sandy should support exactly these hosts and refuse the others.
@@ -195,9 +195,9 @@ None are missing. Expected differences are:
 4. **Keep the MpsSvc check.** Firewall profiles that are turned off do not matter (2.3).
 5. **AF_UNIX:** check availability only when a feature needs it, such as a future server socket. Use `socket(AF_UNIX, SOCK_STREAM, 0)`.
 6. **A future `listen = [...]` option:** check that the socket is a real kernel handle (unverified LSP risk, 2.4). Bind to loopback only.
-7. **Small fixes found on the way:**
-   - `plan.rs` says the environment block is "plus SystemRoot" but the code also adds `LOCALAPPDATA`.
-   - `docs/windows.md` says the `LOCALAPPDATA`/`TEMP`/`TMP` redirection is undocumented. Microsoft Learn "Launch an AppContainer" documents it.
+7. **Small fixes found on the way, both done since:**
+   - `plan.rs` said the environment block is "plus SystemRoot" while the code also adds `LOCALAPPDATA`; it now names both.
+   - `docs/windows.md` said the `LOCALAPPDATA`/`TEMP`/`TMP` redirection is undocumented. Microsoft Learn "Launch an AppContainer" documents it, and the text now cites it.
 
 ## 6. Minimal test plan for Windows 10 22H2
 
@@ -232,7 +232,7 @@ None are missing. Expected differences are:
 
 ## Files
 
-- `crates/sandy-windows/src/sys/acl.rs` (static use of `DeriveCapabilitySidsFromName`, in `capability_sid`)
+- `crates/sandy-windows/src/sys/acl.rs` (`capability_sid`, which calls `DeriveCapabilitySidsFromName`; it is resolved at run time in `sys/host.rs`)
 - `crates/sandy-windows/src/sys/mod.rs` (`detect()`, where the new host checks belong)
 - `crates/sandy-windows/src/plan.rs` (environment plan text)
 - `docs/windows.md` (redirection wording; no Windows 10 or Server 2022 results yet)

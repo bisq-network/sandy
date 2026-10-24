@@ -168,8 +168,8 @@ user's SID owns them. The escape test `read_write_paths_are_not_executable` chec
 
 AppContainer processes run at low integrity, and files without a label count as medium. sandy
 sets no integrity label. Microsoft: "if a resource has a mandatory label of Medium IL or lower
-and the DACL grants access through to the AppContainer (through a Package SID or Capability
-SID) then the AppContainer can read, write, or execute depending on the access granted" [Implementing
+and the DACL grants access through to the AppContainer (through a Package SID or Capability SID)
+then the AppContainer can read, write, or execute depending on the access granted" [Implementing
 an AppContainer]. The escape tests write, create and delete in read-write paths on Windows 11.
 
 ### One capability per path
@@ -278,9 +278,9 @@ keeps read, write and execute on it although the AppContainer has no `FILE_EXECU
 process of the user outside the sandbox runs it.
 `review_windows::profile_folder_is_a_persistent_writable_but_not_executable_store` records
 that for the profile folder: inside the sandbox the planted image does not load, outside it
-does. A deny entry
-for the package SID would not help, because the AppContainer access check ignores it
-(`acl::check_writable`), and rewriting the user's own DACLs is not something sandy does.
+does. A deny entry for the package SID would not help, because the AppContainer access check
+ignores it (`acl::check_writable`), and rewriting the user's own DACLs is not something sandy
+does.
 
 The locations that are refused are in `sys::trusted_locations`:
 
@@ -297,13 +297,11 @@ starts sandy with a minimal environment sets no variable. A location that does n
 because the program could create it. Paths are compared as everywhere else on Windows, by their
 spelling (see "Links and identity").
 
-Every absolute directory on sandy's `PATH` (`sys::path_locations`) is such a location too: a
-program left there runs when the user types its name. A writable path that holds one is ordinary
-work, a package cache whose `bin` folder is on `PATH` for example, so sandy enforces the policy
-and warns instead of refusing it. `sandy check` exits 0 and prints a `warning:` line on standard
-error that names the writable path and the folder; the answers are to make only the subfolders
-the program needs writable, or to start sandy with a `PATH` that does not reach into the
-writable path. A folder below one of them is on no `PATH` and says nothing. A writable path that
+Every absolute directory on sandy's `PATH` (`sys::path_locations`) is such a location too, and
+rule 12 warns about it instead of refusing it, because a writable path that holds one is
+ordinary work: a package cache whose `bin` folder is on `PATH`, for example. `sandy check`
+exits 0 and prints a `warning:` line on standard error that names the writable path and the
+folder. A folder below one of them is on no `PATH` and says nothing. A writable path that
 reaches a refused location as well stays refused, `%LOCALAPPDATA%\Microsoft\WindowsApps` for
 example, which the default `PATH` holds: the warning never replaces a refusal.
 
@@ -325,9 +323,8 @@ The sandbox refuses access, it does not hide what exists. Paths outside the poli
 So the program can tell whether a path exists, and from the names it guesses it learns what the
 user has. Hiding paths would need a separate view of the file system, which `DESIGN.md` names a
 non-goal. The same holds for the user's processes: the program cannot open them, but a Toolhelp
-snapshot still lists them.
-`review_windows::an_existing_path_outside_the_policy_is_told_apart_from_a_missing_one` records
-the file case.
+snapshot still lists them. The file case is recorded in
+`review_windows::an_existing_path_outside_the_policy_is_told_apart_from_a_missing_one`.
 
 ### Removing the changes
 
@@ -640,22 +637,21 @@ pipe grants nothing to AppContainers [CreateNamedPipeW] [Implementing an AppCont
   `OpenProcess`), and sandy then requires that exact value instead of the ordering test: no
   clock change alters a recorded creation time, and a process that got the ID later has another
   one. The named process then need not be the one Windows recorded as sandy's parent, so a
-  wrapper such as `cmd /c` or `powershell` between the caller and sandy is allowed.
-  sandy waits for the program and the parent together;
-  when the parent ends, sandy ends the program's job (exit code 1) and finishes as after any end
-  of the program. If ending the job fails, sandy reports the error, and closing the job ends the
-  program. If the parent has already ended, sandy refuses to start the program; any other
-  failure to open it is reported as such. The AppContainer cannot open sandy, so the program
-  cannot keep sandy from doing this.
+  wrapper such as `cmd /c` or `powershell` between the caller and sandy is allowed. sandy waits
+  for the program and the parent together; when the parent ends, sandy ends the program's job
+  (exit code 1) and finishes as after any end of the program. If ending the job fails, sandy
+  reports the error, and closing the job ends the program. If the parent has already ended, sandy
+  refuses to start the program; any other failure to open it is reported as such. The
+  AppContainer cannot open sandy, so the program cannot keep sandy from doing this.
 - **UI restrictions.** The job sets all documented UI restrictions: desktops, display settings,
   `ExitWindows`, global atoms, USER handles of other processes, the clipboard (read and write),
   and system parameters [UI restrictions]. Low integrity already blocks window messages, hooks
   and input to windows of higher integrity (UIPI) [Integrity].
 - **Privilege escalation.** Children inherit the AppContainer token [Legacy apps]. The token
   normally keeps only `SeChangeNotifyPrivilege` and `SeIncreaseWorkingSetPrivilege` [Chromium
-  design]. sandy relies on the AppContainer
-  boundary that Microsoft services [MSRC] against elevation through system services. Starting
-  a program with `requireAdministrator` or calling `runas` from an AppContainer is not tested.
+  design]. sandy relies on the AppContainer boundary that Microsoft services [MSRC] against
+  elevation through system services. Starting a program with `requireAdministrator` or calling
+  `runas` from an AppContainer is not tested.
 - **Other processes.** A process created outside the AppContainer has a default DACL that grants
   nothing to the AppContainer SID, so the program cannot open it, read its memory or terminate it
   [Implementing an AppContainer]. The escape test `cannot_open_processes_outside` checks
@@ -701,10 +697,10 @@ messages that reach processes outside the sandbox.
     example, Winsock initialization fails.
   - `LOCALAPPDATA`, from `SHGetKnownFolderPath`. sandy loads `shell32.dll` for it at run time:
     `shell32.dll` loads `user32.dll`, which cannot initialize in some sessions (limitation 13),
-    and the relays run `sandy.exe` in the AppContainer. Without the variable, `CreateProcessW` fails for an
-    AppContainer process with `ERROR_ENVVAR_NOT_FOUND` (203). Windows replaces it with
-    `<LOCALAPPDATA>\Packages\<name>\AC` and sets `TEMP` and `TMP` to the `Temp` folder below,
-    also when the policy sets them. Microsoft documents the redirection [Implementing an
+    and the relays run `sandy.exe` in the AppContainer. Without the variable, `CreateProcessW`
+    fails for an AppContainer process with `ERROR_ENVVAR_NOT_FOUND` (203). Windows replaces it
+    with `<LOCALAPPDATA>\Packages\<name>\AC` and sets `TEMP` and `TMP` to the `Temp` folder
+    below, also when the policy sets them. Microsoft documents the redirection [Implementing an
     AppContainer]; that the variable is required is not documented, it was observed on Windows 11
     build 26200.
 - **Command line.** sandy quotes each argument so that `CommandLineToArgvW` and the C runtime
@@ -764,8 +760,9 @@ messages that reach processes outside the sandbox.
 6. sandy refuses to grant a directory that contains junctions or symbolic links, and a writable
    directory with a file below it that AppContainers may execute.
 7. Ctrl+C ends the program; it cannot handle it.
-8. The program does not see a console. Programs that read passwords from `CONIN$` read from their
-   own invisible console and wait forever.
+8. The program's console is its own and has no window, and it never gets a console handle of
+   sandy's. Programs that read passwords from `CONIN$` read from that console, which nobody
+   types into, and wait forever.
 9. A volume without ACLs (FAT, exFAT) cannot hold grants; sandy fails when a policy path lies
    there. Whether the AppContainer can access such volumes outside the policy depends on the
    security descriptor of the volume device and is not verified.
@@ -783,12 +780,12 @@ messages that reach processes outside the sandbox.
     `appcontainer-children`: `executes_only_executable_paths`,
     `children_none_denies_starting_programs`,
     `children_contained_ends_what_the_program_leaves_behind` and
-    `children_none_denies_starting_a_system_program`. The expected-skip list of the runner holds
-    them, so losing another check there is noticed. The execute right itself stays checkable
-    without a child process: `load-library` maps an image inside the program's own process and
-    needs `FILE_EXECUTE`, and `read_write_paths_are_not_executable` uses it with a copy in the
-    `read_exec` path as the positive control (measured on Windows 11: that copy maps, the one in
-    the read-write path does not).
+    `children_none_denies_starting_a_system_program`. They belong in the expected-skip list of
+    the runner, so that losing another check there is noticed. The execute right itself stays
+    checkable without a child process: `load-library` maps an image inside the program's own
+    process and needs `FILE_EXECUTE`, and `read_write_paths_are_not_executable` uses a copy
+    in the `read_exec` path as the positive control (measured on Windows 11: that copy maps,
+    the one in the read-write path does not).
 12. `std::fs::canonicalize` and `GetFinalPathNameByHandleW` with DOS names fail with
     `ERROR_ACCESS_DENIED` inside an AppContainer (Windows 11 and Server 2025); NT names work.
     Programs that canonicalize their paths need a fallback such as `std::path::absolute`.
@@ -806,15 +803,14 @@ messages that reach processes outside the sandbox.
 
 Host: Windows 11 build 26200 (VM), binaries built for `x86_64-pc-windows-gnu`. The tests run in
 an elevated SSH session and without administrator rights. Latest elevated run, every test
-passing: `sandy_core` 43, `sandy_relay` 11, `sandy_windows` 70, `escape` 17, `escape_windows`
-41, `expose` 4, `forward` 3, `children` 3, `parent` 3, `check` 4, `runner` 3, `review_windows`
-6. The COM check of `review_windows` is skipped there: the SSH session is session 0, where
-`ole32.dll` does not load in an AppContainer (limitation 13), so a denial would not be the COM
-boundary. Earlier
-non-administrator runs used a scheduled task with `/RL LIMITED` (medium integrity, Administrators
-deny-only). The latest one used `runas /trustlevel:0x20000` (Administrators deny-only, high
-integrity), because the VM had no interactive logon session for an `/IT` task: every test
-passed except two outside controls of `review_windows` (BITS activation and listing
+passing: `sandy_core` 43, `sandy_relay` 11, `sandy_windows` 70, `escape` 17, `escape_windows` 41,
+`expose` 4, `forward` 3, `children` 3, `parent` 3, `check` 4, `runner` 3, `review_windows` 6. The
+COM check of `review_windows` is skipped there: the SSH session is session 0, where `ole32.dll`
+does not load in an AppContainer (limitation 13), so a denial would not be the COM boundary.
+Earlier non-administrator runs used a scheduled task with `/RL LIMITED` (medium integrity,
+Administrators deny-only). The latest one used `runas /trustlevel:0x20000` (Administrators
+deny-only, high integrity), because the VM had no interactive logon session for an `/IT` task:
+every test passed except two outside controls of `review_windows` (BITS activation and listing
 `C:\Users\Public`), which that token may not do, so those tests correctly refuse to judge.
 
 Facts these runs established:

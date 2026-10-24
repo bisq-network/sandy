@@ -19,10 +19,11 @@ pub enum Requirement {
     EnvironmentControlled,
     /// IPv4 and IPv6 networking is denied, including loopback.
     IpNetworkDenied,
-    /// The target cannot connect to Unix domain sockets outside its read_write paths, so it
+    /// The target cannot connect to Unix domain sockets outside the paths it may write, so it
     /// cannot reach local services (session bus, service managers, resolvers). This is a lower
     /// bound: Linux and macOS deny Unix sockets completely; Windows, where access to a socket
-    /// follows the file's access control list, allows sockets inside read_write paths.
+    /// follows the file's access control list, allows the sockets in the read_write paths and
+    /// in the target's private AppContainer folder.
     UnixSocketsDenied,
     /// Signals cannot reach processes outside the sandbox.
     SignalsIsolated,

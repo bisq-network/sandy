@@ -261,39 +261,45 @@ fn a_parent_that_ended_before_sandy_ran_is_refused() {
     }
     let mut args = ending_with_parent(&fixture);
     args.extend(named_probe_parent(true));
-    let (pid, errors) = start_orphaned(&fixture, &args, &[("sleep", LONG_SLEEP)]);
+    let orphaned = start_orphaned(&fixture, &args, &[("sleep", LONG_SLEEP)]);
+    let pid = orphaned.pid;
     let ended = ends_soon(pid, END_TIMEOUT);
     if !ended {
         kill_process(pid);
     }
+    let errors = orphaned.finish();
     assert!(
         ended,
-        "sandy {pid} started the program for a parent that is gone"
+        "sandy {pid} started the program for a parent that is gone; it wrote {errors:?}"
     );
-    let errors = fs::read_to_string(errors).unwrap();
     assert!(errors.contains("has already ended"), "{errors}");
 
     // Without a token sandy knows only that it has a parent, not which process started it.
-    let (pid, errors) = start_orphaned(
+    let orphaned = start_orphaned(
         &fixture,
         &ending_with_parent(&fixture),
         &[("sleep", LONG_SLEEP)],
     );
+    let pid = orphaned.pid;
     if cfg!(target_os = "macos") {
         // macOS has no subreaper: the parent of an orphan is launchd, which sandy refuses.
         let ended = ends_soon(pid, END_TIMEOUT);
         if !ended {
             kill_process(pid);
         }
-        assert!(ended, "sandy {pid} watched launchd");
-        let errors = fs::read_to_string(errors).unwrap();
+        let errors = orphaned.finish();
+        assert!(ended, "sandy {pid} watched launchd; it wrote {errors:?}");
         assert!(errors.contains("launchd"), "{errors}");
     } else {
         // Linux gives the orphan to the nearest subreaper, an ordinary process that sandy
         // cannot tell from a caller that is still there, so it starts the program.
         let running = is_running(pid);
         kill_process(pid);
-        assert!(running, "sandy {pid} refused without being asked to");
+        let errors = orphaned.finish();
+        assert!(
+            running,
+            "sandy {pid} refused without being asked to; it wrote {errors:?}"
+        );
         skip(
             "orphan-detection-without-a-token",
             "Linux re-parents an orphan to the nearest subreaper, which sandy cannot tell from \
@@ -302,28 +308,52 @@ fn a_parent_that_ended_before_sandy_ran_is_refused() {
     }
 }
 
-/// Starts sandy through a probe that ends before sandy runs. Returns sandy's process ID and the
-/// file that holds what it wrote to standard error.
+/// What a run through `start-orphaned` left behind.
+#[cfg(unix)]
+struct Orphaned {
+    /// The probe, kept unreaped until the caller is done with it.
+    parent: std::process::Child,
+    /// The process that execs sandy once the probe has ended.
+    pid: u32,
+    /// The file that holds what sandy wrote to standard error.
+    errors: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Orphaned {
+    /// What sandy wrote to standard error, and reaps the probe. Empty means that sandy never
+    /// ran at all.
+    fn finish(mut self) -> String {
+        let status = self.parent.wait().unwrap();
+        assert!(status.success(), "the parent failed: {status:?}");
+        fs::read_to_string(self.errors).unwrap()
+    }
+}
+
+/// Starts sandy through a probe that ends before sandy runs. The probe stays unreaped until
+/// `Orphaned::finish`, so the process the caller names has certainly ended but still holds its
+/// process ID while sandy looks at it. That is the harder of the two cases and the one that
+/// used to depend on timing.
 #[cfg(unix)]
 fn start_orphaned(
     fixture: &Fixture,
     sandbox_args: &[String],
     program: &[(&str, &str)],
-) -> (u32, std::path::PathBuf) {
+) -> Orphaned {
     let start = sandy_command(sandbox_args, program);
     let report = fixture.path("orphan-report");
     let errors = fixture.path("orphan-errors");
-    let status = Command::new(probe_path())
+    let parent = Command::new(probe_path())
         .args(probe_args(&[("start-orphaned", &start)]))
         .stdout(fs::File::create(&report).unwrap())
         .stderr(fs::File::create(&errors).unwrap())
-        .status()
+        .spawn()
         .unwrap();
-    assert!(status.success(), "the parent failed: {status:?}");
-    (
-        started_process(&fs::read_to_string(&report).unwrap()),
+    Orphaned {
+        pid: wait_for_report(&report),
+        parent,
         errors,
-    )
+    }
 }
 
 /// A wrapper between the caller and sandy is sandy's parent, so `--parent-pid` alone is refused.

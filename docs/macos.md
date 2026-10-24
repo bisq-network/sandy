@@ -176,10 +176,10 @@ of earlier definitions"), so the protections come last. The unit test
    Rust's `std::fs::copy` (which tries `fclonefileat` first and does not fall back on `EPERM`)
    fail. XNU passes both the source and the destination to the single MAC check of a clone, and
    Apple does not document which one the filter matches. The escape test
-   `clones_and_links_stay_inside_the_policy` measured it on macOS 15.7: copies and clones inside a
-   `read_write` path and from a `read` path into it work; a clone of a file outside the policy
-   into a `read_write` path, and a clone out of a `read_write` path to a place that is not
-   writable, are denied.
+   `clones_and_links_stay_inside_the_policy` measures it on every macOS host that runs the
+   suite: copies and clones inside a `read_write` path and from a `read` path into it work; a
+   clone of a file outside the policy into a `read_write` path, and a clone out of a
+   `read_write` path to a place that is not writable, are denied.
 
 8. Networking (see below).
 9. Ancestors of every granted path: `file-read-metadata` and `file-test-existence` on each
@@ -193,23 +193,23 @@ of earlier definitions"), so the protections come last. The unit test
       problem (commit f6950546e5). Policy paths inside writable paths need no rule: sandy-core
       rejects them for the same reason.
     - `(deny file-link nvram* iokit-get-properties mach-priv* mach-task-name mach-task-read
-      mach-task-inspect system-debug)`. `file-link` is not part of `file-write*`, and Apple's `maild.sb` denies
-      it explicitly after `(deny default)`. A hard link to a file outside the policy would make it
-      reachable through a writable path, so links are denied everywhere. Links that already
-      exist are a start-time check of the resolver: a `read_exec` file, the program, sandy's own
-      executable or the policy file must have no second name inside a writable path (see "Links
-      and file identity" in [DESIGN.md](DESIGN.md)).
+      mach-task-inspect system-debug)`. `file-link` is not part of `file-write*`, and Apple's
+      `maild.sb` denies it explicitly after `(deny default)`. A hard link to a file outside the
+      policy would make it reachable through a writable path, so links are denied everywhere.
+      Links that already exist are a start-time check of the resolver: a `read_exec` file, the
+      program, sandy's own executable or the policy file must have no second name inside a
+      writable path (see "Links and file identity" in [DESIGN.md](DESIGN.md)).
     - `(deny syscall-unix (syscall-number 427) (syscall-number 217) (syscall-number 479)
       (syscall-number 225))`: `fsgetpath`, `fsgetpath_ext`, `openbyid_np` and `searchfs` find a
       file by volume id and inode number. `fsgetpath` builds the path in the kernel without
       reaching any Seatbelt file operation, so the target could learn the path of any file on the
       data volume from its device and inode number (a finding of the macOS security review;
-      contents stayed protected). Seatbelt allows
-      `syscall-unix` by default and filters it by number (WebKit's profiles use the same
-      operation). The numbers come from XNU's `bsd/kern/syscalls.master`, because older profile
-      compilers do not know every `SYS_` name. dyld or libSystem calls `fsgetpath` once while a
-      program starts; the call fails, the Sandbox log records `deny(1) syscall-unix 427`, and the
-      program starts normally (CI run 39767043700).
+      contents stayed protected). Seatbelt allows `syscall-unix` by default and filters it by
+      number (WebKit's profiles use the same operation). The numbers come from XNU's
+      `bsd/kern/syscalls.master`, because older profile compilers do not know every `SYS_` name.
+      dyld or libSystem calls `fsgetpath` once while a program starts; the call fails, the
+      Sandbox log records `deny(1) syscall-unix 427`, and the program starts normally (CI run
+      39767043700).
     - `(deny syscall-unix (syscall-number 142))`: `gethostuuid` returns the hardware UUID, an
       identifier of the machine that every user and every reinstall share. IOKit would give the
       same value (`IOPlatformUUID`) only with `iokit-get-properties`, which the profile denies.
@@ -327,15 +327,13 @@ program that starts sandy with a minimal environment sets no `HOME`; when neithe
 none of these locations is checked. A location that does not exist counts, because the
 program could create it, and each counts where it lies and where its symbolic links lead.
 
-Every absolute directory on sandy's `PATH` (`trust::path_locations`) is such a location too: a
-program left there runs when the user types its name. A writable path that holds one is ordinary
-work, `--read-write ~/.cargo` with `~/.cargo/bin` on `PATH` or `--read-write /usr/local`, so
-sandy enforces the policy and warns instead of refusing it. `sandy check` exits 0 and prints a
-`warning:` line on standard error that names the writable path and the directory
-(`plan::notes`); the answers are to make only the subdirectories the program needs writable, or
-to start sandy with a `PATH` that does not reach into the writable path. A directory below one
-of them is on no `PATH` and says nothing. A writable path that reaches a refused location as
-well stays refused: the warning never replaces a refusal.
+Every absolute directory on sandy's `PATH` (`trust::path_locations`) is such a location too,
+and rule 12 warns about it instead of refusing it, because a writable path that holds one is
+ordinary work: `--read-write ~/.cargo` with `~/.cargo/bin` on `PATH`, or `--read-write
+/usr/local`. `sandy check` exits 0 and prints a `warning:` line on standard error that names
+the writable path and the directory (`plan::notes`). A directory below one of them is on no
+`PATH` and says nothing, and a writable path that reaches a refused location as well stays
+refused.
 
 The profile could deny these paths inside a writable path instead of refusing the policy,
 because a later deny rule overrides an earlier allow. sandy refuses, so that one policy means
@@ -392,11 +390,11 @@ allow it, so only `getaddrinfo` and the dns_sd API work.
   already allows (queries, service registration on the local network, port mappings on the
   router). The plan names this exception for `UnixSocketsDenied`.
 - `ip = "none"` and `unix_sockets = "none"`: the resolver is unreachable.
-- `ip = "none"` and `unix_sockets = "all"`: the resolver is reachable like every other Unix socket.
-  The target cannot open IP sockets, but it can make mDNSResponder send DNS queries, and a DNS query
-  can carry data out. This is a consequence of `unix_sockets = "all"`, the same as on Linux, where
-  a resolver or proxy daemon can listen on a Unix socket too. The plan says so for
-  `IpNetworkDenied`.
+- `ip = "none"` and `unix_sockets = "all"`: the resolver is reachable like every other Unix
+  socket. The target cannot open IP sockets, but it can make mDNSResponder send DNS queries,
+  and a DNS query can carry data out. This is a consequence of `unix_sockets = "all"`, the same
+  as on Linux, where a resolver or proxy daemon can listen on a Unix socket too. The plan says
+  so for `IpNetworkDenied`.
 
 ## Exposed and forwarded ports
 
@@ -425,12 +423,13 @@ The relay is a process of its own, outside the program's sandbox and confined by
    profile denies process information about others.
 5. It applies its own Seatbelt profile (`profile::relay_profile`): deny by default,
    `network-inbound` only on its listen ports, `network-outbound` only to the target ports, the
-   `FIONBIO` and `FIOASYNC` ioctls, and the same closing denials as the program's profile. It needs no file at all, because it keeps running the code sandy already
-   loaded and executes nothing.
+   `FIONBIO` and `FIOASYNC` ioctls, and the same closing denials as the program's profile. It
+   needs no file at all, because it keeps running the code sandy already loaded and executes
+   nothing.
 6. Only then does it report over the readiness pipe that it is ready, or why it did not start.
    sandy waits for the report (10 seconds at most) and refuses to start the program without a
-   ready report. sandy closes its own copies of the
-   listeners before the exec, and `POSIX_SPAWN_CLOEXEC_DEFAULT` would close them anyway.
+   ready report. sandy closes its own copies of the listeners before the exec, and
+   `POSIX_SPAWN_CLOEXEC_DEFAULT` would close them anyway.
 7. The relay waits on the same kqueue for new connections (`EVFILT_READ` on each listener) and
    for the end of the program (with `contained` also for the end of the guard's pipe), and relays
    each accepted connection with `sandy_relay::relay` in a thread of its own, up to
@@ -487,10 +486,9 @@ without that check, because the kernel sends those signals itself:
   are measured in `a_program_can_join_a_process_group_outside_the_sandbox`, and
   `a_background_read_stops_another_job_of_the_terminal` shows what it costs: a program with
   isolated signals joins the group of another job of its terminal session, reads the terminal,
-  and the kernel stops that job with it. The ioctls that aim
-  such a signal, `TIOCSPGRP` (take the terminal) and `TIOCSWINSZ` (SIGWINCH to the foreground
-  group), are outside the ioctl allowlist and denied in every mode
-  (`the_terminal_signal_ioctls_are_denied`).
+  and the kernel stops that job with it. The ioctls that aim such a signal, `TIOCSPGRP` (take
+  the terminal) and `TIOCSWINSZ` (SIGWINCH to the foreground group), are outside the ioctl
+  allowlist and denied in every mode (`the_terminal_signal_ioctls_are_denied`).
 
   `process.children = "contained"` closes both routes: it denies `setpgid`, `setsid` and
   `posix_spawn`, so no process of the sandbox can leave the group that sandy ends. It requires
@@ -577,6 +575,11 @@ one SIGKILL can miss a process; a program that forks in a loop leaves survivors 
 `ESRCH` when nothing is left. The guard can repeat the signal because it is not in the group. The
 group's ID is the anchor's process ID, and the guard reaps the anchor only after sandy is done or
 gone, so no other group can have the ID while sandy or the guard signals it.
+
+If both sandy and the guard are killed with `SIGKILL`, nothing ends the group. sandy, the
+guard and the anchor are forks of one process and all carry sandy's command line, so
+`pkill -9 -f sandy` does exactly that. Killing sandy alone is safe, as on Linux: the guard ends
+the group.
 
 The relay of exposed and forwarded ports watches sandy's process ID, which is the supervising
 sandy here, so it ends after the group (rule 5 of "Forwarded ports" in `DESIGN.md`).
@@ -681,11 +684,16 @@ case:
    with `process-exec`. This keeps the guarantee if the platform rule ever changes.
 
 Other routes to privileges need a Mach service (authorization, `security_authtrampoline`,
-privileged helper tools, `sudo` through launchd jobs), which the profile denies. The target can set
-the setuid bit on its own files in a `read_write` path (`file-write-setugid` is part of
-`file-write*`), but such a file belongs to the user, grants no privilege, and is not executable in
-the sandbox. The escape test `setuid_programs_do_not_start` executes `/usr/bin/sudo` with the policy
-allowing it, and expects a refusal.
+privileged helper tools, `sudo` through launchd jobs), which the profile denies. The escape test
+`setuid_programs_do_not_start` executes `/usr/bin/sudo` with the policy allowing it, and expects
+a refusal.
+
+The target can set the setuid bit on its own files in a `read_write` path
+(`file-write-setugid` is part of `file-write*`); the profile does not deny the bits, as the
+Linux denylist does. The bit gives the target nothing: it runs as this user already, and
+nothing in a writable path is executable inside the sandbox. It is a gift to another local user
+who can reach the file, because outside the sandbox the file runs with this user's rights. That
+is the threat Linux denies the mode bits for (docs/linux.md, "Setuid and setgid bits").
 
 ## Information the target can still read
 
@@ -721,8 +729,9 @@ no privilege, and closing them would break ordinary programs:
   (`process_ids_outside_the_sandbox_stay_countable`). macOS answers the same way for a process
   of another user outside any sandbox.
 - The names, file ids and metadata of the entries of the root directory, through
-  `getattrlistbulk` on `/`, which the program may open (`bulk_listing_reaches_only_the_root_directory`).
-  A directory the policy does not grant cannot be opened, so the call cannot reach it.
+  `getattrlistbulk` on `/`, which the program may open
+  (`bulk_listing_reaches_only_the_root_directory`). A directory the policy does not grant cannot
+  be opened, so the call cannot reach it.
 
 ## Known limitations
 

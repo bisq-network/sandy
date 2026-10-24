@@ -7,8 +7,8 @@ The Linux backend restricts sandy's own process and then replaces it with the pr
 
 - **Landlock** confines the file system, isolates the process from ptrace, and (from ABI 6)
   scopes signals and abstract Unix sockets.
-- **Three seccomp filters** deny system calls that Landlock does not cover: socket families,
-  io_uring, namespaces, System V IPC, metadata changes by path, and more.
+- **Up to four seccomp filters** deny system calls that Landlock does not cover: socket
+  families, io_uring, namespaces, System V IPC, metadata changes by path, and more.
 - **no_new_privs** stops setuid programs and file capabilities from adding privileges.
 
 The research behind the design is in [research/linux-mechanisms.md](research/linux-mechanisms.md).
@@ -34,8 +34,9 @@ Then sandy restricts itself, in this order:
 5. Set no_new_privs.
 6. Verify that the process has exactly one thread (one entry in `/proc/self/task`), then
    `landlock_restrict_self`. sandy checks that the ruleset is fully enforced.
-7. Install the allowlist filter, then the denylist filter, then the socket family filter, each
-   with `SECCOMP_FILTER_FLAG_TSYNC`.
+7. Install the filters in this order, each with `SECCOMP_FILTER_FLAG_TSYNC`: the allowlist, the
+   denylist, with `path_metadata = "deny"` the extended attribute filter, and the socket family
+   filter last (see "Seccomp").
 8. `execve`. Only this call remains after the filters are in place.
 
 Landlock and seccomp restrict the calling thread. sandy starts no threads and verifies this before
@@ -90,8 +91,8 @@ One relay process serves all pairs. sandy starts it before it confines itself:
      ABI 6 the signal and abstract socket scopes;
    - the shared allowlist filter and a relay filter that allows only TCP sockets, `accept`,
      `connect`, reading and writing, polling, memory calls, thread creation without namespace
-     flags, `timer_settime` for the watchdog below, `rt_sigtimedwait` and `FIONBIO`. Every other call fails with
-     `EPERM`; `clone3` fails with `ENOSYS`.
+     flags, `timer_settime` for the watchdog below, `rt_sigtimedwait` and `FIONBIO`. Every other
+     call fails with `EPERM`; `clone3` fails with `ENOSYS`.
 4. The relay starts and joins one test thread (so a filter that blocks threads fails here) and
    reports "ready" over the pipe. sandy reads the report and continues only on success. Any
    failure of the relay is reported back, and sandy refuses to run. The relay then polls the
@@ -103,10 +104,11 @@ One relay process serves all pairs. sandy starts it before it confines itself:
    connections deliver their data, at most one second, and exits (DESIGN.md rule 5 of "Forwarded
    ports"), resetting the connections that are still open. A program that connects, writes and
    exits at once therefore does not lose its data, and the relay never outlives the program by
-   more than one second. With `contained` the pidfd is sandy's; the relay also polls a pipe whose
-   write end only the guard holds, which ends when the guard dies with the program's group, so
-   the relay ends with the group also while sandy is stopped. If sandy fails after starting the
-   relay, sandy's process ends and the relay with it.
+   more than one second, unless the program stopped it (step 6). With `contained` the pidfd is
+   sandy's; the relay also polls a pipe whose write end only the guard holds, which ends when
+   the guard dies with the program's group, so the relay ends with the group also while sandy
+   is stopped. If sandy fails after starting the relay, sandy's process ends and the relay with
+   it.
 6. No process can block SIGSTOP, so with the default `signals = "any"` the program can stop its
    relay. A stopped relay neither sees the program end nor accepts anything, while the kernel
    keeps completing handshakes for its listeners; once someone continues it, it would relay
@@ -130,10 +132,10 @@ readiness therefore leaves no message; a failure before that is reported over th
 
 The relay runs in its own Landlock domain, a sibling of the program's domain, so neither can
 ptrace the other. With `signals = "any"` the program can kill or stop the relay; a kill ends the
-relayed connections at once, and a stop ends the relay within two seconds (step 6 above). Any local process can
-connect to the relay's listeners, like to any loopback port. Through an exposed port it reaches
-the program, which is what an exposed port is for: the program's own listener is reachable
-directly anyway, so the relay checks nobody there.
+relayed connections at once, and a stop ends the relay within two seconds (step 6 above). Any
+local process can connect to the relay's listeners, like to any loopback port. Through an exposed
+port it reaches the program, which is what an exposed port is for: the program's own listener is
+reachable directly anyway, so the relay checks nobody there.
 
 A forwarded port is different. It exists for the program alone, and the relay reaches `to` as
 sandy's user, so a connection of another user would pass an owner rule of the packet filter or a
@@ -183,9 +185,9 @@ when the program ends. sandy does not replace itself with the program:
    `SIGSTOP` stops only sandy. The fault signals (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`,
    `SIGSYS`, `SIGABRT`, `SIGTRAP`) stay unblocked, so `kill -SEGV` to sandy ends sandy and the
    guard then kills the group instead of the program receiving the signal. sandy also reaps
-   processes that were re-parented to it,
-   and refuses to continue if the guard ends before the program. With a terminal (one of sandy's
-   standard descriptors is its controlling terminal), sandy follows job control:
+   processes that were re-parented to it, and refuses to continue if the guard ends before the
+   program. With a terminal (one of sandy's standard descriptors is its controlling terminal),
+   sandy follows job control:
    - The program's group starts in the background. When the program stops because it read or
      wrote the terminal (`SIGTTIN`, `SIGTTOU`) and sandy's group is the foreground group, sandy
      gives the terminal to the program's group and continues it. Then Ctrl+C and Ctrl+Z reach the
@@ -265,14 +267,13 @@ started sandy ends:
    program, and continues only after the watcher has reported that it is confined. The watcher
    starts a session of its own (`setsid`) and blocks every signal except the fault signals. It
    keeps only the two pidfds, the readiness pipe and `/dev/null` as its standard descriptors,
-   and confines itself with no_new_privs,
-   Landlock without file access and without TCP (from ABI 6 also the abstract socket scope), and
-   a seccomp filter that allows only polling, `pidfd_send_signal`, the readiness report, ending,
-   and the memory and clock calls of the Rust runtime. It has no Landlock signal scope: it must
-   signal the program, which runs in another Landlock domain. The filter allows
-   `pidfd_send_signal` only through the program's descriptor and only with SIGTERM, SIGCONT and
-   SIGKILL, so the watcher cannot reach the process that started sandy, whose pidfd it also
-   holds.
+   and confines itself with no_new_privs, Landlock without file access and without TCP (from
+   ABI 6 also the abstract socket scope), and a seccomp filter that allows only polling,
+   `pidfd_send_signal`, the readiness report, ending, and the memory and clock calls of the
+   Rust runtime. It has no Landlock signal scope: it must signal the program, which runs in
+   another Landlock domain. The filter allows `pidfd_send_signal` only through the program's
+   descriptor and only with SIGTERM, SIGCONT and SIGKILL, so the watcher cannot reach the
+   process that started sandy, whose pidfd it also holds.
 5. The watcher polls both pidfds. When the program ends first, the watcher ends. When the parent
    ends, the watcher sends SIGTERM and SIGCONT through the program's pidfd (SIGCONT, so that a
    stopped program gets the request), waits at most 5 seconds for the program to end, and then
@@ -438,15 +439,19 @@ sandy installs up to four filters, built with `seccompiler` from `libc::SYS_*` n
 4. **Socket families.** `socket` with a family the policy denies returns `EAFNOSUPPORT`.
 
 The kernel applies the stricter result of all of them, and among equal results the one of the
-filter installed last, which is why the family filter comes after the denylist. Programs treat
-`ENOSYS` like an older kernel: glibc falls back from `clone3` to `clone`, callers of `openat2`
-fall back to `openat`, and a program that cannot create an fanotify group uses inotify. They
-treat `EAFNOSUPPORT` like a kernel without the family, so a program that probes for IPv6 or for
-AF_UNIX falls back instead of ending, and `ENOTSUP` like a file system without extended
-attributes, which every caller of `getxattr` handles; `EPERM` reads like a temporary failure.
-`socketpair` keeps `EPERM`, because its denials are about the socket type, not the family.
-Arguments of type int (socket family, ioctl command, clone flags, open flags) are compared on
-their low 32 bits only, because the kernel ignores the high bits.
+filter installed last, which is why the family filter comes after the denylist. Programs mostly
+treat `ENOSYS` like an older kernel: glibc falls back from `clone3` to `clone`, callers of
+`openat2` fall back to `openat`, and a program that cannot create an fanotify group uses
+inotify. They treat `EAFNOSUPPORT` like a kernel without the family, so a program that probes
+for IPv6 or for AF_UNIX falls back instead of ending, and `ENOTSUP` like a file system without
+extended attributes, which every caller of `getxattr` handles; `EPERM` reads like a temporary
+failure. `socketpair` keeps `EPERM`, because its denials are about the socket type, not the
+family. Arguments of type int (socket family, ioctl command, clone flags, open flags) are
+compared on their low 32 bits only, because the kernel ignores the high bits.
+
+Not every caller falls back. GNU tar 1.35 on glibc 2.43 opens a file in a subdirectory with
+`openat2` and gives up when that fails, so it extracts the top directory of an archive and
+nothing below it (measured on Fedora 44, under both settings of `path_metadata`).
 
 ### Denylist
 
@@ -497,8 +502,10 @@ descriptor with `AT_EMPTY_PATH`, and `O_PATH` opens need no Landlock right. `fch
 `fsetxattr`, `fremovexattr` and `utimensat` without a path stay allowed. They reject `O_PATH`
 descriptors, and access mode 3 is denied, so they only reach files that Landlock let the program
 open for reading or writing, also read-only (see "Known limitations"). Programs that change
-metadata by path, for example `tar`, `cp -p` and `install`, need `path_metadata = "allow"`; then
-the program can change the metadata of every file the user owns.
+metadata by path need `path_metadata = "allow"`; then the program can change the metadata of
+every file the user owns. Measured on Fedora 44: `install`, `cp -a`, `rsync -a`, `unzip`,
+`cpio -idm` and `git` fail under `"deny"` and work under `"allow"`, while `cp -p` works under
+both, because it sets the metadata through the descriptor it wrote.
 
 The same setting decides the reads. `getxattr`, `lgetxattr`, `listxattr` and `llistxattr` with
 a path, and `getxattrat`, `listxattrat` and `file_getattr`, fail with `ENOTSUP`, the error of a
@@ -589,13 +596,14 @@ stop its own group, and `SIGTTIN` reaches no process outside it.
 ### Other processes
 
 `prlimit64`, `setpriority`, `ioprio_set`, `sched_setaffinity`, `sched_setscheduler`,
-`sched_setparam` and `sched_setattr` can change other processes of the user: lower their
-resource limits, priority or I/O priority, or pin them to one CPU. The denylist allows them only
-with process ID 0 (the caller), and with `children = "none"` or `"contained"` also with the
-target's own process ID, which it keeps from sandy after `execve`. With `children = "allowed"` a
-process the program started can outlive it, and once another process of the user has that ID,
-the exemption would cover it; there only 0 works. For `setpriority` and `ioprio_set` it also denies the process group and user forms,
-because sandy's process group can contain processes outside the sandbox.
+`sched_setparam` and `sched_setattr` can change other processes of the user: lower their resource
+limits, priority or I/O priority, or pin them to one CPU. The denylist allows them only with
+process ID 0 (the caller), and with `children = "none"` or `"contained"` also with the target's
+own process ID, which it keeps from sandy after `execve`. With `children = "allowed"` a process
+the program started can outlive it, and once another process of the user has that ID, the
+exemption would cover it; there only 0 works. For `setpriority` and `ioprio_set` it also denies
+the process group and user forms, because sandy's process group can contain processes outside the
+sandbox.
 
 These are system calls. The out-of-memory priority of a process is not set by a call but by a
 write to `/proc/<pid>/oom_score_adj`, which the denylist cannot see. A policy with a write grant
@@ -647,7 +655,8 @@ Left out on purpose:
   the terminal of the user.
 - `/etc/passwd` and `/etc/group`: not needed to start, and they list the accounts of the host.
   `ls -l` shows numeric owners, and `getpwuid` finds nothing (see below).
-- `/usr/bin` and other program directories: the program file is executable by policy rule 4.
+- `/usr/bin` and other program directories: the program file is executable by rule 5 of
+  [DESIGN.md](DESIGN.md).
   A program that starts other programs needs `--read-exec` for them.
 - `/usr/local/lib`: add it to the policy if a program needs libraries from there.
 
@@ -732,15 +741,13 @@ starts sandy. The home directory comes from the password database (`getpwuid_r`)
 location that does not exist counts, because the program could create it, and each counts where
 it lies and where its symbolic links lead.
 
-Every absolute directory on sandy's `PATH` (`trust::path_locations`) is such a location too: a
-program left there runs when the user types its name. A writable path that holds one is ordinary
-work, `--read-write ~/.cargo` with `~/.cargo/bin` on `PATH` or `--read-write /usr/local`, so
-sandy enforces the policy and warns instead of refusing it. `sandy check` exits 0 and prints a
-`warning:` line on standard error that names the writable path and the directory
-(`plan::notes`); the answers are to make only the subdirectories the program needs writable, or
-to start sandy with a `PATH` that does not reach into the writable path. A directory below one
-of them is on no `PATH` and says nothing. A writable path that reaches a refused location as
-well stays refused: the warning never replaces a refusal.
+Every absolute directory on sandy's `PATH` (`trust::path_locations`) is such a location too,
+and rule 12 warns about it instead of refusing it, because a writable path that holds one is
+ordinary work: `--read-write ~/.cargo` with `~/.cargo/bin` on `PATH`, or `--read-write
+/usr/local`. `sandy check` exits 0 and prints a `warning:` line on standard error that names
+the writable path and the directory (`plan::notes`). A directory below one of them is on no
+`PATH` and says nothing, and a writable path that reaches a refused location as well stays
+refused.
 
 The list is a heuristic and can never be complete: no list knows which files the programs of
 this user trust. It also does not see a hard link that already gives one of these files a second
@@ -839,8 +846,8 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   leaves `accept` allowed (both measured on Linux 7.2). Refused are an IP socket or one of
   another family with `ip = "none"`, and an unconnected, datagram or listening Unix socket with
   `unix_sockets = "none"`; a connected Unix stream or seqpacket socket is accepted, because it
-  reaches only the peer it already has. `sandy check` cannot report this: the streams it is given
-  are not the streams of the later `run`. See
+  reaches only the peer it already has. `sandy check` cannot report this: the streams it is
+  given are not the streams of the later `run`. The test is
   `a_socket_on_standard_input_gives_no_network_access`.
 
 ## Known limitations
@@ -883,8 +890,8 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   path, except for setuid and setgid bits. seccomp sees only the descriptor number, not how the
   file was opened, and Landlock has no metadata right, so the only remaining fix is a helper
   outside the sandbox that performs these calls after checking the descriptor. With `fsetxattr`
-  this includes ACLs and, on a host with SELinux, the security label. The file system ioctls of
-  the same kind are denied (see "Metadata"). The test
+  this includes ACLs and, on a host with SELinux, the security label. The file system ioctls
+  of the same kind are denied (see "Metadata"). The test
   `metadata_calls_on_a_read_only_descriptor_still_work` records this.
 - **Files the program writes can be executed outside the sandbox.** The program gets no execute
   right in a writable path, but a file it writes keeps the mode it gives it: the filter strips
@@ -931,7 +938,8 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   `mkfifo` and symbolic links in writable paths, metadata changes and extended attribute reads
   by path with the default setting, `fanotify`, `chattr` and the other file system ioctls that
   change a file, file leases, `ldattach`, job control in a shell and terminal resizing with
-  `signals = "isolated"`, and system calls newer than the reviewed table (`ENOSYS`).
+  `signals = "isolated"`, GNU tar extracting files into subdirectories (it uses `openat2`), and
+  system calls newer than the reviewed table (`ENOSYS`).
 - **Landlock errata.** sandy does not check the errata bitmask. A kernel without the fix for
   erratum 3 lets rights widen through renames of directories that a bind mount disconnected.
   The program cannot mount, and `refer` is granted only inside writable paths, so the practical
@@ -946,11 +954,11 @@ path rules is refused before that, with exit code 125 and the paths it compared.
 Every denial has a control run outside the sandbox. Checks that need a host feature
 (a session bus, a pseudo-terminal, ptrace or `/proc/<pid>/mem` under Yama `ptrace_scope` 1 or
 higher, a socket family) call `common::skip`, which records the skip; the README section
-"Testing" describes the accounting around it.
-Checks that depend on the Landlock ABI read it from the kernel: below ABI 6, the signal test
-expects sandy to refuse `signals = "isolated"`. The unit tests in `crates/sandy-linux` cover the
-planning function with invented host capabilities, and the filter decisions with a small BPF
-interpreter that applies both filters with the kernel's precedence.
+"Testing" describes the accounting around it. Checks that depend on the Landlock ABI read it
+from the kernel: below ABI 6, the signal test expects sandy to refuse `signals = "isolated"`.
+The unit tests in `crates/sandy-linux` cover the planning function with invented host
+capabilities, and the filter decisions with a small BPF interpreter that applies every
+installed filter with the kernel's precedence.
 
 ### A lower ABI on this kernel
 

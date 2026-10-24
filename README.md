@@ -48,7 +48,7 @@ program sees the normal file system, but it can open only what the policy allows
 
 | Platform | Mechanism |
 |---|---|
-| Linux | Landlock (file access, TCP ports, scopes), three seccomp-bpf filters, `no_new_privs`, closing inherited descriptors, then `execve` |
+| Linux | Landlock (file access, TCP ports, scopes), up to four seccomp-bpf filters, `no_new_privs`, closing inherited descriptors, then `execve` |
 | macOS | A Seatbelt profile generated from the policy, applied with `sandbox_init_with_parameters`, then `execve` |
 | Windows | An AppContainer with one capability per policy path, a job object with UI restrictions, and a list of inherited handles |
 
@@ -111,8 +111,10 @@ warns about a freshly downloaded `sandy.exe`. A program that ships sandy inside 
 app signs it together with the app.
 
 **Where to install sandy.** Put the `sandy` binary, and your policy files, where the sandboxed
-program cannot write: not inside any `read_write` path of any policy. Otherwise a compromised
-program could replace sandy or its policy, and the next start would run without a sandbox.
+program cannot write: not inside any `read_write` path of any policy. A compromised program
+could otherwise replace sandy or its policy, and the next start would run without a sandbox.
+sandy checks this at every start and refuses the policy, but only for the binary and the policy
+file it is using, so the rule stays yours to keep.
 
 ## Quick start
 
@@ -129,7 +131,11 @@ enforced     environment limited to policy: execve with only the policy environm
 enforced     IP networking denied: seccomp socket family allowlist ...
 enforced     Unix sockets outside writable paths denied: seccomp denies AF_UNIX sockets ...
 enforced     metadata of files outside policy paths protected: seccomp denies chmod, chown ...
+warning: signals = "any" lets the program signal every process of this user ...
 ```
+
+Warnings go to standard error, requirements to standard output. Every default policy warns
+about `signals = "any"`, which lets the program signal processes outside the sandbox.
 
 Run a program that may read one directory and write another, without network:
 
@@ -271,9 +277,8 @@ appcontainer_name = "example.daemon"
 
 The daemon listens on 127.0.0.1:8080 and 127.0.0.1:8081 inside the sandbox; clients connect to
 18080 and 18081. If the daemon starts helper programs, they must lie in a `read_exec` path, and
-they inherit the sandbox.
-`signals = "isolated"` needs Linux 6.12 or newer; on older kernels sandy refuses this policy, so
-leave it out there.
+they inherit the sandbox. `signals = "isolated"` needs Linux 6.12 or newer; on older kernels
+sandy refuses this policy, so leave it out there.
 
 ### Policies sandy refuses
 
@@ -308,15 +313,14 @@ after the first argument that is not an option) belongs to the program.
 `sandy check` prints one line per requirement: `enforced` with the mechanism, or `UNAVAILABLE`
 with the reason. Pass the program if the policy should include it.
 
-Settings that give up part of the isolation (`unix_sockets = "all"`, `signals = "any"`,
-`path_metadata = "allow"`, a writable path that holds your home directory), options that replace
-a stricter value of the policy file, and facts about the host that make the program behave
-differently inside the sandbox (a directory on your `PATH` inside a writable path, on Linux an
-OpenSSL include the policy does not cover or a cgroup limit the program cannot see), get a
-`warning:` line on standard error. Warnings do not
-change the exit status, and standard output keeps its one line per requirement, so a caller that
-reads it is not affected. `sandy run` prints no warnings: its standard error belongs to the
-program.
+Three kinds of finding get a `warning:` line on standard error: a setting that gives up part of
+the isolation (`unix_sockets = "all"`, `signals = "any"`, `path_metadata = "allow"`), an option
+that replaced a stricter value of the policy file, and a fact about this host that makes the
+program behave differently inside the sandbox (a directory of your `PATH` inside a writable
+path, on Linux an OpenSSL include the policy does not cover or a cgroup limit the program
+cannot see). Warnings change neither the exit status nor the one line per requirement on
+standard output, so a caller that reads it is not affected. `sandy run` prints no warnings: its
+standard error belongs to the program.
 
 `sandy setup` does the one-time host preparation that needs administrator rights. Today this
 matters only on Windows (see [Windows](#windows)); on Linux and macOS it does nothing.
@@ -381,10 +385,9 @@ without changing any exit status. sandy writes short lines to the descriptor, in
 In the exec model (Linux and macOS without `contained`) sandy becomes the program, so the
 record ends after `pid` and the caller's own wait status is the program's. sandy writes that
 line right before it replaces itself with the program, so a `failed` line after it means that
-the `execve` failed. sandy makes the
-descriptor close-on-exec, and on Windows it keeps the handle out of what the program inherits,
-so the program never has it. Writing is best effort: a caller that closed the read end gets no
-record, and the program keeps running.
+the `execve` failed. sandy makes the descriptor close-on-exec, and on Windows it keeps the
+handle out of what the program inherits, so the program never has it. Writing is best effort: a
+caller that closed the read end gets no record, and the program keeps running.
 
 ## Policy reference
 
@@ -428,7 +431,9 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
 2. **Never writable and executable.** No path may be both writable and executable, also not
    through nesting (a `read_write` directory inside a `read_exec` directory, or the reverse).
    The rule compares files, not names: a hard link that gives an executable file a second name
-   inside a `read_write` path is refused too.
+   inside a `read_write` path is refused too. On Windows the comparison is by path only, so a
+   second name of a file and an alias of a directory are not seen; rules 3 and 4 compare the
+   same way (see [docs/windows.md](docs/windows.md)).
 3. **Nothing inside a writable path.** No policy path may lie inside a `read_write` path, or be
    reached through a symbolic link inside one. The program could replace it with a symbolic
    link, and the next start would follow the link. sandy's own executable and the policy file
@@ -441,8 +446,8 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
    never contains user data. Each platform documents its exact list. Programs that need more
    (locale files, configuration in `/etc`, framework resources) need `--read` for those paths.
    No writable path may overlap this set (for example `--read-write /etc`); sandy refuses such a
-   policy. The comparison is the one of rule 2: another name of a directory of the set, a bind
-   mount for example, counts as that directory.
+   policy. The comparison is the one of rules 2 and 3: another name of a directory of the set, a
+   bind mount for example, counts as that directory.
 6. **The environment** contains only `pass` and `set` variables, plus what a platform must add
    for any program to start (on Windows `SystemRoot` and `LOCALAPPDATA`).
 7. **Children inherit the sandbox.** A program that starts other programs needs them in a
@@ -472,9 +477,10 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
 ### Network
 
 - `ip = "none"` denies IPv4 and IPv6, including loopback. `ip = "all"` allows every destination.
-- `unix_sockets = "none"` guarantees that the program cannot connect to Unix sockets outside its
-  `read_write` paths. Linux and macOS deny connections to every Unix socket; Windows allows
-  sockets inside `read_write` paths, because it checks socket access through the socket file.
+- `unix_sockets = "none"` guarantees that the program cannot connect to Unix sockets outside the
+  paths it may write. Linux and macOS deny connections to every Unix socket; Windows checks
+  socket access through the socket file, so it allows the sockets in the `read_write` paths and
+  in the program's private AppContainer folder.
 - **WARNING:** `unix_sockets = "all"` gives up most of the isolation. The program can reach every
   local service on a Unix socket. On Linux that includes the D-Bus session bus, through which the
   systemd user manager starts arbitrary commands outside the sandbox. On macOS it includes the DNS
@@ -573,8 +579,9 @@ Landlock does not control `chmod`, `chown`, `utimensat` and `setxattr`. With the
 writable paths. The calls on an open file (`fchmod`, `futimens`, `fsetxattr`) keep working, also
 on a file the program may only read. The file system ioctls that change a file the same way, and
 fs-verity, fscrypt and btrfs subvolume ioctls, are denied under every policy. Tools that change
-metadata by path (`tar`, `cp -p`, `install`, `git checkout`) need `"allow"`; then the program can
-change the metadata of every file the user owns.
+metadata by path (`install`, `cp -a`, `rsync -a`, `unzip`, `git`) need `"allow"`; then the
+program can change the metadata of every file the user owns. `cp -p` works under `"deny"`,
+because it sets the metadata through the descriptor it wrote.
 
 ## Platform notes
 
@@ -604,8 +611,8 @@ change the metadata of every file the user owns.
   and for a script the interpreter of its `#!` line, which is what the kernel loads. Its x86_64
   build refuses every program there. Use the arm64 build and arm64 or universal programs. The
   x86_64 build has not run on an Intel Mac yet.
-- sandy uses `sandbox_init_with_parameters`, which Apple does not document. Chromium and WebKit
-  use the same function.
+- sandy uses `sandbox_init_with_parameters`, which Apple does not document. Chromium uses the
+  same function.
 - `system = "none"` cannot start any program on macOS, because every program needs the dynamic
   loader and the system library cache. sandy refuses it there unless a policy path covers "/".
 - No Mach services are reachable from the sandbox, so programs that need them (for example to open
@@ -661,7 +668,7 @@ Recommendations:
    status.
 2. **Treat exit status 125 as "not started".** sandy prints the reason on standard error. Two
    exceptions: a program can exit with 125 itself, and with `children = "contained"` sandy can
-   fail while it supervises a running program (its message then starts with "run failed"). Pass
+   fail while it supervises a running program (its message is `sandy: run failed: ...`). Pass
    `--status-fd` when you need to tell these apart, or need the program's process ID (see
    [The status record](#the-status-record)).
 3. **Keep sandy, the policy and the program's binaries out of every writable path.** Use separate
@@ -703,8 +710,9 @@ What remains visible from inside the sandbox differs by platform; for example, o
 program can see which paths exist outside the policy, but not their contents. Each platform
 document lists these limitations.
 
-Independent reviews tried to escape the sandbox on every platform. Their findings were fixed, and
-their tests are part of the test suite (`crates/sandy-cli/tests/review_*.rs`).
+Independent reviews tried to escape the sandbox on every platform. Their findings were fixed, or
+are written down as limitations in the platform documents. Either way a test holds the result
+(`crates/sandy-cli/tests/review_*.rs`).
 
 ## Building and testing
 
@@ -779,7 +787,8 @@ stays although its standalone repository is archived.
 ### What CI runs
 
 The tests run on Ubuntu 22.04 and 24.04 (x86_64) and 24.04 (arm64), macOS 15, and Windows Server
-2022 and 2025, each with its expected skips, its ABI floor and the features it must offer. The
+2022 and 2025. Each runner names the features it must be able to check and, on Linux, the lowest
+Landlock ABI it must report; after the suite, CI compares the skips with the runner's list. The
 `audit` workflow runs `cargo deny`, weekly as well, because an advisory can appear without a
 push. The `release` workflow builds archives for Linux, macOS and Windows on x86_64 and arm64
 when a tag `v<version>` is pushed, attests their build provenance, verifies the attestations, and

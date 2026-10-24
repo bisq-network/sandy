@@ -576,8 +576,9 @@ runc uses such a guard and documents its weakness
 The x86_64 table in Linux 7.3 shows why: `uretprobe` (335) and `uprobe` (336) were added after
 the shared numbering from 424 upward started, but below it
 ([syscall_64.tbl](https://github.com/torvalds/linux/blob/v7.3/arch/x86/entry/syscalls/syscall_64.tbl)).
-Linux 7.3 also added `fchroot` (472), `listns` (470) and `rseq_slice_yield` (471). A table
-allowlist returns `ENOSYS` for all of them until sandy reviews them.
+Linux 7.3 also added `fchroot` (472), for which a table allowlist returns `ENOSYS` until sandy
+reviews it. `listns` (470) and `rseq_slice_yield` (471) are in the 7.2 table that sandy has
+reviewed, so the allowlist passes them; `listns` is denied by the denylist instead.
 
 Costs: every new kernel system call needs a sandy release before programs can use it. Programs
 handle `ENOSYS` like an older kernel, so this is usually invisible. Since Linux 5.11 the kernel

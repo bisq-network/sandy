@@ -70,12 +70,13 @@ obeys, but `sandy check` names every option that replaced a stricter value of th
 the isolation (`ResolvedPolicy::warnings`) and what the backend found on this host that makes
 the program behave differently inside the sandbox (`Backend::notes`). Warnings do not change
 what sandy enforces or its exit status; `sandy run` prints none, because its standard error
-belongs to the program. sandy's
-own executable and the policy file get the checks of rules 3 and 4: sandy refuses to start when
-a writable path contains one of them, reaches one through a link or an alias, or holds a second
-name of one, because the program could then change what the next start runs or reads. The name
-sandy was started under counts next to the file it leads to, because that name can be a link
-inside a writable path.
+belongs to the program.
+
+sandy's own executable and the policy file get the checks of rules 3 and 4: sandy refuses to
+start when a writable path contains one of them, reaches one through a link or an alias, or
+holds a second name of one, because the program could then change what the next start runs or
+reads. The name sandy was started under counts next to the file it leads to, because that name
+can be a link inside a writable path.
 
 Rules:
 
@@ -142,27 +143,27 @@ Rules:
    extended attributes of files outside the policy paths cannot change. Landlock does not
    control these calls, so the Linux backend denies the path-based variants (`chmod`, `chown`,
    `utimensat` with a path, `setxattr` and relatives) everywhere, also inside writable paths. The
-   calls on an open file (`fchmod`, `futimens`, `fsetxattr`) keep working. `allow` removes the
-   requirement for programs that change metadata by path (`tar`, `cp -p`, `install`); they can
-   then change the metadata of every file the user owns. macOS and Windows protect metadata
-   outside the writable paths in every case.
-11. `process.end_with_parent = true` ends the program when the process that started sandy ends,
-   for example when the application that runs a helper in the sandbox crashes. The program gets a
-   request to end (SIGTERM on Linux and macOS) and is killed if it has not ended 5 seconds later;
-   Windows ends the program's job at once. With `children = "allowed"` on Linux and macOS,
+   calls on an open file (`fchmod`, `futimens`, `fsetxattr`) keep working, which is why `cp -p`
+   needs nothing. `allow` removes the requirement for programs that change metadata by path
+   (`install`, `cp -a`, `rsync -a`, `git`); they can then change the metadata of every file the
+   user owns. macOS and Windows protect metadata outside the writable paths in every case.
+11. `process.end_with_parent = true` ends the program when the process that started sandy
+   ends, for example when the application that runs a helper in the sandbox crashes. The program
+   gets a request to end (SIGTERM on Linux and macOS) and is killed if it has not ended 5 seconds
+   later; Windows ends the program's job at once. With `children = "allowed"` on Linux and macOS,
    processes the program started can outlive it, as with any end of the program; use
-   `children = "contained"` to end them too. The option needs `signals = "isolated"`, so that the program cannot kill the process
-   that ends it. Without `--parent-start`, "parent" means sandy's direct parent: a wrapper
-   between the application and sandy (`sh -c 'a; sandy ...'`, `timeout`, `systemd-run`) is the
-   parent instead. sandy reads the parent's process ID as its first step; a parent that ends
-   before that cannot be detected. The caller closes the first gap with `--parent-pid` and its
-   own process ID: sandy then refuses when its parent is another process. `--parent-start`
-   closes both: the caller adds when its own process started, which no other process can have
-   and which nothing but a new start changes, so sandy checks the identity of the named process
-   instead of asking whether it is its own parent. The form is platform-specific (field 22 of
-   `/proc/PID/stat`, the recorded start time, the creation time). sandy also refuses when it
-   sees that the process it would watch has already ended, and on macOS when that process is
-   launchd, which has no end to wait for.
+   `children = "contained"` to end them too. The option needs `signals = "isolated"`, so that
+   the program cannot kill the process that ends it. Without `--parent-start`, "parent" means
+   sandy's direct parent: a wrapper between the application and sandy (`sh -c 'a; sandy ...'`,
+   `timeout`, `systemd-run`) is the parent instead. sandy reads the parent's process ID as its
+   first step; a parent that ends before that cannot be detected. The caller closes the first gap
+   with `--parent-pid` and its own process ID: sandy then refuses when its parent is another
+   process. `--parent-start` closes both: the caller adds when its own process started, which no
+   other process can have and which nothing but a new start changes, so sandy checks the identity
+   of the named process instead of asking whether it is its own parent. The form is
+   platform-specific (field 22 of `/proc/PID/stat`, the recorded start time, the creation time).
+   sandy also refuses when it sees that the process it would watch has already ended, and on
+   macOS when that process is launchd, which has no end to wait for.
 12. No writable policy path may reach a location of this user whose content other programs read
    or execute later: the home directory (which it may not contain), the shell startup files,
    autostart entries and user services, `~/.ssh`, and per platform `~/Library/LaunchAgents`, the
@@ -227,18 +228,18 @@ write the other changes what programs read.
   executable and the policy file. It walks the writable trees first, because a file with more
   than one name is rare there, and the executable trees only when it found one. A directory
   the user may not list is skipped: the program runs as the same user and cannot list it
-  either.
+  either. Windows does not compare the names of a file yet, as above.
 - **What stays open.** A hard link between a writable path and a file that no rule names, or
   that only a `read` rule names, is allowed: the program can change that file through the
   writable name. Refusing it would stop the package managers that fill a project from a shared
   cache with hard links, so the policy decides what a writable path may hold. The entries of the
   system set and the locations of rule 12 are compared as paths and directories, not for second
   names: a hard link of a shell startup file inside a writable path stays writable through that
-  name. Two names that different file systems show for one
-  file, as a passthrough FUSE mount does, have different identities and stay unseen. The check
-  runs at the start, so a link that a process outside the sandbox makes while the program runs
-  is not covered. The program cannot make one itself: it gets no link right out of its writable
-  paths and no execute access inside them.
+  name. Two names that different file systems show for one file, as a passthrough FUSE mount
+  does, have different identities and stay unseen. The check runs at the start, so a link that a
+  process outside the sandbox makes while the program runs is not covered. The program cannot
+  make one itself: it gets no link right out of its writable paths and no execute access inside
+  them.
 
 ## Exposed ports
 
@@ -287,11 +288,13 @@ Rules:
 5. Lifetime of both relays: when the program ends, the relay closes its listeners at once, gives
    connections it already accepted at most one second to deliver their remaining data, and then
    ends. A program that connects, writes and exits immediately therefore does not lose its data,
-   and no relay outlives the program by more than one second. Connections still open when that
-   second ends close with a reset, so no peer takes a cut stream for a complete one. With
-   `process.children = "contained"` on Linux and macOS, the relay watches the supervising sandy
-   instead, which ends after the program's process group, and also a pipe that only the guard
-   holds, so it ends with the group also while sandy is stopped.
+   and no relay outlives the program by more than one second, except when the program stopped it
+   (below). Connections still open when that second ends close with a reset, so no peer takes a
+   cut stream for a complete one. With `process.children = "contained"` on Linux and macOS, the
+   relay watches the supervising sandy instead, which ends after the program's process group,
+   and also a pipe that only the guard holds, so it ends with the group also while sandy is
+   stopped.
+
    With `signals = "any"` the program can also send SIGSTOP, which no process can block, and a
    stopped relay sees nothing. On Linux the relay has a watchdog for that: the kernel kills it
    two seconds after its poll loop last ran, so the bound for a stopped relay is two seconds
@@ -332,9 +335,10 @@ Rules:
 | `EndsWithParent` | `process.end_with_parent = true` |
 
 A requirement is a lower bound. A backend may deny more, but never less. For example,
-`UnixSocketsDenied` guarantees that the program cannot connect to Unix sockets outside its
-`read_write` paths; Linux and macOS deny connections to every Unix socket, while Windows allows
-sockets inside `read_write` paths, because Windows checks access to a socket through its file.
+`UnixSocketsDenied` guarantees that the program cannot connect to Unix sockets outside the paths
+it may write; Linux and macOS deny connections to every Unix socket, while Windows checks access
+to a socket through its file and therefore allows the sockets in the `read_write` paths and in
+the program's private AppContainer folder (docs/windows.md).
 (On Linux with `ip = "all"` a socket pair can still take a free abstract name; see
 `docs/linux.md`.)
 
@@ -374,9 +378,10 @@ a moment later.
 
 Details, the minimal system set and the known limitations are in [linux.md](linux.md).
 
-- Order: mark descriptors above 2 close-on-exec, `PR_SET_NO_NEW_PRIVS`, Landlock
-  `restrict_self`, up to four seccomp filters (TSYNC), `execve`. Everything that can fail on bad input
-  is prepared before the first step.
+- Order: mark descriptors above 2 close-on-exec, `PR_SET_NO_NEW_PRIVS`, check that the process
+  has one thread, Landlock `restrict_self`, up to four seccomp filters (TSYNC), `execve`.
+  Everything that can fail on bad input is prepared before the first step. Landlock restricts
+  the calling thread, so the thread check is what makes the domain cover the whole process.
 - Landlock (ABI 1 or newer, read from the kernel at run time) handles every file system right of
   the ABI. Writable paths never get execute, symbolic link, named pipe or device rights. ABI 6
   scopes signals (required for `signals = "isolated"`) and abstract Unix sockets; ABI 9 denies
@@ -425,12 +430,13 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   `pidfd_open` instead of asking whether it is its own parent; a caller can also let the kernel
   do the whole job with `clone3(CLONE_PIDFD_AUTOKILL | CLONE_AUTOREAP | CLONE_NNP)` on Linux 7
   (see docs/linux.md).
-- Exposed and forwarded ports: one relay forked twice before sandy confines itself, so it is not
-  a child of the program. It watches the program with a pidfd and ends at most one second after
-  it (rule 5 of "Forwarded ports"), or two seconds when the program stopped it, which a timer
-  the relay re-arms takes care of. It confines itself with no_new_privs, Landlock without file
-  access (TCP connect only to the relay targets from ABI 4) and a seccomp filter limited to TCP,
-  copying, threads and that timer. A forwarded port serves only sandy's own user (rule 6).
+- - Exposed and forwarded ports: one relay, forked twice from the single-threaded sandy before it
+  confines itself, so it is not a child of the program. It watches the program with a pidfd and
+  ends at most one second after it (rule 5 of "Forwarded ports"), or two seconds when the program
+  stopped it, which a timer the relay re-arms takes care of. It confines itself with
+  no_new_privs, Landlock without file access (TCP connect only to the relay targets from ABI 4)
+  and a seccomp filter limited to TCP, copying, threads and that timer. A forwarded port serves
+  only sandy's own user (rule 6 of "Forwarded ports").
 - Refused: no Landlock (the reason names the fix), no seccomp, root or any capability, a writable
   path that overlaps the minimal system set (rule 6), a program whose ELF loader no executable
   path covers (the kernel opens it during `execve`).
@@ -512,10 +518,10 @@ Details, limitations and sources: `docs/windows.md`.
 - File grants: one capability per policy path (named after the AppContainer, the level and the
   file ID), with one inheritable ACE on the path. The program starts with the capabilities of the
   current policy only, so grants of older policies grant nothing. sandy never removes grants and
-  serializes its DACL changes with a lock file of the user, so concurrent runs do not conflict. Read and read-write never contain `FILE_EXECUTE`; read levels
-  contain no right that changes metadata. sandy refuses to propagate a grant through junctions or
-  symbolic links. The system set is what Windows grants ALL APPLICATION PACKAGES; `system =
-  "none"` is unavailable.
+  serializes its DACL changes with a lock file of the user, so concurrent runs do not conflict.
+  Read and read-write never contain `FILE_EXECUTE`; read levels contain no right that changes
+  metadata. sandy refuses to propagate a grant through junctions or symbolic links. The system
+  set is what Windows grants ALL APPLICATION PACKAGES; `system = "none"` is unavailable.
 - Network capabilities `internetClientServer` and `privateNetworkClientServer` only with
   `ip = "all"`. Connections from the program to loopback listeners outside need the loopback
   exemption, which `sandy setup` installs (administrator rights); connections from outside to
@@ -576,7 +582,7 @@ Details, limitations and sources: `docs/windows.md`.
 |---|---|
 | program's status | `sandy run` started the program |
 | 128 + signal number | Linux and macOS with `process.children = "contained"`: a signal ended the program |
-| 125 | sandy failed or refused (invalid policy, unenforceable policy, setup failure) |
+| 125 | sandy failed or refused (invalid policy, unenforceable policy, a socket on a standard stream the policy denies, setup failure) |
 | 0 / 1 | `sandy check`: enforceable / not enforceable |
 
 The caller sees sandy's process ID where sandy stays the parent, and 125 means both "sandy
