@@ -20,6 +20,58 @@ unsafe extern "C" {
         actions: *mut libc::posix_spawn_file_actions_t,
         fd: c_int,
     ) -> c_int;
+
+    /// <mach/task.h>, missing from the libc crate: sets the handler of the exceptions in `mask`
+    /// for the whole task.
+    fn task_set_exception_ports(
+        task: libc::mach_port_t,
+        mask: u32,
+        handler: libc::mach_port_t,
+        behavior: u32,
+        flavor: i32,
+    ) -> libc::kern_return_t;
+}
+
+/// Every machine-independent exception, as `EXC_MASK_ALL` in <mach/exception_types.h> (0x1bfe on
+/// macOS 26.5). `EXC_MASK_CRASH`, which launchd sets to the system crash reporter, and
+/// `EXC_MASK_CORPSE_NOTIFY` are not part of it.
+const EXC_MASK_ALL: u32 = 0x1bfe;
+/// `EXCEPTION_DEFAULT` and `THREAD_STATE_NONE`: the behaviour and thread state flavour of a
+/// handler. They are required arguments; with MACH_PORT_NULL as the handler they have no effect.
+const EXCEPTION_DEFAULT: u32 = 1;
+const THREAD_STATE_NONE: i32 = 0;
+
+/// Drops the Mach exception handler ports of sandy's task.
+///
+/// Exception ports are task state, not descriptors: the kernel copies them when it creates a
+/// task and keeps them across `exec`, and the profile's `mach-lookup` denial does not cover a
+/// right that the task already holds. A caller with a crash reporter (Crashpad, Sentry, a
+/// debugger) therefore hands the program a send right to its handler, which the program could
+/// use to send forged exception messages. The program loses nothing it should have: the system
+/// crash reporter hangs on the crash port, which is not in `EXC_MASK_ALL`.
+pub fn reset_exception_ports() -> Result<(), SandboxError> {
+    // SAFETY: mach_task_self only reads the task port name that libSystem set up at start; the
+    // libc binding is deprecated in favour of the mach2 crate, which sandy does not depend on.
+    #[allow(deprecated)]
+    let task = unsafe { libc::mach_task_self() };
+    // SAFETY: the call takes a task port, a mask and a port name, and reads no memory.
+    let result = unsafe {
+        task_set_exception_ports(
+            task,
+            EXC_MASK_ALL,
+            libc::MACH_PORT_NULL as libc::mach_port_t,
+            EXCEPTION_DEFAULT,
+            THREAD_STATE_NONE,
+        )
+    };
+    if result == libc::KERN_SUCCESS {
+        Ok(())
+    } else {
+        Err(SandboxError::new(format!(
+            "cannot drop the inherited Mach exception ports: task_set_exception_ports \
+             returned {result}"
+        )))
+    }
 }
 
 /// The target, converted to C strings before the sandbox is applied.

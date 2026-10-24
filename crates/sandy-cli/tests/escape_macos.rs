@@ -1086,3 +1086,155 @@ fn file_changing_fcntls_are_denied_on_read_only_descriptors() {
         assert_eq!(line.result, "denied", "{line:?}");
     }
 }
+
+/// Runs the probe with `actions` inside the sandbox with `stdin` as its standard input, so a
+/// test can give the program a descriptor of its own choosing.
+fn probe_inside_with_stdin(
+    sandbox_args: &[String],
+    actions: &[(&str, &str)],
+    stdin: fs::File,
+) -> Vec<ProbeLine> {
+    let output = Command::new(sandy_path())
+        .args(run_args(sandbox_args, actions))
+        .stdin(Stdio::from(stdin))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "sandy run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse(&output)
+}
+
+/// Runs the probe with `actions` outside the sandbox with `stdin` as its standard input.
+fn probe_outside_with_stdin(actions: &[(&str, &str)], stdin: fs::File) -> Vec<ProbeLine> {
+    let output = Command::new(probe_path())
+        .args(probe_args(actions))
+        .stdin(Stdio::from(stdin))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "probe failed outside: {output:?}");
+    parse(&output)
+}
+
+/// `/dev/fd/N` and the links `/dev/stdin`, `/dev/stdout` and `/dev/stderr` name the program's
+/// own open descriptors. Opening one duplicates the descriptor instead of opening the file
+/// again, so it reaches nothing the program does not already hold.
+#[test]
+fn descriptor_paths_name_the_programs_own_descriptors() {
+    let fixture = Fixture::new("macos-devfd");
+    // Both paths lead to descriptor 0 and share its file offset, so only the first read of the
+    // two sees the content.
+    let actions = [
+        ("list", "/dev/fd"),
+        ("read", "/dev/fd/0"),
+        ("read", "/dev/stdin"),
+    ];
+    let open = || fs::File::open(fixture.path("ro/file")).unwrap();
+
+    for line in probe_outside_with_stdin(&actions, open()) {
+        line.assert_ok();
+    }
+    let inside = probe_inside_with_stdin(&fixture.access_args(), &actions, open());
+    for line in &inside {
+        line.assert_ok();
+    }
+    assert_eq!(inside[1].detail, "7 bytes", "{inside:?}");
+}
+
+/// A descriptor path cannot widen access: writing through `/dev/fd/0` of a read-only descriptor
+/// fails in the kernel (`dupfdopen` refuses a mode the original descriptor lacks), inside the
+/// sandbox and outside it alike.
+#[test]
+fn a_descriptor_path_grants_no_more_than_the_descriptor() {
+    let fixture = Fixture::new("macos-devfd-write");
+    let actions = [("write", "/dev/fd/0")];
+    let open = || fs::File::open(fixture.path("rw/file")).unwrap();
+
+    probe_outside_with_stdin(&actions, open())[0].assert_blocked();
+    probe_inside_with_stdin(&fixture.access_args(), &actions, open())[0].assert_blocked();
+    assert_eq!(fs::read(fixture.path("rw/file")).unwrap(), b"content");
+}
+
+/// Mach port rights are not descriptors: an exception handler port of the caller's task passes
+/// through `posix_spawn` and `execve` into the program, which could then send a forged exception
+/// message to the caller's crash handler. sandy resets the task's exception ports before it
+/// applies the profile.
+#[test]
+fn inherited_mach_exception_ports_are_reset() {
+    let fixture = Fixture::new("macos-excports");
+    let report = [probe_path(), "exception-ports".to_string(), "-".to_string()];
+    let control = with_exception_port(&report);
+    control[0].assert_ok();
+    assert_ne!(
+        control[0].detail, "0",
+        "the control kept no exception port, so this host cannot show the route"
+    );
+
+    let mut inside = vec![sandy_path()];
+    inside.extend(run_args(
+        &fixture.access_args(),
+        &[("exception-ports", "-")],
+    ));
+    let lines = with_exception_port(&inside);
+    lines[0].assert_ok();
+    assert_eq!(
+        lines[0].detail, "0",
+        "the program inherited exception handler ports"
+    );
+}
+
+/// Installs a Mach exception handler port and then execs `command`, which reports what it
+/// inherited.
+fn with_exception_port(command: &[String]) -> Vec<ProbeLine> {
+    let target = command.join(ARGUMENT_SEPARATOR);
+    let output = Command::new(probe_path())
+        .args(["exception-port-exec", &target])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "exception-port-exec failed: {output:?}"
+    );
+    parse(&output)
+}
+
+/// A thin x86_64 Mach-O header at `path`, enough for sandy to judge the file without running it.
+fn write_x86_64_program(path: &Path) {
+    let mut header = vec![0xcf, 0xfa, 0xed, 0xfe, 0x07, 0x00, 0x00, 0x01];
+    header.resize(32, 0);
+    fs::write(path, header).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// The kernel runs a script's interpreter, so the interpreter decides whether Rosetta is needed.
+/// sandy reads the `#!` line and judges that file, as it does for the program itself.
+#[test]
+fn a_script_with_an_x86_64_interpreter_is_refused_before_it_starts() {
+    if !sysctl_flag("hw.optional.arm64") || sysctl_flag("sysctl.proc_translated") {
+        skip(
+            "apple-silicon",
+            "the interpreter is only judged on Apple silicon that runs sandy natively",
+        );
+        return;
+    }
+    let fixture = Fixture::new("macos-rosetta-script");
+    let interpreter = fixture.path("bin").join("x86_64-only");
+    write_x86_64_program(&interpreter);
+    let script = fixture.path("bin").join("script");
+    fs::write(&script, format!("#!{}\n", interpreter.display())).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut args = vec!["check".to_string()];
+    args.extend(fixture.access_args());
+    args.extend(["--".to_string(), script.to_str().unwrap().to_string()]);
+    let output = sandy(args);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(report.contains("has no arm64 code"), "{report}");
+    assert!(
+        report.contains(interpreter.to_str().unwrap()),
+        "the reason does not name the interpreter: {report}"
+    );
+}

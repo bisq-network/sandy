@@ -1,19 +1,25 @@
-//! Tests written during the macOS sandbox security review. Each denial has a control run outside
-//! the sandbox, like the other escape tests, so a test cannot pass because the action was
-//! impossible anyway. Tests whose name says "stays", "cannot" or "does not" encode an invariant
-//! that held; `fsgetpath_discloses_out_of_policy_paths` is a proof of concept for a confirmed
-//! finding and documents the current (insecure) behavior.
+//! Tests written during the macOS sandbox security reviews. Each denial has a control run
+//! outside the sandbox, like the other escape tests, so a test cannot pass because the action
+//! was impossible anyway. Tests whose name says "stays", "cannot" or "does not" encode an
+//! invariant that held. The others record what the sandbox does where it cannot stop something,
+//! so that a change shows up as a failing test: `getattrlist_discloses_paths_outside_the_policy`
+//! is a proof of concept for a confirmed finding, and the tests around process groups, process
+//! ids, mounted volumes and the existence of paths bound limitations that `docs/macos.md`
+//! describes.
 #![cfg(target_os = "macos")]
 
 mod common;
 
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use common::unix::*;
 use common::*;
 
 /// `DEV:INODE` of a path, read outside the sandbox. The probe turns it into `/.vol/DEV/INODE` or
@@ -319,4 +325,516 @@ fn isolated_signals_do_not_cross_sandbox_instances() {
     let inside = probe_inside(&isolated, &[("signal", &pid)]);
     inside[0].assert_blocked();
     drop(victim);
+}
+
+/// Separates the program and its arguments in the target of `spawn-join`.
+const ARGUMENT_SEPARATOR: &str = "\u{1f}";
+
+/// The by-id calls that reach no file operation, so no path rule of the profile can stop them:
+/// the profile denies them by system call number. None of them may hand the program the path of
+/// a file outside the policy. `openbyid_np` needs a privilege that no ordinary process has, so
+/// outside the sandbox it fails too and the test only records that.
+#[test]
+fn by_id_lookups_do_not_reach_files_outside_the_policy() {
+    let fixture = Fixture::new("macos-byid");
+    let secret = dev_inode(&fixture.path("secret/file"));
+    let volume = format!("{}{ARGUMENT_SEPARATOR}file", fixture.arg("secret"));
+    let actions = [
+        ("fsgetpath-ext", secret.as_str()),
+        ("vol-getattr", secret.as_str()),
+        ("openbyid", secret.as_str()),
+        ("searchfs", volume.as_str()),
+    ];
+
+    let outside = probe_outside(&actions);
+    let inside = probe_inside(&fixture.access_args(), &actions);
+    let mut disclosed = Vec::new();
+    for ((action, _), (out, inside)) in actions.iter().zip(outside.iter().zip(&inside)) {
+        if inside.detail.contains("/secret/") {
+            disclosed.push(format!("{action}: {}", inside.detail));
+            continue;
+        }
+        if out.result != "ok" {
+            // The host refuses the call to every process, so the sandbox adds nothing here.
+            skip(
+                "by-id-call",
+                &format!("{action} does not work outside the sandbox: {}", out.detail),
+            );
+            continue;
+        }
+        inside.assert_blocked();
+    }
+    assert!(
+        disclosed.is_empty(),
+        "by-id calls disclosed paths outside the policy: {disclosed:?}"
+    );
+}
+
+/// `getattrlistbulk` returns the metadata of every entry of a directory in one call. The one
+/// directory outside the policy that the program can open is the root directory, which dyld
+/// needs. This records what that reveals: the names and file ids of the entries of `/`, and
+/// nothing of a directory the policy does not grant.
+#[test]
+fn bulk_listing_reaches_only_the_root_directory() {
+    let fixture = Fixture::new("macos-bulk");
+    let secret = fixture.arg("secret");
+    let actions = [
+        ("getattrlistbulk", "/"),
+        ("getattrlistbulk", secret.as_str()),
+    ];
+
+    for line in probe_outside(&actions) {
+        line.assert_ok();
+    }
+    let inside = probe_inside(&fixture.access_args(), &actions);
+    // Recorded, not a guarantee: the root directory is readable, so its entries come back.
+    inside[0].assert_ok();
+    assert!(
+        inside[0].detail.contains("usr#"),
+        "the root listing lost its entries: {}",
+        inside[0].detail
+    );
+    inside[1].assert_blocked();
+}
+
+/// `stat` outside the policy tells an existing file from one that does not exist: the profile
+/// refuses the first with EPERM, and the path lookup of the second fails with ENOENT. Contents
+/// and metadata stay unreadable, but the program can test whether a path exists. Recorded, not
+/// a guarantee: closing it would need a file system of its own.
+#[test]
+fn metadata_outside_the_policy_tells_existing_from_missing() {
+    let fixture = Fixture::new("macos-visibility");
+    let secret = fixture.arg("secret/file");
+    let missing = fixture.arg("secret/no-such-file");
+    let actions = [
+        ("metadata", secret.as_str()),
+        ("metadata", missing.as_str()),
+    ];
+
+    let outside = probe_outside(&actions);
+    outside[0].assert_ok();
+    assert_eq!(outside[1].result, "error", "{outside:?}");
+
+    let inside = probe_inside(&fixture.access_args(), &actions);
+    assert_eq!(inside[0].result, "denied", "{inside:?}");
+    assert_eq!(inside[1].result, "error", "{inside:?}");
+    assert_ne!(
+        inside[0].detail, inside[1].detail,
+        "both answers are the same now; the documented limitation is stale"
+    );
+}
+
+/// `getattrlist` answers a request for ATTR_CMN_FULLPATH without reading the file's
+/// attributes, and the kernel runs no check for that path building. A program inside the
+/// sandbox therefore learns the path of a file outside the policy, and with a `/.vol` path the
+/// path of any inode number of the volume, which is the disclosure the fsgetpath denial closed.
+/// Every other attribute is denied, so contents and metadata stay protected.
+///
+/// This records the current behaviour. Denying the two system calls by number closes it, but it
+/// also breaks `realpath(3)`, which libSystem builds on the same call: measured on macOS 26.5,
+/// sandy itself could no longer resolve a policy path inside the sandbox.
+#[test]
+fn getattrlist_discloses_paths_outside_the_policy() {
+    let fixture = Fixture::new("macos-getattr");
+    let metadata = fs::metadata(fixture.path("secret/file")).unwrap();
+    let only_the_path = |path: String| format!("{path}{ARGUMENT_SEPARATOR}fullpath");
+    let secret = only_the_path(fixture.arg("secret/file"));
+    let volume = only_the_path(format!("/.vol/{}/{}", metadata.dev(), metadata.ino()));
+    // The attributes of the same file, which the profile does decide on.
+    let attributes = fixture.arg("secret/file");
+    let actions = [
+        ("getattr", secret.as_str()),
+        ("getattr", volume.as_str()),
+        ("getattr", attributes.as_str()),
+    ];
+
+    for line in probe_outside(&actions) {
+        line.assert_ok();
+    }
+    let inside = probe_inside(&fixture.access_args(), &actions);
+    assert!(
+        inside[0].detail.ends_with("/secret/file"),
+        "the path is no longer disclosed; the documented limitation is stale: {:?}",
+        inside[0]
+    );
+    assert_eq!(inside[1].detail, inside[0].detail, "{inside:?}");
+    inside[2].assert_blocked();
+}
+
+/// `setattrlist` writes the metadata that `getattrlist` reads, so it must be denied outside
+/// writable paths like every other metadata change.
+#[test]
+fn setattrlist_cannot_change_files_outside_writable_paths() {
+    let fixture = Fixture::new("macos-setattr");
+    let secret = fixture.arg("secret/file");
+    let readable = fixture.arg("ro/file");
+    let writable = fixture.arg("rw/file");
+    let actions = [
+        ("setattr", secret.as_str()),
+        ("setattr", readable.as_str()),
+        ("setattr", writable.as_str()),
+    ];
+
+    for line in probe_outside(&actions) {
+        line.assert_ok();
+    }
+    let inside = probe_inside(&fixture.access_args(), &actions);
+    inside[0].assert_blocked();
+    inside[1].assert_blocked();
+    inside[2].assert_ok();
+}
+
+/// `getfsstat` lists every mounted volume with the directory it is mounted on. It takes no path,
+/// so no file rule of the profile applies to it. This records that the list is readable: it
+/// names the volumes of the machine, including the names of attached disks under /Volumes.
+#[test]
+fn the_volume_list_is_readable() {
+    let fixture = Fixture::new("macos-getfsstat");
+    probe_outside(&[("getfsstat", "")])[0].assert_ok();
+    let inside = probe_inside(&fixture.access_args(), &[("getfsstat", "")]);
+    assert_eq!(
+        inside[0].result, "ok",
+        "getfsstat is denied; the documented limitation is stale: {}",
+        inside[0].detail
+    );
+    assert!(inside[0].detail.contains(" volumes: /"), "{:?}", inside[0]);
+}
+
+/// `kill(pid, 0)` checks permission without sending anything, so it tells a live process from a
+/// process ID that nothing uses: EPERM against ESRCH. `signals = "isolated"` stops the signal
+/// but not the answer, so the program can still find out which process ids exist. macOS itself
+/// gives the same answer for a process of another user, so this records a limit, not a defect.
+#[test]
+fn process_ids_outside_the_sandbox_stay_countable() {
+    let fixture = Fixture::new("macos-pidprobe");
+    let isolated = with(fixture.access_args(), &["--signals", "isolated"]);
+    let live = std::process::id().to_string();
+    // A process id that nothing uses: one above every live process of this run.
+    let unused = "99998";
+    let actions = [("signal", live.as_str()), ("signal", unused)];
+
+    let outside = probe_outside(&actions);
+    outside[0].assert_ok();
+    assert_eq!(outside[1].result, "error", "{outside:?}");
+
+    let inside = probe_inside(&isolated, &actions);
+    inside[0].assert_blocked();
+    inside[1].assert_blocked();
+    assert_ne!(
+        inside[0].detail, inside[1].detail,
+        "a live process id and an unused one now give the same answer; the documented \
+         limitation is stale"
+    );
+}
+
+/// The kernel sends SIGIO to the owner of a socket, and `F_SETOWN` names any process as the
+/// owner. XNU sends it without the check that `(allow signal (target self) (target
+/// same-sandbox))` hooks, so `signals = "isolated"` must not be trusted to stop it. This
+/// records whether the signal arrives.
+#[test]
+fn sigio_through_f_setown_follows_no_signal_policy() {
+    let fixture = Fixture::new("macos-sigio");
+    let isolated = with(fixture.access_args(), &["--signals", "isolated"]);
+
+    // Control outside the sandbox: SIGIO (23 on Darwin) reaches the victim, which exits 42.
+    let mut victim = spawn_victim();
+    let pid = victim.0.id().to_string();
+    probe_outside(&[("sigio-signal", &pid)])[0].assert_ok();
+    assert_eq!(
+        exit_code_within(&mut victim, Duration::from_secs(2)),
+        Some(42),
+        "control: the SIGIO path does not deliver on this host"
+    );
+    drop(victim);
+
+    let mut victim = spawn_victim();
+    let pid = victim.0.id().to_string();
+    let inside = probe_inside(&isolated, &[("sigio-signal", &pid)]);
+    inside[0].assert_blocked();
+    let delivered = exit_code_within(&mut victim, Duration::from_secs(2)) == Some(42);
+    assert!(
+        !delivered,
+        "SIGIO reached a process outside the sandbox under signals = isolated: {:?}",
+        inside[0]
+    );
+}
+
+/// A victim outside the sandbox that waits for SIGIO (23) and exits with 42 when it arrives.
+fn spawn_victim() -> Victim {
+    let child = Command::new(probe_path())
+        .args(["await-signal", "23"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Give the child time to install the handler before it is targeted.
+    sleep(Duration::from_millis(300));
+    Victim(child)
+}
+
+/// The victim's exit code, or `None` when it is still running after `grace`.
+fn exit_code_within(victim: &mut Victim, grace: Duration) -> Option<i32> {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        match victim.0.try_wait().unwrap() {
+            Some(status) => return status.code(),
+            None if std::time::Instant::now() < deadline => sleep(Duration::from_millis(20)),
+            None => return None,
+        }
+    }
+}
+
+/// The terminal ioctls that make the kernel signal a process group are outside the profile's
+/// ioctl allowlist: TIOCSPGRP would give the terminal to another job of the session, which then
+/// stops at its next read, and TIOCSWINSZ makes the kernel send SIGWINCH to the foreground
+/// group. Both are denied in every mode, so `signals = "isolated"` needs no rule of its own.
+#[test]
+fn the_terminal_signal_ioctls_are_denied() {
+    let fixture = Fixture::new("macos-ttyioctl");
+    let actions = [("tcsetpgrp", "0"), ("tiocswinsz", "0")];
+    // tcsetpgrp needs the terminal to be the caller's controlling terminal, so each run becomes
+    // a session of its own with a pseudo-terminal, as a shell's session is. macOS revokes a
+    // terminal when its session leader ends, which leaves every descriptor of it invalid, so
+    // the second run needs a terminal of its own.
+    let on_a_terminal = |mut command: Command| {
+        let pty = open_pty()?;
+        with_terminal(&pty)(&mut command);
+        Some(parse(&command.output().unwrap()))
+    };
+
+    let mut control = Command::new(probe_path());
+    control.args(probe_args(&actions));
+    let Some(control) = on_a_terminal(control) else {
+        return skip("pty", "no pseudo-terminal available");
+    };
+    for line in &control {
+        line.assert_ok();
+    }
+
+    let mut inside = Command::new(sandy_path());
+    inside.args(run_args(&fixture.access_args(), &actions));
+    for line in &on_a_terminal(inside).unwrap() {
+        line.assert_blocked();
+    }
+}
+
+/// `signals = "isolated"` does not keep the program out of the process groups of the terminal
+/// session it was started in: SBPL cannot filter the arguments of `setpgid`, so denying it
+/// would deny every process group, and `posix_spawn` would change the group inside the kernel
+/// anyway. This records both routes. `children = "contained"` closes them, because it denies
+/// setpgid, setsid and posix_spawn.
+#[test]
+fn a_program_can_join_a_process_group_outside_the_sandbox() {
+    let fixture = Fixture::new("macos-joinpg");
+    let isolated = with(fixture.access_args(), &["--signals", "isolated"]);
+    // SAFETY: getpgrp takes no arguments.
+    let outside_group = unsafe { libc::getpgrp() }.to_string();
+    let program = fixture.copy_probe("bin");
+    let spawn = format!(
+        "{outside_group}{ARGUMENT_SEPARATOR}{program}{ARGUMENT_SEPARATOR}sleep{ARGUMENT_SEPARATOR}50"
+    );
+    let actions = [
+        ("setpgid-join", outside_group.as_str()),
+        ("spawn-join", spawn.as_str()),
+    ];
+
+    let inside = probe_inside(&isolated, &actions);
+    inside[0].assert_ok();
+    inside[1].assert_ok();
+    assert!(
+        inside[1]
+            .detail
+            .ends_with(&format!("group {outside_group}")),
+        "the spawned process did not join the group: {:?}",
+        inside[1]
+    );
+
+    // `contained` denies both routes: setpgid by system call number, and posix_spawn as a whole.
+    let contained = with(
+        fixture.access_args(),
+        &["--signals", "isolated", "--children", "contained"],
+    );
+    let contained = probe_inside(&contained, &actions);
+    contained[0].assert_blocked();
+    contained[1].assert_blocked();
+}
+
+/// A terminal session like a shell's. A session leader owns a pseudo-terminal and keeps its
+/// foreground group, and starts two background jobs, each in a process group of its own: a
+/// victim outside the sandbox that only sleeps, and the job under test, in whose arguments
+/// `{job}` stands for the victim's process group. The kernel stops a whole process group when
+/// one of its processes reads the terminal in the background, and that send has no permission
+/// check behind it, so a session of this shape is what shows whether a program can reach
+/// another job.
+struct JobSession {
+    /// Held open: with no descriptor of the master left, a read of the terminal returns at
+    /// once instead of waiting, and the kernel stops no one.
+    _pty: Pty,
+    leader: Child,
+    victim: u32,
+    job: u32,
+    /// The probe lines of the jobs; the leader's own `start-job` lines are taken out.
+    lines: mpsc::Receiver<ProbeLine>,
+    /// Lines of the job that arrived while `start` still waited for a `start-job` line.
+    early: Vec<ProbeLine>,
+}
+
+impl JobSession {
+    /// `None` when the host has no pseudo-terminal.
+    fn start(job: &[String]) -> Option<JobSession> {
+        let pty = open_pty()?;
+        let victim = [probe_path(), "sleep".to_string(), "60000".to_string()];
+        let actions = [
+            ("start-job", victim.join(ARGUMENT_SEPARATOR)),
+            ("start-job", job.join(ARGUMENT_SEPARATOR)),
+            ("sleep", "60000".to_string()),
+        ];
+        let actions: Vec<(&str, &str)> = actions
+            .iter()
+            .map(|(action, target)| (*action, target.as_str()))
+            .collect();
+        let mut command = Command::new(probe_path());
+        command
+            .args(probe_args(&actions))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        with_terminal(&pty)(&mut command);
+        let mut leader = command.spawn().unwrap();
+        let output = BufReader::new(leader.stdout.take().unwrap());
+        let (sender, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in output.lines().map_while(Result::ok) {
+                if sender.send(parse_line(&line)).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut started = Vec::new();
+        let mut early = Vec::new();
+        while started.len() < 2 {
+            let line = lines.recv_timeout(Duration::from_secs(10)).unwrap();
+            // The job can report before the leader reports having started it.
+            if line.action == "start-job" {
+                line.assert_ok();
+                started.push(line.detail.parse().unwrap());
+            } else {
+                early.push(line);
+            }
+        }
+        Some(JobSession {
+            _pty: pty,
+            leader,
+            victim: started[0],
+            job: started[1],
+            lines,
+            early,
+        })
+    }
+
+    /// The job's probe line, or `None` if the victim stopped or ten seconds passed first.
+    fn job_line(&mut self) -> Option<ProbeLine> {
+        if !self.early.is_empty() {
+            return Some(self.early.remove(0));
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !self.victim_stopped() {
+            if let Ok(line) = self.lines.recv_timeout(Duration::from_millis(50)) {
+                return Some(line);
+            }
+        }
+        None
+    }
+
+    fn victim_stopped(&self) -> bool {
+        process_status(self.victim as libc::pid_t) == Some(libc::SSTOP)
+    }
+}
+
+impl Drop for JobSession {
+    fn drop(&mut self) {
+        // None of these processes forks, so one signal per group is enough. The leader goes
+        // last: its children are reaped once it has ended and they belong to process 1.
+        for group in [self.victim, self.job, self.leader.id()] {
+            // SAFETY: kill takes a process group ID and a signal.
+            unsafe { libc::kill(-(group as libc::pid_t), libc::SIGKILL) };
+        }
+        let _ = self.leader.kill();
+        let _ = self.leader.wait();
+    }
+}
+
+/// The BSD process status of `pid` (`SSTOP` for a stopped process), or `None` when it is gone.
+fn process_status(pid: libc::pid_t) -> Option<u32> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the buffer has exactly the size passed.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    // SAFETY: proc_pidinfo filled the whole structure.
+    Some(unsafe { info.assume_init() }.pbi_status)
+}
+
+/// The `JobSession` job that runs the probe in the sandbox with `extra` options.
+fn sandboxed_job(fixture: &Fixture, extra: &[&str], actions: &[(&str, &str)]) -> Vec<String> {
+    let mut job = vec![sandy_path()];
+    job.extend(run_args(&with(fixture.access_args(), extra), actions));
+    job
+}
+
+/// What the gap above costs in practice: a program with isolated signals joins the process
+/// group of another job of its terminal session, reads the terminal, and the kernel stops that
+/// job with it. `children = "contained"` denies the move, and the job outside keeps running.
+#[test]
+fn a_background_read_stops_another_job_of_the_terminal() {
+    let fixture = Fixture::new("macos-jobstop");
+    let join = [("setpgid-join", "{job}")];
+
+    let mut outside = vec![probe_path()];
+    outside.extend(probe_args(&join));
+    let Some(mut control) = JobSession::start(&outside) else {
+        return skip("pty", "no pseudo-terminal available");
+    };
+    // The control stops itself together with the victim, so it reports no line.
+    let line = control.job_line();
+    assert!(
+        line.is_none(),
+        "the control was not stopped: {line:?}, victim status {:?}",
+        process_status(control.victim as libc::pid_t)
+    );
+    assert!(control.victim_stopped(), "the control stopped no job");
+    drop(control);
+
+    // Recorded, not a guarantee: isolated signals do not stop this.
+    let isolated = sandboxed_job(&fixture, &["--signals", "isolated"], &join);
+    let mut session = JobSession::start(&isolated).unwrap();
+    assert!(
+        session.job_line().is_none() && session.victim_stopped(),
+        "the program no longer stops another job; the documented limitation is stale"
+    );
+    drop(session);
+
+    let contained = sandboxed_job(
+        &fixture,
+        &["--signals", "isolated", "--children", "contained"],
+        &join,
+    );
+    let mut session = JobSession::start(&contained).unwrap();
+    let line = session.job_line();
+    assert!(!session.victim_stopped(), "the program stopped another job");
+    assert_eq!(
+        line.as_ref().map(|line| line.result.as_str()),
+        Some("denied"),
+        "{line:?}"
+    );
 }

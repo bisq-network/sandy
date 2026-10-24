@@ -440,7 +440,11 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
   Landlock ABI 6 (kernel 6.12 or newer); older kernels refuse such a policy. The kernel also
   signals whole process groups for terminal job control, without that check, so on Linux the
   program can then neither join another job's process group nor take the terminal from the
-  foreground job nor resize it. A shell inside the sandbox therefore has no job control.
+  foreground job nor resize it. A shell inside the sandbox therefore has no job control. On
+  macOS a profile cannot filter the arguments of `setpgid`, so the program can still join
+  another job's process group of its terminal session and have the kernel stop that job; taking
+  the terminal and resizing it are denied there in every mode, and `children = "contained"`
+  closes the rest (see [docs/macos.md](docs/macos.md)).
 - `children` decides whether the program may start processes:
   - `allowed` (the default): yes. On Linux and macOS these processes can outlive the program; on
     Windows they end with it.
@@ -522,8 +526,9 @@ change the metadata of every file the user owns.
 - **Tested** on macOS 15 (arm64) through GitHub Actions, and on macOS 26 (arm64).
 - **Not through Rosetta:** x86_64 code cannot run in the sandbox on Apple silicon, because Rosetta
   cannot load its runtime there. sandy refuses a program without arm64 code on Apple silicon,
-  and its x86_64 build refuses every program there. Use the arm64 build and arm64 or universal
-  programs. The x86_64 build has not run on an Intel Mac yet.
+  and for a script the interpreter of its `#!` line, which is what the kernel loads. Its x86_64
+  build refuses every program there. Use the arm64 build and arm64 or universal programs. The
+  x86_64 build has not run on an Intel Mac yet.
 - sandy uses `sandbox_init_with_parameters`, which Apple does not document. Chromium and WebKit
   use the same function.
 - `system = "none"` cannot start any program on macOS, because every program needs the dynamic
@@ -600,8 +605,8 @@ sandbox applies are trusted.
 sandy protects:
 
 - the user's files outside the policy (their contents, and their metadata against changes),
-- other processes of the user (memory, debugging; signals, including the terminal's job control
-  signals, with `signals = "isolated"`),
+- other processes of the user (memory, debugging; signals with `signals = "isolated"`, on Linux
+  including the terminal's job control signals),
 - the user's privileges (no setuid, no capabilities, no elevation),
 - the network, as far as `ip` and `unix_sockets` deny it,
 - the host's local services on Unix sockets.

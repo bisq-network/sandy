@@ -95,7 +95,12 @@ fn system_conflict(policy: &ResolvedPolicy) -> Option<String> {
     }
     let entries = system::MINIMAL
         .iter()
-        .filter(|entry| !matches!(entry.access, Grant::ReadWriteDevice | Grant::Symlink))
+        .filter(|entry| {
+            !matches!(
+                entry.access,
+                Grant::ReadWriteDevice | Grant::ReadWriteDeviceTree | Grant::Symlink
+            )
+        })
         .map(|entry| {
             let tree = matches!(entry.access, Grant::ReadTree | Grant::CodeTree);
             (entry.path, tree)

@@ -14,6 +14,9 @@ pub enum SystemAccess {
     ReadDevice,
     /// Read and write one device. The target cannot create, delete or rename it.
     ReadWriteDevice,
+    /// Read and write a directory tree of devices. The target cannot create, delete or rename
+    /// an entry.
+    ReadWriteDeviceTree,
     /// Read the metadata of one symbolic link, so path lookups can pass through it.
     Symlink,
 }
@@ -78,6 +81,28 @@ pub const MINIMAL: &[SystemPath] = &[
         path: "/dev/null",
         access: SystemAccess::ReadWriteDevice,
         reason: "discarding output; also standard streams redirected to it",
+    },
+    SystemPath {
+        path: "/dev/fd",
+        access: SystemAccess::ReadWriteDeviceTree,
+        reason: "the program's own open descriptors as paths (/dev/fd/N); opening one duplicates \
+                 the descriptor instead of opening the file again, so it reaches nothing the \
+                 program does not hold already",
+    },
+    SystemPath {
+        path: "/dev/stdin",
+        access: SystemAccess::Symlink,
+        reason: "link to /dev/fd/0",
+    },
+    SystemPath {
+        path: "/dev/stdout",
+        access: SystemAccess::Symlink,
+        reason: "link to /dev/fd/1",
+    },
+    SystemPath {
+        path: "/dev/stderr",
+        access: SystemAccess::Symlink,
+        reason: "link to /dev/fd/2",
     },
     SystemPath {
         path: "/dev/zero",
@@ -176,6 +201,12 @@ pub const FIOASYNC: u64 = 0x8004_667d;
 pub const TIOCGETA: u64 = 0x4048_7413;
 pub const TIOCGWINSZ: u64 = 0x4008_7468;
 pub const TIOCSTI: u64 = 0x8001_7472;
+
+/// `F_SETOWN` names the process or process group that the kernel sends SIGIO and SIGURG to when
+/// a socket or a pipe becomes ready. XNU sends those signals without the check behind
+/// `(allow signal ...)`, so with `signals = "isolated"` the command is denied. Number from
+/// `<sys/fcntl.h>`; the ioctl variants FIOSETOWN and SIOCSPGRP are not in `ALLOWED_IOCTLS`.
+pub const F_SETOWN: u32 = 6;
 
 /// The ioctls allowed on files and devices. fcntl(F_SETFL) issues FIONBIO and FIOASYNC;
 /// TIOCGETA and TIOCGWINSZ only read terminal state (isatty, window size). Every other request

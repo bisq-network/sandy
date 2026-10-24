@@ -277,7 +277,7 @@ impl ResolvedPolicy {
 /// The interpreter of a `#!` line: the first word after `#!`, or `None` when `file` does not
 /// start with one. The kernel reads only the beginning of the file (256 bytes on Linux) and the
 /// first line of it, and takes everything after the interpreter as one argument.
-fn shebang(file: &Path) -> Option<PathBuf> {
+pub fn shebang(file: &Path) -> Option<PathBuf> {
     use std::io::Read;
 
     /// As Linux (BINPRM_BUF_SIZE). macOS reads less.

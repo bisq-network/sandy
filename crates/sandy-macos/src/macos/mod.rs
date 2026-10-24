@@ -26,6 +26,7 @@ const _: () = {
     assert!(system::TIOCGETA == libc::TIOCGETA);
     assert!(system::TIOCGWINSZ == libc::TIOCGWINSZ);
     assert!(system::TIOCSTI == libc::TIOCSTI);
+    assert!(system::F_SETOWN as libc::c_int == libc::F_SETOWN);
 };
 
 /// Seatbelt profile applied in-process with sandbox_init_with_parameters, then the target
@@ -60,6 +61,8 @@ impl Backend for MacosBackend {
             })?;
         }
         let seatbelt = Seatbelt::load().map_err(SandboxError::new)?;
+        // Before anything is forked, so that no process sandy starts keeps the ports either.
+        exec::reset_exception_ports()?;
         let contained = policy.children == ChildProcesses::Contained;
         let pairs = relay_pairs(policy);
         // With `contained`, the relay also ends when the guard has ended the program's group.
@@ -189,22 +192,49 @@ fn rosetta(policy: &ResolvedPolicy) -> Option<String> {
         return None;
     }
     let program = policy.program.as_ref()?;
+    // The kernel loads a script's interpreter, so that file decides, as it does for the
+    // `read_exec` check (`SHEBANG_LEVELS`).
+    let mut loaded = program.clone();
+    let mut named_by = None;
+    for _ in 0..SHEBANG_LEVELS {
+        match sandy_core::shebang(&loaded) {
+            Some(interpreter) => {
+                named_by = Some(loaded);
+                loaded = interpreter;
+            }
+            None => break,
+        }
+    }
+    match binary::has_arm64_code(&header_of(&loaded)?) {
+        Some(false) => Some(match named_by {
+            Some(script) => format!(
+                "{}, the interpreter of the script {}, has no arm64 code, so it would run \
+                 through Rosetta, which cannot load its runtime inside the sandbox; use an \
+                 arm64 or universal build of the interpreter",
+                loaded.display(),
+                script.display()
+            ),
+            None => format!(
+                "{} has no arm64 code, so it would run through Rosetta, which cannot load its \
+                 runtime inside the sandbox; use an arm64 or universal build of the program",
+                loaded.display()
+            ),
+        }),
+        _ => None,
+    }
+}
+
+/// The beginning of `file`, as much as `binary::has_arm64_code` needs. A file that cannot be
+/// read is left to the exec, which reports its own error.
+fn header_of(file: &std::path::Path) -> Option<Vec<u8>> {
     let mut header = Vec::with_capacity(binary::HEADER_SIZE);
-    // A file that cannot be read is left to the exec, which reports its own error.
-    std::fs::File::open(program)
+    std::fs::File::open(file)
         .and_then(|file| {
             file.take(binary::HEADER_SIZE as u64)
                 .read_to_end(&mut header)
         })
         .ok()?;
-    match binary::has_arm64_code(&header) {
-        Some(false) => Some(format!(
-            "{} has no arm64 code, so it would run through Rosetta, which cannot load its \
-             runtime inside the sandbox; use an arm64 or universal build of the program",
-            program.display()
-        )),
-        _ => None,
-    }
+    Some(header)
 }
 
 /// Whether the integer sysctl `name` is 1. A name this Mac does not know counts as 0.

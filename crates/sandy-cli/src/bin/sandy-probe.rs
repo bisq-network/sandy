@@ -469,10 +469,6 @@ mod linux {
         "utime-path",
         "utime-fd",
         "winsize-path",
-        "start-job",
-        "setpgid-join",
-        "tcsetpgrp",
-        "tiocswinsz",
         "tiocsetd",
         "lease-read",
         "delegation",
@@ -504,10 +500,6 @@ mod linux {
             "utime-path" => utime_path(target),
             "utime-fd" => utime_fd(target),
             "winsize-path" => winsize_path(target),
-            "start-job" => start_job(target),
-            "setpgid-join" => setpgid_join(number(target)?),
-            "tcsetpgrp" => tcsetpgrp(number(target)?),
-            "tiocswinsz" => tiocswinsz(number(target)?),
             "tiocsetd" => tiocsetd(number(target)?),
             "lease-read" => lease_read(target),
             "delegation" => delegation(target),
@@ -1234,29 +1226,7 @@ mod linux {
     }
 
     fn tiocgwinsz(fd: libc::c_int) -> io::Result<String> {
-        let size = window_size(fd)?;
-        Ok(format!("{}x{}", size.ws_row, size.ws_col))
-    }
-
-    fn window_size(fd: libc::c_int) -> io::Result<libc::winsize> {
-        let mut size = libc::winsize {
-            ws_row: 0,
-            ws_col: 0,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        // SAFETY: TIOCGWINSZ writes a winsize through the pointer.
-        check(unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size as *mut libc::winsize) })?;
-        Ok(size)
-    }
-
-    /// Makes terminal `fd` one row taller. The kernel sends SIGWINCH to its foreground process
-    /// group, which is outside the sandbox when the program inherited the user's terminal.
-    fn tiocswinsz(fd: libc::c_int) -> io::Result<String> {
-        let mut size = window_size(fd)?;
-        size.ws_row += 1;
-        // SAFETY: TIOCSWINSZ reads a winsize through the pointer.
-        check(unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &size as *const libc::winsize) })?;
+        let size = super::unix::window_size(fd)?;
         Ok(format!("{}x{}", size.ws_row, size.ws_col))
     }
 
@@ -1403,64 +1373,6 @@ mod linux {
         // SAFETY: TIOCSETD reads an int through the pointer.
         check(unsafe { libc::ioctl(fd, libc::TIOCSETD, &discipline as *const libc::c_int) })?;
         Ok(format!("discipline {discipline}"))
-    }
-
-    /// Makes the probe's process group the foreground group of terminal `fd`. The job that had
-    /// the foreground stops as soon as it reads the terminal again. SIGTTOU is ignored first, as
-    /// a shell does: the kernel sends it to a background group that changes the terminal, which
-    /// would otherwise stop the probe before the call takes effect.
-    fn tcsetpgrp(fd: libc::c_int) -> io::Result<String> {
-        // SAFETY: setting a signal to SIG_IGN has no memory safety requirements.
-        unsafe { libc::signal(libc::SIGTTOU, libc::SIG_IGN) };
-        // SAFETY: getpgrp takes no arguments.
-        let group = unsafe { libc::getpgrp() };
-        // SAFETY: tcsetpgrp takes a descriptor and a process group ID.
-        check(unsafe { libc::tcsetpgrp(fd, group) })?;
-        Ok(format!("group {group}"))
-    }
-
-    /// Joins process group `pgid` and then reads the terminal on standard input. The group is a
-    /// background job of the terminal, so the kernel stops every process in it, including the
-    /// ones that were there before. The read therefore does not return while the stop holds.
-    fn setpgid_join(pgid: libc::pid_t) -> io::Result<String> {
-        // SAFETY: setpgid takes process IDs.
-        check(unsafe { libc::setpgid(0, pgid) })?;
-        let mut byte = 0u8;
-        // SAFETY: the buffer is valid for one byte.
-        check_long(unsafe { libc::read(0, (&raw mut byte).cast(), 1) } as libc::c_long)?;
-        Ok(format!("joined {pgid}"))
-    }
-
-    /// The job that the last `start-job` started. Its process group is its process ID, because
-    /// `start-job` makes it a group leader.
-    static LAST_JOB: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-
-    /// Starts `PROGRAM ARGS...` (separated by U+001F) in a process group of its own, with the
-    /// standard streams of the probe, and reports its process ID. A terminal job control test
-    /// needs a background job: the probe that starts it keeps the terminal's foreground. In the
-    /// arguments, `{job}` stands for the job that the last `start-job` started, so one job can
-    /// act on another without the test knowing process IDs in advance.
-    fn start_job(target: &str) -> io::Result<String> {
-        use std::os::unix::process::CommandExt;
-        use std::sync::atomic::Ordering;
-        let last = LAST_JOB.load(Ordering::SeqCst).to_string();
-        let target = target.replace("{job}", &last);
-        let mut parts = target.split(super::ARGUMENT_SEPARATOR);
-        let program = parts.next().unwrap_or_default();
-        let mut command = Command::new(program);
-        command.args(parts);
-        // SAFETY: setpgid is async-signal-safe.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let job = command.spawn()?.id() as i32;
-        LAST_JOB.store(job, Ordering::SeqCst);
-        Ok(job.to_string())
     }
 
     fn shm_attach(id: libc::c_int) -> io::Result<String> {
@@ -2196,10 +2108,36 @@ mod macos {
         "rmdir",
         "host-uuid",
         "fcntl-read-only",
+        "exception-ports",
+        "exception-port-exec",
+        "fsgetpath-ext",
+        "openbyid",
+        "searchfs",
+        "vol-getattr",
+        "getattr",
+        "setattr",
+        "getattrlistbulk",
+        "getfsstat",
+        "metadata",
+        "sigio-signal",
+        "spawn-join",
     ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
         match action {
+            "exception-ports" => exception_ports(),
+            "exception-port-exec" => exception_port_exec(target),
+            "fsgetpath-ext" => fsgetpath_ext(target),
+            "openbyid" => openbyid(target),
+            "searchfs" => searchfs(target),
+            "vol-getattr" => vol_getattr(target),
+            "getattr" => getattr(target),
+            "setattr" => setattr(target),
+            "getattrlistbulk" => getattrlistbulk(target),
+            "getfsstat" => getfsstat(),
+            "metadata" => metadata(target),
+            "sigio-signal" => sigio_signal(target),
+            "spawn-join" => spawn_join(target),
             "rename" => {
                 let (from, to) = super::pair(target)?;
                 fs::rename(from, to).map(|()| String::new())
@@ -2434,9 +2372,7 @@ mod macos {
         if length < 0 {
             return Err(io::Error::last_os_error());
         }
-        let end = (length as usize).min(buffer.len()).saturating_sub(1);
-        let bytes: Vec<u8> = buffer[..end].iter().map(|c| *c as u8).collect();
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        Ok(text(&buffer, length as usize))
     }
 
     /// Creates a socket of a non-Unix family. `(deny default)` should refuse socket creation of
@@ -2641,6 +2577,635 @@ mod macos {
         };
         Ok("attached".to_string())
     }
+
+    /// Every machine-independent exception, the value of `EXC_MASK_ALL` in
+    /// `<mach/exception_types.h>` (measured on macOS 26.5). `EXC_MASK_CRASH` (0x400) and
+    /// `EXC_MASK_CORPSE_NOTIFY` (0x2000) are not part of it.
+    const EXC_MASK_ALL: u32 = 0x1bfe;
+    const EXCEPTION_DEFAULT: u32 = 1;
+    const THREAD_STATE_NONE: i32 = 0;
+    const MACH_PORT_RIGHT_RECEIVE: u32 = 1;
+    const MACH_MSG_TYPE_MAKE_SEND: u32 = 20;
+    /// `EXC_TYPES_COUNT`: the most slots `task_get_exception_ports` can return.
+    const EXCEPTION_SLOTS: usize = 14;
+
+    unsafe extern "C" {
+        fn task_get_exception_ports(
+            task: libc::mach_port_t,
+            mask: u32,
+            masks: *mut u32,
+            count: *mut u32,
+            handlers: *mut libc::mach_port_t,
+            behaviors: *mut u32,
+            flavors: *mut i32,
+        ) -> libc::kern_return_t;
+        fn task_set_exception_ports(
+            task: libc::mach_port_t,
+            mask: u32,
+            handler: libc::mach_port_t,
+            behavior: u32,
+            flavor: i32,
+        ) -> libc::kern_return_t;
+        fn mach_port_allocate(
+            task: libc::mach_port_t,
+            right: u32,
+            name: *mut libc::mach_port_t,
+        ) -> libc::kern_return_t;
+        fn mach_port_insert_right(
+            task: libc::mach_port_t,
+            name: libc::mach_port_t,
+            right: libc::mach_port_t,
+            kind: u32,
+        ) -> libc::kern_return_t;
+    }
+
+    /// The task port of this process. The libc binding is deprecated in favour of the mach2
+    /// crate, which sandy does not depend on.
+    #[allow(deprecated)]
+    fn task_self() -> libc::mach_port_t {
+        // SAFETY: mach_task_self only reads the port name that libSystem set up at start.
+        unsafe { libc::mach_task_self() }
+    }
+
+    /// How many Mach exception handler ports the task holds. A handler port is a send right, so
+    /// it needs no `mach-lookup`: a program that inherits one can send a message to the crash
+    /// handler of whoever started sandy.
+    fn exception_ports() -> io::Result<String> {
+        let mut masks = [0u32; EXCEPTION_SLOTS];
+        let mut handlers = [0 as libc::mach_port_t; EXCEPTION_SLOTS];
+        let mut behaviors = [0u32; EXCEPTION_SLOTS];
+        let mut flavors = [0i32; EXCEPTION_SLOTS];
+        let mut count = EXCEPTION_SLOTS as u32;
+        // SAFETY: every array holds EXCEPTION_SLOTS entries, which `count` states; the call
+        // writes no more and updates `count`.
+        let result = unsafe {
+            task_get_exception_ports(
+                task_self(),
+                EXC_MASK_ALL,
+                masks.as_mut_ptr(),
+                &mut count,
+                handlers.as_mut_ptr(),
+                behaviors.as_mut_ptr(),
+                flavors.as_mut_ptr(),
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::other(format!(
+                "task_get_exception_ports returned {result}"
+            )));
+        }
+        let live = handlers[..count as usize]
+            .iter()
+            .filter(|port| **port != 0)
+            .count();
+        Ok(live.to_string())
+    }
+
+    /// Installs a Mach exception handler port on this task, then replaces this process with the
+    /// program in `target` (program and arguments separated by U+001F), as a caller with a crash
+    /// reporter starts sandy. Mach port rights are not descriptors: they survive the exec.
+    fn exception_port_exec(target: &str) -> io::Result<String> {
+        let mut port: libc::mach_port_t = 0;
+        let task = task_self();
+        // SAFETY: mach_port_allocate writes one port name into `port`; the other two calls take
+        // that name and no pointers.
+        let result = unsafe {
+            match mach_port_allocate(task, MACH_PORT_RIGHT_RECEIVE, &mut port) {
+                0 => match mach_port_insert_right(task, port, port, MACH_MSG_TYPE_MAKE_SEND) {
+                    0 => task_set_exception_ports(
+                        task,
+                        EXC_MASK_ALL,
+                        port,
+                        EXCEPTION_DEFAULT,
+                        THREAD_STATE_NONE,
+                    ),
+                    error => error,
+                },
+                error => error,
+            }
+        };
+        if result != 0 {
+            return Err(io::Error::other(format!(
+                "installing the exception port returned {result}"
+            )));
+        }
+        let mut parts = target.split(super::ARGUMENT_SEPARATOR);
+        let program = cstr(parts.next().unwrap_or_default())?;
+        let arguments: Vec<CString> = std::iter::once(Ok(program.clone()))
+            .chain(parts.map(cstr))
+            .collect::<io::Result<_>>()?;
+        let argv: Vec<*const c_char> = arguments
+            .iter()
+            .map(|argument| argument.as_ptr())
+            .chain(std::iter::once(ptr::null()))
+            .collect();
+        // SAFETY: every pointer refers to a CString that lives until the call returns, and the
+        // array ends with a null pointer.
+        unsafe { libc::execv(program.as_ptr(), argv.as_ptr()) };
+        Err(io::Error::last_os_error())
+    }
+
+    /// A function of libSystem that the SDK headers do not declare.
+    fn symbol(name: &std::ffi::CStr) -> io::Result<*mut libc::c_void> {
+        // SAFETY: RTLD_DEFAULT searches the images that are already loaded; the name is a C
+        // string.
+        let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+        if found.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("libSystem has no {}", name.to_string_lossy()),
+            ));
+        }
+        Ok(found)
+    }
+
+    /// The path of a file named by volume id and inode number, through `fsgetpath_ext`, the
+    /// newer variant of fsgetpath. The profile denies it by system call number.
+    fn fsgetpath_ext(target: &str) -> io::Result<String> {
+        type Call =
+            unsafe extern "C" fn(*mut c_char, libc::size_t, *const Fsid, u64, u32) -> libc::ssize_t;
+        let found = symbol(c"fsgetpath_ext")?;
+        // SAFETY: this is the signature of fsgetpath_ext in libSystem.
+        let call = unsafe { std::mem::transmute::<*mut libc::c_void, Call>(found) };
+        let (dev, inode) = dev_inode(target)?;
+        let fsid = Fsid {
+            val: [dev as i32, 0],
+        };
+        let mut buffer = [0 as c_char; 1024];
+        // SAFETY: the call reads the two-int fsid and writes at most buffer.len() bytes.
+        let length = unsafe { call(buffer.as_mut_ptr(), buffer.len(), &fsid, inode, 0) };
+        if length < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(text(&buffer, length as usize))
+    }
+
+    /// Opens a file by volume id and inode number (`openbyid_np`) and reads one byte. XNU asks
+    /// for a private privilege first, so this fails outside the sandbox as well; the profile
+    /// denies the system call in any case.
+    fn openbyid(target: &str) -> io::Result<String> {
+        #[repr(C)]
+        struct ObjectId {
+            number: u32,
+            generation: u32,
+        }
+        type Call = unsafe extern "C" fn(*const Fsid, *const ObjectId, libc::c_int) -> libc::c_int;
+        let found = symbol(c"openbyid_np")?;
+        // SAFETY: this is the signature of openbyid_np in libSystem.
+        let call = unsafe { std::mem::transmute::<*mut libc::c_void, Call>(found) };
+        let (dev, inode) = dev_inode(target)?;
+        let fsid = Fsid {
+            val: [dev as i32, 0],
+        };
+        let object = ObjectId {
+            number: inode as u32,
+            generation: 0,
+        };
+        // SAFETY: the call reads both structures and returns a descriptor or -1.
+        let descriptor = unsafe { call(&fsid, &object, libc::O_RDONLY) };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut byte = [0u8; 1];
+        // SAFETY: reads one byte into a buffer of one byte from a descriptor this function owns.
+        let read = unsafe { libc::read(descriptor, byte.as_mut_ptr().cast(), 1) };
+        // SAFETY: closing a descriptor this function owns.
+        unsafe { libc::close(descriptor) };
+        Ok(format!("{read} bytes"))
+    }
+
+    const SRCHFS_START: libc::c_uint = 0x0000_0001;
+    const SRCHFS_MATCHFILES: libc::c_uint = 0x0000_0008;
+
+    /// An attribute list that asks for common attributes only.
+    fn common_attributes(attributes: libc::attrgroup_t) -> libc::attrlist {
+        libc::attrlist {
+            bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+            reserved: 0,
+            commonattr: attributes,
+            volattr: 0,
+            dirattr: 0,
+            fileattr: 0,
+            forkattr: 0,
+        }
+    }
+
+    /// The name search of `searchfs`: the attribute buffer holds its own size, then the
+    /// reference to the name, then the name itself.
+    #[repr(C)]
+    struct NameSearch {
+        size: u32,
+        name: libc::attrreference_t,
+        text: [u8; 64],
+    }
+
+    #[repr(C)]
+    struct SearchBlock {
+        return_attributes: *mut libc::attrlist,
+        return_buffer: *mut libc::c_void,
+        return_buffer_size: libc::size_t,
+        max_matches: libc::c_ulong,
+        time_limit: libc::timeval,
+        search_parameters1: *mut libc::c_void,
+        size_of_search_parameters1: libc::size_t,
+        search_parameters2: *mut libc::c_void,
+        size_of_search_parameters2: libc::size_t,
+        search_attributes: libc::attrlist,
+    }
+
+    /// Searches the catalog of a volume for a file name, without walking any directory
+    /// (`searchfs`). `target` is `VOLUME_PATH<U+001F>NAME`: the volume is the one the path lies
+    /// on. The profile denies the system call, so inside the sandbox this never searches.
+    fn searchfs(target: &str) -> io::Result<String> {
+        type Call = unsafe extern "C" fn(
+            *const c_char,
+            *mut SearchBlock,
+            *mut libc::c_ulong,
+            libc::c_uint,
+            libc::c_uint,
+            *mut libc::c_void,
+        ) -> libc::c_int;
+        let found = symbol(c"searchfs")?;
+        // SAFETY: this is the signature of searchfs in libSystem.
+        let call = unsafe { std::mem::transmute::<*mut libc::c_void, Call>(found) };
+        let (volume, name) = super::pair(target)?;
+        let volume = cstr(volume)?;
+        let mut wanted = NameSearch {
+            size: std::mem::size_of::<NameSearch>() as u32,
+            name: libc::attrreference_t {
+                attr_dataoffset: std::mem::size_of::<libc::attrreference_t>() as i32,
+                attr_length: name.len() as u32 + 1,
+            },
+            text: [0; 64],
+        };
+        if name.len() >= wanted.text.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "name too long"));
+        }
+        wanted.text[..name.len()].copy_from_slice(name.as_bytes());
+        let mut returned = common_attributes(libc::ATTR_CMN_NAME);
+        let mut matches = [0u8; 4096];
+        let mut block = SearchBlock {
+            return_attributes: &mut returned,
+            return_buffer: matches.as_mut_ptr().cast(),
+            return_buffer_size: matches.len(),
+            max_matches: 8,
+            time_limit: libc::timeval {
+                tv_sec: 1,
+                tv_usec: 0,
+            },
+            search_parameters1: (&raw mut wanted).cast(),
+            size_of_search_parameters1: std::mem::size_of::<NameSearch>(),
+            search_parameters2: ptr::null_mut(),
+            size_of_search_parameters2: 0,
+            search_attributes: common_attributes(libc::ATTR_CMN_NAME),
+        };
+        // `struct searchstate` is opaque; it is 556 bytes on every macOS that has searchfs.
+        let mut state = [0u8; 556];
+        let mut count: libc::c_ulong = 0;
+        // SAFETY: the block points to buffers that outlive the call, and each size field matches
+        // its buffer.
+        let result = unsafe {
+            call(
+                volume.as_ptr(),
+                &mut block,
+                &mut count,
+                0,
+                SRCHFS_START | SRCHFS_MATCHFILES,
+                state.as_mut_ptr().cast(),
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(format!("{count} matches"))
+    }
+
+    /// The full path of a file named by volume id and inode number, through `getattrlist` on its
+    /// `/.vol` path, which names the file without walking its directories.
+    fn vol_getattr(target: &str) -> io::Result<String> {
+        let (dev, inode) = dev_inode(target)?;
+        full_path(&format!("/.vol/{dev}/{inode}"))
+    }
+
+    /// The modification time and the full path of `target` through `getattrlist`, which is the
+    /// one file call that returns a path instead of taking one (ATTR_CMN_FULLPATH).
+    /// `PATH<U+001F>fullpath` or `PATH<U+001F>modtime` asks for one of the two alone.
+    fn getattr(target: &str) -> io::Result<String> {
+        match target.split_once(super::ARGUMENT_SEPARATOR) {
+            Some((path, "fullpath")) => attributes(path, libc::ATTR_CMN_FULLPATH),
+            Some((path, "modtime")) => attributes(path, libc::ATTR_CMN_MODTIME),
+            Some((path, _)) => full_path(path),
+            None => full_path(target),
+        }
+    }
+
+    /// One attribute of `path`, reported as the kernel returned it.
+    fn attributes(path: &str, wanted: libc::attrgroup_t) -> io::Result<String> {
+        let path = cstr(path)?;
+        let mut list = common_attributes(wanted);
+        let mut buffer = [0u8; 2048];
+        // SAFETY: the call writes at most buffer.len() bytes into the buffer.
+        let result = unsafe {
+            libc::getattrlist(
+                path.as_ptr(),
+                (&raw mut list).cast(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if wanted == libc::ATTR_CMN_FULLPATH {
+            return read_reference(&buffer, 4);
+        }
+        let seconds = i64::from_ne_bytes(
+            buffer[4..12]
+                .try_into()
+                .map_err(|_| io::Error::other("the attribute buffer is malformed"))?,
+        );
+        Ok(format!("mtime {seconds}"))
+    }
+
+    fn full_path(path: &str) -> io::Result<String> {
+        let path = cstr(path)?;
+        let mut wanted = common_attributes(libc::ATTR_CMN_MODTIME | libc::ATTR_CMN_FULLPATH);
+        let mut buffer = [0u8; 2048];
+        // SAFETY: the call writes at most buffer.len() bytes into the buffer.
+        let result = unsafe {
+            libc::getattrlist(
+                path.as_ptr(),
+                (&raw mut wanted).cast(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // The buffer starts with its own length, then the attributes in the order of their
+        // bits: the modification time (a timespec), then the reference to the path.
+        let seconds = i64::from_ne_bytes(
+            buffer[4..12]
+                .try_into()
+                .map_err(|_| io::Error::other("the attribute buffer is malformed"))?,
+        );
+        let path = read_reference(&buffer, 4 + std::mem::size_of::<libc::timespec>())?;
+        Ok(format!("{path} mtime {seconds}"))
+    }
+
+    /// Sets the modification time of `target` through `setattrlist`, the counterpart of
+    /// getattrlist. Writing metadata outside a writable path must be denied.
+    fn setattr(target: &str) -> io::Result<String> {
+        let path = cstr(target)?;
+        let mut wanted = common_attributes(libc::ATTR_CMN_MODTIME);
+        let time = libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        // SAFETY: the attribute buffer holds exactly the one timespec the list asks for.
+        let result = unsafe {
+            libc::setattrlist(
+                path.as_ptr(),
+                (&raw mut wanted).cast(),
+                (&raw const time).cast_mut().cast(),
+                std::mem::size_of::<libc::timespec>(),
+                0,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(String::new())
+    }
+
+    /// Reads the variable-length attribute at `at` as text: the reference holds the offset of
+    /// the data, counted from the reference itself.
+    fn read_reference(buffer: &[u8], at: usize) -> io::Result<String> {
+        let invalid = || io::Error::other("the attribute buffer is malformed");
+        let header = buffer.get(at..at + 8).ok_or_else(invalid)?;
+        let offset = i32::from_ne_bytes(header[..4].try_into().map_err(|_| invalid())?);
+        let length = u32::from_ne_bytes(header[4..].try_into().map_err(|_| invalid())?) as usize;
+        let start = at.checked_add_signed(offset as isize).ok_or_else(invalid)?;
+        let data = buffer
+            .get(start..start + length.saturating_sub(1))
+            .ok_or_else(invalid)?;
+        Ok(String::from_utf8_lossy(data).into_owned())
+    }
+
+    /// Lists a directory with `getattrlistbulk`, which returns the metadata of every entry in one
+    /// call instead of one `stat` per name. Reports the entries it returned with their file ids.
+    fn getattrlistbulk(target: &str) -> io::Result<String> {
+        let path = cstr(target)?;
+        // SAFETY: the path is a C string; O_RDONLY on a directory needs no mode.
+        let directory = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if directory < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut wanted = common_attributes(
+            libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | libc::ATTR_CMN_FILEID,
+        );
+        let mut buffer = [0u8; 8192];
+        // SAFETY: the call writes at most buffer.len() bytes into the buffer.
+        let count = unsafe {
+            libc::getattrlistbulk(
+                directory,
+                (&raw mut wanted).cast(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0,
+            )
+        };
+        // SAFETY: closing a descriptor this function owns.
+        unsafe { libc::close(directory) };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut entries = Vec::new();
+        let mut at = 0usize;
+        for _ in 0..count {
+            let length = u32::from_ne_bytes(
+                buffer
+                    .get(at..at + 4)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| io::Error::other("the entry is cut short"))?,
+            ) as usize;
+            // After the length comes the set of attributes that are present (five words), then
+            // the attributes themselves in order.
+            let name = read_reference(&buffer, at + 4 + 20)?;
+            let id_at = at + 4 + 20 + 8;
+            let id = u64::from_ne_bytes(
+                buffer
+                    .get(id_at..id_at + 8)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .unwrap_or_default(),
+            );
+            entries.push(format!("{name}#{id}"));
+            at += length;
+        }
+        Ok(format!("{count} entries: {}", entries.join(" ")))
+    }
+
+    /// Every mounted volume (`getfsstat`), with the directory it is mounted on. This needs no
+    /// path, so no file rule of the profile applies to it.
+    fn getfsstat() -> io::Result<String> {
+        // SAFETY: a null buffer asks for the number of volumes only.
+        let count = unsafe { libc::getfsstat(ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut volumes: Vec<libc::statfs> = Vec::with_capacity(count as usize);
+        let size = count as usize * std::mem::size_of::<libc::statfs>();
+        // SAFETY: the buffer holds `count` statfs values, which `size` states; getfsstat fills
+        // the first `got` of them.
+        let got = unsafe {
+            let got = libc::getfsstat(volumes.as_mut_ptr(), size as libc::c_int, libc::MNT_NOWAIT);
+            if got >= 0 {
+                volumes.set_len(got as usize);
+            }
+            got
+        };
+        if got < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let names: Vec<String> = volumes
+            .iter()
+            .map(|volume| {
+                let bytes: Vec<u8> = volume
+                    .f_mntonname
+                    .iter()
+                    .take_while(|byte| **byte != 0)
+                    .map(|byte| *byte as u8)
+                    .collect();
+                String::from_utf8_lossy(&bytes).into_owned()
+            })
+            .collect();
+        Ok(format!("{got} volumes: {}", names.join(" ")))
+    }
+
+    /// The metadata of a path, without following a final symbolic link (`lstat`). It tells
+    /// whether a path outside the policy can be told apart from one that does not exist.
+    fn metadata(target: &str) -> io::Result<String> {
+        let metadata = fs::symlink_metadata(target)?;
+        Ok(format!("{} bytes", metadata.len()))
+    }
+
+    /// Asks the kernel to send SIGIO to another process: `F_SETOWN` names the owner of a
+    /// socket pair end (or a pipe with `PID:pipe`), `O_ASYNC` turns on the signal, and the write
+    /// makes the other end readable. The owner needs no relation to this process.
+    fn sigio_signal(target: &str) -> io::Result<String> {
+        let (pid, kind) = target.split_once(':').unwrap_or((target, "socket"));
+        let pid: libc::pid_t = pid
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"))?;
+        let mut ends = [0 as libc::c_int; 2];
+        // SAFETY: both calls write two descriptors into `ends`.
+        let made = unsafe {
+            match kind {
+                "pipe" => libc::pipe(ends.as_mut_ptr()),
+                _ => libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, ends.as_mut_ptr()),
+            }
+        };
+        if made != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let (owned, other) = (ends[0], ends[1]);
+        let result = (|| {
+            // SAFETY: F_SETOWN and F_SETFL take an integer argument, F_GETFL none.
+            unsafe {
+                if libc::fcntl(owned, libc::F_SETOWN, pid) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                let flags = libc::fcntl(owned, libc::F_GETFL);
+                if flags == -1 || libc::fcntl(owned, libc::F_SETFL, flags | libc::O_ASYNC) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            let byte = *b"x";
+            // SAFETY: writes one byte from a valid buffer.
+            if unsafe { libc::write(other, byte.as_ptr().cast(), 1) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // Let the kernel deliver the signal before the descriptors close.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            Ok(format!("SIGIO to {pid}"))
+        })();
+        // SAFETY: closing descriptors this function owns.
+        unsafe {
+            libc::close(owned);
+            libc::close(other);
+        }
+        result
+    }
+
+    /// Starts a program in another process group with posix_spawn and POSIX_SPAWN_SETPGROUP:
+    /// `PGID<U+001F>PROGRAM<U+001F>ARGUMENT...`. The kernel changes the group itself, where no
+    /// profile rule for `setpgid` sees it. Reports the new process and the group it ended up in.
+    fn spawn_join(target: &str) -> io::Result<String> {
+        let (group, command) = super::pair(target)?;
+        let group: libc::pid_t = group
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid group"))?;
+        let mut parts = command.split(super::ARGUMENT_SEPARATOR);
+        let program = cstr(parts.next().unwrap_or_default())?;
+        let arguments: Vec<CString> = std::iter::once(Ok(program.clone()))
+            .chain(parts.map(cstr))
+            .collect::<io::Result<_>>()?;
+        let argv: Vec<*mut c_char> = arguments
+            .iter()
+            .map(|argument| argument.as_ptr().cast_mut())
+            .chain(std::iter::once(ptr::null_mut()))
+            .collect();
+        let mut attributes: libc::posix_spawnattr_t = ptr::null_mut();
+        let mut actions: libc::posix_spawn_file_actions_t = ptr::null_mut();
+        let discard = cstr("/dev/null")?;
+        let mut child: libc::pid_t = 0;
+        // SAFETY: the attributes and file actions are initialized before use and destroyed
+        // afterwards; argv ends with a null pointer and the strings outlive the call.
+        let result = unsafe {
+            libc::posix_spawnattr_init(&mut attributes);
+            libc::posix_spawnattr_setflags(&mut attributes, libc::POSIX_SPAWN_SETPGROUP as i16);
+            libc::posix_spawnattr_setpgroup(&mut attributes, group);
+            // The child would otherwise write its own report into the output of this process.
+            libc::posix_spawn_file_actions_init(&mut actions);
+            for descriptor in 0..=2 {
+                libc::posix_spawn_file_actions_addopen(
+                    &mut actions,
+                    descriptor,
+                    discard.as_ptr(),
+                    libc::O_RDWR,
+                    0,
+                );
+            }
+            let result = libc::posix_spawn(
+                &mut child,
+                program.as_ptr(),
+                &actions,
+                &attributes,
+                argv.as_ptr(),
+                ptr::null(),
+            );
+            libc::posix_spawn_file_actions_destroy(&mut actions);
+            libc::posix_spawnattr_destroy(&mut attributes);
+            result
+        };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result));
+        }
+        // SAFETY: getpgid takes a process ID.
+        let joined = unsafe { libc::getpgid(child) };
+        Ok(format!("pid {child} group {joined}"))
+    }
+
+    /// The text in a C string buffer that a call filled with `length` bytes, including its
+    /// terminating NUL.
+    fn text(buffer: &[c_char], length: usize) -> String {
+        let end = length.min(buffer.len()).saturating_sub(1);
+        let bytes: Vec<u8> = buffer[..end].iter().map(|byte| *byte as u8).collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
 }
 
 /// Actions on Linux and macOS for `process.children` and `process.end_with_parent`
@@ -2656,6 +3221,10 @@ mod unix {
     pub const ACTIONS: &[&str] = &[
         "setsid",
         "setpgid",
+        "start-job",
+        "setpgid-join",
+        "tcsetpgrp",
+        "tiocswinsz",
         "signal-parent",
         "stop-self",
         "ignore-signal",
@@ -2668,6 +3237,10 @@ mod unix {
         match action {
             "fork-walk" => fork_walk(target),
             "await-signal" => await_signal(target),
+            "start-job" => start_job(target),
+            "setpgid-join" => setpgid_join(number(target)?),
+            "tcsetpgrp" => tcsetpgrp(number(target)?),
+            "tiocswinsz" => tiocswinsz(number(target)?),
             // SAFETY: setsid has no arguments.
             "setsid" => check(unsafe { libc::setsid() }).map(|_| String::new()),
             // SAFETY: setpgid takes process IDs; 0 and 0 make the caller a group leader.
@@ -2812,6 +3385,96 @@ mod unix {
             // SAFETY: stops the probe itself.
             _ => check(unsafe { libc::kill(parent, libc::SIGSTOP) }).map(|_| String::new()),
         }
+    }
+
+    /// The job that the last `start-job` started. Its process group is its process ID, because
+    /// `start-job` makes it a group leader.
+    static LAST_JOB: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+    /// Starts `PROGRAM ARGS...` (separated by U+001F) in a process group of its own, with the
+    /// standard streams of the probe, and reports its process ID. A terminal job control test
+    /// needs a background job: the probe that starts it keeps the terminal's foreground. In the
+    /// arguments, `{job}` stands for the job that the last `start-job` started, so one job can
+    /// act on another without the test knowing process IDs in advance.
+    fn start_job(target: &str) -> io::Result<String> {
+        use std::os::unix::process::CommandExt;
+        use std::sync::atomic::Ordering;
+        let last = LAST_JOB.load(Ordering::SeqCst).to_string();
+        let target = target.replace("{job}", &last);
+        let mut parts = target.split(super::ARGUMENT_SEPARATOR);
+        let program = parts.next().unwrap_or_default();
+        let mut command = Command::new(program);
+        command.args(parts);
+        // SAFETY: setpgid is async-signal-safe.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let job = command.spawn()?.id() as i32;
+        LAST_JOB.store(job, Ordering::SeqCst);
+        Ok(job.to_string())
+    }
+
+    /// Joins process group `pgid` and then reads standard input. With a terminal there, the
+    /// group is a background job of it, so the kernel stops every process in the group,
+    /// including the ones that were there before; the read then does not return while the stop
+    /// holds.
+    fn setpgid_join(pgid: libc::pid_t) -> io::Result<String> {
+        // SAFETY: setpgid takes process IDs.
+        check(unsafe { libc::setpgid(0, pgid) })?;
+        let mut byte = 0u8;
+        // SAFETY: the buffer is valid for one byte.
+        if unsafe { libc::read(0, (&raw mut byte).cast(), 1) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(format!("joined {pgid}"))
+    }
+
+    /// Makes the probe's process group the foreground group of terminal `fd`. The job that had
+    /// the foreground stops as soon as it reads the terminal again. SIGTTOU is ignored first, as
+    /// a shell does: the kernel sends it to a background group that changes the terminal, which
+    /// would otherwise stop the probe before the call takes effect.
+    fn tcsetpgrp(fd: libc::c_int) -> io::Result<String> {
+        // SAFETY: setting a signal to SIG_IGN has no memory safety requirements.
+        unsafe { libc::signal(libc::SIGTTOU, libc::SIG_IGN) };
+        // SAFETY: getpgrp takes no arguments.
+        let group = unsafe { libc::getpgrp() };
+        // SAFETY: tcsetpgrp takes a descriptor and a process group ID.
+        check(unsafe { libc::tcsetpgrp(fd, group) })?;
+        Ok(format!("group {group}"))
+    }
+
+    /// The window size of terminal `fd`.
+    pub fn window_size(fd: libc::c_int) -> io::Result<libc::winsize> {
+        let mut size = libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: TIOCGWINSZ writes a winsize through the pointer.
+        check(unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size as *mut libc::winsize) })?;
+        Ok(size)
+    }
+
+    /// Makes terminal `fd` one row taller. The kernel sends SIGWINCH to its foreground process
+    /// group, which is outside the sandbox when the program inherited the user's terminal.
+    fn tiocswinsz(fd: libc::c_int) -> io::Result<String> {
+        let mut size = window_size(fd)?;
+        size.ws_row += 1;
+        // SAFETY: TIOCSWINSZ reads a winsize through the pointer.
+        check(unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &size as *const libc::winsize) })?;
+        Ok(format!("{}x{}", size.ws_row, size.ws_col))
+    }
+
+    fn number<T: std::str::FromStr>(target: &str) -> io::Result<T> {
+        target
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid number"))
     }
 
     fn check(result: libc::c_int) -> io::Result<libc::c_int> {

@@ -431,8 +431,8 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   program's end right before each signal.
 - `sandy check` compiles the profile without applying it, so it reports operations or filters that
   this macOS does not know.
-- Refused: sandy running through Rosetta, and on Apple silicon a program without arm64 code;
-  Rosetta cannot load its runtime inside the sandbox.
+- Refused: sandy running through Rosetta, and on Apple silicon a program without arm64 code, or
+  a script whose interpreter has none; Rosetta cannot load its runtime inside the sandbox.
 - `docs/macos.md` describes the profile, the system set with a reason per entry, and the known
   limitations.
 

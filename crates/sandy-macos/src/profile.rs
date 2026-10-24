@@ -219,7 +219,19 @@ fn process_rules(writer: &mut Writer, signals: SignalScope, children: ChildProce
     writer.line("(allow process-info* (target self))");
     match signals {
         SignalScope::Any => writer.line("(allow signal)"),
-        SignalScope::Isolated => writer.line("(allow signal (target self) (target same-sandbox))"),
+        SignalScope::Isolated => {
+            writer.line("(allow signal (target self) (target same-sandbox))");
+            writer.comment(
+                "F_SETOWN makes the kernel send SIGIO to any process of this user when a socket\n\
+                 or pipe becomes ready, and that send has no check behind it that `signal`\n\
+                 covers. A profile cannot filter the owner, so the command is denied: with\n\
+                 isolated signals a program gets no SIGIO at all.",
+            );
+            writer.line(&format!(
+                "(deny system-fcntl (fcntl-command {}))",
+                system::F_SETOWN
+            ));
+        }
     }
 }
 
@@ -251,12 +263,13 @@ fn sysctl_rules(writer: &mut Writer) {
 
 fn system_rules(writer: &mut Writer) {
     writer.comment("System paths that dyld and libSystem need (system = \"minimal\").");
-    let groups: [(Grant, &[&str]); 6] = [
+    let groups: [(Grant, &[&str]); 7] = [
         (Grant::CodeTree, CODE),
         (Grant::ReadTree, READ),
         (Grant::ReadFile, READ),
         (Grant::ReadDevice, READ),
         (Grant::ReadWriteDevice, READ_WRITE_DEVICE),
+        (Grant::ReadWriteDeviceTree, READ_WRITE_DEVICE),
         (Grant::Symlink, METADATA),
     ];
     for (grant, operations) in groups {
@@ -266,7 +279,9 @@ fn system_rules(writer: &mut Writer) {
             .map(|entry| {
                 let param = writer.grant("SYSTEM", Path::new(entry.path));
                 match grant {
-                    Grant::CodeTree | Grant::ReadTree => subpath(param),
+                    Grant::CodeTree | Grant::ReadTree | Grant::ReadWriteDeviceTree => {
+                        subpath(param)
+                    }
                     _ => literal(param),
                 }
             })
@@ -513,6 +528,12 @@ mod tests {
 (allow process-fork)
 (allow process-info* (target self))
 (allow signal (target self) (target same-sandbox))
+
+; F_SETOWN makes the kernel send SIGIO to any process of this user when a socket
+; or pipe becomes ready, and that send has no check behind it that `signal`
+; covers. A profile cannot filter the owner, so the command is denied: with
+; isolated signals a program gets no SIGIO at all.
+(deny system-fcntl (fcntl-command 6))
 
 ; ioctls on open files and devices: only the two that fcntl(F_SETFL) issues and two that
 ; read terminal state (FIONBIO, FIOASYNC, TIOCGETA, TIOCGWINSZ).
@@ -916,11 +937,54 @@ mod tests {
     #[test]
     fn signals_follow_the_policy() {
         let mut policy = typical("/srv");
-        assert!(generate(&policy).text.contains("\n(allow signal)\n"));
+        let setown = format!("(deny system-fcntl (fcntl-command {}))", system::F_SETOWN);
+        let open = generate(&policy).text;
+        assert!(open.contains("\n(allow signal)\n"));
+        // With signals = "any" the program may signal every process anyway.
+        assert!(!open.contains(&setown));
         policy.signals = SignalScope::Isolated;
         let text = generate(&policy).text;
         assert!(text.contains("\n(allow signal (target self) (target same-sandbox))\n"));
         assert!(!text.contains("\n(allow signal)\n"));
+        assert!(text.contains(&setown));
+    }
+
+    /// `/dev/fd` is the one tree of the system set that the target may write to, because
+    /// `/dev/fd/N` is only another name for a descriptor it already holds. The links
+    /// `/dev/stdin`, `/dev/stdout` and `/dev/stderr` point into it, so the lookup must pass
+    /// through them.
+    #[test]
+    fn descriptor_paths_are_granted_as_a_tree() {
+        let profile = generate(&typical("/srv"));
+        let parameter = |path: &str| {
+            profile
+                .parameters
+                .iter()
+                .find(|(_, value)| value == Path::new(path))
+                .map(|(name, _)| name.clone())
+                .unwrap_or_else(|| panic!("{path} is not in the system set"))
+        };
+        let writable: String = profile
+            .text
+            .split("(allow file-read* file-test-existence file-write-data")
+            .skip(1)
+            .filter_map(|rest| rest.split_once("))\n").map(|(rule, _)| rule.to_string()))
+            .collect();
+        assert!(
+            writable.contains(&format!("(subpath (param \"{}\"", parameter("/dev/fd"))),
+            "{writable}"
+        );
+        for link in ["/dev/stdin", "/dev/stdout", "/dev/stderr"] {
+            let metadata = profile
+                .text
+                .split("(allow file-read-metadata file-test-existence")
+                .nth(1)
+                .expect("the link rule");
+            assert!(
+                metadata.contains(&format!("(literal (param \"{}\"", parameter(link))),
+                "{link} is not readable as a link"
+            );
+        }
     }
 
     #[test]

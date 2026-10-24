@@ -85,7 +85,7 @@ compiler fail, and sandy fails closed.
 | `EnvironmentControlled` | `posix_spawn` (with `children = "contained"`: `execve`) receives exactly `command.env`. The backend adds no variable. |
 | `IpNetworkDenied` | Profile: no `network-*` rule for IP. The name resolver is unreachable unless `unix_sockets = "all"`. |
 | `UnixSocketsDenied` | Profile: no `network-bind` or `network-outbound` for Unix sockets. With `ip = "all"`, the resolver socket is the one exception. |
-| `SignalsIsolated` | Profile: `(allow signal (target self) (target same-sandbox))` instead of `(allow signal)`. |
+| `SignalsIsolated` | Profile: `(allow signal (target self) (target same-sandbox))` instead of `(allow signal)`, and `(deny system-fcntl (fcntl-command 6))`, because `F_SETOWN` makes the kernel send SIGIO to any process. The kernel's job control signals stay outside it (see [Signals the profile does not cover](#signals-the-profile-does-not-cover)). |
 | `ChildProcessesDenied` | Profile: no `(allow process-fork)`, and an explicit `(deny process-fork)` at the end. Seatbelt checks `fork`, `vfork` and `posix_spawn` without `POSIX_SPAWN_SETEXEC` as `process-fork`; all three fail with `EPERM` (CI run 39857337279 logged `deny(1) process-fork` for each). Threads are no operation, and `execve` of an allowed program, which replaces the image without creating a process, stays covered by `process-exec*`. sandy's own final `posix_spawn` with `POSIX_SPAWN_SETEXEC` is not a `process-fork`, and the relay is forked before the profile applies, so both still work. |
 | `EndsWithParent` | A watcher process outside the sandbox with its own profile; see [Ending with the parent](#ending-with-the-parent). |
 | `ChildProcessesContained` | sandy stays the target's parent; a guard process leads the target's process group; the profile denies `setpgid`, `setsid` and `posix_spawn`. See [Contained child processes](#contained-child-processes). |
@@ -102,8 +102,24 @@ appear between a scan and the exec, and a descriptor above the current `RLIMIT_N
 too. Chromium starts all its child processes on macOS with the same two calls
 (`base/process/launch_mac.cc`).
 
-Mach port rights are not file descriptors. Every lookup through the inherited bootstrap port is a
-`mach-lookup`, which the profile denies.
+### Inherited Mach port rights
+
+Mach port rights are not file descriptors, and the profile cannot close them: every lookup
+through the inherited bootstrap port is a `mach-lookup`, which the profile denies, but a right
+the task already holds needs no lookup. The kernel copies the task's exception ports when it
+creates a task and keeps them across `exec`, so a caller with a crash reporter (Crashpad,
+Sentry, a debugger) would hand the program a send right to its handler, which the program could
+use for forged exception messages. Before it applies the profile, sandy therefore sets the
+handler of every machine-independent exception (`EXC_MASK_ALL`) to `MACH_PORT_NULL`, as
+Chromium's launcher does. It happens before the relay and the watcher are forked, so they drop
+the ports too.
+
+What stays: the crash port (`EXC_MASK_CRASH`), which launchd sets to the system crash reporter
+and which is not part of `EXC_MASK_ALL`, so crashes are still reported; and the host name port,
+which every process inherits (see "Information the target can still read"). A program that is
+started by a caller with its own crash reporter loses that reporter, which is the point.
+Measured on macOS 26.5: a task starts with a handler for `EXC_MASK_RESOURCE` even without a
+crash reporter, the handler survives `exec`, and after the reset the exec'd program finds none.
 
 ### SIGPIPE
 
@@ -237,6 +253,8 @@ that.
 | `/usr/share/zoneinfo.default` | read | time zone database shipped with the system |
 | `/usr/share/locale` | read | locale data for `setlocale` |
 | `/dev/null` | read, write data | discarding output; standard streams redirected to it |
+| `/dev/fd` | read, write data (the tree) | the program's own open descriptors as paths (`/dev/fd/N`) |
+| `/dev/stdin`, `/dev/stdout`, `/dev/stderr` | metadata of the link | links into `/dev/fd`; programs take them as file names |
 | `/dev/zero` | read | zero bytes |
 | `/dev/random`, `/dev/urandom` | read | random numbers |
 | `/etc`, `/tmp`, `/var` | metadata of the link | symbolic links to `/private/...`; programs use paths such as `/etc/localtime` and `/var/run/...`, and the path lookup must read the link |
@@ -249,7 +267,15 @@ Not in the set, on purpose:
 - `/private/etc/passwd`, preferences (`/Library/Preferences`), `/System/Library/CoreServices`. The
   C runtime starts without them.
 - The App cryptex (`/System/Cryptexes/App`), which holds the shared cache of Safari's frameworks.
-- `/dev/tty`, `/dev/fd`, pseudo-terminals, `/dev/dtracehelper`.
+- `/dev/tty`, pseudo-terminals, `/dev/dtracehelper`.
+
+`/dev/fd` is the one tree of the set that the program may write to. It widens nothing:
+`/dev/fd/N` is another name for a descriptor the program already holds, and opening it
+duplicates that descriptor instead of opening the file again. XNU's `dupfdopen` refuses a mode
+the original lacks, measured on macOS 26.5 and in the escape test
+`a_descriptor_path_grants_no_more_than_the_descriptor`: `open("/dev/fd/0", O_WRONLY)` on a
+read-only standard input gives `EACCES` inside the sandbox and outside it. A program that takes
+`/dev/stdin` as a file name therefore works, as it does on Linux.
 
 The set is smaller than the sets of Chromium (`common.sb`) and the Codex CLI
 (`seatbelt_read_only_platform_defaults.sbpl`), which serve programs with Cocoa, preferences and
@@ -365,6 +391,41 @@ kills a process that is not running (the Linux relay uses one), so only `signals
 which keeps the program from signalling the relay at all, holds that bound here. Connections
 that reach a stopped relay are not relayed: the kqueue reports the end of the program before
 anything that became ready after it, and the relay returns on that event without accepting.
+
+## Signals the profile does not cover
+
+`signals = "isolated"` is `(allow signal (target self) (target same-sandbox))`. It covers the
+`signal` operation, which is `kill` and its relatives, and the scope is one sandbox instance:
+the escape test `isolated_signals_do_not_cross_sandbox_instances` showed that a second sandy run
+with the same policy cannot signal the first. Two paths reach a process outside the sandbox
+without that check, because the kernel sends those signals itself:
+
+- `F_SETOWN` names the process that gets SIGIO when a socket or a pipe becomes ready, and XNU
+  sends it with no check behind it that `signal` covers. Measured on macOS 26.5: a program with
+  isolated signals delivered SIGIO to a process outside the sandbox. A profile cannot filter the
+  owner, so with `signals = "isolated"` the command itself is denied and the program gets no
+  SIGIO at all. The ioctl variants `FIOSETOWN` and `SIOCSPGRP` were outside the ioctl allowlist
+  already. With the default `signals = "any"` the program may signal every process anyway, so
+  the rule is only added for `isolated`.
+- Job control. The kernel stops a whole process group when one of its processes reads a terminal
+  in the background, and that send has no check behind it either. A program can join the process
+  group of another job of the terminal session it was started in: `setpgid` cannot be filtered by
+  its argument in SBPL, so denying it under `isolated` would mean no process groups at all inside
+  the sandbox, and `posix_spawn` with `POSIX_SPAWN_SETPGROUP` would still put a child in a
+  foreign group, because the kernel changes the group itself where no rule sees it. Both routes
+  are measured in `a_program_can_join_a_process_group_outside_the_sandbox`, and
+  `a_background_read_stops_another_job_of_the_terminal` shows what it costs: a program with
+  isolated signals joins the group of another job of its terminal session, reads the terminal,
+  and the kernel stops that job with it. The ioctls that aim
+  such a signal, `TIOCSPGRP` (take the terminal) and `TIOCSWINSZ` (SIGWINCH to the foreground
+  group), are outside the ioctl allowlist and denied in every mode
+  (`the_terminal_signal_ioctls_are_denied`).
+
+  `process.children = "contained"` closes both routes: it denies `setpgid`, `setsid` and
+  `posix_spawn`, so no process of the sandbox can leave the group that sandy ends. It requires
+  `signals = "isolated"`. Linux can express the narrow rule that macOS cannot: there `setpgid` is
+  allowed only with 0 as its second argument, so a program may lead a group of its own but not
+  join one.
 
 ## Contained child processes
 
@@ -542,6 +603,28 @@ no privilege, and closing them would break ordinary programs:
   the routines with `syscall-mig`, but runtimes use them for memory heuristics (for example the
   JVM and libuv's `uv_get_free_memory`), so the profile leaves them open, as Chromium's and the
   Codex CLI's profiles do. The privileged host port stays denied (`mach-priv*`).
+- Whether a path outside the policy exists. `stat` of a file the policy does not grant fails
+  with `EPERM`, and of a path that does not exist with `ENOENT`, so the two can be told apart
+  (`metadata_outside_the_policy_tells_existing_from_missing`). Contents, metadata and directory
+  listings stay unreadable.
+- The path of a file, through `getattrlist` with `ATTR_CMN_FULLPATH`. The kernel builds that
+  path in the VFS layer without reading the file's attributes, so the check that decides every
+  other attribute does not run: a request for the modification time of the same file is denied,
+  one for the path alone answers. With a `/.vol/<dev>/<inode>` path this turns an inode number
+  into a path, which is the disclosure that the `fsgetpath` denial closed
+  (`getattrlist_discloses_paths_outside_the_policy`). Denying `getattrlist` and `getattrlistat`
+  by number closes it, but `realpath(3)` is built on the same call and then fails for every
+  program in the sandbox, so the profile leaves them open.
+- The mounted volumes and the directories they are mounted on, through `getfsstat`, which takes
+  no path (`the_volume_list_is_readable`). The names of attached disks under `/Volumes` are part
+  of that list.
+- Which process ids exist. `kill(pid, 0)` only asks for permission: with isolated signals a live
+  process outside the sandbox answers `EPERM` and an unused process id `ESRCH`
+  (`process_ids_outside_the_sandbox_stay_countable`). macOS answers the same way for a process
+  of another user outside any sandbox.
+- The names, file ids and metadata of the entries of the root directory, through
+  `getattrlistbulk` on `/`, which the program may open (`bulk_listing_reaches_only_the_root_directory`).
+  A directory the policy does not grant cannot be opened, so the call cannot reach it.
 
 ## Known limitations
 
@@ -552,7 +635,11 @@ no privilege, and closing them would break ordinary programs:
   unknown; Chromium uses custom profiles in every release.
 - `file-ioctl` allows only four requests. Programs that change terminal modes (raw mode, echo) or
   use other device ioctls fail. The reason: `TIOCSTI` on the controlling terminal would let the
-  target type commands into the shell that started sandy.
+  target type commands into the shell that started sandy. Job control fails for the same reason:
+  `TIOCSPGRP` is not allowed either, so a shell inside the sandbox cannot give the terminal to a
+  job.
+- With `signals = "isolated"` the program gets no SIGIO, because `F_SETOWN` is denied (see
+  [Signals the profile does not cover](#signals-the-profile-does-not-cover)).
 - `link(2)` fails everywhere (see the hard link rule above).
 - With `system = "none"` no program starts on macOS: every program is linked dynamically, and dyld
   itself needs the root directory and the shared cache from the system set. sandy refuses such a
@@ -577,9 +664,14 @@ no privilege, and closing them would break ordinary programs:
   program would abort with "rosetta error: Failed to open libRosettaRuntime" (measured on macOS
   26). A translated process executes universal programs such as `/bin/echo` as x86_64 too. The
   plan therefore refuses, before anything starts, when sandy itself runs translated
-  (`sysctl.proc_translated`), and on Apple silicon (`hw.optional.arm64`) when the program is a
-  Mach-O file without arm64 code (`binary::has_arm64_code` reads its header). A program that
-  later executes an x86_64-only program still meets the error. Allowing Rosetta would need its
+  (`sysctl.proc_translated`), and on Apple silicon (`hw.optional.arm64`) when the file the kernel
+  would load has no arm64 code (`binary::has_arm64_code` reads its header). For a script that is
+  the interpreter of the `#!` line, one level deep, as for the `read_exec` check. A program that
+  later executes an x86_64-only program still meets the error, and so does `arch -x86_64` or an
+  interpreter that `/usr/bin/env` finds on the PATH, because sandy judges only the file the
+  kernel loads first. An arm64e slice counts as arm64 code: measured on macOS 26.5, a third
+  party arm64e program built with the Command Line Tools runs, and in a file with an x86_64 and
+  an arm64e slice the kernel picks arm64e. Allowing Rosetta would need its
   runtime, its translation cache and probably its Mach service in the profile, which has not been
   evaluated.
 - With `process.children = "contained"` the target cannot use `posix_spawn`, so programs that
@@ -588,12 +680,10 @@ no privilege, and closing them would break ordinary programs:
 - The watcher of `process.end_with_parent` signals the target by process ID, not through a
   pidfd (see [Ending with the parent](#ending-with-the-parent)).
 - With `signals = "any"`, the target can signal every process of the user, as on other platforms.
-- Open questions that the escape tests do not answer:
-  - Apple does not document whether `(target same-sandbox)` means the same sandbox instance or any
-    process with the same profile. In the second case, two sandy runs with the same policy could
-    signal each other.
-  - Whether `(deny default)` covers every other operation that the profile never mentions. Chromium
-    and WebKit name a few exceptions, and the profile denies all of those explicitly.
+- Open question that the escape tests do not answer: whether `(deny default)` covers every other
+  operation that the profile never mentions. Chromium and WebKit name a few exceptions, and the
+  profile denies all of those explicitly. Two that it does not cover are measured above:
+  `getattrlist` with `ATTR_CMN_FULLPATH` and `getfsstat`.
 
 ## Verification
 
@@ -619,6 +709,11 @@ macOS only:
   and 2 are inherited, and job control with a pseudo-terminal. `parent.rs` tests
   `process.end_with_parent`, also with `contained` and against signals to the caller's process
   group.
+- `review_macos.rs` holds the checks the security reviews added, and the measurements that
+  record what the sandbox does where it cannot stop something: the by-id calls, `getattrlist`,
+  `getfsstat`, the existence of paths outside the policy, process ids, SIGIO and the process
+  groups of the terminal session. A check that this host cannot run reports a skip, and
+  `tests/expected-skips/macos-26-arm.txt` lists the ones that are expected.
 
 To see what the sandbox denies on a Mac:
 
