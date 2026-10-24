@@ -9,8 +9,12 @@
 //!    child, so the group's ID stays reserved until the guard reaps it. The guard keeps only its
 //!    pipes from and to sandy and, with exposed or forwarded ports, the write end of the pipe
 //!    that tells the relay that the group has ended.
-//! 3. It forks the program into the anchor's group and sends the program's process ID to the
-//!    guard. The guard watches the program and the pipe from sandy with kqueue. When the program
+//! 3. It forks the program. The program joins the anchor's group and then sends its own process
+//!    ID to the guard, so that the guard learns it even if sandy never runs again after the fork,
+//!    and learns it only once the program is in the group, so a kill of the group reaches it from
+//!    the moment the guard knows it. The program keeps a copy of the write end of that pipe until
+//!    execve closes it, so the pipe ends only once sandy is gone and the program has started or
+//!    ended. The guard watches the program and the pipe from sandy with kqueue. When the program
 //!    ends or the pipe ends, that is when sandy dies, also by SIGKILL, or is done, the guard
 //!    kills the group with SIGKILL until no live process is left in it. The guard is not in the
 //!    group, so it can repeat the signal: on macOS a process forked while a group signal is
@@ -108,12 +112,11 @@ pub fn run(start: impl FnOnce() -> SandboxError, ended: Option<File>) -> Result<
         }
         0 => {
             drop(report);
-            program_main(group.id, &signals, &actions, report_write, start)
+            program_main(&group, &signals, &actions, report_write, start)
         }
         pid => group.program = Some(pid),
     }
     drop(report_write);
-    group.tell_guard()?;
     let mut message = Vec::new();
     report
         .read_to_end(&mut message)
@@ -137,7 +140,8 @@ struct Group {
     terminal: Option<RawFd>,
     /// sandy gave the terminal to the program's group, and should give it again after a stop.
     program_has_terminal: bool,
-    /// The write end of the pipe to the guard. Closing it tells the guard that sandy is done.
+    /// The write end of the pipe to the guard. The forked program writes its process ID into it;
+    /// closing it tells the guard that sandy is done.
     to_guard: Option<File>,
     ended: bool,
 }
@@ -182,17 +186,6 @@ impl Group {
         }
         group.id = libc::pid_t::from_ne_bytes(id);
         Ok(group)
-    }
-
-    /// Sends the program's process ID to the guard, which then also ends the group when the
-    /// program ends.
-    fn tell_guard(&mut self) -> Result<(), SandboxError> {
-        let program = self.program.expect("the program was started");
-        self.to_guard
-            .as_mut()
-            .expect("sandy is not done")
-            .write_all(&program.to_ne_bytes())
-            .map_err(|error| SandboxError::io("cannot reach the guard", error))
     }
 
     /// Forwards signals and follows the program until it exits. Returns sandy's exit status.
@@ -467,10 +460,11 @@ fn watch_program(end: &File) -> Option<OwnedFd> {
     Some(queue)
 }
 
-/// The forked child: joins the group, restores the signal state the caller gave sandy, confines
-/// itself and executes the target. Reports a failure over `report`.
+/// The forked child: joins the group, tells the guard its process ID, restores the signal state
+/// the caller gave sandy, confines itself and executes the target. Reports a failure over
+/// `report`.
 fn program_main(
-    group: libc::pid_t,
+    group: &Group,
     signals: &Signals,
     actions: &CaughtSignals,
     mut report: File,
@@ -478,11 +472,19 @@ fn program_main(
 ) -> ! {
     let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: setpgid takes process IDs.
-        if unsafe { libc::setpgid(0, group) } != 0 {
+        if unsafe { libc::setpgid(0, group.id) } != 0 {
             return SandboxError::io(
                 "cannot join the program's process group",
                 io::Error::last_os_error(),
             );
+        }
+        // The child reports its own ID, and only now that it is in the group: see step 3 of the
+        // module documentation.
+        // SAFETY: getpid has no preconditions.
+        let id = unsafe { libc::getpid() }.to_ne_bytes();
+        let mut to_guard = group.to_guard.as_ref().expect("sandy is not done");
+        if let Err(error) = to_guard.write_all(&id) {
+            return SandboxError::io("cannot reach the guard", error);
         }
         if let Err(error) = actions.restore() {
             return error;

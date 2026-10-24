@@ -162,15 +162,21 @@ when the program ends. sandy does not replace itself with the program:
    its caller ignored the signal, and blocks every signal except the fault signals.
 2. sandy forks the guard. The guard creates a process group of its own and closes every
    descriptor except the read end of a pipe. sandy holds the write end; the forked program in
-   step 3 has a copy only until `execve` closes it.
-3. sandy forks the program and writes its process ID into the guard's pipe. The guard opens a
-   pidfd for the program and polls it and the pipe. When the program ends, or when the pipe ends
+   step 3 has a copy until `execve` closes it, so the pipe ends only once sandy is gone and the
+   program has started or ended.
+3. sandy forks the program. Once the program has reported its process ID (step 4), the guard
+   opens a pidfd for it and polls that and the pipe. When the program ends, or when the pipe ends
    because sandy died (also by `SIGKILL`), the guard checks that it leads its group and kills the
    group with `SIGKILL`. The group therefore ends with the program even while sandy is stopped.
-4. The forked program joins the guard's group, restores `SIGCHLD` and the signal mask that sandy's
-   caller set, and then runs steps 4 to 8 of the launch sequence. The denylist filter names the
-   child's process ID. If a step fails, the child writes the error into a close-on-exec pipe and
-   exits; sandy reads the pipe until `execve` closes it, and refuses with that error.
+4. The forked program joins the guard's group and then writes its own process ID into the guard's
+   pipe, in that order. The guard therefore learns the ID even if sandy never runs again after
+   the fork, for example because it was stopped or killed in that moment, and it never learns it
+   while a kill of the group would still miss the program. A failed write means the guard is
+   gone, and the program refuses to start. The program then restores `SIGCHLD` and the signal
+   mask that sandy's caller set, and runs steps 4 to 8 of the launch sequence. The denylist
+   filter names the child's process ID. If a step fails, the child writes the error into a
+   close-on-exec pipe and exits; sandy reads the pipe until `execve` closes it, and refuses with
+   that error.
 5. sandy waits for signals with `sigwaitinfo`. It forwards every signal to the program except
    `SIGCHLD`, `SIGCONT`, `SIGTTIN` and `SIGTTOU`, reaps processes that were re-parented to it,
    and refuses to continue if the guard ends before the program. With a terminal (one of sandy's

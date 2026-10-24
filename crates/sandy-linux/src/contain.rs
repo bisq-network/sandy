@@ -5,11 +5,14 @@
 //!    instead of init. It blocks the signals it forwards and waits for them with sigwaitinfo.
 //! 2. It forks the guard. The guard creates a process group of its own and closes every
 //!    descriptor except the read end of a pipe. sandy holds the write end; the forked program has
-//!    a copy only until execve closes it.
-//! 3. It forks the program into the guard's group and writes the program's process ID into the
-//!    pipe. The guard opens a pidfd for the program and kills its group when the program ends or
-//!    when the pipe ends, that is when sandy dies, also by SIGKILL. So the group ends with the
-//!    program even while sandy is stopped.
+//!    a copy until execve closes it, so the pipe ends only once sandy is gone and the program
+//!    has started or ended.
+//! 3. It forks the program. The program joins the guard's group and then writes its own process
+//!    ID into the pipe. The guard opens a pidfd for it and kills the group when the program ends
+//!    or when the pipe ends, that is when sandy dies, also by SIGKILL. So the group ends with the
+//!    program even while sandy is stopped. The program sends the ID itself, so the guard learns
+//!    it even if sandy never runs again after the fork, and it sends it only once it is in the
+//!    group, so a kill of the group reaches it from the moment the guard knows it.
 //! 4. The program confines itself as in the exec model and executes the target; it reports a
 //!    failure over a close-on-exec pipe. Its seccomp filter denies setsid and setpgid, so no
 //!    process it starts can leave the group, and the Landlock signal scope (the policy requires
@@ -70,7 +73,7 @@ pub fn run(start: impl FnOnce() -> SandboxError, ended: Option<File>) -> Result<
         }
         0 => {
             drop(report);
-            program_main(group.leader, &signals, &child_action, report_write, start)
+            program_main(&group, &signals, &child_action, report_write, start)
         }
         pid => {
             group.program = Some(pid);
@@ -80,7 +83,6 @@ pub fn run(start: impl FnOnce() -> SandboxError, ended: Option<File>) -> Result<
         }
     }
     drop(report_write);
-    group.tell_guard()?;
     let mut message = Vec::new();
     report
         .read_to_end(&mut message)
@@ -103,7 +105,8 @@ struct Group {
     terminal: Option<RawFd>,
     /// sandy gave the terminal to the program's group, and should give it again after a stop.
     program_has_terminal: bool,
-    /// The write end of the guard's pipe.
+    /// The write end of the guard's pipe. The forked program writes its process ID into it, and
+    /// sandy holds it open, so that its close tells the guard that sandy is gone.
     guard: File,
     ended: bool,
 }
@@ -146,15 +149,6 @@ impl Group {
             ));
         }
         Ok(group)
-    }
-
-    /// Sends the program's process ID to the guard, which then also ends the group when the
-    /// program ends.
-    fn tell_guard(&mut self) -> Result<(), SandboxError> {
-        let program = self.program.expect("the program was started");
-        self.guard
-            .write_all(&program.to_ne_bytes())
-            .map_err(|error| SandboxError::io("cannot reach the guard", error))
     }
 
     /// Forwards signals and follows the program until it exits. Returns sandy's exit status.
@@ -383,10 +377,11 @@ fn read_program(end: &File) -> Option<RawFd> {
     (pidfd >= 0).then_some(pidfd as RawFd)
 }
 
-/// The forked child: joins the group, restores the signal state the caller gave sandy, confines
-/// itself and executes the target. Reports a failure over `report`.
+/// The forked child: joins the group, tells the guard its process ID, restores the signal state
+/// the caller gave sandy, confines itself and executes the target. Reports a failure over
+/// `report`.
 fn program_main(
-    leader: libc::pid_t,
+    group: &Group,
     signals: &Signals,
     child_action: &libc::sigaction,
     mut report: File,
@@ -394,11 +389,19 @@ fn program_main(
 ) -> ! {
     let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: setpgid takes process IDs.
-        if unsafe { libc::setpgid(0, leader) } != 0 {
+        if unsafe { libc::setpgid(0, group.leader) } != 0 {
             return SandboxError::io(
                 "cannot join the program's process group",
                 io::Error::last_os_error(),
             );
+        }
+        // The child reports its own ID, and only now that it is in the group: see step 3 of the
+        // module documentation.
+        // SAFETY: getpid has no preconditions.
+        let id = unsafe { libc::getpid() }.to_ne_bytes();
+        let mut guard = &group.guard;
+        if let Err(error) = guard.write_all(&id) {
+            return SandboxError::io("cannot reach the guard", error);
         }
         // SAFETY: restores the action that `default_child_action` returned.
         if unsafe { libc::sigaction(libc::SIGCHLD, child_action, ptr::null_mut()) } != 0 {

@@ -347,8 +347,11 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   itself as above. The seccomp denylist denies `setsid` and `setpgid`, and the Landlock signal
   scope keeps the program from signaling sandy or the guard, so no process the program starts can
   leave the group. The guard watches the program with a pidfd and sandy through a pipe, and kills
-  the group when either ends, so the group ends with the program even while sandy is stopped.
-  sandy also kills the group when the program exits and waits until the group is gone.
+  the group when either ends, so the group ends with the program even while sandy is stopped. The
+  program writes its own process ID into that pipe, after it has joined the group, so the guard
+  learns it without sandy running again after the fork and never before a kill of the group would
+  reach the program. sandy also kills the group when the program exits and waits until the group
+  is gone.
 - `process.end_with_parent`: a watcher process, forked twice like the relay, polls pidfds for
   sandy's parent and for the program (with `contained`: the supervising sandy). When the parent
   ends, it sends SIGTERM and SIGCONT and, 5 seconds later, SIGKILL. Like the relay, it runs in a
@@ -401,8 +404,11 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   `fork`, `vfork` and `posix_spawn`; threads and `execve` stay allowed.
 - `process.children = "contained"`: sandy forks a guard process outside the program's group,
   which forks an anchor that leads a new process group, and then the program, which joins that
-  group, applies the profile and executes the target with `execve` after marking every
-  descriptor above 2 close-on-exec. The profile denies `setpgid`, `setsid` and `posix_spawn` with
+  group, writes its own process ID into the pipe to the guard, applies the profile and executes
+  the target with `execve` after marking every descriptor above 2 close-on-exec. As on Linux, the
+  program sends the ID itself, and only once it is in the group, so the guard learns it without
+  sandy running again after the fork and never before a kill of the group would reach the
+  program. The profile denies `setpgid`, `setsid` and `posix_spawn` with
   `syscall-unix` rules (the flags `POSIX_SPAWN_SETSID` and `POSIX_SPAWN_SETPGROUP` change the
   group inside `posix_spawn`, which no rule can inspect), and the signal rule keeps the program
   from signaling sandy, the guard or the anchor, which run outside the sandbox. The guard watches

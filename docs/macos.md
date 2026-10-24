@@ -383,15 +383,21 @@ when sandy itself is killed. sandy then stays the target's parent instead of rep
    nor the target's group) and forks the anchor, which starts the target's process group and only
    waits to be killed. The guard keeps two pipes to and from sandy and, with exposed or
    forwarded ports, the write end of the relay's pipe; the anchor keeps no descriptor.
-3. sandy learns the group's ID (the anchor's process ID) from the guard, forks the target into
-   that group, and sends the target's process ID to the guard. The guard registers the target's
-   `NOTE_EXIT` and the pipe from sandy in a kqueue. When either reports, that is when the target
-   ends or sandy is done or gone (also killed by SIGKILL), the guard kills the group until no live
-   process is left in it, closes the relay's pipe, waits until sandy is done or gone, reaps the
-   anchor and ends.
-4. The forked target restores the signal actions and the mask, applies the profile, marks every
-   descriptor above 2 close-on-exec and executes the target with `execve`. It reports a failure
-   over a close-on-exec pipe.
+3. sandy learns the group's ID (the anchor's process ID) from the guard and forks the target into
+   that group. Once the target has reported its process ID (step 4), the guard registers the
+   target's `NOTE_EXIT` and the pipe from sandy in a kqueue. When either reports, that is when
+   the target ends or sandy is done or gone (also killed by SIGKILL), the guard kills the group
+   until no live process is left in it, closes the relay's pipe, waits until sandy is done or
+   gone, reaps the anchor and ends.
+4. The forked target joins the group and then writes its own process ID into the pipe to the
+   guard, in that order. The guard therefore learns the ID even if sandy never runs again after
+   the fork, for example because it was stopped or killed in that moment, and it never learns it
+   while a kill of the group would still miss the target. A failed write means the guard is gone,
+   and the target refuses to start. The target keeps its copy of that write end until `execve`
+   closes it, so the pipe ends only once sandy is gone and the target has started or ended. Then
+   it restores the signal actions and the mask, applies the profile, marks every descriptor above
+   2 close-on-exec and executes the target with `execve`. It reports a failure over a
+   close-on-exec pipe.
 5. sandy forwards the signals it receives to the target and follows job control with a terminal,
    as on Linux (see "Process model" in `DESIGN.md`).
 6. When the target exits, sandy kills the group until no live process is left in it, closes its
