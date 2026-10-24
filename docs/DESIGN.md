@@ -575,6 +575,57 @@ action was impossible anyway. The same tests run on every platform; platform-spe
 routes get additional tests. `check.rs` holds the agreement tests: for every case where `run`
 refuses a policy, `sandy check` must refuse it too.
 
+## Dependencies
+
+sandy has seven direct dependencies: `landlock` and `seccompiler` on Linux, `windows-sys` on
+Windows, `libc` on Unix, and `lexopt`, `serde` and `toml` everywhere. `deny.toml` turns that into
+a rule the `audit` workflow enforces: only the crates listed there may be in the tree, at any
+version, and only from crates.io. A crate that appears, an advisory, a yanked version or an
+unexpected license fails the check. Advisories that report a crate as unmaintained or unsound
+count as errors, not as notes.
+
+### seccompiler
+
+seccompiler's standalone repository is archived. Work continues in the rust-vmm monorepo, which
+has published nothing newer on crates.io, so 0.5.0 of 2025-03-07 is the last release. sandy keeps
+it, pinned by the lock file, for these reasons:
+
+- It is a leaf crate, and its only dependency is `libc`.
+- sandy uses a narrow part of it: `SeccompFilter`, `SeccompRule`, `SeccompCondition` with the
+  `Dword` compares, the `Allow` and `Errno` actions, and `apply_filter_all_threads`. It assembles
+  BPF and decides nothing.
+- The system call numbers are sandy's own, taken from `libc::SYS_*`, so a stale table in
+  seccompiler cannot reach the filters.
+- `compiled_programs_match_the_snapshot` in `crates/sandy-linux/src/filter.rs` pins the compiled
+  programs against `crates/sandy-linux/snapshots/x86_64.txt`, and the interpreter tests beside it
+  check what those programs decide. A version of seccompiler that compiles the same rules
+  differently is a diff to read, not a silent change.
+
+No advisory against seccompiler exists today, so `deny.toml` has nothing to silence. If one
+appears, the answer is a decision and not a quiet `ignore` entry: either replace the crate, or
+write here why it stays and name the advisory in `deny.toml` with that reason. The other things
+that would change the decision are a bug in its code generation and a filter sandy needs that it
+cannot express. The replacement would not be another crate but a generator inside sandy, a few
+hundred lines against the same `libc` constants, which the interpreter tests would then test
+directly.
+
+## Release integrity
+
+The `release` workflow builds every target from a tag with `--locked`, keeps the path of the
+checkout and of `CARGO_HOME` out of the binary, and packs the archives with sorted entries, a
+fixed time and no owner. A second job builds one target in two directories and compares the
+binaries, so a change that ties the output to the machine that built it is noticed.
+
+Every archive gets a GitHub build provenance attestation, which names the workflow, the commit
+and the run that produced it. The job verifies the attestations before it creates the draft, so a
+release never carries an archive that cannot be checked. A user checks a download with `gh
+attestation verify <archive> --repo <owner>/<repo>`.
+
+`SHA256SUMS` says that the archives belong together, not who made them. A maintainer signature of
+that file would say it, and there is none yet. The macOS binaries carry only the linker's ad-hoc
+signature, and `sandy.exe` has no Authenticode signature; the workflow holds both steps, skipped
+until the certificates exist.
+
 ## Code layout
 
 | Crate | Role | May depend on |

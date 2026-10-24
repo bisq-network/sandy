@@ -1,8 +1,8 @@
 name: release
 
-# A tag v<version> builds every platform and creates a DRAFT release with the archives and their
-# SHA-256 sums. A maintainer reviews and publishes it. Running the workflow by hand builds the
-# archives without creating a release.
+# A tag v<version> builds every platform and creates a DRAFT release with the archives, their
+# SHA-256 sums and a build provenance attestation. A maintainer reviews and publishes it.
+# Running the workflow by hand builds the archives without creating a release.
 
 on:
   push:
@@ -28,6 +28,11 @@ jobs:
     env:
       # Paths of the build machine must not end up in the binary.
       RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/sandy ${{ contains(matrix.target, 'windows-msvc') && '-C target-feature=+crt-static' || '' }}
+      # Both are empty: these secrets do not exist. They gate the two signing steps below, which
+      # stay skipped until someone creates them. A step's `if` cannot read a secret, so they are
+      # read here.
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      WINDOWS_SIGNING_CERTIFICATE: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check that the tag matches the crate version
@@ -40,7 +45,72 @@ jobs:
         shell: bash
         run: |
           export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          # The dependencies are compiled from CARGO_HOME, and the locations in their panic
+          # messages keep that path. It cannot be written in the env block above, because that
+          # expands no variables. A prefix that does not match changes nothing.
+          export RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
           cargo build --release --locked --target ${{ matrix.target }} -p sandy-cli --bin sandy
+      # Skipped: this project has no Apple Developer ID, so the macOS binaries carry only the
+      # linker's ad-hoc signature. To sign and notarize them, join the Apple Developer Program,
+      # export the "Developer ID Application" certificate as a PKCS#12 file, and add six
+      # repository secrets: APPLE_SIGNING_IDENTITY (the certificate's common name),
+      # APPLE_SIGNING_CERTIFICATE (the PKCS#12 file, base64 encoded) with
+      # APPLE_SIGNING_CERTIFICATE_PASSWORD, and an App Store Connect key for notarytool,
+      # APPLE_NOTARY_KEY (base64 encoded) with APPLE_NOTARY_KEY_ID and APPLE_NOTARY_ISSUER.
+      # None of them exists today. Before turning this on, check on a Mac that the hardened
+      # runtime still lets sandy load /usr/lib/libsandbox.1.dylib and exec an unsigned program.
+      # A bare Mach-O cannot be stapled, so Gatekeeper checks the notarization online.
+      - name: Sign and notarize the macOS binary
+        if: ${{ contains(matrix.target, 'apple') && env.APPLE_SIGNING_IDENTITY != '' }}
+        shell: bash
+        env:
+          APPLE_SIGNING_CERTIFICATE: ${{ secrets.APPLE_SIGNING_CERTIFICATE }}
+          APPLE_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
+          APPLE_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/sandy"
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          security create-keychain -p "" "$keychain"
+          security set-keychain-settings -lut 900 "$keychain"
+          security unlock-keychain -p "" "$keychain"
+          echo "$APPLE_SIGNING_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -T /usr/bin/codesign \
+            -P "$APPLE_SIGNING_CERTIFICATE_PASSWORD"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" "$keychain" > /dev/null
+          security list-keychain -d user -s "$keychain"
+          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$binary"
+          codesign --verify --strict --verbose=2 "$binary"
+          echo "$APPLE_NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          ditto -c -k --keepParent "$binary" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" --wait \
+            --issuer "$APPLE_NOTARY_ISSUER" --key-id "$APPLE_NOTARY_KEY_ID" --key "$RUNNER_TEMP/notary.p8"
+          rm -f "$RUNNER_TEMP/certificate.p12" "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/notarize.zip"
+      # Skipped: this project has no code signing certificate, so Windows SmartScreen warns
+      # about a freshly downloaded sandy.exe and some enterprise policies refuse it. An OV or EV
+      # certificate costs money and today lives in a hardware token or a signing service, so the
+      # step below only fits a certificate that can still be exported as a PKCS#12 file; a
+      # signing service wants its own step instead. The secrets are WINDOWS_SIGNING_CERTIFICATE
+      # (the PKCS#12 file, base64 encoded) and WINDOWS_SIGNING_CERTIFICATE_PASSWORD. Neither
+      # exists today.
+      - name: Sign sandy.exe
+        if: ${{ contains(matrix.target, 'windows') && env.WINDOWS_SIGNING_CERTIFICATE != '' }}
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGNING_CERTIFICATE))
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' |
+            Sort-Object FullName | Select-Object -Last 1
+          & $signtool.FullName sign /fd sha256 /td sha256 /tr http://timestamp.digicert.com `
+            /f $pfx /p $env:WINDOWS_SIGNING_CERTIFICATE_PASSWORD `
+            "target/${{ matrix.target }}/release/sandy.exe"
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed" }
+          Remove-Item $pfx
       - name: Package
         shell: bash
         run: |
@@ -70,25 +140,78 @@ jobs:
             dist/*.zip
           if-no-files-found: error
 
+  reproducible:
+    # The release build removes what would otherwise tie a binary to the machine that made it:
+    # the path prefix of the checkout, the owner and the times in the archive. Nothing checked
+    # that it works. This builds one target twice from two directories and compares the
+    # binaries, so a change that makes the output depend on where it is built is noticed. It
+    # does not gate the release: a difference here is a finding to read, not a reason to keep a
+    # reviewed tag from being packaged.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: first
+      - name: Build twice and compare
+        shell: bash
+        run: |
+          set -euo pipefail
+          target=x86_64-unknown-linux-musl
+          cp -a first second
+          for dir in first second; do
+            (
+              cd "$dir"
+              export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+              export RUSTFLAGS="--remap-path-prefix=$PWD=/sandy"
+              export RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+              cargo build --release --locked --target "$target" -p sandy-cli --bin sandy
+            )
+          done
+          sha256sum first/target/"$target"/release/sandy second/target/"$target"/release/sandy
+          cmp first/target/"$target"/release/sandy second/target/"$target"/release/sandy \
+            || { echo "the binary depends on the directory it was built in"; exit 1; }
+
   release:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      # For the build provenance attestation below.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           merge-multiple: true
+      - name: Sum the archives
+        shell: bash
+        run: |
+          cd dist
+          sha256sum ./*.tar.gz ./*.zip | sed 's| \./| |' > SHA256SUMS
+          cat SHA256SUMS
+      # Nothing is published if this step or the verification below fails.
+      - name: Attest the build provenance of the archives
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+      - name: Verify the attestations before anything is published
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for archive in dist/*.tar.gz dist/*.zip; do
+            gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
+          done
       - name: Create a draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd dist
-          sha256sum ./*.tar.gz ./*.zip | sed 's| \./| |' > SHA256SUMS
-          cat SHA256SUMS
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
             --title "sandy $GITHUB_REF_NAME" \
-            --notes "Draft. Verify the archives against SHA256SUMS and sign SHA256SUMS before publishing. The aarch64 Windows build is cross-compiled and not tested at run time." \
+            --notes "Draft. Every archive carries a build provenance attestation: check one with \`gh attestation verify <archive> --repo $GITHUB_REPOSITORY\`. Verify the archives against SHA256SUMS, then sign SHA256SUMS with the project key and upload the signature as an asset before publishing; a published release takes no further assets. The aarch64 Windows build is cross-compiled and not tested at run time." \
             ./*.tar.gz ./*.zip SHA256SUMS

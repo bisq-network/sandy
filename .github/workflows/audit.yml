@@ -1,0 +1,25 @@
+name: audit
+
+# The dependency audit of deny.toml: advisories, licenses, sources, and the allowlist of crates
+# that may appear in the tree. It runs weekly as well, because an advisory can be published
+# without anything in this repository changing.
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Built from crates.io rather than taken from an action, so that nothing but the pinned
+      # toolchain and the lock file of cargo-deny itself decides what runs. The version is
+      # pinned because a new major version of cargo-deny changes what deny.toml means.
+      - run: cargo install --locked cargo-deny@0.20.2
+      - run: cargo deny --locked check all

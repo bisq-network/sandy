@@ -1003,6 +1003,158 @@ mod tests {
         }
     }
 
+    /// The golden snapshot of the compiled programs. x86_64 only: arm64 has its own system
+    /// call numbers, so its snapshot would have to be written on an arm64 Linux host.
+    #[cfg(target_arch = "x86_64")]
+    mod snapshot {
+        use super::*;
+
+        /// The pidfd of the program in the watcher's snapshot, which its rules compare against.
+        const WATCHED_PROGRAM: i32 = 4;
+
+        /// The highest system call number the snapshot lists. Above the reviewed table, so it also
+        /// records what the programs do with the numbers of a newer kernel.
+        const SNAPSHOT_LAST_CALL: i64 = 511;
+
+        /// Repeated at the top of the snapshot file, so the file says what it is.
+        const SNAPSHOT_HEADER: &str = "\
+# The compiled seccomp programs of sandy's configurations on x86_64, written by
+# compiled_programs_match_the_snapshot in crates/sandy-linux/src/filter.rs.
+#
+# Every section names one program, how many instructions it has, a checksum of them, and the
+# action it returns for each system call number with all arguments zero. Rules that look at
+# arguments do not show in that table, because their call is allowed with zero arguments; the
+# checksum covers them, and the tests next to the snapshot check what they decide.
+#
+# A diff here means a filter, the reviewed table or seccompiler's code generation changed.
+";
+
+        /// A checksum over the compiled instructions. It has to make a change visible, not resist
+        /// one, so FNV-1a is enough and needs no dependency.
+        fn checksum(program: &[sock_filter]) -> u64 {
+            let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+            let bytes = program.iter().flat_map(|insn| {
+                insn.code
+                    .to_le_bytes()
+                    .into_iter()
+                    .chain([insn.jt, insn.jf])
+                    .chain(insn.k.to_le_bytes())
+            });
+            for byte in bytes {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            hash
+        }
+
+        fn action_name(action: u32) -> String {
+            let errno = (action & libc::SECCOMP_RET_DATA) as i32;
+            match action {
+                RET_ALLOW => "allow".to_string(),
+                RET_KILL_PROCESS => "kill process".to_string(),
+                _ if action & libc::SECCOMP_RET_ACTION_FULL == libc::SECCOMP_RET_ERRNO => {
+                    match errno {
+                        libc::EPERM => "EPERM".to_string(),
+                        libc::ENOSYS => "ENOSYS".to_string(),
+                        libc::ENOTSUP => "ENOTSUP".to_string(),
+                        libc::EAFNOSUPPORT => "EAFNOSUPPORT".to_string(),
+                        other => format!("errno {other}"),
+                    }
+                }
+                other => format!("action {other:#010x}"),
+            }
+        }
+
+        /// One section of the snapshot: the size and checksum of `program`, then its decision per
+        /// system call number, with numbers that decide the same way collapsed into a range.
+        fn render(name: &str, program: &[sock_filter], out: &mut String) {
+            out.push_str(&format!(
+                "\n[{name}]\ninstructions {}\nchecksum {:#018x}\n",
+                program.len(),
+                checksum(program)
+            ));
+            let mut first = 0;
+            let mut action = evaluate(program, NATIVE, 0, [0; 6]);
+            for nr in 1..=SNAPSHOT_LAST_CALL + 1 {
+                let next =
+                    (nr <= SNAPSHOT_LAST_CALL).then(|| evaluate(program, NATIVE, nr, [0; 6]));
+                if next == Some(action) {
+                    continue;
+                }
+                let last = nr - 1;
+                let calls = if first == last {
+                    format!("{first}")
+                } else {
+                    format!("{first}-{last}")
+                };
+                out.push_str(&format!("{calls} {}\n", action_name(action)));
+                first = nr;
+                if let Some(next) = next {
+                    action = next;
+                }
+            }
+        }
+
+        fn snapshot() -> String {
+            let strict = build(&strict(), OWN_PID).unwrap();
+            let open = build(&open(), OWN_PID).unwrap();
+            let watcher = watcher(WATCHED_PROGRAM).unwrap();
+            let relay = relay().unwrap();
+            let mut out = SNAPSHOT_HEADER.to_string();
+            for (name, filters) in [
+                ("strict", &strict),
+                ("open", &open),
+                ("watcher", &watcher),
+                ("relay", &relay),
+            ] {
+                assert_eq!(
+                    checksum(&filters.allowlist),
+                    checksum(&strict.allowlist),
+                    "the allowlist of {name} differs from the shared one"
+                );
+                render(&format!("{name} denylist"), &filters.denylist, &mut out);
+                if let Some(program) = &filters.path_xattrs {
+                    render(&format!("{name} path xattrs"), program, &mut out);
+                }
+                if let Some(program) = &filters.families {
+                    render(&format!("{name} socket families"), program, &mut out);
+                }
+            }
+            render("allowlist", &strict.allowlist, &mut out);
+            out
+        }
+
+        /// Pins the compiled programs, so that a change to a rule, to the reviewed table or to
+        /// seccompiler shows up as a diff of a committed file instead of passing unnoticed.
+        /// Update that file deliberately: write the text the failure prints to it, then read
+        /// its diff and check that every line that changed is one you meant to change.
+        #[test]
+        fn compiled_programs_match_the_snapshot() {
+            let expected = include_str!("../snapshots/x86_64.txt");
+            let actual = snapshot();
+            // Trailing whitespace only: an editor that adds or drops the last newline is no change.
+            if actual.trim_end() == expected.trim_end() {
+                return;
+            }
+            // Only the first difference: a changed call shifts the ranges after it, so a line by
+            // line report would list every later line as well. The diff of the committed file,
+            // once it is updated, names the calls that changed instead.
+            let committed: Vec<&str> = expected.lines().collect();
+            let now: Vec<&str> = actual.lines().collect();
+            let index = (0..committed.len().max(now.len()))
+                .find(|&index| committed.get(index) != now.get(index))
+                .expect("the texts differ, so one of their lines differs");
+            let end = "<end of file>";
+            panic!(
+                "the compiled programs differ from crates/sandy-linux/snapshots/x86_64.txt, from \
+                 line {}:\n  committed: {}\n  now:       {}\n\nWrite the text below to that file \
+                 and review its diff. Every difference must be one you meant to make.\n{actual}",
+                index + 1,
+                committed.get(index).unwrap_or(&end),
+                now.get(index).unwrap_or(&end)
+            );
+        }
+    }
+
     #[test]
     fn foreign_architectures_are_killed_and_x32_fails() {
         const AUDIT_ARCH_I386: u32 = 3 | 0x4000_0000;

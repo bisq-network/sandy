@@ -94,7 +94,20 @@ Release archives for each platform are built by the `release` workflow (see
 | `x86_64-pc-windows-msvc` (static C runtime) | 734 KiB | 336 KiB |
 | `aarch64-pc-windows-msvc` (built, not tested) | 632 KiB | 308 KiB |
 
-The macOS binaries are not signed or notarized. A program that ships sandy inside a signed macOS
+**Verifying a download.** Every archive carries a GitHub build provenance attestation, which
+names the workflow, the commit and the run that built it:
+
+```sh
+gh attestation verify sandy-1.3.2-x86_64-unknown-linux-musl.tar.gz --repo <owner>/sandy
+```
+
+`SHA256SUMS` in the release lists the sum of every archive. It says that the archives belong
+together, not who made them: only a maintainer signature of that file would say that, and there
+is none yet.
+
+The macOS binaries are not signed or notarized, and `sandy.exe` has no Authenticode signature.
+macOS refuses a copy that a browser downloaded, because it is not notarized, and SmartScreen
+warns about a freshly downloaded `sandy.exe`. A program that ships sandy inside a signed macOS
 app signs it together with the app.
 
 **Where to install sandy.** Put the `sandy` binary, and your policy files, where the sandboxed
@@ -703,11 +716,42 @@ that is not in the list, and on a listed skip that did not happen. A check that 
 running is then a diff to review, not a silent pass. A runner without a list fails that
 comparison and prints the list to commit.
 
-CI runs the tests on Ubuntu 22.04 and 24.04 (x86_64) and 24.04 (arm64), macOS 15, and Windows
-Server 2022 and 2025, each with its expected skips, its ABI floor and the features it must
-offer. The `release` workflow builds archives for Linux, macOS and Windows on x86_64 and arm64
-when a tag `v<version>` is pushed, and creates a draft release with `SHA256SUMS`. The arm64
-Windows build is compiled but not tested.
+### The snapshot of the compiled seccomp filters
+
+`compiled_programs_match_the_snapshot` in `crates/sandy-linux/src/filter.rs` compares the
+compiled Linux BPF programs with `crates/sandy-linux/snapshots/x86_64.txt`. Each section of that
+file names one program, its instruction count, a checksum of its instructions, and the action it
+returns for every system call number. A change to a rule, to the reviewed system call table or to
+seccompiler's code generation makes the test fail.
+
+Update it deliberately. The failure prints the new text; write it to the file, then read the diff
+of the file and check that every line that changed is a line you meant to change. The snapshot is
+x86_64's, because arm64 has its own system call numbers and its file would have to be written on
+an arm64 Linux host.
+
+### The dependency audit
+
+`deny.toml` lists every crate that may appear in the tree. The `audit` workflow runs it, and so
+does:
+
+```sh
+cargo install --locked cargo-deny@0.20.2
+cargo deny --locked check all
+```
+
+A crate that is not in the list, an advisory, a yanked version, an unexpected license or a source
+other than crates.io fails the check. [docs/DESIGN.md](docs/DESIGN.md) says why `seccompiler`
+stays although its standalone repository is archived.
+
+### What CI runs
+
+The tests run on Ubuntu 22.04 and 24.04 (x86_64) and 24.04 (arm64), macOS 15, and Windows Server
+2022 and 2025, each with its expected skips, its ABI floor and the features it must offer. The
+`audit` workflow runs `cargo deny`, weekly as well, because an advisory can appear without a
+push. The `release` workflow builds archives for Linux, macOS and Windows on x86_64 and arm64
+when a tag `v<version>` is pushed, attests their build provenance, verifies the attestations, and
+creates a draft release with `SHA256SUMS`. It also builds one target twice from two directories
+and compares the binaries. The arm64 Windows build is compiled but not tested.
 
 ### Code layout
 
