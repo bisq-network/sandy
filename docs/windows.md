@@ -617,15 +617,31 @@ pipe grants nothing to AppContainers [CreateNamedPipeW] [Implementing an AppCont
   behaves the same on Windows; `contained` states the guarantee in the policy, so that the same
   policy is refused on platforms that cannot give it. The policy rules for `contained`
   (`unix_sockets = "none"`, `signals = "isolated"`) apply on Windows too.
+- **The status record.** sandy is always the parent on Windows, so the caller's process handle
+  names sandy and not the program, and exit code 125 means both "sandy refused" and "the
+  program exited with 125". `--status-fd` reports what the exit code cannot, without changing
+  any exit code: sandy writes `pid N` once the program runs, then `exited N`, or `failed` when
+  sandy itself failed or refused. The number is an inheritable handle the caller passes to
+  sandy, which clears its inherit flag at once; the program's own
+  `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` names only its three standard handles, so the handle
+  never reaches the program or a relay. A program that sandy ended because the parent ended is
+  reported as `exited 1`, which is the exit code the job gets.
 - **Ending with the parent.** With `process.end_with_parent = true`, sandy finds its parent's
   process ID in a process snapshot (`CreateToolhelp32Snapshot`), opens the process for waiting,
   and checks that it was created before sandy and still runs. Windows records only the parent's
   process ID, which another process can have once the parent has ended, and a process created
   after sandy cannot be its parent. An equal creation time counts as older; Windows 11 records
   creation times in 100 ns units (measured: 40 processes started in a row had 40 distinct
-  times). A system clock set back between the start of the parent and the start of sandy makes
-  sandy refuse a running parent. With `--parent-pid`, the recorded
-  parent must also be the named process. sandy waits for the program and the parent together;
+  times). This is an ordering test on the wall clock, so a system clock set back between the
+  start of the parent and the start of sandy makes sandy refuse a running parent, and an early
+  death of the parent, a clock set back and a reused process ID together could let an unrelated
+  process pass. With `--parent-pid`, the recorded parent must also be the named process.
+  `--parent-start` adds the caller's own creation time (`GetProcessTimes`, read after
+  `OpenProcess`), and sandy then requires that exact value instead of the ordering test: no
+  clock change alters a recorded creation time, and a process that got the ID later has another
+  one. The named process then need not be the one Windows recorded as sandy's parent, so a
+  wrapper such as `cmd /c` or `powershell` between the caller and sandy is allowed.
+  sandy waits for the program and the parent together;
   when the parent ends, sandy ends the program's job (exit code 1) and finishes as after any end
   of the program. If ending the job fails, sandy reports the error, and closing the job ends the
   program. If the parent has already ended, sandy refuses to start the program; any other

@@ -531,6 +531,176 @@ pub fn appcontainer_children_blocked() -> bool {
     blocked
 }
 
+/// When this process started, in the form `--parent-start` takes on this platform: clock ticks
+/// since boot from field 22 of `/proc/self/stat`. This is the recipe a caller follows (see
+/// docs/linux.md).
+#[cfg(target_os = "linux")]
+pub fn start_token() -> u64 {
+    let stat = fs::read_to_string("/proc/self/stat").unwrap();
+    let after_name = &stat[stat.rfind(')').unwrap() + 1..];
+    // Field 3 is the first after the name, so field 22 is the twentieth.
+    after_name
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// Microseconds since the epoch, from `PROC_PIDTBSDINFO` (see docs/macos.md).
+#[cfg(target_os = "macos")]
+pub fn start_token() -> u64 {
+    use std::mem::{MaybeUninit, size_of};
+
+    let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the buffer has exactly the size passed.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            std::process::id() as libc::pid_t,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    assert_eq!(written, size, "cannot read the start time of this process");
+    // SAFETY: proc_pidinfo filled the whole structure.
+    let info = unsafe { info.assume_init() };
+    info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec
+}
+
+/// The creation time of this process in 100 ns units (see docs/windows.md).
+#[cfg(windows)]
+pub fn start_token() -> u64 {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    let mut times = [FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    }; 4];
+    let [creation, exit, kernel, user] = &mut times;
+    // SAFETY: the pseudo handle is valid and every pointer is writable.
+    let ok = unsafe { GetProcessTimes(GetCurrentProcess(), creation, exit, kernel, user) };
+    assert_ne!(ok, 0, "cannot read the creation time of this process");
+    u64::from(creation.dwHighDateTime) << 32 | u64::from(creation.dwLowDateTime)
+}
+
+/// Runs sandy with `args` plus a `--status-fd` channel, and returns its output and the record
+/// it wrote there (see `sandy_core::StatusReport`). `args` must start with `run`; the option is
+/// inserted after it.
+#[cfg(unix)]
+pub fn sandy_with_status(args: &[String]) -> (Output, String) {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::os::unix::process::CommandExt;
+
+    /// The descriptor sandy gets. Free in a test process, which has 0, 1 and 2 plus the pipes
+    /// of the harness, and the child gets nothing else.
+    const CHANNEL: RawFd = 3;
+
+    let mut ends = [0; 2];
+    // SAFETY: pipe writes two new descriptors into `ends`. macOS has no pipe2, so the flag
+    // comes after; the tests fork only through Command, which this thread drives.
+    let made = unsafe { libc::pipe(ends.as_mut_ptr()) };
+    assert_eq!(made, 0, "cannot create the status pipe");
+    for end in ends {
+        // Close-on-exec, so a child that another test thread starts in the meantime does not
+        // hold the write end open.
+        // SAFETY: F_SETFD only changes the flags of an open descriptor.
+        let marked = unsafe { libc::fcntl(end, libc::F_SETFD, libc::FD_CLOEXEC) };
+        assert_eq!(marked, 0, "cannot mark the status pipe close-on-exec");
+    }
+    // SAFETY: both descriptors are new and nothing else owns them.
+    let (mut reader, writer) = unsafe {
+        (
+            fs::File::from_raw_fd(ends[0]),
+            OwnedFd::from_raw_fd(ends[1]),
+        )
+    };
+    let raw = writer.as_raw_fd();
+    let mut command = Command::new(sandy_path());
+    command
+        .args(with_status_option(args, CHANNEL.to_string()))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: dup2 is async-signal-safe and the closure calls nothing else.
+    unsafe {
+        command.pre_exec(move || match libc::dup2(raw, CHANNEL) {
+            CHANNEL => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        });
+    }
+    let child = command.spawn().unwrap();
+    // Only sandy holds the write end now, so the read below ends when sandy exits.
+    drop(writer);
+    let output = child.wait_with_output().unwrap();
+    let mut record = String::new();
+    reader.read_to_string(&mut record).unwrap();
+    (output, record)
+}
+
+#[cfg(windows)]
+pub fn sandy_with_status(args: &[String]) -> (Output, String) {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::TRUE;
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
+
+    let mut read = std::ptr::null_mut();
+    let mut write = std::ptr::null_mut();
+    // The write handle must be inheritable for sandy to get it; sandy clears the flag at once.
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: TRUE,
+    };
+    // SAFETY: both out pointers are writable and the attributes are filled in.
+    let ok = unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) };
+    assert_ne!(ok, 0, "cannot create the status pipe");
+    // SAFETY: both handles are new and nothing else owns them.
+    let (reader, writer) = unsafe {
+        (
+            OwnedHandle::from_raw_handle(read),
+            OwnedHandle::from_raw_handle(write),
+        )
+    };
+    let channel = (writer.as_raw_handle() as usize).to_string();
+    let output = Command::new(sandy_path())
+        .args(with_status_option(args, channel))
+        .output()
+        .unwrap();
+    drop(writer);
+    // Another test thread may have started a process that holds the write end open, so the
+    // record is read by what is in the pipe and not until its end.
+    let mut available = 0u32;
+    // SAFETY: reader is a valid pipe handle; only `available` is written.
+    let ok = unsafe {
+        PeekNamedPipe(
+            reader.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(ok, 0, "cannot read the status record");
+    let mut record = vec![0u8; available as usize];
+    if available > 0 {
+        std::io::Read::read_exact(&mut fs::File::from(reader), &mut record).unwrap();
+    }
+    (output, String::from_utf8_lossy(&record).into_owned())
+}
+
+/// `args` with `--status-fd CHANNEL` after the command word, where sandy takes options.
+fn with_status_option(args: &[String], channel: String) -> Vec<String> {
+    let mut with_option = args.to_vec();
+    with_option.splice(1..1, ["--status-fd".to_string(), channel]);
+    with_option
+}
+
 /// How long a process may take to end after sandy has ended it.
 pub const END_TIMEOUT: Duration = Duration::from_secs(10);
 

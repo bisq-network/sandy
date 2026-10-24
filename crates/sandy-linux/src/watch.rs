@@ -4,7 +4,9 @@
 //! 1. sandy reads its parent's process ID as its first step (or the caller names it with
 //!    `--parent-pid` and sandy checks it then). Here it opens a pidfd for that process and checks
 //!    that it is still sandy's parent; otherwise the parent has already ended, and sandy refuses
-//!    to start the program. It also opens a pidfd for its own process ID, which the program keeps
+//!    to start the program. With `--parent-start` the caller names the start time of its own
+//!    process instead, and sandy checks that (see `check_start`), so the named process need not
+//!    be sandy's parent. It also opens a pidfd for its own process ID, which the program keeps
 //!    after execve. With `children = "contained"` the ID stays the supervising sandy's, which
 //!    forwards the signals and ends the program's process group.
 //! 2. sandy starts the watcher as a helper process (see `helper`), so it is not a child of the
@@ -24,14 +26,16 @@
 //! `/proc` cannot raise its `oom_score_adj` and have the kernel end it under memory pressure.
 //!
 //! A parent that ends before sandy has read its process ID cannot be detected without
-//! `--parent-pid`: sandy then already has another parent, the process it was re-parented to.
+//! `--parent-pid` and `--parent-start`: sandy then already has another parent, the process it
+//! was re-parented to, and nothing on the host records which process started sandy.
 
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::ptr;
 use std::time::{Duration, Instant};
 
 use landlock::{ABI, Scope};
-use sandy_core::SandboxError;
+use sandy_core::{ParentProcess, SandboxError};
 
 use crate::filter;
 use crate::helper::{self, Ready};
@@ -41,19 +45,89 @@ pub const GRACE: Duration = Duration::from_secs(5);
 
 /// Starts the watcher for `parent`, the process that started sandy, and returns once the watcher
 /// is confined and watching.
-pub fn start(parent_id: libc::pid_t, abi: ABI) -> Result<(), SandboxError> {
-    let parent = helper::pidfd_open(parent_id, "sandy's parent")?;
-    // SAFETY: as above.
-    if unsafe { libc::getppid() } != parent_id {
-        return Err(SandboxError::new(
-            "the process that started sandy has already ended",
-        ));
+pub fn start(parent: ParentProcess, abi: ABI) -> Result<(), SandboxError> {
+    let id = parent.id as libc::pid_t;
+    let parent_fd = open_parent(id)?;
+    match parent.start {
+        Some(token) => check_start(id, token, &parent_fd)?,
+        // SAFETY: getppid has no preconditions.
+        None if unsafe { libc::getppid() } != id => return Err(already_ended()),
+        None => {}
     }
     // SAFETY: getpid has no preconditions.
     let program = helper::pidfd_open(unsafe { libc::getpid() }, "the program")?;
     helper::start("the watcher", move |ready| {
-        watcher_main(&parent, &program, ready, abi)
+        watcher_main(&parent_fd, &program, ready, abi)
     })
+}
+
+fn already_ended() -> SandboxError {
+    SandboxError::new("the process that started sandy has already ended")
+}
+
+/// A pidfd for the process that started sandy. `ESRCH` means that no process has that ID any
+/// more, which `helper::pidfd_open` would report as a plain failure.
+fn open_parent(id: libc::pid_t) -> Result<OwnedFd, SandboxError> {
+    // SAFETY: pidfd_open takes a process ID and flags and returns a new close-on-exec
+    // descriptor.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, id, 0u32) };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        return Err(match error.raw_os_error() {
+            Some(libc::ESRCH) => already_ended(),
+            _ => SandboxError::io("cannot open a pidfd for sandy's parent", error),
+        });
+    }
+    // SAFETY: the descriptor was just created and nothing else owns it.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+
+/// Checks that the process `id` started at `token`, so that the caller is told apart from a
+/// process that got its ID afterwards. `pidfd` must be a pidfd of `id`.
+///
+/// The start time is read by process ID, which could name another process by the time it is
+/// read. A pidfd becomes readable as soon as its process ends, so a pidfd that is not readable
+/// after the read proves that the process held its ID throughout. That also covers a parent
+/// that ended before sandy ran: either its ID is gone (`pidfd_open` fails), or the pidfd is
+/// readable, or another process holds the ID now and its start time differs.
+fn check_start(id: libc::pid_t, token: u64, pidfd: &OwnedFd) -> Result<(), SandboxError> {
+    let Some(started) = start_time(id)? else {
+        return Err(already_ended());
+    };
+    let mut poll = [readable(pidfd.as_raw_fd())];
+    // SAFETY: polls one open descriptor and returns at once.
+    if unsafe { libc::poll(poll.as_mut_ptr(), 1, 0) } != 0 {
+        return Err(already_ended());
+    }
+    if started != token {
+        return Err(SandboxError::new(format!(
+            "process {id} started at {started}, not at {token} (--parent-start); the process \
+             that started sandy may have ended already"
+        )));
+    }
+    Ok(())
+}
+
+/// When process `id` started, in clock ticks since boot: field 22 of `/proc/ID/stat`. It is
+/// measured from the boot of the host, so a change of the system clock does not alter it.
+/// `None` when the process is gone.
+fn start_time(id: libc::pid_t) -> Result<Option<u64>, SandboxError> {
+    let path = format!("/proc/{id}/stat");
+    let stat = match std::fs::read_to_string(&path) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(SandboxError::io(format!("cannot read {path}"), error)),
+    };
+    parse_start_time(&stat)
+        .map(Some)
+        .ok_or_else(|| SandboxError::new(format!("{path} has no start time")))
+}
+
+/// Field 22 of a `/proc/PID/stat` line. The name in field 2 can hold spaces and parentheses, so
+/// the fields are counted from the last closing parenthesis; field 3 is the first after it.
+fn parse_start_time(stat: &str) -> Option<u64> {
+    let after_name = stat.get(stat.rfind(')')? + 1..)?;
+    after_name.split_whitespace().nth(19)?.parse().ok()
 }
 
 fn watcher_main(parent: &OwnedFd, program: &OwnedFd, ready: Ready, abi: ABI) {
@@ -186,6 +260,27 @@ mod tests {
                 0u32,
             )
         }
+    }
+
+    #[test]
+    fn the_start_time_is_field_22_whatever_the_name_holds() {
+        let stat = "7 (a b) c) S 1 7 7 0 -1 4194560 300 0 0 0 1 2 0 0 20 0 1 0 918273 500 0";
+        assert_eq!(parse_start_time(stat), Some(918_273));
+        assert_eq!(parse_start_time("7 (prog) S 1"), None);
+        assert_eq!(parse_start_time("nothing"), None);
+    }
+
+    /// The same value `/proc/self/stat` shows, and it does not change while the process runs.
+    #[test]
+    fn this_process_has_a_start_time() {
+        // SAFETY: getpid has no preconditions.
+        let own = unsafe { libc::getpid() };
+        let first = start_time(own).unwrap().expect("this process runs");
+        assert_eq!(start_time(own).unwrap(), Some(first));
+        let pidfd = helper::pidfd_open(own, "this process").unwrap();
+        check_start(own, first, &pidfd).unwrap();
+        let error = check_start(own, first + 1, &pidfd).unwrap_err().to_string();
+        assert!(error.contains("--parent-start"), "{error}");
     }
 
     /// The child process applies the watcher's confinement to itself. It never prints and leaves

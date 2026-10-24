@@ -12,7 +12,7 @@ mod resolve;
 pub mod streams;
 pub mod verify;
 
-pub use backend::{Backend, SandboxError, TargetCommand};
+pub use backend::{Backend, ParentProcess, SandboxError, StatusReport, TargetCommand};
 pub use env::target_environment;
 pub use plan::{EnforcementPlan, PlanItem, Requirement, Status};
 pub use policy::{

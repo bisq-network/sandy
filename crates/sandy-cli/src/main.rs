@@ -2,6 +2,7 @@
 //! platform backend. All enforcement lives in the backends.
 
 mod args;
+mod status;
 mod stdio;
 
 use std::process::ExitCode;
@@ -9,7 +10,8 @@ use std::process::ExitCode;
 use args::{Command, Invocation, Mode};
 use sandy_core::streams::StandardStream;
 use sandy_core::{
-    Backend, EnforcementPlan, Policy, ResolvedPolicy, TargetCommand, target_environment,
+    Backend, EnforcementPlan, ParentProcess, Policy, ResolvedPolicy, StatusReport, TargetCommand,
+    target_environment,
 };
 
 const EXIT_FAILURE: u8 = 125;
@@ -168,24 +170,54 @@ fn parent_process_id() -> Option<u32> {
 }
 
 /// The parent for `end_with_parent`: the one the caller named with `--parent-pid`, which must be
-/// the parent sandy saw at its start, or else that parent.
+/// the parent sandy saw at its start, or else that parent. With `--parent-start` the caller
+/// proves which process it means, so the named one need not be sandy's own parent; the backend
+/// checks the token against the process.
 fn parent_for(
     named: Option<u32>,
+    start: Option<u64>,
     at_start: Option<u32>,
     end_with_parent: bool,
-) -> Result<Option<u32>, String> {
+) -> Result<Option<ParentProcess>, String> {
+    match (named, start) {
+        (_, Some(_)) if named.is_none() => {
+            return Err("--parent-start needs --parent-pid".to_string());
+        }
+        (Some(_), _) if !end_with_parent => {
+            return Err("--parent-pid needs end_with_parent".to_string());
+        }
+        _ => {}
+    }
     match (named, at_start) {
-        (Some(_), _) if !end_with_parent => Err("--parent-pid needs end_with_parent".to_string()),
-        (Some(named), Some(actual)) if named != actual => Err(format!(
+        (Some(named), Some(actual)) if start.is_none() && named != actual => Err(format!(
             "the process that started sandy is {actual}, not {named} (--parent-pid); \
-             {named} may have ended already"
+             {named} may have ended already, or sandy was started through a wrapper; \
+             --parent-start says which process {named} is"
         )),
-        (Some(named), _) => Ok(Some(named)),
-        (None, at_start) => Ok(at_start),
+        (Some(id), _) => Ok(Some(ParentProcess { id, start })),
+        (None, at_start) => Ok(at_start.map(|id| ParentProcess { id, start: None })),
     }
 }
 
+/// Opens the status channel before anything else, so that every refusal of `run` is reported on
+/// it, and marks a failure on the way out.
 fn execute(invocation: Invocation, parent_at_start: Option<u32>) -> Result<ExitCode, String> {
+    let status = match invocation.mode {
+        Mode::Run => status::open(invocation.status_fd)?,
+        _ => StatusReport::none(),
+    };
+    let result = sandbox(invocation, parent_at_start, &status);
+    if result.is_err() {
+        status.failed();
+    }
+    result
+}
+
+fn sandbox(
+    invocation: Invocation,
+    parent_at_start: Option<u32>,
+    status: &StatusReport,
+) -> Result<ExitCode, String> {
     let mut policy = match &invocation.policy_file {
         Some(path) => {
             let text = std::fs::read_to_string(path)
@@ -202,6 +234,7 @@ fn execute(invocation: Invocation, parent_at_start: Option<u32>) -> Result<ExitC
     // Checked in every mode, so that check reports what run would refuse.
     let parent = parent_for(
         invocation.parent_pid,
+        invocation.parent_start,
         parent_at_start,
         resolved.end_with_parent,
     )?;
@@ -268,7 +301,7 @@ fn execute(invocation: Invocation, parent_at_start: Option<u32>) -> Result<ExitC
                 parent,
             };
             let code = backend
-                .run(&resolved, &command)
+                .run(&resolved, &command, status)
                 // Also after the program started: with children = "contained" on Linux and
                 // macOS, sandy supervises it and can fail while it runs.
                 .map_err(|error| format!("run failed: {error}"))?;
@@ -433,6 +466,7 @@ impl Backend for UnsupportedBackend {
         &self,
         _policy: &ResolvedPolicy,
         _command: &TargetCommand,
+        _status: &StatusReport,
     ) -> Result<i32, sandy_core::SandboxError> {
         Err(sandy_core::SandboxError::new(
             "this operating system is not supported",
@@ -444,15 +478,33 @@ impl Backend for UnsupportedBackend {
 mod tests {
     use super::*;
 
+    fn parent(id: u32, start: Option<u64>) -> Result<Option<ParentProcess>, String> {
+        Ok(Some(ParentProcess { id, start }))
+    }
+
     #[test]
     fn the_named_parent_must_be_the_parent_at_start() {
-        assert_eq!(parent_for(None, Some(7), true), Ok(Some(7)));
-        assert_eq!(parent_for(None, None, true), Ok(None));
-        assert_eq!(parent_for(Some(7), Some(7), true), Ok(Some(7)));
+        assert_eq!(parent_for(None, None, Some(7), true), parent(7, None));
+        assert_eq!(parent_for(None, None, None, true), Ok(None));
+        assert_eq!(parent_for(Some(7), None, Some(7), true), parent(7, None));
         // Windows reads no parent at start; the backend checks the named one.
-        assert_eq!(parent_for(Some(7), None, true), Ok(Some(7)));
-        let error = parent_for(Some(7), Some(1), true).unwrap_err();
+        assert_eq!(parent_for(Some(7), None, None, true), parent(7, None));
+        let error = parent_for(Some(7), None, Some(1), true).unwrap_err();
         assert!(error.contains("is 1, not 7"), "{error}");
-        assert!(parent_for(Some(7), Some(7), false).is_err());
+        assert!(parent_for(Some(7), None, Some(7), false).is_err());
+    }
+
+    #[test]
+    fn a_start_token_allows_a_parent_that_is_not_sandys_own() {
+        assert_eq!(
+            parent_for(Some(7), Some(99), Some(1), true),
+            parent(7, Some(99))
+        );
+        let error = parent_for(None, Some(99), Some(1), true).unwrap_err();
+        assert!(
+            error.contains("--parent-start needs --parent-pid"),
+            "{error}"
+        );
+        assert!(parent_for(Some(7), Some(99), Some(7), false).is_err());
     }
 }

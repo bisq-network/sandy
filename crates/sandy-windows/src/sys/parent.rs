@@ -4,7 +4,7 @@
 use std::mem::size_of;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
-use sandy_core::SandboxError;
+use sandy_core::{ParentProcess, SandboxError};
 use windows_sys::Win32::Foundation::{
     ERROR_INVALID_PARAMETER, FALSE, FILETIME, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
     WAIT_TIMEOUT,
@@ -19,19 +19,33 @@ use windows_sys::Win32::System::Threading::{
 
 use super::util::last_error;
 
-/// Opens the process that started sandy, for waiting. `named` is the process ID the caller gave
-/// with `--parent-pid`, which must be that process. Windows records only the parent's process ID,
-/// which another process can have once the parent has ended. A process created after sandy cannot
-/// be its parent, so the creation times tell them apart. An equal time counts as older; Windows 11
-/// records creation times in 100 ns units (40 processes started in a row had 40 distinct times).
-pub fn open_parent(named: Option<u32>) -> Result<OwnedHandle, SandboxError> {
+/// Opens the process that started sandy, for waiting. `named` is what the caller gave with
+/// `--parent-pid` and `--parent-start`. Windows records only the parent's process ID, which
+/// another process can have once the parent has ended.
+///
+/// Without a start token sandy compares creation times: a process created after sandy cannot be
+/// its parent. That is an ordering test on the wall clock, so a clock set back between the start
+/// of the parent and the start of sandy makes sandy refuse a running parent, and an early death,
+/// a clock set back and a reused process ID together could let an unrelated process pass. With
+/// `--parent-start`, the caller's own creation time, sandy requires that exact time instead,
+/// which no clock change can alter and which a reused process ID cannot have; the named process
+/// then need not be the one Windows recorded as sandy's parent, so a wrapper between the caller
+/// and sandy is allowed.
+pub fn open_parent(named: Option<ParentProcess>) -> Result<OwnedHandle, SandboxError> {
     let ended = || SandboxError::new("the process that started sandy has already ended");
-    let parent_id = parent_id()?;
-    if let Some(named) = named.filter(|&named| named != parent_id) {
-        return Err(SandboxError::new(format!(
-            "the process that started sandy is {parent_id}, not {named} (--parent-pid)"
-        )));
-    }
+    let recorded = parent_id()?;
+    let token = named.and_then(|named| named.start);
+    let parent_id = match named {
+        Some(named) if token.is_none() && named.id != recorded => {
+            return Err(SandboxError::new(format!(
+                "the process that started sandy is {recorded}, not {} (--parent-pid); sandy may \
+                 have been started through a wrapper; --parent-start says which process {} is",
+                named.id, named.id
+            )));
+        }
+        Some(named) => named.id,
+        None => recorded,
+    };
     // SAFETY: OpenProcess takes access rights, an inheritance flag and a process ID.
     let raw = unsafe {
         OpenProcess(
@@ -54,10 +68,30 @@ pub fn open_parent(named: Option<u32>) -> Result<OwnedHandle, SandboxError> {
     let own = created(unsafe { GetCurrentProcess() })?;
     // SAFETY: parent is a valid process handle with SYNCHRONIZE access.
     let running = unsafe { WaitForSingleObject(parent.as_raw_handle(), 0) } == WAIT_TIMEOUT;
-    if created(parent.as_raw_handle())? > own || !running {
+    let parent_created = created(parent.as_raw_handle())?;
+    if !running {
         return Err(ended());
     }
+    if !is_the_caller(parent_created, own, token) {
+        return Err(match token {
+            Some(token) => SandboxError::new(format!(
+                "process {parent_id} was created at {parent_created}, not at {token} \
+                 (--parent-start); the process that started sandy may have ended already"
+            )),
+            None => ended(),
+        });
+    }
     Ok(parent)
+}
+
+/// Whether the opened process can be the one the caller means. `created` and `own` are creation
+/// times in 100 ns units; an equal time counts as older, because Windows 11 records them finely
+/// enough to tell processes apart (40 processes started in a row had 40 distinct times).
+fn is_the_caller(created: u64, own: u64, token: Option<u64>) -> bool {
+    match token {
+        Some(token) => created == token,
+        None => created <= own,
+    }
 }
 
 /// The process ID that Windows recorded as sandy's parent.
@@ -100,4 +134,21 @@ fn created(process: HANDLE) -> Result<u64, SandboxError> {
         return Err(last_error("cannot read the creation time of a process"));
     }
     Ok(u64::from(creation.dwHighDateTime) << 32 | u64::from(creation.dwLowDateTime))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_start_token_asks_for_the_exact_creation_time() {
+        // Without a token, every process created no later than sandy passes.
+        assert!(is_the_caller(10, 20, None));
+        assert!(is_the_caller(20, 20, None));
+        assert!(!is_the_caller(21, 20, None));
+        // With one, only that creation time does, whichever side of sandy's it is on.
+        assert!(is_the_caller(10, 20, Some(10)));
+        assert!(is_the_caller(21, 20, Some(21)));
+        assert!(!is_the_caller(10, 20, Some(11)));
+    }
 }

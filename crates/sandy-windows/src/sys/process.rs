@@ -14,7 +14,7 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use sandy_core::SandboxError;
+use sandy_core::{SandboxError, StatusReport};
 use windows_sys::Win32::Foundation::{
     DUPLICATE_SAME_ACCESS, DuplicateHandle, FALSE, GENERIC_READ, GENERIC_WRITE, HANDLE,
     HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, STATUS_CONTROL_C_EXIT, SetHandleInformation, TRUE,
@@ -44,11 +44,12 @@ use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
     DETACHED_PROCESS, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    GetCurrentProcess, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
+    GetCurrentProcess, GetExitCodeProcess, GetProcessId, INFINITE,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, ResumeThread,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForMultipleObjects, WaitForSingleObject,
 };
 
 use super::util::{Sid, last_error, wide_nul};
@@ -126,7 +127,7 @@ pub struct Process<'a> {
 /// The job that `on_console_control` terminates. Only a raw handle fits into a static.
 static CONSOLE_JOB: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
-pub fn run(launch: Launch<'_>) -> Result<Ended, SandboxError> {
+pub fn run(launch: Launch<'_>, status: &StatusReport) -> Result<Ended, SandboxError> {
     // With an active-process limit of 1 the job admits the program and refuses every process
     // that would join it later; children of a job process join the job, and the job allows no
     // breakaway. The program's console host is not counted (measured on Windows 11).
@@ -140,7 +141,7 @@ pub fn run(launch: Launch<'_>) -> Result<Ended, SandboxError> {
         return Err(last_error("cannot install the console control handler"));
     }
 
-    let result = start_and_wait(launch, &job, stdio);
+    let result = start_and_wait(launch, &job, stdio, status);
     CONSOLE_JOB.store(ptr::null_mut(), Ordering::SeqCst);
     result
 }
@@ -149,6 +150,7 @@ fn start_and_wait(
     launch: Launch<'_>,
     job: &OwnedHandle,
     stdio: StandardHandles,
+    status: &StatusReport,
 ) -> Result<Ended, SandboxError> {
     let Launch {
         appcontainer,
@@ -180,6 +182,9 @@ fn start_and_wait(
         &[],
         Role::Program,
     )?;
+    // sandy stays the parent on Windows, so its own process ID is not the program's.
+    // SAFETY: process is a valid process handle with the rights CreateProcessW gives.
+    status.started(unsafe { GetProcessId(process.as_raw_handle()) });
     let StandardHandles { child, relays } = stdio;
     // The target owns its copies now. sandy's copies of the pipe ends would keep the relays
     // from seeing the end of the output.
@@ -192,6 +197,7 @@ fn start_and_wait(
     if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) } == 0 {
         return Err(last_error("cannot read the exit code of the program"));
     }
+    status.exited(code as i32);
     // Processes the program left behind would die when sandy exits and the job closes. Ending
     // them now also closes their copies of the output pipes, so the console relays finish, and
     // nothing in the sandbox can make a new connection while the relays drain.

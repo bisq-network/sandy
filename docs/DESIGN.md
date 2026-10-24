@@ -152,12 +152,17 @@ Rules:
    Windows ends the program's job at once. With `children = "allowed"` on Linux and macOS,
    processes the program started can outlive it, as with any end of the program; use
    `children = "contained"` to end them too. The option needs `signals = "isolated"`, so that the program cannot kill the process
-   that ends it. "Parent" means sandy's direct parent: a wrapper between the application and
-   sandy (`sh -c 'a; sandy ...'`, `timeout`, `systemd-run`) is the parent instead. sandy reads
-   the parent's process ID as its first step; a parent that ends before that cannot be
-   detected. The caller closes this gap with `--parent-pid` and its own process ID: sandy then
-   refuses when its parent is another process. sandy also refuses when it sees that its parent
-   has already ended.
+   that ends it. Without `--parent-start`, "parent" means sandy's direct parent: a wrapper
+   between the application and sandy (`sh -c 'a; sandy ...'`, `timeout`, `systemd-run`) is the
+   parent instead. sandy reads the parent's process ID as its first step; a parent that ends
+   before that cannot be detected. The caller closes the first gap with `--parent-pid` and its
+   own process ID: sandy then refuses when its parent is another process. `--parent-start`
+   closes both: the caller adds when its own process started, which no other process can have
+   and which nothing but a new start changes, so sandy checks the identity of the named process
+   instead of asking whether it is its own parent. The form is platform-specific (field 22 of
+   `/proc/PID/stat`, the recorded start time, the creation time). sandy also refuses when it
+   sees that the process it would watch has already ended, and on macOS when that process is
+   launchd, which has no end to wait for.
 12. No writable policy path may reach a location of this user whose content other programs read
    or execute later: the home directory (which it may not contain), the shell startup files,
    autostart entries and user services, `~/.ssh`, and per platform `~/Library/LaunchAgents`, the
@@ -353,7 +358,8 @@ a moment later.
   directly.
 - Linux and macOS with `process.children = "contained"`: sandy forks the program and stays its
   parent. sandy forwards every signal it receives to the program, except `SIGCHLD`, `SIGCONT`,
-  `SIGTTIN`, `SIGTTOU` and the fault signals, and exits with the program's exit status, or 128
+  `SIGTTIN`, `SIGTTOU` and the fault signals, which it cannot wait for, and `SIGKILL` and
+  `SIGSTOP`, which cannot be caught at all. It exits with the program's exit status, or 128
   plus the signal number when a signal ended the program. With a terminal, sandy follows job
   control: the program's process group gets the terminal when the program uses it, and the rest
   of sandy's job gets it back when it uses it; any other stop of the program stops sandy, and
@@ -414,7 +420,11 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   ending and the memory and clock calls of the Rust runtime; it has no Landlock signal scope,
   because it must signal the program. Its filter allows the signal only through the program's
   descriptor. It is also undumpable, so a program with a write grant on `/proc` cannot make the
-  out-of-memory killer end it first; the supervising sandy and its guard do the same.
+  out-of-memory killer end it first; the supervising sandy and its guard do the same. With
+  `--parent-start` sandy checks field 22 of `/proc/PID/stat` of the named process after
+  `pidfd_open` instead of asking whether it is its own parent; a caller can also let the kernel
+  do the whole job with `clone3(CLONE_PIDFD_AUTOKILL | CLONE_AUTOREAP | CLONE_NNP)` on Linux 7
+  (see docs/linux.md).
 - Exposed and forwarded ports: one relay forked twice before sandy confines itself, so it is not
   a child of the program. It watches the program with a pidfd and ends at most one second after
   it (rule 5 of "Forwarded ports"), or two seconds when the program stopped it, which a timer
@@ -476,7 +486,9 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   sandy checks after the watcher is ready that its parent is unchanged, so the registration names
   the real parent. When the parent ends, the watcher sends SIGTERM and SIGCONT and, 5 seconds
   later, SIGKILL. macOS has no pidfd: the watcher signals by process ID and checks for the
-  program's end right before each signal.
+  program's end right before each signal. With `--parent-start` sandy checks the named
+  process's recorded start time instead of `getppid`, before and after the registration. It
+  refuses process 1: macOS has no child subreaper, so launchd is the parent of every orphan.
 - `sandy check` compiles the profile without applying it, so it reports operations or filters that
   this macOS does not know.
 - Refused: sandy running through Rosetta, and on Apple silicon a program without arm64 code, or
@@ -547,8 +559,9 @@ Details, limitations and sources: `docs/windows.md`.
   sandy dies. `allowed` behaves the same on Windows.
 - `process.end_with_parent`: sandy finds its parent in a process snapshot, opens it and checks
   that it was created before sandy (Windows records only the parent's process ID, which another
-  process can have once the parent has ended). sandy waits for the program and the parent, and
-  ends the program's job when the parent ends.
+  process can have once the parent has ended). With `--parent-start` it requires that exact
+  creation time instead, which a clock change cannot alter and a reused process ID cannot have.
+  sandy waits for the program and the parent, and ends the program's job when the parent ends.
 - Relay lifetime (rule 5): when the program exits, sandy ends its job at once and closes the
   relays' standard input; the relays accept what already waits in the backlog, close their
   listeners, drain for at most one second and end; sandy ends the relay job one second after
@@ -565,6 +578,13 @@ Details, limitations and sources: `docs/windows.md`.
 | 128 + signal number | Linux and macOS with `process.children = "contained"`: a signal ended the program |
 | 125 | sandy failed or refused (invalid policy, unenforceable policy, setup failure) |
 | 0 / 1 | `sandy check`: enforceable / not enforceable |
+
+The caller sees sandy's process ID where sandy stays the parent, and 125 means both "sandy
+refused" and "the program exited with 125". These are additions, not changes: `--status-fd`
+carries the program's process ID and how it ended on a descriptor of the caller's choosing,
+which sandy makes close-on-exec and keeps out of what the program inherits. The lines are
+`pid N`, then `exited N` or `signaled N`, or `failed` when sandy itself failed. See README.md,
+"The status record". No exit status changes meaning, because callers parse the documented ones.
 
 ## Testing
 

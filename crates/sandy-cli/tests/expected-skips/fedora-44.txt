@@ -1,2 +1,5 @@
 # Expected skips, measured on the development host: Fedora 44, kernel 7.2, Landlock ABI 10,
 # Yama ptrace_scope 0, no GUI session.
+# Linux re-parents a process whose parent ended to the nearest subreaper, which sandy cannot
+# tell from a caller that is still there. Only --parent-start closes this (docs/linux.md).
+parent a_parent_that_ended_before_sandy_ran_is_refused orphan-detection-without-a-token

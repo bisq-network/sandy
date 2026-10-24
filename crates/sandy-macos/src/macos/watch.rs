@@ -4,6 +4,10 @@
 //! 1. sandy reads its parent's process ID as its first step (or the caller names it with
 //!    `--parent-pid` and sandy checks it then). Here it checks that this process is still its
 //!    parent; otherwise the parent has already ended, and sandy refuses to start the program.
+//!    With `--parent-start` the caller names when its own process started, and sandy checks
+//!    that instead, so the named process need not be sandy's parent. Process 1 is refused in
+//!    both cases: macOS has no subreaper, so launchd is the parent of every process whose
+//!    parent ended, and waiting for launchd to end says nothing.
 //! 2. sandy starts the watcher as a helper process (see `helper`), so it is not a child of the
 //!    program. The watcher registers `NOTE_EXIT` in a kqueue for the parent and for sandy's
 //!    process ID, which the program keeps after the exec. With `children = "contained"` the ID
@@ -27,10 +31,11 @@
 //! reaches it either.
 
 use std::io;
+use std::mem::{MaybeUninit, size_of};
 use std::os::fd::OwnedFd;
 use std::time::{Duration, Instant};
 
-use sandy_core::SandboxError;
+use sandy_core::{ParentProcess, SandboxError};
 
 use super::helper::{self, NO_EVENT, new_queue, register};
 use super::seatbelt::Seatbelt;
@@ -41,31 +46,88 @@ pub const GRACE: Duration = Duration::from_secs(5);
 
 /// Starts the watcher for `parent`, the process that started sandy, and returns once the watcher
 /// is confined and watching.
-pub fn start(parent: libc::pid_t, seatbelt: &Seatbelt) -> Result<(), SandboxError> {
+pub fn start(parent: ParentProcess, seatbelt: &Seatbelt) -> Result<(), SandboxError> {
+    let id = parent.id as libc::pid_t;
+    if id <= 1 {
+        return Err(SandboxError::new(format!(
+            "sandy will not watch process {id}: macOS has no child subreaper, so launchd \
+             (process 1) is the parent of every process whose parent has ended. Either the \
+             process that started sandy has already ended, or launchd started sandy itself; \
+             launchd has no end to wait for"
+        )));
+    }
     ensure_parent(parent)?;
     // SAFETY: getpid has no requirements.
     let program = unsafe { libc::getpid() };
     let profile = watcher_profile();
     let seatbelt = *seatbelt;
     helper::start("the watcher", &[], move |ready| {
-        let queue = match watch_and_confine(parent, program, &profile, &seatbelt) {
+        let queue = match watch_and_confine(id, program, &profile, &seatbelt) {
             Ok(queue) => queue,
             Err(error) => ready.fail(&error.to_string()),
         };
         ready.report();
-        watch(&queue, parent, program);
+        watch(&queue, id, program);
     })?;
+    // The watcher registered `NOTE_EXIT` while the parent was still the same process, so the
+    // registration names that process and not a later one with the same ID.
     ensure_parent(parent)
 }
 
-fn ensure_parent(parent: libc::pid_t) -> Result<(), SandboxError> {
-    // SAFETY: getppid has no requirements.
-    if unsafe { libc::getppid() } != parent {
-        return Err(SandboxError::new(
+/// Checks that the named process is still the one the caller means: with `--parent-start` that
+/// it started when the caller said, and otherwise that it is still sandy's own parent.
+fn ensure_parent(parent: ParentProcess) -> Result<(), SandboxError> {
+    let ended = || {
+        Err(SandboxError::new(
             "the process that started sandy has already ended",
-        ));
+        ))
+    };
+    let id = parent.id as libc::pid_t;
+    let Some(token) = parent.start else {
+        // SAFETY: getppid has no requirements.
+        if unsafe { libc::getppid() } != id {
+            return ended();
+        }
+        return Ok(());
+    };
+    let Some(started) = start_time(id) else {
+        return ended();
+    };
+    if started != token {
+        return Err(SandboxError::new(format!(
+            "process {id} started at {started}, not at {token} (--parent-start); the process \
+             that started sandy may have ended already"
+        )));
     }
     Ok(())
+}
+
+/// When process `id` started, in microseconds since the epoch, from `PROC_PIDTBSDINFO`. macOS
+/// records this once at the start of the process, so a later change of the system clock does
+/// not alter it, and two processes with the same ID would have to start in the same microsecond
+/// to share it. `None` when the process is gone or its information cannot be read.
+///
+/// `p_uniqueid` of `PROC_PIDUNIQIDENTIFIERINFO` would be a stronger token, but it is not in the
+/// public SDK headers; sandy uses one private interface (Seatbelt) and does not need a second.
+fn start_time(id: libc::pid_t) -> Option<u64> {
+    let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the buffer has exactly the size passed.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            id,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    // SAFETY: proc_pidinfo filled the whole structure.
+    let info = unsafe { info.assume_init() };
+    Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
 }
 
 /// Registers the end of the parent and of the program, then applies the watcher's profile, which

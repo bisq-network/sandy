@@ -98,6 +98,12 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
         }
         "spawn" => spawn(target),
         "start" => start(target),
+        "start-wrapped" => start_wrapped(target),
+        // The probe's own process ID; the target is ignored.
+        "pid" => Ok(std::process::id().to_string()),
+        // When the probe's own process started, in the form `--parent-start` takes; the target
+        // is ignored.
+        "start-token" => start_token().map(|token| token.to_string()),
         // argv[0] as the program received it; the target is ignored.
         "arg0" => Ok(std::env::args_os()
             .next()
@@ -322,10 +328,123 @@ fn spawn(target: &str) -> io::Result<String> {
 /// Starts a program with arguments (separated by U+001F) without waiting for it and reports its
 /// process ID. The program gets no standard streams, so it does not keep the caller's output open.
 fn start(target: &str) -> io::Result<String> {
+    let target = expand(target)?;
     let mut parts = target.split(ARGUMENT_SEPARATOR);
     let program = parts.next().unwrap_or_default();
     let child = Command::new(program)
         .args(parts)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(child.id().to_string())
+}
+
+/// What `expand` replaces with the probe's own process ID and start, so a test can give sandy
+/// the `--parent-pid` and `--parent-start` of the process that starts it.
+const PID_PLACEHOLDER: &str = "%pid%";
+const START_PLACEHOLDER: &str = "%start%";
+
+fn expand(target: &str) -> io::Result<String> {
+    let mut expanded = target.replace(PID_PLACEHOLDER, &std::process::id().to_string());
+    if expanded.contains(START_PLACEHOLDER) {
+        expanded = expanded.replace(START_PLACEHOLDER, &start_token()?.to_string());
+    }
+    Ok(expanded)
+}
+
+/// When this process started, in the form `--parent-start` takes on this platform: clock ticks
+/// since boot from field 22 of `/proc/self/stat`.
+#[cfg(target_os = "linux")]
+fn start_token() -> io::Result<u64> {
+    let stat = fs::read_to_string("/proc/self/stat")?;
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "no start time");
+    let after_name = &stat[stat.rfind(')').ok_or_else(invalid)? + 1..];
+    // Field 3 is the first after the name, so field 22 is the twentieth.
+    after_name
+        .split_whitespace()
+        .nth(19)
+        .and_then(|field| field.parse().ok())
+        .ok_or_else(invalid)
+}
+
+/// Microseconds since the epoch, from `PROC_PIDTBSDINFO`.
+#[cfg(target_os = "macos")]
+fn start_token() -> io::Result<u64> {
+    use std::mem::{MaybeUninit, size_of};
+
+    let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the buffer has exactly the size passed.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            std::process::id() as libc::pid_t,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: proc_pidinfo filled the whole structure.
+    let info = unsafe { info.assume_init() };
+    Ok(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+}
+
+/// The creation time of this process in 100 ns units, from `GetProcessTimes`.
+#[cfg(windows)]
+fn start_token() -> io::Result<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    let mut times = [FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    }; 4];
+    let [creation, exit, kernel, user] = &mut times;
+    // SAFETY: the pseudo handle is valid and every pointer is writable.
+    if unsafe { GetProcessTimes(GetCurrentProcess(), creation, exit, kernel, user) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(u64::from(creation.dwHighDateTime) << 32 | u64::from(creation.dwLowDateTime))
+}
+
+/// Starts a program (arguments separated by U+001F) through a shell, so the program's direct
+/// parent is the shell and not the probe. Reports the shell's process ID; the shell ends when
+/// the program does, and passes its status on. The `exit` keeps the shell from replacing
+/// itself with the program, which most shells do for a script of one command.
+#[cfg(unix)]
+fn start_wrapped(target: &str) -> io::Result<String> {
+    let script: Vec<String> = expand(target)?
+        .split(ARGUMENT_SEPARATOR)
+        .map(shell_word)
+        .collect();
+    let child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("{}\nexit $?", script.join(" ")))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(child.id().to_string())
+}
+
+/// A shell word that holds `value` literally.
+#[cfg(unix)]
+fn shell_word(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// As above through `cmd /c`, which waits for the program instead of replacing itself with it,
+/// so the reported process ID is the shell's and it ends when the program ends.
+#[cfg(windows)]
+fn start_wrapped(target: &str) -> io::Result<String> {
+    let target = expand(target)?;
+    let child = Command::new("cmd")
+        .arg("/c")
+        .args(target.split(ARGUMENT_SEPARATOR))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -3558,7 +3677,9 @@ mod unix {
         "signal-parent",
         "stop-self",
         "ignore-signal",
+        "raise-signal",
         "start-forked",
+        "start-orphaned",
         "fork-walk",
         "await-signal",
     ];
@@ -3591,12 +3712,66 @@ mod unix {
                     _ => Ok(String::new()),
                 }
             }
+            // Ends the probe by signal `target`, so a caller sees a signal death.
+            "raise-signal" => {
+                let signal = number(target)?;
+                // SAFETY: restoring the default action has no memory safety requirements.
+                if unsafe { libc::signal(signal, libc::SIG_DFL) } == libc::SIG_ERR {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: raise sends the signal to this process.
+                check(unsafe { libc::raise(signal) })?;
+                Err(io::Error::other("the signal did not end the probe"))
+            }
             "start-forked" => start_forked(target),
+            "start-orphaned" => start_orphaned(target),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "unknown action",
             )),
         }
+    }
+
+    /// Starts a program (arguments separated by U+001F) from a child process that waits until
+    /// its own parent has ended, so the program has no parent any more before its first
+    /// instruction. Reports the child's process ID. Unlike `start`, the child keeps the standard
+    /// streams, so the caller can read what the program writes.
+    fn start_orphaned(target: &str) -> io::Result<String> {
+        use std::ffi::CString;
+
+        let target = super::expand(target)?;
+        let invalid = |_| io::Error::new(io::ErrorKind::InvalidInput, "the target holds a NUL");
+        let args = target
+            .split(super::ARGUMENT_SEPARATOR)
+            .map(|part| CString::new(part).map_err(invalid))
+            .collect::<io::Result<Vec<CString>>>()?;
+        let argv: Vec<*const libc::c_char> = args
+            .iter()
+            .map(|arg| arg.as_ptr())
+            .chain([ptr::null()])
+            .collect();
+        // SAFETY: the probe has one thread, so the child may run any code. It only waits for
+        // its parent to end and then leaves through execv or `_exit`.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            // SAFETY: getppid has no preconditions.
+            let parent = unsafe { libc::getppid() };
+            let pause = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 1_000_000,
+            };
+            // SAFETY: as above.
+            while unsafe { libc::getppid() } == parent {
+                // SAFETY: nanosleep reads a valid timespec and writes nothing.
+                unsafe { libc::nanosleep(&pause, ptr::null_mut()) };
+            }
+            // SAFETY: both arrays live in this process and argv ends with a null pointer.
+            unsafe {
+                libc::execv(argv[0], argv.as_ptr());
+                libc::_exit(127)
+            }
+        }
+        check(child).map(|child| child.to_string())
     }
 
     /// As `start`, but with fork and execve instead of posix_spawn: std uses fork as soon as a

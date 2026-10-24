@@ -18,7 +18,7 @@ mod system;
 mod trust;
 mod watch;
 
-use sandy_core::{Backend, PlanItem, ResolvedPolicy, SandboxError, TargetCommand};
+use sandy_core::{Backend, PlanItem, ResolvedPolicy, SandboxError, StatusReport, TargetCommand};
 
 use host::HostCapabilities;
 
@@ -38,11 +38,16 @@ impl Backend for LinuxBackend {
         plan::notes(policy, &HostCapabilities::detect_for(policy))
     }
 
-    fn run(&self, policy: &ResolvedPolicy, command: &TargetCommand) -> Result<i32, SandboxError> {
+    fn run(
+        &self,
+        policy: &ResolvedPolicy,
+        command: &TargetCommand,
+        status: &StatusReport,
+    ) -> Result<i32, SandboxError> {
         let plan = plan::plan_for(policy, &HostCapabilities::detect_for(policy));
         let sandbox = plan
             .sandbox
             .ok_or_else(|| SandboxError::new("this host cannot enforce the policy"))?;
-        launch::launch(&sandbox, command)
+        launch::launch(&sandbox, command, status)
     }
 }

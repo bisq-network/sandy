@@ -177,8 +177,13 @@ when the program ends. sandy does not replace itself with the program:
    filter names the child's process ID. If a step fails, the child writes the error into a
    close-on-exec pipe and exits; sandy reads the pipe until `execve` closes it, and refuses with
    that error.
-5. sandy waits for signals with `sigwaitinfo`. It forwards every signal to the program except
-   `SIGCHLD`, `SIGCONT`, `SIGTTIN` and `SIGTTOU`, reaps processes that were re-parented to it,
+5. sandy waits for signals with `sigwaitinfo`. It forwards every signal it can wait for to the
+   program except `SIGCHLD`, `SIGCONT`, `SIGTTIN` and `SIGTTOU`. `SIGKILL` and `SIGSTOP` cannot
+   be blocked or caught, so a `SIGKILL` to sandy leaves the guard to end the group and a
+   `SIGSTOP` stops only sandy. The fault signals (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`,
+   `SIGSYS`, `SIGABRT`, `SIGTRAP`) stay unblocked, so `kill -SEGV` to sandy ends sandy and the
+   guard then kills the group instead of the program receiving the signal. sandy also reaps
+   processes that were re-parented to it,
    and refuses to continue if the guard ends before the program. With a terminal (one of sandy's
    standard descriptors is its controlling terminal), sandy follows job control:
    - The program's group starts in the background. When the program stops because it read or
@@ -216,6 +221,12 @@ Costs and differences from the exec model:
   which forwards signals and reports the exit status.
 - A signal death becomes the exit status 128 plus the signal number, which a caller cannot tell
   from a program that exits with that status.
+- `--status-fd` reports both on a descriptor of the caller's choosing, without changing any exit
+  status. sandy writes `pid N` once the program runs, then `exited N` or `signaled N`, or
+  `failed` when sandy itself failed or refused, which tells its exit status 125 from a program
+  that exits with 125. The descriptor is made close-on-exec, so the program never has it. In the
+  exec model the record ends after `pid`, because sandy becomes the program and the caller's own
+  wait status is the program's.
 - Programs that call `setsid` or `setpgid` get `EPERM`: programs that turn themselves into
   daemons, and shells with job control, which then run without it.
 - Without a terminal, sandy does not stop when the program stops. There is no job control to
@@ -240,12 +251,14 @@ started sandy ends:
    `--parent-pid`, the caller names its own process ID, and sandy refuses when its parent is
    another process, for example because the caller has already ended and sandy was re-parented.
    Without `--parent-pid`, a parent that ends before this first step cannot be detected: sandy
-   then already has another parent, the process it was re-parented to. "Parent" is always the
-   direct parent; a wrapper such as `sh -c`, `timeout` or `systemd-run` between the application
-   and sandy is the parent instead.
+   then already has another parent, the process it was re-parented to. Without `--parent-start`,
+   "parent" is always the direct parent; a wrapper such as `sh -c`, `timeout` or `systemd-run`
+   between the application and sandy is the parent instead.
 2. Before it starts the watcher, sandy opens a pidfd for that process ID and checks that
    `getppid` still returns it. If it does not, the parent ended in between, and sandy refuses to
    start the program. A process ID that another process got in between fails this check too.
+   With `--parent-start` sandy checks that start time instead of `getppid` (see "Naming the
+   caller" below).
 3. sandy opens a pidfd for its own process ID. The program keeps this ID after `execve`; with
    `children = "contained"` it stays the supervising sandy's.
 4. sandy starts the watcher like the relay: it forks twice, so the watcher is not a child of the
@@ -269,6 +282,49 @@ started sandy ends:
 
 With `contained`, the supervising sandy forwards SIGTERM to the program and ends the group when the
 program ends; SIGKILL to the supervising sandy makes the guard end the group.
+
+### Naming the caller
+
+`--parent-pid` alone is a process ID, which another process can have once the caller has ended,
+so sandy accepts it only when it is sandy's own parent. `--parent-start` adds when that process
+started: field 22 of `/proc/PID/stat`, in clock ticks since the boot of the host, so no change
+of the system clock can alter it. The caller reads its own value from `/proc/self/stat` and
+passes it with its process ID:
+
+```sh
+start=$(awk '{ match($0, /.*\)/); rest = substr($0, RLENGTH + 2); split(rest, f, " ")
+               print f[20] }' /proc/$$/stat)
+sandy run --signals isolated --end-with-parent --parent-pid $$ --parent-start "$start" ...
+```
+
+The name is in field 2 and can hold spaces and parentheses, so the fields are counted from the
+last closing parenthesis; field 3 is the first after it, which makes the start time the
+twentieth. The file is read by process ID and not through `/proc/self`, which would name the
+`awk` process.
+
+sandy opens a pidfd for the process ID, reads the start time, and then checks that the pidfd has
+not become readable, which it does as soon as its process ends. A process that is still running
+after the read held its ID throughout, so the start time belongs to it. sandy refuses when the
+ID is gone, when its process has ended, or when the start time differs. With the token the named
+process need not be sandy's parent, so a wrapper between the caller and sandy is allowed, and a
+caller that ended before sandy's first step is caught instead of going unnoticed.
+
+Without the token, a caller that ends before sandy's first step cannot be detected at all. The
+kernel gives the orphan to the nearest child subreaper, usually the user's service manager,
+which sandy cannot tell from a caller that is still there (`tests/parent.rs`,
+`a_parent_that_ended_before_sandy_ran_is_refused`, records this).
+
+### Letting the kernel do it
+
+A caller on Linux 7.0 or newer can start sandy with
+`clone3(CLONE_PIDFD | CLONE_PIDFD_AUTOKILL | CLONE_AUTOREAP | CLONE_NNP)` instead. The kernel
+then kills sandy, and the program after the `execve`, as soon as the caller's pidfd closes,
+which the end of the caller does (measured on kernel 7.2.11). Nothing has to be identified and
+no watcher runs, and a caller that dies between `clone3` and sandy's first instruction is
+covered as well. The limits: it is a SIGKILL with no grace period; it reaches only the process
+the caller started, so it needs `children = "contained"` for the guard to end the rest of the
+group; and the caller must not let the pidfd reach processes that outlive it. The exit status
+stays readable through `PIDFD_GET_INFO` with `PIDFD_INFO_EXIT`.
 
 Two rules keep the program from stopping the watcher. The policy requires `signals = "isolated"`,
 so the program cannot signal the watcher, which is outside its Landlock domain. And the watcher is

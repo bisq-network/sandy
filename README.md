@@ -340,6 +340,8 @@ macOS it does nothing because those backends leave nothing behind.
 | `--signals any\|isolated` | Whether the program may signal processes outside its sandbox. | `any` |
 | `--end-with-parent` | End the program when the process that started sandy ends. Needs `--signals isolated`. See [Processes](#processes). | off |
 | `--parent-pid PID` | With `--end-with-parent`: the caller's own process ID. sandy refuses to start if its parent is another process. | |
+| `--parent-start TOKEN` | With `--parent-pid`: when that process started, so sandy can tell the caller from a process that got its ID later. The caller may then start sandy through a wrapper. See [Processes](#processes). | |
+| `--status-fd N` | Report the program's process ID and how it ended on descriptor `N` (on Windows: an inherited handle). `run` only. See [Exit status](#exit-status). | |
 | `--children allowed\|none\|contained` | Whether the program may start other processes, and whether they may outlive it. See [Processes](#processes). | `allowed` |
 | `--expose ADDRESS=PORT` | Relay connections on the loopback `ADDRESS` to the program's loopback `PORT`. Needs `--ip all`. | |
 | `--forward PORT=ADDRESS` | Relay the program's connections to its loopback `PORT` to the loopback `ADDRESS` outside the sandbox. Needs `--ip all`. | |
@@ -361,6 +363,28 @@ The options that take a path or a variable can be repeated.
 | 0 / 1 | `sandy check`: the policy is enforceable / not enforceable |
 
 On Windows the program's 32-bit exit code is passed through unchanged.
+
+### The status record
+
+The exit status leaves two things open. With `children = "contained"`, and always on Windows,
+sandy stays the parent, so the caller holds sandy's process ID and not the program's; and 125
+means both "sandy refused" and "the program exited with 125". `--status-fd N` answers both
+without changing any exit status. sandy writes short lines to the descriptor, in this order:
+
+| Line | When |
+|---|---|
+| `pid N` | the program runs; `N` is its process ID |
+| `exited N` | sandy saw the program exit with status `N` |
+| `signaled N` | sandy saw signal `N` end the program (Linux and macOS with `contained`) |
+| `failed` | sandy itself failed or refused; without a `pid` line the program never ran |
+
+In the exec model (Linux and macOS without `contained`) sandy becomes the program, so the
+record ends after `pid` and the caller's own wait status is the program's. sandy writes that
+line right before it replaces itself with the program, so a `failed` line after it means that
+the `execve` failed. sandy makes the
+descriptor close-on-exec, and on Windows it keeps the handle out of what the program inherits,
+so the program never has it. Writing is best effort: a caller that closed the read end gets no
+record, and the program keeps running.
 
 ## Policy reference
 
@@ -528,10 +552,17 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
   program to end (SIGTERM on Linux and macOS) and kills it 5 seconds later if it is still
   running; on Windows it ends the program at once. Unlike a program's own check of its parent,
   this works also when the program is compromised. It needs `signals = "isolated"`. Combine it
-  with `children = "contained"` so that the processes the program started end too. The parent is
-  the process that starts sandy directly, so start sandy from your application itself, not
-  through a shell or another wrapper, and pass your process ID with `--parent-pid`: otherwise a
-  crash in the moment sandy starts goes unnoticed.
+  with `children = "contained"` so that the processes the program started end too.
+
+  Tell sandy which process you are. `--parent-pid` is your process ID, which sandy accepts only
+  when it is sandy's own parent, so start sandy from your application itself and not through a
+  shell or another wrapper. `--parent-start` adds when your process started, which only you can
+  know, so sandy can tell you from a process that got your ID after you ended. With both, a
+  wrapper between you and sandy is allowed, and a crash in the moment sandy starts makes sandy
+  refuse instead of going unnoticed. The value is platform-specific: field 22 of
+  `/proc/PID/stat` on Linux ([docs/linux.md](docs/linux.md)), the recorded start time on macOS
+  ([docs/macos.md](docs/macos.md)), the creation time on Windows
+  ([docs/windows.md](docs/windows.md)).
 - Debugging and reading the memory of processes outside the sandbox are always denied, and the
   program can never gain privileges, for example through setuid programs.
 
@@ -630,7 +661,9 @@ Recommendations:
    status.
 2. **Treat exit status 125 as "not started".** sandy prints the reason on standard error. Two
    exceptions: a program can exit with 125 itself, and with `children = "contained"` sandy can
-   fail while it supervises a running program (its message then starts with "run failed").
+   fail while it supervises a running program (its message then starts with "run failed"). Pass
+   `--status-fd` when you need to tell these apart, or need the program's process ID (see
+   [The status record](#the-status-record)).
 3. **Keep sandy, the policy and the program's binaries out of every writable path.** Use separate
    directories for binaries (`read_exec`) and data (`read_write`). A program that can rewrite its
    own binary or library directory can escape at the next start.

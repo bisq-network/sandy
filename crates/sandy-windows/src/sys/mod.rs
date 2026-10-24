@@ -16,7 +16,7 @@ use std::os::windows::io::AsRawSocket;
 
 use sandy_core::{
     Backend, ChildProcesses, NetworkAccess, PlanItem, ProtectedPath, ResolvedPolicy, SandboxError,
-    Status, TargetCommand, path_directories,
+    Status, StatusReport, TargetCommand, path_directories,
 };
 use windows_sys::Win32::Security::{
     WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientServerSid,
@@ -64,7 +64,12 @@ impl Backend for WindowsBackend {
         policy.path_directory_notes(&path_locations())
     }
 
-    fn run(&self, policy: &ResolvedPolicy, command: &TargetCommand) -> Result<i32, SandboxError> {
+    fn run(
+        &self,
+        policy: &ResolvedPolicy,
+        command: &TargetCommand,
+        status: &StatusReport,
+    ) -> Result<i32, SandboxError> {
         // The caller checked the plan, but the host may have changed since. Every mechanism
         // below is one the plan named.
         if let Some(item) = self.plan(policy).into_iter().find(|i| !i.is_enforced()) {
@@ -185,13 +190,16 @@ impl Backend for WindowsBackend {
             cwd,
             &capabilities,
         )?;
-        let ended = process::run(process::Launch {
-            appcontainer: &container,
-            program,
-            relays,
-            deny_children: policy.children == ChildProcesses::None,
-            parent,
-        })?;
+        let ended = process::run(
+            process::Launch {
+                appcontainer: &container,
+                program,
+                relays,
+                deny_children: policy.children == ChildProcesses::None,
+                parent,
+            },
+            status,
+        )?;
         if let Some(forwarding) = forwarding {
             forwarding.stop(ended.deadline);
         }

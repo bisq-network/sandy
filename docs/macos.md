@@ -536,6 +536,13 @@ when sandy itself is killed. sandy then stays the target's parent instead of rep
    pipe to the guard, reaps the guard and the target, and exits with the target's exit status, or
    128 plus the signal number.
 
+The caller sees sandy's process ID and that exit status, not the target's ID and not how it
+really ended. `--status-fd` reports both without changing any exit status: sandy writes `pid N`
+once the target runs, then `exited N` or `signaled N`, or `failed` when sandy itself failed or
+refused, which tells its exit status 125 from a target that exits with 125. The descriptor is
+made close-on-exec, so the target never has it. In the exec model the record ends after `pid`,
+because sandy becomes the target and the caller's own wait status is the target's.
+
 So the group ends with the target also while sandy is stopped (by its caller, or by the target
 through the terminal), when sandy is killed, and when the watcher of `end_with_parent` kills
 sandy. The relay of exposed and forwarded ports polls the relay's pipe besides sandy's process
@@ -580,7 +587,11 @@ sandy here, so it ends after the group (rule 5 of "Forwarded ports" in `DESIGN.m
 (`crates/sandy-macos/src/macos/watch.rs`):
 
 1. sandy reads its parent's process ID as its first step, or checks the one named with
-   `--parent-pid`, and checks that this process is still its parent.
+   `--parent-pid`, and checks that this process is still its parent. With `--parent-start` it
+   checks the start time of the named process instead, so that process need not be sandy's own
+   parent (see "Naming the caller" below). Process 1 is refused in both cases: macOS has no
+   child subreaper, so launchd is the parent of every process whose parent has ended, and
+   waiting for launchd to end says nothing.
 2. It starts the watcher like the relay: forked twice, so launchd adopts it and the target never
    sees it as a child; in a session of its own with every signal except the fault signals blocked;
    0, 1 and 2 on `/dev/null` and no other descriptor of sandy's.
@@ -588,9 +599,10 @@ sandy here, so it ends after the group (rule 5 of "Forwarded ports" in `DESIGN.m
    the exec; with `contained`, the supervising sandy, which forwards the signals and ends the
    group). Then it applies its own profile (`profile::watcher_profile`): deny by default, signals
    allowed, nothing else; it executes nothing and keeps running the code sandy loaded.
-4. After the watcher reports ready, sandy checks again that its parent is unchanged. A process
-   whose parent ends is adopted by launchd at once, so an unchanged parent means that the
-   watcher's registration names the real parent, not a later process with the same ID.
+4. After the watcher reports ready, sandy checks again that its parent is unchanged, or that the
+   start time still matches. A process whose parent ends is adopted by launchd at once, so an
+   unchanged answer means that the watcher's registration names the real parent, not a later
+   process with the same ID.
 5. When the target ends first, the watcher ends. When the parent ends, the watcher sends SIGTERM
    and SIGCONT (so that a stopped target gets the request), waits at most 5 seconds for the
    target's end, then sends SIGKILL, and ends.
@@ -605,6 +617,21 @@ it.
 
 The policy requires `signals = "isolated"`, so the target cannot signal the watcher. `sandy check`
 compiles the watcher's profile together with the target's.
+
+### Naming the caller
+
+`--parent-pid` alone is a process ID, which another process can have once the caller has ended,
+so sandy accepts it only when it is sandy's own parent. `--parent-start` adds when that process
+started: `pbi_start_tvsec` and `pbi_start_tvusec` of `proc_pidinfo(PROC_PIDTBSDINFO)`, in
+microseconds since the epoch. macOS records the value once when the process starts, so a later
+change of the system clock does not alter it, and two processes with the same ID would have to
+start in the same microsecond to share it. `p_uniqueid` of `PROC_PIDUNIQIDENTIFIERINFO` would
+be stronger, but it is not in the public SDK headers; sandy uses one undocumented interface
+(Seatbelt) and does not need a second.
+
+With the token the named process need not be sandy's parent, so a wrapper between the caller and
+sandy (`sh -c`, `open`, a launcher) is allowed. sandy refuses when the process is gone or its
+start time differs. `tests/common/mod.rs`, `start_token`, is the recipe a caller follows.
 
 Residual risk: if the watcher itself is ended from outside the sandbox, for example by `pkill -f
 sandy`, which matches it because it keeps sandy's command line, or by jetsam under memory

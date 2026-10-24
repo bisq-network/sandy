@@ -8,7 +8,10 @@ mod relay;
 mod seatbelt;
 mod watch;
 
-use sandy_core::{Backend, ChildProcesses, PlanItem, ResolvedPolicy, SandboxError, TargetCommand};
+use sandy_core::{
+    Backend, ChildProcesses, ParentProcess, PlanItem, ResolvedPolicy, SandboxError, StatusReport,
+    TargetCommand,
+};
 
 use std::ffi::CStr;
 use std::io::Read;
@@ -56,7 +59,12 @@ impl Backend for MacosBackend {
         items
     }
 
-    fn run(&self, policy: &ResolvedPolicy, command: &TargetCommand) -> Result<i32, SandboxError> {
+    fn run(
+        &self,
+        policy: &ResolvedPolicy,
+        command: &TargetCommand,
+        status: &StatusReport,
+    ) -> Result<i32, SandboxError> {
         let profile = generate(policy);
         let target = exec::Target::new(command)?;
         if let Some(cwd) = &command.cwd {
@@ -82,10 +90,11 @@ impl Backend for MacosBackend {
             relay::start(&pairs, &seatbelt, ended)?;
         }
         if policy.end_with_parent {
-            // SAFETY: getppid has no preconditions.
-            let parent = command
-                .parent
-                .map_or_else(|| unsafe { libc::getppid() }, |pid| pid as libc::pid_t);
+            let parent = command.parent.unwrap_or_else(|| ParentProcess {
+                // SAFETY: getppid has no preconditions.
+                id: unsafe { libc::getppid() } as u32,
+                start: None,
+            });
             watch::start(parent, &seatbelt)?;
         }
         let apply = || {
@@ -106,8 +115,11 @@ impl Backend for MacosBackend {
                     Err(error) => error,
                 },
                 group_ended,
+                status,
             );
         }
+        // In the exec model sandy becomes the program, so its own process ID is the program's.
+        status.started(std::process::id());
         apply()?;
         Err(cannot_execute(target.exec()))
     }

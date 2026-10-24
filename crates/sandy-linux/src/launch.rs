@@ -12,7 +12,7 @@ use landlock::{
     CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreated,
     RulesetCreatedAttr, RulesetError, RulesetStatus,
 };
-use sandy_core::{SandboxError, TargetCommand};
+use sandy_core::{ParentProcess, SandboxError, StatusReport, TargetCommand};
 
 use crate::filter::{FilterConfig, Filters};
 use crate::host::THREADS_DIR;
@@ -26,7 +26,11 @@ use crate::{contain, filter, relay, watch};
 /// Landlock and seccomp restrict the calling thread. sandy verifies right before Landlock that
 /// it has a single thread, the filters are installed with TSYNC, and execve ends every other
 /// thread, so the target runs with exactly the restrictions applied here.
-pub fn launch(sandbox: &Sandbox, command: &TargetCommand) -> Result<i32, SandboxError> {
+pub fn launch(
+    sandbox: &Sandbox,
+    command: &TargetCommand,
+    status: &StatusReport,
+) -> Result<i32, SandboxError> {
     // With `contained`, the relay also ends when the guard has ended the program's group.
     let mut group_ended = None;
     if let Some(relay) = &sandbox.relay {
@@ -40,10 +44,11 @@ pub fn launch(sandbox: &Sandbox, command: &TargetCommand) -> Result<i32, Sandbox
         relay::start(relay, ended)?;
     }
     if sandbox.end_with_parent {
-        // SAFETY: getppid has no preconditions.
-        let parent = command
-            .parent
-            .map_or_else(|| unsafe { libc::getppid() }, |pid| pid as _);
+        let parent = command.parent.unwrap_or_else(|| ParentProcess {
+            // SAFETY: getppid has no preconditions.
+            id: unsafe { libc::getppid() } as u32,
+            start: None,
+        });
         watch::start(parent, sandbox.landlock.abi)?;
     }
     let ruleset = prepare_ruleset(&sandbox.landlock)?;
@@ -62,8 +67,12 @@ pub fn launch(sandbox: &Sandbox, command: &TargetCommand) -> Result<i32, Sandbox
         Err(error) => error,
     };
     if sandbox.contain {
-        contain::run(start, group_ended)
+        contain::run(start, group_ended, status)
     } else {
+        // In the exec model sandy becomes the program, so its own process ID is the program's.
+        // Reported before the sandbox, because the status channel is closed on execve and the
+        // seccomp filter has no rule for it.
+        status.started(std::process::id());
         Err(start())
     }
 }

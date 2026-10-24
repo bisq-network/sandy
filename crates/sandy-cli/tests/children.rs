@@ -98,6 +98,78 @@ fn children_contained_ends_what_the_program_leaves_behind() {
     );
 }
 
+/// sandy stays the parent with `contained`, so its own process ID is not the program's and its
+/// exit status does not say how the program ended. `--status-fd` carries both.
+#[test]
+fn the_status_record_names_the_program_and_how_it_ended() {
+    let fixture = Fixture::new("status-pid");
+    if let Some(reason) = unsupported() {
+        skip("landlock-abi-6", reason);
+        return;
+    }
+    let args = run_args(&contained(&fixture), &[("pid", "x"), ("exit", "7")]);
+    let (output, record) = sandy_with_status(&args);
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    let program = parse(&output)[0].detail.clone();
+    assert_eq!(record, format!("pid {program}\nexited 7\n"), "{record}");
+}
+
+/// Exit status 125 means both "sandy refused" and "the program exited with 125". The record
+/// tells them apart, and neither exit status changes.
+#[test]
+fn the_status_record_tells_a_refusal_from_the_programs_own_exit_125() {
+    let fixture = Fixture::new("status-refusal");
+    let exit = EXIT_FAILURE.to_string();
+    let args = run_args(&fixture.access_args(), &[("exit", &exit)]);
+    let (output, record) = sandy_with_status(&args);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    assert!(record.starts_with("pid "), "{record}");
+    assert!(!record.contains("failed"), "{record}");
+
+    let mut refused = vec!["run".to_string()];
+    refused.extend(platform_args());
+    refused.extend(fixture.access_args());
+    refused.push("--".to_string());
+    refused.push(fixture.arg("bin/not-a-program"));
+    let (output, record) = sandy_with_status(&refused);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    assert_eq!(record, "failed\n", "{record}");
+}
+
+/// The status descriptor is close-on-exec, so the program never has it. sandy wrote the record
+/// through the same number, which the program cannot even query.
+#[cfg(unix)]
+#[test]
+fn the_program_does_not_get_the_status_descriptor() {
+    let fixture = Fixture::new("status-closed");
+    let args = run_args(&fixture.access_args(), &[("fd-read", "3")]);
+    let (output, record) = sandy_with_status(&args);
+    let lines = parse(&output);
+    assert_eq!(lines.len(), 1, "{output:?}");
+    lines[0].assert_blocked();
+    assert!(record.starts_with("pid "), "{record}");
+}
+
+/// A signal that ends the program stays exit status 128 plus the signal number, which a caller
+/// cannot tell from a program that exits with that status. The record names the signal.
+#[cfg(unix)]
+#[test]
+fn a_signal_death_is_in_the_status_record() {
+    let fixture = Fixture::new("status-signal");
+    if let Some(reason) = unsupported() {
+        skip("landlock-abi-6", reason);
+        return;
+    }
+    let args = run_args(
+        &contained(&fixture),
+        &[("pid", "x"), ("raise-signal", "15")],
+    );
+    let (output, record) = sandy_with_status(&args);
+    assert_eq!(output.status.code(), Some(128 + 15), "{output:?}");
+    let program = parse(&output)[0].detail.clone();
+    assert_eq!(record, format!("pid {program}\nsignaled 15\n"), "{record}");
+}
+
 #[test]
 fn children_contained_needs_isolated_signals() {
     let fixture = Fixture::new("contained-signals");

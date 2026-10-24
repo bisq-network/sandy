@@ -39,7 +39,7 @@ use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
 use std::ptr;
 
-use sandy_core::SandboxError;
+use sandy_core::{SandboxError, StatusReport};
 
 use crate::helper::{block_signals, close_descriptors_except, pipe, set_undumpable};
 use crate::launch::ensure_single_thread;
@@ -55,7 +55,11 @@ const START_FAILED: i32 = 125;
 /// the target, and returns only on failure.
 /// `ended` is the write end of the relay's pipe, if a relay runs: only the guard keeps it, so it
 /// ends when the guard has ended the group.
-pub fn run(start: impl FnOnce() -> SandboxError, ended: Option<File>) -> Result<i32, SandboxError> {
+pub fn run(
+    start: impl FnOnce() -> SandboxError,
+    ended: Option<File>,
+    status: &StatusReport,
+) -> Result<i32, SandboxError> {
     ensure_single_thread()?;
     set_child_subreaper()?;
     let child_action = default_child_action()?;
@@ -90,9 +94,21 @@ pub fn run(start: impl FnOnce() -> SandboxError, ended: Option<File>) -> Result<
     if !message.is_empty() {
         return Err(SandboxError::new(String::from_utf8_lossy(&message)));
     }
-    let status = group.supervise(&signals)?;
+    // The program has started: the report pipe reached its end without a message, which only
+    // execve does.
+    status.started(group.program.expect("the program was started") as u32);
+    let exited = group.supervise(&signals)?;
     group.end();
-    Ok(status)
+    Ok(match exited.code {
+        libc::CLD_EXITED => {
+            status.exited(exited.status);
+            exited.status
+        }
+        _ => {
+            status.signaled(exited.status);
+            SIGNALED + exited.status
+        }
+    })
 }
 
 /// The program's process group, led by the guard. Dropping it ends the group, so a failure after
@@ -151,15 +167,12 @@ impl Group {
         Ok(group)
     }
 
-    /// Forwards signals and follows the program until it exits. Returns sandy's exit status.
-    fn supervise(&mut self, signals: &Signals) -> Result<i32, SandboxError> {
+    /// Forwards signals and follows the program until it exits. Returns how it ended.
+    fn supervise(&mut self, signals: &Signals) -> Result<ChildState, SandboxError> {
         let program = self.program.expect("the program was started");
         loop {
             if let Some(exited) = self.reap_others(program)? {
-                return Ok(match exited.code {
-                    libc::CLD_EXITED => exited.status,
-                    _ => SIGNALED + exited.status,
-                });
+                return Ok(exited);
             }
             match signals.wait()? {
                 libc::SIGCHLD => self.follow_program(program)?,

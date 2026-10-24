@@ -35,6 +35,11 @@ Options (they extend the policy file):
                              (needs --signals isolated)
   --parent-pid PID           with --end-with-parent: the process ID of the caller; sandy
                              refuses to start if its parent is another process
+  --parent-start TOKEN       with --parent-pid: when that process started, so sandy can tell
+                             the caller from a process that got its ID later; the caller may
+                             then start sandy through a wrapper (see the platform docs)
+  --status-fd N              report the program's process ID and how it ended on descriptor N
+                             (on Windows: an inherited handle); run only
   --expose ADDRESS=PORT      relay connections on the loopback ADDRESS to the program's
                              loopback PORT, for example 127.0.0.1:18080=8080 (repeatable;
                              needs --ip all)
@@ -200,6 +205,10 @@ pub struct Invocation {
     pub overrides: Overrides,
     pub cwd: Option<PathBuf>,
     pub parent_pid: Option<u32>,
+    pub parent_start: Option<u64>,
+    /// `--status-fd`: the descriptor, or on Windows the handle, sandy writes the status record
+    /// to. The number is checked when `run` takes it over.
+    pub status_fd: Option<u64>,
     pub program: Option<PathBuf>,
     pub args: Vec<OsString>,
 }
@@ -245,6 +254,8 @@ where
         overrides: Overrides::default(),
         cwd: None,
         parent_pid: None,
+        parent_start: None,
+        status_fd: None,
         program: None,
         args: Vec::new(),
     };
@@ -337,6 +348,8 @@ where
             }
             Long("cwd") => invocation.cwd = Some(parser.value()?.into()),
             Long("parent-pid") => invocation.parent_pid = Some(parser.value()?.parse()?),
+            Long("parent-start") => invocation.parent_start = Some(parser.value()?.parse()?),
+            Long("status-fd") => invocation.status_fd = Some(parser.value()?.parse()?),
             Value(program) => {
                 invocation.program = Some(program.into());
                 invocation.args = parser.raw_args()?.collect();
