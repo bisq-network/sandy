@@ -69,6 +69,7 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
             TcpStream::connect_timeout(&socket_address(target)?, CONNECT_TIMEOUT)?;
             Ok(String::new())
         }
+        "tcp-connect-read" => tcp_connect_read(target),
         "tcp-listen" => {
             let listener = TcpListener::bind(socket_address(target)?)?;
             Ok(listener.local_addr()?.to_string())
@@ -1780,6 +1781,18 @@ mod linux {
     pub fn perform(_action: &str, _target: &str) -> io::Result<String> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported"))
     }
+}
+
+/// Connects and reads until the other side closes. A connection that is still open when the
+/// relay accepts it keeps the owner the relay looks up, which a connection that closed first
+/// does not (docs/linux.md, "Exposed and forwarded ports").
+fn tcp_connect_read(target: &str) -> io::Result<String> {
+    const READ_TIMEOUT: Duration = Duration::from_secs(20);
+    let mut stream = TcpStream::connect_timeout(&socket_address(target)?, CONNECT_TIMEOUT)?;
+    stream.set_read_timeout(Some(READ_TIMEOUT))?;
+    let mut received = Vec::new();
+    stream.read_to_end(&mut received)?;
+    Ok(format!("{} bytes", received.len()))
 }
 
 /// Accepts one TCP connection on `target` within `ACCEPT_TIMEOUT`. The escape tests connect from

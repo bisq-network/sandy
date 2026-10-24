@@ -501,9 +501,13 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
   With `signals = "any"` the program may stop its own relay. On Linux a stopped relay is killed
   two seconds later and its ports are released; on macOS only `signals = "isolated"` keeps that
   bound.
-- `forward` entries: on Linux the relay serves only sandy's own user. A connection from another
-  local user is closed without reaching the service (docs/linux.md). On macOS it is served, so
-  forward only to services that authenticate their clients.
+- `forward` entries: on Linux the relay closes a connection whose other end the kernel names as
+  another local user's, so it never reaches the service. A socket its process has closed has no
+  owner for the kernel to name, and such a connection is served, because it is the program's
+  own in any ordinary run. Another local user can therefore still get a write through by
+  closing first and retrying until it hits that window, but never read the answer
+  (docs/linux.md). On macOS every connection is served. Forward only to services that
+  authenticate their clients.
 - A port another process already holds makes `sandy run` refuse with status 125. `sandy check`
   binds the same listeners for a moment and reports `UNAVAILABLE` for such a port, so it gives
   the same answer. Between the two the port can change hands, so `run` is the final word.

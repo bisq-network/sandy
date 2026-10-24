@@ -7,10 +7,34 @@
 //! exact lookup of one connection with the owner of the socket on the other end. The socket is
 //! opened before the relay confines itself, so its filter needs no rule beyond `sendto` and
 //! `recvfrom`, which it already allows; Landlock does not mediate netlink. An answer about
-//! another connection, an answer with another owner and every failure mean that the connection
-//! is refused, and a kernel that cannot answer at all is found by a self test before the relay
-//! starts. The kernel answers a lookup in the call that sends it, so the relay's watchdog bounds
-//! the wait for an answer that never comes.
+//! another connection and every failure mean that the connection is refused, and a kernel that
+//! cannot answer at all is found by a self test before the relay starts. The kernel answers a
+//! lookup in the call that sends it, so the relay's watchdog bounds the wait for an answer that
+//! never comes.
+//!
+//! One peer the kernel cannot name: one that closed its socket. The owner it reports comes from
+//! the socket's file (`sock_i_uid`), and closing the socket takes that file away, so from the
+//! close onwards the lookup answers with no owner for a connection of any user. It says so in
+//! the inode of the answer, which is zero exactly then, and that is the field the relay reads.
+//! The user in such an answer cannot be used: kernels up to 6.8 report user 0 from the close,
+//! and 6.17 and later keep the user until they replace the socket with a timewait record a few
+//! milliseconds afterwards. Reading the user therefore refused nearly every connection of a
+//! program that connects and exits on 6.8, and between none and two thirds of them on the
+//! newer kernels, depending on what the program does and how busy the host is (docs/linux.md,
+//! "Exposed and forwarded ports").
+//!
+//! The relay serves a connection no owner can be found for. It is the program's own in every
+//! ordinary run: the kernel completes a handshake by itself, so a program that connects and
+//! exits is always ahead of the relay's accept, and refusing these answers is refusing what a
+//! forwarded port exists to carry. What it costs is that another local user can land a write by
+//! connecting, writing, closing and retrying until one attempt hits the window.
+//!
+//! The one thing that keeps the straightforward attack closed is that only a peer which can no
+//! longer read is ever unnamed. Losing the file is what loses the owner, and it also gives up
+//! the answer. A peer that only shuts down its sending side keeps its socket and its file, so
+//! it keeps its owner and is checked like any other: half closing is no way to proxy through a
+//! forwarded port. A change here that read the state instead of the inode would open exactly
+//! that, because a half closed peer and a closed one are both in FIN_WAIT2.
 
 use std::io;
 use std::mem::size_of;
@@ -26,6 +50,17 @@ const NO_COOKIE: [u32; 2] = [u32::MAX, u32::MAX];
 /// Every TCP state, so that the lookup also finds the socket of a peer that has closed its side
 /// already, which is the normal case for a program that connects, writes and exits.
 const ALL_STATES: u32 = u32::MAX;
+/// Who the socket on the other end of a connection belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Owner {
+    /// sandy's own user.
+    Us,
+    /// Another user, or an answer the relay cannot trust.
+    AnotherUser,
+    /// Nobody the kernel still knows: the peer closed its socket, and the record left behind
+    /// carries no owner.
+    Nobody,
+}
 
 /// The owner of the other end of a connection, as the kernel reports it.
 pub(crate) struct PeerCheck {
@@ -67,19 +102,38 @@ impl PeerCheck {
         self.diag.as_raw_fd()
     }
 
-    /// Whether the connection from `peer` to `local` belongs to sandy's user. False for every
-    /// failure, so a connection the kernel cannot account for is refused.
-    pub(crate) fn owned_by_us(&self, peer: SocketAddr, local: SocketAddr) -> bool {
+    /// Whether the connection from `peer` to `local` may be relayed on a forwarded port. False
+    /// when the kernel names another user as the owner of the other end, and false for every
+    /// failure, so an answer the relay cannot trust refuses the connection.
+    pub(crate) fn may_relay(&self, peer: SocketAddr, local: SocketAddr) -> bool {
+        self.owner(peer, local) != Owner::AnotherUser
+    }
+
+    /// Who the kernel says the socket on the other end belongs to. `Nobody` when the answer
+    /// carries no inode, which is how the kernel reports a socket that has no file any more.
+    fn owner(&self, peer: SocketAddr, local: SocketAddr) -> Owner {
         let Some(request) = Request::new(peer, local) else {
-            return false;
+            return Owner::AnotherUser;
         };
         let mut answer = [0u8; 4096];
-        match self.ask(&request, &mut answer) {
-            // A lookup that matches no connection falls back to a listening socket, and a socket
-            // the kernel no longer accounts for (a peer in TIME_WAIT) reports no owner. Both are
-            // caught by comparing the answer with what was asked.
-            Some(message) => message.id.same_as(&request.id) && message.uid == self.uid,
-            None => false,
+        let Some(message) = self.ask(&request, &mut answer) else {
+            return Owner::AnotherUser;
+        };
+        // A lookup that matches no connection falls back to a listening socket, which comparing
+        // the answer with what was asked catches.
+        if !message.id.same_as(&request.id) {
+            return Owner::AnotherUser;
+        }
+        // Only a peer that closed its socket is unnamed, and such a peer can no longer read.
+        // A half closed peer keeps its file, so it keeps its inode and its owner. Both reach
+        // FIN_WAIT2, so this must stay a test of the inode and never of `idiag_state`.
+        if message.inode == 0 {
+            return Owner::Nobody;
+        }
+        if message.uid == self.uid {
+            Owner::Us
+        } else {
+            Owner::AnotherUser
         }
     }
 
@@ -143,7 +197,7 @@ impl PeerCheck {
         let client = TcpStream::connect(address).map_err(failed)?;
         let (accepted, peer) = listener.accept().map_err(failed)?;
         let local = accepted.local_addr().map_err(failed)?;
-        let ours = self.owned_by_us(peer, local);
+        let ours = self.owner(peer, local) == Owner::Us;
         drop((client, accepted, listener));
         if !ours {
             return Err(SandboxError::new(
@@ -267,10 +321,21 @@ impl Request {
 mod tests {
     use super::*;
 
-    /// A connection of this process belongs to this user, also when the peer has closed its
-    /// side already, and the same lookup with another user's ID rejects it. The rejection is
-    /// what a forward listener does with a connection of another user, which a test cannot make
-    /// without a second account.
+    use std::net::Shutdown;
+    use std::time::{Duration, Instant};
+
+    /// The same lookup with another user's ID, which is what a forward listener answers for a
+    /// connection of another user. A test cannot make one without a second account.
+    fn as_another_user(check: &PeerCheck) -> PeerCheck {
+        PeerCheck {
+            diag: check.diag.try_clone().unwrap(),
+            uid: check.uid + 1,
+        }
+    }
+
+    /// A connection of this process belongs to this user and is refused for any other, also
+    /// when the peer has stopped sending. Half closing keeps the socket and its owner, so it is
+    /// no way around the check: a peer that can still read is always named.
     #[test]
     fn a_loopback_connection_reports_its_owner() {
         let check = PeerCheck::open().unwrap();
@@ -278,22 +343,52 @@ mod tests {
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (accepted, peer) = listener.accept().unwrap();
         let local = accepted.local_addr().unwrap();
-        assert!(check.owned_by_us(peer, local));
+        let other = as_another_user(&check);
+        assert_eq!(check.owner(peer, local), Owner::Us);
+        assert!(!other.may_relay(peer, local));
 
-        let other = PeerCheck {
-            diag: check.diag.try_clone().unwrap(),
-            uid: check.uid + 1,
-        };
-        assert!(!other.owned_by_us(peer, local));
+        client.shutdown(Shutdown::Write).unwrap();
+        // Long enough to pass the few milliseconds in which a peer that closed loses its owner.
+        let until = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < until {
+            assert_eq!(check.owner(peer, local), Owner::Us);
+            assert!(!other.may_relay(peer, local));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
-        // A program that connects, writes and exits at once leaves its side closed before the
-        // relay accepts. Its socket still names its owner.
+    /// A peer that closed its socket has no file for the kernel to read an owner from, so no
+    /// lookup can attribute it to anybody and the relay serves it whoever asks. That is what
+    /// keeps the program's own connection, and what another local user can reach for (see the
+    /// module documentation). The kernel answers this way from the close onwards, before it
+    /// replaces the socket with a timewait record.
+    #[test]
+    fn a_peer_that_closed_its_socket_has_no_owner() {
+        let check = PeerCheck::open().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (accepted, peer) = listener.accept().unwrap();
+        let local = accepted.local_addr().unwrap();
         drop(client);
-        assert!(check.owned_by_us(peer, local));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while check.owner(peer, local) != Owner::Nobody {
+            assert!(Instant::now() < deadline, "the peer kept an owner");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(check.may_relay(peer, local));
+        assert!(as_another_user(&check).may_relay(peer, local));
+    }
 
-        // A connection that is gone has no owner to report, and is refused.
-        drop(accepted);
-        drop(listener);
-        assert!(!check.owned_by_us(peer, local));
+    /// A lookup the relay cannot trust refuses the connection: an answer about another socket
+    /// is the one such answer a test can produce, by asking about a connection that never
+    /// existed, where the kernel falls back to the listening socket.
+    #[test]
+    fn an_answer_about_another_socket_is_refused() {
+        let check = PeerCheck::open().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = listener.local_addr().unwrap();
+        let never_connected = SocketAddr::from(([127, 0, 0, 1], 1));
+        assert_eq!(check.owner(never_connected, local), Owner::AnotherUser);
+        assert!(!check.may_relay(never_connected, local));
     }
 }

@@ -52,6 +52,9 @@ fn forwarded_port_reaches_the_outside_service() {
         "--forward".to_string(),
         format!("{inner}={service}"),
     ]);
+    // The program connects and exits without sending anything. The kernel keeps no owner for
+    // the socket it closed, and the relay serves the connection anyway (rule 6 of "Forwarded
+    // ports").
     let lines = probe_inside(&args, &[("tcp-connect", &format!("127.0.0.1:{inner}"))]);
     lines[0].assert_ok();
     assert!(
@@ -110,8 +113,11 @@ fn a_connection_cut_when_the_relay_ends_is_reset() {
 /// A forward listener is an ordinary loopback port, so any local user can connect to it. Only
 /// the program should: the relay reaches the service outside as sandy's user, so a connection of
 /// another user would pass an owner rule of a packet filter or a peer credential check in that
-/// service. On Linux the relay asks the kernel who owns the other end and closes what is not
-/// sandy's user. macOS has no such check (docs/macos.md), so this test is Linux only.
+/// service. On Linux the relay asks the kernel who owns the other end and closes a connection
+/// the kernel names as another user's. The one it cannot name is a peer that closed its socket
+/// first, which it serves (docs/linux.md, "Exposed and forwarded ports"); a peer that holds its
+/// connection open, which is what reading an answer takes, is always named. macOS has no such
+/// check (docs/macos.md), so this test is Linux only.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_forward_port_refuses_other_users() {
@@ -125,10 +131,10 @@ fn a_forward_port_refuses_other_users() {
         );
         return;
     };
-    let as_other_user = |action: &str, target: &str| {
+    let as_other_user = |actions: &[(&str, &str)]| {
         std::process::Command::new(&other_user[0])
             .args(&other_user[1..])
-            .args([action, target])
+            .args(probe_args(actions))
             .output()
             .unwrap()
     };
@@ -172,8 +178,10 @@ fn a_forward_port_refuses_other_users() {
     );
 
     // The other user's connection reaches the port, because the kernel completes the handshake,
-    // but it must never reach the service.
-    let output = as_other_user("tcp-send", &format!("127.0.0.1:{inner}"));
+    // but it must never reach the service. It is held open until the relay closes it: that is
+    // what any use of the service needs, and the kernel names the owner of a socket that exists.
+    let port = format!("127.0.0.1:{inner}");
+    let output = as_other_user(&[("tcp-connect-read", &port)]);
     assert!(output.status.success(), "{output:?}");
     parse(&output)[0].assert_ok();
     thread::sleep(Duration::from_secs(1));

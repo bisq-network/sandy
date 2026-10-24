@@ -830,6 +830,35 @@ fn forward_relay_is_confined_and_ends_with_the_program() {
     check_relay(&args(&["--ip", "all", "--forward", &forward]), inner, 2);
 }
 
+/// The process of the relay that listens on 127.0.0.1:`port` for the program `program_pid`,
+/// once it serves. sandy executes the program only after the relay has reported that it is
+/// ready, and sandy gives up its own copy of the listener first. The intermediate process of the
+/// double fork, a child of the program's process, can still hold the listener for a moment. The
+/// relay is ready when it is the only holder and its parent is not the program.
+fn ready_relay(port: u16, program_pid: u32) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let executed =
+            read_proc(program_pid, "comm").is_some_and(|comm| comm.trim() == "sandy-probe");
+        let holders = listener_inode(port)
+            .map(|inode| socket_holders(&inode))
+            .unwrap_or_default();
+        if let [relay] = holders[..]
+            && executed
+            && parent_of(relay).is_some_and(|parent| parent != program_pid)
+        {
+            return relay;
+        }
+        let parents: Vec<_> = holders.iter().map(|&pid| parent_of(pid)).collect();
+        assert!(
+            Instant::now() < deadline,
+            "no ready relay on port {port}: program executed {executed}, listener holders \
+             {holders:?} with parents {parents:?}, program {program_pid}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Runs a sleeping program with `sandbox_args`, finds the relay that listens on 127.0.0.1:`port`
 /// and checks its confinement, then kills the program and checks that the relay ends. `sockets`
 /// is how many sockets the relay holds.
@@ -843,31 +872,7 @@ fn check_relay(sandbox_args: &[String], port: u16, sockets: usize) {
             .unwrap(),
     );
     let program_pid = program.0.id();
-    // sandy executes the program only after the relay has reported that it is ready, and sandy
-    // gives up its own copy of the listener first. The intermediate process of the double fork,
-    // a child of the program's process, can still hold the listener for a moment. The relay is
-    // ready when it is the only holder and its parent is not the program.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let relay = loop {
-        let executed =
-            read_proc(program_pid, "comm").is_some_and(|comm| comm.trim() == "sandy-probe");
-        let holders = listener_inode(port)
-            .map(|inode| socket_holders(&inode))
-            .unwrap_or_default();
-        if let [relay] = holders[..]
-            && executed
-            && parent_of(relay).is_some_and(|parent| parent != program_pid)
-        {
-            break relay;
-        }
-        let parents: Vec<_> = holders.iter().map(|&pid| parent_of(pid)).collect();
-        assert!(
-            Instant::now() < deadline,
-            "no ready relay on port {port}: program executed {executed}, listener holders \
-             {holders:?} with parents {parents:?}, program {program_pid}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let relay = ready_relay(port, program_pid);
 
     let status = read_proc(relay, "status").unwrap();
     assert_eq!(status_value(&status, "NoNewPrivs"), "1", "{status}");
@@ -937,10 +942,11 @@ fn accepts_within(listener: &std::net::TcpListener, wait: Duration) -> bool {
 fn forward_relay_reaches_only_its_target() {
     let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let target_address = target.local_addr().unwrap();
     let inner = free_port();
-    let forward = format!("{inner}={target_address}");
+    let forward = format!("{inner}={}", target.local_addr().unwrap());
     let sandbox_args = args(&["--ip", "all", "--forward", &forward]);
+    // The program connects and exits without sending anything, so the kernel has dropped the
+    // owner of its socket by the time the relay accepts (rule 6 of "Forwarded ports").
     let lines = probe_inside(
         &sandbox_args,
         &[("tcp-connect", &format!("127.0.0.1:{inner}"))],
@@ -949,6 +955,44 @@ fn forward_relay_reaches_only_its_target() {
     assert!(accepts_within(&target, Duration::from_secs(20)));
     // The relay connects only to the target; the other listener sees nothing.
     assert!(!accepts_within(&other, Duration::from_millis(500)));
+}
+
+/// Rule 6 of "Forwarded ports": a peer that closed its socket before the relay accepted it has
+/// no owner left for the kernel to report, and the relay serves it rather than drop what is in
+/// every ordinary run the program's own connection. Stopping the relay makes the late accept
+/// certain; a program that connects and exits reaches it by itself most of the time, on some
+/// kernels always. This is also the window another local user can retry into (docs/linux.md).
+#[test]
+fn forward_relay_serves_a_peer_that_closed_before_it_accepted() {
+    let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let inner = free_port();
+    let forward = format!("{inner}={}", target.local_addr().unwrap());
+    let sandbox_args = args(&["--ip", "all", "--forward", &forward]);
+    let program = Victim(
+        Command::new(sandy_path())
+            .args(run_args(&sandbox_args, &[("sleep", "600000")]))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let relay = ready_relay(inner, program.0.id()) as libc::pid_t;
+    // SAFETY: kill takes no pointers.
+    unsafe { libc::kill(relay, libc::SIGSTOP) };
+    let address = format!("127.0.0.1:{inner}").parse().unwrap();
+    // The kernel completes the handshake while the relay is stopped.
+    let client = TcpStream::connect_timeout(&address, Duration::from_secs(20)).unwrap();
+    drop(client);
+    // Long enough for the kernel to replace the closed socket with a record without an owner.
+    std::thread::sleep(Duration::from_millis(200));
+    // SAFETY: as above.
+    unsafe { libc::kill(relay, libc::SIGCONT) };
+    assert!(accepts_within(&target, Duration::from_secs(20)));
+    // It was the relay that answered, not a relay the watchdog killed while it was stopped.
+    assert!(
+        !has_ended(relay as u32),
+        "the relay did not survive the stop"
+    );
 }
 
 /// Rule 5 of "Forwarded ports": the relay closes its listeners as soon as the program ends.

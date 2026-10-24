@@ -86,8 +86,8 @@ struct Served {
     listener: TcpListener,
     listen: SocketAddr,
     target: SocketAddr,
-    /// Whether only connections of sandy's own user are relayed (see `peer`).
-    only_our_user: bool,
+    /// Whether a connection the kernel names as another user's is refused (see `peer`).
+    refuse_other_users: bool,
 }
 
 /// Starts the relay and returns once it is confined and serving. `ended` is the read end of the
@@ -106,7 +106,7 @@ pub fn start(config: &RelayConfig, ended: Option<File>) -> Result<(), SandboxErr
                 listener,
                 listen: pair.listen,
                 target: pair.target,
-                only_our_user: index >= exposed,
+                refuse_other_users: index >= exposed,
             })
         })
         .collect::<Result<Vec<_>, SandboxError>>()?;
@@ -353,8 +353,8 @@ fn was_stopped() -> bool {
 }
 
 /// Accepts every waiting connection on `served` and relays each one in its own thread, up to
-/// `sandy_relay::MAX_CONNECTIONS` of this listener at the same time. A connection that may come
-/// only from sandy's own user is closed before it takes one of those places.
+/// `sandy_relay::MAX_CONNECTIONS` of this listener at the same time. A connection the kernel
+/// names as another user's is closed before it takes one of those places.
 fn accept_all(served: &Served, peers: Option<&PeerCheck>, active: &Arc<AtomicUsize>) {
     let target = served.target;
     loop {
@@ -368,8 +368,8 @@ fn accept_all(served: &Served, peers: Option<&PeerCheck>, active: &Arc<AtomicUsi
                 return;
             }
         };
-        if served.only_our_user
-            && !peers.is_some_and(|peers| peers.owned_by_us(peer, served.listen))
+        if served.refuse_other_users
+            && !peers.is_some_and(|peers| peers.may_relay(peer, served.listen))
         {
             continue;
         }

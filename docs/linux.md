@@ -140,17 +140,57 @@ reachable directly anyway, so the relay checks nobody there.
 A forwarded port is different. It exists for the program alone, and the relay reaches `to` as
 sandy's user, so a connection of another user would pass an owner rule of the packet filter or a
 peer credential check in that service. The relay therefore asks the kernel who owns the other
-end of every connection it accepts on a forwarded port, and closes it unless the owner is
-sandy's user. It asks over a `NETLINK_SOCK_DIAG` socket that sandy opens before the relay
-confines itself, with an exact lookup of the connection's four addresses
+end of every connection it accepts on a forwarded port, and closes the connection when the
+answer names another user. It asks over a `NETLINK_SOCK_DIAG` socket that sandy opens before the
+relay confines itself, with an exact lookup of the connection's four addresses
 (`SOCK_DIAG_BY_FAMILY`), and it compares the answer with what it asked, so a lookup that matched
-a listening socket instead, or that reports no owner, is refused like any other failure. Every
-failure closes the connection, and sandy checks the lookup on a connection of its own before it
-starts the relay, so a kernel without `inet_diag` refuses the run instead of refusing every
-connection later. Two limits are inherent: the owner is the user that created the socket, so a
-process of sandy's own user that acts for someone else still passes, and a descriptor passed
-between processes keeps the owner of its creator. macOS has no such check; on Windows only the
-program's AppContainer reaches the forward listener.
+a listening socket instead is refused like any other failure. Every failure closes the
+connection, and sandy checks the lookup on a connection of its own before it starts the relay,
+so a kernel without `inet_diag` refuses the run instead of refusing every connection later.
+
+One answer names nobody, and this is the residual of the check. The owner the kernel reports
+comes from the socket's file, so closing the socket takes it away: from the close onwards the
+answer carries no inode, which is how the kernel says it has no owner to give. The user in such
+an answer cannot be read instead, because kernels differ on it. Up to 6.8 the answer reports
+user 0 from the close; 6.17 and later keep the user until the kernel replaces the socket with a
+timewait record a few milliseconds afterwards. The relay therefore reads the inode, which says
+the same thing on every kernel, and serves a connection that no owner can be found for.
+
+It has to. The kernel completes a handshake by itself, so a program that connects and exits is
+always ahead of the relay's accept, and the relay cannot be made to win that race. Refusing
+these answers refused much of what a forwarded port is there to carry, and how much depended on
+the kernel rather than on anything the program did. One run of a program making 100 connections
+through a forwarded port, counted at the service outside, reading the user:
+
+| program | 6.8, two cpus | 6.17, two cpus | 7.2, 24 cpus |
+| --- | --- | --- | --- |
+| connect and exit | 10 and 6 of 100 | 34 and 43 of 100 | 30 to 32 idle, 8 to 23 loaded |
+| connect, write and exit | 12 and 12 of 100 | 100 of 100 | 100 idle, 41 to 91 loaded |
+
+Reading the inode gives 100 of 100 for both programs on all three kernels, and 4000 of 4000
+connections on the host where the spread was widest. Writing before exiting buys nothing on
+6.8, and the same test run twice on one host differs widely, so neither is a workaround a
+program can rely on. Kernel 6.8 is Ubuntu 22.04 LTS's kernel, a common deployment target, and
+there this is the difference between a forwarded port that mostly works and one that mostly
+does not. Dropping the program's own connection is the one thing a forwarded port must not do,
+and version 1.3.2 had no check at all, so refusing them was a reliability regression against it.
+
+What this leaves open: another local user can get a write through to the service, by connecting,
+writing, closing and retrying until one attempt lands in the window. It cannot read what comes
+back. Losing the file is what loses the owner, and it also gives up the answer, so the service
+cannot be used interactively, read from, or probed for a reply. A peer that only shuts down its
+sending side keeps its socket and its file, so it keeps its owner and is refused like any
+other: half closing is not a way around the check, and because a half closed peer and a closed
+one are both in FIN_WAIT2, the check must read the inode and never the state. The only way to
+close the residual rather than narrow it is a listener other local users cannot reach at all,
+which on Linux means a network namespace, as the AppContainer gives on Windows. Forward only to
+services that are safe against an unauthenticated local write, or that authenticate their
+clients themselves.
+
+Two further limits are inherent: the owner is the user that created the socket, so a process of
+sandy's own user that acts for someone else still passes, and a descriptor passed between
+processes keeps the owner of its creator. macOS has no such check; on Windows only the program's
+AppContainer reaches the forward listener.
 
 
 ## Contained child processes

@@ -304,10 +304,22 @@ Rules:
 6. Who may connect: an exposed port is meant for other processes, including those of other
    users, and the program's own listener is reachable directly on Linux and macOS anyway, so
    the relay serves every connection there. A forwarded port is for the program alone, and the
-   relay reaches `to` as sandy's user. On Linux it therefore refuses connections whose other end
-   belongs to another user, and refuses the run when the kernel cannot tell it the owner
-   (docs/linux.md). On macOS it cannot ask, so a forwarded port is reachable by every local user
-   (docs/macos.md). On Windows only the program's AppContainer reaches it.
+   relay reaches `to` as sandy's user. On Linux it therefore refuses a connection whose other end
+   the kernel names as another user's, and refuses the run when the kernel cannot answer such a
+   lookup at all (docs/linux.md). On macOS it cannot ask, so a forwarded port is reachable by
+   every local user (docs/macos.md). On Windows only the program's AppContainer reaches it.
+
+   There is one answer the kernel cannot give, and the residual that comes with it. The owner it
+   reports comes from the socket's file, so a socket its process has closed has none, which the
+   answer shows by carrying no inode. The relay serves such a connection. It has to: the kernel
+   completes a handshake by itself, so a program that connects and exits is always ahead of the
+   relay's accept, and refusing those answers dropped most of its connections on kernel 6.8 and
+   up to a fifth of them elsewhere, which is the opposite of what a forwarded port is for. What
+   it leaves open is that another local user can get a write through, by connecting, writing,
+   closing and retrying until it lands in the same window. It cannot read the answer, because
+   losing the file is what loses the owner and also gives up the reply, so the service cannot
+   be used interactively or read from; and a peer that only half closes keeps its file and its
+   owner, so that is not a way around the check either (docs/linux.md).
 7. The relay passes the end of a stream on as it came: a normal end as a half close, and a reset,
    or data the relay cannot deliver, as a reset of the other side. After one direction of a
    connection has ended, the other ends when it stays idle for `sandy_relay::HALF_CLOSED_IDLE`
@@ -437,8 +449,8 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   ends at most one second after it (rule 5 of "Forwarded ports"), or two seconds when the program
   stopped it, which a timer the relay re-arms takes care of. It confines itself with
   no_new_privs, Landlock without file access (TCP connect only to the relay targets from ABI 4)
-  and a seccomp filter limited to TCP, copying, threads and that timer. A forwarded port serves
-  only sandy's own user (rule 6 of "Forwarded ports").
+  and a seccomp filter limited to TCP, copying, threads and that timer. A forwarded port refuses
+  a connection the kernel names as another user's (rule 6 of "Forwarded ports").
 - Refused: no Landlock (the reason names the fix), no seccomp, root or any capability, a writable
   path that overlaps the minimal system set (rule 6), a program whose ELF loader no executable
   path covers (the kernel opens it during `execve`).
