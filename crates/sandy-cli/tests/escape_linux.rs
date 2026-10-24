@@ -379,8 +379,19 @@ fn other_processes_cannot_be_changed() {
     for line in controlled(&[], &other) {
         line.assert_blocked();
     }
+    // Process ID 0, the caller, always works.
+    let caller: Vec<(&str, &str)> = calls.iter().map(|call| (*call, "0")).collect();
+    for line in probe_inside(&[], &caller) {
+        line.assert_ok();
+    }
+    // The program's own ID works only where no process it started can outlive it and see the ID
+    // go to another process.
     let own: Vec<(&str, &str)> = calls.iter().map(|call| (*call, "self")).collect();
     for line in probe_inside(&[], &own) {
+        line.assert_blocked();
+    }
+    let no_children = ["--children".to_string(), "none".to_string()];
+    for line in probe_inside(&no_children, &own) {
         line.assert_ok();
     }
 }

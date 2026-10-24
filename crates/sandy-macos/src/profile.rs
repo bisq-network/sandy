@@ -407,6 +407,15 @@ fn hardening_rules(writer: &mut Writer) {
         .collect();
     writer.rule("deny", &["syscall-unix"], &filters);
 
+    writer.comment(
+        "The hardware UUID, which the denial of IOKit properties already hides: gethostuuid.",
+    );
+    let filters: Vec<String> = system::MACHINE_ID_SYSCALLS
+        .iter()
+        .map(|(_, number)| format!("(syscall-number {number})"))
+        .collect();
+    writer.rule("deny", &["syscall-unix"], &filters);
+
     writer.comment("TIOCSTI would type commands into the terminal of the caller.");
     writer.line(&format!(
         "(deny file-ioctl (ioctl-command {}))",
@@ -555,6 +564,10 @@ mod tests {
   (syscall-number 217)
   (syscall-number 479)
   (syscall-number 225))
+
+; The hardware UUID, which the denial of IOKit properties already hides: gethostuuid.
+(deny syscall-unix
+  (syscall-number 142))
 
 ; TIOCSTI would type commands into the terminal of the caller.
 (deny file-ioctl (ioctl-command 2147578994))

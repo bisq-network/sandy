@@ -193,6 +193,12 @@ pub const BY_ID_SYSCALLS: &[(&str, u32)] = &[
     ("searchfs", 225),
 ];
 
+/// System calls that return an identifier of the machine that every user and every reinstall
+/// share: gethostuuid returns the hardware UUID, which IOKit (`IOPlatformUUID`) would give only
+/// with `iokit-get-properties`, which the profile denies. Number from XNU
+/// `bsd/kern/syscalls.master`.
+pub const MACHINE_ID_SYSCALLS: &[(&str, u32)] = &[("gethostuuid", 142)];
+
 /// System calls that move a process out of its process group, denied with
 /// `process.children = "contained"`. posix_spawn is denied as a whole: its POSIX_SPAWN_SETSID and
 /// POSIX_SPAWN_SETPGROUP flags change the group inside the kernel, where no profile rule sees

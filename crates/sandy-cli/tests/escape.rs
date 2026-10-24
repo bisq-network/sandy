@@ -218,6 +218,80 @@ fn refuses_a_relative_program_path() {
     assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
 }
 
+/// The program gets argv[0] as the caller wrote the program, not the resolved path: multi-call
+/// programs choose their behavior by this name.
+#[test]
+fn the_program_gets_the_name_the_caller_gave_it() {
+    let fixture = Fixture::new("arg0");
+    let program = fixture.copy_probe("bin");
+    // Rust removes `.` from a path with the Windows `\\?\` prefix, so spell it without one.
+    let plain = program.strip_prefix(r"\\?\").unwrap_or(&program);
+    let path = std::path::Path::new(plain);
+    let spelled = path
+        .parent()
+        .unwrap()
+        .join(".")
+        .join(path.file_name().unwrap());
+    let spelled = spelled.to_str().unwrap();
+    let mut args = vec!["run".to_string()];
+    args.extend(platform_args());
+    args.extend(fixture.access_args());
+    args.extend([
+        "--".to_string(),
+        spelled.to_string(),
+        "arg0".to_string(),
+        "-".to_string(),
+    ]);
+    let output = sandy(&args);
+    assert!(output.status.success(), "{output:?}");
+    let lines = parse(&output);
+    lines[0].assert_ok();
+    assert_eq!(lines[0].detail, spelled);
+}
+
+/// The policy file is trusted: a program that could write it would choose its own policy for
+/// the next start.
+#[test]
+fn refuses_a_policy_file_inside_a_writable_path() {
+    let fixture = Fixture::new("policy-file");
+    let write_policy = |dir: &str| {
+        let file = fixture.path(dir).join("policy.toml");
+        let text = format!(
+            "version = 1\n[filesystem]\nread_write = ['{}']\n",
+            fixture.arg("rw")
+        );
+        std::fs::write(&file, text).unwrap();
+        file.to_str().unwrap().to_string()
+    };
+    let mut check = vec!["check".to_string()];
+    check.extend(platform_args());
+
+    // Control: the same policy from a directory the program cannot write.
+    let mut args = check.clone();
+    args.extend(["--policy".to_string(), write_policy("ro")]);
+    let output = sandy(&args);
+    assert!(output.status.success(), "{output:?}");
+
+    let mut args = check;
+    args.extend(["--policy".to_string(), write_policy("rw")]);
+    let output = sandy(&args);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("inside writable path"), "{stderr}");
+}
+
+/// check refuses what run would refuse: --parent-pid without end_with_parent.
+#[test]
+fn check_refuses_a_parent_pid_without_end_with_parent() {
+    let mut args = vec!["check".to_string()];
+    args.extend(platform_args());
+    args.extend(["--parent-pid".to_string(), std::process::id().to_string()]);
+    let output = sandy(&args);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--parent-pid"), "{stderr}");
+}
+
 #[test]
 fn metadata_outside_writable_paths_cannot_change() {
     let fixture = Fixture::new("metadata");

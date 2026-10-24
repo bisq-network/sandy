@@ -16,7 +16,7 @@ sandy run \
   -- /srv/app/bin/server --port 8080
 ```
 
-Version 1.3.1. Policies use format `version = 1`.
+Version 1.3.2. Policies use format `version = 1`.
 
 ## Contents
 
@@ -202,7 +202,8 @@ denied" (Windows), and add exactly the path it needs.
 
 ### A policy file
 
-Options can come from a TOML file. Command line options extend the file.
+Options can come from a TOML file. Path options on the command line add to the file's paths;
+every other option replaces the file's value, also with a weaker one.
 
 ```toml
 # /etc/sandy/convert.toml
@@ -299,7 +300,7 @@ matters only on Windows (see [Windows](#windows)); on Linux and macOS it does no
 
 | Option | Meaning | Default |
 |---|---|---|
-| `--policy FILE` | Read the policy from a TOML file. The other options extend it. | none |
+| `--policy FILE` | Read the policy from a TOML file (at most one). Path options add to it; the other options replace its values. | none |
 | `--read PATH` | Allow reading files and listing directories below `PATH`. | |
 | `--read-exec PATH` | Allow reading and executing below `PATH`. | |
 | `--read-write PATH` | Allow reading, creating, changing and deleting below `PATH`. Never executing. | |
@@ -325,8 +326,8 @@ The options that take a path or a variable can be repeated.
 | Status | Meaning |
 |---|---|
 | the program's status | `sandy run` started the program |
-| 128 + signal number | Linux with `children = "contained"`: a signal ended the program |
-| 125 | sandy failed or refused: invalid policy, a requirement this host cannot enforce, a setup error |
+| 128 + signal number | Linux and macOS with `children = "contained"`: a signal ended the program |
+| 125 | sandy failed or refused: invalid policy, a requirement this host cannot enforce, a setup error; with `children = "contained"` also a failure while sandy supervises the program |
 | 0 / 1 | `sandy check`: the policy is enforceable / not enforceable |
 
 On Windows the program's 32-bit exit code is passed through unchanged.
@@ -372,8 +373,10 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
    rule applies to the path and everything below it.
 2. **Never writable and executable.** No path may be both writable and executable, also not
    through nesting (a `read_write` directory inside a `read_exec` directory, or the reverse).
-3. **Nothing inside a writable path.** No policy path may lie inside a `read_write` path. The
-   program could replace it with a symbolic link, and the next start would follow the link.
+3. **Nothing inside a writable path.** No policy path may lie inside a `read_write` path, or be
+   reached through a symbolic link inside one. The program could replace it with a symbolic
+   link, and the next start would follow the link. sandy's own executable and the policy file
+   must not lie inside a `read_write` path either.
 4. **The program file** gets read and execute access automatically. It must not lie inside a
    `read_write` path.
 5. **The minimal system set** (`system = "minimal"`) adds, read-only, what programs need to start:
@@ -396,8 +399,8 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
 
 - `ip = "none"` denies IPv4 and IPv6, including loopback. `ip = "all"` allows every destination.
 - `unix_sockets = "none"` guarantees that the program cannot connect to Unix sockets outside its
-  `read_write` paths. Linux and macOS deny Unix sockets completely; Windows allows sockets inside
-  `read_write` paths, because it checks socket access through the socket file.
+  `read_write` paths. Linux and macOS deny connections to every Unix socket; Windows allows
+  sockets inside `read_write` paths, because it checks socket access through the socket file.
 - **WARNING:** `unix_sockets = "all"` gives up most of the isolation. The program can reach every
   local service on a Unix socket. On Linux that includes the D-Bus session bus, through which the
   systemd user manager starts arbitrary commands outside the sandbox. On macOS it includes the DNS
@@ -405,7 +408,8 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
   for programs you would also run without a sandbox.
 - `expose` entries: `listen` must be a loopback address, must differ from the program's own
   address, and may appear only once. They need `ip = "all"` in this version. At most 256
-  connections are relayed at the same time.
+  connections per port are relayed at the same time. A connection that is still open when the
+  relay ends, one second after the program, is reset, so a cut stream never looks complete.
 
 ### Processes
 
@@ -543,7 +547,9 @@ Recommendations:
 
 1. **Call `sandy check` first** and show its output when the exit status is 1, so users learn
    why the program cannot run on their host.
-2. **Treat exit status 125 as "not started".** sandy prints the reason on standard error.
+2. **Treat exit status 125 as "not started".** sandy prints the reason on standard error. Two
+   exceptions: a program can exit with 125 itself, and with `children = "contained"` sandy can
+   fail while it supervises a running program (its message then starts with "run failed").
 3. **Keep sandy, the policy and the program's binaries out of every writable path.** Use separate
    directories for binaries (`read_exec`) and data (`read_write`). A program that can rewrite its
    own binary or library directory can escape at the next start.

@@ -3,6 +3,7 @@
 
 mod common;
 
+use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -95,4 +96,52 @@ fn expose_without_ip_is_refused() {
     let output = sandy(run_args(&sandbox_args, &[("env", "PATH")]));
     assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
     assert!(output.stdout.is_empty(), "{output:?}");
+}
+
+/// The relay holds many connections at once: each one needs two descriptors in the relay, more
+/// than the soft limit of 256 that macOS gives a process, which the relay raises.
+#[test]
+fn an_exposed_port_relays_many_connections_at_once() {
+    const CONNECTIONS: usize = 180;
+    let fixture = Fixture::new("expose-many");
+    let (inner, outer) = (free_port(), free_port());
+    let mut sandbox_args = fixture.access_args();
+    sandbox_args.extend([
+        "--ip".to_string(),
+        "all".to_string(),
+        "--expose".to_string(),
+        format!("127.0.0.1:{outer}={inner}"),
+    ]);
+    let serve = format!("127.0.0.1:{inner}\u{1f}{CONNECTIONS}");
+    let server = Command::new(sandy_path())
+        .args(run_args(&sandbox_args, &[("tcp-serve", &serve)]))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let address = format!("127.0.0.1:{outer}").parse().unwrap();
+    let deadline = Instant::now() + WAIT * 3;
+    let mut clients = Vec::with_capacity(CONNECTIONS);
+    // Every connection stays open, so all of them go through the relay at the same time. Before
+    // the program listens, the relay closes connections without a greeting; those are retried.
+    while clients.len() < CONNECTIONS && Instant::now() < deadline {
+        let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(500))
+        else {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut greeting = [0u8; 3];
+        match stream.read_exact(&mut greeting) {
+            Ok(()) if &greeting == b"hi\n" => clients.push(stream),
+            _ => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    let greeted = clients.len();
+    let output = server.wait_with_output().unwrap();
+    assert_eq!(greeted, CONNECTIONS, "{output:?}");
+    assert!(output.status.success(), "{output:?}");
+    parse(&output)[0].assert_ok();
 }

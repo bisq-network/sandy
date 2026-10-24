@@ -76,6 +76,13 @@ const CANDIDATES: &[(&str, SystemUse, Needed)] = &[
         SystemUse::Read,
         Needed::Always,
     ),
+    // The back-ends are symbolic links into the policy texts; Landlock checks the target.
+    (
+        "/usr/share/crypto-policies",
+        SystemUse::Read,
+        Needed::Always,
+    ),
+    ("/etc/pki/tls/openssl.d", SystemUse::Read, Needed::Always),
     ("/etc/hosts", SystemUse::Read, Needed::WithIpNetwork),
     ("/etc/resolv.conf", SystemUse::Read, Needed::WithIpNetwork),
     ("/etc/nsswitch.conf", SystemUse::Read, Needed::WithIpNetwork),
@@ -135,43 +142,91 @@ pub fn detect() -> Vec<SystemPath> {
     found
 }
 
-/// Returns every candidate, also those that do not exist, where it is or would be: symbolic links
-/// in the existing part of the path are resolved. A missing candidate such as /etc/ld.so.preload
-/// matters too, because a program that can write its directory can create it.
+/// Returns every candidate, also those that do not exist, where it is or would be, and where each
+/// symbolic link on the way to it is. A missing candidate such as /etc/ld.so.preload matters too,
+/// because a program that can write its directory can create it. So does the missing target of
+/// a symbolic link such as /etc/resolv.conf, which programs outside the sandbox would read once
+/// it exists, and the link itself, which a program that can write its directory can replace.
 pub fn locations() -> Vec<SystemPath> {
     candidates()
-        .map(|(path, usage, needed)| {
-            let path = resolve_existing_part(Path::new(path));
-            let is_dir = path.metadata().is_ok_and(|metadata| metadata.is_dir());
-            SystemPath {
-                path,
+        .flat_map(|(path, usage, needed)| {
+            let (location, links) = resolve_existing_part(Path::new(path));
+            let is_dir = location.metadata().is_ok_and(|metadata| metadata.is_dir());
+            let links = links.into_iter().map(move |link| SystemPath {
+                path: link,
+                is_dir: false,
+                usage,
+                needed,
+            });
+            std::iter::once(SystemPath {
+                path: location,
                 is_dir,
                 usage,
                 needed,
-            }
+            })
+            .chain(links)
         })
         .collect()
 }
 
-/// `path` with its longest existing prefix replaced by that prefix's canonical form.
-fn resolve_existing_part(path: &Path) -> PathBuf {
-    let mut rest = Vec::new();
-    let mut existing = path;
-    loop {
-        if let Ok(canonical) = existing.canonicalize() {
-            return rest
-                .iter()
-                .rev()
-                .fold(canonical, |path, name| path.join(name));
-        }
-        match (existing.parent(), existing.file_name()) {
-            (Some(parent), Some(name)) => {
-                rest.push(name);
-                existing = parent;
+/// Where `path` is or would be, like `canonicalize`, except that the part from the first missing
+/// entry on is kept as written, also the missing target of a symbolic link. Also returns where
+/// each symbolic link on the way is (its canonical directory plus its name).
+fn resolve_existing_part(path: &Path) -> (PathBuf, Vec<PathBuf>) {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::path::Component;
+
+    /// As the kernel's limit for one path lookup (MAXSYMLINKS).
+    const MAX_LINKS: usize = 40;
+    fn queue_front(pending: &mut VecDeque<OsString>, path: &Path) {
+        for component in path.components().rev() {
+            match component {
+                Component::Normal(name) => pending.push_front(name.to_os_string()),
+                Component::ParentDir => pending.push_front(OsString::from("..")),
+                Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
             }
-            _ => return path.to_path_buf(),
         }
     }
+
+    let mut resolved = PathBuf::from("/");
+    let mut links = Vec::new();
+    let mut pending = VecDeque::new();
+    queue_front(&mut pending, path);
+    while let Some(name) = pending.pop_front() {
+        if name == ".." {
+            resolved.pop();
+            continue;
+        }
+        let entry = resolved.join(&name);
+        let link = std::fs::symlink_metadata(&entry)
+            .ok()
+            .filter(|metadata| metadata.file_type().is_symlink())
+            .and_then(|_| std::fs::read_link(&entry).ok());
+        match link {
+            Some(target) if links.len() < MAX_LINKS => {
+                links.push(entry);
+                if target.is_absolute() {
+                    resolved = PathBuf::from("/");
+                }
+                queue_front(&mut pending, &target);
+            }
+            _ if entry.symlink_metadata().is_ok() => resolved = entry,
+            _ => {
+                // Missing: the rest stays as written.
+                resolved = entry;
+                for rest in pending {
+                    if rest == ".." {
+                        resolved.pop();
+                    } else {
+                        resolved.push(rest);
+                    }
+                }
+                break;
+            }
+        }
+    }
+    (resolved, links)
 }
 
 #[cfg(test)]
@@ -193,7 +248,7 @@ mod tests {
     #[test]
     fn locations_include_missing_candidates() {
         let locations = locations();
-        assert_eq!(locations.len(), candidates().count());
+        assert!(locations.len() >= candidates().count());
         let preload = locations
             .iter()
             .find(|entry| entry.path.ends_with("ld.so.preload"))
@@ -203,6 +258,27 @@ mod tests {
             preload.path.parent().unwrap(),
             Path::new("/etc").canonicalize().unwrap()
         );
+    }
+
+    /// A symbolic link whose target is missing counts at both places: where the link is, and
+    /// where its target would be.
+    #[test]
+    fn a_dangling_link_counts_where_it_is_and_where_it_points() {
+        let dir = std::env::temp_dir().join(format!("sandy-system-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("etc")).unwrap();
+        std::fs::create_dir_all(dir.join("run")).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        std::os::unix::fs::symlink("../run/missing/stub.conf", dir.join("etc/resolv.conf"))
+            .unwrap();
+        let (location, links) = resolve_existing_part(&dir.join("etc/resolv.conf"));
+        assert_eq!(location, dir.join("run/missing/stub.conf"));
+        assert_eq!(links, [dir.join("etc/resolv.conf")]);
+        // An existing path resolves like canonicalize.
+        let (location, links) = resolve_existing_part(&dir.join("etc"));
+        assert_eq!(location, dir.join("etc"));
+        assert!(links.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

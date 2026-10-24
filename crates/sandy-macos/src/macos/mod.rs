@@ -52,9 +52,19 @@ impl Backend for MacosBackend {
             })?;
         }
         let seatbelt = Seatbelt::load().map_err(SandboxError::new)?;
+        let contained = policy.children == ChildProcesses::Contained;
         let pairs = relay_pairs(policy);
+        // With `contained`, the relay also ends when the guard has ended the program's group.
+        let mut group_ended = None;
         if !pairs.is_empty() {
-            relay::start(&pairs, &seatbelt)?;
+            let ended = if contained {
+                let (read, write) = helper::pipe("the pipe of the group's end")?;
+                group_ended = Some(write);
+                Some(read)
+            } else {
+                None
+            };
+            relay::start(&pairs, &seatbelt, ended)?;
         }
         if policy.end_with_parent {
             // SAFETY: getppid has no preconditions.
@@ -74,11 +84,14 @@ impl Backend for MacosBackend {
                 error,
             )
         };
-        if policy.children == ChildProcesses::Contained {
-            return contain::run(|| match apply() {
-                Ok(()) => cannot_execute(target.execve()),
-                Err(error) => error,
-            });
+        if contained {
+            return contain::run(
+                || match apply() {
+                    Ok(()) => cannot_execute(target.execve()),
+                    Err(error) => error,
+                },
+                group_ended,
+            );
         }
         apply()?;
         Err(cannot_execute(target.exec()))

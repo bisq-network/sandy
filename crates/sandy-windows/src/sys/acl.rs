@@ -28,14 +28,16 @@ use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS
 use super::host;
 use super::util::{LocalBox, SessionLock, Sid, last_error, wide_nul, win32_error};
 use crate::access::{
-    ALL_APPLICATION_PACKAGES, Ace, AceKind, CONTAINER_INHERIT_ACE, FILE_EXECUTE, INHERITED_ACE,
-    OBJECT_INHERIT_ACE, access_mask, ace_flags, grants, has_explicit_ace,
+    ALL_APPLICATION_PACKAGES, ALL_RESTRICTED_APPLICATION_PACKAGES, Ace, AceKind,
+    CONTAINER_INHERIT_ACE, FILE_EXECUTE, INHERITED_ACE, OBJECT_INHERIT_ACE, access_mask, ace_flags,
+    grants, has_explicit_ace, may_grant,
 };
 use crate::name::{FileIdentity, grant_capability_name};
 
 /// Makes sure the AppContainer can use `rule.path` at `rule.access` and returns the capability
 /// the target must hold for it. Changes nothing when the grant is already in place.
 pub fn grant(appcontainer: &str, rule: &PathRule) -> Result<Sid, SandboxError> {
+    check_writable(rule).map_err(SandboxError::new)?;
     let path = wide_nul(rule.path.as_os_str());
     let capability = grant_capability(appcontainer, rule, &path)?;
     if !lacks_grant(rule, &capability, &Dacl::read(&path, &rule.path)?)? {
@@ -62,6 +64,43 @@ pub fn grant(appcontainer: &str, rule: &PathRule) -> Result<Sid, SandboxError> {
         )?;
     }
     Ok(capability)
+}
+
+/// Refuses a writable path where Windows lets every AppContainer execute files: on the path
+/// itself, or on files and directories created in it, as below `C:\Program Files`. The program
+/// could write a program there and run it (DESIGN.md rules 3 and 6). Changes nothing.
+pub fn check_writable(rule: &PathRule) -> Result<(), String> {
+    if rule.access != PathAccess::ReadWrite {
+        return Ok(());
+    }
+    let path = wide_nul(rule.path.as_os_str());
+    let aces = Dacl::read(&path, &rule.path)
+        .and_then(|dacl| dacl.aces(&rule.path))
+        .map_err(|error| error.to_string())?;
+    if aces.has_unknown_types {
+        return Err(format!(
+            "the permissions of writable path {} contain entries that sandy cannot evaluate, so \
+             it cannot tell whether AppContainers may execute files there",
+            rule.path.display()
+        ));
+    }
+    let entries = aces.entries();
+    for (sid, group) in [
+        (ALL_APPLICATION_PACKAGES, "ALL APPLICATION PACKAGES"),
+        (
+            ALL_RESTRICTED_APPLICATION_PACKAGES,
+            "ALL RESTRICTED APPLICATION PACKAGES",
+        ),
+    ] {
+        if may_grant(&entries, sid, FILE_EXECUTE, rule.is_dir) {
+            return Err(format!(
+                "Windows lets every AppContainer ({group}) execute files in writable path {}, so \
+                 the program could write a program there and run it",
+                rule.path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Whether `grant` would succeed for `rule`: the grant is in place, or the current user may

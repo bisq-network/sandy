@@ -267,6 +267,11 @@ pub enum PolicyError {
         writable: PathBuf,
         executable: PathBuf,
     },
+    ResolvedThroughWritable {
+        path: PathBuf,
+        entry: PathBuf,
+        writable: PathBuf,
+    },
     InsideWritable {
         path: PathBuf,
         writable: PathBuf,
@@ -310,6 +315,18 @@ impl fmt::Display for PolicyError {
                 writable.display(),
                 executable.display()
             ),
+            PolicyError::ResolvedThroughWritable {
+                path,
+                entry,
+                writable,
+            } => write!(
+                f,
+                "policy path {} is resolved through {}, which lies inside writable path {}; the \
+                 program could change where it leads before the next start",
+                path.display(),
+                entry.display(),
+                writable.display()
+            ),
             PolicyError::InsideWritable { path, writable } => write!(
                 f,
                 "policy path {} lies inside writable path {}; the program could replace it with a symbolic link before the next start",
@@ -338,7 +355,7 @@ impl fmt::Display for PolicyError {
                 expose.listen, expose.port
             ),
             PolicyError::ProgramNotAFile(path) => {
-                write!(f, "program is not a regular file: {}", path.display())
+                write!(f, "program is a directory: {}", path.display())
             }
             PolicyError::InvalidEnvironmentName(name) => {
                 write!(f, "invalid environment variable name: {name:?}")

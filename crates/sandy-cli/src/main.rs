@@ -191,6 +191,19 @@ fn execute(invocation: Invocation, parent_at_start: Option<u32>) -> Result<ExitC
     invocation.overrides.apply(&mut policy);
     let resolved = ResolvedPolicy::resolve(&policy, invocation.program.as_deref())
         .map_err(|error| error.to_string())?;
+    // Checked in every mode, so that check reports what run would refuse.
+    let parent = parent_for(
+        invocation.parent_pid,
+        parent_at_start,
+        resolved.end_with_parent,
+    )?;
+    let sandy_path = std::env::current_exe()
+        .map_err(|error| format!("cannot find the path of sandy: {error}"))?;
+    let trusted = [
+        Some(sandy_path.as_path()),
+        invocation.policy_file.as_deref(),
+    ];
+    refuse_trusted_inside_writable(&resolved, trusted.into_iter().flatten())?;
     let backend = platform_backend();
     let plan = EnforcementPlan::new(&resolved.requirements(), backend.plan(&resolved));
 
@@ -228,11 +241,7 @@ fn execute(invocation: Invocation, parent_at_start: Option<u32>) -> Result<ExitC
                 args: invocation.args,
                 env: target_environment(&resolved.environment, std::env::vars_os()),
                 cwd: invocation.cwd,
-                parent: parent_for(
-                    invocation.parent_pid,
-                    parent_at_start,
-                    resolved.end_with_parent,
-                )?,
+                parent,
             };
             let code = backend
                 .run(&resolved, &command)
@@ -243,6 +252,33 @@ fn execute(invocation: Invocation, parent_at_start: Option<u32>) -> Result<ExitC
             std::process::exit(code)
         }
     }
+}
+
+/// sandy and its policy are trusted: the program must not be able to change them for the next
+/// start (see "Threat model" in DESIGN.md). A writable path that contains either would let it.
+fn refuse_trusted_inside_writable<'a>(
+    resolved: &ResolvedPolicy,
+    trusted: impl IntoIterator<Item = &'a std::path::Path>,
+) -> Result<(), String> {
+    for path in trusted {
+        let canonical = path
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve {}: {error}", path.display()))?;
+        let writable = resolved
+            .paths
+            .iter()
+            .filter(|rule| rule.access == sandy_core::PathAccess::ReadWrite)
+            .find(|rule| canonical.starts_with(&rule.path));
+        if let Some(rule) = writable {
+            return Err(format!(
+                "{} lies inside writable path {}; the program could change it before the next \
+                 start",
+                canonical.display(),
+                rule.path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn refusal(plan: &EnforcementPlan) -> String {

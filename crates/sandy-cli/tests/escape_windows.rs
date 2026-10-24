@@ -100,6 +100,34 @@ fn read_write_paths_are_not_executable() {
     lines[2].assert_blocked();
 }
 
+/// A writable directory where Windows lets every AppContainer execute new files, as below
+/// C:\Program Files, would make files the program writes executable (rules 3 and 6). sandy
+/// refuses such a policy before it starts anything.
+#[test]
+fn a_writable_path_that_all_appcontainers_may_execute_is_refused() {
+    let fixture = Fixture::new("rw-aap-exec");
+    let check = |fixture: &Fixture| {
+        let mut args = vec!["check".to_string()];
+        args.extend(platform_args());
+        args.extend(fixture.access_args());
+        sandy(&args)
+    };
+    // Control: the fixture's writable directory is accepted.
+    let output = check(&fixture);
+    assert!(output.status.success(), "{output:?}");
+
+    // ALL APPLICATION PACKAGES, read and execute, inherited by everything created inside.
+    let granted = Command::new("icacls")
+        .args([&fixture.arg("rw"), "/grant", "*S-1-15-2-1:(OI)(CI)(RX)"])
+        .output()
+        .unwrap();
+    assert!(granted.status.success(), "{granted:?}");
+    let output = check(&fixture);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("ALL APPLICATION PACKAGES"), "{stdout}");
+}
+
 /// sandy grants each path to a capability that only runs with this path in the policy hold.
 /// The access control entry stays on disk, but it must grant nothing to a later run.
 #[test]

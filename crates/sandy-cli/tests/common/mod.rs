@@ -510,6 +510,102 @@ pub mod unix {
         }
     }
 
+    /// The processes of process group `group` that have not ended; zombies do not count.
+    pub fn live_members(group: libc::pid_t) -> Vec<libc::pid_t> {
+        members(group)
+            .into_iter()
+            .filter_map(|(pid, live)| live.then_some(pid))
+            .collect()
+    }
+
+    /// Whether `group` has ended: no live process in it, and nothing changes in it for a moment.
+    /// Processes that fork in a loop live only microseconds, so one look can miss them all; while
+    /// they run, members come and go.
+    pub fn group_ended(group: libc::pid_t) -> bool {
+        let before = members(group);
+        if before.iter().any(|&(_, live)| live) {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        members(group) == before
+    }
+
+    /// The processes of process group `group`, sorted, each with whether it is live (not a
+    /// zombie).
+    fn members(group: libc::pid_t) -> Vec<(libc::pid_t, bool)> {
+        #[cfg(target_os = "macos")]
+        let mut found: Vec<(libc::pid_t, bool)> = {
+            use std::mem::{MaybeUninit, size_of};
+            let mut pids = vec![0 as libc::pid_t; 4096];
+            let size = (pids.len() * size_of::<libc::pid_t>()) as libc::c_int;
+            // SAFETY: the buffer holds `size` bytes.
+            let count = unsafe { libc::proc_listpgrppids(group, pids.as_mut_ptr().cast(), size) };
+            pids.truncate(count.max(0) as usize);
+            pids.into_iter()
+                .filter_map(|pid| {
+                    let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+                    let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+                    // SAFETY: the buffer has exactly the size passed.
+                    let written = unsafe {
+                        libc::proc_pidinfo(
+                            pid,
+                            libc::PROC_PIDTBSDINFO,
+                            0,
+                            info.as_mut_ptr().cast(),
+                            size,
+                        )
+                    };
+                    if written != size {
+                        return None;
+                    }
+                    // SAFETY: proc_pidinfo filled the whole structure.
+                    let status = unsafe { info.assume_init() }.pbi_status;
+                    Some((pid, status != libc::SZOMB))
+                })
+                .collect()
+        };
+        #[cfg(not(target_os = "macos"))]
+        let mut found: Vec<(libc::pid_t, bool)> = {
+            let Ok(entries) = std::fs::read_dir("/proc") else {
+                return Vec::new();
+            };
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    let pid: libc::pid_t = entry.file_name().to_str()?.parse().ok()?;
+                    let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+                    // After the name in parentheses: state, parent, process group.
+                    let mut fields = stat[stat.rfind(')')? + 2..].split_whitespace();
+                    let state = fields.next()?;
+                    let pgrp: libc::pid_t = fields.nth(1)?.parse().ok()?;
+                    (pgrp == group).then_some((pid, !matches!(state, "Z" | "X")))
+                })
+                .collect()
+        };
+        found.sort_unstable();
+        found
+    }
+
+    /// Whether a live process is in `group`. kill fails with ESRCH for an empty group, and with
+    /// EPERM on macOS for one with only zombies. Faster than `live_members` for processes that
+    /// live only microseconds.
+    pub fn group_alive(group: libc::pid_t) -> bool {
+        // SAFETY: signal 0 only checks whether the group has a process that may be signaled.
+        unsafe { libc::kill(-group, 0) == 0 }
+    }
+
+    /// Ends every process of `group`, also those forked while it is signaled. For cleaning up
+    /// after a test.
+    pub fn kill_group(group: libc::pid_t) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // SAFETY: kill takes a process group ID and a signal.
+        while unsafe { libc::kill(-group, libc::SIGKILL) } == 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
     /// Reads and discards what the terminal shows (the echo of typed input, for example), as a
     /// terminal emulator does. On macOS a session leader that exits waits until its terminal's
     /// output is read, so a test that types input needs this to see the leader end.

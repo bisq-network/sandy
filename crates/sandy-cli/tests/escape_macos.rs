@@ -441,6 +441,88 @@ fn ptrace_cannot_attach_outside_the_sandbox() {
     lines[0].assert_blocked();
 }
 
+/// The root of a writable path can be written in place, but not deleted, moved or replaced:
+/// otherwise the program could put a symbolic link in its place, and the next run would resolve
+/// the path to the link's target. Every action below is allowed by the other rules of the
+/// profile (both ends lie in writable paths), so only the anchor rule can deny it.
+#[test]
+fn writable_roots_cannot_be_deleted_or_replaced() {
+    let fixture = Fixture::new("macos-anchors");
+    let prepare = || {
+        fixture.reset();
+        fs::create_dir_all(fixture.path("rw2/sub")).unwrap();
+        fs::create_dir_all(fixture.path("rw3")).unwrap();
+        fs::write(fixture.path("wfile"), b"content").unwrap();
+        fs::write(fixture.path("rw/other"), b"other").unwrap();
+    };
+    prepare();
+    let args = with(
+        fixture.access_args(),
+        &[
+            "--read-write",
+            &fixture.arg("rw2"),
+            "--read-write",
+            &fixture.arg("rw3"),
+            "--read-write",
+            &fixture.arg("wfile"),
+        ],
+    );
+    let pair = |from: &str, to: &str| spawn_target(&[&fixture.arg(from), &fixture.arg(to)]);
+    let (wfile, rw3) = (fixture.arg("wfile"), fixture.arg("rw3"));
+    let (move_dir, over_file) = (pair("rw2", "rw/moved"), pair("rw/other", "wfile"));
+    let actions = [
+        ("write", wfile.as_str()),
+        ("rename", move_dir.as_str()),
+        ("rmdir", rw3.as_str()),
+        ("rename", over_file.as_str()),
+        ("delete", wfile.as_str()),
+    ];
+    for line in probe_outside(&actions) {
+        line.assert_ok();
+    }
+    prepare();
+
+    let lines = probe_inside(&args, &actions);
+    lines[0].assert_ok();
+    for line in &lines[1..] {
+        line.assert_blocked();
+    }
+    for root in ["rw2/sub", "rw3", "wfile", "rw/other"] {
+        assert!(fixture.path(root).exists(), "{root} was moved or deleted");
+    }
+}
+
+/// macOS ignores a second profile, so sandy inside a sandbox must refuse instead of starting a
+/// program that would be confined only by the outer profile.
+#[test]
+fn sandy_refuses_to_run_inside_a_sandbox() {
+    let fixture = Fixture::new("macos-nested");
+    let inner = fixture.path("bin/sandy");
+    fs::copy(sandy_path(), &inner).unwrap();
+    let inner = inner.to_str().unwrap().to_string();
+    let probe = fixture.copy_probe("bin");
+    let readable = fixture.arg("ro/file");
+    // A program that only reads a file the policy grants, so it needs nothing from the host.
+    let mut inner_run = vec!["run".to_string()];
+    inner_run.extend(fixture.access_args());
+    inner_run.extend([probe, "read".to_string(), readable]);
+    // Control: outside a sandbox the copy runs the program.
+    let output = Command::new(&inner).args(&inner_run).output().unwrap();
+    assert!(output.status.success(), "control: {output:?}");
+    parse(&output)[0].assert_ok();
+
+    let mut outer = vec!["run".to_string()];
+    outer.extend(fixture.access_args());
+    outer.extend(["--".to_string(), inner]);
+    let output = sandy(outer.iter().chain(&inner_run));
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    assert!(parse(&output).is_empty(), "the program started: {output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("already runs in a Seatbelt sandbox"),
+        "{output:?}"
+    );
+}
+
 /// sandy's Rust runtime ignores SIGPIPE; the target must start with the default action again.
 /// Every other disposition the caller set (here SIGHUP ignored, as nohup does) must survive.
 /// The probe records its dispositions before its own Rust runtime changes SIGPIPE.
@@ -976,5 +1058,28 @@ fn code_that_needs_rosetta_is_refused_before_it_starts() {
     if reason == "has no arm64 code" {
         let output = with("check", &probe_path());
         assert!(output.status.success(), "{output:?}");
+    }
+}
+
+/// F_MAKECOMPRESSED (80) and F_TRANSFEREXTENTS (110) can change a file through a read-only
+/// descriptor; the profile denies them. Outside the sandbox the calls reach the file system and
+/// fail there for want of real arguments (ESTALE, EBADF); inside, the profile refuses them first.
+#[test]
+fn file_changing_fcntls_are_denied_on_read_only_descriptors() {
+    let fixture = Fixture::new("macos-fcntl");
+    let file = fixture.arg("ro/file");
+    let targets: Vec<String> = ["80", "110"]
+        .iter()
+        .map(|command| format!("{file}{ARGUMENT_SEPARATOR}{command}"))
+        .collect();
+    let actions: Vec<(&str, &str)> = targets
+        .iter()
+        .map(|target| ("fcntl-read-only", target.as_str()))
+        .collect();
+    for line in probe_outside(&actions) {
+        assert_eq!(line.result, "error", "control: {line:?}");
+    }
+    for line in probe_inside(&fixture.access_args(), &actions) {
+        assert_eq!(line.result, "denied", "{line:?}");
     }
 }

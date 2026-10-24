@@ -348,6 +348,45 @@ fn a_program_that_stops_sandy_cannot_outlive_its_end() {
     );
 }
 
+/// The forked program starts with the signal actions of sandy's caller, as in the exec model:
+/// sandy restores the actions it caught (SIGCHLD, SIGWINCH, SIGINFO) and sets only SIGPIPE,
+/// which its Rust runtime ignores, back to the default.
+#[test]
+fn signal_actions_pass_through_except_sigpipe() {
+    let fixture = Fixture::new("contained-actions");
+    // SIGHUP, SIGPIPE, SIGCHLD, SIGWINCH, SIGINFO.
+    let actions = ["1", "13", "20", "28", "29"].map(|signal| ("signal-disposition", signal));
+    let ignoring = |program: String, args: Vec<String>| {
+        let mut command = Command::new(program);
+        command.args(args);
+        // SAFETY: signal(2) is async-signal-safe, so it may run between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                for signal in [libc::SIGHUP, libc::SIGCHLD, libc::SIGWINCH] {
+                    libc::signal(signal, libc::SIG_IGN);
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        parse(&output)
+            .into_iter()
+            .map(|line| line.detail)
+            .collect::<Vec<_>>()
+    };
+    let expected = ["ignore", "default", "ignore", "ignore", "default"];
+    assert_eq!(
+        ignoring(probe_path(), probe_args(&actions)),
+        expected,
+        "control"
+    );
+    assert_eq!(
+        ignoring(sandy_path(), run_args(&contained(&fixture), &actions)),
+        expected
+    );
+}
+
 /// A process that sandy's caller started before it executed sandy is sandy's child, but the
 /// program did not start it. sandy does not wait for it.
 #[test]

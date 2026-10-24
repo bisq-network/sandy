@@ -5,6 +5,7 @@
 //! profile, and only then tells sandy that it is ready. It accepts connections until the target ends, then closes
 //! its listeners and lets the accepted connections finish for at most one second.
 
+use std::fs::File;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -26,8 +27,14 @@ const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(50);
 
 /// Starts the relay for `pairs` as a helper process (see `helper`). Returns once the relay is
 /// confined, watches this process and serves; any failure before that is an error, and then no
-/// relay serves.
-pub fn start(pairs: &[RelayPair], seatbelt: &Seatbelt) -> Result<(), SandboxError> {
+/// relay serves. With `children = "contained"`, `ended` is the read end of a pipe whose write end
+/// only the guard holds: its end means that the program's group has ended, also while the
+/// supervising sandy is stopped.
+pub fn start(
+    pairs: &[RelayPair],
+    seatbelt: &Seatbelt,
+    ended: Option<File>,
+) -> Result<(), SandboxError> {
     let mut listeners = Vec::with_capacity(pairs.len());
     for pair in pairs {
         let listener = TcpListener::bind(pair.listen).map_err(|error| {
@@ -39,34 +46,51 @@ pub fn start(pairs: &[RelayPair], seatbelt: &Seatbelt) -> Result<(), SandboxErro
     let seatbelt = *seatbelt;
     // SAFETY: getpid has no requirements.
     let watched = unsafe { libc::getpid() };
-    let keep: Vec<RawFd> = listeners.iter().map(|(l, _)| l.as_raw_fd()).collect();
+    let mut keep: Vec<RawFd> = listeners.iter().map(|(l, _)| l.as_raw_fd()).collect();
+    keep.extend(ended.as_ref().map(AsRawFd::as_raw_fd));
     helper::start("the relay", &keep, move |ready| {
-        serve(listeners, &profile, &seatbelt, watched, ready)
+        serve(listeners, ended, &profile, &seatbelt, watched, ready)
     })
 }
 
 /// The relay process. Returns when the target has ended.
 fn serve(
     listeners: Vec<(TcpListener, SocketAddr)>,
+    ended: Option<File>,
     profile: &Profile,
     seatbelt: &Seatbelt,
     watched: libc::pid_t,
     ready: Ready,
 ) {
-    let queue = match watch_and_confine(&listeners, profile, seatbelt, watched) {
+    let queue = match watch_and_confine(&listeners, ended.as_ref(), profile, seatbelt, watched) {
         Ok(queue) => queue,
         Err(error) => ready.fail(&error.to_string()),
     };
     ready.report();
 
-    let active = Arc::new(AtomicUsize::new(0));
+    // One count per listener: clients of one port cannot take the connections of another.
+    let active: Vec<Arc<AtomicUsize>> = listeners
+        .iter()
+        .map(|_| Arc::new(AtomicUsize::new(0)))
+        .collect();
+    let total = || {
+        active
+            .iter()
+            .map(|count| count.load(Ordering::Acquire))
+            .sum::<usize>()
+    };
     accept_until_exit(&queue, &listeners, &active);
     // The program has ended: no new connections, and the accepted ones get a last moment to
     // deliver what the program sent before it exited.
     drop(listeners);
     let start = Instant::now();
-    while active.load(Ordering::Acquire) > 0 && start.elapsed() < DRAIN {
+    while total() > 0 && start.elapsed() < DRAIN {
         std::thread::sleep(DRAIN_POLL);
+    }
+    if total() > 0 {
+        // The relay ends now; the connections it still relays end with a reset, not with the
+        // normal end that would look like a complete stream.
+        sandy_relay::abort_all();
     }
 }
 
@@ -75,12 +99,18 @@ fn serve(
 /// about others.
 fn watch_and_confine(
     listeners: &[(TcpListener, SocketAddr)],
+    ended: Option<&File>,
     profile: &Profile,
     seatbelt: &Seatbelt,
     watched: libc::pid_t,
 ) -> io::Result<OwnedFd> {
+    sandy_relay::raise_descriptor_limit(listeners.len())?;
     let queue = new_queue()?;
     register(&queue, watched as usize, libc::EVFILT_PROC, libc::NOTE_EXIT)?;
+    if let Some(ended) = ended {
+        // Readable only at its end: nothing writes into this pipe.
+        register(&queue, ended.as_raw_fd() as usize, libc::EVFILT_READ, 0)?;
+    }
     for (listener, _) in listeners {
         listener.set_nonblocking(true)?;
         register(&queue, listener.as_raw_fd() as usize, libc::EVFILT_READ, 0)?;
@@ -90,12 +120,12 @@ fn watch_and_confine(
 }
 
 /// Accepts connections on every listener whenever the kqueue reports one, until it reports that
-/// the watched process exited. An error of kevent also ends the loop, so the relay never
-/// outlives a watch it lost.
+/// the watched process exited or the group's pipe ended. An error of kevent also ends the loop,
+/// so the relay never outlives a watch it lost.
 fn accept_until_exit(
     queue: &OwnedFd,
     listeners: &[(TcpListener, SocketAddr)],
-    active: &Arc<AtomicUsize>,
+    active: &[Arc<AtomicUsize>],
 ) {
     let mut events = [NO_EVENT; 16];
     loop {
@@ -103,14 +133,16 @@ fn accept_until_exit(
             return;
         };
         for event in &events[..count] {
-            if event.filter == libc::EVFILT_PROC {
-                return;
-            }
             let ready = listeners
                 .iter()
-                .find(|(listener, _)| listener.as_raw_fd() as usize == event.ident);
-            if let Some((listener, target)) = ready {
-                accept_pending(listener, *target, active);
+                .zip(active)
+                .find(|((listener, _), _)| listener.as_raw_fd() as usize == event.ident);
+            match ready {
+                Some(((listener, target), count)) if event.filter == libc::EVFILT_READ => {
+                    accept_pending(listener, *target, count)
+                }
+                // The watched process exited, or the group's pipe ended.
+                _ => return,
             }
         }
     }

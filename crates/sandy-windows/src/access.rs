@@ -49,6 +49,11 @@ pub const INHERITED_ACE: u8 = 0x10;
 /// AppContainer process that is not a Less Privileged AppContainer is a member.
 pub const ALL_APPLICATION_PACKAGES: &[u8] = &[1, 2, 0, 0, 0, 0, 0, 15, 2, 0, 0, 0, 1, 0, 0, 0];
 
+/// `S-1-15-2-2`, ALL RESTRICTED APPLICATION PACKAGES: what Windows grants it, it grants Less
+/// Privileged AppContainers as well as all others.
+pub const ALL_RESTRICTED_APPLICATION_PACKAGES: &[u8] =
+    &[1, 2, 0, 0, 0, 0, 0, 15, 2, 0, 0, 0, 2, 0, 0, 0];
+
 /// The rights sandy grants on a policy path. Read and read-write never contain `FILE_EXECUTE`,
 /// so the loader cannot map a file from these paths as a program or library. Neither level
 /// contains `WRITE_DAC` or `WRITE_OWNER`, so the program cannot widen its own access.
@@ -104,6 +109,21 @@ pub fn grants(aces: &[Ace<'_>], sid: &[u8], mask: u32, is_dir: bool) -> bool {
     on_object
         && evaluate(aces, sid, mask, inherited_by(OBJECT_INHERIT_ACE))
         && evaluate(aces, sid, mask, inherited_by(CONTAINER_INHERIT_ACE))
+}
+
+/// Whether `aces` may give `sid` `right` on the object itself or, for a directory, on a file or
+/// directory created in it. Unlike `grants`, one way suffices: the result is meant for refusing
+/// a writable path whose files an AppContainer could execute, so an error towards "granted" only
+/// refuses a policy.
+pub fn may_grant(aces: &[Ace<'_>], sid: &[u8], right: u32, is_dir: bool) -> bool {
+    let on_object = evaluate(aces, sid, right, |ace| ace.flags & INHERIT_ONLY_ACE == 0);
+    if on_object || !is_dir {
+        return on_object;
+    }
+    // NO_PROPAGATE_INHERIT_ACE still reaches the direct children, so it counts here.
+    let inherited_by = |bit: u8| move |ace: &Ace<'_>| ace.flags & bit != 0;
+    evaluate(aces, sid, right, inherited_by(OBJECT_INHERIT_ACE))
+        || evaluate(aces, sid, right, inherited_by(CONTAINER_INHERIT_ACE))
 }
 
 /// Whether `aces` contain the ACE sandy adds: explicit (not inherited), allow, exactly `mask` and
@@ -345,6 +365,75 @@ mod tests {
             OTHER,
             mask,
             flags
+        ));
+    }
+    /// C:\Program Files gives ALL APPLICATION PACKAGES read and execute on everything created
+    /// in it; a writable path below it must be refused.
+    #[test]
+    fn may_grant_finds_execute_for_new_files() {
+        let program_files = [
+            allow(0, RX, ALL_APPLICATION_PACKAGES),
+            allow(
+                OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | INHERIT_ONLY_ACE,
+                GENERIC_READ | GENERIC_EXECUTE,
+                ALL_APPLICATION_PACKAGES,
+            ),
+        ];
+        assert!(may_grant(
+            &program_files,
+            ALL_APPLICATION_PACKAGES,
+            FILE_EXECUTE,
+            true
+        ));
+        // Inherited by new files only, or only by the direct children.
+        let files_only = [allow(
+            OBJECT_INHERIT_ACE | INHERIT_ONLY_ACE | NO_PROPAGATE_INHERIT_ACE,
+            GENERIC_EXECUTE,
+            ALL_APPLICATION_PACKAGES,
+        )];
+        assert!(may_grant(
+            &files_only,
+            ALL_APPLICATION_PACKAGES,
+            FILE_EXECUTE,
+            true
+        ));
+        // A file: only its own ACEs count; inheritance flags mean nothing there.
+        assert!(!may_grant(
+            &files_only,
+            ALL_APPLICATION_PACKAGES,
+            FILE_EXECUTE,
+            false
+        ));
+        // Read only, another SID, or a deny before the allow: no execute.
+        let read_only = [allow(
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+            FILE_GENERIC_READ,
+            ALL_APPLICATION_PACKAGES,
+        )];
+        assert!(!may_grant(
+            &read_only,
+            ALL_APPLICATION_PACKAGES,
+            FILE_EXECUTE,
+            true
+        ));
+        assert!(!may_grant(&program_files, OTHER, FILE_EXECUTE, true));
+        let denied = [
+            deny(
+                OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+                FILE_EXECUTE,
+                ALL_APPLICATION_PACKAGES,
+            ),
+            allow(
+                OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+                RX,
+                ALL_APPLICATION_PACKAGES,
+            ),
+        ];
+        assert!(!may_grant(
+            &denied,
+            ALL_APPLICATION_PACKAGES,
+            FILE_EXECUTE,
+            true
         ));
     }
 }

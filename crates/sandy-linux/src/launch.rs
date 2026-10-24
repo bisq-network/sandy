@@ -27,8 +27,17 @@ use crate::{contain, filter, relay, watch};
 /// it has a single thread, the filters are installed with TSYNC, and execve ends every other
 /// thread, so the target runs with exactly the restrictions applied here.
 pub fn launch(sandbox: &Sandbox, command: &TargetCommand) -> Result<i32, SandboxError> {
+    // With `contained`, the relay also ends when the guard has ended the program's group.
+    let mut group_ended = None;
     if let Some(relay) = &sandbox.relay {
-        relay::start(relay)?;
+        let ended = if sandbox.contain {
+            let (read, write) = crate::helper::pipe("the pipe of the group's end")?;
+            group_ended = Some(write);
+            Some(read)
+        } else {
+            None
+        };
+        relay::start(relay, ended)?;
     }
     if sandbox.end_with_parent {
         // SAFETY: getppid has no preconditions.
@@ -53,7 +62,7 @@ pub fn launch(sandbox: &Sandbox, command: &TargetCommand) -> Result<i32, Sandbox
         Err(error) => error,
     };
     if sandbox.contain {
-        contain::run(start)
+        contain::run(start, group_ended)
     } else {
         Err(start())
     }

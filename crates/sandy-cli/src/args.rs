@@ -199,7 +199,12 @@ where
     while let Some(arg) = parser.next()? {
         match arg {
             Short('h') | Long("help") => return Ok(Command::Help),
-            Long("policy") => invocation.policy_file = Some(parser.value()?.into()),
+            Long("policy") => {
+                if invocation.policy_file.is_some() {
+                    return Err("--policy given twice".into());
+                }
+                invocation.policy_file = Some(parser.value()?.into())
+            }
             Long("read") => overrides.read.push(parser.value()?.into()),
             Long("read-exec") => overrides.read_exec.push(parser.value()?.into()),
             Long("read-write") => overrides.read_write.push(parser.value()?.into()),
@@ -312,6 +317,12 @@ mod tests {
 
     fn parse_strs(args: &[&str]) -> Result<Command, String> {
         parse(args.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn a_second_policy_file_is_an_error() {
+        let error = parse_strs(&["check", "--policy", "/a.toml", "--policy", "/b.toml"]);
+        assert!(error.unwrap_err().contains("--policy given twice"));
     }
 
     fn invocation(args: &[&str]) -> Invocation {

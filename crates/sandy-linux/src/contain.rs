@@ -46,12 +46,14 @@ const START_FAILED: i32 = 125;
 /// Starts the program in a process group that sandy ends when the program ends, and returns the
 /// exit status for sandy. `start` runs in the forked child: it confines the child and executes
 /// the target, and returns only on failure.
-pub fn run(start: impl FnOnce() -> SandboxError) -> Result<i32, SandboxError> {
+/// `ended` is the write end of the relay's pipe, if a relay runs: only the guard keeps it, so it
+/// ends when the guard has ended the group.
+pub fn run(start: impl FnOnce() -> SandboxError, ended: Option<File>) -> Result<i32, SandboxError> {
     ensure_single_thread()?;
     set_child_subreaper()?;
     let child_action = default_child_action()?;
     let signals = Signals::block()?;
-    let mut group = Group::start()?;
+    let mut group = Group::start(ended)?;
     let (mut report, report_write) = pipe("the program's report pipe")?;
     // SAFETY: sandy is single-threaded (checked above), so the child may run any code. It leaves
     // only through execve or `_exit`, never by returning into sandy's code.
@@ -98,7 +100,7 @@ struct Group {
 }
 
 impl Group {
-    fn start() -> Result<Group, SandboxError> {
+    fn start(ended: Option<File>) -> Result<Group, SandboxError> {
         let (guard_end, guard) = pipe("the guard's pipe")?;
         // SAFETY: sandy is single-threaded (checked in `run`). The guard leaves only through
         // `_exit`.
@@ -111,11 +113,12 @@ impl Group {
             }
             0 => {
                 drop(guard);
-                guard_main(guard_end)
+                guard_main(guard_end, ended)
             }
             pid => pid,
         };
         drop(guard_end);
+        drop(ended);
         let group = Group {
             leader,
             program: None,
@@ -310,11 +313,12 @@ impl Drop for Group {
 }
 
 /// The guard: leads the program's process group and kills it when the program ends or sandy
-/// ends.
-fn guard_main(end: File) -> ! {
+/// ends. `ended`, the relay's pipe, closes when the guard dies with the group.
+fn guard_main(end: File, ended: Option<File>) -> ! {
+    let mut keep = vec![end.as_raw_fd()];
+    keep.extend(ended.as_ref().map(AsRawFd::as_raw_fd));
     // SAFETY: setpgid takes process IDs.
-    if unsafe { libc::setpgid(0, 0) } != 0 || close_descriptors_except(&[end.as_raw_fd()]).is_err()
-    {
+    if unsafe { libc::setpgid(0, 0) } != 0 || close_descriptors_except(&keep).is_err() {
         // SAFETY: ends the guard without running sandy's cleanup. sandy kills the group by ID.
         unsafe { libc::_exit(1) };
     }

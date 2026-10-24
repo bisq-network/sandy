@@ -28,6 +28,15 @@ fn with(mut args: Vec<String>, extra: &[&str]) -> Vec<String> {
     args
 }
 
+/// `gethostuuid` returns the hardware UUID of the Mac, a stable identifier that survives a
+/// reinstall and is the same for every user. The profile blocks the same value through IOKit
+/// (`IOPlatformUUID` needs `iokit-get-properties`) and denies the system call too.
+#[test]
+fn host_uuid_is_not_readable_inside_the_sandbox() {
+    let fixture = Fixture::new("macos-hostuuid");
+    controlled(&fixture.access_args(), &[("host-uuid", "-")])[0].assert_blocked();
+}
+
 /// Opening a file by device and inode through volfs (`/.vol/<dev>/<inode>`) must be checked like
 /// any other open: reading a file outside the policy this way is denied.
 #[test]

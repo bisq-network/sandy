@@ -2,6 +2,7 @@
 
 mod common;
 
+use std::io::Read;
 use std::net::TcpListener;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -68,4 +69,38 @@ fn forward_without_ip_is_refused() {
     let output = sandy(run_args(&args, &[("env", "PATH")]));
     assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
     assert!(output.stdout.is_empty(), "{output:?}");
+}
+
+/// A program that writes more than the target reads in time, and exits. When the one second of
+/// rule 5 runs out, the relay ends the connection with a reset: the target gets every byte or
+/// sees the cut, but never a normal end after part of the stream.
+#[test]
+fn a_connection_cut_when_the_relay_ends_is_reset() {
+    let fixture = Fixture::new("forward-cut");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let service = listener.local_addr().unwrap().to_string();
+    let target = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        // Busy: it reads only after the relay has given up.
+        thread::sleep(Duration::from_secs(3));
+        let mut received = Vec::new();
+        let complete = stream.read_to_end(&mut received).is_ok();
+        (received.len(), complete)
+    });
+    let inner = free_port();
+    let mut args = fixture.access_args();
+    args.extend([
+        "--ip".to_string(),
+        "all".to_string(),
+        "--forward".to_string(),
+        format!("{inner}={service}"),
+    ]);
+    let bytes = 4_000_000;
+    let send = format!("127.0.0.1:{inner}\u{1f}{bytes}");
+    probe_inside(&args, &[("tcp-send-many", &send)])[0].assert_ok();
+    let (received, normal_end) = target.join().unwrap();
+    assert!(
+        !normal_end || received == bytes,
+        "the target saw a normal end after {received} of {bytes} bytes"
+    );
 }

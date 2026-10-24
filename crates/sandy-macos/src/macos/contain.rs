@@ -1,34 +1,43 @@
 //! `process.children = "contained"`. sandy stays the parent of the program, so that it can end
 //! every process the program starts:
 //!
-//! 1. sandy catches the signals whose action is to ignore them (macOS discards such a signal
-//!    even while it is blocked), blocks the signals it forwards and waits for them with sigwait.
-//! 2. It forks the guard. The guard creates a process group of its own and closes every
-//!    descriptor except the read end of a pipe. sandy holds the write end; the forked program has
-//!    a copy only until execve closes it.
-//! 3. It forks the program into the guard's group and writes the program's process ID into the
-//!    pipe. The guard watches the program and the pipe with kqueue and kills its group when the
-//!    program ends or when the pipe ends, that is when sandy dies, also by SIGKILL. So the group
-//!    ends with the program even while sandy is stopped.
+//! 1. sandy catches every signal that macOS would discard while it is blocked (those whose action
+//!    is to ignore them, by default or set by the caller), blocks the signals it forwards and
+//!    waits for them with sigwait.
+//! 2. It forks the guard, which starts a process group of its own and forks the anchor. The
+//!    anchor leads the program's process group and only waits to be killed; it is the guard's
+//!    child, so the group's ID stays reserved until the guard reaps it. The guard keeps only its
+//!    pipes from and to sandy and, with exposed or forwarded ports, the write end of the pipe
+//!    that tells the relay that the group has ended.
+//! 3. It forks the program into the anchor's group and sends the program's process ID to the
+//!    guard. The guard watches the program and the pipe from sandy with kqueue. When the program
+//!    ends or the pipe ends, that is when sandy dies, also by SIGKILL, or is done, the guard
+//!    kills the group with SIGKILL until no live process is left in it. The guard is not in the
+//!    group, so it can repeat the signal: on macOS a process forked while a group signal is
+//!    delivered can escape one signal. So the group ends with the program also while sandy is
+//!    stopped. Then it closes the relay's pipe, waits until sandy is done, reaps the anchor and
+//!    ends.
 //! 4. The program applies the profile and executes the target with execve; it reports a failure
 //!    over a close-on-exec pipe. The profile denies setpgid, setsid and posix_spawn, whose
 //!    POSIX_SPAWN_SETSID and POSIX_SPAWN_SETPGROUP flags would change the group inside the
 //!    kernel, so no process it starts can leave the group. With `signals = "isolated"` (which the
-//!    policy requires) it cannot signal sandy or the guard, which run outside the sandbox.
+//!    policy requires) it cannot signal sandy, the guard or the anchor, which run outside the
+//!    sandbox.
 //! 5. sandy forwards the signals it receives to the program and reaps its exited children. With
 //!    a terminal it follows job control. The program's group gets the terminal only when the
 //!    program stops because it used the terminal while sandy's job had it; another process of
 //!    sandy's job that then uses the terminal gets it back. Any other stop of the program stops
 //!    sandy too, so a shell sees the job stop; when sandy continues, it continues the group.
 //! 6. When the program exits, sandy gives the terminal back, kills the group with SIGKILL until
-//!    no live process is left in it, and exits with the program's exit status, or 128 plus the
-//!    signal number if a signal ended it.
+//!    no live process is left in it, tells the guard that it is done, reaps the guard and the
+//!    program, and exits with the program's exit status, or 128 plus the signal number if a
+//!    signal ended it.
 //!
-//! macOS has no child subreaper: launchd adopts a process whose parent ends, so sandy cannot wait
-//! for the processes of the group. Instead it repeats the SIGKILL until the kernel finds no live
-//! process in the group (zombies do not count). The group's ID is the guard's process ID. sandy
-//! reaps neither the guard nor the program before the group is gone, so no other process or group
-//! can have these IDs while sandy may signal them.
+//! macOS has no child subreaper: launchd adopts a process whose parent ends, so neither sandy nor
+//! the guard can wait for the processes of the group. Instead they repeat the SIGKILL until the
+//! kernel finds no live process in the group (zombies do not count). The group's ID is the
+//! anchor's process ID, and the guard reaps the anchor only after sandy is done or gone, so no
+//! other group can have this ID while either may signal it.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -51,19 +60,42 @@ const SIGNALED: i32 = 128;
 const START_FAILED: i32 = 125;
 /// How long sandy waits between two SIGKILLs to the group while processes of it are left.
 const KILL_POLL: Duration = Duration::from_millis(10);
-/// Signals whose default action is to ignore them. macOS discards them on arrival while that is
-/// their action, even when they are blocked, so sandy catches them to wait for them.
-const IGNORED_BY_DEFAULT: [libc::c_int; 4] =
-    [libc::SIGCHLD, libc::SIGURG, libc::SIGWINCH, libc::SIGINFO];
+/// Signals whose default action is to ignore them. macOS discards a signal on arrival while its
+/// action is to ignore it, even when it is blocked, so sandy catches these and every signal that
+/// the caller set to be ignored, to wait for them.
+const DISCARDED_BY_DEFAULT: [libc::c_int; 5] = [
+    libc::SIGCHLD,
+    libc::SIGURG,
+    libc::SIGIO,
+    libc::SIGWINCH,
+    libc::SIGINFO,
+];
+/// NSIG of macOS (`sys/signal.h`): signal numbers are 1 to 31.
+const SIGNAL_COUNT: libc::c_int = 32;
+/// Signals sandy never catches: SIGKILL and SIGSTOP cannot be caught, SIGCONT is never discarded,
+/// and the fault signals keep their action, so that a fault ends sandy.
+const NOT_CAUGHT: [libc::c_int; 10] = [
+    libc::SIGKILL,
+    libc::SIGSTOP,
+    libc::SIGCONT,
+    libc::SIGSEGV,
+    libc::SIGBUS,
+    libc::SIGILL,
+    libc::SIGFPE,
+    libc::SIGTRAP,
+    libc::SIGSYS,
+    libc::SIGABRT,
+];
 
 /// Starts the program in a process group that sandy ends when the program ends, and returns the
 /// exit status for sandy. `start` runs in the forked child: it confines the child and executes
-/// the target, and returns only on failure.
-pub fn run(start: impl FnOnce() -> SandboxError) -> Result<i32, SandboxError> {
+/// the target, and returns only on failure. `ended` is the write end of the relay's pipe, if a
+/// relay runs: the guard closes it once the group has ended.
+pub fn run(start: impl FnOnce() -> SandboxError, ended: Option<File>) -> Result<i32, SandboxError> {
     require_single_thread()?;
     let actions = CaughtSignals::catch()?;
     let signals = Signals::block()?;
-    let mut group = Group::start()?;
+    let mut group = Group::start(ended)?;
     let (mut report, report_write) = pipe("the program's report pipe")?;
     // SAFETY: sandy is single-threaded (checked above), so the child may run any code. It leaves
     // only through execve or `_exit`, never by returning into sandy's code.
@@ -76,7 +108,7 @@ pub fn run(start: impl FnOnce() -> SandboxError) -> Result<i32, SandboxError> {
         }
         0 => {
             drop(report);
-            program_main(group.leader, &signals, &actions, report_write, start)
+            program_main(group.id, &signals, &actions, report_write, start)
         }
         pid => group.program = Some(pid),
     }
@@ -94,27 +126,29 @@ pub fn run(start: impl FnOnce() -> SandboxError) -> Result<i32, SandboxError> {
     Ok(status)
 }
 
-/// The program's process group, led by the guard. Dropping it ends the group, so a failure after
-/// the guard started also ends everything sandy started.
+/// The program's process group, led by the anchor, which the guard started. Dropping it ends the
+/// group, so a failure after the guard started also ends everything sandy started.
 struct Group {
-    /// The guard's process ID, which is also the group's ID.
-    leader: libc::pid_t,
+    /// The group's ID: the anchor's process ID.
+    id: libc::pid_t,
+    guard: libc::pid_t,
     program: Option<libc::pid_t>,
     /// sandy's controlling terminal, if one of its standard descriptors is that terminal.
     terminal: Option<RawFd>,
     /// sandy gave the terminal to the program's group, and should give it again after a stop.
     program_has_terminal: bool,
-    /// The write end of the guard's pipe.
-    guard: File,
+    /// The write end of the pipe to the guard. Closing it tells the guard that sandy is done.
+    to_guard: Option<File>,
     ended: bool,
 }
 
 impl Group {
-    fn start() -> Result<Group, SandboxError> {
-        let (guard_end, guard) = pipe("the guard's pipe")?;
+    fn start(ended: Option<File>) -> Result<Group, SandboxError> {
+        let (guard_reads, to_guard) = pipe("the pipe to the guard")?;
+        let (mut from_guard, guard_writes) = pipe("the pipe from the guard")?;
         // SAFETY: sandy is single-threaded (checked in `run`). The guard leaves only through
         // `_exit`.
-        let leader = match unsafe { libc::fork() } {
+        let guard = match unsafe { libc::fork() } {
             -1 => {
                 return Err(SandboxError::io(
                     "cannot fork the guard",
@@ -122,29 +156,31 @@ impl Group {
                 ));
             }
             0 => {
-                drop(guard);
-                guard_main(guard_end)
+                drop(to_guard);
+                drop(from_guard);
+                guard_main(guard_reads, guard_writes, ended)
             }
             pid => pid,
         };
-        drop(guard_end);
-        let group = Group {
-            leader,
+        drop(guard_reads);
+        drop(guard_writes);
+        drop(ended);
+        let mut group = Group {
+            id: 0,
+            guard,
             program: None,
             terminal: controlling_terminal(),
             program_has_terminal: false,
-            guard,
+            to_guard: Some(to_guard),
             ended: false,
         };
-        // The guard sets its group too. Setting it here as well means the group exists before
-        // sandy continues, whichever process runs first.
-        // SAFETY: setpgid takes two process IDs.
-        if unsafe { libc::setpgid(leader, leader) } != 0 {
-            return Err(SandboxError::io(
-                "cannot create the program's process group",
-                io::Error::last_os_error(),
+        let mut id = [0u8; mem::size_of::<libc::pid_t>()];
+        if from_guard.read_exact(&mut id).is_err() {
+            return Err(SandboxError::new(
+                "the guard could not create the program's process group",
             ));
         }
+        group.id = libc::pid_t::from_ne_bytes(id);
         Ok(group)
     }
 
@@ -152,7 +188,9 @@ impl Group {
     /// program ends.
     fn tell_guard(&mut self) -> Result<(), SandboxError> {
         let program = self.program.expect("the program was started");
-        self.guard
+        self.to_guard
+            .as_mut()
+            .expect("sandy is not done")
             .write_all(&program.to_ne_bytes())
             .map_err(|error| SandboxError::io("cannot reach the guard", error))
     }
@@ -195,9 +233,9 @@ impl Group {
             if child.pid == program {
                 return Ok(Some(child));
             }
-            if child.pid == self.leader {
-                // The guard ends with the group once the program has exited; it is older, so
-                // waitid may report it first.
+            if child.pid == self.guard {
+                // The guard waits for sandy before it ends, so it ends early only when someone
+                // killed it.
                 return match program_exited()? {
                     Some(exited) => Ok(Some(exited)),
                     None => Err(SandboxError::new(
@@ -228,7 +266,7 @@ impl Group {
         let used_terminal = matches!(stopped.status, libc::SIGTTIN | libc::SIGTTOU);
         if used_terminal && self.give_terminal(terminal) {
             // SAFETY: kill takes a process group ID; see the module documentation.
-            unsafe { libc::kill(-self.leader, libc::SIGCONT) };
+            unsafe { libc::kill(-self.id, libc::SIGCONT) };
         } else {
             self.take_terminal();
             // SAFETY: stops sandy itself.
@@ -244,7 +282,7 @@ impl Group {
             self.give_terminal(terminal);
         }
         // SAFETY: kill takes a process group ID; see the module documentation.
-        unsafe { libc::kill(-self.leader, libc::SIGCONT) };
+        unsafe { libc::kill(-self.id, libc::SIGCONT) };
     }
 
     /// Another process of sandy's job used the terminal while the program's group had it, and
@@ -263,8 +301,7 @@ impl Group {
     fn give_terminal(&mut self, terminal: RawFd) -> bool {
         // SAFETY: tcgetpgrp, getpgrp and tcsetpgrp take a descriptor and process group IDs.
         let given = unsafe {
-            libc::tcgetpgrp(terminal) == libc::getpgrp()
-                && libc::tcsetpgrp(terminal, self.leader) == 0
+            libc::tcgetpgrp(terminal) == libc::getpgrp() && libc::tcsetpgrp(terminal, self.id) == 0
         };
         self.program_has_terminal |= given;
         given
@@ -278,38 +315,31 @@ impl Group {
         };
         // SAFETY: as in `give_terminal`.
         unsafe {
-            libc::tcgetpgrp(terminal) == self.leader
-                && libc::tcsetpgrp(terminal, libc::getpgrp()) == 0
+            libc::tcgetpgrp(terminal) == self.id && libc::tcsetpgrp(terminal, libc::getpgrp()) == 0
         }
     }
 
-    /// Kills the group, the guard and the program until no live process of the group is left,
-    /// then reaps the guard and the program.
+    /// Kills the group until no live process of it is left, tells the guard that sandy is done,
+    /// and reaps the guard and the program.
     fn end(&mut self) {
         if self.ended {
             return;
         }
         self.ended = true;
         self.take_terminal();
-        // SAFETY: kill takes process and group IDs. sandy has reaped neither the guard nor the
-        // program, so these IDs still belong to them, and the group's ID to the group. The guard
-        // and the program are killed by ID as well, in case either never joined the group.
-        unsafe {
-            libc::kill(self.leader, libc::SIGKILL);
-            if let Some(program) = self.program {
-                libc::kill(program, libc::SIGKILL);
-            }
+        if let Some(program) = self.program {
+            // SAFETY: kill takes a process ID; sandy has not reaped the program, so the ID still
+            // names it. It is killed by ID as well, in case it never joined the group.
+            unsafe { libc::kill(program, libc::SIGKILL) };
         }
-        // kill fails with ESRCH when the group has no process, and with EPERM when it has only
-        // zombies: the unreaped guard and program, or a process whose parent died a moment ago
-        // and that launchd has not reaped yet. A process forked while the signal was delivered
-        // gets the next one.
-        // SAFETY: as above.
-        while unsafe { libc::kill(-self.leader, libc::SIGKILL) } == 0 {
-            std::thread::sleep(KILL_POLL);
+        if self.id > 0 {
+            kill_group(self.id);
         }
-        for child in [Some(self.leader), self.program].into_iter().flatten() {
-            // SAFETY: reaps a child of sandy that has been killed; the status is not needed.
+        // The guard reaps the anchor, and with it frees the group's ID, only after this.
+        drop(self.to_guard.take());
+        for child in [Some(self.guard), self.program].into_iter().flatten() {
+            // SAFETY: reaps a child of sandy that has ended or ends now; the status is not
+            // needed.
             while unsafe { libc::waitpid(child, ptr::null_mut(), 0) } < 0
                 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
             {}
@@ -323,26 +353,87 @@ impl Drop for Group {
     }
 }
 
-/// The guard: leads the program's process group and kills it when the program ends or sandy
-/// ends.
-fn guard_main(end: File) -> ! {
+/// Sends SIGKILL to group `id` until no live process is left in it. kill fails with ESRCH when
+/// the group has no process, and with EPERM when it has only zombies, for example a process whose
+/// parent died a moment ago and that launchd has not reaped yet. A process forked while the signal
+/// was delivered gets the next one. The caller must keep the group's ID reserved (the anchor
+/// unreaped) during the call.
+fn kill_group(id: libc::pid_t) {
+    // SAFETY: kill takes a process group ID; see above.
+    while unsafe { libc::kill(-id, libc::SIGKILL) } == 0 {
+        std::thread::sleep(KILL_POLL);
+    }
+}
+
+/// The guard: starts the anchor, which leads the program's group, and kills the group when the
+/// program ends or sandy ends. `from_sandy` brings the program's process ID and ends when sandy is
+/// done or gone; `to_sandy` takes the group's ID; `ended` is the relay's pipe.
+fn guard_main(from_sandy: File, mut to_sandy: File, ended: Option<File>) -> ! {
+    let mut keep = vec![from_sandy.as_raw_fd(), to_sandy.as_raw_fd()];
+    keep.extend(ended.as_ref().map(AsRawFd::as_raw_fd));
+    // A group of its own: the guard is in neither sandy's job nor the program's group.
     // SAFETY: setpgid takes process IDs.
-    if unsafe { libc::setpgid(0, 0) } != 0 || close_all_except(&[end.as_raw_fd()]).is_err() {
-        // SAFETY: ends the guard without running sandy's cleanup. sandy kills the group by ID.
+    if unsafe { libc::setpgid(0, 0) } != 0 || close_all_except(&keep).is_err() {
+        // SAFETY: ends the guard without running sandy's cleanup; sandy reports the failure.
         unsafe { libc::_exit(1) };
     }
-    if let Some(queue) = watch_program(&end) {
+    // SAFETY: the guard is single-threaded, as sandy was when it forked. The anchor leaves only
+    // by being killed or through `_exit`.
+    let anchor = match unsafe { libc::fork() } {
+        0 => anchor_main(),
+        -1 => {
+            // SAFETY: as above.
+            unsafe { libc::_exit(1) }
+        }
+        pid => pid,
+    };
+    // The anchor sets its group too. Setting it here as well means the group exists before
+    // sandy learns its ID, whichever process runs first.
+    // SAFETY: setpgid takes process IDs.
+    let created = unsafe { libc::setpgid(anchor, anchor) } == 0;
+    if !created || to_sandy.write_all(&anchor.to_ne_bytes()).is_err() {
+        // SAFETY: kills and reaps the anchor, which leads no group sandy knows.
+        unsafe {
+            libc::kill(anchor, libc::SIGKILL);
+            libc::waitpid(anchor, ptr::null_mut(), 0);
+            libc::_exit(1)
+        }
+    }
+    drop(to_sandy);
+    if let Some(queue) = watch_program(&from_sandy) {
         let mut events = [NO_EVENT; 2];
         // Any event is an end: the program's exit, or the end of the pipe.
         let _ = wait_events(&queue, &mut events, None);
     }
-    // SAFETY: kill(0, ...) signals the caller's group, so it is used only after checking that the
-    // guard leads its own group. The guard dies with the group.
-    unsafe {
-        if libc::getpgrp() == libc::getpid() {
-            libc::kill(0, libc::SIGKILL);
+    kill_group(anchor);
+    drop(ended);
+    // sandy may still signal the group, so its ID stays reserved until sandy is done or gone.
+    let mut rest = [0u8; 64];
+    loop {
+        match (&from_sandy).read(&mut rest) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
         }
+    }
+    // SAFETY: reaps the anchor, which the group's SIGKILL ended, and ends the guard.
+    unsafe {
+        libc::waitpid(anchor, ptr::null_mut(), 0);
         libc::_exit(0)
+    }
+}
+
+/// The anchor: leads the program's process group and waits, with every signal blocked as in the
+/// guard, until the group's SIGKILL ends it.
+fn anchor_main() -> ! {
+    // SAFETY: setpgid takes process IDs; the guard sets the same group, so a failure here is
+    // harmless when the guard succeeds, and reported by the guard otherwise.
+    unsafe { libc::setpgid(0, 0) };
+    let _ = close_all_except(&[]);
+    loop {
+        // SAFETY: pause only waits; no unblocked signal can arrive except SIGKILL.
+        unsafe { libc::pause() };
     }
 }
 
@@ -379,7 +470,7 @@ fn watch_program(end: &File) -> Option<OwnedFd> {
 /// The forked child: joins the group, restores the signal state the caller gave sandy, confines
 /// itself and executes the target. Reports a failure over `report`.
 fn program_main(
-    leader: libc::pid_t,
+    group: libc::pid_t,
     signals: &Signals,
     actions: &CaughtSignals,
     mut report: File,
@@ -387,7 +478,7 @@ fn program_main(
 ) -> ! {
     let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: setpgid takes process IDs.
-        if unsafe { libc::setpgid(0, leader) } != 0 {
+        if unsafe { libc::setpgid(0, group) } != 0 {
             return SandboxError::io(
                 "cannot join the program's process group",
                 io::Error::last_os_error(),
@@ -452,37 +543,58 @@ impl Signals {
     }
 }
 
-/// The actions of `IGNORED_BY_DEFAULT` before sandy caught them. A caught signal is blocked and
-/// its handler never runs; sandy needs it only pending. Catching SIGCHLD also keeps an ignored
+/// The signals sandy caught, with their actions before. A caught signal is blocked and its
+/// handler never runs; sandy needs it only pending. Catching SIGCHLD also keeps an ignored
 /// SIGCHLD, inherited from the caller, from reaping the program before sandy sees its status.
-struct CaughtSignals([libc::sigaction; IGNORED_BY_DEFAULT.len()]);
+struct CaughtSignals(Vec<(libc::c_int, libc::sigaction)>);
 
 impl CaughtSignals {
+    /// Catches every signal that macOS would discard while it is blocked: those whose action is
+    /// to ignore them, by default (`DISCARDED_BY_DEFAULT`) or set by the caller.
     fn catch() -> Result<CaughtSignals, SandboxError> {
-        // SAFETY: sigaction is plain data.
-        let mut previous: [libc::sigaction; IGNORED_BY_DEFAULT.len()] = unsafe { mem::zeroed() };
-        for (signal, previous) in IGNORED_BY_DEFAULT.into_iter().zip(previous.iter_mut()) {
-            // SAFETY: sigaction is plain data; the call reads `action` and writes `previous`.
-            // The handler does nothing, so it is async-signal-safe.
+        let mut caught = Vec::new();
+        for signal in 1..SIGNAL_COUNT {
+            if NOT_CAUGHT.contains(&signal) {
+                continue;
+            }
+            // SAFETY: sigaction is plain data; a null new action only reads the current one.
+            let current = unsafe {
+                let mut current: libc::sigaction = mem::zeroed();
+                if libc::sigaction(signal, ptr::null(), &mut current) != 0 {
+                    return Err(SandboxError::io(
+                        format!("cannot read the action of signal {signal}"),
+                        io::Error::last_os_error(),
+                    ));
+                }
+                current
+            };
+            let discarded = current.sa_sigaction == libc::SIG_IGN
+                || (current.sa_sigaction == libc::SIG_DFL
+                    && DISCARDED_BY_DEFAULT.contains(&signal));
+            if !discarded {
+                continue;
+            }
+            // SAFETY: as above. The handler does nothing, so it is async-signal-safe.
             unsafe {
                 let mut action: libc::sigaction = mem::zeroed();
                 action.sa_sigaction = pending_only as *const () as libc::sighandler_t;
-                if libc::sigaction(signal, &action, previous) != 0 {
+                if libc::sigaction(signal, &action, ptr::null_mut()) != 0 {
                     return Err(SandboxError::io(
                         format!("cannot catch signal {signal}"),
                         io::Error::last_os_error(),
                     ));
                 }
             }
+            caught.push((signal, current));
         }
-        Ok(CaughtSignals(previous))
+        Ok(CaughtSignals(caught))
     }
 
     /// Restores the actions the caller gave sandy, so that the program starts with them.
     fn restore(&self) -> Result<(), SandboxError> {
-        for (signal, previous) in IGNORED_BY_DEFAULT.into_iter().zip(&self.0) {
+        for (signal, previous) in &self.0 {
             // SAFETY: restores an action that `catch` read.
-            if unsafe { libc::sigaction(signal, previous, ptr::null_mut()) } != 0 {
+            if unsafe { libc::sigaction(*signal, previous, ptr::null_mut()) } != 0 {
                 return Err(SandboxError::io(
                     format!("cannot restore signal {signal}"),
                     io::Error::last_os_error(),

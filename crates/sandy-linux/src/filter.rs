@@ -303,6 +303,20 @@ fn denylist(
     rules.add(libc::SYS_ioctl, ioctl_rules()?);
     rules.add(libc::SYS_socket, socket_rules(config)?);
     rules.add(libc::SYS_socketpair, socketpair_rules(config)?);
+    if !config.allow_ip && !config.allow_unix {
+        // The only sockets left are connected pairs, which need none of these. bind would let
+        // one end take an abstract name that a service outside binds later; the Landlock scope
+        // checks connect and send, not bind.
+        for call in [
+            libc::SYS_bind,
+            libc::SYS_listen,
+            libc::SYS_connect,
+            libc::SYS_accept,
+            libc::SYS_accept4,
+        ] {
+            rules.add(call, Vec::new());
+        }
+    }
     let mut clone = namespace_rules(CLONE_NAMESPACES)?;
     if config.deny_children {
         // Only a thread (CLONE_THREAD) stays possible. The flags are the first argument of clone
@@ -343,7 +357,9 @@ fn denylist(
             rules.add(call, setid_rules(mode)?);
         }
     }
-    let own_pid = u64::from(own_pid);
+    // With children = "allowed", a process the program started can outlive it, and once the
+    // program's ID belongs to another process of the user, the exemption would cover that one.
+    let own_pid = (config.deny_children || config.keep_process_group).then_some(u64::from(own_pid));
     for &(call, pid) in PROCESS_CALLS {
         rules.add(call, vec![other_process(pid, own_pid)?]);
     }
@@ -444,14 +460,15 @@ fn setid_rules(mode: u8) -> Result<Vec<SeccompRule>, BackendError> {
         .collect()
 }
 
-/// Matches a process ID argument that names neither the caller (0) nor the target. Children of
-/// the target therefore cannot use these calls on each other, and a thread ID other than the
-/// main thread's counts as another process.
-fn other_process(pid: u8, own_pid: u64) -> Result<SeccompRule, BackendError> {
-    rule(vec![
-        low(pid, SeccompCmpOp::Ne, 0)?,
-        low(pid, SeccompCmpOp::Ne, own_pid)?,
-    ])
+/// Matches a process ID argument that names neither the caller (0) nor the target (`own_pid`,
+/// when given). Children of the target therefore cannot use these calls on each other, and a
+/// thread ID other than the main thread's counts as another process.
+fn other_process(pid: u8, own_pid: Option<u64>) -> Result<SeccompRule, BackendError> {
+    let mut conditions = vec![low(pid, SeccompCmpOp::Ne, 0)?];
+    if let Some(own_pid) = own_pid {
+        conditions.push(low(pid, SeccompCmpOp::Ne, own_pid)?);
+    }
+    rule(conditions)
 }
 
 /// One rule per flag, because a rule matches only when all its conditions match.
@@ -501,6 +518,8 @@ const RELAY_CALLS: &[i64] = &[
     libc::SYS_connect,
     libc::SYS_shutdown,
     libc::SYS_getsockopt,
+    // SO_LINGER, so that a cut connection ends with a reset; SO_RCVTIMEO for the read tick.
+    libc::SYS_setsockopt,
     libc::SYS_fcntl,
     libc::SYS_ppoll,
     libc::SYS_mmap,
@@ -731,6 +750,13 @@ mod tests {
         }
     }
 
+    fn contained() -> FilterConfig {
+        FilterConfig {
+            keep_process_group: true,
+            ..open()
+        }
+    }
+
     fn args(values: &[u64]) -> [u64; 6] {
         let mut args = [0; 6];
         args[..values.len()].copy_from_slice(values);
@@ -825,6 +851,73 @@ mod tests {
         let high_bits = (1u64 << 32) | libc::AF_UNIX as u64;
         let args = args(&[high_bits, 1]);
         assert_eq!(call(&strict(), libc::SYS_socket, args), RET_EPERM);
+    }
+
+    /// Without IP and Unix sockets the program has only connected socket pairs, which need no
+    /// name, connection or listener; bind could take an abstract name.
+    #[test]
+    fn sockets_cannot_be_named_without_network_access() {
+        for nr in [
+            libc::SYS_bind,
+            libc::SYS_listen,
+            libc::SYS_connect,
+            libc::SYS_accept,
+            libc::SYS_accept4,
+        ] {
+            assert_eq!(call(&strict(), nr, [0; 6]), RET_EPERM, "{nr}");
+            assert_eq!(call(&open(), nr, [0; 6]), RET_ALLOW, "{nr}");
+        }
+    }
+
+    /// Every int argument the denylist checks is read by the kernel from its low 32 bits (umode_t
+    /// from its low 16), so set high bits must change neither a denial nor an allowance.
+    #[test]
+    fn argument_rules_decide_on_the_bits_the_kernel_reads() {
+        const HIGH: u64 = 0xffff_ffff_0000_0000;
+        let own = u64::from(OWN_PID);
+        for &(nr, pid_index) in PROCESS_CALLS {
+            let with_pid = |pid: u64| {
+                let mut args = [0; 6];
+                args[usize::from(pid_index)] = pid;
+                args
+            };
+            assert_eq!(call(&open(), nr, with_pid(HIGH)), RET_ALLOW, "{nr}");
+            assert_eq!(
+                call(&contained(), nr, with_pid(HIGH | own)),
+                RET_ALLOW,
+                "{nr}"
+            );
+            assert_eq!(
+                call(&contained(), nr, with_pid(HIGH | (own + 1))),
+                RET_EPERM,
+                "{nr}"
+            );
+        }
+        for &(nr, one_process) in PROCESS_SELECTOR_CALLS {
+            let group = args(&[HIGH | (one_process + 1), 0]);
+            assert_eq!(call(&open(), nr, group), RET_EPERM, "{nr}");
+            let own_process = args(&[HIGH | one_process, HIGH]);
+            assert_eq!(call(&open(), nr, own_process), RET_ALLOW, "{nr}");
+        }
+        for &(nr, flags_index) in arch::OPEN_CALLS {
+            let mut ioctl_only = [0; 6];
+            ioctl_only[usize::from(flags_index)] = HIGH | libc::O_ACCMODE as u64;
+            assert_eq!(call(&open(), nr, ioctl_only), RET_EPERM, "{nr}");
+        }
+        let setuid = args(&[3, HIGH | 0o4755]);
+        assert_eq!(call(&open(), libc::SYS_fchmod, setuid), RET_EPERM);
+        let dgram = socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0);
+        let dgram = args(&[dgram[0] | HIGH, dgram[1] | HIGH]);
+        assert_eq!(call(&strict(), libc::SYS_socketpair, dgram), RET_EPERM);
+        let user = args(&[HIGH | libc::CLONE_NEWUSER as u64]);
+        assert_eq!(call(&open(), libc::SYS_unshare, user), RET_EPERM);
+        const READ_IMPLIES_EXEC: u64 = 0x040_0000;
+        let exec = args(&[HIGH | READ_IMPLIES_EXEC]);
+        assert_eq!(call(&open(), libc::SYS_personality, exec), RET_EPERM);
+        assert_eq!(
+            call(&open(), libc::SYS_personality, args(&[HIGH])),
+            RET_ALLOW
+        );
     }
 
     #[test]
@@ -989,8 +1082,10 @@ mod tests {
                 args
             };
             assert_eq!(call(&open(), nr, with_pid(0)), RET_ALLOW, "{nr}");
-            assert_eq!(call(&open(), nr, with_pid(own)), RET_ALLOW, "{nr}");
             assert_eq!(call(&open(), nr, with_pid(other)), RET_EPERM, "{nr}");
+            // The own ID only where no process the program started can outlive it.
+            assert_eq!(call(&open(), nr, with_pid(own)), RET_EPERM, "{nr}");
+            assert_eq!(call(&contained(), nr, with_pid(own)), RET_ALLOW, "{nr}");
         }
         let prio_pgrp = libc::PRIO_PGRP as u64;
         let prio_user = libc::PRIO_USER as u64;
@@ -1003,7 +1098,8 @@ mod tests {
             (libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, [2, 3]),
         ] {
             assert_eq!(call(&open(), nr, args(&[one, 0])), RET_ALLOW, "{nr}");
-            assert_eq!(call(&open(), nr, args(&[one, own])), RET_ALLOW, "{nr}");
+            assert_eq!(call(&open(), nr, args(&[one, own])), RET_EPERM, "{nr}");
+            assert_eq!(call(&contained(), nr, args(&[one, own])), RET_ALLOW, "{nr}");
             assert_eq!(call(&open(), nr, args(&[one, other])), RET_EPERM, "{nr}");
             for which in groups {
                 assert_eq!(call(&open(), nr, args(&[which, 0])), RET_EPERM, "{nr}");

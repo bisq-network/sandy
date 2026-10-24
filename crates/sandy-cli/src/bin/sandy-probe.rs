@@ -92,6 +92,11 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
         }
         "spawn" => spawn(target),
         "start" => start(target),
+        // argv[0] as the program received it; the target is ignored.
+        "arg0" => Ok(std::env::args_os()
+            .next()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .unwrap_or_default()),
         "exit" => std::process::exit(
             target
                 .parse()
@@ -147,6 +152,57 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
             stream.write_all(TCP_SEND_PAYLOAD)?;
             stream.shutdown(std::net::Shutdown::Write)?;
             Ok(format!("{} bytes", TCP_SEND_PAYLOAD.len()))
+        }
+        // ADDRESS<U+001F>COUNT: listens on ADDRESS, greets each connection with "hi\n" and keeps
+        // them all open until COUNT were accepted (at most a minute), then returns.
+        "tcp-serve" => {
+            let (address, count) = pair(target)?;
+            let count: usize = count
+                .parse()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid count"))?;
+            let listener = TcpListener::bind(socket_address(address)?)?;
+            listener.set_nonblocking(true)?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let mut held = Vec::with_capacity(count);
+            while held.len() < count {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false)?;
+                        stream.write_all(b"hi\n")?;
+                        held.push(stream);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() > deadline {
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                format!("{} of {count} connections", held.len()),
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(format!("{count} connections"))
+        }
+        // ADDRESS<U+001F>COUNT: sends COUNT bytes, ends its side and returns, as a program that
+        // writes a stream and exits.
+        "tcp-send-many" => {
+            let (address, count) = pair(target)?;
+            let count: usize = count
+                .parse()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid count"))?;
+            let mut stream =
+                TcpStream::connect_timeout(&socket_address(address)?, CONNECT_TIMEOUT)?;
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut left = count;
+            while left > 0 {
+                let part = left.min(chunk.len());
+                stream.write_all(&chunk[..part])?;
+                left -= part;
+            }
+            stream.shutdown(std::net::Shutdown::Write)?;
+            Ok(format!("{count} bytes"))
         }
         action if unix::ACTIONS.contains(&action) => unix::perform(action, target),
         action if linux::ACTIONS.contains(&action) => linux::perform(action, target),
@@ -308,7 +364,6 @@ mod linux {
         "sigio-signal",
         "pidfd-signal",
         "fanotify-init",
-        "await-signal",
         "symlink",
         "mkfifo",
         "opath-read",
@@ -320,10 +375,24 @@ mod linux {
         "clone-process",
         "posix-spawn",
         "thread",
+        "socketpair-bind",
+        "setxattr-path",
+        "setxattr-fd",
+        "chown-path",
+        "utime-path",
+        "utime-fd",
+        "winsize-path",
     ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
         match action {
+            "socketpair-bind" => socketpair_bind(target),
+            "setxattr-path" => setxattr_path(target),
+            "setxattr-fd" => setxattr_fd(target),
+            "chown-path" => chown_path(target),
+            "utime-path" => utime_path(target),
+            "utime-fd" => utime_fd(target),
+            "winsize-path" => winsize_path(target),
             "open" => fs::File::open(target).map(|_| String::new()),
             "open-ioctl-only" => open_ioctl_only(target),
             "fchmod-readonly" => fchmod_readonly(target),
@@ -356,7 +425,6 @@ mod linux {
             "sigio-signal" => sigio_signal(target),
             "pidfd-signal" => pidfd_signal(target),
             "fanotify-init" => fanotify_init(target),
-            "await-signal" => await_signal(target),
             "symlink" => symlink(target),
             "mkfifo" => mkfifo(target),
             "opath-read" => opath_read(target),
@@ -379,6 +447,124 @@ mod linux {
     }
 
     const SETUID_MODE: u32 = 0o4755;
+
+    /// Binds one end of a stream socket pair to `target`: an abstract name when it starts with
+    /// `@`, otherwise a pathname. socketpair stays allowed with `unix_sockets = "none"`, so this
+    /// shows whether the program can still take a name that processes outside the sandbox use.
+    fn socketpair_bind(target: &str) -> io::Result<String> {
+        let (is_abstract, name) = match target.strip_prefix('@') {
+            Some(name) => (true, name),
+            None => (false, target),
+        };
+        // SAFETY: sockaddr_un is plain data; all zeros is a valid value.
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        // An abstract name starts after a NUL byte.
+        let start = usize::from(is_abstract);
+        if start + name.len() >= address.sun_path.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "name too long"));
+        }
+        for (slot, byte) in address.sun_path[start..].iter_mut().zip(name.bytes()) {
+            *slot = byte as libc::c_char;
+        }
+        // Abstract names have no terminating NUL; pathnames include it.
+        let length = std::mem::size_of::<libc::sa_family_t>()
+            + start
+            + name.len()
+            + usize::from(!is_abstract);
+        let mut fds = [0; 2];
+        // SAFETY: socketpair writes two descriptors into `fds`.
+        check(unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        })?;
+        // SAFETY: `address` is a valid sockaddr_un and `length` does not exceed its size.
+        let bound = check(unsafe {
+            libc::bind(
+                fds[0],
+                (&address as *const libc::sockaddr_un).cast(),
+                length as libc::socklen_t,
+            )
+        });
+        fds.into_iter().for_each(close);
+        bound.map(|_| format!("bound {target}"))
+    }
+
+    const XATTR_NAME: &[u8] = b"user.sandy-probe\0";
+
+    /// setxattr through the path.
+    fn setxattr_path(target: &str) -> io::Result<String> {
+        let path = CString::new(target)?;
+        // SAFETY: the path and the name are NUL-terminated; the value is one valid byte.
+        check(unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                XATTR_NAME.as_ptr().cast(),
+                b"x".as_ptr().cast(),
+                1,
+                0,
+            )
+        })?;
+        Ok(String::new())
+    }
+
+    /// fsetxattr through a descriptor opened for reading.
+    fn setxattr_fd(target: &str) -> io::Result<String> {
+        use std::os::fd::AsRawFd;
+        let file = fs::File::open(target)?;
+        // SAFETY: the name is NUL-terminated; the value is one valid byte.
+        check(unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                XATTR_NAME.as_ptr().cast(),
+                b"x".as_ptr().cast(),
+                1,
+                0,
+            )
+        })?;
+        Ok(String::new())
+    }
+
+    /// chown through the path, keeping owner and group (-1): the kernel performs the call but
+    /// nothing changes.
+    fn chown_path(target: &str) -> io::Result<String> {
+        let path = CString::new(target)?;
+        // SAFETY: the path is NUL-terminated.
+        check(unsafe { libc::fchownat(libc::AT_FDCWD, path.as_ptr(), u32::MAX, u32::MAX, 0) })?;
+        Ok(String::new())
+    }
+
+    /// utimensat with a path; null times mean "now".
+    fn utime_path(target: &str) -> io::Result<String> {
+        let path = CString::new(target)?;
+        // SAFETY: the path is NUL-terminated and the times pointer may be null.
+        check(unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), ptr::null(), 0) })?;
+        Ok(String::new())
+    }
+
+    /// futimens on a descriptor opened for writing; null times mean "now".
+    fn utime_fd(target: &str) -> io::Result<String> {
+        use std::os::fd::AsRawFd;
+        let file = fs::OpenOptions::new().write(true).open(target)?;
+        // SAFETY: the times pointer may be null.
+        check(unsafe { libc::futimens(file.as_raw_fd(), ptr::null()) })?;
+        Ok(String::new())
+    }
+
+    /// Opens a terminal device by path and queries its window size, a device ioctl.
+    fn winsize_path(target: &str) -> io::Result<String> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(target)?;
+        tiocgwinsz(file.as_raw_fd())
+    }
 
     /// A process ID, or `self` for the probe's own one.
     fn pid(target: &str) -> io::Result<libc::pid_t> {
@@ -622,17 +808,18 @@ mod linux {
         result.map(|_| String::new())
     }
 
-    /// Tries to create an fanotify group and mark `target`. Unprivileged callers normally fail
-    /// with EPERM; success would allow watching (and, in some classes, reading) files by path
-    /// outside the policy.
+    /// Creates an fanotify group and marks `target`, as an unprivileged process can since Linux
+    /// 5.13: a notification group that reports file IDs (FAN_REPORT_FID) and inode marks only.
+    /// It reports events, not file contents.
     fn fanotify_init(target: &str) -> io::Result<String> {
         const FAN_CLOEXEC: libc::c_uint = 0x0000_0001;
         const FAN_CLASS_NOTIF: libc::c_uint = 0x0000_0000;
+        const FAN_REPORT_FID: libc::c_uint = 0x0000_0200;
         // SAFETY: fanotify_init takes two ints, no pointers.
         let fd = unsafe {
             libc::syscall(
                 libc::SYS_fanotify_init,
-                FAN_CLOEXEC | FAN_CLASS_NOTIF,
+                FAN_CLOEXEC | FAN_CLASS_NOTIF | FAN_REPORT_FID,
                 libc::O_RDONLY as libc::c_uint,
             )
         };
@@ -662,31 +849,6 @@ mod linux {
         };
         close(fd);
         outcome
-    }
-
-    /// Installs a handler for `SIGNUM` and waits up to five seconds for it. Exits with code 42 on
-    /// delivery. Used as the victim of `sigio-signal` in the escape test.
-    fn await_signal(target: &str) -> io::Result<String> {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static GOT: AtomicBool = AtomicBool::new(false);
-        extern "C" fn handler(_sig: libc::c_int) {
-            GOT.store(true, Ordering::SeqCst);
-        }
-        let signum: libc::c_int = number(target)?;
-        // SAFETY: installs a signal handler with an empty mask and no flags.
-        unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = handler as *const () as usize;
-            check(libc::sigaction(signum, &action, ptr::null_mut()))?;
-        }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if GOT.load(Ordering::SeqCst) {
-                std::process::exit(42);
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        Err(io::Error::new(io::ErrorKind::TimedOut, "no signal"))
     }
 
     fn check(result: libc::c_int) -> io::Result<libc::c_int> {
@@ -1559,10 +1721,21 @@ mod macos {
         "posix-spawn",
         "execve",
         "thread",
+        "rename",
+        "rmdir",
+        "host-uuid",
+        "fcntl-read-only",
     ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
         match action {
+            "rename" => {
+                let (from, to) = super::pair(target)?;
+                fs::rename(from, to).map(|()| String::new())
+            }
+            "rmdir" => fs::remove_dir(target).map(|()| String::new()),
+            "host-uuid" => host_uuid(),
+            "fcntl-read-only" => fcntl_read_only(target),
             "fork" => fork(false),
             "vfork" => fork(true),
             "posix-spawn" => posix_spawn(target),
@@ -1594,6 +1767,40 @@ mod macos {
     unsafe extern "C" {
         /// Not in the libc crate for macOS. The child may only call _exit.
         fn vfork() -> libc::pid_t;
+    }
+
+    /// `PATH<U+001F>COMMAND`: opens PATH read-only and calls fcntl with COMMAND and argument 0.
+    /// The error tells whether the call reached the file system (for example ESTALE or EBADF)
+    /// or a policy refused it first (EPERM).
+    fn fcntl_read_only(target: &str) -> io::Result<String> {
+        let (path, command) = super::pair(target)?;
+        let command: libc::c_int = command
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid command"))?;
+        let file = fs::File::open(path)?;
+        // SAFETY: fcntl with an integer argument on an open descriptor.
+        let result = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&file), command, 0) };
+        if result == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(result.to_string())
+    }
+
+    /// The hardware UUID of the machine (gethostuuid), a stable identifier of the Mac.
+    fn host_uuid() -> io::Result<String> {
+        let mut id = [0u8; 16];
+        let wait = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: gethostuuid writes 16 bytes into `id` and reads `wait`.
+        if unsafe { libc::gethostuuid(id.as_mut_ptr(), &wait) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(format!(
+            "{:02x}{:02x}{:02x}{:02x}...",
+            id[0], id[1], id[2], id[3]
+        ))
     }
 
     /// fork or vfork; the child exits at once.
@@ -1972,7 +2179,8 @@ mod unix {
     use std::io;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
-    use std::time::Duration;
+    use std::ptr;
+    use std::time::{Duration, Instant};
 
     pub const ACTIONS: &[&str] = &[
         "setsid",
@@ -1981,10 +2189,14 @@ mod unix {
         "stop-self",
         "ignore-signal",
         "start-forked",
+        "fork-walk",
+        "await-signal",
     ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
         match action {
+            "fork-walk" => fork_walk(target),
+            "await-signal" => await_signal(target),
             // SAFETY: setsid has no arguments.
             "setsid" => check(unsafe { libc::setsid() }).map(|_| String::new()),
             // SAFETY: setpgid takes process IDs; 0 and 0 make the caller a group leader.
@@ -2027,6 +2239,84 @@ mod unix {
         // SAFETY: the closure does nothing, so it is async-signal-safe.
         unsafe { command.pre_exec(|| Ok(())) };
         Ok(command.spawn()?.id().to_string())
+    }
+
+    /// Installs a handler for signal `target`, writes "await-signal ready" to standard error,
+    /// and exits with status 42 when the signal arrives within 5 seconds.
+    fn await_signal(target: &str) -> io::Result<String> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static GOT: AtomicBool = AtomicBool::new(false);
+        extern "C" fn handler(_sig: libc::c_int) {
+            GOT.store(true, Ordering::SeqCst);
+        }
+        let signum: libc::c_int = target
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid number"))?;
+        // SAFETY: installs a signal handler with an empty mask and no flags.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = handler as *const () as usize;
+            check(libc::sigaction(signum, &action, ptr::null_mut()))?;
+        }
+        // Standard error is unbuffered: a test that reads it knows that the handler is in place.
+        eprintln!("await-signal ready");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if GOT.load(Ordering::SeqCst) {
+                std::process::exit(42);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Err(io::Error::new(io::ErrorKind::TimedOut, "no signal"))
+    }
+
+    /// How long the processes of `fork-walk` keep forking at most.
+    const WALK_SECONDS: libc::time_t = 30;
+
+    /// Starts `target` processes that never stop forking: each forks a child and exits at once,
+    /// and the child does the same. So at almost every moment one of them is inside fork, as in
+    /// a program that starts processes in a loop. Reports the probe's process group.
+    fn fork_walk(target: &str) -> io::Result<String> {
+        let count: usize = target
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid count"))?;
+        let null = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/null")?;
+        let null = std::os::fd::AsRawFd::as_raw_fd(&null);
+        // A test that fails must not leave them running: each ends after this many seconds.
+        // SAFETY: time with a null pointer only returns the time.
+        let deadline = unsafe { libc::time(ptr::null_mut()) } + WALK_SECONDS;
+        for _ in 0..count {
+            // SAFETY: fork has no preconditions; the probe is single-threaded here.
+            match unsafe { libc::fork() } {
+                -1 => return Err(io::Error::last_os_error()),
+                // SAFETY: the children only call dup2, time, fork, usleep and _exit, which are
+                // async-signal-safe.
+                0 => unsafe {
+                    // Off the caller's output, which would otherwise never see its end.
+                    for fd in 0..=2 {
+                        libc::dup2(null, fd);
+                    }
+                    loop {
+                        if libc::time(ptr::null_mut()) > deadline {
+                            libc::_exit(0);
+                        }
+                        match libc::fork() {
+                            0 => {}
+                            -1 => {
+                                libc::usleep(1000);
+                            }
+                            _ => libc::_exit(0),
+                        }
+                    }
+                },
+                _ => {}
+            }
+        }
+        // SAFETY: getpgrp has no preconditions.
+        Ok(unsafe { libc::getpgrp() }.to_string())
     }
 
     /// Stops the probe with SIGSTOP. A child it forks first continues it after `target`

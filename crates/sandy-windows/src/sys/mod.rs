@@ -26,7 +26,9 @@ use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
-use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, KF_FLAG_DEFAULT};
+use windows_sys::Win32::UI::Shell::{
+    FOLDERID_LocalAppData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, KF_FLAG_DEFAULT,
+};
 
 use crate::cmdline::{command_line, is_batch_file, without_verbatim_prefix};
 use crate::envblock::{LOCAL_APP_DATA, SYSTEM_ROOT, environment_block};
@@ -117,7 +119,14 @@ impl Backend for WindowsBackend {
                     wide(target.to_string().as_ref()),
                 ];
                 relays.push(process::Relay {
-                    process: process_for(sandy.as_os_str(), &args, &[], None, capability)?,
+                    process: process_for(
+                        sandy.as_os_str(),
+                        sandy.as_os_str(),
+                        &args,
+                        &[],
+                        None,
+                        capability,
+                    )?,
                     socket: Some(listener),
                     reports_ready: false,
                 });
@@ -133,7 +142,14 @@ impl Backend for WindowsBackend {
                         wide(route.socket.as_os_str()),
                     ];
                     relays.push(process::Relay {
-                        process: process_for(sandy.as_os_str(), &args, &[], None, capability)?,
+                        process: process_for(
+                            sandy.as_os_str(),
+                            sandy.as_os_str(),
+                            &args,
+                            &[],
+                            None,
+                            capability,
+                        )?,
                         socket: None,
                         reports_ready: true,
                     });
@@ -145,6 +161,7 @@ impl Backend for WindowsBackend {
         let cwd = command.cwd.as_ref().map(|cwd| wide_nul(cwd.as_os_str()));
         let program = process_for(
             command.program.as_os_str(),
+            &command.arg0,
             &args,
             &command.env,
             cwd,
@@ -181,10 +198,11 @@ impl Backend for WindowsBackend {
     }
 }
 
-/// A process of `program` with `args`, the policy environment `env` plus the variables sandy
-/// sets, and `capabilities`.
+/// A process of `program` with `arg0` as the first token of its command line, then `args`, the
+/// policy environment `env` plus the variables sandy sets, and `capabilities`.
 fn process_for<'a>(
     program: &OsStr,
+    arg0: &OsStr,
     args: &[Vec<u16>],
     env: &[(OsString, OsString)],
     cwd: Option<Vec<u16>>,
@@ -192,7 +210,8 @@ fn process_for<'a>(
 ) -> Result<process::Process<'a>, SandboxError> {
     let program = wide(program);
     let program = without_verbatim_prefix(&program);
-    let command_line = command_line(program, args)
+    let arg0 = wide(arg0);
+    let command_line = command_line(without_verbatim_prefix(&arg0), args)
         .map_err(|error| SandboxError::new(format!("invalid command line: {error}")))?;
     let mut application = program.to_vec();
     application.push(0);
@@ -217,6 +236,7 @@ fn detect(policy: &ResolvedPolicy) -> HostCapabilities {
         appcontainer: container.as_ref().map(|_| ()).map_err(Clone::clone),
         windows: host::windows_version(),
         capability_sids: host::derive_capability_sids().map(|_| ()),
+        writable_paths: check_writable_paths(policy),
         outer_job_ui: host::outer_job_ui(),
         firewall: network::firewall_running(),
         loopback_exempt: container.and_then(|sid| network::is_loopback_exempt(&sid)),
@@ -275,23 +295,74 @@ fn profile_folder(name: &str) -> Result<std::path::PathBuf, SandboxError> {
 }
 
 fn local_app_data() -> Result<Vec<u16>, SandboxError> {
+    known_folder(
+        &FOLDERID_LocalAppData,
+        "cannot find the local application data folder",
+    )
+}
+
+/// The directories of the system set that a writable path may neither contain nor lie in: the
+/// Windows directory and the program files directories, where Windows grants every
+/// AppContainer read and execute access (rule 6 in DESIGN.md).
+fn system_directories() -> Result<Vec<std::path::PathBuf>, SandboxError> {
+    let mut directories = vec![windows_directory()?];
+    directories.push(known_folder(
+        &FOLDERID_ProgramFiles,
+        "cannot find the program files folder",
+    )?);
+    directories.push(known_folder(
+        &FOLDERID_ProgramFilesX86,
+        "cannot find the x86 program files folder",
+    )?);
+    // Policy paths are canonical, so compare with the canonical form; a folder that does not
+    // exist cannot overlap one.
+    Ok(directories
+        .into_iter()
+        .filter_map(|directory| {
+            std::path::PathBuf::from(OsString::from_wide(&directory))
+                .canonicalize()
+                .ok()
+        })
+        .collect())
+}
+
+/// Rules 3 and 6 for the writable paths of `policy`: none may overlap a system directory, and
+/// Windows must not let every AppContainer execute files in one. Changes nothing.
+fn check_writable_paths(policy: &ResolvedPolicy) -> Result<(), String> {
+    let system = system_directories().map_err(|error| error.to_string())?;
+    let writable = policy
+        .paths
+        .iter()
+        .filter(|rule| rule.access == sandy_core::PathAccess::ReadWrite);
+    for rule in writable {
+        let overlap = system.iter().find(|directory| {
+            rule.path.starts_with(directory) || directory.starts_with(&rule.path)
+        });
+        if let Some(directory) = overlap {
+            return Err(format!(
+                "writable path {} overlaps the system directory {}, where Windows lets every \
+                 AppContainer read and execute files",
+                rule.path.display(),
+                directory.display()
+            ));
+        }
+        acl::check_writable(rule)?;
+    }
+    Ok(())
+}
+
+fn known_folder(
+    id: &windows_sys::core::GUID,
+    error: &'static str,
+) -> Result<Vec<u16>, SandboxError> {
     let known_folder_path = sh_get_known_folder_path()?;
     let mut path: windows_sys::core::PWSTR = std::ptr::null_mut();
     // SAFETY: the folder ID is a valid GUID, a null token selects the current user, and path is
     // a valid out pointer.
-    let hresult = unsafe {
-        known_folder_path(
-            &FOLDERID_LocalAppData,
-            KF_FLAG_DEFAULT as u32,
-            std::ptr::null_mut(),
-            &mut path,
-        )
-    };
+    let hresult =
+        unsafe { known_folder_path(id, KF_FLAG_DEFAULT as u32, std::ptr::null_mut(), &mut path) };
     let result = if hresult < 0 {
-        Err(util::hresult_error(
-            "cannot find the local application data folder",
-            hresult,
-        ))
+        Err(util::hresult_error(error, hresult))
     } else {
         // SAFETY: on success path is a NUL-terminated string from the function.
         let len = (0..).take_while(|&i| unsafe { *path.add(i) } != 0).count();

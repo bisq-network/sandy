@@ -19,6 +19,9 @@ pub struct HostCapabilities {
     /// `DeriveCapabilitySidsFromName` exists. sandy resolves it at run time, so `sandy.exe`
     /// still starts and can explain the problem on builds that lack it.
     pub capability_sids: Result<(), String>,
+    /// No writable path overlaps a system directory, and Windows does not let every
+    /// AppContainer execute files in one (rules 3 and 6).
+    pub writable_paths: Result<(), String>,
     /// The UI restrictions of the job sandy runs in, or `None` outside a job.
     pub outer_job_ui: Result<Option<u32>, String>,
     /// The Windows Firewall service runs. It installs the filters that isolate AppContainers
@@ -132,15 +135,18 @@ fn contained(
         return unavailable(reason);
     }
     match requirement {
-        Requirement::FilesystemConfined => match (policy.system, &host.capability_sids) {
-            (SystemAccess::None, _) => unavailable(SYSTEM_NONE.into()),
-            (SystemAccess::Minimal, Err(reason)) => unavailable(reason.clone()),
-            (SystemAccess::Minimal, Ok(())) => enforced(format!(
-                "AppContainer {name:?}: one capability per policy path with an access control \
+        Requirement::FilesystemConfined => {
+            match (policy.system, &host.capability_sids, &host.writable_paths) {
+                (SystemAccess::None, _, _) => unavailable(SYSTEM_NONE.into()),
+                (SystemAccess::Minimal, Err(reason), _)
+                | (SystemAccess::Minimal, _, Err(reason)) => unavailable(reason.clone()),
+                (SystemAccess::Minimal, Ok(()), Ok(())) => enforced(format!(
+                    "AppContainer {name:?}: one capability per policy path with an access control \
                  entry on the path (no FILE_EXECUTE on read and read-write paths); besides, what \
                  Windows grants all AppContainers and the AppContainer profile folder"
-            )),
-        },
+                )),
+            }
+        }
         Requirement::ChildProcessesDenied => enforced(
             "the program's job admits one active process (JOB_OBJECT_LIMIT_ACTIVE_PROCESS = \
              1), so Windows refuses every process that would join it, and every child of the \
@@ -302,6 +308,7 @@ mod tests {
                 revision: Some(7000),
             }),
             capability_sids: Ok(()),
+            writable_paths: Ok(()),
             outer_job_ui: Ok(None),
             firewall: Ok(()),
             loopback_exempt: Ok(false),
@@ -534,6 +541,20 @@ mod tests {
         };
         let reason = unavailable(status(&policy(), &host, Requirement::FilesystemConfined));
         assert!(reason.contains("DeriveCapabilitySidsFromName"), "{reason}");
+        assert!(matches!(
+            status(&policy(), &host, Requirement::ProcessMemoryIsolated),
+            Status::Enforced { .. }
+        ));
+    }
+
+    #[test]
+    fn a_writable_path_problem_blocks_the_filesystem_only() {
+        let host = HostCapabilities {
+            writable_paths: Err("writable path C:\\Program Files\\App overlaps".into()),
+            ..host()
+        };
+        let reason = unavailable(status(&policy(), &host, Requirement::FilesystemConfined));
+        assert!(reason.contains("overlaps"), "{reason}");
         assert!(matches!(
             status(&policy(), &host, Requirement::ProcessMemoryIsolated),
             Status::Enforced { .. }

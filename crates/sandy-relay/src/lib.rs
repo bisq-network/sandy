@@ -6,15 +6,27 @@
 //! The relay only copies bytes; it never interprets them. Each backend decides where the relay
 //! process runs, how it is confined, and how it ends together with the program.
 
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// Connections beyond this number are closed at once, so clients cannot exhaust threads.
+/// Connections of one listener beyond this number are closed at once, so clients cannot exhaust
+/// threads. Each exposed or forwarded port has its own limit, so clients of one cannot take the
+/// connections of another.
 pub const MAX_CONNECTIONS: usize = 256;
+
+/// After one direction of a connection has ended, the other may stay idle this long before the
+/// relay ends the connection. Otherwise a peer that never sends again, after the other peer has
+/// closed its side, would keep the connection and its slot for as long as it likes.
+pub const HALF_CLOSED_IDLE: Duration = Duration::from_secs(60);
+
+/// How often a direction that waits for data checks whether the connection was aborted or the
+/// other direction has ended.
+const READ_TICK: Duration = Duration::from_secs(1);
+const BUFFER_SIZE: usize = 64 * 1024;
 
 /// How long connections that a relay already accepted may still deliver data after the program
 /// ends (docs/DESIGN.md, "Forwarded ports", rule 5).
@@ -134,7 +146,7 @@ const STOP_CHECK: Duration = Duration::from_millis(50);
 ///    exits would otherwise lose its data.
 /// 2. It closes the listener, so no later connection is taken.
 /// 3. It waits up to `drain` for the accepted connections to finish, then returns. Connections
-///    still open after that end with the process.
+///    still open after that end with the process, with a reset (`abort_all`).
 ///
 /// It never blocks in `accept` without a pending connection, so the stop takes effect within
 /// `STOP_CHECK` without closing the listener under another thread.
@@ -145,8 +157,6 @@ where
     A: FnMut(&L) -> io::Result<TcpStream>,
     C: Fn() -> io::Result<TcpStream> + Send + Sync + 'static,
 {
-    use std::time::Instant;
-
     let connections = Connections::new(connect);
     let mut deadline: Option<Instant> = None;
     loop {
@@ -178,6 +188,9 @@ where
     let deadline = deadline.unwrap_or_else(|| Instant::now() + drain);
     while connections.active() > 0 && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
+    }
+    if connections.active() > 0 {
+        abort_all();
     }
 }
 
@@ -216,17 +229,235 @@ pub fn relay(client: TcpStream, target: SocketAddr) -> io::Result<()> {
 /// clone (`try_clone`, which calls `WSADuplicateSocketW`) of a socket whose non-blocking connect
 /// has just completed can report `WSAENOTCONN` for `shutdown`, although it sends. The half close
 /// then never reaches the target, and both peers wait until Windows drops the connection.
+///
+/// A direction that reaches the end of its stream passes the end on as a half close. A direction
+/// that fails (a reset, or a write the other peer refuses) aborts the connection: both sockets
+/// close with a reset, so neither peer takes a cut stream for a complete one.
 fn relay_streams(client: TcpStream, server: TcpStream) -> io::Result<()> {
+    relay_streams_with(client, server, HALF_CLOSED_IDLE)
+}
+
+/// `relay_streams` with `idle` instead of `HALF_CLOSED_IDLE`.
+fn relay_streams_with(client: TcpStream, server: TcpStream, idle: Duration) -> io::Result<()> {
+    let _registered = Registered::new(&client, &server);
+    let state = Connection::default();
     thread::scope(|scope| {
-        thread::Builder::new().spawn_scoped(scope, || pump(&client, &server))?;
-        pump(&server, &client);
+        thread::Builder::new().spawn_scoped(scope, || {
+            pump(
+                &client,
+                &server,
+                [&state.ended[0], &state.ended[1]],
+                idle,
+                &state,
+            )
+        })?;
+        pump(
+            &server,
+            &client,
+            [&state.ended[1], &state.ended[0]],
+            idle,
+            &state,
+        );
         Ok(())
     })
 }
 
-fn pump(mut from: &TcpStream, mut to: &TcpStream) {
-    let _ = io::copy(&mut from, &mut to);
-    let _ = to.shutdown(Shutdown::Write);
+/// What the two directions of one connection share.
+#[derive(Default)]
+struct Connection {
+    /// Whether each direction has ended.
+    ended: [AtomicBool; 2],
+    aborted: AtomicBool,
+}
+
+impl Connection {
+    /// Makes both sockets close with a reset and stops both directions within `READ_TICK`.
+    fn abort(&self, sockets: [&TcpStream; 2]) {
+        self.aborted.store(true, Ordering::Release);
+        for socket in sockets {
+            reset_on_close(raw(socket));
+        }
+    }
+}
+
+/// Copies `from` to `to` until `from` ends, the connection is aborted, or the other direction
+/// has ended and this one stayed idle for `idle`. `[ended, other_ended]` are the end flags of
+/// this direction and of the other one.
+fn pump(
+    mut from: &TcpStream,
+    mut to: &TcpStream,
+    [ended, other_ended]: [&AtomicBool; 2],
+    idle: Duration,
+    connection: &Connection,
+) {
+    let mut buffer = vec![0u8; BUFFER_SIZE];
+    let mut active = Instant::now();
+    let mut saw_other_end = false;
+    // Without the timeout a read would block until the peer sends, also after an abort.
+    if from.set_read_timeout(Some(READ_TICK)).is_err() {
+        connection.abort([from, to]);
+    }
+    while !connection.aborted.load(Ordering::Acquire) {
+        match from.read(&mut buffer) {
+            Ok(0) => {
+                let _ = to.shutdown(Shutdown::Write);
+                break;
+            }
+            Ok(read) => {
+                if to.write_all(&buffer[..read]).is_err() {
+                    connection.abort([from, to]);
+                    break;
+                }
+                active = Instant::now();
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                if other_ended.load(Ordering::Acquire) {
+                    if !saw_other_end {
+                        // The idle time counts from the other direction's end at the earliest.
+                        saw_other_end = true;
+                        active = active.max(Instant::now());
+                    }
+                    if active.elapsed() >= idle {
+                        let _ = to.shutdown(Shutdown::Write);
+                        break;
+                    }
+                }
+            }
+            Err(_) => {
+                connection.abort([from, to]);
+                break;
+            }
+        }
+    }
+    ended.store(true, Ordering::Release);
+}
+
+#[cfg(unix)]
+type RawSocket = std::os::fd::RawFd;
+#[cfg(windows)]
+type RawSocket = std::os::windows::io::RawSocket;
+
+#[cfg(unix)]
+fn raw(socket: &TcpStream) -> RawSocket {
+    std::os::fd::AsRawFd::as_raw_fd(socket)
+}
+
+#[cfg(windows)]
+fn raw(socket: &TcpStream) -> RawSocket {
+    std::os::windows::io::AsRawSocket::as_raw_socket(socket)
+}
+
+/// Makes closing `socket` send a reset instead of the normal end (SO_LINGER with time 0).
+#[cfg(unix)]
+fn reset_on_close(socket: RawSocket) {
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    // SAFETY: the option value is a valid linger structure of the size passed.
+    unsafe {
+        libc::setsockopt(
+            socket,
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            (&raw const linger).cast(),
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+}
+
+/// Makes closing `socket` send a reset instead of the normal end (SO_LINGER with time 0).
+#[cfg(windows)]
+fn reset_on_close(socket: RawSocket) {
+    use windows_sys::Win32::Networking::WinSock::{
+        LINGER, SO_LINGER, SOCKET, SOL_SOCKET, setsockopt,
+    };
+    let linger = LINGER {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    // SAFETY: the option value is a valid LINGER structure of the size passed.
+    unsafe {
+        setsockopt(
+            socket as SOCKET,
+            SOL_SOCKET,
+            SO_LINGER,
+            (&raw const linger).cast(),
+            std::mem::size_of::<LINGER>() as i32,
+        )
+    };
+}
+
+/// The sockets of the connections this process relays now.
+static ACTIVE: Mutex<Vec<(u64, [RawSocket; 2])>> = Mutex::new(Vec::new());
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Keeps the sockets of one connection in `ACTIVE` while it is relayed. It is dropped before the
+/// sockets close, so `abort_all` never touches a socket number that another connection reuses.
+struct Registered(u64);
+
+impl Registered {
+    fn new(client: &TcpStream, server: &TcpStream) -> Registered {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut active) = ACTIVE.lock() {
+            active.push((id, [raw(client), raw(server)]));
+        }
+        Registered(id)
+    }
+}
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        if let Ok(mut active) = ACTIVE.lock() {
+            active.retain(|(id, _)| *id != self.0);
+        }
+    }
+}
+
+/// Makes every connection that this process still relays close with a reset when the process
+/// ends. A relay calls it when the drain of rule 5 runs out and it exits with connections open,
+/// so no peer takes a cut stream for a complete one.
+pub fn abort_all() {
+    if let Ok(active) = ACTIVE.lock() {
+        for (_, sockets) in active.iter() {
+            for &socket in sockets {
+                reset_on_close(socket);
+            }
+        }
+    }
+}
+
+/// Raises this process's soft limit of open descriptors so that `listeners` listeners with
+/// `MAX_CONNECTIONS` connections each fit: two descriptors per connection, plus some for the
+/// process itself. The limit stays at or below the hard limit; macOS starts processes with a
+/// soft limit of 256, which would allow only about 125 connections.
+#[cfg(unix)]
+pub fn raise_descriptor_limit(listeners: usize) -> io::Result<()> {
+    let needed = (listeners * 2 * MAX_CONNECTIONS + 64) as libc::rlim_t;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes into a valid rlimit.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if limit.rlim_cur >= needed {
+        return Ok(());
+    }
+    limit.rlim_cur = needed.min(limit.rlim_max);
+    // SAFETY: setrlimit reads a valid rlimit.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Takes ownership of a listening socket that the parent process passed by descriptor or handle
@@ -479,6 +710,75 @@ mod tests {
             }
         });
         address
+    }
+
+    /// A connected pair: the end a peer holds, and the end the relay gets.
+    fn pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (relayed, _) = listener.accept().unwrap();
+        (peer, relayed)
+    }
+
+    /// A peer that resets its connection must not look like one that ended it: the relay resets
+    /// the other side too, so the target cannot take a cut stream for a complete one.
+    #[test]
+    fn a_reset_reaches_the_other_side() {
+        let (client, client_end) = pair();
+        let (mut target, target_end) = pair();
+        let relay = thread::spawn(move || relay_streams(client_end, target_end));
+        (&client).write_all(&[7; 100_000]).unwrap();
+        reset_on_close(raw(&client));
+        drop(client);
+        let mut received = Vec::new();
+        let result = target.read_to_end(&mut received);
+        assert!(
+            result.is_err(),
+            "the target saw a normal end after {} bytes",
+            received.len()
+        );
+        relay.join().unwrap().unwrap();
+    }
+
+    /// After one side has ended, a peer that never sends again does not keep the connection.
+    #[test]
+    fn a_half_closed_connection_ends_when_idle() {
+        let (mut client, client_end) = pair();
+        let (target, target_end) = pair();
+        let idle = Duration::from_millis(100);
+        let relay = thread::spawn(move || relay_streams_with(client_end, target_end, idle));
+        // The target ends its side; the client stays open and silent.
+        drop(target);
+        let mut rest = Vec::new();
+        client.read_to_end(&mut rest).unwrap();
+        let started = Instant::now();
+        while !relay.is_finished() && started.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(relay.is_finished(), "the relay kept the idle connection");
+        relay.join().unwrap().unwrap();
+        // The relay closed its end of the client's connection.
+        assert!(matches!(client.read(&mut [0; 1]), Ok(0) | Err(_)));
+    }
+
+    /// A peer that stays busy is not cut off by the idle limit.
+    #[test]
+    fn a_half_closed_connection_stays_while_data_flows() {
+        let (client, client_end) = pair();
+        let (mut target, target_end) = pair();
+        let idle = Duration::from_millis(300);
+        let relay = thread::spawn(move || relay_streams_with(client_end, target_end, idle));
+        // The target ends its side first; the client then sends for longer than the limit.
+        target.shutdown(Shutdown::Write).unwrap();
+        for _ in 0..8 {
+            (&client).write_all(b"tick").unwrap();
+            thread::sleep(Duration::from_millis(100));
+        }
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut received = Vec::new();
+        target.read_to_end(&mut received).unwrap();
+        assert_eq!(received, b"tick".repeat(8));
+        relay.join().unwrap().unwrap();
     }
 
     fn relay_to(target: SocketAddr) -> SocketAddr {

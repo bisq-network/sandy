@@ -63,7 +63,10 @@ path_metadata = "deny"        # "deny" | "allow"; chmod, chown, utimensat, setxa
 appcontainer_name = "example.app"  # required on Windows
 ```
 
-Command line options extend the policy file (`sandy --help`).
+Command line options extend the policy file (`sandy --help`): path options add paths, and every
+other option replaces the file's value, also with a weaker one. The caller is trusted. sandy
+refuses to run when its own executable or the policy file lies inside a writable path, because
+the program could change them for the next start.
 
 Rules:
 
@@ -73,10 +76,13 @@ Rules:
 3. No path may be both writable and executable, also not through nesting. sandy rejects such a
    policy. The program could otherwise drop an executable that a process outside the sandbox
    later runs.
-4. No policy path may lie inside a writable path. sandy resolves symbolic links at every start,
-   so the program could replace such a path with a link and widen its access at the next start.
-   For the same reason the integrator must keep the parent directories of policy paths out of the
-   program's reach.
+4. No policy path may lie inside a writable path, and none may be resolved through an entry
+   inside one, such as a symbolic link in a writable directory that points elsewhere. sandy
+   resolves symbolic links at every start, so the program could replace such an entry with a
+   link and widen its access at the next start. For the same reason the integrator must keep the
+   parent directories of policy paths out of the program's reach. Rules 3 and 4 compare file
+   identity (device and inode) as well as paths on Linux and macOS, so one directory reachable
+   under two paths, for example through a bind mount, counts as one.
 5. The program file itself gets read and execute access automatically.
 6. `system = "minimal"` adds a backend-defined read-only set of system paths that programs need to
    start: shared libraries, loader configuration, time zone data, random devices. Each backend
@@ -161,7 +167,8 @@ Rules:
 4. The relay is confined as tightly as the platform allows: on Windows it runs in the program's
    AppContainer and job; on Linux and macOS it runs outside the program's sandbox in its own
    sandbox with no file access.
-5. At most `sandy_relay::MAX_CONNECTIONS` connections are relayed at the same time.
+5. Each exposed or forwarded port relays at most `sandy_relay::MAX_CONNECTIONS` connections at
+   the same time, so clients of one port cannot take the connections of another.
 
 ## Forwarded ports
 
@@ -186,9 +193,15 @@ Rules:
 5. Lifetime of both relays: when the program ends, the relay closes its listeners at once, gives
    connections it already accepted at most one second to deliver their remaining data, and then
    ends. A program that connects, writes and exits immediately therefore does not lose its data,
-   and no relay outlives the program by more than one second. With
+   and no relay outlives the program by more than one second. Connections still open when that
+   second ends close with a reset, so no peer takes a cut stream for a complete one. With
    `process.children = "contained"` on Linux and macOS, the relay watches the supervising sandy
-   instead, which ends after the program's process group.
+   instead, which ends after the program's process group, and also a pipe that only the guard
+   holds, so it ends with the group also while sandy is stopped.
+6. The relay passes the end of a stream on as it came: a normal end as a half close, and a reset,
+   or data the relay cannot deliver, as a reset of the other side. After one direction of a
+   connection has ended, the other ends when it stays idle for `sandy_relay::HALF_CLOSED_IDLE`
+   (60 seconds), so a peer that never sends again cannot hold the connection and its slot.
 
 ## Requirements and the enforcement plan
 
@@ -213,8 +226,10 @@ Rules:
 
 A requirement is a lower bound. A backend may deny more, but never less. For example,
 `UnixSocketsDenied` guarantees that the program cannot connect to Unix sockets outside its
-`read_write` paths; Linux and macOS deny Unix sockets completely, while Windows allows sockets
-inside `read_write` paths, because Windows checks access to a socket through its file.
+`read_write` paths; Linux and macOS deny connections to every Unix socket, while Windows allows
+sockets inside `read_write` paths, because Windows checks access to a socket through its file.
+(On Linux with `ip = "all"` a socket pair can still take a free abstract name; see
+`docs/linux.md`.)
 
 The backend reports each requirement as enforced (naming the mechanism) or unavailable (naming the
 reason). `EnforcementPlan::new` treats a requirement without a report as unavailable, so a backend
@@ -315,15 +330,17 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   signals blocked. sandy execs only after the relay reports ready.
 - `process.children = "none"`: the profile denies `process-fork`, which Seatbelt checks for
   `fork`, `vfork` and `posix_spawn`; threads and `execve` stay allowed.
-- `process.children = "contained"`: sandy forks a guard process, which leads a new process
-  group, and then the program, which joins that group, applies the profile and executes the
-  target with `execve` after marking every descriptor above 2 close-on-exec. The profile denies
-  `setpgid`, `setsid` and `posix_spawn` with `syscall-unix` rules (the flags
-  `POSIX_SPAWN_SETSID` and `POSIX_SPAWN_SETPGROUP` change the group inside `posix_spawn`, which
-  no rule can inspect), and the signal rule keeps the program from signaling sandy or the guard,
-  which run outside the sandbox. The guard watches the program and a pipe from sandy with kqueue
-  and kills the group when either ends. macOS has no child subreaper, so after the program exits
-  sandy repeats SIGKILL to the group until the kernel finds no live process in it.
+- `process.children = "contained"`: sandy forks a guard process outside the program's group,
+  which forks an anchor that leads a new process group, and then the program, which joins that
+  group, applies the profile and executes the target with `execve` after marking every
+  descriptor above 2 close-on-exec. The profile denies `setpgid`, `setsid` and `posix_spawn` with
+  `syscall-unix` rules (the flags `POSIX_SPAWN_SETSID` and `POSIX_SPAWN_SETPGROUP` change the
+  group inside `posix_spawn`, which no rule can inspect), and the signal rule keeps the program
+  from signaling sandy, the guard or the anchor, which run outside the sandbox. The guard watches
+  the program and a pipe from sandy with kqueue and, when either ends, sends SIGKILL to the group
+  until no live process is left: on macOS a process being forked can miss one signal for its
+  group. sandy does the same after the program exits. The guard reaps the anchor, which keeps the
+  group's ID reserved, only after sandy is done or gone.
 - `process.end_with_parent`: a watcher process, forked twice like the relay, registers
   `NOTE_EXIT` for sandy's parent and for the program (with `contained`: the supervising sandy)
   and then applies its own profile (no files, no network, no Mach services, signals allowed).
@@ -369,6 +386,9 @@ Details, limitations and sources: `docs/windows.md`.
   execute what it writes there (the writable-never-executable rule). A deny entry would not help:
   the AppContainer access check ignores a deny ACE for the package SID. The folder holds no user
   data and persists across runs.
+- Writable paths (rules 3 and 6): the plan refuses a `read_write` path that overlaps the Windows
+  or a program files directory, or where Windows lets every AppContainer (ALL APPLICATION
+  PACKAGES, ALL RESTRICTED APPLICATION PACKAGES) execute files, also only files created later.
 - sandy sets `SystemRoot` and `LOCALAPPDATA`; without the latter Windows refuses to create an
   AppContainer process. Windows sets `LOCALAPPDATA`, `TEMP` and `TMP` to the profile folder.
 - Job object with kill-on-close, no breakaway and all UI restrictions. The program is created

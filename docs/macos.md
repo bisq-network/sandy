@@ -170,6 +170,9 @@ of earlier definitions"), so the protections come last. The unit test
       compilers do not know every `SYS_` name. dyld or libSystem calls `fsgetpath` once while a
       program starts; the call fails, the Sandbox log records `deny(1) syscall-unix 427`, and the
       program starts normally (CI run 39767043700).
+    - `(deny syscall-unix (syscall-number 142))`: `gethostuuid` returns the hardware UUID, an
+      identifier of the machine that every user and every reinstall share. IOKit would give the
+      same value (`IOPlatformUUID`) only with `iokit-get-properties`, which the profile denies.
     - With `process.children = "contained"`: `(deny syscall-unix (syscall-number 82)
       (syscall-number 147) (syscall-number 244))`, that is `setpgid`, `setsid` and `posix_spawn`
       (see [Contained child processes](#contained-child-processes)).
@@ -319,11 +322,15 @@ The relay is a process of its own, outside the program's sandbox and confined by
    ready report. sandy closes its own copies of the
    listeners before the exec, and `POSIX_SPAWN_CLOEXEC_DEFAULT` would close them anyway.
 7. The relay waits on the same kqueue for new connections (`EVFILT_READ` on each listener) and
-   for the end of the program, and relays each accepted connection with `sandy_relay::relay` in
-   a thread of its own. When the program ends, also after `SIGKILL`, the relay closes its
-   listeners at once, gives the connections it already accepted at most one second to deliver
-   what is left, and exits (rule 5 of "Forwarded ports" in `DESIGN.md`). A program that connects,
-   writes and exits immediately therefore does not lose its data.
+   for the end of the program (with `contained` also for the end of the guard's pipe), and relays
+   each accepted connection with `sandy_relay::relay` in a thread of its own, up to
+   `sandy_relay::MAX_CONNECTIONS` per listener. Before it applies its profile it raises its soft
+   limit of open descriptors to fit them: macOS starts processes with 256, enough for only about
+   125 connections. When the program ends, also after `SIGKILL`, the relay closes its listeners
+   at once, gives the connections it already accepted at most one second to deliver what is
+   left, and exits (rule 5 of "Forwarded ports" in `DESIGN.md`), resetting the connections that
+   are still open. A program that connects, writes and exits immediately therefore does not lose
+   its data.
 
 `sandy check` compiles the relay's profile together with the program's.
 
@@ -333,23 +340,36 @@ The relay is a process of its own, outside the program's sandbox and confined by
 when sandy itself is killed. sandy then stays the target's parent instead of replacing itself
 (`crates/sandy-macos/src/macos/contain.rs`):
 
-1. sandy catches `SIGCHLD`, `SIGURG`, `SIGWINCH` and `SIGINFO` with a handler that does nothing.
-   macOS discards a signal on arrival while its action is to ignore it, even when it is blocked,
-   so without the handler sandy would never see these signals. Then it blocks every signal except
-   the fault signals and waits for them with `sigwait`.
-2. It forks the guard, which creates a process group of its own and keeps only the read end of a
-   pipe from sandy.
-3. It forks the target into the guard's group and sends the target's process ID through the pipe.
-   The guard registers the target's `NOTE_EXIT` and the pipe in a kqueue and kills its group when
-   either reports: when the target ends, or when sandy dies, also by SIGKILL.
+1. sandy catches, with a handler that does nothing, every signal whose action is to ignore it:
+   those ignored by default (`SIGCHLD`, `SIGURG`, `SIGIO`, `SIGWINCH`, `SIGINFO`) and those that
+   its caller set to be ignored, for example `SIGINT` and `SIGQUIT` after `&` in a script or
+   `SIGHUP` under `nohup`. macOS discards a signal on arrival while its action is to ignore it,
+   even when it is blocked, so without the handler sandy would never see these signals and could
+   not forward them. Then it blocks every signal except the fault signals and waits for them with
+   `sigwait`. The target gets the caller's actions back before it starts.
+2. It forks the guard. The guard starts a process group of its own (it is in neither sandy's job
+   nor the target's group) and forks the anchor, which starts the target's process group and only
+   waits to be killed. The guard keeps two pipes to and from sandy and, with exposed or
+   forwarded ports, the write end of the relay's pipe; the anchor keeps no descriptor.
+3. sandy learns the group's ID (the anchor's process ID) from the guard, forks the target into
+   that group, and sends the target's process ID to the guard. The guard registers the target's
+   `NOTE_EXIT` and the pipe from sandy in a kqueue. When either reports, that is when the target
+   ends or sandy is done or gone (also killed by SIGKILL), the guard kills the group until no live
+   process is left in it, closes the relay's pipe, waits until sandy is done or gone, reaps the
+   anchor and ends.
 4. The forked target restores the signal actions and the mask, applies the profile, marks every
    descriptor above 2 close-on-exec and executes the target with `execve`. It reports a failure
    over a close-on-exec pipe.
 5. sandy forwards the signals it receives to the target and follows job control with a terminal,
    as on Linux (see "Process model" in `DESIGN.md`).
-6. When the target exits, sandy kills the group with SIGKILL, repeats that until the kernel finds
-   no live process in the group, reaps the guard and the target, and exits with the target's exit
-   status, or 128 plus the signal number.
+6. When the target exits, sandy kills the group until no live process is left in it, closes its
+   pipe to the guard, reaps the guard and the target, and exits with the target's exit status, or
+   128 plus the signal number.
+
+So the group ends with the target also while sandy is stopped (by its caller, or by the target
+through the terminal), when sandy is killed, and when the watcher of `end_with_parent` kills
+sandy. The relay of exposed and forwarded ports polls the relay's pipe besides sandy's process
+ID, so it ends with the group, also while sandy is stopped and therefore does not end.
 
 No process may leave the group. The profile denies `setpgid` (82) and `setsid` (147) with
 `syscall-unix` rules, as it denies the lookups by file ID. That is not enough: `posix_spawn` with
@@ -372,12 +392,14 @@ process's ID returns the same answer for every process to an unprivileged caller
 tell which processes run in this sandbox; and `NOTE_TRACK` of kqueue, which followed forks, is no
 longer supported.
 
-Killing the group: `kill(-group, SIGKILL)` returns 0 while a live process is in the group,
-`EPERM` when only zombies are left (measured on macOS 26), and `ESRCH` when nothing is left.
-sandy repeats the signal every 10 milliseconds while it returns 0, so a process forked while the
-signal was delivered gets the next one. The group's ID is the guard's process ID; sandy reaps the
-guard and the target only after that, so no other process or group can have these IDs while
-sandy signals them.
+Killing the group: on macOS a process that is being forked while a signal for its group is
+delivered is not in the group yet, and its parent finishes `fork` before the signal ends it, so
+one SIGKILL can miss a process; a program that forks in a loop leaves survivors almost every time
+(measured on macOS 26). So whoever ends the group repeats the signal every 10 milliseconds while
+`kill(-group, SIGKILL)` returns 0. It returns `EPERM` when only zombies are left (measured) and
+`ESRCH` when nothing is left. The guard can repeat the signal because it is not in the group. The
+group's ID is the anchor's process ID, and the guard reaps the anchor only after sandy is done or
+gone, so no other group can have the ID while sandy or the guard signals it.
 
 The relay of exposed and forwarded ports watches sandy's process ID, which is the supervising
 sandy here, so it ends after the group (rule 5 of "Forwarded ports" in `DESIGN.md`).
@@ -405,8 +427,11 @@ sandy here, so it ends after the group (rule 5 of "Forwarded ports" in `DESIGN.m
 
 macOS has no pidfd, so the watcher signals the target by its process ID. Right before each signal
 it checks the kqueue for the target's end. The ID could name another process only if the target
-ended between that check and the signal and macOS gave the ID to a new process in that moment,
-which it does only after the process IDs wrapped around.
+ended between that check and the signal and macOS gave the ID to a new process in that moment.
+The target can make the process IDs wrap around quickly (processes that fork in a loop went
+through all 99999 IDs in about 10 seconds on macOS 26), so the remaining window is the moment
+between the check and the signal, and another process of the user would have to get the ID in
+it.
 
 The policy requires `signals = "isolated"`, so the target cannot signal the watcher. `sandy check`
 compiles the watcher's profile together with the target's.

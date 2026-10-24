@@ -15,9 +15,12 @@
 //!    the listeners and relays each accepted connection in its own threads.
 //! 5. When the pidfd becomes readable, that is when the program (with `contained`: sandy) ends,
 //!    also by SIGKILL, it closes the listeners at once, gives accepted connections at most one
-//!    second, and exits.
+//!    second, and exits. With `contained` it also polls a pipe whose write end only the guard
+//!    holds: the pipe ends when the guard has ended the program's group, also while sandy is
+//!    stopped and therefore does not end.
 //!
 
+use std::fs::File;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -62,8 +65,9 @@ impl RelayConfig {
     }
 }
 
-/// Starts the relay and returns once it is confined and serving.
-pub fn start(config: &RelayConfig) -> Result<(), SandboxError> {
+/// Starts the relay and returns once it is confined and serving. `ended` is the read end of the
+/// guard's pipe with `children = "contained"` (see the module documentation).
+pub fn start(config: &RelayConfig, ended: Option<File>) -> Result<(), SandboxError> {
     let listeners = config
         .pairs
         .iter()
@@ -77,19 +81,24 @@ pub fn start(config: &RelayConfig) -> Result<(), SandboxError> {
     // SAFETY: getpid has no preconditions.
     let program = helper::pidfd_open(unsafe { libc::getpid() }, "the program")?;
     helper::start("the relay", move |ready| {
-        relay_main(listeners, program, ready, config)
+        relay_main(listeners, program, ended, ready, config)
     })
 }
 
 fn relay_main(
     listeners: Vec<(TcpListener, SocketAddr)>,
     program: OwnedFd,
+    ended: Option<File>,
     ready: Ready,
     config: &RelayConfig,
 ) {
     let mut keep: Vec<RawFd> = listeners.iter().map(|(l, _)| l.as_raw_fd()).collect();
     keep.extend([program.as_raw_fd(), ready.fd(), libc::STDERR_FILENO]);
+    keep.extend(ended.as_ref().map(AsRawFd::as_raw_fd));
     let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sandy_relay::raise_descriptor_limit(listeners.len()).map_err(|error| {
+            SandboxError::io("cannot raise the relay's descriptor limit", error)
+        })?;
         confine(&keep, config)?;
         // Every connection gets its own threads. Starting one now shows that the filter allows
         // it, so a missing system call fails the start instead of the first connection.
@@ -111,7 +120,7 @@ fn relay_main(
     match started {
         Ok(Ok(())) => {
             ready.report();
-            serve_until_exit(listeners, &program);
+            serve_until_exit(listeners, &program, ended.as_ref());
         }
         Ok(Err(error)) => ready.fail(&error.to_string()),
         Err(_) => ready.fail("the relay panicked"),
@@ -124,13 +133,34 @@ const DRAIN: Duration = Duration::from_secs(1);
 const DRAIN_POLL: Duration = Duration::from_millis(10);
 const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(50);
 
-/// Accepts and relays connections until the program ends, then closes the listeners at once and
-/// gives the accepted connections at most `DRAIN` to deliver what is left. A program that
-/// connects, writes and exits therefore does not lose its data, as it would not without a relay.
-fn serve_until_exit(listeners: Vec<(TcpListener, SocketAddr)>, program: &OwnedFd) {
-    let active = Arc::new(AtomicUsize::new(0));
-    let mut polls: Vec<libc::pollfd> = [program.as_raw_fd()]
+/// Accepts and relays connections until the program ends (or the guard's pipe `ended` ends),
+/// then closes the listeners at once and gives the accepted connections at most `DRAIN` to
+/// deliver what is left. A program that connects, writes and exits therefore does not lose its
+/// data, as it would not without a relay.
+fn serve_until_exit(
+    listeners: Vec<(TcpListener, SocketAddr)>,
+    program: &OwnedFd,
+    ended: Option<&File>,
+) {
+    // One count per listener: clients of one port cannot take the connections of another.
+    let active: Vec<Arc<AtomicUsize>> = listeners
+        .iter()
+        .map(|_| Arc::new(AtomicUsize::new(0)))
+        .collect();
+    let total = || {
+        active
+            .iter()
+            .map(|count| count.load(Ordering::Acquire))
+            .sum::<usize>()
+    };
+    // The end watches come first; the listeners follow.
+    let ends: Vec<RawFd> = [program.as_raw_fd()]
         .into_iter()
+        .chain(ended.map(AsRawFd::as_raw_fd))
+        .collect();
+    let mut polls: Vec<libc::pollfd> = ends
+        .iter()
+        .copied()
         .chain(listeners.iter().map(|(listener, _)| listener.as_raw_fd()))
         .map(|fd| libc::pollfd {
             fd,
@@ -149,24 +179,30 @@ fn serve_until_exit(listeners: Vec<(TcpListener, SocketAddr)>, program: &OwnedFd
             break;
         }
         // Connections that completed together with the end of the program are still taken.
-        for (poll, (listener, target)) in polls[1..].iter().zip(&listeners) {
+        let watched = polls[ends.len()..].iter().zip(&listeners).zip(&active);
+        for ((poll, (listener, target)), count) in watched {
             if poll.revents != 0 {
-                accept_all(listener, *target, &active);
+                accept_all(listener, *target, count);
             }
         }
-        if polls[0].revents != 0 {
+        if polls[..ends.len()].iter().any(|poll| poll.revents != 0) {
             break;
         }
     }
     drop(listeners);
     let ended = Instant::now();
-    while active.load(Ordering::Acquire) > 0 && ended.elapsed() < DRAIN {
+    while total() > 0 && ended.elapsed() < DRAIN {
         thread::sleep(DRAIN_POLL);
+    }
+    if total() > 0 {
+        // The relay ends now; the connections it still relays end with a reset, not with the
+        // normal end that would look like a complete stream.
+        sandy_relay::abort_all();
     }
 }
 
 /// Accepts every waiting connection on `listener` and relays each one in its own thread, up to
-/// `sandy_relay::MAX_CONNECTIONS` at the same time.
+/// `sandy_relay::MAX_CONNECTIONS` of this listener at the same time.
 fn accept_all(listener: &TcpListener, target: SocketAddr, active: &Arc<AtomicUsize>) {
     loop {
         let client = match listener.accept() {

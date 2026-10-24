@@ -63,6 +63,22 @@ keys to the group ALL APPLICATION PACKAGES (`S-1-15-2-1`). Every AppContainer is
 contains no user profile data in a default installation, but software can grant this group
 access anywhere.
 
+No writable path may overlap this set (rule 6 in `DESIGN.md`), and none may be a place where the
+program could write a file that it may then execute (rule 3). The plan reports
+`FilesystemConfined` unavailable, and `grant` refuses, when a `read_write` path:
+
+- contains or lies inside the Windows directory (`GetSystemWindowsDirectoryW`) or a program files
+  directory (`FOLDERID_ProgramFiles`, `FOLDERID_ProgramFilesX86`);
+- has a DACL that gives ALL APPLICATION PACKAGES or ALL RESTRICTED APPLICATION PACKAGES
+  `FILE_EXECUTE`, on the path itself or through an entry that files or directories created in it
+  inherit (`access::may_grant`). Effective access is the union of all allow entries, so the
+  execute right of the group would join the write right of sandy's capability. A writable data
+  folder below `C:\Program Files` inherits exactly such an entry;
+- has entries of a type the evaluator does not know, because then it cannot tell.
+
+sandy checks the path's own DACL. A file below it that carries an explicit entry for one of the
+groups is not found; software rarely sets one on files in a data folder.
+
 `system = "none"` is unavailable. A Less Privileged AppContainer (LPAC,
 `PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY`) drops ALL APPLICATION PACKAGES, but
 `C:\Windows` and `C:\Program Files` also grant read and execute to ALL RESTRICTED APPLICATION
@@ -490,8 +506,9 @@ messages that reach processes outside the sandbox.
   in `cmd.exe`, which parses arguments with other rules, so arguments could run commands
   [BatBadBut]. Run `cmd.exe /c` explicitly instead.
 - **Program path.** `std::fs::canonicalize` returns `\\?\C:\...` paths. sandy passes the
-  ordinary form when it names the same file, so the program sees an ordinary path as its own
-  name.
+  ordinary form to `CreateProcessW` when it names the same file. The first token of the command
+  line, the program's `argv[0]`, is the program as the caller wrote it (`TargetCommand::arg0`), as
+  on Linux and macOS, so multi-call programs see the name they were started under.
 
 ## Supported Windows versions
 

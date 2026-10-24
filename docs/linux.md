@@ -94,14 +94,17 @@ One relay process serves all pairs. sandy starts it before it confines itself:
    reports "ready" over the pipe. sandy reads the report and continues only on success. Any
    failure of the relay is reported back, and sandy refuses to run. The relay then polls the
    pidfd and its listeners and relays every accepted connection in its own threads, up to
-   `sandy_relay::MAX_CONNECTIONS` at the same time.
+   `sandy_relay::MAX_CONNECTIONS` per listener at the same time. Before it confines itself it
+   raises its soft limit of open descriptors so that they fit.
 5. When the pidfd becomes readable, that is when the program ends (also by SIGKILL), the relay
    accepts the connections reported in the same round, closes its listeners, waits while accepted
    connections deliver their data, at most one second, and exits (DESIGN.md rule 5 of "Forwarded
-   ports"). A program that connects, writes and exits at once therefore does not
-   lose its data, and the relay never outlives the program (with `contained`: sandy) by more than
-   one second. If sandy fails after starting the relay, sandy's process ends and the relay with
-   it.
+   ports"), resetting the connections that are still open. A program that connects, writes and
+   exits at once therefore does not lose its data, and the relay never outlives the program by
+   more than one second. With `contained` the pidfd is sandy's; the relay also polls a pipe whose
+   write end only the guard holds, which ends when the guard dies with the program's group, so
+   the relay ends with the group also while sandy is stopped. If sandy fails after starting the
+   relay, sandy's process ends and the relay with it.
 
 The listeners and the pidfd are close-on-exec, and sandy closes its copies before it confines
 itself, so the program never holds them. The relay keeps standard error to report errors; a
@@ -111,7 +114,12 @@ second after the program ends.
 The relay runs in its own Landlock domain, a sibling of the program's domain, so neither can
 ptrace the other. With `signals = "any"` the program can kill the relay. Any local process can
 connect to the relay's listeners, like to any loopback port: through an exposed port it reaches
-the program, through a forwarded port it reaches `to`, which it could reach directly.
+the program, through a forwarded port it reaches `to`. A process of the same user could reach
+`to` directly. A process of another user reaches `to` through the relay as sandy's user, so a
+service that decides by the connecting user (an owner rule of the packet filter, a peer
+credential check) would let it in; forward only to services that authenticate their clients.
+macOS behaves the same; on Windows only the program's AppContainer reaches the forward
+listener.
 
 
 ## Contained child processes
@@ -394,8 +402,10 @@ exposed and forwarded ports is forked before the program's filter exists, so it 
 `prlimit64`, `setpriority`, `ioprio_set`, `sched_setaffinity`, `sched_setscheduler`,
 `sched_setparam` and `sched_setattr` can change other processes of the user: lower their
 resource limits, priority or I/O priority, or pin them to one CPU. The denylist allows them only
-with process ID 0 (the caller) or the target's own process ID, which it keeps from sandy after
-`execve`. For `setpriority` and `ioprio_set` it also denies the process group and user forms,
+with process ID 0 (the caller), and with `children = "none"` or `"contained"` also with the
+target's own process ID, which it keeps from sandy after `execve`. With `children = "allowed"` a
+process the program started can outlive it, and once another process of the user has that ID,
+the exemption would cover it; there only 0 works. For `setpriority` and `ioprio_set` it also denies the process group and user forms,
 because sandy's process group can contain processes outside the sandbox.
 
 Costs: children of the program cannot use these calls on each other, and a thread ID other than
@@ -417,7 +427,7 @@ thread, and `nice` works only for the calling thread through ID 0.
 | `/etc/ld.so.preload` | read | always | The system-wide preload list. Without it the program would start differently than outside the sandbox. |
 | `/etc/ld-musl-x86_64.path` (arm64: `-aarch64`) | read | always | The library path of the musl loader. |
 | `/etc/localtime`, `/usr/share/zoneinfo` | read | always | Time zone data. |
-| `/etc/ssl/openssl.cnf`, `/etc/pki/tls/openssl.cnf`, `/etc/crypto-policies/back-ends` | read | always | OpenSSL configuration and the crypto policy files it includes on Fedora and RHEL. Node.js does not start when the configuration exists but cannot be read. |
+| `/etc/ssl/openssl.cnf`, `/etc/pki/tls/openssl.cnf`, `/etc/pki/tls/openssl.d`, `/etc/crypto-policies/back-ends`, `/usr/share/crypto-policies` | read | always | OpenSSL configuration and the system crypto policy it includes on Fedora and RHEL (the back-ends are symbolic links into `/usr/share/crypto-policies`, and Landlock checks the target). OpenSSL drops an include it cannot read without an error and then runs with weaker built-in defaults; Node.js does not start when the configuration exists but cannot be read. |
 | `/dev/null` | read, write | always | Programs redirect output to it. Writes are discarded. No ioctl right. |
 | `/dev/zero`, `/dev/random`, `/dev/urandom` | read | always | Zero and random sources for programs that do not use `getrandom`. |
 | `/sys/devices/system/cpu/online`, `/sys/devices/system/cpu/possible` | read | always | The number of CPUs for glibc, Go and Java. |
@@ -462,7 +472,9 @@ secrets passed on command lines, and `/proc/net` of the network namespace. `/pro
   FilesystemConfined is unavailable. The path contains an entry of the set, or lies inside one of
   its directories. Entries that do not exist on this host count too (their location with the
   symbolic links of the existing part resolved), because the program could create them, for
-  example `/etc/ld.so.preload`. Only `/dev/null` is exempt. Otherwise the program could change the
+  example `/etc/ld.so.preload`. A symbolic link counts where it is and where it points, also when
+  its target is missing, as `/etc/resolv.conf` can be before the resolver starts. Only
+  `/dev/null` is exempt. Otherwise the program could change the
   dynamic loader, shared libraries, the loader configuration or files such as `/etc/hosts`, which
   the next start and programs outside the sandbox use. File permissions usually forbid this
   anyway, because these files belong to root and sandy refuses to run as root; the check keeps
@@ -471,10 +483,17 @@ secrets passed on command lines, and `/proc/net` of the network namespace. `/pro
 ## Known limitations
 
 - **Paths outside the policy are visible.** `stat`, `access`, `readlink`, `getxattr`,
-  `getxattrat`, `listxattrat`, `file_getattr` and `inotify` watches work on every path the user
-  can reach (tested: an inotify watch on a directory outside the policy succeeded). The program
-  can learn which files exist, their sizes, times and attributes, and when other programs touch
-  them.
+  `getxattrat`, `listxattrat`, `file_getattr`, `name_to_handle_at`, `inotify` watches and
+  unprivileged `fanotify` marks (`FAN_REPORT_FID` and related flags) work on every path the user
+  can reach (tested: an inotify watch and a fanotify mark on a directory outside the policy
+  succeeded). The program can learn which files exist, their sizes, times and attributes, and
+  when other programs touch them. It cannot open them: `open_by_handle_at` needs a capability.
+- **Abstract socket names with `ip = "all"`.** The program can bind one end of a socket pair, or
+  an AF_UNIX socket, to a free abstract name, because the filter cannot tell a socket's family
+  from its descriptor and the Landlock scope checks connect and send, not bind. A service outside
+  that binds the same name later then fails to start; the program cannot impersonate it, because
+  such a socket cannot listen. With `ip = "none"` and `unix_sockets = "none"` the filter denies
+  `bind`, `listen`, `connect` and `accept`, which no socket pair needs.
 - **System information.** `uname`, `sysinfo`, `statfs` and `lsm_list_modules` stay allowed. They
   show the kernel version, load and memory, file system statistics, and the active security
   modules (which `/sys/kernel/security/lsm` shows to every user). The mount and namespace listing
