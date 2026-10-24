@@ -17,6 +17,7 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use common::linux::*;
+use common::unix::*;
 use common::*;
 
 fn args(values: &[&str]) -> Vec<String> {

@@ -6,10 +6,10 @@ process, and then replaces itself with the target. The target keeps sandy's proc
 process it starts inherits the sandbox.
 
 Status: the pure parts (profile generation and planning) are unit tested on every platform. The
-parts that call macOS compile for `aarch64-apple-darwin` and `x86_64-apple-darwin`, but have not
-run yet; they run on the macOS CI runner (see [Verification](#verification)). The intended target
-is macOS 15. An older macOS may reject an operation or filter in the profile; `sandy check` then
-reports it and sandy refuses to run.
+parts that call macOS run in the tests on the macOS 15 CI runner (arm64) and on macOS 26 (arm64);
+see [Verification](#verification). The x86_64 build has not run on an Intel Mac, and does not
+work through Rosetta (see "Known limitations"). An older macOS may reject an
+operation or filter in the profile; `sandy check` then reports it and sandy refuses to run.
 
 ## What `sandy run` does
 
@@ -24,6 +24,11 @@ reports it and sandy refuses to run.
    `sandbox_check(getpid(), NULL, 0)` must then report that the process is sandboxed.
 6. `posix_spawn` with `POSIX_SPAWN_SETEXEC` replaces sandy with the target, like `execve`.
    `argv[0]` is the program name as the caller gave it (`TargetCommand::arg0`).
+
+Before step 5, sandy starts the relay of exposed and forwarded ports and the watcher of
+`process.end_with_parent`, if the policy needs them. With `process.children = "contained"`, a
+forked child performs steps 5 and 6, with `execve` instead of `posix_spawn` (see
+[Contained child processes](#contained-child-processes)).
 
 If any step fails, `run` returns an error and sandy exits with status 125. The target never starts
 with a weaker sandbox.
@@ -64,14 +69,14 @@ compiler fail, and sandy fails closed.
 | `FilesystemConfined` | Profile: `(deny default)`; `file-read*` for every policy path and the system set; `file-write*` only for `read_write` paths; `process-exec*` and `file-map-executable` only for `read_exec` paths, the program and system code. No hard links; clones only into `read_write` paths and only from files the target may read. No Mach or XPC service, so no other process acts on files for the target. Policy paths cannot be deleted or replaced. |
 | `NoPrivilegeEscalation` | Only policy paths execute. Sandbox.kext refuses to execute setuid or setgid files from any sandboxed process, and the profile also denies `process-exec*` for files with mode bit `#o4000` or `#o2000`. No Mach service (authorization, privileged helpers, launchd). |
 | `ProcessMemoryIsolated` | Profile: `process-info*` (allowed by default) is denied and then allowed only for `(target self)`; task ports are denied (`mach-priv*`, `mach-task-name`, `mach-task-read`, `mach-task-inspect`); `ptrace` attach, which Seatbelt checks as `system-debug`, is denied. |
-| `InheritedHandlesClosed` | `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`; descriptors 0, 1 and 2 are named with `posix_spawn_file_actions_addinherit_np`. The kernel closes every other descriptor during the exec. |
-| `EnvironmentControlled` | `posix_spawn` receives exactly `command.env`. The backend adds no variable. |
+| `InheritedHandlesClosed` | `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`; descriptors 0, 1 and 2 are named with `posix_spawn_file_actions_addinherit_np`. The kernel closes every other descriptor during the exec. With `children = "contained"` the forked target, a single thread, marks every descriptor above 2 close-on-exec (`PROC_PIDLISTFDS`) right before `execve`. |
+| `EnvironmentControlled` | `posix_spawn` (with `children = "contained"`: `execve`) receives exactly `command.env`. The backend adds no variable. |
 | `IpNetworkDenied` | Profile: no `network-*` rule for IP. The name resolver is unreachable unless `unix_sockets = "all"`. |
 | `UnixSocketsDenied` | Profile: no `network-bind` or `network-outbound` for Unix sockets. With `ip = "all"`, the resolver socket is the one exception. |
 | `SignalsIsolated` | Profile: `(allow signal (target self) (target same-sandbox))` instead of `(allow signal)`. |
 | `ChildProcessesDenied` | Profile: no `(allow process-fork)`, and an explicit `(deny process-fork)` at the end. Seatbelt checks `fork`, `vfork` and `posix_spawn` without `POSIX_SPAWN_SETEXEC` as `process-fork`; all three fail with `EPERM` (CI run 39857337279 logged `deny(1) process-fork` for each). Threads are no operation, and `execve` of an allowed program, which replaces the image without creating a process, stays covered by `process-exec*`. sandy's own final `posix_spawn` with `POSIX_SPAWN_SETEXEC` is not a `process-fork`, and the relay is forked before the profile applies, so both still work. |
-| `EndsWithParent` | Not implemented; the plan reports it unavailable and sandy refuses. See "Known limitations". |
-| `ChildProcessesContained` | Not implemented; the plan reports it unavailable and sandy refuses. See "Known limitations". |
+| `EndsWithParent` | A watcher process outside the sandbox with its own profile; see [Ending with the parent](#ending-with-the-parent). |
+| `ChildProcessesContained` | sandy stays the target's parent; a guard process leads the target's process group; the profile denies `setpgid`, `setsid` and `posix_spawn`. See [Contained child processes](#contained-child-processes). |
 | `MetadataConfined` | Profile: `file-write*`, which includes `file-write-mode`, `-owner`, `-flags`, `-times`, `-xattr`, `-acl` and `-setugid`, is denied explicitly and allowed again only on `read_write` paths. XNU runs the same MAC check for the path and the descriptor variant of each call (`chmod_vnode`, `vn_chown_internal`, `setutimes` and `vn_setxattr` serve both), so descriptors do not bypass the rule, and unlike on Linux the target keeps full metadata access inside writable paths. `linux.path_metadata = "allow"` only drops the requirement; the profile is the same. |
 
 ### Inherited descriptors
@@ -163,6 +168,9 @@ of earlier definitions"), so the protections come last. The unit test
       compilers do not know every `SYS_` name. dyld or libSystem calls `fsgetpath` once while a
       program starts; the call fails, the Sandbox log records `deny(1) syscall-unix 427`, and the
       program starts normally (CI run 39767043700).
+    - With `process.children = "contained"`: `(deny syscall-unix (syscall-number 82)
+      (syscall-number 147) (syscall-number 244))`, that is `setpgid`, `setsid` and `posix_spawn`
+      (see [Contained child processes](#contained-child-processes)).
     - `(deny file-ioctl (ioctl-command TIOCSTI))`: also covered by step 2, written out so that no
       later change can allow it by accident.
     - Setuid and setgid files (see [Privilege escalation](#privilege-escalation)).
@@ -294,17 +302,19 @@ The relay is a process of its own, outside the program's sandbox and confined by
    is `fork` safe, and forks twice. The intermediate process exits at once, so launchd adopts the
    relay. The program takes over sandy's process ID after the exec; the relay is not its child,
    so the program can neither reap it with `wait` nor receive `SIGCHLD` for it.
-3. The relay starts a new session (no terminal signals), points 0, 1 and 2 at `/dev/null`, and
-   closes every other descriptor except its listeners and the readiness pipe
-   (`PROC_PIDLISTFDS`).
+3. The relay starts a new session (no terminal signals), blocks every signal except the fault
+   signals, points 0, 1 and 2 at `/dev/null`, and closes every other descriptor except its
+   listeners and the readiness pipe (`PROC_PIDLISTFDS`). The watcher of
+   [Ending with the parent](#ending-with-the-parent) starts the same way.
 4. It registers `EVFILT_PROC` with `NOTE_EXIT` for sandy's process ID in a kqueue, before its
    profile denies process information about others.
 5. It applies its own Seatbelt profile (`profile::relay_profile`): deny by default,
    `network-inbound` only on its listen ports, `network-outbound` only to the target ports, the
    `FIONBIO` and `FIOASYNC` ioctls, and the same closing denials as the program's profile. It needs no file at all, because it keeps running the code sandy already
    loaded and executes nothing.
-6. Only then does it write one byte to the readiness pipe. sandy waits for it (10 seconds at most)
-   and refuses to start the program if the byte does not come. sandy closes its own copies of the
+6. Only then does it report over the readiness pipe that it is ready, or why it did not start.
+   sandy waits for the report (10 seconds at most) and refuses to start the program without a
+   ready report. sandy closes its own copies of the
    listeners before the exec, and `POSIX_SPAWN_CLOEXEC_DEFAULT` would close them anyway.
 7. The relay waits on the same kqueue for new connections (`EVFILT_READ` on each listener) and
    for the end of the program, and relays each accepted connection with `sandy_relay::relay` in
@@ -314,6 +324,90 @@ The relay is a process of its own, outside the program's sandbox and confined by
    writes and exits immediately therefore does not lose its data.
 
 `sandy check` compiles the relay's profile together with the program's.
+
+## Contained child processes
+
+`process.children = "contained"` ends every process the target starts when the target ends, also
+when sandy itself is killed. sandy then stays the target's parent instead of replacing itself
+(`crates/sandy-macos/src/macos/contain.rs`):
+
+1. sandy catches `SIGCHLD`, `SIGURG`, `SIGWINCH` and `SIGINFO` with a handler that does nothing.
+   macOS discards a signal on arrival while its action is to ignore it, even when it is blocked,
+   so without the handler sandy would never see these signals. Then it blocks every signal except
+   the fault signals and waits for them with `sigwait`.
+2. It forks the guard, which creates a process group of its own and keeps only the read end of a
+   pipe from sandy.
+3. It forks the target into the guard's group and sends the target's process ID through the pipe.
+   The guard registers the target's `NOTE_EXIT` and the pipe in a kqueue and kills its group when
+   either reports: when the target ends, or when sandy dies, also by SIGKILL.
+4. The forked target restores the signal actions and the mask, applies the profile, marks every
+   descriptor above 2 close-on-exec and executes the target with `execve`. It reports a failure
+   over a close-on-exec pipe.
+5. sandy forwards the signals it receives to the target and follows job control with a terminal,
+   as on Linux (see "Process model" in `DESIGN.md`).
+6. When the target exits, sandy kills the group with SIGKILL, repeats that until the kernel finds
+   no live process in the group, reaps the guard and the target, and exits with the target's exit
+   status, or 128 plus the signal number.
+
+No process may leave the group. The profile denies `setpgid` (82) and `setsid` (147) with
+`syscall-unix` rules, as it denies the lookups by file ID. That is not enough: `posix_spawn` with
+the flag `POSIX_SPAWN_SETSID` or `POSIX_SPAWN_SETPGROUP` puts the new process into a session or
+group of its own inside the kernel, without calling either system call, and a test on macOS 26
+moved a process out of the group this way with both calls denied. A profile rule sees only the
+system call number of `posix_spawn` (244), not its flags, so the profile denies `posix_spawn` as a
+whole. `fork`, `vfork` and `execve` stay allowed, and so does `process-fork`. The sandbox also
+cannot reach launchd or other services that would start a process for it (see
+[Mach services and other IPC](#mach-services-and-other-ipc)).
+
+Programs that start processes with `posix_spawn` therefore get `EPERM`: Rust's
+`std::process::Command` (it falls back to `fork` only when `pre_exec` is set), Java's
+`ProcessBuilder`, Node.js (libuv) and `system()` and `popen()` of libSystem. Programs that use
+`fork` and `exec`, such as shells, work. The target's own start uses `execve` for the same reason.
+
+Other ways to find the target's processes again were tested and rejected: macOS has no child
+subreaper, so a process whose parent ends is adopted by launchd; `sandbox_check` on another
+process's ID returns the same answer for every process to an unprivileged caller, so it cannot
+tell which processes run in this sandbox; and `NOTE_TRACK` of kqueue, which followed forks, is no
+longer supported.
+
+Killing the group: `kill(-group, SIGKILL)` returns 0 while a live process is in the group,
+`EPERM` when only zombies are left (measured on macOS 26), and `ESRCH` when nothing is left.
+sandy repeats the signal every 10 milliseconds while it returns 0, so a process forked while the
+signal was delivered gets the next one. The group's ID is the guard's process ID; sandy reaps the
+guard and the target only after that, so no other process or group can have these IDs while
+sandy signals them.
+
+The relay of exposed and forwarded ports watches sandy's process ID, which is the supervising
+sandy here, so it ends after the group (rule 5 of "Forwarded ports" in `DESIGN.md`).
+
+## Ending with the parent
+
+`process.end_with_parent = true` ends the target when the process that started sandy ends
+(`crates/sandy-macos/src/macos/watch.rs`):
+
+1. sandy reads its parent's process ID as its first step, or checks the one named with
+   `--parent-pid`, and checks that this process is still its parent.
+2. It starts the watcher like the relay: forked twice, so launchd adopts it and the target never
+   sees it as a child; in a session of its own with every signal except the fault signals blocked;
+   0, 1 and 2 on `/dev/null` and no other descriptor of sandy's.
+3. The watcher registers `NOTE_EXIT` for the parent and for sandy's process ID (the target after
+   the exec; with `contained`, the supervising sandy, which forwards the signals and ends the
+   group). Then it applies its own profile (`profile::watcher_profile`): deny by default, signals
+   allowed, nothing else; it executes nothing and keeps running the code sandy loaded.
+4. After the watcher reports ready, sandy checks again that its parent is unchanged. A process
+   whose parent ends is adopted by launchd at once, so an unchanged parent means that the
+   watcher's registration names the real parent, not a later process with the same ID.
+5. When the target ends first, the watcher ends. When the parent ends, the watcher sends SIGTERM
+   and SIGCONT (so that a stopped target gets the request), waits at most 5 seconds for the
+   target's end, then sends SIGKILL, and ends.
+
+macOS has no pidfd, so the watcher signals the target by its process ID. Right before each signal
+it checks the kqueue for the target's end. The ID could name another process only if the target
+ended between that check and the signal and macOS gave the ID to a new process in that moment,
+which it does only after the process IDs wrapped around.
+
+The policy requires `signals = "isolated"`, so the target cannot signal the watcher. `sandy check`
+compiles the watcher's profile together with the target's.
 
 ## Mach services and other IPC
 
@@ -398,13 +492,19 @@ no privilege, and closing them would break ordinary programs:
   by renaming another file over it. Programs must write such a file in place.
 - `getcwd` fails when the working directory is outside the policy.
 - sandy cannot run inside another Seatbelt sandbox; `sandy check` reports this.
-- `process.end_with_parent` is not implemented: no process of sandy watches the parent. A possible
-  design, not verified: a watcher forked twice like the relay, with kqueue `NOTE_EXIT` on the
-  parent and the program.
-- `process.children = "contained"` is not implemented. sandy replaces itself with the program, so
-  nothing would end the processes the program leaves behind; launchd adopts them. A possible
-  design, not verified: keep sandy as the parent like on Linux, deny `setsid` and `setpgid` with
-  `syscall-unix` rules, and kill the program's process group when it ends.
+- x86_64 code does not run in the sandbox on Apple silicon. Rosetta loads its runtime
+  (`libRosettaRuntime`) into every translated process, and the profile does not allow it, so the
+  program aborts with "rosetta error: Failed to open libRosettaRuntime". This hits x86_64
+  programs, and every program that sandy's x86_64 build starts: a translated process executes
+  universal binaries such as `/bin/echo` as x86_64 too. Rosetta also adds a thread to the
+  translated sandy, so its check for a single thread refuses the relay, the watcher and
+  `contained`. Measured on macOS 26; allowing Rosetta would need its runtime, its translation
+  cache and probably its Mach service in the profile, which has not been evaluated.
+- With `process.children = "contained"` the target cannot use `posix_spawn`, so programs that
+  start processes through it (Rust's `std::process::Command`, Java, Node.js, `system()`,
+  `popen()`) fail to start them (see [Contained child processes](#contained-child-processes)).
+- The watcher of `process.end_with_parent` signals the target by process ID, not through a
+  pidfd (see [Ending with the parent](#ending-with-the-parent)).
 - With `signals = "any"`, the target can signal every process of the user, as on other platforms.
 - Open questions that the escape tests do not answer:
   - Apple does not document whether `(target same-sandbox)` means the same sandbox instance or any
@@ -427,6 +527,12 @@ macOS only:
 - `crates/sandy-cli/tests/escape.rs` and `escape_macos.rs` run the probe inside the sandbox, with a
   control run outside for every denial. The `open`, `osascript` and `launchctl` tests need a
   logged-in GUI session.
+- `children.rs` and `children_macos.rs` test `process.children`: the group cannot be left
+  (`setsid`, `setpgid`, `posix_spawn`), `fork` still works, the target cannot signal sandy, the
+  guard ends the group when sandy is killed, signals and the exit status pass through, only 0, 1
+  and 2 are inherited, and job control with a pseudo-terminal. `parent.rs` tests
+  `process.end_with_parent`, also with `contained` and against signals to the caller's process
+  group.
 
 To see what the sandbox denies on a Mac:
 

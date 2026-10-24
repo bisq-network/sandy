@@ -148,6 +148,7 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
             stream.shutdown(std::net::Shutdown::Write)?;
             Ok(format!("{} bytes", TCP_SEND_PAYLOAD.len()))
         }
+        action if unix::ACTIONS.contains(&action) => unix::perform(action, target),
         action if linux::ACTIONS.contains(&action) => linux::perform(action, target),
         action if macos::ACTIONS.contains(&action) => macos::perform(action, target),
         _ => Err(io::Error::new(
@@ -319,11 +320,6 @@ mod linux {
         "clone-process",
         "posix-spawn",
         "thread",
-        "setsid",
-        "setpgid",
-        "signal-parent",
-        "stop-self",
-        "ignore-signal",
     ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
@@ -367,21 +363,6 @@ mod linux {
             "rename-in" => rename_in(target),
             "raw-syscall" => raw_syscall(target),
             "move-pages" => move_pages(target),
-            // SAFETY: setsid has no arguments.
-            "setsid" => check(unsafe { libc::setsid() }).map(|_| String::new()),
-            // SAFETY: setpgid takes process IDs; 0 and 0 make the caller a group leader.
-            "setpgid" => check(unsafe { libc::setpgid(0, 0) }).map(|_| String::new()),
-            // Signal 0 only checks permission. The parent is sandy with children = "contained".
-            "signal-parent" => {
-                // SAFETY: kill and getppid take and return process IDs.
-                check(unsafe { libc::kill(libc::getppid(), 0) }).map(|_| String::new())
-            }
-            "stop-self" => stop_self(target),
-            // SAFETY: setting a signal to SIG_IGN has no memory safety requirements.
-            "ignore-signal" => match unsafe { libc::signal(number(target)?, libc::SIG_IGN) } {
-                libc::SIG_ERR => Err(io::Error::last_os_error()),
-                _ => Ok(String::new()),
-            },
             "fork" => fork_raw(),
             "vfork" => vfork_raw(),
             "clone-process" => clone_process(),
@@ -398,30 +379,6 @@ mod linux {
     }
 
     const SETUID_MODE: u32 = 0o4755;
-
-    /// Stops the probe with SIGSTOP. A child it forks first continues it after `target`
-    /// milliseconds, as a program that wants to leave its supervisor stopped would.
-    fn stop_self(target: &str) -> io::Result<String> {
-        let millis: u64 = target
-            .parse()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid duration"))?;
-        // SAFETY: getpid has no preconditions.
-        let parent = unsafe { libc::getpid() };
-        // SAFETY: the child only sleeps, signals the parent and calls _exit.
-        match unsafe { libc::fork() } {
-            -1 => Err(io::Error::last_os_error()),
-            0 => {
-                std::thread::sleep(Duration::from_millis(millis));
-                // SAFETY: kill and _exit take a process ID and a status.
-                unsafe {
-                    libc::kill(parent, libc::SIGCONT);
-                    libc::_exit(0)
-                }
-            }
-            // SAFETY: stops the probe itself.
-            _ => check(unsafe { libc::kill(parent, libc::SIGSTOP) }).map(|_| String::new()),
-        }
-    }
 
     /// A process ID, or `self` for the probe's own one.
     fn pid(target: &str) -> io::Result<libc::pid_t> {
@@ -2005,6 +1962,114 @@ mod macos {
             )
         };
         Ok("attached".to_string())
+    }
+}
+
+/// Actions on Linux and macOS for `process.children` and `process.end_with_parent`
+/// (`tests/children*.rs`, `tests/parent.rs`).
+#[cfg(unix)]
+mod unix {
+    use std::io;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    pub const ACTIONS: &[&str] = &[
+        "setsid",
+        "setpgid",
+        "signal-parent",
+        "stop-self",
+        "ignore-signal",
+        "start-forked",
+    ];
+
+    pub fn perform(action: &str, target: &str) -> io::Result<String> {
+        match action {
+            // SAFETY: setsid has no arguments.
+            "setsid" => check(unsafe { libc::setsid() }).map(|_| String::new()),
+            // SAFETY: setpgid takes process IDs; 0 and 0 make the caller a group leader.
+            "setpgid" => check(unsafe { libc::setpgid(0, 0) }).map(|_| String::new()),
+            // Signal 0 only checks permission. The parent is sandy with children = "contained".
+            "signal-parent" => {
+                // SAFETY: kill and getppid take and return process IDs.
+                check(unsafe { libc::kill(libc::getppid(), 0) }).map(|_| String::new())
+            }
+            "stop-self" => stop_self(target),
+            "ignore-signal" => {
+                let signal = target
+                    .parse()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid number"))?;
+                // SAFETY: setting a signal to SIG_IGN has no memory safety requirements.
+                match unsafe { libc::signal(signal, libc::SIG_IGN) } {
+                    libc::SIG_ERR => Err(io::Error::last_os_error()),
+                    _ => Ok(String::new()),
+                }
+            }
+            "start-forked" => start_forked(target),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unknown action",
+            )),
+        }
+    }
+
+    /// As `start`, but with fork and execve instead of posix_spawn: std uses fork as soon as a
+    /// `pre_exec` closure is set. On macOS, `children = "contained"` denies posix_spawn.
+    fn start_forked(target: &str) -> io::Result<String> {
+        let mut parts = target.split(super::ARGUMENT_SEPARATOR);
+        let program = parts.next().unwrap_or_default();
+        let mut command = Command::new(program);
+        command
+            .args(parts)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: the closure does nothing, so it is async-signal-safe.
+        unsafe { command.pre_exec(|| Ok(())) };
+        Ok(command.spawn()?.id().to_string())
+    }
+
+    /// Stops the probe with SIGSTOP. A child it forks first continues it after `target`
+    /// milliseconds, as a program that wants to leave its supervisor stopped would.
+    fn stop_self(target: &str) -> io::Result<String> {
+        let millis: u64 = target
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid duration"))?;
+        // SAFETY: getpid has no preconditions.
+        let parent = unsafe { libc::getpid() };
+        // SAFETY: the child only sleeps, signals the parent and calls _exit.
+        match unsafe { libc::fork() } {
+            -1 => Err(io::Error::last_os_error()),
+            0 => {
+                std::thread::sleep(Duration::from_millis(millis));
+                // SAFETY: kill and _exit take a process ID and a status.
+                unsafe {
+                    libc::kill(parent, libc::SIGCONT);
+                    libc::_exit(0)
+                }
+            }
+            // SAFETY: stops the probe itself.
+            _ => check(unsafe { libc::kill(parent, libc::SIGSTOP) }).map(|_| String::new()),
+        }
+    }
+
+    fn check(result: libc::c_int) -> io::Result<libc::c_int> {
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(result)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod unix {
+    use std::io;
+
+    pub const ACTIONS: &[&str] = &[];
+
+    pub fn perform(_action: &str, _target: &str) -> io::Result<String> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported"))
     }
 }
 

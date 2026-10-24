@@ -11,6 +11,8 @@ use std::ptr;
 
 use sandy_core::{SandboxError, TargetCommand};
 
+use super::helper::mark_close_on_exec_above_standard;
+
 unsafe extern "C" {
     /// Apple extension in <spawn.h>, missing from the libc crate: keeps `fd` open in the new
     /// image when POSIX_SPAWN_CLOEXEC_DEFAULT is set.
@@ -78,6 +80,37 @@ impl Target {
             Err(error) => error,
             Ok(()) => io::Error::other("posix_spawn returned without replacing the process"),
         }
+    }
+}
+
+impl Target {
+    /// Replaces the current process image with the target through execve, with exactly the
+    /// target environment and only descriptors 0, 1 and 2. The forked target of
+    /// `children = "contained"` uses it, because its profile denies posix_spawn. The process must
+    /// run a single thread, so that no descriptor appears between the marking and the exec.
+    /// Returns only on failure.
+    pub fn execve(&self) -> io::Error {
+        if let Err(error) = mark_close_on_exec_above_standard() {
+            return error;
+        }
+        // The Rust runtime of sandy ignores SIGPIPE, and an ignored signal stays ignored across
+        // execve. The target starts with the default action, as after posix_spawn above.
+        // SAFETY: setting the default action of SIGPIPE has no memory safety requirements.
+        if unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) } == libc::SIG_ERR {
+            return io::Error::last_os_error();
+        }
+        let argv = null_terminated(&self.argv);
+        let envp = null_terminated(&self.envp);
+        // SAFETY: every pointer points into a CString owned by `self`, and both arrays end with a
+        // null pointer.
+        unsafe {
+            libc::execve(
+                self.program.as_ptr(),
+                argv.as_ptr().cast(),
+                envp.as_ptr().cast(),
+            )
+        };
+        io::Error::last_os_error()
     }
 }
 

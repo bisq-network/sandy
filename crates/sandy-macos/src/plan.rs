@@ -3,7 +3,9 @@
 
 use std::path::Path;
 
-use sandy_core::{NetworkAccess, PathAccess, PlanItem, Requirement, ResolvedPolicy, SystemAccess};
+use sandy_core::{
+    ChildProcesses, NetworkAccess, PathAccess, PlanItem, Requirement, ResolvedPolicy, SystemAccess,
+};
 
 use crate::system::{self, SystemAccess as Grant};
 
@@ -12,7 +14,8 @@ use crate::system::{self, SystemAccess as Grant};
 pub struct HostCapabilities {
     /// `Ok` when the Seatbelt functions could be loaded, otherwise the reason.
     pub seatbelt: Result<(), String>,
-    /// `Ok` when the Seatbelt compiler of this host accepts the generated profile, otherwise its
+    /// `Ok` when the Seatbelt compiler of this host accepts the generated profiles (the
+    /// program's, and the relay's and the watcher's when the policy needs them), otherwise its
     /// message.
     pub profile: Result<(), String>,
     /// sandy itself already runs in a Seatbelt sandbox. macOS then refuses another profile.
@@ -46,7 +49,6 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<PlanIte
                 Err(reason) => PlanItem::unavailable(requirement, reason.clone()),
             },
             Mechanism::Exec(text) => PlanItem::enforced(requirement, text),
-            Mechanism::Missing(reason) => PlanItem::unavailable(requirement, reason),
         })
         .collect()
 }
@@ -97,13 +99,13 @@ fn system_conflict(policy: &ResolvedPolicy) -> Option<String> {
 enum Mechanism {
     /// Enforced by the Seatbelt profile.
     Profile(String),
-    /// Enforced by how sandy starts the target. Needs no host capability beyond posix_spawn.
+    /// Enforced by how sandy starts the target. Needs no host capability beyond posix_spawn and
+    /// execve.
     Exec(String),
-    /// Not implemented on macOS.
-    Missing(&'static str),
 }
 
 fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
+    let contained = policy.children == ChildProcesses::Contained;
     let text = match requirement {
         Requirement::FilesystemConfined => {
             "deny by default; read, write and execute only policy paths and the system set; \
@@ -120,14 +122,19 @@ fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
              mach-task-inspect); process-info* only for the target itself"
         }
         Requirement::InheritedHandlesClosed => {
-            return Mechanism::Exec(
+            return Mechanism::Exec(if contained {
+                "the forked target, a single thread, marks every descriptor except 0, 1 and 2 \
+                 close-on-exec (PROC_PIDLISTFDS) right before execve"
+                    .to_string()
+            } else {
                 "posix_spawn with POSIX_SPAWN_SETEXEC and POSIX_SPAWN_CLOEXEC_DEFAULT; the \
                  kernel closes every descriptor except 0, 1 and 2"
-                    .to_string(),
-            );
+                    .to_string()
+            });
         }
         Requirement::EnvironmentControlled => {
-            return Mechanism::Exec("posix_spawn with exactly the policy environment".to_string());
+            let call = if contained { "execve" } else { "posix_spawn" };
+            return Mechanism::Exec(format!("{call} with exactly the policy environment"));
         }
         Requirement::IpNetworkDenied => {
             if policy.unix_sockets == NetworkAccess::All {
@@ -152,17 +159,17 @@ fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
              paths, by path and through open descriptors alike"
         }
         Requirement::EndsWithParent => {
-            return Mechanism::Missing(
-                "not implemented on macOS yet: sandy replaces itself with the program, and no \
-                 process of sandy watches its parent",
-            );
+            "a watcher process that is not a child of the target (forked twice, so launchd \
+             adopts it), in a session of its own with every signal but the faults blocked, \
+             confined by its own profile (no files, no network, no Mach services); it watches \
+             sandy's parent and the target with kqueue (NOTE_EXIT) and, when the parent ends, \
+             sends SIGTERM and SIGCONT, and SIGKILL 5 seconds later"
         }
         Requirement::ChildProcessesContained => {
-            return Mechanism::Missing(
-                "not implemented on macOS yet: sandy replaces itself with the program, so nothing \
-                 ends the processes the program leaves behind; use children = \"none\", or \
-                 \"allowed\" if they may outlive the program",
-            );
+            "sandy stays the target's parent and runs it in a process group led by a guard \
+             process; setpgid, setsid and posix_spawn denied (syscall-unix), so no process the \
+             target starts can leave the group (fork, vfork and execve work); the guard kills the \
+             group when the target or sandy ends, and sandy kills it when the target exits"
         }
         Requirement::ChildProcessesDenied => {
             "process-fork denied, so fork, vfork and posix_spawn fail; threads and replacing the \
@@ -285,6 +292,31 @@ mod tests {
         let policy = strictest();
         let plan = EnforcementPlan::new(&policy.requirements(), plan_for(&policy, &capable()));
         assert!(plan.is_enforceable(), "{plan}");
+    }
+
+    #[test]
+    fn contained_and_end_with_parent_are_enforced_on_a_capable_host() {
+        let mut policy = strictest();
+        policy.children = ChildProcesses::Contained;
+        policy.end_with_parent = true;
+        let items = plan_for(&policy, &capable());
+        let plan = EnforcementPlan::new(&policy.requirements(), items.clone());
+        assert!(plan.is_enforceable(), "{plan}");
+        let mechanism = |requirement| {
+            format!(
+                "{:?}",
+                items
+                    .iter()
+                    .find(|item| item.requirement == requirement)
+                    .unwrap()
+                    .status
+            )
+        };
+        assert!(mechanism(Requirement::ChildProcessesContained).contains("posix_spawn"));
+        assert!(mechanism(Requirement::EndsWithParent).contains("NOTE_EXIT"));
+        // The forked target starts with execve, not posix_spawn.
+        assert!(mechanism(Requirement::InheritedHandlesClosed).contains("execve"));
+        assert!(mechanism(Requirement::EnvironmentControlled).contains("execve"));
     }
 
     #[test]

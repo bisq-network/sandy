@@ -37,11 +37,16 @@ fn contained(fixture: &Fixture) -> Vec<String> {
     args
 }
 
+/// The probe action that starts a process without waiting for it. On macOS, `contained` denies
+/// posix_spawn, which std's Command uses, so the probe forks there.
+const START: &str = if cfg!(target_os = "macos") {
+    "start-forked"
+} else {
+    "start"
+};
+
 /// Why this host cannot run `children = "contained"`, if it cannot.
 fn unsupported() -> Option<&'static str> {
-    if cfg!(target_os = "macos") {
-        return Some("children = \"contained\" is not implemented on macOS");
-    }
     #[cfg(target_os = "linux")]
     if common::linux::landlock_abi() < 6 {
         return Some("signal isolation needs Landlock ABI 6");
@@ -59,7 +64,7 @@ fn children_contained_ends_what_the_program_leaves_behind() {
     let program = fixture.copy_probe("bin");
     let start = format!("{program}\u{1f}sleep\u{1f}{LONG_SLEEP}");
     if let Some(reason) = unsupported() {
-        let output = sandy(run_args(&contained(&fixture), &[("start", &start)]));
+        let output = sandy(run_args(&contained(&fixture), &[(START, &start)]));
         assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
         eprintln!("skipped: {reason}; sandy refused");
         return;
@@ -69,7 +74,7 @@ fn children_contained_ends_what_the_program_leaves_behind() {
     // of the program's job in any case.
     #[cfg(unix)]
     {
-        let lines = probe_inside(&fixture.access_args(), &[("start", &start)]);
+        let lines = probe_inside(&fixture.access_args(), &[(START, &start)]);
         lines[0].assert_ok();
         let pid: u32 = lines[0].detail.parse().unwrap();
         let survived = is_running(pid);
@@ -78,7 +83,7 @@ fn children_contained_ends_what_the_program_leaves_behind() {
     }
 
     let started = Instant::now();
-    let lines = probe_inside(&contained(&fixture), &[("start", &start)]);
+    let lines = probe_inside(&contained(&fixture), &[(START, &start)]);
     // sandy ends the process; it does not wait until the process ends by itself.
     assert!(
         started.elapsed() < END_TIMEOUT,

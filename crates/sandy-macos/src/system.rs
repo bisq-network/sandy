@@ -193,6 +193,13 @@ pub const BY_ID_SYSCALLS: &[(&str, u32)] = &[
     ("searchfs", 225),
 ];
 
+/// System calls that move a process out of its process group, denied with
+/// `process.children = "contained"`. posix_spawn is denied as a whole: its POSIX_SPAWN_SETSID and
+/// POSIX_SPAWN_SETPGROUP flags change the group inside the kernel, where no profile rule sees
+/// them. Numbers from XNU `bsd/kern/syscalls.master`.
+pub const GROUP_LEAVING_SYSCALLS: &[(&str, u32)] =
+    &[("setpgid", 82), ("setsid", 147), ("posix_spawn", 244)];
+
 #[cfg(test)]
 mod tests {
     use super::*;

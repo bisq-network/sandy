@@ -236,8 +236,8 @@ fn execute(invocation: Invocation, parent_at_start: Option<u32>) -> Result<ExitC
             };
             let code = backend
                 .run(&resolved, &command)
-                // Also after the program started: with children = "contained" on Linux, sandy
-                // supervises it and can fail while it runs.
+                // Also after the program started: with children = "contained" on Linux and
+                // macOS, sandy supervises it and can fail while it runs.
                 .map_err(|error| format!("run failed: {error}"))?;
             // Exit codes on Windows are 32 bits wide; ExitCode only carries 8.
             std::process::exit(code)

@@ -15,6 +15,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use common::linux::*;
+use common::unix::*;
 use common::*;
 
 const TIMEOUT: Duration = Duration::from_secs(10);

@@ -106,9 +106,11 @@ Rules:
    - `none`: the program cannot create processes at all (threads stay allowed, and so does
      replacing its own program image with `execve`), so nothing it starts can outlive it.
    - `contained`: the program may start processes, and sandy ends every one of them when the
-     program ends, also when sandy itself is killed. On Linux, sandy then stays the program's
-     parent instead of replacing itself with it (see "Process model"). macOS cannot enforce it
-     yet, so sandy refuses there.
+     program ends, also when sandy itself is killed. On Linux and macOS, sandy then stays the
+     program's parent instead of replacing itself with it (see "Process model"). On macOS the
+     program cannot use `posix_spawn` then: its flags move the new process out of the group
+     inside the kernel, where no profile rule sees them, so the profile denies the call as a
+     whole. `fork`, `vfork` and `execve` keep working.
 
    `none` and `contained` cover the processes the program starts itself or through its
    children. Both need `unix_sockets = "none"`: through a Unix socket the program could ask a
@@ -127,16 +129,16 @@ Rules:
    outside the writable paths in every case.
 11. `process.end_with_parent = true` ends the program when the process that started sandy ends,
    for example when the application that runs a helper in the sandbox crashes. The program gets a
-   request to end (SIGTERM on Linux) and is killed if it has not ended 5 seconds later; Windows
-   ends the program's job at once. With `children = "allowed"` on Linux, processes the program
-   started can outlive it, as with any end of the program; use `children = "contained"` to end
-   them too. The option needs `signals = "isolated"`, so that the program cannot kill the process
+   request to end (SIGTERM on Linux and macOS) and is killed if it has not ended 5 seconds later;
+   Windows ends the program's job at once. With `children = "allowed"` on Linux and macOS,
+   processes the program started can outlive it, as with any end of the program; use
+   `children = "contained"` to end them too. The option needs `signals = "isolated"`, so that the program cannot kill the process
    that ends it. "Parent" means sandy's direct parent: a wrapper between the application and
    sandy (`sh -c 'a; sandy ...'`, `timeout`, `systemd-run`) is the parent instead. sandy reads
    the parent's process ID as its first step; a parent that ends before that cannot be
    detected. The caller closes this gap with `--parent-pid` and its own process ID: sandy then
    refuses when its parent is another process. sandy also refuses when it sees that its parent
-   has already ended. macOS cannot enforce the option yet, so sandy refuses there.
+   has already ended.
 
 ## Exposed ports
 
@@ -185,8 +187,8 @@ Rules:
    connections it already accepted at most one second to deliver their remaining data, and then
    ends. A program that connects, writes and exits immediately therefore does not lose its data,
    and no relay outlives the program by more than one second. With
-   `process.children = "contained"` on Linux, the relay watches the supervising sandy instead,
-   which ends after the program's process group.
+   `process.children = "contained"` on Linux and macOS, the relay watches the supervising sandy
+   instead, which ends after the program's process group.
 
 ## Requirements and the enforcement plan
 
@@ -225,12 +227,13 @@ continue if any mechanism fails while it is applied.
 - Linux and macOS: sandy restricts itself, then calls `execve` on the program. The program keeps
   sandy's process ID, so the caller's process handle, signals and exit status refer to the program
   directly.
-- Linux with `process.children = "contained"`: sandy forks the program and stays its parent. sandy
-  forwards every signal it receives to the program, except `SIGCHLD`, `SIGCONT`, `SIGTTIN`,
-  `SIGTTOU` and the fault signals, and exits with the program's exit status, or 128 plus the signal number when a signal
-  ended the program. With a terminal, sandy follows job control: the program's process group gets
-  the terminal when the program uses it, and the rest of sandy's job gets it back when it uses
-  it; any other stop of the program stops sandy, and `SIGCONT` to sandy continues the group.
+- Linux and macOS with `process.children = "contained"`: sandy forks the program and stays its
+  parent. sandy forwards every signal it receives to the program, except `SIGCHLD`, `SIGCONT`,
+  `SIGTTIN`, `SIGTTOU` and the fault signals, and exits with the program's exit status, or 128
+  plus the signal number when a signal ended the program. With a terminal, sandy follows job
+  control: the program's process group gets the terminal when the program uses it, and the rest
+  of sandy's job gets it back when it uses it; any other stop of the program stops sandy, and
+  `SIGCONT` to sandy continues the group.
 - Windows: there is no `execve`. sandy creates the program inside the AppContainer and a job
   object with kill-on-close, waits, and exits with the program's exit code. If sandy dies, the job
   closes and the program dies with it.
@@ -308,14 +311,26 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   adopts it (it is not the program's child), and the relay watches the program's process ID with
   kqueue (`NOTE_EXIT`). The relay has its own profile: accept on its listeners, connect only to
   the targets (the program's ports for `expose`, `to` for `forward`), no files, no Mach services.
-  sandy execs only after the relay reports ready.
+  Like the watcher below, it runs in a session of its own with every signal except the fault
+  signals blocked. sandy execs only after the relay reports ready.
 - `process.children = "none"`: the profile denies `process-fork`, which Seatbelt checks for
   `fork`, `vfork` and `posix_spawn`; threads and `execve` stay allowed.
-- `process.children = "contained"` is not implemented: sandy replaces itself with the program, so
-  nothing would end the processes the program leaves behind. The plan reports it unavailable, and
-  sandy refuses.
-- `process.end_with_parent` is not implemented: no process of sandy watches the parent. The plan
-  reports it unavailable, and sandy refuses.
+- `process.children = "contained"`: sandy forks a guard process, which leads a new process
+  group, and then the program, which joins that group, applies the profile and executes the
+  target with `execve` after marking every descriptor above 2 close-on-exec. The profile denies
+  `setpgid`, `setsid` and `posix_spawn` with `syscall-unix` rules (the flags
+  `POSIX_SPAWN_SETSID` and `POSIX_SPAWN_SETPGROUP` change the group inside `posix_spawn`, which
+  no rule can inspect), and the signal rule keeps the program from signaling sandy or the guard,
+  which run outside the sandbox. The guard watches the program and a pipe from sandy with kqueue
+  and kills the group when either ends. macOS has no child subreaper, so after the program exits
+  sandy repeats SIGKILL to the group until the kernel finds no live process in it.
+- `process.end_with_parent`: a watcher process, forked twice like the relay, registers
+  `NOTE_EXIT` for sandy's parent and for the program (with `contained`: the supervising sandy)
+  and then applies its own profile (no files, no network, no Mach services, signals allowed).
+  sandy checks after the watcher is ready that its parent is unchanged, so the registration names
+  the real parent. When the parent ends, the watcher sends SIGTERM and SIGCONT and, 5 seconds
+  later, SIGKILL. macOS has no pidfd: the watcher signals by process ID and checks for the
+  program's end right before each signal.
 - `sandy check` compiles the profile without applying it, so it reports operations or filters that
   this macOS does not know.
 - `docs/macos.md` describes the profile, the system set with a reason per entry, and the known
@@ -391,7 +406,7 @@ Details, limitations and sources: `docs/windows.md`.
 | Status | Meaning |
 |---|---|
 | program's status | `sandy run` started the program |
-| 128 + signal number | Linux with `process.children = "contained"`: a signal ended the program |
+| 128 + signal number | Linux and macOS with `process.children = "contained"`: a signal ended the program |
 | 125 | sandy failed or refused (invalid policy, unenforceable policy, setup failure) |
 | 0 / 1 | `sandy check`: enforceable / not enforceable |
 

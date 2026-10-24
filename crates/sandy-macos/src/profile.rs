@@ -75,6 +75,24 @@ pub fn relay_pairs(policy: &ResolvedPolicy) -> Vec<RelayPair> {
     exposed.chain(forwarded).collect()
 }
 
+/// The profile of the watcher of `process.end_with_parent`. Like the relay, it keeps running the
+/// code that sandy has already loaded and needs no file. It registered its kqueue events before
+/// the profile applies, and it only waits and signals the program.
+pub fn watcher_profile() -> Profile {
+    let mut writer = Writer::default();
+    writer.line("(version 1)");
+    writer.line("(deny default)");
+    writer.comment("(deny default) does not cover these operations, and the watcher needs none.");
+    writer.line("(deny process-info* file-map-executable file-ioctl file-write*)");
+    writer.comment("The program runs in another sandbox; the watcher ends it.");
+    writer.line("(allow signal)");
+    hardening_rules(&mut writer);
+    Profile {
+        text: writer.text,
+        parameters: writer.parameters,
+    }
+}
+
 /// The profile of the relay process. The relay keeps running the code that sandy has already
 /// loaded and never executes anything, so it needs no file at all: it accepts on the listeners
 /// sandy passed it and connects only to the targets. Every address is loopback and every port a
@@ -352,10 +370,22 @@ fn protection_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
         );
         writer.line("(deny process-fork)");
     }
+    if policy.children == ChildProcesses::Contained {
+        writer.comment(
+            "process.children = \"contained\": no process may leave the process group that sandy\n\
+             ends with the program: no setpgid, no setsid, and no posix_spawn, whose flags would\n\
+             change the group inside the kernel. fork, vfork and execve stay possible.",
+        );
+        let filters: Vec<String> = system::GROUP_LEAVING_SYSCALLS
+            .iter()
+            .map(|(_, number)| format!("(syscall-number {number})"))
+            .collect();
+        writer.rule("deny", &["syscall-unix"], &filters);
+    }
     hardening_rules(writer);
 }
 
-/// Denials that both the program's profile and the relay's profile end with.
+/// Denials that the profiles of the program, the relay and the watcher end with.
 fn hardening_rules(writer: &mut Writer) {
     writer.comment(
         "Operations that (deny default) may not cover and that nothing allows again: hard links\n\
@@ -836,6 +866,38 @@ mod tests {
         let deny = denied.find("\n(deny process-fork)\n").unwrap();
         assert!(deny > denied.rfind("(allow").unwrap());
         assert!(denied.contains("process-exec*"));
+    }
+
+    #[test]
+    fn children_contained_denies_leaving_the_group() {
+        let mut policy = typical("/srv");
+        let group_rule = "(deny syscall-unix\n  (syscall-number 82)\n  (syscall-number 147)\n  \
+                          (syscall-number 244))\n";
+        assert!(!generate(&policy).text.contains(group_rule));
+        policy.children = ChildProcesses::Contained;
+        let text = generate(&policy).text;
+        assert!(text.contains("\n(allow process-fork)\n"));
+        let deny = text.find(group_rule).unwrap();
+        assert!(deny > text.rfind("(allow").unwrap());
+        for (name, number) in system::GROUP_LEAVING_SYSCALLS {
+            assert!(
+                text.contains(&format!("(syscall-number {number})")),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn watcher_profile_allows_only_signals() {
+        let profile = watcher_profile();
+        assert!(profile.parameters.is_empty());
+        assert!(profile.text.starts_with("(version 1)\n(deny default)\n"));
+        let allows: Vec<&str> = profile
+            .text
+            .lines()
+            .filter(|line| line.starts_with("(allow"))
+            .collect();
+        assert_eq!(allows, ["(allow signal)"]);
     }
 
     #[test]

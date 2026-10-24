@@ -1,14 +1,17 @@
 //! The parts that call macOS: loading Seatbelt, applying the profile and replacing sandy with
 //! the target.
 
+mod contain;
 mod exec;
+mod helper;
 mod relay;
 mod seatbelt;
+mod watch;
 
-use sandy_core::{Backend, PlanItem, ResolvedPolicy, SandboxError, TargetCommand};
+use sandy_core::{Backend, ChildProcesses, PlanItem, ResolvedPolicy, SandboxError, TargetCommand};
 
 use crate::plan::{HostCapabilities, plan_for};
-use crate::profile::{generate, relay_pairs, relay_profile};
+use crate::profile::{generate, relay_pairs, relay_profile, watcher_profile};
 use seatbelt::Seatbelt;
 
 // The profile is generated on every platform, so it carries its own copy of these numbers.
@@ -22,7 +25,8 @@ const _: () = {
 };
 
 /// Seatbelt profile applied in-process with sandbox_init_with_parameters, then the target
-/// replaces sandy (see `docs/macos.md`).
+/// replaces sandy, or with `children = "contained"` a forked child of sandy (see
+/// `docs/macos.md`).
 #[derive(Debug, Default)]
 pub struct MacosBackend;
 
@@ -48,32 +52,61 @@ impl Backend for MacosBackend {
         if !pairs.is_empty() {
             relay::start(&pairs, &seatbelt)?;
         }
-        seatbelt.apply(&profile).map_err(|message| {
-            SandboxError::new(format!("cannot apply the Seatbelt profile: {message}"))
-        })?;
-        let error = target.exec();
-        Err(SandboxError::io(
-            format!("cannot execute {}", command.program.display()),
-            error,
-        ))
+        if policy.end_with_parent {
+            // SAFETY: getppid has no preconditions.
+            let parent = command
+                .parent
+                .map_or_else(|| unsafe { libc::getppid() }, |pid| pid as libc::pid_t);
+            watch::start(parent, &seatbelt)?;
+        }
+        let apply = || {
+            seatbelt.apply(&profile).map_err(|message| {
+                SandboxError::new(format!("cannot apply the Seatbelt profile: {message}"))
+            })
+        };
+        let cannot_execute = |error| {
+            SandboxError::io(
+                format!("cannot execute {}", command.program.display()),
+                error,
+            )
+        };
+        if policy.children == ChildProcesses::Contained {
+            return contain::run(|| match apply() {
+                Ok(()) => cannot_execute(target.execve()),
+                Err(error) => error,
+            });
+        }
+        apply()?;
+        Err(cannot_execute(target.exec()))
     }
 }
 
-/// Loads Seatbelt and compiles the profiles of `policy` (the program's and, with exposed or
-/// forwarded ports, the relay's) without applying them. Neither step changes the sandbox state of the process.
+/// Loads Seatbelt and compiles the profiles of `policy` (the program's, the relay's with exposed
+/// or forwarded ports, and the watcher's with `end_with_parent`) without applying them. Neither
+/// step changes the sandbox state of the process.
 fn detect(policy: &ResolvedPolicy) -> HostCapabilities {
     match Seatbelt::load() {
         Ok(seatbelt) => HostCapabilities {
             seatbelt: Ok(()),
-            profile: seatbelt.compile(&generate(policy)).and_then(|()| {
-                let pairs = relay_pairs(policy);
-                if pairs.is_empty() {
-                    return Ok(());
-                }
-                seatbelt
-                    .compile(&relay_profile(&pairs))
-                    .map_err(|message| format!("relay profile: {message}"))
-            }),
+            profile: seatbelt
+                .compile(&generate(policy))
+                .and_then(|()| {
+                    let pairs = relay_pairs(policy);
+                    if pairs.is_empty() {
+                        return Ok(());
+                    }
+                    seatbelt
+                        .compile(&relay_profile(&pairs))
+                        .map_err(|message| format!("relay profile: {message}"))
+                })
+                .and_then(|()| {
+                    if !policy.end_with_parent {
+                        return Ok(());
+                    }
+                    seatbelt
+                        .compile(&watcher_profile())
+                        .map_err(|message| format!("watcher profile: {message}"))
+                }),
             already_sandboxed: seatbelt.is_sandboxed(),
         },
         Err(reason) => HostCapabilities {
@@ -143,6 +176,12 @@ mod tests {
             end_with_parent: false,
             ..base.clone()
         });
+        policies.push(ResolvedPolicy {
+            children: sandy_core::ChildProcesses::Contained,
+            signals: SignalScope::Isolated,
+            end_with_parent: true,
+            ..base.clone()
+        });
         policies
     }
 
@@ -171,6 +210,15 @@ mod tests {
                 target: "[::1]:8081".parse().unwrap(),
             },
         ]);
+        if let Err(message) = seatbelt.compile(&profile) {
+            panic!("{message}\n{}", profile.text);
+        }
+    }
+
+    #[test]
+    fn this_macos_compiles_the_watcher_profile() {
+        let seatbelt = Seatbelt::load().expect("Seatbelt functions");
+        let profile = watcher_profile();
         if let Err(message) = seatbelt.compile(&profile) {
             panic!("{message}\n{}", profile.text);
         }

@@ -16,7 +16,7 @@ sandy run \
   -- /srv/app/bin/server --port 8080
 ```
 
-Version 1.2.0. Policies use format `version = 1`.
+Version 1.3.0. Policies use format `version = 1`.
 
 ## Contents
 
@@ -53,7 +53,8 @@ program sees the normal file system, but it can open only what the policy allows
 | Windows | An AppContainer with one capability per policy path, a job object with UI restrictions, and a list of inherited handles |
 
 On Linux and macOS, sandy confines itself and then replaces itself with the program, so the
-program keeps sandy's process ID. On Windows, sandy starts the program and waits for it; when
+program keeps sandy's process ID; with `children = "contained"` sandy stays the program's parent
+instead (see [Processes](#processes)). On Windows, sandy starts the program and waits for it; when
 sandy exits, the job object ends the program.
 
 For every policy, sandy derives a list of requirements, for example "filesystem confined to policy
@@ -416,11 +417,15 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
   - `none`: the program cannot start processes at all. Threads still work.
   - `contained`: the program may start processes, and sandy ends all of them when the program
     ends, also when sandy itself is killed. Use it for a program that starts helpers, so that no
-    helper keeps running after the program has stopped. On Linux, sandy then stays the parent of
-    the program instead of becoming the program: it forwards signals, gives the program the
-    terminal when the program uses it, and exits with the program's status (128 plus the signal
-    number if a signal ended the program). Processes in the sandbox cannot call `setsid` or
-    `setpgid`. macOS does not support `contained` yet and refuses it.
+    helper keeps running after the program has stopped. On Linux and macOS, sandy then stays the
+    parent of the program instead of becoming the program: it forwards signals, gives the program
+    the terminal when the program uses it, and exits with the program's status (128 plus the
+    signal number if a signal ended the program). Processes in the sandbox cannot call `setsid` or
+    `setpgid`. On macOS they cannot call `posix_spawn` either, because its flags can move the new
+    process out of the group as well: programs that start processes with `fork` and `exec` (for
+    example shells) work, but programs that use `posix_spawn` get `EPERM` when they start one.
+    Among them are Rust's `std::process::Command` (unless it sets `pre_exec`), Java's
+    `ProcessBuilder`, Node.js, and `system()` and `popen()` in C.
 
   `none` and `contained` need `unix_sockets = "none"`, and `contained` also needs
   `signals = "isolated"`; otherwise the program could have a process started outside the sandbox,
@@ -442,13 +447,13 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
   sandbox either way.
 - `end_with_parent = true` ends the program when the process that started sandy ends, for
   example when your application crashes while its helper runs in the sandbox. sandy asks the
-  program to end (SIGTERM on Linux) and kills it 5 seconds later if it is still running; on
-  Windows it ends the program at once. Unlike a program's own check of its parent, this works
-  also when the program is compromised. It needs `signals = "isolated"`. Combine it with
-  `children = "contained"` so that the processes the program started end too. The parent is the
-  process that starts sandy directly, so start sandy from your application itself, not through a
-  shell or another wrapper, and pass your process ID with `--parent-pid`: otherwise a crash in
-  the moment sandy starts goes unnoticed. macOS does not support it yet and refuses it.
+  program to end (SIGTERM on Linux and macOS) and kills it 5 seconds later if it is still
+  running; on Windows it ends the program at once. Unlike a program's own check of its parent,
+  this works also when the program is compromised. It needs `signals = "isolated"`. Combine it
+  with `children = "contained"` so that the processes the program started end too. The parent is
+  the process that starts sandy directly, so start sandy from your application itself, not
+  through a shell or another wrapper, and pass your process ID with `--parent-pid`: otherwise a
+  crash in the moment sandy starts goes unnoticed.
 - Debugging and reading the memory of processes outside the sandbox are always denied, and the
   program can never gain privileges, for example through setuid programs.
 
@@ -480,7 +485,11 @@ program can change the metadata of every file the user owns.
 
 ### macOS
 
-- **Tested** on macOS 15 (arm64) through GitHub Actions.
+- **Tested** on macOS 15 (arm64) through GitHub Actions, and on macOS 26 (arm64).
+- **Not on Apple silicon through Rosetta:** an x86_64 program, and every program that sandy's
+  x86_64 build starts, fails in the sandbox with "rosetta error: Failed to open
+  libRosettaRuntime", because the profile does not allow the Rosetta runtime. Use the arm64 build
+  and arm64 programs on Apple silicon. The x86_64 build has not run on an Intel Mac yet.
 - sandy uses `sandbox_init_with_parameters`, which Apple does not document. Chromium and WebKit
   use the same function.
 - `system = "none"` cannot start any program on macOS, because every program needs the dynamic
@@ -488,6 +497,8 @@ program can change the metadata of every file the user owns.
 - No Mach services are reachable from the sandbox, so programs that need them (for example to open
   other apps, use the pasteboard or read preferences) do not work.
 - Terminal programs that change terminal modes fail; only a few terminal requests are allowed.
+- With `children = "contained"`, the program cannot use `posix_spawn` (see
+  [Processes](#processes)).
 - Details: [docs/macos.md](docs/macos.md).
 
 ### Windows

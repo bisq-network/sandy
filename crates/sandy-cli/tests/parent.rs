@@ -22,9 +22,6 @@ fn ending_with_parent(fixture: &Fixture) -> Vec<String> {
 
 /// Why this host cannot end the program with sandy's parent, if it cannot.
 fn unsupported() -> Option<&'static str> {
-    if cfg!(target_os = "macos") {
-        return Some("end_with_parent is not implemented on macOS");
-    }
     #[cfg(target_os = "linux")]
     if common::linux::landlock_abi() < 6 {
         return Some("signal isolation needs Landlock ABI 6");
@@ -92,8 +89,8 @@ fn the_program_ends_with_sandys_parent() {
     }
     assert!(!ended, "control: sandy ended with its parent");
 
-    // The program ends at the first request (SIGTERM on Linux), before the watcher's 5 s grace
-    // period would end it by force.
+    // The program ends at the first request (SIGTERM on Linux and macOS), before the watcher's
+    // 5 s grace period would end it by force.
     let pid = start_through_parent(&fixture, &args, &[("sleep", LONG_SLEEP)]);
     assert!(
         ends_soon(pid, Duration::from_secs(3)),
@@ -113,7 +110,7 @@ fn end_with_parent_needs_isolated_signals() {
 }
 
 /// A program that ignores SIGTERM is killed after the grace period.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn a_program_that_ignores_the_request_is_killed() {
     let fixture = Fixture::new("parent-ignore");
@@ -137,7 +134,7 @@ fn a_program_that_ignores_the_request_is_killed() {
 
 /// With `children = "contained"`, the watcher signals the supervising sandy, which ends the
 /// program's whole process group.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn contained_processes_end_with_sandys_parent() {
     let fixture = Fixture::new("parent-contained");
@@ -148,7 +145,13 @@ fn contained_processes_end_with_sandys_parent() {
     args.extend(["--children", "contained"].map(String::from));
     let program = fixture.copy_probe("bin");
     let start = format!("{program}\u{1f}sleep\u{1f}{LONG_SLEEP}");
-    let pid = start_through_parent(&fixture, &args, &[("start", &start), ("sleep", LONG_SLEEP)]);
+    // On macOS, `contained` denies posix_spawn, which std's Command uses, so the probe forks.
+    let action = if cfg!(target_os = "macos") {
+        "start-forked"
+    } else {
+        "start"
+    };
+    let pid = start_through_parent(&fixture, &args, &[(action, &start), ("sleep", LONG_SLEEP)]);
     assert!(
         ends_soon(pid, END_TIMEOUT),
         "sandy {pid} outlived its parent"
@@ -156,6 +159,26 @@ fn contained_processes_end_with_sandys_parent() {
     // The process the program started runs the fixture's copy of the probe.
     let left = running(&program);
     assert!(left.is_empty(), "processes {left:?} outlived sandy");
+}
+
+/// The processes that run the executable `program`.
+#[cfg(target_os = "macos")]
+fn running(program: &str) -> Vec<u32> {
+    let mut pids = vec![0 as libc::c_int; 8192];
+    let size = (pids.len() * std::mem::size_of::<libc::c_int>()) as libc::c_int;
+    // SAFETY: the buffer holds `size` bytes.
+    let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), size) };
+    pids.truncate(count.max(0) as usize);
+    pids.into_iter()
+        .filter(|&pid| {
+            let mut path = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+            // SAFETY: the buffer holds the size passed.
+            let length =
+                unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
+            length > 0 && &path[..length as usize] == program.as_bytes()
+        })
+        .map(|pid| pid as u32)
+        .collect()
 }
 
 /// The processes whose command line starts with `program`.
@@ -205,7 +228,7 @@ fn a_named_parent_must_be_sandys_parent() {
 /// Landlock signal scope, so it must not reach the watcher. The program ignores SIGHUP and
 /// SIGTERM, so only the watcher's SIGKILL ends it. (If the process that adopts the program is in
 /// the test's session, the group is not orphaned and the test passes without checking this.)
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn a_stopped_program_cannot_end_the_watcher_through_its_process_group() {
     use std::os::unix::process::CommandExt;
@@ -233,7 +256,7 @@ fn a_stopped_program_cannot_end_the_watcher_through_its_process_group() {
 /// Ctrl+C, a shell's SIGHUP to its jobs when the terminal closes, and `kill 0` signal the whole
 /// process group of sandy's caller. The program ignores SIGINT; the signal must not end the
 /// watcher, which then ends the program when the parent ends.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn a_signal_to_the_callers_process_group_does_not_end_the_watcher() {
     use std::os::unix::process::CommandExt;

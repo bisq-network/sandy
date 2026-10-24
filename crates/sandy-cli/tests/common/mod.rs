@@ -438,10 +438,6 @@ pub fn kill_process(pid: u32) {
 /// Helpers for the Linux tests.
 #[cfg(target_os = "linux")]
 pub mod linux {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
-
     /// The Landlock ABI of the running kernel, 0 without Landlock.
     pub fn landlock_abi() -> i64 {
         // SAFETY: with a null attribute, size 0 and the VERSION flag the kernel only returns the
@@ -456,6 +452,27 @@ pub mod linux {
         };
         abi.max(0)
     }
+}
+
+/// Helpers for the Linux and macOS tests.
+#[cfg(unix)]
+pub mod unix {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    #[cfg(target_os = "macos")]
+    const TIOCSCTTY: libc::c_ulong = 0x2000_7461;
+    #[cfg(not(target_os = "macos"))]
+    const TIOCSCTTY: libc::c_ulong = libc::TIOCSCTTY as libc::c_ulong;
+
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" {
+        /// In libSystem since macOS 10.13.4, not in the libc crate.
+        fn ptsname_r(fd: libc::c_int, buf: *mut libc::c_char, buflen: libc::size_t) -> libc::c_int;
+    }
+    #[cfg(not(target_os = "macos"))]
+    use libc::ptsname_r;
 
     /// A pseudo-terminal pair. The child that gets the slave as standard input makes it its
     /// controlling terminal, so TIOCSTI is not refused for a foreign terminal.
@@ -476,7 +493,7 @@ pub mod linux {
                 return None;
             }
             let mut name = [0 as libc::c_char; 128];
-            if libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) != 0 {
+            if ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) != 0 {
                 return None;
             }
             let slave = libc::open(
@@ -493,6 +510,17 @@ pub mod linux {
         }
     }
 
+    /// Reads and discards what the terminal shows (the echo of typed input, for example), as a
+    /// terminal emulator does. On macOS a session leader that exits waits until its terminal's
+    /// output is read, so a test that types input needs this to see the leader end.
+    pub fn discard_output(pty: &Pty) {
+        let mut master = std::fs::File::from(pty.master.try_clone().unwrap());
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 1024];
+            while matches!(std::io::Read::read(&mut master, &mut buffer), Ok(read) if read > 0) {}
+        });
+    }
+
     /// Makes the pseudo-terminal the standard input and the controlling terminal of a new
     /// session for `command`.
     pub fn with_terminal(pty: &Pty) -> impl Fn(&mut Command) + '_ {
@@ -501,7 +529,7 @@ pub mod linux {
             // SAFETY: setsid and ioctl are async-signal-safe.
             unsafe {
                 command.pre_exec(|| {
-                    if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                    if libc::setsid() < 0 || libc::ioctl(0, TIOCSCTTY as _, 0) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
                     Ok(())
