@@ -58,7 +58,8 @@ pub fn start(parent: ParentProcess, abi: ABI) -> Result<(), SandboxError> {
     let program = helper::pidfd_open(unsafe { libc::getpid() }, "the program")?;
     helper::start("the watcher", move |ready| {
         watcher_main(&parent_fd, &program, ready, abi)
-    })
+    })?;
+    Ok(())
 }
 
 fn already_ended() -> SandboxError {

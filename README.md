@@ -542,8 +542,10 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
   connections per port are relayed at the same time. A connection that is still open when the
   relay ends, one second after the program, is reset, so a cut stream never looks complete.
   With `signals = "any"` the program may stop its own relay. On Linux a stopped relay is killed
-  two seconds later and its ports are released; on macOS only `signals = "isolated"` keeps that
-  bound.
+  two seconds later and its ports are released; on macOS nothing bounds it, so only
+  `signals = "isolated"` keeps the bound there. A relay that is continued before that can serve
+  one more connection, made after the program ended, on whatever now holds the address it
+  forwards to; `process.children = "contained"` closes that on Linux (docs/linux.md).
 - `forward` entries: on Linux the relay closes a connection whose other end the kernel names as
   another local user's, so it never reaches the service. A socket its process has closed has no
   owner for the kernel to name, and such a connection is served, because it is the program's

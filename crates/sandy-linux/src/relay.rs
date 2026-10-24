@@ -90,9 +90,9 @@ struct Served {
     refuse_other_users: bool,
 }
 
-/// Starts the relay and returns once it is confined and serving. `ended` is the read end of the
-/// guard's pipe with `children = "contained"` (see the module documentation).
-pub fn start(config: &RelayConfig, ended: Option<File>) -> Result<(), SandboxError> {
+/// Starts the relay and returns its process ID once it is confined and serving. `ended` is the
+/// read end of the guard's pipe with `children = "contained"` (see the module documentation).
+pub fn start(config: &RelayConfig, ended: Option<File>) -> Result<libc::pid_t, SandboxError> {
     let exposed = config.pairs.len() - config.forwarded;
     let listeners = config
         .pairs
@@ -317,6 +317,15 @@ fn serve_until_exit(
             }
         }
         if over {
+            // The kernel completes a handshake on its own, so it can have queued a connection
+            // after it filled in this turn's poll result. Closing the listeners now would drop
+            // it, and rule 5 of "Forwarded ports" promises the program's last connection, so
+            // take what is waiting. Not after a stop, for the reason above.
+            if !stopped {
+                for (served, count) in listeners.iter().zip(&active) {
+                    accept_all(served, peers, count);
+                }
+            }
             break;
         }
     }
@@ -334,8 +343,15 @@ fn serve_until_exit(
 
 /// Whether the relay was stopped and continued since the last turn of the poll loop. SIGSTOP
 /// cannot be blocked, but SIGCONT can: the helper blocks every signal except the faults, so the
-/// kernel continues the process and leaves SIGCONT pending. Taking it from the pending set
-/// reports the stop exactly, where a long turn would also mean a host that is merely busy.
+/// kernel continues the process and leaves SIGCONT pending, which a long turn on a merely busy
+/// host does not.
+///
+/// It is not exact at the moment of resuming. The kernel wakes a stopped process before it
+/// queues the signal, so a relay can run a turn before the SIGCONT is there to take, and the
+/// end of the program is not always in the same poll result as the readiness of a listener.
+/// A relay continued while its program has already ended can therefore take its backlog before
+/// it can tell that either happened, which has been seen on this host. What bounds that window
+/// is the watchdog ending a relay that was stopped for `WATCHDOG`, not this check.
 fn was_stopped() -> bool {
     // SAFETY: sigset_t is plain data, and the two calls initialize and change it.
     let cont = unsafe {

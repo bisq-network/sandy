@@ -456,11 +456,20 @@ local user. Forward only to services that authenticate their clients.
 
 With the default `signals = "any"` the program can also stop the relay with `SIGSTOP`, which no
 process can block. A stopped relay keeps its listen ports bound until someone continues or kills
-it, so it can outlive the program by more than the one second of rule 5. macOS has no timer that
-kills a process that is not running (the Linux relay uses one), so only `signals = "isolated"`,
-which keeps the program from signalling the relay at all, holds that bound here. Connections
-that reach a stopped relay are not relayed: the kqueue reports the end of the program before
-anything that became ready after it, and the relay returns on that event without accepting.
+it, so it can outlive the program by more than the one second of rule 5, without any bound at
+all. macOS has no timer that kills a process that is not running (the Linux relay uses one), so
+only `signals = "isolated"`, which keeps the program from signalling the relay at all, holds
+that bound here.
+
+A continued relay here is meant not to relay what its listeners collected while it was stopped:
+the kqueue reports the end of the program before anything that became ready after it, and the
+relay returns on that event without accepting. That has not been measured on macOS, and the
+equivalent claim on Linux turned out to be false for two reasons that do not depend on signals
+(docs/linux.md, "Exposed and forwarded ports"), so treat it as untested rather than as a
+guarantee. What it would cost if it does not hold is a violation of the relay's lifetime, not
+an escape: an exposed port can answer once more after the operator believes the run ended.
+`process.children = "contained"` does not close it here as it does on Linux, where sandy ends
+the program's group when the relay is gone.
 
 ## Signals the profile does not cover
 

@@ -119,12 +119,32 @@ One relay process serves all pairs. sandy starts it before it confines itself:
    which waits at most 250 ms. A stopped relay is killed within those two seconds and its ports
    are released. The timer is created before the relay confines itself, so only `timer_settime`
    has to pass the filter. A relay that the host does not schedule for two seconds is killed as
-   well, and its connections then end with a normal close instead of the reset of rule 5. The
-   relay also sees a stop exactly: the helper blocks SIGCONT like every other signal, so the
-   kernel continues the process and leaves SIGCONT pending, and the poll loop takes it from the
+   well, and its connections then end with a normal close instead of the reset of rule 5. On a
+   small machine that is not a remote risk: 16 busy loops on two CPUs, with no signal sent, were
+   enough to kill a healthy relay within a minute.
+
+   The poll loop also looks for a stop: the helper blocks SIGCONT like every other signal, so
+   the kernel continues the process and leaves SIGCONT pending, and the loop takes it from the
    pending set on every turn. When the turn that finds the program ended also finds that the
    relay was continued, it closes its listeners without accepting what the backlog collected
-   while it was stopped, because those connections may have been made after the program ended.
+   while it was stopped. That narrows the window but does not close it, which was measured on
+   this host. Two races defeat it, and either is enough. The kernel wakes a stopped process
+   before it queues the signal, so the first turn after a continue can find nothing pending; and
+   the end of the program is not always in the same poll result as the readiness of a listener,
+   so the turn that sees the backlog can still believe the program is running. Both were seen.
+   A relay continued inside the two seconds can therefore relay a connection that was made after
+   the program ended.
+
+   What that costs: the connection reaches whatever now holds the address the relay forwards to,
+   which after the run may be another process, and an exposed port can answer once more after
+   the operator believes the run is over. It is a violation of the relay's lifetime, not a way
+   out of the sandbox: nothing gains access the relay did not already have, and anything the
+   program started is still inside the sandbox and is ended with its group. With
+   `process.children = "contained"` the window does not exist, because sandy stays as the
+   supervisor, holds a pidfd for the relay, and ends the program's group as soon as the relay is
+   gone, so there is no program left for a continued relay to be serving on behalf of. The
+   caller sees that as exit 125 with the reason on standard error, and as a status record of
+   `pid` followed by `failed` rather than `exited` or `signaled`.
 
 The listeners and the pidfd are close-on-exec, and sandy closes its copies before it confines
 itself, so the program never holds them. The relay has `/dev/null` as its standard descriptors,

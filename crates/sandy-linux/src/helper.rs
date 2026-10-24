@@ -31,7 +31,9 @@ use sandy_core::SandboxError;
 use crate::filter::{self, Filters};
 use crate::launch::{ensure_single_thread, restrict, set_no_new_privs};
 
-const READY: &[u8] = b"ready";
+/// What a helper writes to its readiness pipe, followed by its process ID, so that sandy can
+/// watch it. A failure writes a message instead, which never starts with this.
+const READY: &str = "ready ";
 
 /// Signals that report a fault of the process itself. They stay unblocked, so a fault ends it.
 const FAULTS: [libc::c_int; 7] = [
@@ -73,7 +75,9 @@ impl Ready {
 
     /// Reports that the helper is confined and serving. Ends the helper if sandy is gone.
     pub(crate) fn report(mut self) {
-        if self.0.write_all(READY).is_err() {
+        // SAFETY: getpid has no preconditions.
+        let pid = unsafe { libc::getpid() };
+        if write!(self.0, "{READY}{pid}").is_err() {
             // SAFETY: ends the helper without running sandy's cleanup.
             unsafe { libc::_exit(1) };
         }
@@ -90,7 +94,7 @@ impl Ready {
 /// Starts `main` in a helper process named `name` (for example "the relay") and returns once it
 /// reported that it is ready. `main` runs in the helper and must call `Ready::report` after it has
 /// confined itself; the helper ends when `main` returns. What `main` owns is dropped in sandy.
-pub(crate) fn start(name: &str, main: impl FnOnce(Ready)) -> Result<(), SandboxError> {
+pub(crate) fn start(name: &str, main: impl FnOnce(Ready)) -> Result<libc::pid_t, SandboxError> {
     let null = File::options()
         .read(true)
         .write(true)
@@ -155,13 +159,14 @@ pub(crate) fn start(name: &str, main: impl FnOnce(Ready)) -> Result<(), SandboxE
             "{name} ended before it was ready"
         )));
     }
-    if report != READY {
-        return Err(SandboxError::new(format!(
-            "{name} did not start: {}",
-            String::from_utf8_lossy(&report)
-        )));
-    }
-    Ok(())
+    let report = String::from_utf8_lossy(&report);
+    let started = report
+        .strip_prefix(READY)
+        .and_then(|pid| pid.parse::<libc::pid_t>().ok());
+    let Some(started) = started else {
+        return Err(SandboxError::new(format!("{name} did not start: {report}")));
+    };
+    Ok(started)
 }
 
 /// Gives this process's `/proc/<pid>` files to root, so that the program cannot change them even

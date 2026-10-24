@@ -337,6 +337,72 @@ fn a_stopped_relay_ends_with_the_program() {
     );
 }
 
+/// With `children = "contained"` sandy stays as the supervisor, so it can watch the relay in
+/// turn and end the program's group when the relay is gone. Without that, the program keeps
+/// running with its ports served by nothing, and a relay that was only frozen can serve a
+/// connection made after the program ended (`relay::was_stopped`). Killing the relay is the
+/// mechanism, not a race: the scenario it protects against cannot be tested without one.
+///
+/// Linux only: sandy watches the relay in the Linux `contain` supervisor.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dead_relay_ends_a_contained_program() {
+    let (service_port, stop_service) = holding_service();
+    let inner = free_port();
+    let sandbox_args = [
+        "--ip",
+        "all",
+        "--children",
+        "contained",
+        "--signals",
+        "isolated",
+        "--forward",
+    ]
+    .map(String::from)
+    .into_iter()
+    .chain([format!("{inner}=127.0.0.1:{service_port}")])
+    .collect::<Vec<String>>();
+    let mut program = Command::new(sandy_path())
+        .args(run_args(&sandbox_args, &[("sleep", "600000")]))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let relay = relay_of(inner, &mut program);
+    let address = format!("127.0.0.1:{inner}").parse().unwrap();
+    // Control: the port serves while the program and its relay run.
+    assert!(
+        TcpStream::connect_timeout(&address, HALF_SECOND).is_ok(),
+        "the forward port did not serve before the relay was killed"
+    );
+
+    kill_process(relay);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while program.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "sandy kept the program running after its relay was gone"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let output = program.wait_with_output().unwrap();
+    let _ = stop_service.send(());
+    let reason = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "sandy reported success although its relay was gone: {output:?}"
+    );
+    assert!(
+        reason.contains("relay"),
+        "sandy did not say that the relay ended: {reason}"
+    );
+    // The program went with it, and so did the port it was served on.
+    assert!(
+        TcpStream::connect_timeout(&address, HALF_SECOND).is_err(),
+        "the forward port still answers after the run ended"
+    );
+}
+
 /// The relay of the sandbox that `program` runs: the one process that listens on
 /// 127.0.0.1:`port`. Waits until it is there, and fails if the program ends first.
 #[cfg(target_os = "linux")]

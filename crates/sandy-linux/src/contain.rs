@@ -36,8 +36,9 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::ptr;
+use std::time::Duration;
 
 use sandy_core::{SandboxError, StatusReport};
 
@@ -50,6 +51,23 @@ pub(crate) const SIGNALED: i32 = 128;
 /// The forked child's exit status when it cannot start the program. sandy reports the message
 /// from the pipe instead.
 pub(crate) const START_FAILED: i32 = 125;
+/// How often sandy looks at the relay while it supervises the program. A pidfd cannot wake
+/// `sigtimedwait`, so the wait is bounded instead; this only has to be short against a person
+/// noticing that a port stopped answering.
+const RELAY_CHECK: Duration = Duration::from_millis(250);
+
+/// Whether the process `pidfd` watches has ended.
+fn ended(pidfd: &OwnedFd) -> bool {
+    let mut poll = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd, and a zero timeout does not block.
+    let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+    // A relay sandy cannot ask about has to count as gone.
+    ready != 0
+}
 
 /// Starts the program in a process group that sandy ends when the program ends, and returns the
 /// exit status for sandy. `start` runs in the forked child: it confines the child and executes
@@ -61,6 +79,7 @@ pub(crate) const START_FAILED: i32 = 125;
 pub fn run(
     start: impl FnOnce() -> SandboxError,
     ended: Option<File>,
+    relay: Option<OwnedFd>,
     status: &StatusReport,
     mut explain: Option<&mut Explain>,
 ) -> Result<i32, SandboxError> {
@@ -106,7 +125,7 @@ pub fn run(
     // The program has started: the report pipe reached its end without a message, which only
     // execve does.
     status.started(group.program.expect("the program was started") as u32);
-    let exited = group.supervise(&signals)?;
+    let exited = group.supervise(&signals, relay.as_ref())?;
     group.end();
     if let Some(explain) = &mut explain {
         explain.finish();
@@ -180,20 +199,44 @@ impl Group {
     }
 
     /// Forwards signals and follows the program until it exits. Returns how it ended.
-    fn supervise(&mut self, signals: &Signals) -> Result<ChildState, SandboxError> {
+    ///
+    /// `relay` is a pidfd for the relay, which sandy holds only here: in the exec model sandy
+    /// has become the program and there is nobody left to watch it. A relay that is gone leaves
+    /// its ports to whatever binds them next, and a relay that was frozen can serve a connection
+    /// made after the program ended (`relay::was_stopped`), so the program ends with it. The
+    /// program's own end is checked first, because the relay ending after it is the normal way
+    /// a run finishes.
+    fn supervise(
+        &mut self,
+        signals: &Signals,
+        relay: Option<&OwnedFd>,
+    ) -> Result<ChildState, SandboxError> {
         let program = self.program.expect("the program was started");
         loop {
             if let Some(exited) = self.reap_others(program)? {
                 return Ok(exited);
             }
-            match signals.wait()? {
-                libc::SIGCHLD => self.follow_program(program)?,
-                libc::SIGCONT => self.resume(),
+            if relay.is_some_and(ended) {
+                // Once more, so that a relay that ended together with the program is the end of
+                // a run and not a failure.
+                if let Some(exited) = self.reap_others(program)? {
+                    return Ok(exited);
+                }
+                return Err(SandboxError::new(
+                    "the relay of the exposed or forwarded ports ended before the program; the \
+                     ports it served are gone and the program has been ended with it",
+                ));
+            }
+            match signals.wait(relay.map(|_| RELAY_CHECK))? {
+                // The wait ran out, which only happens while a relay is watched.
+                None => {}
+                Some(libc::SIGCHLD) => self.follow_program(program)?,
+                Some(libc::SIGCONT) => self.resume(),
                 // The kernel sends these to sandy's group when another process of sandy's job
                 // uses the terminal while the program's group has it.
-                libc::SIGTTIN | libc::SIGTTOU => self.return_terminal(),
+                Some(libc::SIGTTIN) | Some(libc::SIGTTOU) => self.return_terminal(),
                 // SAFETY: kill takes a process ID; sandy has not reaped the program.
-                signal => unsafe {
+                Some(signal) => unsafe {
                     libc::kill(program, signal);
                 },
             }
@@ -470,14 +513,28 @@ impl Signals {
         Ok(())
     }
 
-    fn wait(&self) -> Result<libc::c_int, SandboxError> {
+    /// Waits for a signal, at most `limit` when there is one. `None` means the wait ran out.
+    fn wait(&self, limit: Option<Duration>) -> Result<Option<libc::c_int>, SandboxError> {
         loop {
-            // SAFETY: waits for a signal of a valid set; the details are not needed.
-            let signal = unsafe { libc::sigwaitinfo(&self.blocked, ptr::null_mut()) };
+            let signal = match limit {
+                // SAFETY: waits for a signal of a valid set; the details are not needed.
+                None => unsafe { libc::sigwaitinfo(&self.blocked, ptr::null_mut()) },
+                Some(limit) => {
+                    let limit = libc::timespec {
+                        tv_sec: limit.as_secs() as _,
+                        tv_nsec: limit.subsec_nanos() as _,
+                    };
+                    // SAFETY: as above, and the timeout is a valid timespec.
+                    unsafe { libc::sigtimedwait(&self.blocked, ptr::null_mut(), &limit) }
+                }
+            };
             if signal > 0 {
-                return Ok(signal);
+                return Ok(Some(signal));
             }
             let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EAGAIN) {
+                return Ok(None);
+            }
             if error.kind() != io::ErrorKind::Interrupted {
                 return Err(SandboxError::io("cannot wait for signals", error));
             }

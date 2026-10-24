@@ -299,8 +299,22 @@ Rules:
    stopped relay sees nothing. On Linux the relay has a watchdog for that: the kernel kills it
    two seconds after its poll loop last ran, so the bound for a stopped relay is two seconds
    instead of one (docs/linux.md, "Exposed and forwarded ports"). Windows is not affected: sandy
-   terminates the relay's job object from outside the sandbox. On macOS a stopped process cannot
-   wake itself, so there the bound holds only with `signals = "isolated"` (docs/macos.md).
+   terminates the relay's job object from outside the sandbox. On macOS there is no such timer,
+   so a stopped relay holds its ports until someone continues or kills it, and only
+   `signals = "isolated"`, which keeps the program from signalling the relay at all, holds the
+   bound there (docs/macos.md).
+
+   A relay that is continued inside that bound can relay a connection that was made after the
+   program ended. The poll loop looks for a stop and refuses the backlog it collected while
+   stopped, but two races defeat that check, both measured: the kernel wakes a stopped process
+   before it queues SIGCONT, so the first turn after a continue can find nothing pending, and
+   the end of the program is not always in the same poll result as the readiness of a listener.
+   On Linux the watchdog bounds how long that is possible; on macOS nothing does. The harm is a
+   violation of the relay's lifetime, not an escape: an exposed port can answer once more after
+   the operator believes the run ended, served by whatever now holds the inner address, and
+   nothing gains access the relay did not already have. With `process.children = "contained"`
+   on Linux the window does not exist, because sandy stays as the supervisor and ends the
+   program's group as soon as the relay is gone.
 6. Who may connect: an exposed port is meant for other processes, including those of other
    users, and the program's own listener is reachable directly on Linux and macOS anyway, so
    the relay serves every connection there. A forwarded port is for the program alone, and the

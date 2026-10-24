@@ -39,8 +39,10 @@ pub fn launch(
              the supervising sandy of \"contained\" passes on the signals that end the program",
         ));
     }
-    // With `contained`, the relay also ends when the guard has ended the program's group.
+    // With `contained`, the relay also ends when the guard has ended the program's group, and
+    // sandy stays to watch the relay in turn (see `contain::run`).
     let mut group_ended = None;
+    let mut relay_alive = None;
     if let Some(relay) = &sandbox.relay {
         let ended = if sandbox.contain {
             let (read, write) = crate::helper::pipe("the pipe of the group's end")?;
@@ -49,7 +51,10 @@ pub fn launch(
         } else {
             None
         };
-        relay::start(relay, ended)?;
+        let started = relay::start(relay, ended)?;
+        if sandbox.contain {
+            relay_alive = Some(crate::helper::pidfd_open(started, "the relay")?);
+        }
     }
     if sandbox.end_with_parent {
         let parent = command.parent.unwrap_or_else(|| ParentProcess {
@@ -82,7 +87,7 @@ pub fn launch(
         Err(error) => error,
     };
     if sandbox.contain {
-        contain::run(start, group_ended, status, explain.as_mut())
+        contain::run(start, group_ended, relay_alive, status, explain.as_mut())
     } else if let Some(explain) = explain {
         explain::supervise(start, explain, status)
     } else {
