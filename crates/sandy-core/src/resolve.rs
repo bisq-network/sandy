@@ -147,6 +147,90 @@ impl ResolvedPolicy {
         requirements
     }
 
+    /// Why the kernel could not execute the program: it is a script whose interpreter the backend
+    /// does not let it execute. The kernel reads the `#!` line of the program and executes the
+    /// interpreter named there, which needs execute access of its own; `levels` is how many such
+    /// lines the kernel follows, and `executable` are the paths the backend's plan executes, each
+    /// covering everything beneath it. A backend reports this before it starts the program,
+    /// because the `execve` would otherwise fail with "Permission denied" after the sandbox is
+    /// already in place.
+    pub fn interpreter_problem(&self, levels: usize, executable: &[PathBuf]) -> Option<String> {
+        let mounts = Mounts::read().ok()?;
+        let mut script = self.program.clone()?;
+        for _ in 0..levels {
+            // A file that cannot be read, or a `#!` line without a path, is left to the execve,
+            // which reports its own error.
+            let interpreter = shebang(&script)?.canonicalize().ok()?;
+            if !executable
+                .iter()
+                .any(|allowed| is_within(&interpreter, allowed, &mounts))
+            {
+                return Some(format!(
+                    "{} is a script and the kernel executes its interpreter {}, which no \
+                     read_exec path covers",
+                    script.display(),
+                    interpreter.display()
+                ));
+            }
+            script = interpreter;
+        }
+        None
+    }
+
+    /// The settings of this policy that give up part of the isolation, each with what the program
+    /// gains by it. sandy enforces them as written; these are advice for whoever wrote the policy,
+    /// which `sandy check` prints. `home` is the user's home directory, which only the caller can
+    /// name because the variable that holds it differs per platform.
+    ///
+    /// A plain path comparison is enough here: the rules that must hold whatever the program does
+    /// compare file identity instead (`is_within`).
+    pub fn warnings(&self, home: Option<&Path>) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.unix_sockets == NetworkAccess::All {
+            warnings.push(
+                "unix_sockets = \"all\" gives up most of the isolation: the program can reach \
+                 every local service that listens on a Unix socket, and some of them start \
+                 programs or read files outside the policy (on Linux the D-Bus session bus and \
+                 the systemd user manager, on macOS the DNS resolver)"
+                    .to_string(),
+            );
+        }
+        if self.signals == SignalScope::Any {
+            warnings.push(
+                "signals = \"any\" lets the program signal every process of this user, so it can \
+                 stop or kill programs outside the sandbox; signals = \"isolated\" limits signals \
+                 to the sandbox"
+                    .to_string(),
+            );
+        }
+        if self.path_metadata == PathMetadata::Allow {
+            warnings.push(
+                "path_metadata = \"allow\" lets the program change the permissions, owner, \
+                 timestamps and extended attributes of every file this user owns on Linux, also \
+                 outside the policy paths"
+                    .to_string(),
+            );
+        }
+        if let Some(home) = home {
+            let writable = self
+                .paths
+                .iter()
+                .filter(|rule| rule.access == PathAccess::ReadWrite);
+            for rule in writable {
+                if home.starts_with(&rule.path) {
+                    warnings.push(format!(
+                        "the writable path {} holds the home directory {}, so the program can \
+                         change shell startup files, autostart entries and the configuration of \
+                         other programs, and what it writes there runs outside the sandbox",
+                        rule.path.display(),
+                        home.display()
+                    ));
+                }
+            }
+        }
+        warnings
+    }
+
     /// sandy's own executable and the policy file are trusted: the program must not be able to
     /// change them for the next start (see "Threat model" in DESIGN.md). They are not policy
     /// paths, so rules 3 and 4 do not cover them; this applies the same checks. The caller
@@ -188,6 +272,43 @@ impl ResolvedPolicy {
         }
         check_no_writable_trusted_name(&canonical, &self.paths)
     }
+}
+
+/// The interpreter of a `#!` line: the first word after `#!`, or `None` when `file` does not
+/// start with one. The kernel reads only the beginning of the file (256 bytes on Linux) and the
+/// first line of it, and takes everything after the interpreter as one argument.
+fn shebang(file: &Path) -> Option<PathBuf> {
+    use std::io::Read;
+
+    /// As Linux (BINPRM_BUF_SIZE). macOS reads less.
+    const HEADER: usize = 256;
+
+    let mut header = Vec::with_capacity(HEADER);
+    std::fs::File::open(file)
+        .and_then(|file| file.take(HEADER as u64).read_to_end(&mut header))
+        .ok()?;
+    let line = header.strip_prefix(b"#!")?;
+    // Without a newline the kernel uses what it read, so the end of the header ends the line.
+    let end = line.iter().position(|byte| *byte == b'\n');
+    let line = &line[..end.unwrap_or(line.len())];
+    let word = line
+        .split(|byte| matches!(byte, b' ' | b'\t'))
+        .find(|word| !word.is_empty())?;
+    Some(path_from_bytes(word))
+}
+
+#[cfg(unix)]
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    PathBuf::from(OsString::from_vec(bytes.to_vec()))
+}
+
+/// Windows has no `#!`; a backend there follows no level.
+#[cfg(not(unix))]
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
 /// The directory entries that resolving one policy path passes, and the path as given.
@@ -1578,5 +1699,34 @@ mod tests {
                 == Path::new("/")),
             Some(PathBuf::from("/odd name/alias/t"))
         );
+    }
+
+    #[test]
+    fn warns_about_every_setting_that_gives_up_isolation() {
+        let dir = temp_dir();
+        let home = dir.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let mut policy = policy_with(&[], &[], &[&dir]);
+        policy.network.unix_sockets = NetworkAccess::All;
+        policy.linux.path_metadata = PathMetadata::Allow;
+        let resolved = ResolvedPolicy::resolve(&policy, None).unwrap();
+        let warnings = resolved.warnings(Some(&home)).join("\n");
+        for setting in [
+            "unix_sockets = \"all\"",
+            "signals = \"any\"",
+            "path_metadata = \"allow\"",
+        ] {
+            assert!(warnings.contains(setting), "{warnings}");
+        }
+        assert!(warnings.contains(&home.display().to_string()), "{warnings}");
+
+        // The strictest policy keeps quiet, and a writable path beside the home directory is not
+        // one that holds it.
+        let data = dir.join("data");
+        fs::create_dir_all(&data).unwrap();
+        let mut policy = policy_with(&[], &[], &[&data]);
+        policy.process.signals = SignalScope::Isolated;
+        let resolved = ResolvedPolicy::resolve(&policy, None).unwrap();
+        assert_eq!(resolved.warnings(Some(&home)), Vec::<String>::new());
     }
 }

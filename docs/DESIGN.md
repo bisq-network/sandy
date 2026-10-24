@@ -64,7 +64,11 @@ appcontainer_name = "example.app"  # required on Windows
 ```
 
 Command line options extend the policy file (`sandy --help`): path options add paths, and every
-other option replaces the file's value, also with a weaker one. The caller is trusted. sandy's
+other option replaces the file's value, also with a weaker one. The caller is trusted, so sandy
+obeys, but `sandy check` names every option that replaced a stricter value of the file in a
+`warning:` line on standard error, together with the settings of the policy that give up part of
+the isolation (`ResolvedPolicy::warnings`). Warnings do not change what sandy enforces or its
+exit status; `sandy run` prints none, because its standard error belongs to the program. sandy's
 own executable and the policy file get the checks of rules 3 and 4: sandy refuses to start when
 a writable path contains one of them, reaches one through a link or an alias, or holds a second
 name of one, because the program could then change what the next start runs or reads. The name
@@ -285,6 +289,13 @@ cannot weaken the sandbox by omission. `sandy check` prints the plan. `sandy run
 program only when every requirement is enforced, and the backend's `run` must fail rather than
 continue if any mechanism fails while it is applied.
 
+`plan` changes nothing on the host, so some reasons for `run` to refuse are invisible to it: a
+port of a relay that another process holds, for example. `check` therefore also calls the
+backend's `verify`, which may touch the host as long as it leaves it as it found it; its reports
+join the plan, where an unavailable report wins. `run` does not call `verify`: it finds out while
+it applies the sandbox, and it stays the authoritative answer, because a trial bind can be stale
+a moment later.
+
 ## Process model
 
 - Linux and macOS: sandy restricts itself, then calls `execve` on the program. The program keeps
@@ -301,7 +312,7 @@ continue if any mechanism fails while it is applied.
   object with kill-on-close, waits, and exits with the program's exit code. If sandy dies, the job
   closes and the program dies with it.
 
-## Mechanisms (initial plan; each backend section is owned by its backend)
+## Mechanisms (each backend section is owned by its backend)
 
 ### Linux
 
@@ -373,7 +384,8 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
 - Hard links are denied; clones (`std::fs::copy`) work only into writable paths and only from
   files the target may read. ptrace attach is denied (Seatbelt checks it as `system-debug`).
 - dyld needs the root directory itself (only the names in `/`) to find the shared cache, so the
-  minimal system set contains it; with `system = "none"` no program can start on macOS.
+  minimal system set contains it; with `system = "none"` no program can start on macOS, so the
+  backend refuses that unless a policy path covers "/".
 - Name resolution is part of `ip = "all"`: the profile allows exactly the Unix socket of
   mDNSResponder, so DNS does not need `unix_sockets = "all"`.
 - Metadata (mode, owner, flags, times, extended attributes, ACLs) can change only on `read_write`
@@ -495,7 +507,8 @@ Details, limitations and sources: `docs/windows.md`.
 or `error`. The escape tests in `crates/sandy-cli/tests/escape.rs` run it inside the sandbox. Each
 denial is checked against a control run outside the sandbox, so a test cannot pass because the
 action was impossible anyway. The same tests run on every platform; platform-specific escape
-routes get additional tests.
+routes get additional tests. `check.rs` holds the agreement tests: for every case where `run`
+refuses a policy, `sandy check` must refuse it too.
 
 ## Code layout
 

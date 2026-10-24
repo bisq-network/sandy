@@ -27,11 +27,11 @@ impl Backend for LinuxBackend {
     }
 
     fn plan(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
-        plan::plan_for(policy, &HostCapabilities::detect()).items
+        plan::plan_for(policy, &HostCapabilities::detect_for(policy)).items
     }
 
     fn run(&self, policy: &ResolvedPolicy, command: &TargetCommand) -> Result<i32, SandboxError> {
-        let plan = plan::plan_for(policy, &HostCapabilities::detect());
+        let plan = plan::plan_for(policy, &HostCapabilities::detect_for(policy));
         let sandbox = plan
             .sandbox
             .ok_or_else(|| SandboxError::new("this host cannot enforce the policy"))?;

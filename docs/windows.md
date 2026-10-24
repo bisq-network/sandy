@@ -187,6 +187,12 @@ path, unless Windows already grants the level to all AppContainers. A path witho
 DACL, everyone has full access) also makes the run fail; adding an ACE would take the user's
 access away.
 
+`sandy check` asks the same question for every policy path (`acl::grantable`, which opens the
+path for `WRITE_DAC` and changes nothing) and reports FilesystemConfined as unavailable with the
+path and the reason, so it does not report as enforced what `run` then refuses. A path whose
+entry is already in place needs no change and passes. The owner of a file always holds
+`WRITE_DAC`, whatever the DACL says, so only paths the user does not own can fail this way.
+
 ### Links and identity
 
 The resolver compares files and not only paths where it can: one directory reachable under two
@@ -554,6 +560,16 @@ messages that reach processes outside the sandbox.
   job. Microsoft documents a stricter rule ("neither job sets UI limits") [Nested jobs], which
   the measurements on Windows 11, Server 2022 and Server 2025 do not show; Windows 10 is
   untested.
+
+  A job sandy runs in can itself lie in a job, and `QueryInformationJobObject` reports the limits
+  of the immediate job only: in a chain whose outer job has UI restrictions and whose immediate
+  job has none, the restrictions read as 0 while the assignment still fails (measured on Windows
+  11 build 26200). `sandy check` therefore tries the nesting (`Backend::verify`): it creates a job
+  with the program's UI restrictions, starts a suspended process of `sandy.exe`, which joins
+  sandy's job chain as the program would, assigns it to that job and terminates it again before
+  it runs an instruction. The trial runs only for the case nothing else can answer, an immediate
+  job without UI restrictions, so outside a job `check` touches nothing. `run` does not try: it
+  finds out when it assigns the program.
 
 ## Known limitations
 

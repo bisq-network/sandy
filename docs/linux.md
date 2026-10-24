@@ -618,6 +618,22 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   the next start and programs outside the sandbox use. File permissions usually forbid this
   anyway, because these files belong to root and sandy refuses to run as root; the check keeps
   the guarantee independent of them.
+- `children = "contained"` while sandy itself runs in a sandbox that denies `setpgid`:
+  ChildProcessesContained is unavailable. The program runs in a process group of its own, and
+  sandy's own filter denies `setpgid` inside `contained`, so one contained sandbox cannot hold
+  another. sandy probes this by joining the process group it is already in, which changes
+  nothing. A session leader cannot change its own group whatever a filter allows, so sandy skips
+  the probe then; the group is led by the guard, which is no session leader.
+- A program that is a script whose interpreter no `read_exec` path covers: FilesystemConfined is
+  unavailable. The kernel reads the `#!` line and executes the interpreter, which needs execute
+  access of its own, so `sandy check` reads that line too and follows up to four levels of it.
+  Without the check, `execve` would fail with "Permission denied" after the sandbox is in place.
+  The minimal system set grants execute on the dynamic loader, so a chain that ends there is
+  covered.
+- A listening address of a relay that another process holds: ExposedPortsRelayed or
+  ForwardedPortsRelayed is unavailable. `sandy check` binds the same addresses for a moment and
+  releases them again, so it reports what `run` refuses. The answer can be stale one moment
+  later; `run` binds for real and stays the authoritative answer.
 
 ## Known limitations
 
@@ -694,7 +710,8 @@ path rules is refused before that, with exit code 125 and the paths it compared.
 ## Testing
 
 `crates/sandy-cli/tests/escape_linux.rs` holds the Linux escape tests; the shared ones are in
-`escape.rs`. Every denial has a control run outside the sandbox. Checks that need a host feature
+`escape.rs`, and `check.rs` holds the tests that `sandy check` reports what `sandy run` refuses.
+Every denial has a control run outside the sandbox. Checks that need a host feature
 (a session bus, a pseudo-terminal, ptrace or `/proc/<pid>/mem` under Yama `ptrace_scope` 1 or
 higher, a socket family) call `common::skip`, which records the skip; the README section
 "Testing" describes the accounting around it.

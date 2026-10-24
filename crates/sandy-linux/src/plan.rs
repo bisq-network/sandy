@@ -1,6 +1,8 @@
-//! The planning step. It is pure: from a policy and the host capabilities it derives the plan
-//! items and the exact configuration that `run` applies. Both come from the same function, so
-//! `run` applies what the plan names.
+//! The planning step. From a policy and the host capabilities it derives the plan items and the
+//! exact configuration that `run` applies. Both come from the same function, so `run` applies
+//! what the plan names. The only state it reads besides the host capabilities is the `#!` line of
+//! the program, which tells whether the kernel could execute it at all; that depends on the
+//! policy, so no detection step can answer it.
 
 use std::path::PathBuf;
 
@@ -61,6 +63,12 @@ const FILTER_PROCESSES: &str = "seccomp denies ptrace, process_vm_readv, process
     pidfd_getfd, kcmp, process_madvise, System V IPC and POSIX message queues, and changes of the \
     limits, priority and CPU affinity of other processes";
 
+/// How many `#!` lines sandy follows when it checks whether the program can be executed. The
+/// kernel follows more (measured on Linux 7.2: a chain of five scripts runs, six fails with
+/// ELOOP), so this never names a level the kernel would not reach, and no real program nests
+/// more than one.
+const SHEBANG_LEVELS: usize = 4;
+
 pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
     // Landlock restricts only the calling thread, so it is only usable when sandy can verify
     // that it is single-threaded.
@@ -68,16 +76,21 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
         (Err(reason), _) | (Ok(_), Err(reason)) => Err(reason.as_str()),
         (Ok(version), Ok(())) => Ok(ABI::from(*version)),
     };
-    let conflict = system_conflict(policy, &host.system_locations);
+    let landlock = abi
+        .ok()
+        .map(|abi| landlock_config(policy, &host.system_paths, abi));
+    let conflict = system_conflict(policy, &host.system_locations).or_else(|| {
+        policy.interpreter_problem(SHEBANG_LEVELS, &executable_paths(landlock.as_ref()?))
+    });
     let items: Vec<PlanItem> = policy
         .requirements()
         .into_iter()
         .map(|requirement| plan_item(requirement, host, abi, conflict.as_deref()))
         .collect();
     let enforceable = items.iter().all(PlanItem::is_enforced);
-    let sandbox = match abi {
-        Ok(abi) if enforceable => Some(Sandbox {
-            landlock: landlock_config(policy, &host.system_paths, abi),
+    let sandbox = match (abi, landlock) {
+        (Ok(abi), Some(landlock)) if enforceable => Some(Sandbox {
+            landlock,
             filter: FilterConfig {
                 allow_ip: policy.ip == NetworkAccess::All,
                 allow_unix: policy.unix_sockets == NetworkAccess::All,
@@ -190,17 +203,21 @@ fn plan_item(
                     .to_string(),
             ),
         },
-        Requirement::ChildProcessesContained => match (&host.seccomp, &host.pidfd) {
-            (Err(reason), _) | (_, Err(reason)) => unavailable(reason),
-            (Ok(()), Ok(())) => enforced(
-                "sandy stays the program's parent and puts it in a process group of its own, \
-                 whose leader is a guard process of sandy; seccomp denies setsid and setpgid, so \
-                 every process the program starts stays in that group; the guard kills the \
-                 group when the program ends (pidfd) or sandy dies, and sandy kills it with \
-                 SIGKILL when the program ends and reaps it as child subreaper"
-                    .to_string(),
-            ),
-        },
+        Requirement::ChildProcessesContained => {
+            match (&host.seccomp, &host.pidfd, &host.process_group) {
+                (Err(reason), _, _) | (_, Err(reason), _) | (_, _, Err(reason)) => {
+                    unavailable(reason)
+                }
+                (Ok(()), Ok(()), Ok(())) => enforced(
+                    "sandy stays the program's parent and puts it in a process group of its own, \
+                     whose leader is a guard process of sandy; seccomp denies setsid and setpgid, \
+                     so every process the program starts stays in that group; the guard kills \
+                     the group when the program ends (pidfd) or sandy dies, and sandy kills it \
+                     with SIGKILL when the program ends and reaps it as child subreaper"
+                        .to_string(),
+                ),
+            }
+        }
         Requirement::EndsWithParent => match (&host.landlock, &host.seccomp, &host.pidfd) {
             (Err(reason), _, _) | (_, Err(reason), _) | (_, _, Err(reason)) => unavailable(reason),
             _ => enforced(format!(
@@ -286,6 +303,18 @@ fn system_conflict(policy: &ResolvedPolicy, system: &[SystemPath]) -> Option<Str
         }
     }
     None
+}
+
+/// The paths this configuration executes, for `ResolvedPolicy::interpreter_problem`: the policy's
+/// `read_exec` paths and the entries of the system set that hold code, as the Landlock rules
+/// carry them.
+fn executable_paths(landlock: &LandlockConfig) -> Vec<PathBuf> {
+    landlock
+        .rules
+        .iter()
+        .filter(|rule| rule.access.contains(AccessFs::Execute))
+        .map(|rule| rule.path.clone())
+        .collect()
 }
 
 fn landlock_config(policy: &ResolvedPolicy, system: &[SystemPath], abi: ABI) -> LandlockConfig {
@@ -412,6 +441,7 @@ mod tests {
         HostCapabilities {
             landlock: abi.ok_or_else(|| "no Landlock here".to_string()),
             thread_count: Ok(()),
+            process_group: Ok(()),
             seccomp: Ok(()),
             no_new_privs: Ok(()),
             unprivileged: Ok(()),

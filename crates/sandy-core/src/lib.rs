@@ -9,6 +9,7 @@ mod env;
 mod plan;
 mod policy;
 mod resolve;
+pub mod verify;
 
 pub use backend::{Backend, SandboxError, TargetCommand};
 pub use env::target_environment;

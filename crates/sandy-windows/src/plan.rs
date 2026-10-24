@@ -22,6 +22,9 @@ pub struct HostCapabilities {
     /// No writable path overlaps a system directory, and Windows does not let every
     /// AppContainer execute files in one (rules 3 and 6).
     pub writable_paths: Result<(), String>,
+    /// sandy can give the AppContainer access to every policy path: the entry is in place, or
+    /// the current user may change the path's access control list.
+    pub grants: Result<(), String>,
     /// The UI restrictions of the job sandy runs in, or `None` outside a job.
     pub outer_job_ui: Result<Option<u32>, String>,
     /// The Windows Firewall service runs. It installs the filters that isolate AppContainers
@@ -102,6 +105,32 @@ fn job_problem(host: &HostCapabilities) -> Option<String> {
     }
 }
 
+/// Whether sandy's job objects carry this requirement: they hold the no-breakaway rule and the UI
+/// restrictions, and they end the relays.
+fn needs_job(requirement: Requirement) -> bool {
+    matches!(
+        requirement,
+        Requirement::NoPrivilegeEscalation
+            | Requirement::SignalsIsolated
+            | Requirement::ExposedPortsRelayed
+            | Requirement::ForwardedPortsRelayed
+            | Requirement::ChildProcessesDenied
+            | Requirement::ChildProcessesContained
+            | Requirement::EndsWithParent
+    )
+}
+
+/// Reports every requirement that sandy's job objects carry as unavailable with `reason`. For
+/// `verify`, which learns in a trial whether the program's job can be nested here.
+pub fn job_unavailable(policy: &ResolvedPolicy, reason: &str) -> Vec<PlanItem> {
+    policy
+        .requirements()
+        .into_iter()
+        .filter(|requirement| needs_job(*requirement))
+        .map(|requirement| PlanItem::unavailable(requirement, reason))
+        .collect()
+}
+
 /// Requirements that the AppContainer enforces.
 fn contained(
     requirement: Requirement,
@@ -111,19 +140,10 @@ fn contained(
 ) -> PlanItem {
     let enforced = |mechanism: String| PlanItem::enforced(requirement, mechanism);
     let unavailable = |reason: String| PlanItem::unavailable(requirement, reason);
-    // The jobs carry the no-breakaway rule and the UI restrictions, and end the relays.
-    if let (
-        Requirement::NoPrivilegeEscalation
-        | Requirement::SignalsIsolated
-        | Requirement::ExposedPortsRelayed
-        | Requirement::ForwardedPortsRelayed
-        | Requirement::ChildProcessesDenied
-        | Requirement::ChildProcessesContained
-        | Requirement::EndsWithParent,
-        Some(reason),
-    ) = (requirement, job_problem(host))
-    {
-        return unavailable(reason);
+    if needs_job(requirement) {
+        if let Some(reason) = job_problem(host) {
+            return unavailable(reason);
+        }
     }
     let bypass = host
         .windows
@@ -135,12 +155,15 @@ fn contained(
         return unavailable(reason);
     }
     match requirement {
+        Requirement::FilesystemConfined if policy.system == SystemAccess::None => {
+            unavailable(SYSTEM_NONE.into())
+        }
         Requirement::FilesystemConfined => {
-            match (policy.system, &host.capability_sids, &host.writable_paths) {
-                (SystemAccess::None, _, _) => unavailable(SYSTEM_NONE.into()),
-                (SystemAccess::Minimal, Err(reason), _)
-                | (SystemAccess::Minimal, _, Err(reason)) => unavailable(reason.clone()),
-                (SystemAccess::Minimal, Ok(()), Ok(())) => enforced(format!(
+            match (&host.capability_sids, &host.writable_paths, &host.grants) {
+                (Err(reason), _, _) | (_, Err(reason), _) | (_, _, Err(reason)) => {
+                    unavailable(reason.clone())
+                }
+                (Ok(()), Ok(()), Ok(())) => enforced(format!(
                     "AppContainer {name:?}: one capability per policy path with an access control \
                  entry on the path (no FILE_EXECUTE on read and read-write paths); besides, what \
                  Windows grants all AppContainers and the AppContainer profile folder"
@@ -309,6 +332,7 @@ mod tests {
             }),
             capability_sids: Ok(()),
             writable_paths: Ok(()),
+            grants: Ok(()),
             outer_job_ui: Ok(None),
             firewall: Ok(()),
             loopback_exempt: Ok(false),
@@ -397,6 +421,23 @@ mod tests {
     fn default_policy_is_enforceable() {
         assert!(plan(&policy(), &host()).is_enforceable());
         assert!(plan(&with_rule(policy(), PathAccess::Read), &host()).is_enforceable());
+    }
+
+    /// sandy grants access by adding an entry to the access control list of each policy path, so
+    /// a path whose list the user may not change makes the run fail. The plan reports it.
+    #[test]
+    fn a_policy_path_that_cannot_be_granted_refuses() {
+        let host = HostCapabilities {
+            grants: Err(
+                r#"cannot give AppContainer "example.app" access to C:\data: the grant is missing, and the current user may not change the permissions"#
+                    .into(),
+            ),
+            ..host()
+        };
+        let policy = with_rule(policy(), PathAccess::Read);
+        assert!(!plan(&policy, &host).is_enforceable());
+        let reason = unavailable(status(&policy, &host, Requirement::FilesystemConfined));
+        assert!(reason.contains(r"C:\data"), "{reason}");
     }
 
     #[test]

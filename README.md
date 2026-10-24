@@ -293,6 +293,13 @@ after the first argument that is not an option) belongs to the program.
 `sandy check` prints one line per requirement: `enforced` with the mechanism, or `UNAVAILABLE`
 with the reason. Pass the program if the policy should include it.
 
+Settings that give up part of the isolation (`unix_sockets = "all"`, `signals = "any"`,
+`path_metadata = "allow"`, a writable path that holds your home directory), and options that
+replace a stricter value of the policy file, get a `warning:` line on standard error. Warnings do
+not change the exit status, and standard output keeps its one line per requirement, so a caller
+that reads it is not affected. `sandy run` prints no warnings: its standard error belongs to the
+program.
+
 `sandy setup` does the one-time host preparation that needs administrator rights. Today this
 matters only on Windows (see [Windows](#windows)); on Linux and macOS it does nothing.
 
@@ -391,7 +398,9 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
 6. **The environment** contains only `pass` and `set` variables, plus what a platform must add
    for any program to start (on Windows `SystemRoot` and `LOCALAPPDATA`).
 7. **Children inherit the sandbox.** A program that starts other programs needs them in a
-   `read_exec` path; they run with the same restrictions.
+   `read_exec` path; they run with the same restrictions. A script needs its interpreter there
+   too, because the kernel executes the interpreter; `sandy check` reads the `#!` line and says
+   so instead of letting the program fail to start.
 8. **A writable path gives the program your write rights there.** sandy cannot know which of your
    files other programs trust. Never make a directory writable that holds files other programs run
    or read as configuration, such as shell startup files (`~/.bashrc`, `~/.profile`), autostart
@@ -419,6 +428,9 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
 - `forward` entries: on Linux the relay serves only sandy's own user. A connection from another
   local user is closed without reaching the service (docs/linux.md). On macOS it is served, so
   forward only to services that authenticate their clients.
+- A port another process already holds makes `sandy run` refuse with status 125. `sandy check`
+  binds the same listeners for a moment and reports `UNAVAILABLE` for such a port, so it gives
+  the same answer. Between the two the port can change hands, so `run` is the final word.
 
 ### Processes
 
@@ -513,7 +525,7 @@ change the metadata of every file the user owns.
 - sandy uses `sandbox_init_with_parameters`, which Apple does not document. Chromium and WebKit
   use the same function.
 - `system = "none"` cannot start any program on macOS, because every program needs the dynamic
-  loader and the system library cache.
+  loader and the system library cache. sandy refuses it there unless a policy path covers "/".
 - No Mach services are reachable from the sandbox, so programs that need them (for example to open
   other apps, use the pasteboard or read preferences) do not work.
 - Terminal programs that change terminal modes fail; only a few terminal requests are allowed.
@@ -562,7 +574,9 @@ sandy is a command line tool, so any language can use it. Start sandy instead of
 Recommendations:
 
 1. **Call `sandy check` first** and show its output when the exit status is 1, so users learn
-   why the program cannot run on their host.
+   why the program cannot run on their host. Its standard output has one line per requirement;
+   the `warning:` lines on standard error are advice about the policy and do not change the exit
+   status.
 2. **Treat exit status 125 as "not started".** sandy prints the reason on standard error. Two
    exceptions: a program can exit with 125 itself, and with `children = "contained"` sandy can
    fail while it supervises a running program (its message then starts with "run failed").
@@ -615,8 +629,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 The escape tests in `crates/sandy-cli/tests/` run a probe program (`sandy-probe`) inside the
 sandbox. Each test tries an action, first outside the sandbox (it must work there) and then inside
 (it must fail), so a test cannot pass because the action was impossible anyway. Platform tests
-are in `escape_linux.rs`, `escape_macos.rs` and `escape_windows.rs`; the tests from the reviews are
-in `review_*.rs`.
+are in `escape_linux.rs`, `escape_macos.rs` and `escape_windows.rs`; `check.rs` checks that
+`sandy check` reports what `sandy run` refuses, and the tests from the reviews are in
+`review_*.rs`.
 
 To run the tests on another machine, build the test executables, copy them together with `sandy`
 and `sandy-probe` into one directory there, and set `SANDY_TEST_BIN_DIR` to that directory:

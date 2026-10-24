@@ -378,18 +378,22 @@ fn create_job(active_process_limit: Option<u32>) -> Result<OwnedHandle, SandboxE
     )?;
 
     let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
-        UIRestrictionsClass: JOB_OBJECT_UILIMIT_DESKTOP
-            | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
-            | JOB_OBJECT_UILIMIT_EXITWINDOWS
-            | JOB_OBJECT_UILIMIT_GLOBALATOMS
-            | JOB_OBJECT_UILIMIT_HANDLES
-            | JOB_OBJECT_UILIMIT_READCLIPBOARD
-            | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
-            | JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
+        UIRestrictionsClass: UI_RESTRICTIONS,
     };
     set_job_information(&job, JobObjectBasicUIRestrictions, &ui, "UI restrictions")?;
     Ok(job)
 }
+
+/// What the program's job keeps it from reaching outside the sandbox. `host::job_nests` sets the
+/// same restrictions in its trial, because these are what Windows refuses to nest.
+pub const UI_RESTRICTIONS: u32 = JOB_OBJECT_UILIMIT_DESKTOP
+    | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
+    | JOB_OBJECT_UILIMIT_EXITWINDOWS
+    | JOB_OBJECT_UILIMIT_GLOBALATOMS
+    | JOB_OBJECT_UILIMIT_HANDLES
+    | JOB_OBJECT_UILIMIT_READCLIPBOARD
+    | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
+    | JOB_OBJECT_UILIMIT_WRITECLIPBOARD;
 
 fn set_job_information<T>(
     job: &OwnedHandle,

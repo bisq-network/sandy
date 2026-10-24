@@ -23,6 +23,26 @@ pub struct HostCapabilities {
     /// Why the program would run as x86_64 code through Rosetta, if it would. Rosetta cannot load
     /// its runtime inside the sandbox, so such a program never starts.
     pub rosetta: Option<String>,
+    /// Why the kernel could not execute the program, if it could not: it is a script whose
+    /// interpreter no `read_exec` path covers (`executable_paths`).
+    pub interpreter: Option<String>,
+}
+
+/// How many `#!` lines sandy follows when it checks whether the program can be executed. XNU
+/// follows more (measured on macOS 26: a script whose interpreter is a script runs), so this
+/// never names a level the kernel would not reach, and no real program nests more than one.
+pub const SHEBANG_LEVELS: usize = 1;
+
+/// The paths the profile lets the target execute, for `ResolvedPolicy::interpreter_problem`. The
+/// system set grants `file-map-executable` for the dynamic loader but no `process-exec*`, so only
+/// the policy's `read_exec` paths execute.
+pub fn executable_paths(policy: &ResolvedPolicy) -> Vec<std::path::PathBuf> {
+    policy
+        .paths
+        .iter()
+        .filter(|rule| rule.access == PathAccess::ReadExec)
+        .map(|rule| rule.path.clone())
+        .collect()
 }
 
 /// Reports every requirement of `policy` exactly once, as enforced (with its mechanism) or
@@ -45,7 +65,7 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<PlanIte
         )),
         (Ok(()), false, None, Ok(())) => Ok(()),
     };
-    let conflict = system_conflict(policy);
+    let conflict = system_conflict(policy).or_else(|| host.interpreter.clone());
     policy
         .requirements()
         .into_iter()
@@ -70,8 +90,8 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<PlanIte
 /// sandbox, as far as the user may write there. /dev/null is writable in the set itself, and the
 /// entries for /etc, /tmp and /var allow only reading the links.
 fn system_conflict(policy: &ResolvedPolicy) -> Option<String> {
-    if policy.system != SystemAccess::Minimal {
-        return None;
+    if policy.system == SystemAccess::None {
+        return root_directory_missing(policy);
     }
     let entries = system::MINIMAL
         .iter()
@@ -103,6 +123,33 @@ fn system_conflict(policy: &ResolvedPolicy) -> Option<String> {
         }
     }
     None
+}
+
+/// Reports every requirement that the Seatbelt profile enforces as unavailable with `reason`. For
+/// `verify`, which learns in a helper process whether the profile can be applied at all.
+pub fn profile_unavailable(policy: &ResolvedPolicy, reason: &str) -> Vec<PlanItem> {
+    policy
+        .requirements()
+        .into_iter()
+        .filter(|requirement| matches!(mechanism(*requirement, policy), Mechanism::Profile(_)))
+        .map(|requirement| PlanItem::unavailable(requirement, reason))
+        .collect()
+}
+
+/// Why `system = "none"` cannot start a program, unless a policy path covers the root directory.
+/// Every program on macOS is linked dynamically: dyld opens the root directory to locate the
+/// shared cache, and it maps the cache and its own code from /usr/lib. `system = "none"` adds
+/// none of that, and a rule on "/" is the only way a policy can, because dyld needs the root
+/// directory itself. Without this, `check` reported such a policy as enforced and the program
+/// then died at its start.
+fn root_directory_missing(policy: &ResolvedPolicy) -> Option<String> {
+    let covered = policy.paths.iter().any(|rule| rule.path == Path::new("/"));
+    (!covered).then(|| {
+        "system = \"none\" adds none of the paths that every program on macOS needs to start: \
+         dyld opens the root directory to locate the dyld shared cache and maps its own code \
+         from /usr/lib. Use system = \"minimal\", or add a read rule for \"/\""
+            .to_string()
+    })
 }
 
 enum Mechanism {
@@ -244,6 +291,7 @@ mod tests {
             profile: Ok(()),
             already_sandboxed: false,
             rosetta: None,
+            interpreter: None,
         }
     }
 
@@ -293,8 +341,35 @@ mod tests {
         // Not part of the set, or the set itself allows writing.
         assert!(unavailable_with("/Users/someone/data", SystemAccess::Minimal).is_empty());
         assert!(unavailable_with("/dev/null", SystemAccess::Minimal).is_empty());
-        // Without the system set there is nothing to overlap.
-        assert!(unavailable_with("/private/var/db", SystemAccess::None).is_empty());
+        // Without the system set there is nothing to overlap, but then no program starts
+        // (`system_none_needs_the_root_directory`).
+        assert_eq!(
+            unavailable_with("/private/var/db", SystemAccess::None),
+            refused
+        );
+    }
+
+    /// `system = "none"` leaves out what dyld needs, so no program starts with it. A policy that
+    /// reads the root directory brings its own.
+    #[test]
+    fn system_none_needs_the_root_directory() {
+        let plan_of = |root: Option<PathAccess>| {
+            let mut policy = strictest();
+            policy.system = SystemAccess::None;
+            if let Some(access) = root {
+                policy.paths.push(sandy_core::PathRule {
+                    path: "/".into(),
+                    access,
+                    is_dir: true,
+                });
+            }
+            EnforcementPlan::new(&policy.requirements(), plan_for(&policy, &capable()))
+        };
+        let plan = plan_of(None);
+        assert!(!plan.is_enforceable(), "{plan}");
+        assert!(plan.to_string().contains("dyld"), "{plan}");
+        assert!(plan_of(Some(PathAccess::Read)).is_enforceable());
+        assert!(plan_of(Some(PathAccess::ReadExec)).is_enforceable());
     }
 
     #[test]
@@ -337,6 +412,7 @@ mod tests {
             profile: Err("not compiled".into()),
             already_sandboxed: false,
             rosetta: None,
+            interpreter: None,
         };
         let items = plan_for(&policy, &host);
         let plan = EnforcementPlan::new(&policy.requirements(), items.clone());
@@ -361,6 +437,7 @@ mod tests {
             profile: Err("unbound variable: file-test-existence".into()),
             already_sandboxed: false,
             rosetta: None,
+            interpreter: None,
         };
         let items = plan_for(&policy, &host);
         let filesystem = items
@@ -414,6 +491,51 @@ mod tests {
             Status::Unavailable {
                 reason: "the program has no arm64 code".into()
             }
+        );
+    }
+
+    /// XNU executes the interpreter of a script, so a script whose interpreter no `read_exec`
+    /// path covers cannot start. The plan reports it instead of letting the `execve` fail with
+    /// the profile already applied.
+    #[test]
+    fn a_script_without_an_executable_interpreter_refuses() {
+        let policy = strictest();
+        let host = HostCapabilities {
+            interpreter: Some("/tmp/s is a script and the kernel executes its interpreter".into()),
+            ..capable()
+        };
+        let items = plan_for(&policy, &host);
+        let plan = EnforcementPlan::new(&policy.requirements(), items.clone());
+        assert!(!plan.is_enforceable());
+        let filesystem = items
+            .iter()
+            .find(|item| item.requirement == Requirement::FilesystemConfined)
+            .unwrap();
+        assert_eq!(
+            filesystem.status,
+            Status::Unavailable {
+                reason: host.interpreter.clone().unwrap()
+            }
+        );
+    }
+
+    #[test]
+    fn only_read_exec_paths_execute() {
+        let mut policy = strictest();
+        for (path, access) in [
+            ("/bin/tool", PathAccess::ReadExec),
+            ("/data", PathAccess::ReadWrite),
+            ("/etc/app", PathAccess::Read),
+        ] {
+            policy.paths.push(sandy_core::PathRule {
+                path: path.into(),
+                access,
+                is_dir: false,
+            });
+        }
+        assert_eq!(
+            executable_paths(&policy),
+            vec![std::path::PathBuf::from("/bin/tool")]
         );
     }
 

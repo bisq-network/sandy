@@ -31,6 +31,7 @@ pub struct TargetCommand {
 /// Contract:
 /// - `plan` reports every requirement of `policy.requirements()` as enforced (naming the
 ///   mechanism) or unavailable (naming the reason). It must not change any state.
+/// - `verify` adds what `plan` cannot see without touching the host. Only `check` calls it.
 /// - `run` is called only when the plan is fully enforceable. It applies every mechanism the
 ///   plan named. If any step fails, it returns an error and never starts the target with a
 ///   weaker sandbox.
@@ -40,6 +41,15 @@ pub trait Backend {
     fn name(&self) -> &'static str;
 
     fn plan(&self, policy: &ResolvedPolicy) -> Vec<PlanItem>;
+
+    /// Conditions that would make `run` refuse and that `plan` cannot see without touching the
+    /// host, for example a relay port another process holds. `check` adds these reports to the
+    /// plan, where any unavailable report wins; `run` does not call it, because it finds out
+    /// while it applies the sandbox. An implementation must leave the host as it found it, and
+    /// its answer can be stale a moment later, so `run` stays the authoritative answer.
+    fn verify(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
+        crate::verify::relay_listeners(policy)
+    }
 
     fn run(&self, policy: &ResolvedPolicy, command: &TargetCommand) -> Result<i32, SandboxError>;
 

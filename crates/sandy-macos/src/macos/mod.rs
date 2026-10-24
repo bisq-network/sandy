@@ -14,7 +14,7 @@ use std::ffi::CStr;
 use std::io::Read;
 
 use crate::binary;
-use crate::plan::{HostCapabilities, plan_for};
+use crate::plan::{HostCapabilities, SHEBANG_LEVELS, executable_paths, plan_for};
 use crate::profile::{generate, relay_pairs, relay_profile, watcher_profile};
 use seatbelt::Seatbelt;
 
@@ -41,6 +41,14 @@ impl Backend for MacosBackend {
 
     fn plan(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
         plan_for(policy, &detect(policy))
+    }
+
+    fn verify(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
+        let mut items = sandy_core::verify::relay_listeners(policy);
+        if let Err(reason) = applies_in_a_trial(policy) {
+            items.extend(crate::plan::profile_unavailable(policy, &reason));
+        }
+        items
     }
 
     fn run(&self, policy: &ResolvedPolicy, command: &TargetCommand) -> Result<i32, SandboxError> {
@@ -102,9 +110,11 @@ impl Backend for MacosBackend {
 /// or forwarded ports, and the watcher's with `end_with_parent`) without applying them. Neither
 /// step changes the sandbox state of the process.
 fn detect(policy: &ResolvedPolicy) -> HostCapabilities {
+    let interpreter = policy.interpreter_problem(SHEBANG_LEVELS, &executable_paths(policy));
     match Seatbelt::load() {
         Ok(seatbelt) => HostCapabilities {
             seatbelt: Ok(()),
+            interpreter,
             profile: seatbelt
                 .compile(&generate(policy))
                 .and_then(|()| {
@@ -132,8 +142,36 @@ fn detect(policy: &ResolvedPolicy) -> HostCapabilities {
             profile: Err("not compiled".to_string()),
             already_sandboxed: false,
             rosetta: rosetta(policy),
+            interpreter,
         },
     }
+}
+
+/// Applies the program's profile in a helper process, which ends right after. `check` compiles
+/// the profile, but a profile that compiles can still be refused when it is applied, and sandy
+/// must not apply it to itself: `check` has to leave its own process unsandboxed.
+///
+/// The helper only applies the profile and ends. It must not execute anything: only a `read_exec`
+/// path grants `process-exec*`, so the profile would refuse that and the trial would report a
+/// problem the run does not have.
+///
+/// A missing Seatbelt and a sandbox around sandy are reported by the plan, so the trial stays
+/// silent about them.
+fn applies_in_a_trial(policy: &ResolvedPolicy) -> Result<(), String> {
+    let Ok(seatbelt) = Seatbelt::load() else {
+        return Ok(());
+    };
+    if seatbelt.is_sandboxed() {
+        return Ok(());
+    }
+    let profile = generate(policy);
+    helper::start("the trial sandbox", &[], move |ready| {
+        match seatbelt.apply(&profile) {
+            Ok(()) => ready.report(),
+            Err(message) => ready.fail(&message),
+        }
+    })
+    .map_err(|error| error.to_string())
 }
 
 /// Why the program would run as x86_64 code through Rosetta, if it would. Rosetta loads its

@@ -4,6 +4,8 @@
 use std::io;
 use std::ptr;
 
+use sandy_core::{ChildProcesses, ResolvedPolicy};
+
 use crate::filter;
 use crate::system::{self, SystemPath};
 
@@ -26,6 +28,9 @@ pub struct HostCapabilities {
     /// pidfd_open, which the relay uses to watch the program and the guard of
     /// `children = "contained"` uses to watch the program.
     pub pidfd: Support,
+    /// Whether sandy may put a process into a process group, which `children = "contained"`
+    /// needs. Only probed for a policy that needs it (`detect_for`).
+    pub process_group: Support,
     /// The candidates of the minimal system set that exist on this host.
     pub system_paths: Vec<SystemPath>,
     /// Where every candidate of the minimal system set is or would be, also missing ones.
@@ -33,11 +38,13 @@ pub struct HostCapabilities {
 }
 
 impl HostCapabilities {
+    /// What this host offers whatever the policy asks for.
     pub fn detect() -> Self {
         HostCapabilities {
             landlock: landlock_abi(),
             thread_count: thread_count_support(),
             pidfd: pidfd_support(),
+            process_group: Ok(()),
             seccomp: seccomp_support(),
             no_new_privs: no_new_privs_support(),
             unprivileged: unprivileged(),
@@ -45,6 +52,45 @@ impl HostCapabilities {
             system_locations: system::locations(),
         }
     }
+
+    /// `detect` plus the probes that only some policies need. A probe is a system call that an
+    /// outer sandbox can answer with SIGSYS instead of an error, so it runs only for a policy
+    /// whose run would make the call anyway.
+    pub fn detect_for(policy: &ResolvedPolicy) -> Self {
+        let mut host = Self::detect();
+        if policy.children == ChildProcesses::Contained {
+            host.process_group = process_group_support();
+        }
+        host
+    }
+}
+
+/// Whether sandy may put a process into a process group. `children = "contained"` runs the
+/// program in a group of its own, so a sandbox around sandy that denies `setpgid` makes the run
+/// fail; sandy's own filter denies it inside `contained`, so one contained sandbox cannot hold
+/// another.
+fn process_group_support() -> Support {
+    // SAFETY: getsid, getpid and getpgrp have no preconditions.
+    unsafe {
+        // A session leader cannot change its own process group, whatever a filter allows, and
+        // that does not stop `contained`: the group is led by the guard, which is a child of
+        // sandy and no session leader. Without this, sandy started with `setsid` would report a
+        // problem it does not have.
+        if libc::getsid(0) == libc::getpid() {
+            return Ok(());
+        }
+        // Joining the group this process is already in changes nothing.
+        if libc::setpgid(0, libc::getpgrp()) != 0 {
+            return Err(format!(
+                "sandy cannot put a process into a process group, which \
+                 children = \"contained\" needs: {}. A sandbox around sandy denies setpgid; \
+                 sandy's own filter does inside children = \"contained\", so one contained \
+                 sandbox cannot hold another",
+                io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
 }
 
 const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;

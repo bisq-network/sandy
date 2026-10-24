@@ -42,6 +42,16 @@ through Rosetta, or when this macOS rejects the profile (with the compiler's mes
 `plan_for(policy, &HostCapabilities)` contains this decision and is pure; only the detection does
 I/O.
 
+A profile that compiles can still be refused when it is applied, so `check` also applies it. It
+does that in a helper process (`Backend::verify`), because `check` must leave its own process
+unsandboxed: the helper applies the program's profile and ends right after. It executes nothing,
+because only a `read_exec` path grants `process-exec*` and the profile would refuse the exec. If
+the helper cannot apply the profile, every requirement that the profile enforces is reported as
+unavailable with the message the kernel gave. A missing Seatbelt and a sandbox around sandy are
+already in the plan, so the trial stays silent about them. `check` also binds the listeners of
+exposed and forwarded ports for a moment, so a port another process holds is reported instead of
+making `run` fail.
+
 ## Why in-process `sandbox_init_with_parameters` and not `sandbox-exec`
 
 Both use the same compiler and the same kernel policy. `/usr/bin/sandbox-exec -p PROFILE -D
@@ -539,11 +549,19 @@ no privilege, and closing them would break ordinary programs:
   target type commands into the shell that started sandy.
 - `link(2)` fails everywhere (see the hard link rule above).
 - With `system = "none"` no program starts on macOS: every program is linked dynamically, and dyld
-  itself needs the root directory and the shared cache from the system set.
+  itself needs the root directory and the shared cache from the system set. sandy refuses such a
+  policy unless a policy path covers "/", which is the only way a policy can bring those paths
+  itself (measured: `run --system none --read / -- /usr/bin/true` works).
 - A program that needs a framework resource, ICU data, a Mach service or user lookups does not work
   with `system = "minimal"` alone. Add the paths with `--read`; there is no way to allow Mach
   services.
 - A script needs its interpreter in a `read_exec` path, because the interpreter is executed too.
+  `sandy check` reads the `#!` line of the program and reports FilesystemConfined as unavailable
+  when no `read_exec` path covers the interpreter, so it does not report a policy as enforced
+  that `run` then refuses. The system set grants `file-map-executable` for the dynamic loader but
+  no `process-exec*`, so only `read_exec` paths execute. sandy follows one `#!` line; XNU follows
+  more (measured on macOS 26: a script whose interpreter is a script runs), so sandy never names
+  an interpreter the kernel would not reach.
 - A `read_write` path itself cannot be deleted or replaced, and a writable file cannot be replaced
   by renaming another file over it. Programs must write such a file in place.
 - `getcwd` fails when the working directory is outside the policy.
@@ -580,8 +598,12 @@ allowlist, the system set, and the plan with fake host capabilities (missing
 
 macOS only:
 
-- `macos::tests` compiles every combination of `system`, `ip`, `unix_sockets` and `signals` with the
+- `macos::tests` compiles every combination of `system`, `ip`, `unix_sockets` and `signals`, plus
+  the `children` and `end_with_parent` variants and the relay and watcher profiles, with the
   host's Seatbelt compiler, without applying it, and checks that the plan is enforceable.
+- `crates/sandy-cli/tests/check.rs` checks that `check` reports what `run` refuses: a busy relay
+  port, a script whose interpreter is not executable, `system = "none"`, and that the trial that
+  applies the profile does not refuse a policy that runs.
 - `crates/sandy-cli/tests/escape.rs` and `escape_macos.rs` run the probe inside the sandbox, with a
   control run outside for every denial. The `open`, `osascript` and `launchctl` tests need a
   logged-in GUI session.

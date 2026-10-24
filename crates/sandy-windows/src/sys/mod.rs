@@ -48,6 +48,14 @@ impl Backend for WindowsBackend {
         plan_for(policy, &detect(policy))
     }
 
+    fn verify(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
+        let mut items = sandy_core::verify::relay_listeners(policy);
+        if let Err(reason) = host::job_nests() {
+            items.extend(crate::plan::job_unavailable(policy, &reason));
+        }
+        items
+    }
+
     fn run(&self, policy: &ResolvedPolicy, command: &TargetCommand) -> Result<i32, SandboxError> {
         // The caller checked the plan, but the host may have changed since. Every mechanism
         // below is one the plan named.
@@ -237,6 +245,11 @@ fn detect(policy: &ResolvedPolicy) -> HostCapabilities {
         windows: host::windows_version(),
         capability_sids: host::derive_capability_sids().map(|_| ()),
         writable_paths: check_writable_paths(policy),
+        // Only `FilesystemConfined` reads this, and only with an AppContainer name.
+        grants: match policy.windows.appcontainer_name.as_deref() {
+            Some(name) => check_grants(name, policy),
+            None => Ok(()),
+        },
         outer_job_ui: host::outer_job_ui(),
         firewall: network::firewall_running(),
         loopback_exempt: container.and_then(|sid| network::is_loopback_exempt(&sid)),
@@ -347,6 +360,22 @@ fn check_writable_paths(policy: &ResolvedPolicy) -> Result<(), String> {
             ));
         }
         acl::check_writable(rule)?;
+    }
+    Ok(())
+}
+
+/// Whether sandy can give the AppContainer access to every policy path. `run` adds an entry for
+/// the path's capability to the path's access control list, which needs the right to change that
+/// list, and refuses when it cannot. A path whose list is already right needs no change. Changes
+/// nothing.
+fn check_grants(appcontainer: &str, policy: &ResolvedPolicy) -> Result<(), String> {
+    for rule in &policy.paths {
+        acl::grantable(appcontainer, rule).map_err(|reason| {
+            format!(
+                "cannot give AppContainer {appcontainer:?} access to {}: {reason}",
+                rule.path.display()
+            )
+        })?;
     }
     Ok(())
 }

@@ -13,6 +13,10 @@ use sandy_core::{
 const EXIT_FAILURE: u8 = 125;
 const EXIT_NOT_ENFORCEABLE: u8 = 1;
 
+/// Marks the advice `check` writes to standard error. `run` prints none: its standard error
+/// belongs to the program.
+const WARNING_PREFIX: &str = "warning: ";
+
 fn main() -> ExitCode {
     // First, so that the window in which sandy's parent can end unseen stays as short as possible
     // (`process.end_with_parent`).
@@ -188,7 +192,9 @@ fn execute(invocation: Invocation, parent_at_start: Option<u32>) -> Result<ExitC
         }
         None => Policy::default(),
     };
-    invocation.overrides.apply(&mut policy);
+    let weakened = invocation
+        .overrides
+        .apply(&mut policy, invocation.policy_file.is_some());
     let resolved = ResolvedPolicy::resolve(&policy, invocation.program.as_deref())
         .map_err(|error| error.to_string())?;
     // Checked in every mode, so that check reports what run would refuse.
@@ -199,11 +205,23 @@ fn execute(invocation: Invocation, parent_at_start: Option<u32>) -> Result<ExitC
     )?;
     refuse_writable_trusted_files(&resolved, invocation.policy_file.as_deref())?;
     let backend = platform_backend();
-    let plan = EnforcementPlan::new(&resolved.requirements(), backend.plan(&resolved));
+    let mut reported = backend.plan(&resolved);
+    if invocation.mode == Mode::Check {
+        reported.extend(backend.verify(&resolved));
+    }
+    let plan = EnforcementPlan::new(&resolved.requirements(), reported);
 
     match invocation.mode {
         Mode::Check => {
             print!("backend: {}\n{plan}", backend.name());
+            // On standard error and with a prefix of their own, so that a caller which reads the
+            // one line per requirement that check prints keeps working (see README.md).
+            for warning in resolved.warnings(home_directory().as_deref()) {
+                eprintln!("{WARNING_PREFIX}{warning}");
+            }
+            for warning in weakened {
+                eprintln!("{WARNING_PREFIX}{warning}");
+            }
             if plan.is_enforceable() {
                 Ok(ExitCode::SUCCESS)
             } else {
@@ -246,6 +264,15 @@ fn execute(invocation: Invocation, parent_at_start: Option<u32>) -> Result<ExitC
             std::process::exit(code)
         }
     }
+}
+
+/// The user's home directory, for the warning about a writable path that holds it. The variable
+/// that names it differs per platform, so `ResolvedPolicy::warnings` takes it from here. The
+/// canonical form matches the canonical policy paths.
+fn home_directory() -> Option<std::path::PathBuf> {
+    let variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let home = std::env::var_os(variable).filter(|home| !home.is_empty())?;
+    std::path::Path::new(&home).canonicalize().ok()
 }
 
 /// sandy and its policy are trusted: the program must not be able to change them for the next

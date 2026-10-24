@@ -79,7 +79,22 @@ pub struct Overrides {
 }
 
 impl Overrides {
-    pub fn apply(self, policy: &mut Policy) {
+    /// Applies the command line options to `policy`. With `from_file`, `policy` comes from a
+    /// policy file, and the result names every option that replaced a stricter value of that
+    /// file: the option still wins, because the caller is trusted (DESIGN.md, "Threat model"),
+    /// but it widens what the program may do without the file saying so. A policy without a file
+    /// is the options themselves, so there is nothing to report.
+    pub fn apply(self, policy: &mut Policy, from_file: bool) -> Vec<String> {
+        let mut weakened = Vec::new();
+        let mut note = |option: &str, value: &str, setting: &str, before: &str| {
+            if !from_file {
+                return;
+            }
+            weakened.push(format!(
+                "{option} {value} replaces {setting} = {before:?} from the policy file and allows \
+                 more than the file does"
+            ));
+        };
         let filesystem = &mut policy.filesystem;
         filesystem.read.extend(self.read);
         filesystem.read_exec.extend(self.read_exec);
@@ -88,21 +103,45 @@ impl Overrides {
             filesystem.system = system;
         }
         if let Some(ip) = self.ip {
+            if ip == NetworkAccess::All && policy.network.ip == NetworkAccess::None {
+                note("--ip", "all", "ip", "none");
+            }
             policy.network.ip = ip;
         }
         if let Some(unix_sockets) = self.unix_sockets {
+            if unix_sockets == NetworkAccess::All
+                && policy.network.unix_sockets == NetworkAccess::None
+            {
+                note("--unix-sockets", "all", "unix_sockets", "none");
+            }
             policy.network.unix_sockets = unix_sockets;
         }
         if let Some(signals) = self.signals {
+            if signals == SignalScope::Any && policy.process.signals == SignalScope::Isolated {
+                note("--signals", "any", "signals", "isolated");
+            }
             policy.process.signals = signals;
         }
         if let Some(children) = self.children {
+            if strictness(children) < strictness(policy.process.children) {
+                note(
+                    "--children",
+                    children.name(),
+                    "children",
+                    policy.process.children.name(),
+                );
+            }
             policy.process.children = children;
         }
         if self.end_with_parent {
             policy.process.end_with_parent = true;
         }
         if let Some(path_metadata) = self.path_metadata {
+            if path_metadata == PathMetadata::Allow
+                && policy.linux.path_metadata == PathMetadata::Deny
+            {
+                note("--linux-path-metadata", "allow", "path_metadata", "deny");
+            }
             policy.linux.path_metadata = path_metadata;
         }
         policy.environment.pass.extend(self.pass_env);
@@ -112,6 +151,16 @@ impl Overrides {
         if let Some(name) = self.appcontainer {
             policy.windows.appcontainer_name = Some(name);
         }
+        weakened
+    }
+}
+
+/// How strict a `children` value is, higher is stricter. Only the order matters.
+fn strictness(children: ChildProcesses) -> u8 {
+    match children {
+        ChildProcesses::Allowed => 0,
+        ChildProcesses::Contained => 1,
+        ChildProcesses::None => 2,
     }
 }
 
@@ -377,7 +426,7 @@ mod tests {
         ]);
         let mut policy = Policy::default();
         policy.filesystem.read.push("/z".into());
-        invocation.overrides.apply(&mut policy);
+        invocation.overrides.apply(&mut policy, true);
         assert_eq!(
             policy.filesystem.read,
             vec![PathBuf::from("/z"), PathBuf::from("/a")]
@@ -415,7 +464,7 @@ mod tests {
         ] {
             let invocation = invocation(&["check", "--children", value]);
             let mut policy = Policy::default();
-            invocation.overrides.apply(&mut policy);
+            invocation.overrides.apply(&mut policy, true);
             assert_eq!(policy.process.children, expected);
         }
         assert!(parse_strs(&["check", "--children", "some"]).is_err());
