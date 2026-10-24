@@ -73,6 +73,9 @@ impl ProtectedPath {
 /// leaves in one of them runs outside the sandbox as soon as the user types its name. Only the
 /// directories themselves are protected: a writable path below one of them puts nothing on PATH.
 /// Entries that are not absolute name no fixed directory and are left out.
+///
+/// Rule 12 warns about these instead of refusing them (`ResolvedPolicy::path_directory_notes`),
+/// so the backends keep them apart from the locations that are refused.
 pub fn path_directories(path: Option<&std::ffi::OsStr>) -> Vec<ProtectedPath> {
     let Some(path) = path else {
         return Vec::new();
@@ -366,26 +369,67 @@ impl ResolvedPolicy {
         protected: &'protected [ProtectedPath],
         identity: &PathIdentity,
     ) -> Option<(&'policy PathRule, &'protected ProtectedPath)> {
-        let writable = self
-            .paths
-            .iter()
-            .filter(|rule| rule.access == PathAccess::ReadWrite);
-        for rule in writable {
-            for location in protected {
-                let contains = location
-                    .spellings()
-                    .any(|path| identity.within(path, &rule.path));
-                let inside = location.subtree
-                    && location
-                        .spellings()
-                        .any(|path| identity.within(&rule.path, path));
-                if contains || inside {
-                    return Some((rule, location));
-                }
-            }
-        }
-        None
+        self.writable_conflicts(protected, identity).next()
     }
+
+    /// Every writable path that reaches one of `protected`, with the location it reaches, in the
+    /// order of the paths. `writable_conflict` reports the first of them; the warning for the
+    /// PATH directories names them all, so one `check` lists every directory to deal with.
+    fn writable_conflicts<'policy, 'protected>(
+        &'policy self,
+        protected: &'protected [ProtectedPath],
+        identity: &PathIdentity,
+    ) -> impl Iterator<Item = (&'policy PathRule, &'protected ProtectedPath)> {
+        self.paths
+            .iter()
+            .filter(|rule| rule.access == PathAccess::ReadWrite)
+            .flat_map(move |rule| {
+                protected
+                    .iter()
+                    .filter(move |location| reaches(location, &rule.path, identity))
+                    .map(move |location| (rule, location))
+            })
+    }
+
+    /// Warnings for the writable paths that reach a directory on sandy's `PATH`. The escape is
+    /// the one of the other trusted locations, but a writable path that holds such a directory
+    /// is often what the caller means, a package cache whose `bin` directory is on `PATH` for
+    /// example, so rule 12 warns here instead of refusing. `check` prints the warnings; they
+    /// change nothing sandy enforces.
+    ///
+    /// The backends pass the directories, as they do for `writable_conflict`, so a warning and a
+    /// refusal never disagree about what reaches what. A host whose comparison cannot be read
+    /// gets no warning: its policy is refused anyway, for the same reason.
+    pub fn path_directory_notes(&self, directories: &[ProtectedPath]) -> Vec<String> {
+        let Ok(identity) = PathIdentity::read() else {
+            return Vec::new();
+        };
+        self.writable_conflicts(directories, &identity)
+            .map(|(rule, directory)| {
+                format!(
+                    "the writable path {} overlaps {}, a directory on sandy's PATH, so a file \
+                     the program leaves there runs outside the sandbox when the user next types \
+                     its name; grant the subdirectories the program needs instead, or start \
+                     sandy with a PATH that does not reach into the writable path",
+                    rule.path.display(),
+                    directory.path.display()
+                )
+            })
+            .collect()
+    }
+}
+
+/// Whether the writable path `writable` reaches `location`: it contains the location, or it lies
+/// inside one that protects its tree.
+fn reaches(location: &ProtectedPath, writable: &Path, identity: &PathIdentity) -> bool {
+    let contains = location
+        .spellings()
+        .any(|path| identity.within(path, writable));
+    let inside = location.subtree
+        && location
+            .spellings()
+            .any(|path| identity.within(writable, path));
+    contains || inside
 }
 
 /// How this host compares two paths: by the file they lead to, not by how they are spelled. The
@@ -1944,5 +1988,37 @@ mod tests {
             conflict(&data, &[ProtectedPath::tree(&home)]),
             Some((data.clone(), home.clone()))
         );
+    }
+
+    /// A writable path that holds a directory on PATH is warned about, not refused (rule 12),
+    /// and every such directory is named, so one run lists them all.
+    #[test]
+    fn every_directory_on_path_inside_a_writable_path_is_named() {
+        let dir = temp_dir();
+        let tools = dir.join("tools");
+        let directories = [
+            ProtectedPath::entry(tools.join("bin")),
+            ProtectedPath::entry(tools.join("sbin")),
+            ProtectedPath::entry(dir.join("beside")),
+        ];
+        fs::create_dir_all(tools.join("bin/sub")).unwrap();
+        let notes = |writable: &Path| {
+            let policy = policy_with(&[], &[], &[writable]);
+            let resolved = ResolvedPolicy::resolve(&policy, None).unwrap();
+            resolved.path_directory_notes(&directories)
+        };
+
+        let warned = notes(&tools);
+        assert_eq!(warned.len(), 2, "{warned:?}");
+        for (note, directory) in warned.iter().zip(["bin", "sbin"]) {
+            assert!(note.contains("types its name"), "{note}");
+            assert!(
+                note.contains(&tools.join(directory).display().to_string()),
+                "{note}"
+            );
+        }
+        // A directory on PATH that the writable path does not hold says nothing, and neither
+        // does a writable path below one of them: it puts nothing on PATH.
+        assert!(notes(&tools.join("bin/sub")).is_empty());
     }
 }

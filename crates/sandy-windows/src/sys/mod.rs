@@ -58,6 +58,12 @@ impl Backend for WindowsBackend {
         items
     }
 
+    /// What makes the program behave differently inside the sandbox than outside, beyond the
+    /// requirements: a directory on sandy's PATH inside a writable path (rule 12).
+    fn notes(&self, policy: &ResolvedPolicy) -> Vec<String> {
+        policy.path_directory_notes(&path_locations())
+    }
+
     fn run(&self, policy: &ResolvedPolicy, command: &TargetCommand) -> Result<i32, SandboxError> {
         // The caller checked the plan, but the host may have changed since. Every mechanism
         // below is one the plan named.
@@ -401,15 +407,15 @@ fn held_sids(policy: &ResolvedPolicy, container: &Sid) -> Result<Vec<Sid>, Sandb
 
 /// Locations of this user that programs outside the sandbox read or execute later: the folders
 /// Windows runs programs from at logon, the PowerShell profile folders, the app execution
-/// aliases, the SSH configuration, and every directory on sandy's PATH. A writable path that
-/// reaches one of them lets the program leave a file there that runs outside the sandbox at the
-/// next logon or the next command, and a file the program creates keeps the user's own rights
-/// on it, including the right to execute it (see "Trusted user locations" in docs/windows.md).
+/// aliases and the SSH configuration. A writable path that reaches one of them lets the program
+/// leave a file there that runs outside the sandbox at the next logon, and a file the program
+/// creates keeps the user's own rights on it, including the right to execute it (see "Trusted
+/// user locations" in docs/windows.md). Such a path is refused; the directories on sandy's PATH
+/// only warn (`path_locations`).
 ///
 /// The list is a heuristic and can never be complete: no list knows which files the programs of
-/// this user trust. The user profile and the PATH directories are protected only against a
-/// writable path that contains them, so an ordinary writable folder below the profile, or below
-/// a directory on PATH, keeps working.
+/// this user trust. The user profile is protected only against a writable path that contains it,
+/// so an ordinary writable folder below the profile keeps working.
 fn trusted_locations() -> Result<Vec<ProtectedPath>, SandboxError> {
     let folder = |id, error| -> Result<std::path::PathBuf, SandboxError> {
         Ok(std::path::PathBuf::from(OsString::from_wide(
@@ -439,8 +445,15 @@ fn trusted_locations() -> Result<Vec<ProtectedPath>, SandboxError> {
         // makes it dangerous.
         locations.push(ProtectedPath::entry(profile));
     }
-    locations.extend(path_directories(std::env::var_os("PATH").as_deref()));
     Ok(locations)
+}
+
+/// The directories on sandy's PATH, which only warn. A program the sandboxed one leaves in one
+/// of them runs outside the sandbox when the user next types its name, but a writable path that
+/// holds such a directory is ordinary work, a package cache whose `bin` folder is on PATH for
+/// example, so refusing it would turn away the common case (rule 12).
+fn path_locations() -> Vec<ProtectedPath> {
+    path_directories(std::env::var_os("PATH").as_deref())
 }
 
 /// The profile folder of this user, from the known folder and from USERPROFILE. The known

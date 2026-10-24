@@ -1,8 +1,10 @@
 //! Locations of this user that programs outside the sandbox read or execute later: the launch
-//! agents launchd starts at login, the shell startup files, the SSH and GnuPG configuration, and
-//! the directories on sandy's PATH. A file the program leaves in one of them runs outside the
-//! sandbox at the next login, the next shell or the next command, so a writable path that reaches
-//! one is refused (`plan::trust_conflict`).
+//! agents launchd starts at login, the shell startup files, and the SSH and GnuPG configuration.
+//! A file the program leaves in one of them runs outside the sandbox at the next login or the
+//! next shell, so a writable path that reaches one is refused (`plan::trust_conflict`).
+//!
+//! The directories on sandy's PATH are the same kind of location, but rule 12 warns about them
+//! instead of refusing them (`path_locations`, `plan::notes`).
 //!
 //! A Seatbelt profile could deny these paths inside a writable path instead, because a later deny
 //! rule overrides an earlier allow (`profile`). sandy refuses instead, so that one policy means
@@ -12,8 +14,8 @@
 //! The list is a heuristic and can never be complete: no list knows which files the programs of
 //! this user trust. It names the locations of the usual shell and desktop setups.
 //!
-//! Only the lookup of the home directory is specific to macOS. The rest is pure, so the planner
-//! stays testable on every platform; off macOS the set holds the PATH directories alone.
+//! Only the lookup of the home directory in the password database is specific to macOS. The
+//! rest is pure, so the planner stays testable on every platform.
 
 use std::path::PathBuf;
 
@@ -37,7 +39,8 @@ const STARTUP_FILES: &[&str] = &[
 /// `LocalCommand`, `authorized_keys`) and the GnuPG configuration (`pinentry-program`).
 const HOME_TREES: &[&str] = &["Library/LaunchAgents", ".ssh", ".gnupg"];
 
-/// Where the files are that other programs of this user read or execute.
+/// Where the files are that other programs of this user read or execute. A writable path that
+/// reaches one of them is refused.
 pub fn locations() -> Vec<ProtectedPath> {
     let mut locations = Vec::new();
     for home in home_directories() {
@@ -56,8 +59,15 @@ pub fn locations() -> Vec<ProtectedPath> {
         // refused: the usual policies make a directory below it writable, which stays allowed.
         locations.push(ProtectedPath::entry(home));
     }
-    locations.extend(path_directories(std::env::var_os("PATH").as_deref()));
     locations
+}
+
+/// The directories on sandy's PATH, which only warn. A program the sandboxed one leaves in one
+/// of them runs outside the sandbox when the user next types its name, but a writable path that
+/// holds such a directory is ordinary work, a package cache whose `bin` directory is on PATH for
+/// example, so refusing it would turn away the common case (rule 12).
+pub fn path_locations() -> Vec<ProtectedPath> {
+    path_directories(std::env::var_os("PATH").as_deref())
 }
 
 /// The home directory of this user, from the password database and from HOME. The password
@@ -125,18 +135,24 @@ fn passwd_home() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    /// The directories of PATH are in the set (`sandy_core::path_directories` checks how they
-    /// are read).
+    /// The directories of PATH are in the set that warns and in no other
+    /// (`sandy_core::path_directories` checks how they are read).
     #[test]
-    fn the_locations_cover_the_directories_on_path() {
+    fn the_directories_on_path_are_only_warned_about() {
         let Some(path) = std::env::var_os("PATH") else {
             return;
         };
-        let locations = locations();
+        let refused = locations();
+        let warned = path_locations();
         for directory in std::env::split_paths(&path).filter(|entry| entry.is_absolute()) {
             assert!(
-                locations.iter().any(|entry| entry.path == directory),
-                "{} is not protected",
+                warned.iter().any(|entry| entry.path == directory),
+                "{} is not warned about",
+                directory.display()
+            );
+            assert!(
+                !refused.iter().any(|entry| entry.path == directory),
+                "{} is refused",
                 directory.display()
             );
         }

@@ -282,7 +282,7 @@ does. A deny entry
 for the package SID would not help, because the AppContainer access check ignores it
 (`acl::check_writable`), and rewriting the user's own DACLs is not something sandy does.
 
-The list is in `sys::trusted_locations`:
+The locations that are refused are in `sys::trusted_locations`:
 
 | Location | Protected | Why |
 |---|---|---|
@@ -291,12 +291,21 @@ The list is in `sys::trusted_locations`:
 | `Documents\WindowsPowerShell`, `Documents\PowerShell` | the tree | the profile scripts of PowerShell 5 and PowerShell 7 |
 | `%LOCALAPPDATA%\Microsoft\WindowsApps` | the tree | the app execution aliases, which the default `PATH` holds |
 | `<profile>\.ssh` | the tree | `ProxyCommand` and `LocalCommand` in the configuration run programs |
-| every absolute directory on sandy's `PATH` | itself | a program left there runs when the user types its name; a folder below one of them is on no `PATH` and stays allowed |
 
 The profile folder comes from the known folder and from `USERPROFILE`, because a service that
 starts sandy with a minimal environment sets no variable. A location that does not exist counts,
 because the program could create it. Paths are compared as everywhere else on Windows, by their
 spelling (see "Links and identity").
+
+Every absolute directory on sandy's `PATH` (`sys::path_locations`) is such a location too: a
+program left there runs when the user types its name. A writable path that holds one is ordinary
+work, a package cache whose `bin` folder is on `PATH` for example, so sandy enforces the policy
+and warns instead of refusing it. `sandy check` exits 0 and prints a `warning:` line on standard
+error that names the writable path and the folder; the answers are to make only the subfolders
+the program needs writable, or to start sandy with a `PATH` that does not reach into the
+writable path. A folder below one of them is on no `PATH` and says nothing. A writable path that
+reaches a refused location as well stays refused, `%LOCALAPPDATA%\Microsoft\WindowsApps` for
+example, which the default `PATH` holds: the warning never replaces a refusal.
 
 The list is a heuristic and can never be complete: no list knows which files the programs of
 this user trust. Among the things it does not cover are the registry autostart keys, which the

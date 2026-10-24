@@ -44,6 +44,10 @@ impl Backend for MacosBackend {
         plan_for(policy, &detect(policy))
     }
 
+    fn notes(&self, policy: &ResolvedPolicy) -> Vec<String> {
+        crate::plan::notes(policy)
+    }
+
     fn verify(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
         let mut items = sandy_core::verify::relay_listeners(policy);
         if let Err(reason) = applies_in_a_trial(policy) {

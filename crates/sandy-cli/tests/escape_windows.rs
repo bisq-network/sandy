@@ -1777,17 +1777,54 @@ fn refuses_a_writable_path_over_the_startup_folder() {
 }
 
 /// A directory on PATH inside a writable path lets the program leave a command there that the
-/// user runs outside the sandbox by name. The same writable path without that PATH entry stays
-/// allowed, and so does a writable path below the user profile.
+/// user runs outside the sandbox by name. Such a policy is ordinary work, so sandy enforces it
+/// and warns, naming the folder (README rule 8). The same writable path without that PATH entry
+/// says nothing, and a writable folder below the user profile stays allowed.
 #[test]
-fn refuses_a_writable_path_that_holds_a_directory_on_path() {
+fn warns_about_a_writable_path_that_holds_a_directory_on_path() {
     let fixture = Fixture::new_in(&user_profile(), "trusted-path");
     fs::create_dir_all(fixture.path("rw/bin")).unwrap();
     let writable = fixture.arg("rw");
 
-    let refused = check_with_path(
+    let warned = check_with_path(
         &format!("{};C:\\Windows\\system32", fixture.arg("rw/bin")),
         &writable,
+    );
+    let report = String::from_utf8_lossy(&warned.stdout);
+    let warnings = String::from_utf8_lossy(&warned.stderr);
+    assert_eq!(warned.status.code(), Some(0), "{report}{warnings}");
+    let names_it =
+        |line: &str| line.starts_with("warning: ") && line.contains(&fixture.arg("rw/bin"));
+    assert!(warnings.lines().any(names_it), "{warnings}");
+
+    let quiet = check_with_path("C:\\Windows\\system32", &writable);
+    let warnings = String::from_utf8_lossy(&quiet.stderr);
+    assert_eq!(
+        quiet.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&quiet.stdout)
+    );
+    assert!(!warnings.contains(&fixture.arg("rw/bin")), "{warnings}");
+}
+
+/// A writable path that holds a directory on PATH and a trusted location stays refused: the
+/// warning never replaces the refusal. The folder on PATH does not have to exist, so this only
+/// reads state, as the test above.
+#[test]
+fn refuses_a_writable_path_that_holds_a_directory_on_path_and_the_startup_folder() {
+    let startup =
+        user_profile().join("AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup");
+    if !startup.exists() {
+        return skip(
+            "startup-folder",
+            "this account has no Startup folder below its profile",
+        );
+    }
+    let on_path = format!("{}\\bin", startup.display());
+    let refused = check_with_path(
+        &format!("{on_path};C:\\Windows\\system32"),
+        startup.to_str().unwrap(),
     );
     let report = String::from_utf8_lossy(&refused.stdout);
     assert_eq!(
@@ -1796,12 +1833,8 @@ fn refuses_a_writable_path_that_holds_a_directory_on_path() {
         "{report}"
     );
     assert!(report.contains("runs outside the sandbox"), "{report}");
-
-    let allowed = check_with_path("C:\\Windows\\system32", &writable);
-    assert_eq!(
-        allowed.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&allowed.stdout)
-    );
+    // The folder on PATH is warned about as well, so the refusal did win over a warning.
+    let warnings = String::from_utf8_lossy(&refused.stderr);
+    let names_it = |line: &str| line.starts_with("warning: ") && line.contains(&on_path);
+    assert!(warnings.lines().any(names_it), "{warnings}");
 }

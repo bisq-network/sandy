@@ -311,7 +311,8 @@ their arguments and environment.
 ## Trusted user locations
 
 Rule 12 of [DESIGN.md](DESIGN.md): a writable policy path may not reach a location of this user
-that other programs read or execute later. The list is in `trust::locations`:
+that other programs read or execute later. The locations that are refused are in
+`trust::locations`:
 
 | Location | Protected | Why |
 |---|---|---|
@@ -320,12 +321,21 @@ that other programs read or execute later. The list is in `trust::locations`:
 | `.zshenv`, `.zprofile`, `.zshrc`, `.zlogin`, `.zlogout`, `.bashrc`, `.bash_profile`, `.profile` | the file | zsh is the login shell of macOS, and bash is installed |
 | `.ssh` | the tree | `ProxyCommand` and `LocalCommand` in the configuration run programs, and `authorized_keys` admits logins |
 | `.gnupg` | the tree | `pinentry-program` names a program that gpg runs |
-| every absolute directory on sandy's `PATH` | itself | a program left there runs when the user types its name; a directory below one of them is on no `PATH` and stays allowed |
 
 The home directory comes from the password database (`getpwuid_r`) and from `HOME`, because a
 program that starts sandy with a minimal environment sets no `HOME`; when neither names one,
-only the `PATH` directories are checked. A location that does not exist counts, because the
+none of these locations is checked. A location that does not exist counts, because the
 program could create it, and each counts where it lies and where its symbolic links lead.
+
+Every absolute directory on sandy's `PATH` (`trust::path_locations`) is such a location too: a
+program left there runs when the user types its name. A writable path that holds one is ordinary
+work, `--read-write ~/.cargo` with `~/.cargo/bin` on `PATH` or `--read-write /usr/local`, so
+sandy enforces the policy and warns instead of refusing it. `sandy check` exits 0 and prints a
+`warning:` line on standard error that names the writable path and the directory
+(`plan::notes`); the answers are to make only the subdirectories the program needs writable, or
+to start sandy with a `PATH` that does not reach into the writable path. A directory below one
+of them is on no `PATH` and says nothing. A writable path that reaches a refused location as
+well stays refused: the warning never replaces a refusal.
 
 The profile could deny these paths inside a writable path instead of refusing the policy,
 because a later deny rule overrides an earlier allow. sandy refuses, so that one policy means

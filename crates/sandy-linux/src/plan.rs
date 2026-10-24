@@ -117,13 +117,15 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
 }
 
 /// What makes the program behave differently inside the sandbox than outside, beyond the
-/// requirements: an OpenSSL include the policy does not cover, and a cgroup limit the program
-/// cannot see. `sandy check` prints these as warnings; they change nothing sandy enforces, and a
-/// program that uses neither TLS nor the limits runs as it is.
+/// requirements: a directory on sandy's PATH inside a writable path, an OpenSSL include the
+/// policy does not cover, and a cgroup limit the program cannot see. `sandy check` prints these
+/// as warnings; they change nothing sandy enforces, and a program that uses neither TLS nor the
+/// limits runs as it is.
 pub fn notes(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
+    let mut notes = policy.path_directory_notes(&host.path_locations);
     let Ok(&version) = host.landlock.as_ref() else {
         // Without Landlock the policy is refused anyway, and there are no rules to compare with.
-        return Vec::new();
+        return notes;
     };
     let loader = program_loader(policy);
     let rules = landlock_config(
@@ -139,20 +141,21 @@ pub fn notes(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
         };
         rules.iter().any(covers)
     };
-    let mut notes: Vec<String> = openssl::missing_includes(&system::openssl_configs(), &readable)
-        .into_iter()
-        .map(|missing| {
-            format!(
-                "the OpenSSL configuration {} includes {}, which this policy does not let the \
-                 program read: OpenSSL drops an include it cannot read without an error and then \
-                 runs with weaker built-in defaults, for example other TLS cipher suites. Add \
-                 --read {} unless the program needs no cryptography",
-                missing.config.display(),
-                missing.target.display(),
-                missing.target.display()
-            )
-        })
-        .collect();
+    notes.extend(
+        openssl::missing_includes(&system::openssl_configs(), &readable)
+            .into_iter()
+            .map(|missing| {
+                format!(
+                    "the OpenSSL configuration {} includes {}, which this policy does not let \
+                     the program read: OpenSSL drops an include it cannot read without an error \
+                     and then runs with weaker built-in defaults, for example other TLS cipher \
+                     suites. Add --read {} unless the program needs no cryptography",
+                    missing.config.display(),
+                    missing.target.display(),
+                    missing.target.display()
+                )
+            }),
+    );
     let sees_own_cgroup =
         readable(Path::new("/proc/self/cgroup")) && readable(Path::new("/sys/fs/cgroup"));
     if !sees_own_cgroup {
@@ -591,6 +594,7 @@ mod tests {
             system_locations: [existing.clone(), vec![missing]].concat(),
             system_paths: existing,
             trusted_locations: vec![sandy_core::ProtectedPath::entry("/home/someone")],
+            path_locations: vec![sandy_core::ProtectedPath::entry("/data/bin")],
         }
     }
 
@@ -1053,6 +1057,28 @@ mod tests {
         assert!(refused("/home", SystemAccess::Minimal));
         assert!(refused("/home", SystemAccess::None));
         assert!(!refused("/home/someone/data", SystemAccess::Minimal));
+    }
+
+    /// A writable path that holds a directory on PATH is enforced and warned about (rule 12),
+    /// and a writable path that holds a refused location as well stays refused: the warning
+    /// never replaces the refusal. `/data` of the test policy holds `/data/bin` of the host.
+    #[test]
+    fn a_writable_path_over_a_directory_on_path_is_warned_about() {
+        let host = host(Some(9));
+        let plan = plan_for(&policy(), &host);
+        assert_eq!(unavailable(&plan), vec![]);
+        let notes = notes(&policy(), &host);
+        assert!(
+            notes.iter().any(|note| note.contains("/data/bin")),
+            "{notes:?}"
+        );
+
+        let mut policy = policy();
+        policy
+            .paths
+            .push(rule("/home", PathAccess::ReadWrite, true));
+        let plan = plan_for(&policy, &host);
+        assert_eq!(unavailable(&plan), vec![Requirement::FilesystemConfined]);
     }
 
     #[test]

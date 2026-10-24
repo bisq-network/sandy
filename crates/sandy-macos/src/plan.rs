@@ -150,6 +150,13 @@ fn trust_conflict(policy: &ResolvedPolicy, trusted: &[ProtectedPath]) -> Option<
     ))
 }
 
+/// What makes the program behave differently inside the sandbox than outside, beyond the
+/// requirements: a directory on sandy's PATH inside a writable path (rule 12). `sandy check`
+/// prints these as warnings; they change nothing sandy enforces.
+pub fn notes(policy: &ResolvedPolicy) -> Vec<String> {
+    policy.path_directory_notes(&trust::path_locations())
+}
+
 /// Reports every requirement that the Seatbelt profile enforces as unavailable with `reason`. For
 /// `verify`, which learns in a helper process whether the profile can be applied at all.
 pub fn profile_unavailable(policy: &ResolvedPolicy, reason: &str) -> Vec<PlanItem> {

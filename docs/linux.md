@@ -653,7 +653,8 @@ Java, Node.js) still start.
 Rule 12 of [DESIGN.md](DESIGN.md): a writable policy path may not reach a location of this user
 that other programs read or execute later. Landlock rules are allow-only and apply to a whole
 tree, so a writable home directory cannot leave out the shell startup file in it; refusing the
-policy is the only way to keep what it promises. The list is in `trust::locations`:
+policy is the only way to keep what it promises. The locations that are refused are in
+`trust::locations`:
 
 | Location | Protected | Why |
 |---|---|---|
@@ -667,14 +668,23 @@ policy is the only way to keep what it promises. The list is in `trust::location
 | `<config>/environment.d` | the tree | variables for every program of the session |
 | `<config>/fish` | the tree | the startup files of the fish shell |
 | `<data>/applications` | the tree | desktop entries that say which program opens a file |
-| every absolute directory on sandy's `PATH` | itself | a program left there runs when the user types its name; a directory below one of them is on no `PATH` and stays allowed |
 
 `<config>` is `XDG_CONFIG_HOME` and `~/.config`, `<data>` is `XDG_DATA_HOME` and
 `~/.local/share`; both spellings count, because the variables are not set for every program that
 starts sandy. The home directory comes from the password database (`getpwuid_r`) and from
-`HOME`, for the same reason; when neither names one, only the `PATH` directories are checked. A
+`HOME`, for the same reason; when neither names one, none of these locations is checked. A
 location that does not exist counts, because the program could create it, and each counts where
 it lies and where its symbolic links lead.
+
+Every absolute directory on sandy's `PATH` (`trust::path_locations`) is such a location too: a
+program left there runs when the user types its name. A writable path that holds one is ordinary
+work, `--read-write ~/.cargo` with `~/.cargo/bin` on `PATH` or `--read-write /usr/local`, so
+sandy enforces the policy and warns instead of refusing it. `sandy check` exits 0 and prints a
+`warning:` line on standard error that names the writable path and the directory
+(`plan::notes`); the answers are to make only the subdirectories the program needs writable, or
+to start sandy with a `PATH` that does not reach into the writable path. A directory below one
+of them is on no `PATH` and says nothing. A writable path that reaches a refused location as
+well stays refused: the warning never replaces a refusal.
 
 The list is a heuristic and can never be complete: no list knows which files the programs of
 this user trust. It also does not see a hard link that already gives one of these files a second
@@ -739,7 +749,8 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   bind alias of a directory of the set is refused like the directory itself; sandy refuses the
   policy when it cannot read the mount table.
 - A writable policy path that overlaps a trusted user location, whatever the system access:
-  FilesystemConfined is unavailable. The locations are in "Trusted user locations" above.
+  FilesystemConfined is unavailable. The locations are in "Trusted user locations" above; a
+  directory on `PATH` warns there instead.
 - `children = "contained"` while sandy itself runs in a sandbox that denies `setpgid`:
   ChildProcessesContained is unavailable. The program runs in a process group of its own, and
   sandy's own filter denies `setpgid` inside `contained`, so one contained sandbox cannot hold

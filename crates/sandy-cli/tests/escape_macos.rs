@@ -1301,15 +1301,45 @@ fn refuses_a_writable_path_over_the_home_directory() {
 }
 
 /// A directory on PATH inside a writable path lets the program leave a command there that the
-/// user runs outside the sandbox by name. The same writable path without that PATH entry stays
-/// allowed.
+/// user runs outside the sandbox by name. Such a policy is ordinary work, so sandy enforces it
+/// and warns, naming the directory (README rule 8). The same writable path without that PATH
+/// entry says nothing.
 #[test]
-fn refuses_a_writable_path_that_holds_a_directory_on_path() {
+fn warns_about_a_writable_path_that_holds_a_directory_on_path() {
     let fixture = home_fixture("trusted-path");
     fs::create_dir_all(fixture.path("rw/bin")).unwrap();
     let check = |path: &str| check_with_environment(&fixture.arg("home"), path, &fixture.arg("rw"));
 
-    let refused = check(&format!("{}:/usr/bin", fixture.arg("rw/bin")));
+    let warned = check(&format!("{}:/usr/bin", fixture.arg("rw/bin")));
+    let report = String::from_utf8_lossy(&warned.stdout);
+    let warnings = String::from_utf8_lossy(&warned.stderr);
+    assert_eq!(warned.status.code(), Some(0), "{report}{warnings}");
+    let names_it =
+        |line: &str| line.starts_with("warning: ") && line.contains(&fixture.arg("rw/bin"));
+    assert!(warnings.lines().any(names_it), "{warnings}");
+
+    let quiet = check("/usr/bin");
+    let warnings = String::from_utf8_lossy(&quiet.stderr);
+    assert_eq!(
+        quiet.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&quiet.stdout)
+    );
+    assert!(!warnings.contains(&fixture.arg("rw/bin")), "{warnings}");
+}
+
+/// A writable path that holds a directory on PATH and a location that is refused stays refused:
+/// the warning never replaces the refusal.
+#[test]
+fn refuses_a_writable_path_that_holds_a_directory_on_path_and_a_launch_agent_folder() {
+    let fixture = home_fixture("trusted-both");
+    fs::create_dir_all(fixture.path("home/bin")).unwrap();
+    let refused = check_with_environment(
+        &fixture.arg("home"),
+        &format!("{}:/usr/bin", fixture.arg("home/bin")),
+        &fixture.arg("home"),
+    );
     let report = String::from_utf8_lossy(&refused.stdout);
     assert_eq!(
         refused.status.code(),
@@ -1317,12 +1347,9 @@ fn refuses_a_writable_path_that_holds_a_directory_on_path() {
         "{report}"
     );
     assert!(report.contains("runs outside the sandbox"), "{report}");
-
-    let allowed = check("/usr/bin");
-    assert_eq!(
-        allowed.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&allowed.stdout)
-    );
+    // The directory on PATH is warned about as well, so the refusal did win over a warning.
+    let warnings = String::from_utf8_lossy(&refused.stderr);
+    let names_it =
+        |line: &str| line.starts_with("warning: ") && line.contains(&fixture.arg("home/bin"));
+    assert!(warnings.lines().any(names_it), "{warnings}");
 }

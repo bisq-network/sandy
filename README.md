@@ -298,8 +298,9 @@ with the reason. Pass the program if the policy should include it.
 Settings that give up part of the isolation (`unix_sockets = "all"`, `signals = "any"`,
 `path_metadata = "allow"`, a writable path that holds your home directory), options that replace
 a stricter value of the policy file, and facts about the host that make the program behave
-differently inside the sandbox (on Linux an OpenSSL include the policy does not cover, or a
-cgroup limit the program cannot see), get a `warning:` line on standard error. Warnings do not
+differently inside the sandbox (a directory on your `PATH` inside a writable path, on Linux an
+OpenSSL include the policy does not cover or a cgroup limit the program cannot see), get a
+`warning:` line on standard error. Warnings do not
 change the exit status, and standard output keeps its one line per requirement, so a caller that
 reads it is not affected. `sandy run` prints no warnings: its standard error belongs to the
 program.
@@ -415,10 +416,16 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
    write rights there, and a file it leaves behind runs with your rights, outside the sandbox.
    sandy refuses a writable path that reaches a location whose content another program reads or
    runs later: your home directory, the shell startup files (`~/.bashrc`, `~/.profile`),
-   autostart entries and user services, `~/.ssh`, and the directories on your `PATH`; on macOS
-   also `~/Library/LaunchAgents`, on Windows the Startup folders, the PowerShell profile folders
-   and `WindowsApps`. Each platform documents its list. A directory below your home directory,
-   or below a directory on `PATH`, stays writable.
+   autostart entries and user services, `~/.ssh`; on macOS also `~/Library/LaunchAgents`, on
+   Windows the Startup folders, the PowerShell profile folders and `WindowsApps`. Each platform
+   documents its list. A directory below your home directory stays writable.
+
+   A directory on your `PATH` gets a warning instead, naming it, because a writable path that
+   holds one is often what you mean: `--read-write ~/.cargo` with `~/.cargo/bin` on `PATH`, or
+   `--read-write /usr/local`. The escape is real, a file the program leaves there runs when you
+   next type its name, so make only the subdirectories the program needs writable, or start
+   sandy with a `PATH` that does not reach into the writable path. A directory below a directory
+   on `PATH` is on no `PATH` and says nothing.
 
    sandy cannot know which of your files other programs trust, so the list is a heuristic and
    can never be complete. Keep the writable paths of a policy as narrow as the program needs,

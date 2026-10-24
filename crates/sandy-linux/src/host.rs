@@ -38,6 +38,8 @@ pub struct HostCapabilities {
     pub system_locations: Vec<SystemPath>,
     /// The locations of this user that programs outside the sandbox read or execute later.
     pub trusted_locations: Vec<ProtectedPath>,
+    /// The directories on sandy's PATH, which only warn (rule 12).
+    pub path_locations: Vec<ProtectedPath>,
 }
 
 impl HostCapabilities {
@@ -54,6 +56,7 @@ impl HostCapabilities {
             system_paths: system::detect(),
             system_locations: system::locations(),
             trusted_locations: trust::locations(),
+            path_locations: trust::path_locations(),
         }
     }
 
