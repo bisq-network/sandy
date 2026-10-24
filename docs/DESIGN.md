@@ -64,9 +64,12 @@ appcontainer_name = "example.app"  # required on Windows
 ```
 
 Command line options extend the policy file (`sandy --help`): path options add paths, and every
-other option replaces the file's value, also with a weaker one. The caller is trusted. sandy
-refuses to run when its own executable or the policy file lies inside a writable path, because
-the program could change them for the next start.
+other option replaces the file's value, also with a weaker one. The caller is trusted. sandy's
+own executable and the policy file get the checks of rules 3 and 4: sandy refuses to start when
+a writable path contains one of them, reaches one through a link or an alias, or holds a second
+name of one, because the program could then change what the next start runs or reads. The name
+sandy was started under counts next to the file it leads to, because that name can be a link
+inside a writable path.
 
 Rules:
 
@@ -75,14 +78,16 @@ Rules:
 2. A rule applies to the path and everything beneath it.
 3. No path may be both writable and executable, also not through nesting. sandy rejects such a
    policy. The program could otherwise drop an executable that a process outside the sandbox
-   later runs.
+   later runs. The rule holds per file, not per name: a file that has a second name inside a
+   writable path is writable, so an executable path, or the program file, that leads to the same
+   file is refused as well (see "Links and file identity").
 4. No policy path may lie inside a writable path, and none may be resolved through an entry
    inside one, such as a symbolic link in a writable directory that points elsewhere. sandy
    resolves symbolic links at every start, so the program could replace such an entry with a
    link and widen its access at the next start. For the same reason the integrator must keep the
-   parent directories of policy paths out of the program's reach. Rules 3 and 4 compare file
-   identity (device and inode) as well as paths on Linux and macOS, so one directory reachable
-   under two paths, for example through a bind mount, counts as one.
+   parent directories of policy paths out of the program's reach. Rules 3 and 4 compare files,
+   not only paths, so one directory reachable under two paths counts as one (see "Links and file
+   identity").
 5. The program file itself gets read and execute access automatically.
 6. `system = "minimal"` adds a backend-defined read-only set of system paths that programs need to
    start: shared libraries, loader configuration, time zone data, random devices. Each backend
@@ -145,6 +150,36 @@ Rules:
    detected. The caller closes this gap with `--parent-pid` and its own process ID: sandy then
    refuses when its parent is another process. sandy also refuses when it sees that its parent
    has already ended.
+
+## Links and file identity
+
+A path names a way to a file, not the file itself. Rules 3 and 4 therefore compare more than the
+spelling of a path.
+
+- **Two paths, one directory.** sandy compares the identity (device and inode) of a writable
+  path with the path it checks and with each of that path's parent directories, so an alias of
+  the writable path or of one of its parents counts as the same directory. On Linux it also
+  compares where both paths lie inside their file system, which is the mount root from
+  `/proc/self/mountinfo` plus the rest of the path. That sees a bind mount of a subdirectory of
+  a writable path, which shares no parent directory with it. sandy refuses the policy when it
+  cannot read the mount table, because it could not tell the two apart then; the Linux backend
+  needs `/proc` anyway. Windows compares paths only (see docs/windows.md).
+- **Two names, one file.** A hard link gives one file a second name. The kernels check the name
+  a call uses, so a file that is executable under one name and writable under another is both.
+  At the start sandy looks for a second name inside the writable paths of every file that must
+  not be writable: the files and trees of `read_exec` paths, the program file, its own
+  executable and the policy file. It walks the writable trees first, because a file with more
+  than one name is rare there, and the executable trees only when it found one. A directory
+  the user may not list is skipped: the program runs as the same user and cannot list it
+  either.
+- **What stays open.** A hard link between a writable path and a file that no rule names, or
+  that only a `read` rule names, is allowed: the program can change that file through the
+  writable name. Refusing it would stop the package managers that fill a project from a shared
+  cache with hard links, so the policy decides what a writable path may hold. Two names that different file systems show for one
+  file, as a passthrough FUSE mount does, have different identities and stay unseen. The check
+  runs at the start, so a link that a process outside the sandbox makes while the program runs
+  is not covered. The program cannot make one itself: it gets no link right out of its writable
+  paths and no execute access inside them.
 
 ## Exposed ports
 

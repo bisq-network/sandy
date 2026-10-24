@@ -266,6 +266,8 @@ pub enum PolicyError {
     WritableAndExecutable {
         writable: PathBuf,
         executable: PathBuf,
+        /// How the two paths lead to one file: nesting, or a second name of the file.
+        relation: &'static str,
     },
     ResolvedThroughWritable {
         path: PathBuf,
@@ -275,6 +277,17 @@ pub enum PolicyError {
     InsideWritable {
         path: PathBuf,
         writable: PathBuf,
+    },
+    TrustedFileWritable {
+        path: PathBuf,
+        /// The name through which a writable path reaches the file: the file itself, an entry
+        /// on the way to it, or a second name of it.
+        through: PathBuf,
+        writable: PathBuf,
+    },
+    Unreadable {
+        path: PathBuf,
+        source: io::Error,
     },
     InvalidExpose {
         expose: ExposedPort,
@@ -309,9 +322,10 @@ impl fmt::Display for PolicyError {
             PolicyError::WritableAndExecutable {
                 writable,
                 executable,
+                relation,
             } => write!(
                 f,
-                "writable path {} overlaps executable path {}; a path must not be both writable and executable",
+                "writable path {} {relation} executable path {}; a path must not be both writable and executable",
                 writable.display(),
                 executable.display()
             ),
@@ -332,6 +346,34 @@ impl fmt::Display for PolicyError {
                 "policy path {} lies inside writable path {}; the program could replace it with a symbolic link before the next start",
                 path.display(),
                 writable.display()
+            ),
+            PolicyError::TrustedFileWritable {
+                path,
+                through,
+                writable,
+            } if through == path => write!(
+                f,
+                "{} lies inside writable path {}; the program could change it before the next \
+                 start",
+                path.display(),
+                writable.display()
+            ),
+            PolicyError::TrustedFileWritable {
+                path,
+                through,
+                writable,
+            } => write!(
+                f,
+                "{} is reachable as {}, inside writable path {}; the program could change it \
+                 before the next start",
+                path.display(),
+                through.display(),
+                writable.display()
+            ),
+            PolicyError::Unreadable { path, source } => write!(
+                f,
+                "cannot read {}, which sandy checks before it starts the program: {source}",
+                path.display()
             ),
             PolicyError::ChildrenNeedUnixSocketsDenied(children) => write!(
                 f,
@@ -370,7 +412,9 @@ impl fmt::Display for PolicyError {
 impl std::error::Error for PolicyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            PolicyError::PathNotFound { source, .. } => Some(source),
+            PolicyError::PathNotFound { source, .. } | PolicyError::Unreadable { source, .. } => {
+                Some(source)
+            }
             _ => None,
         }
     }

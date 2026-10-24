@@ -197,13 +197,7 @@ fn execute(invocation: Invocation, parent_at_start: Option<u32>) -> Result<ExitC
         parent_at_start,
         resolved.end_with_parent,
     )?;
-    let sandy_path = std::env::current_exe()
-        .map_err(|error| format!("cannot find the path of sandy: {error}"))?;
-    let trusted = [
-        Some(sandy_path.as_path()),
-        invocation.policy_file.as_deref(),
-    ];
-    refuse_trusted_inside_writable(&resolved, trusted.into_iter().flatten())?;
+    refuse_writable_trusted_files(&resolved, invocation.policy_file.as_deref())?;
     let backend = platform_backend();
     let plan = EnforcementPlan::new(&resolved.requirements(), backend.plan(&resolved));
 
@@ -255,30 +249,78 @@ fn execute(invocation: Invocation, parent_at_start: Option<u32>) -> Result<ExitC
 }
 
 /// sandy and its policy are trusted: the program must not be able to change them for the next
-/// start (see "Threat model" in DESIGN.md). A writable path that contains either would let it.
-fn refuse_trusted_inside_writable<'a>(
+/// start (see "Threat model" in DESIGN.md). The resolver applies the checks of rules 3 and 4 to
+/// them, so a writable path reaches them neither directly nor through a link, an alias or a
+/// second name.
+fn refuse_writable_trusted_files(
     resolved: &ResolvedPolicy,
-    trusted: impl IntoIterator<Item = &'a std::path::Path>,
+    policy_file: Option<&std::path::Path>,
 ) -> Result<(), String> {
-    for path in trusted {
-        let canonical = path
-            .canonicalize()
-            .map_err(|error| format!("cannot resolve {}: {error}", path.display()))?;
-        let writable = resolved
-            .paths
-            .iter()
-            .filter(|rule| rule.access == sandy_core::PathAccess::ReadWrite)
-            .find(|rule| canonical.starts_with(&rule.path));
-        if let Some(rule) = writable {
-            return Err(format!(
-                "{} lies inside writable path {}; the program could change it before the next \
-                 start",
-                canonical.display(),
-                rule.path.display()
-            ));
+    let sandy_path = std::env::current_exe()
+        .map_err(|error| format!("cannot find the path of sandy: {error}"))?;
+    // The resolver takes absolute paths; the caller may have spelled these relative to the
+    // current directory, which sandy does not change.
+    let absolute = |path: &std::path::Path| {
+        std::path::absolute(path)
+            .map_err(|error| format!("cannot resolve {}: {error}", path.display()))
+    };
+    let mut trusted = vec![absolute(&sandy_path)?];
+    // The name sandy was started under leads to the same file, but a second name can lie in a
+    // writable path. One that no longer exists cannot be used for the next start, so it is left
+    // out instead of refused.
+    for path in executed_paths() {
+        let Ok(path) = absolute(&path) else { continue };
+        if path.exists() && !trusted.contains(&path) {
+            trusted.push(path);
         }
     }
-    Ok(())
+    if let Some(policy_file) = policy_file {
+        trusted.push(absolute(policy_file)?);
+    }
+    resolved
+        .check_trusted(&trusted)
+        .map_err(|error| error.to_string())
+}
+
+/// The names sandy was started under. `current_exe` reads `/proc/self/exe` on Linux, which the
+/// kernel has already resolved, so a symbolic link or a hard link inside a writable path would
+/// stay unseen. `AT_EXECFN` keeps the name execve was given, and argv[0] is what the caller
+/// chose to tell the program.
+#[cfg(unix)]
+fn executed_paths() -> Vec<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut paths = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        // SAFETY: getauxval has no preconditions. It returns 0 when the kernel passed no
+        // AT_EXECFN entry, and else a pointer to a NUL-terminated string on this process's
+        // stack, which lives as long as the process.
+        let name = unsafe { libc::getauxval(libc::AT_EXECFN) } as *const libc::c_char;
+        if !name.is_null() {
+            // SAFETY: the kernel NUL-terminates AT_EXECFN.
+            let name = unsafe { std::ffi::CStr::from_ptr(name) };
+            paths.push(std::path::PathBuf::from(OsString::from_vec(
+                name.to_bytes().to_vec(),
+            )));
+        }
+    }
+    let arg0 = std::env::args_os().next().unwrap_or_default();
+    if arg0.as_bytes().contains(&b'/') {
+        paths.push(std::path::PathBuf::from(arg0));
+    }
+    paths
+}
+
+/// TODO: on Windows the path of the running image comes from the process parameters, which
+/// `current_exe` reads, so there is no second name to check yet. A junction or a hard link that
+/// leads to sandy needs the identity work described in docs/windows.md.
+#[cfg(not(unix))]
+fn executed_paths() -> Vec<std::path::PathBuf> {
+    Vec::new()
 }
 
 fn refusal(plan: &EnforcementPlan) -> String {

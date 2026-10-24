@@ -280,6 +280,177 @@ fn refuses_a_policy_file_inside_a_writable_path() {
     assert!(stderr.contains("inside writable path"), "{stderr}");
 }
 
+/// A writable path that reaches the policy file under a second name is as dangerous as one that
+/// contains it: the program rewrites it there, and the next start reads what it wrote.
+#[cfg(unix)]
+#[test]
+fn refuses_a_policy_file_reached_through_a_link_in_a_writable_path() {
+    let fixture = Fixture::new("policy-link");
+    let policy = fixture.path("ro/policy.toml");
+    let text = format!(
+        "version = 1\n[filesystem]\nread_write = ['{}']\n",
+        fixture.arg("rw")
+    );
+    fs::write(&policy, text).unwrap();
+    let check = |file: &str| {
+        let mut args = vec!["check".to_string()];
+        args.extend(platform_args());
+        args.extend(["--policy".to_string(), file.to_string()]);
+        sandy(&args)
+    };
+
+    // Control: the policy file where it lies, outside the writable path.
+    let output = check(&fixture.arg("ro/policy.toml"));
+    assert!(output.status.success(), "{output:?}");
+
+    // Named through a symbolic link inside the writable path.
+    std::os::unix::fs::symlink(&policy, fixture.path("rw/policy.toml")).unwrap();
+    let output = check(&fixture.arg("rw/policy.toml"));
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("writable path"), "{stderr}");
+
+    // Named where it lies, with a second name inside the writable path.
+    fs::hard_link(&policy, fixture.path("rw/second.toml")).unwrap();
+    let output = check(&fixture.arg("ro/policy.toml"));
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("writable path"), "{stderr}");
+}
+
+/// The same for sandy's own executable, which the program would replace for the next start.
+/// `current_exe` resolves the name on Linux, so the name sandy was started under is checked too.
+#[cfg(unix)]
+#[test]
+fn refuses_a_sandy_executable_a_writable_path_reaches() {
+    let fixture = Fixture::new("sandy-link");
+    let copy = fixture.path("bin/sandy");
+    fs::copy(sandy_path(), &copy).unwrap();
+    let check = |program: &std::path::Path| {
+        let mut args = vec!["check".to_string()];
+        args.extend(platform_args());
+        args.extend(["--read-write".to_string(), fixture.arg("rw")]);
+        Command::new(program).args(&args).output().unwrap()
+    };
+
+    // Control: sandy outside the writable path.
+    let output = check(&copy);
+    assert!(output.status.success(), "{output:?}");
+
+    // Started through a symbolic link inside the writable path.
+    let link = fixture.path("rw/sandy");
+    std::os::unix::fs::symlink(&copy, &link).unwrap();
+    let output = check(&link);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    fs::remove_file(&link).unwrap();
+
+    // Started where it lies, with a second name inside the writable path.
+    fs::hard_link(&copy, &link).unwrap();
+    let output = check(&copy);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("writable path"), "{stderr}");
+}
+
+/// Rule 3 by identity: a file with one name in an executable path and one in a writable path is
+/// writable and executable, whichever name a call uses. The program could rewrite the code that
+/// the next run, or a process outside the sandbox, executes.
+#[cfg(unix)]
+#[test]
+fn a_hard_link_between_writable_and_executable_paths_is_refused() {
+    let fixture = Fixture::new("link-wx");
+    let tool = fixture.copy_probe("bin");
+    let run = || {
+        sandy(run_args(
+            &fixture.access_args(),
+            &[("read", &fixture.arg("ro/file"))],
+        ))
+    };
+
+    // Control: the same policy without the link.
+    let output = run();
+    assert!(output.status.success(), "{output:?}");
+
+    fs::hard_link(&tool, fixture.path("rw/data")).unwrap();
+    let output = run();
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("writable"), "{stderr}");
+}
+
+/// The program file gets execute access of its own (rule 5), so a second name of it inside a
+/// writable path is refused as well.
+#[cfg(unix)]
+#[test]
+fn a_hard_link_of_the_program_into_a_writable_path_is_refused() {
+    let fixture = Fixture::new("link-program");
+    let program = fixture.copy_probe("bin");
+    let run = || {
+        let mut args = vec!["run".to_string()];
+        args.extend(platform_args());
+        args.extend(["--read-write".to_string(), fixture.arg("rw")]);
+        args.extend([
+            "--".to_string(),
+            program.clone(),
+            "read".to_string(),
+            fixture.arg("rw/file"),
+        ]);
+        sandy(&args)
+    };
+
+    // Control: the same program without the link.
+    let output = run();
+    assert!(output.status.success(), "{output:?}");
+
+    fs::hard_link(&program, fixture.path("rw/copy")).unwrap();
+    let output = run();
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("writable"), "{stderr}");
+}
+
+/// What a hard link still carries, so a change in it does not pass unnoticed: a file that lies
+/// outside the policy and has a second name inside a writable path can be changed through that
+/// name. sandy refuses the second name only when the other one is executable, the program or a
+/// file sandy trusts. Refusing every one would stop the package managers that fill a project
+/// from a shared cache with hard links (see "Links" in docs/DESIGN.md).
+#[cfg(unix)]
+#[test]
+fn a_hard_link_to_a_file_outside_the_policy_stays_writable() {
+    let fixture = Fixture::new("link-outside");
+    let (outside, inside) = (fixture.path("secret/file"), fixture.arg("rw/linked"));
+    fs::hard_link(&outside, &inside).unwrap();
+    let lines = probe_inside(
+        &fixture.access_args(),
+        &[
+            ("write", &inside),
+            ("read", &fixture.arg("secret/file")),
+            ("write", &fixture.arg("secret/file")),
+        ],
+    );
+    lines[0].assert_ok();
+    lines[1].assert_blocked();
+    lines[2].assert_blocked();
+    assert_eq!(fs::read(&outside).unwrap(), b"probe");
+}
+
+/// A policy file may be named relative to the current directory. The checks that protect it
+/// take absolute paths, so sandy makes the name absolute before it applies them.
+#[test]
+fn accepts_a_policy_file_named_relative_to_the_current_directory() {
+    let fixture = Fixture::new("policy-relative");
+    fs::write(fixture.path("ro/policy.toml"), "version = 1\n").unwrap();
+    let mut args = vec!["check".to_string()];
+    args.extend(platform_args());
+    args.extend(["--policy".to_string(), "ro/policy.toml".to_string()]);
+    let output = Command::new(sandy_path())
+        .args(&args)
+        .current_dir(&fixture.root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
 /// check refuses what run would refuse: --parent-pid without end_with_parent.
 #[test]
 fn check_refuses_a_parent_pid_without_end_with_parent() {

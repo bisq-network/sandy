@@ -1,4 +1,6 @@
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 use crate::plan::Requirement;
@@ -74,10 +76,12 @@ impl ResolvedPolicy {
             traversals.push(traversal);
         }
 
+        let mounts = Mounts::read()?;
         let paths = merge(rules)?;
-        check_writable_not_executable(&paths)?;
-        check_nothing_inside_writable(&paths)?;
-        check_not_resolved_through_writable(&paths, &traversals)?;
+        check_writable_not_executable(&paths, &mounts)?;
+        check_nothing_inside_writable(&paths, &mounts)?;
+        check_not_resolved_through_writable(&paths, &traversals, &mounts)?;
+        check_no_writable_second_name(&paths)?;
         validate_environment(&policy.environment)?;
         validate_expose(&policy.network.expose, policy.network.ip)?;
         validate_children(&policy.process, policy.network.unix_sockets)?;
@@ -141,6 +145,48 @@ impl ResolvedPolicy {
             requirements.push(Requirement::ForwardedPortsRelayed);
         }
         requirements
+    }
+
+    /// sandy's own executable and the policy file are trusted: the program must not be able to
+    /// change them for the next start (see "Threat model" in DESIGN.md). They are not policy
+    /// paths, so rules 3 and 4 do not cover them; this applies the same checks. The caller
+    /// passes the paths as it knows them, including the one it was executed under, because that
+    /// can be a symbolic link to the file `current_exe` reports.
+    pub fn check_trusted(&self, files: &[PathBuf]) -> Result<(), PolicyError> {
+        let writable: Vec<&PathRule> = self
+            .paths
+            .iter()
+            .filter(|rule| rule.access == PathAccess::ReadWrite)
+            .collect();
+        if writable.is_empty() {
+            return Ok(());
+        }
+        let mounts = Mounts::read()?;
+        let mut canonical = Vec::with_capacity(files.len());
+        for file in files {
+            let (rule, traversal) = resolve_path(file, PathAccess::Read)?;
+            for w in &writable {
+                // The entry that is the writable path itself is not inside it: replacing it
+                // needs write access to its parent, as in `check_not_resolved_through_writable`.
+                let reached = is_within(&rule.path, &w.path, &mounts)
+                    .then_some(&rule.path)
+                    .or_else(|| {
+                        traversal
+                            .entries
+                            .iter()
+                            .find(|entry| **entry != w.path && is_within(entry, &w.path, &mounts))
+                    });
+                if let Some(reached) = reached {
+                    return Err(PolicyError::TrustedFileWritable {
+                        path: rule.path.clone(),
+                        through: reached.clone(),
+                        writable: w.path.clone(),
+                    });
+                }
+            }
+            canonical.push(rule.path);
+        }
+        check_no_writable_trusted_name(&canonical, &self.paths)
     }
 }
 
@@ -231,9 +277,13 @@ fn traversed_entries(_path: &Path) -> std::io::Result<Vec<PathBuf>> {
 
 /// Whether `inner` is `outer` or lies beneath it. Besides the path, on Unix the identity of the
 /// file (device and inode) of `outer` is compared with `inner` and each of its ancestors, so one
-/// directory reachable under two paths (a bind mount, a macOS firmlink) counts as one.
-fn is_within(inner: &Path, outer: &Path) -> bool {
-    inner.starts_with(outer) || same_object_among_ancestors(inner, outer)
+/// directory reachable under two paths (a bind mount, a macOS firmlink) counts as one. On Linux
+/// the physical location is compared as well, which also sees an alias of a subdirectory of
+/// `outer`, which has no ancestor with `outer`'s identity.
+fn is_within(inner: &Path, outer: &Path, mounts: &Mounts) -> bool {
+    inner.starts_with(outer)
+        || same_object_among_ancestors(inner, outer)
+        || same_physical_location(inner, outer, mounts)
 }
 
 #[cfg(unix)]
@@ -250,8 +300,154 @@ fn same_object_among_ancestors(inner: &Path, outer: &Path) -> bool {
 
 #[cfg(not(unix))]
 fn same_object_among_ancestors(_inner: &Path, _outer: &Path) -> bool {
+    // TODO: Windows has no traversal entries and no file identity here yet. The identity is
+    // FILE_ID_INFO, which only the Windows backend can read; it has to reach sandy-core through
+    // a backend hook. See "Links and identity" in docs/windows.md.
     false
 }
+
+/// Where the file systems of this host are mounted. A path says which directory it leads to but
+/// not where that directory lies: a bind mount shows one directory under a second path that
+/// shares no ancestor with the first. The physical location, the path inside the file system
+/// that holds it, is the same for both spellings.
+#[cfg(target_os = "linux")]
+struct Mounts {
+    /// Mount point and the path of the mount's root inside its file system, in mount order.
+    entries: Vec<(PathBuf, PathBuf)>,
+}
+
+#[cfg(target_os = "linux")]
+impl Mounts {
+    const TABLE: &'static str = "/proc/self/mountinfo";
+
+    /// sandy refuses the policy when the table is unreadable instead of falling back to the
+    /// weaker path comparison. Nothing is lost: the Linux backend already needs /proc to count
+    /// its threads before it applies Landlock, so a host without /proc cannot enforce a policy
+    /// anyway.
+    fn read() -> Result<Mounts, PolicyError> {
+        let text = std::fs::read(Self::TABLE).map_err(|source| PolicyError::Unreadable {
+            path: PathBuf::from(Self::TABLE),
+            source,
+        })?;
+        Ok(Mounts::parse(&text))
+    }
+
+    /// Fields 4 and 5 of each line are the mount root and the mount point (`proc(5)`).
+    fn parse(table: &[u8]) -> Mounts {
+        let entries = table
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| {
+                let mut fields = line.split(|byte| *byte == b' ');
+                let root = unescape(fields.nth(3)?);
+                let point = unescape(fields.next()?);
+                Some((point, root))
+            })
+            .collect();
+        Mounts { entries }
+    }
+
+    /// The location of `path` inside the file system that holds it, or `None` when no mount
+    /// matches. The mount is the longest mount point that is a prefix of `path` and that
+    /// `holds_path` accepts; a mount point on another file system is one that a later mount
+    /// covers. `path` must have no symbolic links in it, so that mount points can be compared as
+    /// prefixes.
+    fn physical(&self, path: &Path, holds_path: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+        let mut best: Option<&(PathBuf, PathBuf)> = None;
+        for entry in &self.entries {
+            let (point, _) = entry;
+            let longer =
+                best.is_some_and(|(best, _)| best.as_os_str().len() > point.as_os_str().len());
+            if longer || !path.starts_with(point) || !holds_path(point) {
+                continue;
+            }
+            best = Some(entry);
+        }
+        let (point, root) = best?;
+        Some(root.join(path.strip_prefix(point).ok()?))
+    }
+}
+
+/// Reverses the octal escapes `/proc/self/mountinfo` uses for space, tab, newline and backslash.
+#[cfg(target_os = "linux")]
+fn unescape(field: &[u8]) -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let octal = |byte: &u8| (b'0'..=b'7').contains(byte);
+    let mut name = Vec::with_capacity(field.len());
+    let mut rest = field;
+    while let Some((byte, tail)) = rest.split_first() {
+        match tail.get(..3) {
+            Some(digits) if *byte == b'\\' && digits.iter().all(octal) => {
+                let value = digits
+                    .iter()
+                    .fold(0u32, |value, digit| value * 8 + u32::from(digit - b'0'));
+                name.push(value as u8);
+                rest = &tail[3..];
+            }
+            _ => {
+                name.push(*byte);
+                rest = tail;
+            }
+        }
+    }
+    PathBuf::from(OsString::from_vec(name))
+}
+
+#[cfg(target_os = "linux")]
+fn device_of(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(path.metadata().ok()?.dev())
+}
+
+/// `path` with its directory resolved but its own name kept, so that a symbolic link is compared
+/// where it lies and not where it leads, as `traversed_entries` spells its entries.
+#[cfg(target_os = "linux")]
+fn canonical_name(path: &Path) -> Option<PathBuf> {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => Some(parent.canonicalize().ok()?.join(name)),
+        _ => path.canonicalize().ok(),
+    }
+}
+
+/// Whether `inner` lies at or below `outer` inside the file system that holds them, whatever
+/// mounts the two paths lead through.
+#[cfg(target_os = "linux")]
+fn same_physical_location(inner: &Path, outer: &Path, mounts: &Mounts) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let location = |path: &Path| {
+        let path = canonical_name(path)?;
+        let device = path.symlink_metadata().ok()?.dev();
+        let physical = mounts.physical(&path, |point| device_of(point) == Some(device))?;
+        Some((device, physical))
+    };
+    let (Some(inner), Some(outer)) = (location(inner), location(outer)) else {
+        return false;
+    };
+    inner.0 == outer.0 && inner.1.starts_with(&outer.1)
+}
+
+/// Only Linux has bind mounts. A macOS firmlink aliases a whole volume, which the identity of
+/// the ancestors already catches, and Windows is covered by `same_object_among_ancestors`.
+#[cfg(not(target_os = "linux"))]
+struct Mounts;
+
+#[cfg(not(target_os = "linux"))]
+impl Mounts {
+    fn read() -> Result<Mounts, PolicyError> {
+        Ok(Mounts)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn same_physical_location(_inner: &Path, _outer: &Path, _mounts: &Mounts) -> bool {
+    false
+}
+
+/// How a writable and an executable path lead to one file, for the error message: both lead to
+/// the same place in the file system, through nesting or an alias of a directory.
+const OVERLAPS: &str = "overlaps";
 
 /// Keeps one rule per path. Read is contained in both other levels; read-exec and read-write on
 /// the same path is a conflict that `check_writable_not_executable` reports.
@@ -266,6 +462,7 @@ fn merge(mut rules: Vec<PathRule>) -> Result<Vec<PathRule>, PolicyError> {
                     return Err(PolicyError::WritableAndExecutable {
                         writable: rule.path,
                         executable: last.path.clone(),
+                        relation: OVERLAPS,
                     });
                 }
                 last.access = last.access.max(rule.access);
@@ -279,15 +476,16 @@ fn merge(mut rules: Vec<PathRule>) -> Result<Vec<PathRule>, PolicyError> {
 /// Rules apply to everything beneath a path, so a writable directory inside an executable one
 /// (or the reverse) is writable and executable. The target could then drop a program that a
 /// process outside the sandbox later runs.
-fn check_writable_not_executable(rules: &[PathRule]) -> Result<(), PolicyError> {
+fn check_writable_not_executable(rules: &[PathRule], mounts: &Mounts) -> Result<(), PolicyError> {
     let writable = rules.iter().filter(|r| r.access == PathAccess::ReadWrite);
     for w in writable {
         let executable = rules.iter().filter(|r| r.access == PathAccess::ReadExec);
         for x in executable {
-            if is_within(&w.path, &x.path) || is_within(&x.path, &w.path) {
+            if is_within(&w.path, &x.path, mounts) || is_within(&x.path, &w.path, mounts) {
                 return Err(PolicyError::WritableAndExecutable {
                     writable: w.path.clone(),
                     executable: x.path.clone(),
+                    relation: OVERLAPS,
                 });
             }
         }
@@ -298,12 +496,12 @@ fn check_writable_not_executable(rules: &[PathRule]) -> Result<(), PolicyError> 
 /// sandy resolves symbolic links in policy paths at every start. A policy path inside a writable
 /// path could be replaced with a symbolic link by the target, and the next start would then grant
 /// access to wherever that link points.
-fn check_nothing_inside_writable(rules: &[PathRule]) -> Result<(), PolicyError> {
+fn check_nothing_inside_writable(rules: &[PathRule], mounts: &Mounts) -> Result<(), PolicyError> {
     let writable = rules.iter().filter(|r| r.access == PathAccess::ReadWrite);
     for w in writable {
         let nested = rules
             .iter()
-            .find(|r| r.path != w.path && is_within(&r.path, &w.path));
+            .find(|r| r.path != w.path && is_within(&r.path, &w.path, mounts));
         if let Some(nested) = nested {
             return Err(PolicyError::InsideWritable {
                 path: nested.path.clone(),
@@ -320,6 +518,7 @@ fn check_nothing_inside_writable(rules: &[PathRule]) -> Result<(), PolicyError> 
 fn check_not_resolved_through_writable(
     rules: &[PathRule],
     traversals: &[Traversal],
+    mounts: &Mounts,
 ) -> Result<(), PolicyError> {
     let writable = rules.iter().filter(|r| r.access == PathAccess::ReadWrite);
     for w in writable {
@@ -327,7 +526,7 @@ fn check_not_resolved_through_writable(
             let inside = traversal
                 .entries
                 .iter()
-                .find(|entry| **entry != w.path && is_within(entry, &w.path));
+                .find(|entry| **entry != w.path && is_within(entry, &w.path, mounts));
             if let Some(entry) = inside {
                 return Err(PolicyError::ResolvedThroughWritable {
                     path: traversal.path.clone(),
@@ -337,6 +536,220 @@ fn check_not_resolved_through_writable(
             }
         }
     }
+    Ok(())
+}
+
+/// Identity of a file. Two names of one file, a hard link for example, share device and inode.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct FileId {
+    device: u64,
+    inode: u64,
+}
+
+/// A name inside a writable path, and the writable path that holds it.
+#[cfg(unix)]
+struct WritableName {
+    path: PathBuf,
+    writable: PathBuf,
+}
+
+/// The identity of a regular file that has more than one name, else `None`. A file with one name
+/// is reachable only where the policy says it is.
+#[cfg(unix)]
+fn second_name_candidate(metadata: &std::fs::Metadata) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.is_file() && metadata.nlink() > 1).then(|| FileId {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+/// Rule 3 by identity: a file that also has a name inside a writable path is writable, whichever
+/// name the policy grants execute access to. Landlock and Seatbelt check the name a call uses,
+/// so the program could rewrite the file through the writable name and still run it through the
+/// executable one. The program cannot create such a link itself, so this start-time check holds
+/// against it; links that processes outside the sandbox make while it runs are not covered.
+#[cfg(unix)]
+fn check_no_writable_second_name(rules: &[PathRule]) -> Result<(), PolicyError> {
+    let executable: Vec<&PathRule> = rules
+        .iter()
+        .filter(|rule| rule.access == PathAccess::ReadExec)
+        .collect();
+    let files: Vec<(&PathRule, FileId)> = executable
+        .iter()
+        .filter(|rule| !rule.is_dir)
+        .filter_map(|rule| {
+            let metadata = rule.path.symlink_metadata().ok()?;
+            Some((*rule, second_name_candidate(&metadata)?))
+        })
+        .collect();
+    let directories: Vec<&&PathRule> = executable.iter().filter(|rule| rule.is_dir).collect();
+    if files.is_empty() && directories.is_empty() {
+        return Ok(());
+    }
+    // Hard links are rare, so the writable paths, which are usually the smaller trees, are
+    // walked first; the executable trees are walked only when they can hold the other name.
+    let writable = writable_names(rules)?;
+    if writable.is_empty() {
+        return Ok(());
+    }
+    let conflict = |name: &WritableName, executable: &Path| PolicyError::WritableAndExecutable {
+        writable: name.path.clone(),
+        executable: executable.to_path_buf(),
+        relation: "is another name of",
+    };
+    for (rule, id) in files {
+        if let Some(name) = writable.get(&id) {
+            return Err(conflict(name, &rule.path));
+        }
+    }
+    for rule in directories {
+        let mut found = None;
+        for_each_linked_file(&rule.path, &mut |path, id| match writable.get(&id) {
+            Some(name) => {
+                found = Some(conflict(name, path));
+                ControlFlow::Break(())
+            }
+            None => ControlFlow::Continue(()),
+        })
+        .map_err(|source| PolicyError::Unreadable {
+            path: rule.path.clone(),
+            source,
+        })?;
+        if let Some(conflict) = found {
+            return Err(conflict);
+        }
+    }
+    Ok(())
+}
+
+/// The same for the files sandy itself trusts, which no policy path names: a second name inside
+/// a writable path would let the program rewrite them for the next start.
+#[cfg(unix)]
+fn check_no_writable_trusted_name(
+    files: &[PathBuf],
+    rules: &[PathRule],
+) -> Result<(), PolicyError> {
+    let linked: Vec<(&PathBuf, FileId)> = files
+        .iter()
+        .filter_map(|file| {
+            let metadata = file.symlink_metadata().ok()?;
+            Some((file, second_name_candidate(&metadata)?))
+        })
+        .collect();
+    if linked.is_empty() {
+        return Ok(());
+    }
+    let writable = writable_names(rules)?;
+    for (file, id) in linked {
+        if let Some(name) = writable.get(&id) {
+            return Err(PolicyError::TrustedFileWritable {
+                path: file.clone(),
+                through: name.path.clone(),
+                writable: name.writable.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Every name below a writable path that its file shares with another name, by identity.
+#[cfg(unix)]
+fn writable_names(
+    rules: &[PathRule],
+) -> Result<std::collections::HashMap<FileId, WritableName>, PolicyError> {
+    let mut names = std::collections::HashMap::new();
+    let writable = rules
+        .iter()
+        .filter(|rule| rule.access == PathAccess::ReadWrite);
+    for rule in writable {
+        for_each_linked_file(&rule.path, &mut |path, id| {
+            names.entry(id).or_insert_with(|| WritableName {
+                path: path.to_path_buf(),
+                writable: rule.path.clone(),
+            });
+            ControlFlow::Continue(())
+        })
+        .map_err(|source| PolicyError::Unreadable {
+            path: rule.path.clone(),
+            source,
+        })?;
+    }
+    Ok(names)
+}
+
+/// Calls `visit` for every regular file with more than one name at or below `root`. Symbolic
+/// links are not followed, and a directory is entered once, so an alias of a directory inside
+/// itself cannot make the walk endless.
+///
+/// Entries that disappear while the walk runs are skipped, and so are directories this user may
+/// not list: the program runs as the same user, so it cannot list them either. Any other error
+/// ends the walk, because a tree sandy cannot read is a tree it cannot clear.
+#[cfg(unix)]
+fn for_each_linked_file(
+    root: &Path,
+    visit: &mut impl FnMut(&Path, FileId) -> ControlFlow<()>,
+) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::MetadataExt;
+
+    let gone = |error: &std::io::Error| {
+        matches!(
+            error.kind(),
+            ErrorKind::NotFound | ErrorKind::PermissionDenied
+        )
+    };
+    let mut entered = std::collections::HashSet::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = match path.symlink_metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if gone(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_dir() {
+            if let Some(id) = second_name_candidate(&metadata)
+                && visit(&path, id).is_break()
+            {
+                return Ok(());
+            }
+            continue;
+        }
+        if !entered.insert((metadata.dev(), metadata.ino())) {
+            continue;
+        }
+        let entries = match std::fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(error) if gone(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            match entry {
+                Ok(entry) => pending.push(entry.path()),
+                Err(error) if gone(&error) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// TODO: Windows needs FILE_ID_INFO for the identity and FindFirstFileNameW for the other names
+/// of a file. Both are Windows API calls, which only the Windows backend may make, so they have
+/// to reach sandy-core through a backend hook. Until then a pre-existing hard link between a
+/// writable and an executable path stays undetected there (see "Links and identity" in
+/// docs/windows.md).
+#[cfg(not(unix))]
+fn check_no_writable_second_name(_rules: &[PathRule]) -> Result<(), PolicyError> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_no_writable_trusted_name(
+    _files: &[PathBuf],
+    _rules: &[PathRule],
+) -> Result<(), PolicyError> {
     Ok(())
 }
 
@@ -1059,9 +1472,109 @@ mod tests {
             "/System/Volumes/Data"
         };
         let other = Path::new(prefix).join(dir.strip_prefix("/").unwrap());
+        let mounts = Mounts::read().unwrap();
         assert!(!other.join("sub").starts_with(&dir));
-        assert!(is_within(&other.join("sub"), &dir));
-        assert!(is_within(&dir.join("sub"), &other));
-        assert!(!is_within(&dir, &dir.join("sub")));
+        assert!(is_within(&other.join("sub"), &dir, &mounts));
+        assert!(is_within(&dir.join("sub"), &other, &mounts));
+        assert!(!is_within(&dir, &dir.join("sub"), &mounts));
+    }
+
+    /// Rule 3 by identity: one file under two names, one of them writable.
+    #[cfg(unix)]
+    #[test]
+    fn rejects_an_executable_file_hard_linked_into_a_writable_path() {
+        let root = temp_dir();
+        let (data, tools) = (root.join("data"), root.join("tools"));
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&tools).unwrap();
+        fs::write(tools.join("tool"), b"").unwrap();
+
+        // Control: without the link the two trees are unrelated.
+        let policy = policy_with(&[], &[&tools], &[&data]);
+        ResolvedPolicy::resolve(&policy, None).unwrap();
+
+        fs::hard_link(tools.join("tool"), data.join("copy")).unwrap();
+        let error = ResolvedPolicy::resolve(&policy, None).unwrap_err();
+        assert!(
+            matches!(&error, PolicyError::WritableAndExecutable { writable, executable, .. }
+                if *writable == data.join("copy") && *executable == tools.join("tool")),
+            "{error}"
+        );
+        // The same for an executable path that names the file itself, and for the program.
+        let policy = policy_with(&[], &[&tools.join("tool")], &[&data]);
+        assert!(matches!(
+            ResolvedPolicy::resolve(&policy, None),
+            Err(PolicyError::WritableAndExecutable { .. })
+        ));
+        let policy = policy_with(&[], &[], &[&data]);
+        assert!(matches!(
+            ResolvedPolicy::resolve(&policy, Some(&tools.join("tool"))),
+            Err(PolicyError::WritableAndExecutable { .. })
+        ));
+    }
+
+    /// The files sandy itself trusts get the same checks as policy paths.
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_trusted_file_a_writable_path_reaches() {
+        use std::os::unix::fs::symlink;
+        let root = temp_dir();
+        let (data, safe) = (root.join("data"), root.join("safe"));
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&safe).unwrap();
+        let trusted = safe.join("policy.toml");
+        fs::write(&trusted, b"").unwrap();
+        let resolved = ResolvedPolicy::resolve(&policy_with(&[], &[], &[&data]), None).unwrap();
+        resolved
+            .check_trusted(std::slice::from_ref(&trusted))
+            .unwrap();
+
+        // Reached through a symbolic link inside the writable path.
+        let through_link = data.join("policy.toml");
+        symlink(&trusted, &through_link).unwrap();
+        let error = resolved.check_trusted(&[through_link]).unwrap_err();
+        assert!(
+            matches!(&error, PolicyError::TrustedFileWritable { writable, .. } if *writable == data),
+            "{error}"
+        );
+
+        // A second name inside the writable path.
+        fs::hard_link(&trusted, data.join("other.toml")).unwrap();
+        let error = resolved.check_trusted(&[trusted]).unwrap_err();
+        assert!(
+            matches!(&error, PolicyError::TrustedFileWritable { through, .. }
+                if *through == data.join("other.toml")),
+            "{error}"
+        );
+    }
+
+    /// A bind mount of a subdirectory of a writable path shares no ancestor with it, so only the
+    /// location inside the file system shows that both lead to the same place. Mounting needs
+    /// privileges, so this uses the table that `escape_linux.rs` measures under `unshare -Urm`;
+    /// the names there carry an escaped space, which the parser has to reverse.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_bind_mount_of_a_subdirectory_lies_inside_the_writable_path() {
+        let table = concat!(
+            "25 1 0:22 / / rw,relatime - btrfs /dev/sda2 rw\n",
+            "1785 1542 0:57 / /odd\\040name rw,nosuid,nodev - tmpfs tmpfs rw\n",
+            "2343 1785 0:57 /work/rw/sub /odd\\040name/alias rw,nosuid - tmpfs tmpfs rw\n",
+        );
+        let mounts = Mounts::parse(table.as_bytes());
+        let tmpfs = |point: &Path| point != Path::new("/");
+        let physical = |path: &str| mounts.physical(Path::new(path), tmpfs).unwrap();
+
+        let writable = physical("/odd name/work/rw");
+        assert_eq!(writable, Path::new("/work/rw"));
+        assert_eq!(physical("/odd name/alias/t"), Path::new("/work/rw/sub/t"));
+        assert!(physical("/odd name/alias/t").starts_with(&writable));
+        // Another mount of the same file system that lies outside the writable path.
+        assert!(!physical("/odd name/work/other").starts_with(&writable));
+        // The file system a mount point belongs to decides, not the length of the prefix.
+        assert_eq!(
+            mounts.physical(Path::new("/odd name/alias/t"), |point| point
+                == Path::new("/")),
+            Some(PathBuf::from("/odd name/alias/t"))
+        );
     }
 }

@@ -897,3 +897,59 @@ fn a_writable_path_over_the_system_set_is_refused() {
         "{check:?}"
     );
 }
+
+/// A bind mount of a subdirectory of a writable path shares no ancestor with that path, so
+/// comparing the identity of the ancestors alone does not see that read_exec on the alias makes
+/// the writable directory executable. sandy compares where the paths lie inside the file system.
+///
+/// Mounting needs a mount namespace. The nested user namespace maps the mounting user back to an
+/// unprivileged one, so sandy runs without capabilities, as it would on a normal host.
+#[test]
+fn refuses_a_read_exec_alias_of_a_writable_subdirectory() {
+    let fixture = Fixture::new("bind-alias");
+    for dir in ["rw/sub", "ro/sub", "alias", "control"] {
+        fs::create_dir_all(fixture.path(dir)).unwrap();
+    }
+    let check = |path: &str| {
+        format!(
+            "{} check --read-write {} --read-exec {path} >/dev/null 2>&1",
+            sandy_path(),
+            fixture.arg("rw")
+        )
+    };
+    // The alias of the writable subdirectory, and a control alias of a directory outside the
+    // writable path, which stays allowed.
+    let script = format!(
+        "mount --bind {}/sub {} || exit 97\n\
+         mount --bind {}/sub {} || exit 97\n\
+         exec unshare --user --map-user=1000 --map-group=1000 sh -c '\
+           {}; echo alias=$?; {}; echo control=$?'\n",
+        fixture.arg("rw"),
+        fixture.arg("alias"),
+        fixture.arg("ro"),
+        fixture.arg("control"),
+        check(&fixture.arg("alias")),
+        check(&fixture.arg("control")),
+    );
+    let Ok(output) = Command::new("unshare")
+        .args(["--user", "--map-root-user", "--mount", "sh", "-c", &script])
+        .output()
+    else {
+        return skip("unshare is not installed");
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let code = |name: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.parse::<i32>().ok())
+    };
+    let (Some(alias), Some(control)) = (code("alias="), code("control=")) else {
+        return skip(&format!(
+            "no unprivileged user namespace with a mount namespace: {:?}, {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    };
+    assert_eq!(control, 0, "the control alias was refused: {stdout}");
+    assert_eq!(alias, EXIT_FAILURE, "{stdout}");
+}

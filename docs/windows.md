@@ -178,13 +178,36 @@ Microsoft does not document whether this propagation follows junctions and symbo
 program that could write below a directory in an earlier run could have planted a link to a
 directory of the user. Before sandy adds an inheritable ACE, it therefore walks the directory and
 refuses the run if it finds a junction or symbolic link (`is_symlink` covers every name-surrogate
-reparse point). Hard links cannot be found this way; creating one needs write access to the
-target, which the AppContainer lacks outside its paths.
+reparse point). Hard links cannot be found this way. Creating one is expected to need write
+access to the target, which the AppContainer lacks outside its paths, but that is not measured
+on a host yet.
 
 A path whose DACL the user cannot change makes `sandy run` fail with an error that names the
 path, unless Windows already grants the level to all AppContainers. A path without DACL (NULL
 DACL, everyone has full access) also makes the run fail; adding an ACE would take the user's
 access away.
+
+### Links and identity
+
+The resolver compares files and not only paths where it can: one directory reachable under two
+paths counts as one, and a file with a second name inside a writable path counts as writable
+(see "Links and file identity" in [DESIGN.md](DESIGN.md)). On Windows it compares paths only.
+The identity of a file is `FILE_ID_INFO` and the other names of a file come from
+`FindFirstFileNameW`, both Windows API calls, which `sandy-core` must not make; they have to
+reach the resolver through a backend hook that is not written yet. The stubs are marked in
+`crates/sandy-core/src/resolve.rs`. Until they are filled in, on Windows:
+
+- A policy path or a trusted file reached through a junction or a symbolic link inside a
+  writable path is not refused by the resolver. For `run`, the walk before a new grant refuses a
+  junction below a granted directory (`refuse_links_below`); `check`, and a grant that already
+  exists, do not.
+- A hard link between a `read_write` and a `read_exec` path, or one that leads to the program
+  file, sandy's own executable or the policy file, is not refused. This weighs more here than on
+  Linux and macOS: the rights live in the one security descriptor of the file, so the
+  inheritable ACE of the writable parent and the one of the executable parent both land on it,
+  and stay there after the run.
+- `sandy` is checked under the path `current_exe` reports. There is no second name to compare
+  it with yet.
 
 ### Removing the changes
 

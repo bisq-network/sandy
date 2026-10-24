@@ -457,9 +457,37 @@ secrets passed on command lines, and `/proc/net` of the network namespace. `/pro
 `environ` of processes outside the sandbox stay denied by the Landlock ptrace check (tested). Without `/proc`, `std::env::current_exe` and similar calls fail; common runtimes
 (glibc, Rust, Python, Go, Java, Node.js) still start.
 
+## Links and the mount table
+
+Landlock binds a rule to the inode behind a path when sandy starts, and it checks the path a
+call uses. One file under two names, or one directory under two paths, would otherwise get the
+rights of both, so the resolver compares files before it builds the rules.
+
+- **Bind mounts.** sandy reads `/proc/self/mountinfo` and works out where each path lies inside
+  its file system: the root of the mount that holds it plus the rest of the path, together with
+  the device. A bind mount of a subdirectory of a writable path, given as `read_exec`, is
+  refused this way. Comparing the identity of the path and of its parent directories does not
+  see that case, because such an alias has no parent directory in common with the writable path.
+  sandy refuses the policy when it cannot read the table. Nothing is lost by that: sandy needs
+  `/proc` before Landlock anyway, to check that it is single-threaded. Each btrfs subvolume has
+  its own device number, so two subvolumes are compared as two file systems, as the kernel
+  reports them. sandy picks the mount by the longest mount point that is a prefix of the path
+  and lies on the same file system; a mount that a later mount over one of its parents hides is
+  the one case where that can pick the wrong one.
+- **Hard links.** `read_exec` files, the program file, sandy's own executable and the policy
+  file must have no second name inside a writable path. sandy checks `st_nlink` first and then
+  walks the writable trees, which costs one `lstat` per file there; it walks the `read_exec`
+  trees only when the writable trees hold a file with more than one name, which is rare. A
+  directory the user may not list is skipped: the program runs as the same user and cannot list
+  it either.
+- A file outside the policy that has a second name inside a writable path stays writable through
+  that name, and two names that a passthrough FUSE mount shows for one file have different
+  identities and stay unseen. See "Links and file identity" in [DESIGN.md](DESIGN.md).
+
 ## Refusals
 
-`sandy check` shows the reason for each unavailable requirement.
+`sandy check` shows the reason for each unavailable requirement. A policy that breaks one of the
+path rules is refused before that, with exit code 125 and the paths it compared.
 
 - No Landlock: FilesystemConfined, ProcessMemoryIsolated and SignalsIsolated are unavailable.
 - No seccomp filter support, or a CPU architecture other than x86_64 and arm64: every requirement
@@ -517,6 +545,10 @@ secrets passed on command lines, and `/proc/net` of the network namespace. `/pro
 - **Replaced files.** Landlock rules bind to the inode that existed when sandy started. A file
   that is later replaced by rename (for example `/etc/resolv.conf` after a network change)
   becomes unreadable for a running program.
+- **Hard links made outside.** The link check runs at the start. A process outside the sandbox
+  can link a file into a writable path while the program runs, and the program can then change
+  that file. The program cannot do it itself: it gets no `refer` right out of its writable paths
+  and no execute right inside them.
 - **What fails inside the sandbox:** 32-bit programs (killed), user namespace sandboxes of
   browsers (they fall back or fail), io_uring, debuggers, System V IPC, datagram socket pairs,
   `mkfifo` and symbolic links in writable paths, metadata changes by path with the default
