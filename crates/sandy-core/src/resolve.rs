@@ -684,8 +684,10 @@ fn writable_names(
 /// itself cannot make the walk endless.
 ///
 /// Entries that disappear while the walk runs are skipped, and so are directories this user may
-/// not list: the program runs as the same user, so it cannot list them either. Any other error
-/// ends the walk, because a tree sandy cannot read is a tree it cannot clear.
+/// not list: the program runs as the same user, so it cannot list them either, and a name it
+/// cannot reach cannot carry a grant. `EINVAL` counts as unlistable too, because a directory of
+/// a process that is going away reports it (`/proc/<pid>/net` with `--read-write /proc`). Any
+/// other error ends the walk, because a tree sandy cannot read is a tree it cannot clear.
 #[cfg(unix)]
 fn for_each_linked_file(
     root: &Path,
@@ -697,7 +699,7 @@ fn for_each_linked_file(
     let gone = |error: &std::io::Error| {
         matches!(
             error.kind(),
-            ErrorKind::NotFound | ErrorKind::PermissionDenied
+            ErrorKind::NotFound | ErrorKind::PermissionDenied | ErrorKind::InvalidInput
         )
     };
     let mut entered = std::collections::HashSet::new();

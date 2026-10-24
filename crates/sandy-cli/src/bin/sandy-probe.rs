@@ -2320,7 +2320,7 @@ mod unix {
     }
 
     /// How long the processes of `fork-walk` keep forking at most.
-    const WALK_SECONDS: libc::time_t = 30;
+    const WALK_SECONDS: i64 = 30;
 
     /// Starts `target` processes that never stop forking: each forks a child and exits at once,
     /// and the child does the same. So at almost every moment one of them is inside fork, as in
@@ -2336,7 +2336,7 @@ mod unix {
         let null = std::os::fd::AsRawFd::as_raw_fd(&null);
         // A test that fails must not leave them running: each ends after this many seconds.
         // SAFETY: time with a null pointer only returns the time.
-        let deadline = unsafe { libc::time(ptr::null_mut()) } + WALK_SECONDS;
+        let deadline = unsafe { libc::time(ptr::null_mut()) } as i64 + WALK_SECONDS;
         for _ in 0..count {
             // SAFETY: fork has no preconditions; the probe is single-threaded here.
             match unsafe { libc::fork() } {
@@ -2349,7 +2349,7 @@ mod unix {
                         libc::dup2(null, fd);
                     }
                     loop {
-                        if libc::time(ptr::null_mut()) > deadline {
+                        if (libc::time(ptr::null_mut()) as i64) > deadline {
                             libc::_exit(0);
                         }
                         match libc::fork() {
