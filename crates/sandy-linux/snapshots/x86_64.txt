@@ -297,3 +297,29 @@ checksum 0xf1350f598af417c6
 437 ENOSYS
 438-471 allow
 472-511 ENOSYS
+
+[observer]
+instructions 20
+checksum 0x07af126b6c8c2782
+0-1 allow
+2 notify
+3-58 allow
+59 notify
+60-75 allow
+76 notify
+77-82 allow
+83-85 notify
+86 allow
+87-88 notify
+89-132 allow
+133 notify
+134-256 allow
+257-259 notify
+260-262 allow
+263 notify
+264-265 allow
+266 notify
+267-321 allow
+322 notify
+323-511 allow
+

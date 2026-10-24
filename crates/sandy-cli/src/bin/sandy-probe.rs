@@ -49,6 +49,13 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
             fs::File::open(target)?.read_to_end(&mut content)?;
             Ok(format!("{} bytes", content.len()))
         }
+        // A program that treats a file it cannot read as one that is not there: it reports
+        // success either way. Many programs do this with data they can do without, and the
+        // sandbox then takes something away without anyone noticing.
+        "read-optional" => Ok(match fs::read(target) {
+            Ok(content) => format!("{} bytes", content.len()),
+            Err(_) => "without it".to_string(),
+        }),
         "list" => Ok(format!("{} entries", fs::read_dir(target)?.count())),
         "write" => fs::write(target, b"probe").map(|()| String::new()),
         "truncate" => truncate(target),

@@ -14,6 +14,7 @@ use landlock::{
 };
 use sandy_core::{ParentProcess, SandboxError, StatusReport, TargetCommand};
 
+use crate::explain::{self, Observer};
 use crate::filter::{FilterConfig, Filters};
 use crate::host::THREADS_DIR;
 use crate::plan::{LandlockConfig, Sandbox};
@@ -31,6 +32,13 @@ pub fn launch(
     command: &TargetCommand,
     status: &StatusReport,
 ) -> Result<i32, SandboxError> {
+    if command.explain && sandbox.end_with_parent && !sandbox.contain {
+        return Err(SandboxError::new(
+            "--explain cannot be used with process.end_with_parent unless \
+             children = \"contained\": sandy stays the program's parent in this mode, and only \
+             the supervising sandy of \"contained\" passes on the signals that end the program",
+        ));
+    }
     // With `contained`, the relay also ends when the guard has ended the program's group.
     let mut group_ended = None;
     if let Some(relay) = &sandbox.relay {
@@ -55,6 +63,13 @@ pub fn launch(
     // The filter is built again in the forked child, whose process ID it needs, but a policy it
     // cannot express fails here, before anything starts.
     build_filters(&sandbox.filter)?;
+    let (mut explain, observer) = match command.explain {
+        true => {
+            let (explain, observer) = explain::prepare(&sandbox.landlock)?;
+            (Some(explain), Some(observer))
+        }
+        false => (None, None),
+    };
     let exec = Exec::new(command)?;
     if let Some(cwd) = &command.cwd {
         std::env::set_current_dir(cwd).map_err(|error| {
@@ -62,12 +77,14 @@ pub fn launch(
         })?;
     }
     restore_sigpipe()?;
-    let start = || match confine(ruleset, &sandbox.filter) {
+    let start = || match confine(ruleset, &sandbox.filter, observer.as_ref()) {
         Ok(()) => exec.execute(),
         Err(error) => error,
     };
     if sandbox.contain {
-        contain::run(start, group_ended, status)
+        contain::run(start, group_ended, status, explain.as_mut())
+    } else if let Some(explain) = explain {
+        explain::supervise(start, explain, status)
     } else {
         // In the exec model sandy becomes the program, so its own process ID is the program's.
         // Reported before the sandbox, because the status channel is closed on execve and the
@@ -83,15 +100,26 @@ fn build_filters(config: &FilterConfig) -> Result<Filters, SandboxError> {
         .map_err(|error| SandboxError::new(format!("cannot build the seccomp filter: {error}")))
 }
 
-/// Restricts this process step by step: descriptors, no_new_privs, Landlock, seccomp.
-fn confine(ruleset: RulesetCreated, filter: &FilterConfig) -> Result<(), SandboxError> {
+/// Restricts this process step by step: descriptors, no_new_privs, Landlock, seccomp. The
+/// observer of the diagnostic mode comes last: from then on every call it watches waits for
+/// sandy's answer.
+fn confine(
+    ruleset: RulesetCreated,
+    filter: &FilterConfig,
+    observer: Option<&Observer>,
+) -> Result<(), SandboxError> {
     let filters = build_filters(filter)?;
     mark_descriptors_close_on_exec()?;
     set_no_new_privs()?;
     ensure_single_thread()?;
     restrict(ruleset)?;
-    filter::install(&filters)
-        .map_err(|error| SandboxError::new(format!("cannot install the seccomp filter: {error}")))
+    filter::install(&filters).map_err(|error| {
+        SandboxError::new(format!("cannot install the seccomp filter: {error}"))
+    })?;
+    match observer {
+        Some(observer) => observer.install(),
+        None => Ok(()),
+    }
 }
 
 fn landlock_error(error: RulesetError) -> SandboxError {

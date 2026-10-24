@@ -58,7 +58,7 @@ impl ProtectedPath {
     fn new(path: &Path, subtree: bool) -> ProtectedPath {
         ProtectedPath {
             path: path.to_path_buf(),
-            resolved: resolved_location(path),
+            resolved: canonical_location(path),
             subtree,
         }
     }
@@ -91,7 +91,7 @@ pub fn path_directories(path: Option<&std::ffi::OsStr>) -> Vec<ProtectedPath> {
 /// `path` in the canonical form that policy paths have, also when it does not exist: the
 /// canonical form of its nearest existing ancestor with the rest appended. A location that does
 /// not exist counts, because the program could create it.
-fn resolved_location(path: &Path) -> PathBuf {
+pub fn canonical_location(path: &Path) -> PathBuf {
     let mut names = Vec::new();
     let mut base = path;
     loop {

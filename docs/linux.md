@@ -36,7 +36,9 @@ Then sandy restricts itself, in this order:
    `landlock_restrict_self`. sandy checks that the ruleset is fully enforced.
 7. Install the filters in this order, each with `SECCOMP_FILTER_FLAG_TSYNC`: the allowlist, the
    denylist, with `path_metadata = "deny"` the extended attribute filter, and the socket family
-   filter last (see "Seccomp").
+   filter last (see "Seccomp"). With `--explain`, the observer filter follows them, without
+   TSYNC (this kernel rejects TSYNC together with a new listener, measured on Linux 7.2: EINVAL;
+   the process has one thread here and every thread it starts later inherits the filter).
 8. `execve`. Only this call remains after the filters are in place.
 
 Landlock and seccomp restrict the calling thread. sandy starts no threads and verifies this before
@@ -488,7 +490,8 @@ measurement, so a kernel that closes the hole is noticed.
 
 ### Structure
 
-sandy installs up to four filters, built with `seccompiler` from `libc::SYS_*` numbers:
+sandy installs up to four filters, built with `seccompiler` from `libc::SYS_*` numbers, and a
+fifth only with `--explain` (see "Diagnostic mode"):
 
 1. **Allowlist.** Every number of the reviewed table is allowed: the Linux 7.2 table, on x86_64
    0 to 336 and 424 to 471, on arm64 0 to 243, 260 to 294 and 424 to 471. Every other number
@@ -683,6 +686,103 @@ Costs: children of the program cannot use these calls on each other, and a threa
 the one of the main thread counts as another process. For example,
 `pthread_setaffinity_np` and `pthread_setschedparam` fail for threads other than the main
 thread, and `nice` works only for the calling thread through ID 0.
+
+## Diagnostic mode
+
+`sandy run --explain` names the paths of a run that the policy does not grant. It is off by
+default. Its reason, and why observing this way does not weaken the sandbox, are in
+[DESIGN.md](DESIGN.md), "Diagnostic mode".
+
+How it works:
+
+1. sandy forks the program and stays its parent, as with `children = "contained"`. Only a
+   parent may read the memory of its child where Yama restricts ptrace
+   (`/proc/sys/kernel/yama/ptrace_scope` 1, the default on Debian and Ubuntu).
+2. The forked program installs the observer filter as its last step before `execve`. It returns
+   `SECCOMP_RET_USER_NOTIF` for the watched calls and allows everything else. The kernel hands
+   the installer a descriptor for the filter, which the program sends to sandy over a socket
+   pair with `SCM_RIGHTS`.
+3. A thread of sandy reads one notification per watched call, reads the path out of the calling
+   process with `process_vm_readv`, resolves it against that process's current directory or the
+   call's directory descriptor, and answers `SECCOMP_USER_NOTIF_FLAG_CONTINUE`.
+4. When no rule of this run grants what the call needs, sandy writes one line to standard error
+   with the path, the rule that comes closest and the policy grant that would allow it. Each
+   path is named once, and a closing line counts what the watcher saw.
+
+The watched calls are the ones that take a path and that Landlock can deny: `open`, `openat`,
+`creat`, `execve`, `execveat`, `truncate`, `mkdir`, `mkdirat`, `unlink`, `unlinkat`, `rmdir`,
+`mknod`, `mknodat`, `symlink` and `symlinkat` (x86_64; arm64 has only the `*at` forms). The
+`stat` family, `statx`, `access`, `faccessat`, `readlink` and `chdir` pass a path to the kernel
+but are not denied by any Landlock right (measured on Linux 7.2 in a domain that handles every
+right and grants nothing), so watching them would only cost two context switches per call.
+
+### What it cannot see
+
+The mode reports less than the kernel denies, and a report that is read as complete is worse
+than none. It does not see:
+
+- **Calls another seccomp filter already denies.** The kernel takes the most restrictive answer
+  of all filters, and an `errno` beats a notification, so the watcher is never told about them
+  (measured). With `path_metadata = "deny"` that covers `chmod`, `chown` and `setxattr` by path;
+  with `ip = "none"` or `unix_sockets = "none"` it covers `socket`; it also covers every call
+  outside the reviewed table, which fails with `ENOSYS`.
+- **Denials that are not about a path argument**: a signal the Landlock scope stops, a TCP bind
+  or connect Landlock denies, and a connection to a pathname Unix socket (ABI 9), whose address
+  is a `sockaddr` and not a path argument.
+- **`rename`, `link` and their `*at` forms**, which take two paths. They are not watched at all.
+- **What the kernel answered.** The verdict comes from sandy's own rules, not from the call's
+  result, which the watcher never sees. It is the same rule set Landlock gets, compared against
+  the path after symbolic links are resolved, so the two agree in the cases that matter; they
+  can differ where a path reaches a granted directory by another route, for example through a
+  bind mount, which the mode then names although the kernel allowed it.
+- **A path the watcher could not read**, because the process ended first or the host forbids
+  reading another process's memory (`ptrace_scope` 2 or 3). The closing line counts these.
+- **A process that outlives sandy.** The watcher ends with sandy, and the watched calls of such
+  a process then fail with `ENOSYS`. Do not use `--explain` for a program that daemonizes.
+- **More than 1000 paths.** The program decides how many paths it uses, and the watcher keeps
+  every path it named so that it names it only once. After 1000 it names no more, and the
+  closing line says so.
+
+The program can also change the path between the watcher's read and the call, which makes the
+report name a path the kernel never saw. That is a wrong report, not a weaker sandbox: see
+DESIGN.md.
+
+### Cost and other effects
+
+- Two context switches per watched call. Measured on Fedora 44: a run with about 4900 watched
+  calls took 0.11 to 0.24 seconds instead of 0.03, roughly 25 microseconds per call.
+- sandy stays the program's parent, so the caller's process ID is sandy's and not the program's
+  (as with `contained`; `--status-fd` reports the program's). sandy does not pass signals on in
+  this mode, which is why `--explain` with `process.end_with_parent` is refused unless
+  `children = "contained"` supervises the run.
+- The watcher is a thread of sandy, outside the sandbox, which parses bytes the program
+  controls. It reads at most one path of `PATH_MAX` bytes per call and acts on none of them.
+- The report goes to sandy's standard error, which is usually the program's as well. A reader
+  that goes away does not end the run: sandy ignores `SIGPIPE` from the moment the program is
+  forked (the program keeps the default action), and a line that cannot be written is dropped.
+  Without that, sandy would die and the program would lose its watcher.
+- A run with `--explain` is otherwise the same run: the Landlock ruleset and the other filters
+  are built exactly as without it.
+
+### What `check --explain-path` answers
+
+`sandy check --explain-path PATH` needs no run and no kernel feature. It prints, for each path,
+the deepest rule of the policy that covers it and what that rule allows, or that no rule covers
+it. The rules are the ones the run would give Landlock, including the minimal system set and
+the program's loader, so the answer is about this host and this policy.
+
+### Landlock's own audit records
+
+Linux 6.15 and newer let Landlock report its denials to the audit subsystem, which is the one
+source that knows what the kernel really answered. Measured on Fedora 44 with kernel 7.2 and
+`auditd` running: a denial produces `LANDLOCK_ACCESS domain=... blockers=fs.read_file
+path="/etc/hostname" dev="dm-0" ino=218832`, next to a `LANDLOCK_DOMAIN` record that ties the
+domain to the process that created it. sandy does not use these records, because reading them
+needs rights sandy must not require: `CAP_AUDIT_READ` for the audit multicast group, root for
+`/var/log/audit/audit.log` and `ausearch`, or membership in a group the journal is readable for
+(`adm`, `wheel` or `systemd-journal` on Fedora; `journalctl -t audit` showed the records for a
+user in `wheel`, and `dmesg` refused with `dmesg_restrict=1`). Where those rights exist, the
+audit log is the better source and it costs the run nothing.
 
 ## Minimal system set
 

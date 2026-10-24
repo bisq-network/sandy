@@ -745,6 +745,28 @@ messages that reach processes outside the sandbox.
   job without UI restrictions, so outside a job `check` touches nothing. `run` does not try: it
   finds out when it assigns the program.
 
+## Diagnostic mode
+
+`run --explain` is not available on Windows: sandy refuses the option here instead of reporting
+nothing, which would read as "nothing was denied". The question it answers, "which grant does
+this program need", is in [DESIGN.md](DESIGN.md), "Diagnostic mode", and the Linux
+implementation is in [linux.md](linux.md).
+
+Windows does not log an access denial by default. Object access auditing is off in the default
+audit policy (measured on the Windows 11 VM: `auditpol /get /subcategory:"File System"` answers
+`No Auditing`), and turning it on needs administrator rights (`auditpol /set /subcategory:"File
+System"`), a SACL on each object sandy would have to write (which needs `SeSecurityPrivilege`),
+and the Security event log to read the records, which also needs administrator rights. A
+diagnostic that needs all three is not a diagnostic an integrator can run, and sandy must not
+write SACLs on a user's directories to get it. There is no unprivileged alternative that
+reports what the AppContainer denied: a denied access returns `ERROR_ACCESS_DENIED` to the
+program and leaves no trace the program or sandy can read back.
+
+`check --explain-path` is Linux only as well. What decides a path here is the access control
+list of each object plus the AppContainer's capabilities, not a rule list sandy keeps, so an
+answer would be a second opinion that can disagree with what the kernel does. A wrong answer
+about a path is worse than none, so the backend answers nothing and sandy refuses the option.
+
 ## Known limitations
 
 1. `system = "none"` is unavailable (see above).

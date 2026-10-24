@@ -40,6 +40,11 @@ Options (they extend the policy file):
                              then start sandy through a wrapper (see the platform docs)
   --status-fd N              report the program's process ID and how it ended on descriptor N
                              (on Windows: an inherited handle); run only
+  --explain                  name the paths of the run that the policy does not grant, on
+                             standard error; off by default, it sees not every denial, and it
+                             is not available on every platform (run only)
+  --explain-path PATH        say what the policy allows for PATH and which rule decides it
+                             (repeatable; check only)
   --expose ADDRESS=PORT      relay connections on the loopback ADDRESS to the program's
                              loopback PORT, for example 127.0.0.1:18080=8080 (repeatable;
                              needs --ip all)
@@ -209,6 +214,10 @@ pub struct Invocation {
     /// `--status-fd`: the descriptor, or on Windows the handle, sandy writes the status record
     /// to. The number is checked when `run` takes it over.
     pub status_fd: Option<u64>,
+    /// `--explain`: the diagnostic mode of `run`.
+    pub explain: bool,
+    /// `--explain-path`: the paths `check` answers for.
+    pub explain_paths: Vec<PathBuf>,
     pub program: Option<PathBuf>,
     pub args: Vec<OsString>,
 }
@@ -256,6 +265,8 @@ where
         parent_pid: None,
         parent_start: None,
         status_fd: None,
+        explain: false,
+        explain_paths: Vec::new(),
         program: None,
         args: Vec::new(),
     };
@@ -350,6 +361,8 @@ where
             Long("parent-pid") => invocation.parent_pid = Some(parser.value()?.parse()?),
             Long("parent-start") => invocation.parent_start = Some(parser.value()?.parse()?),
             Long("status-fd") => invocation.status_fd = Some(parser.value()?.parse()?),
+            Long("explain") => invocation.explain = true,
+            Long("explain-path") => invocation.explain_paths.push(parser.value()?.into()),
             Value(program) => {
                 invocation.program = Some(program.into());
                 invocation.args = parser.raw_args()?.collect();
@@ -363,6 +376,12 @@ where
         (Mode::Run, None) => return Err("run needs a PROGRAM".into()),
         (Mode::Setup | Mode::Remove, Some(_)) => return Err("setup takes no PROGRAM".into()),
         _ => {}
+    }
+    if invocation.explain && invocation.mode != Mode::Run {
+        return Err("--explain belongs to run".into());
+    }
+    if !invocation.explain_paths.is_empty() && invocation.mode != Mode::Check {
+        return Err("--explain-path belongs to check".into());
     }
     Ok(Command::Sandbox(Box::new(invocation)))
 }

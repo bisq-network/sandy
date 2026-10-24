@@ -380,9 +380,58 @@ a moment later.
   control: the program's process group gets the terminal when the program uses it, and the rest
   of sandy's job gets it back when it uses it; any other stop of the program stops sandy, and
   `SIGCONT` to sandy continues the group.
+- Linux with `--explain`: sandy forks the program and stays its parent, as with `contained`,
+  because the watcher of the diagnostic mode must be allowed to read the memory of the program.
+  It waits for the program and exits with its status, or 128 plus the signal number. It does not
+  block or pass on signals: both processes are in the group the caller started, so a terminal
+  signal reaches the program directly and job control works, but a signal sent to sandy alone
+  ends sandy and leaves the program without its watcher (see below). `process.end_with_parent`
+  relies on such a signal, so sandy refuses that combination unless `contained` supervises.
 - Windows: there is no `execve`. sandy creates the program inside the AppContainer and a job
   object with kill-on-close, waits, and exits with the program's exit code. If sandy dies, the job
   closes and the program dies with it.
+
+## Diagnostic mode
+
+`run --explain` answers "which grant does this program need". It exists because a denial is
+often invisible: a program that cannot read a path treats the file as missing and runs on with
+less than it was built for, and neither its output nor its logs say so. Without the mode the
+only way to find such a path is to widen the policy until the program behaves differently.
+
+The mode is off by default, and it must not weaken the sandbox. Three rules follow from that.
+
+**Observing is sound where deciding would not be.** On Linux the mode installs one more seccomp
+filter in the program, which returns `SECCOMP_RET_USER_NOTIF` for the calls that take a path and
+that Landlock can deny. A thread of sandy reads the path out of the calling process and answers
+`SECCOMP_USER_NOTIF_FLAG_CONTINUE`. The kernel documents that this notification must not be used
+to make a security decision, because the program can change the path between the watcher's read
+and the call. That objection is about deciding, and nothing here decides: the watcher has one
+answer, and it is "carry on", so the kernel performs the call with the program's own credentials
+and its own Landlock domain. A path the program rewrites after the read makes the report wrong,
+never the sandbox weaker. For the same reason the watcher never uses
+`SECCOMP_IOCTL_NOTIF_ADDFD`, which would hand the program a descriptor the watcher opened and
+would move the decision out of the kernel.
+
+**The filter cannot change a decision either.** The observer returns only `USER_NOTIF` or
+`ALLOW`. The kernel takes the most restrictive answer of all filters, and `USER_NOTIF` is less
+restrictive than every action the other filters use, so a call they deny keeps their answer and
+never reaches the watcher (measured on Linux 7.2). `ALLOW` is what they would have returned
+anyway. A unit test checks this over every system call number for both filter configurations,
+and the compiled program is in the committed snapshot.
+
+**A report that is incomplete must say so.** The mode names the paths of the calls it watches
+that no rule of the run grants, and it says in its own output that it does not see every denial.
+What it cannot see is listed in [linux.md](linux.md), "Diagnostic mode": calls that seccomp
+already denies never notify, the verdict comes from sandy's rules and not from the kernel's
+answer, and the calls that take two paths are not watched. An integrator who reads silence as
+"nothing was denied" would be wrong, so a backend that cannot report at all refuses the option
+instead of printing nothing.
+
+What the mode costs: two context switches per watched call, sandy as the program's parent, and
+a program that outlives sandy whose watched calls then fail with `ENOSYS`. That is why it is
+opt in and documented as a tool for working out a policy. It also runs an unconfined watcher in
+sandy's own process for as long as the program runs, which parses bytes the program controls;
+it reads at most one path of bounded length per call and never acts on what it reads.
 
 ## Mechanisms (each backend section is owned by its backend)
 

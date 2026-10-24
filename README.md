@@ -346,6 +346,8 @@ macOS it does nothing because those backends leave nothing behind.
 | `--parent-pid PID` | With `--end-with-parent`: the caller's own process ID. sandy refuses to start if its parent is another process. | |
 | `--parent-start TOKEN` | With `--parent-pid`: when that process started, so sandy can tell the caller from a process that got its ID later. The caller may then start sandy through a wrapper. See [Processes](#processes). | |
 | `--status-fd N` | Report the program's process ID and how it ended on descriptor `N` (on Windows: an inherited handle). `run` only. See [Exit status](#exit-status). | |
+| `--explain` | Name the paths of the run that the policy does not grant, on standard error. `run` only, Linux only. See [Finding the grants a program needs](#finding-the-grants-a-program-needs). | off |
+| `--explain-path PATH` | Say what the policy allows for `PATH` and which rule decides it. `check` only, Linux only. | |
 | `--children allowed\|none\|contained` | Whether the program may start other processes, and whether they may outlive it. See [Processes](#processes). | `allowed` |
 | `--expose ADDRESS=PORT` | Relay connections on the loopback `ADDRESS` to the program's loopback `PORT`. Needs `--ip all`. | |
 | `--forward PORT=ADDRESS` | Relay the program's connections to its loopback `PORT` to the loopback `ADDRESS` outside the sandbox. Needs `--ip all`. | |
@@ -357,12 +359,53 @@ macOS it does nothing because those backends leave nothing behind.
 
 The options that take a path or a variable can be repeated.
 
+### Finding the grants a program needs
+
+A program that is denied a path often says nothing about it. It treats the file as missing and
+runs on with less than it was built for: without its country database, without its
+configuration, with built-in defaults instead of yours. Nothing in the output says so, and the
+program's own logs say nothing either.
+
+Two options answer the question "which grant does this program need". Both are Linux only
+today; the platform documents say what the other two hosts can and cannot report.
+
+`sandy check --explain-path PATH` says what the policy allows for one path and which rule
+decides it, without running anything:
+
+```console
+$ sandy check --policy convert.toml --explain-path /usr/share/data/table
+backend: linux
+enforced     filesystem confined to policy paths: Landlock ABI 10 ...
+/usr/share/data/table: no rule covers it
+```
+
+`sandy run --explain PROGRAM` watches the run and names every path it uses that the policy does
+not grant:
+
+```console
+$ sandy run --read /srv/in --explain -- /usr/bin/convert /srv/in/x
+sandy explain: on. It names the paths of this run that the policy does not grant, and it does
+not see every denial (docs/linux.md, "Diagnostic mode").
+sandy explain: cannot read /usr/share/data/table: no rule covers it; grant it with read
+(openat in process 4711)
+sandy explain: 1 path the policy does not grant, from 812 watched calls
+```
+
+The mode is off by default and changes nothing the sandbox enforces: it adds a seccomp filter
+that only reports, and sandy's watcher always lets the kernel carry the call out, so Landlock
+decides as it would without the mode. It is meant for working out a policy, not for production:
+it slows every watched call down (measured: about 25 microseconds each), sandy stays the
+program's parent while it runs, and a process that outlives sandy loses the watcher. Read
+"Diagnostic mode" in [docs/linux.md](docs/linux.md) before you trust its silence: it reports
+the paths a call uses, not what the kernel answered, and several kinds of denial never reach
+it.
+
 ### Exit status
 
 | Status | Meaning |
 |---|---|
 | the program's status | `sandy run` started the program |
-| 128 + signal number | Linux and macOS with `children = "contained"`: a signal ended the program |
+| 128 + signal number | Linux and macOS with `children = "contained"`, and Linux with `--explain`: a signal ended the program |
 | 125 | sandy failed or refused: invalid policy, a requirement this host cannot enforce, a socket on a standard stream that the policy denies, a setup error; with `children = "contained"` also a failure while sandy supervises the program |
 | 0 / 1 | `sandy check`: the policy is enforceable / not enforceable |
 
@@ -370,9 +413,9 @@ On Windows the program's 32-bit exit code is passed through unchanged.
 
 ### The status record
 
-The exit status leaves two things open. With `children = "contained"`, and always on Windows,
-sandy stays the parent, so the caller holds sandy's process ID and not the program's; and 125
-means both "sandy refused" and "the program exited with 125". `--status-fd N` answers both
+The exit status leaves two things open. With `children = "contained"`, with `--explain`, and
+always on Windows, sandy stays the parent, so the caller holds sandy's process ID and not the
+program's; and 125 means both "sandy refused" and "the program exited with 125". `--status-fd N` answers both
 without changing any exit status. sandy writes short lines to the descriptor, in this order:
 
 | Line | When |
@@ -382,8 +425,8 @@ without changing any exit status. sandy writes short lines to the descriptor, in
 | `signaled N` | sandy saw signal `N` end the program (Linux and macOS with `contained`) |
 | `failed` | sandy itself failed or refused; without a `pid` line the program never ran |
 
-In the exec model (Linux and macOS without `contained`) sandy becomes the program, so the
-record ends after `pid` and the caller's own wait status is the program's. sandy writes that
+In the exec model (Linux and macOS without `contained` and without `--explain`) sandy becomes
+the program, so the record ends after `pid` and the caller's own wait status is the program's. sandy writes that
 line right before it replaces itself with the program, so a `failed` line after it means that
 the `execve` failed. sandy makes the descriptor close-on-exec, and on Windows it keeps the
 handle out of what the program inherits, so the program never has it. Writing is best effort: a

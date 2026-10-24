@@ -240,6 +240,14 @@ fn sandbox(
     )?;
     refuse_writable_trusted_files(&resolved, invocation.policy_file.as_deref())?;
     let backend = platform_backend();
+    if invocation.explain && !backend.can_explain() {
+        return Err(format!(
+            "--explain is not available on this host: the {} backend has no way to report what \
+             it denied that does not need more rights than sandy has (see the platform \
+             documentation)",
+            backend.name()
+        ));
+    }
     let mut reported = backend.plan(&resolved);
     if invocation.mode == Mode::Check {
         reported.extend(backend.verify(&resolved));
@@ -249,6 +257,20 @@ fn sandbox(
     match invocation.mode {
         Mode::Check => {
             print!("backend: {}\n{plan}", backend.name());
+            if !invocation.explain_paths.is_empty() {
+                let answers = backend
+                    .explain_paths(&resolved, &invocation.explain_paths)
+                    .ok_or_else(|| {
+                        format!(
+                            "--explain-path is not available on this host: the {} backend cannot \
+                             say which rule decides a path (see the platform documentation)",
+                            backend.name()
+                        )
+                    })?;
+                for answer in answers {
+                    println!("{answer}");
+                }
+            }
             // On standard error and with a prefix of their own, so that a caller which reads the
             // one line per requirement that check prints keeps working (see README.md).
             for warning in resolved.warnings(home_directory().as_deref()) {
@@ -299,6 +321,7 @@ fn sandbox(
                 env: target_environment(&resolved.environment, std::env::vars_os()),
                 cwd: invocation.cwd,
                 parent,
+                explain: invocation.explain,
             };
             let code = backend
                 .run(&resolved, &command, status)

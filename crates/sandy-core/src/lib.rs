@@ -21,5 +21,6 @@ pub use policy::{
     SignalScope, SystemAccess, WindowsPolicy,
 };
 pub use resolve::{
-    PathAccess, PathIdentity, PathRule, ProtectedPath, ResolvedPolicy, path_directories, shebang,
+    PathAccess, PathIdentity, PathRule, ProtectedPath, ResolvedPolicy, canonical_location,
+    path_directories, shebang,
 };

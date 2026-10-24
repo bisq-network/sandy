@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use seccompiler::{
     BackendError, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
-    SeccompFilter, SeccompRule, TargetArch,
+    SeccompFilter, SeccompRule, TargetArch, sock_filter,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +46,9 @@ pub struct FilterConfig {
 #[cfg(target_arch = "x86_64")]
 mod arch {
     pub const TARGET: Option<seccompiler::TargetArch> = Some(seccompiler::TargetArch::x86_64);
+    /// `AUDIT_ARCH_X86_64`: EM_X86_64 with the 64-bit and the little-endian bit. seccompiler
+    /// keeps its own copy private, and the observer program needs it.
+    pub const AUDIT_ARCH: u32 = 62 | 0x8000_0000 | 0x4000_0000;
     /// The x86_64 table of Linux 7.2 (arch/x86/entry/syscalls/syscall_64.tbl). Numbers 337 to
     /// 423 are not assigned.
     pub const REVIEWED: &[(i64, i64)] = &[(0, 336), (424, 471)];
@@ -79,6 +82,8 @@ mod arch {
 #[cfg(target_arch = "aarch64")]
 mod arch {
     pub const TARGET: Option<seccompiler::TargetArch> = Some(seccompiler::TargetArch::aarch64);
+    /// `AUDIT_ARCH_AARCH64`: EM_AARCH64 with the 64-bit and the little-endian bit.
+    pub const AUDIT_ARCH: u32 = 183 | 0x8000_0000 | 0x4000_0000;
     /// The generic table (include/uapi/asm-generic/unistd.h) of Linux 7.2 for 64-bit arm64.
     /// 244 to 259 are reserved for architecture-specific calls, which arm64 does not have.
     /// 403 to 423 exist only for 32-bit ABIs.
@@ -95,6 +100,7 @@ mod arch {
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod arch {
     pub const TARGET: Option<seccompiler::TargetArch> = None;
+    pub const AUDIT_ARCH: u32 = 0;
     pub const REVIEWED: &[(i64, i64)] = &[];
     pub const DENIED: &[i64] = &[];
     pub const PATH_METADATA: &[i64] = &[];
@@ -827,6 +833,44 @@ pub fn relay() -> Result<Filters, BackendError> {
     })
 }
 
+/// The program of the diagnostic mode (`explain`): `calls` return SECCOMP_RET_USER_NOTIF, every
+/// other call and every other CPU architecture is allowed. It is written by hand, because
+/// seccompiler has no notification action.
+///
+/// The program cannot change what the sandbox allows. USER_NOTIF is less restrictive than every
+/// action the other filters use, so a call they deny keeps their answer and never reaches the
+/// watcher (measured on Linux 7.2), and ALLOW is what they would have returned anyway. Only a
+/// call that all filters allow notifies, and the watcher answers with
+/// SECCOMP_USER_NOTIF_FLAG_CONTINUE, which leaves the decision to Landlock. See `explain.rs`.
+pub fn observer(calls: &[i64]) -> BpfProgram {
+    const LOAD: u16 = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
+    const JUMP_EQ: u16 = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
+    const RETURN: u16 = (libc::BPF_RET | libc::BPF_K) as u16;
+    /// Offsets of `nr` and `arch` in `struct seccomp_data`.
+    const CALL: u32 = 0;
+    const ARCHITECTURE: u32 = 4;
+
+    let insn = |code, jt, jf, k| sock_filter { code, jt, jf, k };
+    // Every jump leads to one of the two return instructions at the end: the comparison of call
+    // number `index` jumps over the `count - index - 1` comparisons after it and over the allow,
+    // and the architecture check jumps over every comparison and lands on the allow.
+    let count = calls.len();
+    let to_allow =
+        u8::try_from(count + 1).expect("the observer watches few enough calls for one jump");
+    let mut program = vec![
+        insn(LOAD, 0, 0, ARCHITECTURE),
+        insn(JUMP_EQ, 0, to_allow, arch::AUDIT_ARCH),
+        insn(LOAD, 0, 0, CALL),
+    ];
+    for (index, &call) in calls.iter().enumerate() {
+        let to_notify = (count - index) as u8;
+        program.push(insn(JUMP_EQ, to_notify, 0, call as u32));
+    }
+    program.push(insn(RETURN, 0, 0, libc::SECCOMP_RET_ALLOW));
+    program.push(insn(RETURN, 0, 0, libc::SECCOMP_RET_USER_NOTIF));
+    program
+}
+
 /// Installs the filters on every thread of the process, in order. They stay in force across
 /// execve and are inherited by every child.
 pub fn install(filters: &Filters) -> Result<(), seccompiler::Error> {
@@ -853,6 +897,11 @@ mod tests {
     const RET_ENOSYS: u32 = libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32;
     const RET_NO_FAMILY: u32 = libc::SECCOMP_RET_ERRNO | libc::EAFNOSUPPORT as u32;
     const RET_NO_XATTRS: u32 = libc::SECCOMP_RET_ERRNO | libc::ENOTSUP as u32;
+    const RET_USER_NOTIF: u32 = libc::SECCOMP_RET_USER_NOTIF;
+
+    /// The highest system call number the tests and the snapshot look at. Above the reviewed
+    /// table, so they also record what the programs do with the numbers of a newer kernel.
+    const LAST_CALL: i64 = 511;
 
     #[cfg(target_arch = "x86_64")]
     const NATIVE: u32 = 62 | 0x8000_0000 | 0x4000_0000;
@@ -1012,10 +1061,6 @@ mod tests {
         /// The pidfd of the program in the watcher's snapshot, which its rules compare against.
         const WATCHED_PROGRAM: i32 = 4;
 
-        /// The highest system call number the snapshot lists. Above the reviewed table, so it also
-        /// records what the programs do with the numbers of a newer kernel.
-        const SNAPSHOT_LAST_CALL: i64 = 511;
-
         /// Repeated at the top of the snapshot file, so the file says what it is.
         const SNAPSHOT_HEADER: &str = "\
 # The compiled seccomp programs of sandy's configurations on x86_64, written by
@@ -1050,6 +1095,7 @@ mod tests {
             let errno = (action & libc::SECCOMP_RET_DATA) as i32;
             match action {
                 RET_ALLOW => "allow".to_string(),
+                RET_USER_NOTIF => "notify".to_string(),
                 RET_KILL_PROCESS => "kill process".to_string(),
                 _ if action & libc::SECCOMP_RET_ACTION_FULL == libc::SECCOMP_RET_ERRNO => {
                     match errno {
@@ -1074,9 +1120,8 @@ mod tests {
             ));
             let mut first = 0;
             let mut action = evaluate(program, NATIVE, 0, [0; 6]);
-            for nr in 1..=SNAPSHOT_LAST_CALL + 1 {
-                let next =
-                    (nr <= SNAPSHOT_LAST_CALL).then(|| evaluate(program, NATIVE, nr, [0; 6]));
+            for nr in 1..=LAST_CALL + 1 {
+                let next = (nr <= LAST_CALL).then(|| evaluate(program, NATIVE, nr, [0; 6]));
                 if next == Some(action) {
                     continue;
                 }
@@ -1120,6 +1165,11 @@ mod tests {
                 }
             }
             render("allowlist", &strict.allowlist, &mut out);
+            render(
+                "observer",
+                &observer(&crate::explain::watched_calls()),
+                &mut out,
+            );
             out
         }
 
@@ -1353,6 +1403,53 @@ mod tests {
                 RET_ALLOW,
                 "{command:#x}"
             );
+        }
+    }
+
+    /// The program of the diagnostic mode has only these two answers, so it can never be the
+    /// filter that decides a call: every other action is more restrictive than USER_NOTIF, and
+    /// the kernel takes ALLOW only when every other filter allows the call too.
+    #[test]
+    fn the_observer_only_allows_or_notifies() {
+        let watched = crate::explain::watched_calls();
+        let program = observer(&watched);
+        for nr in -1..=LAST_CALL {
+            let action = evaluate(&program, NATIVE, nr, [0; 6]);
+            let expected = if watched.contains(&nr) {
+                RET_USER_NOTIF
+            } else {
+                RET_ALLOW
+            };
+            assert_eq!(action, expected, "system call {nr}");
+        }
+        // Another architecture is the allowlist's business, which kills the process.
+        const AUDIT_ARCH_I386: u32 = 3 | 0x4000_0000;
+        let foreign = evaluate(&program, AUDIT_ARCH_I386, watched[0], [0; 6]);
+        assert_eq!(foreign, RET_ALLOW);
+    }
+
+    /// The diagnostic mode must not be a way around the sandbox. With the observer installed,
+    /// every call keeps the answer it had; only a watched call that was allowed becomes a
+    /// notification, which the watcher always continues (`explain::answer_continue`).
+    #[test]
+    fn the_observer_changes_no_decision() {
+        let watched = crate::explain::watched_calls();
+        let program = observer(&watched);
+        let rank = |action: u32| (action & libc::SECCOMP_RET_ACTION_FULL) as i32;
+        for config in [strict(), open()] {
+            let filters = build(&config, OWN_PID).unwrap();
+            for nr in -1..=LAST_CALL {
+                let without = decide_with(&filters, NATIVE, nr, [0; 6]);
+                let observed = evaluate(&program, NATIVE, nr, [0; 6]);
+                let with = if rank(observed) < rank(without) {
+                    observed
+                } else {
+                    without
+                };
+                let notified = watched.contains(&nr) && without == RET_ALLOW;
+                let expected = if notified { RET_USER_NOTIF } else { without };
+                assert_eq!(with, expected, "system call {nr}");
+            }
         }
     }
 

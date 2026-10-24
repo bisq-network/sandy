@@ -5,6 +5,7 @@
 
 mod cgroup;
 mod contain;
+mod explain;
 mod filter;
 mod helper;
 mod host;
@@ -36,6 +37,31 @@ impl Backend for LinuxBackend {
 
     fn notes(&self, policy: &ResolvedPolicy) -> Vec<String> {
         plan::notes(policy, &HostCapabilities::detect_for(policy))
+    }
+
+    fn can_explain(&self) -> bool {
+        true
+    }
+
+    fn explain_paths(
+        &self,
+        policy: &ResolvedPolicy,
+        paths: &[std::path::PathBuf],
+    ) -> Option<Vec<String>> {
+        let host = HostCapabilities::detect_for(policy);
+        let Some(landlock) = plan::landlock_for(policy, &host) else {
+            return Some(vec![
+                "this host has no Landlock, so the policy grants nothing and sandy refuses to \
+                 start the program"
+                    .to_string(),
+            ]);
+        };
+        Some(
+            paths
+                .iter()
+                .map(|path| explain::explain_path(&landlock, path))
+                .collect(),
+        )
     }
 
     fn run(

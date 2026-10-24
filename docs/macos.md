@@ -733,6 +733,34 @@ no privilege, and closing them would break ordinary programs:
   (`bulk_listing_reaches_only_the_root_directory`). A directory the policy does not grant cannot
   be opened, so the call cannot reach it.
 
+## Diagnostic mode
+
+`run --explain` is not available on macOS: sandy refuses the option here instead of reporting
+nothing, which would read as "nothing was denied". The question it answers, "which grant does
+this program need", is in [DESIGN.md](DESIGN.md), "Diagnostic mode", and the Linux
+implementation is in [linux.md](linux.md).
+
+What a sandboxed process can learn about its own denials on macOS, measured on macOS 26.5 as
+the standard user `mini`:
+
+- Seatbelt denials go to the unified log, and nothing else records them. `log show` answers
+  `Could not open local log store: Operation not permitted`, and `log stream` answers `Must be
+  admin to run 'stream' command`. A process cannot even read back the denials of its own
+  sandbox without administrator rights, which a diagnostic must not need.
+- The profile cannot ask for a report of its own: a profile with `(deny default (with report))`
+  is rejected at compile time with `report modifier does not apply to deny action`.
+- There are no readable violation reports: `~/Library/Logs/DiagnosticReports` does not exist and
+  `/Library/Logs/DiagnosticReports` is not readable for the user.
+- Seatbelt's `(trace "FILE")` profile directive is not a candidate either. It is a profile that
+  collects operations instead of denying them, so it would replace the sandbox rather than
+  observe it, which the diagnostic mode must never do. In the measurement the traced process
+  could not even start (`execvp() ... Operation not permitted`).
+
+`check --explain-path` is Linux only as well. The profile that decides a path here is SBPL text,
+not a rule list sandy keeps, so the macOS backend would have to answer from a second source
+that can disagree with the profile it generates. A wrong answer about a path is worse than
+none, so the backend answers nothing and sandy refuses the option.
+
 ## Known limitations
 
 - The Seatbelt functions are private API (see above). A man page of a macOS 27 SDK, quoted on the

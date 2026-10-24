@@ -123,18 +123,10 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
 /// limits runs as it is.
 pub fn notes(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
     let mut notes = policy.path_directory_notes(&host.path_locations);
-    let Ok(&version) = host.landlock.as_ref() else {
+    let Some(rules) = landlock_for(policy, host).map(|landlock| landlock.rules) else {
         // Without Landlock the policy is refused anyway, and there are no rules to compare with.
         return notes;
     };
-    let loader = program_loader(policy);
-    let rules = landlock_config(
-        policy,
-        &host.system_paths,
-        loader.as_deref(),
-        ABI::from(version),
-    )
-    .rules;
     let readable = |path: &Path| {
         let covers = |rule: &PathRights| {
             rule.access.contains(AccessFs::ReadFile) && path.starts_with(&rule.path)
@@ -162,6 +154,20 @@ pub fn notes(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
         notes.extend(cgroup::note(cgroup::limits()));
     }
     notes
+}
+
+/// The Landlock rules this policy gets on this host, for the callers that need the rules alone:
+/// the notes above and the diagnostic mode. `None` when the host has no Landlock, where sandy
+/// refuses to start the program anyway.
+pub fn landlock_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Option<LandlockConfig> {
+    let &version = host.landlock.as_ref().ok()?;
+    let loader = program_loader(policy);
+    Some(landlock_config(
+        policy,
+        &host.system_paths,
+        loader.as_deref(),
+        ABI::from(version),
+    ))
 }
 
 fn plan_item(

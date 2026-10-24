@@ -332,6 +332,69 @@ fn check_reports_contained_children_inside_a_contained_sandbox() {
 /// directory, /usr/lib and the dyld shared cache, so no program starts with it. check reported
 /// such a policy as enforced and the program then died at its start. A policy that reads the root
 /// directory brings those paths itself.
+/// `check --explain-path` says which rule decides a path. A backend that cannot answer must
+/// refuse the question instead of printing a guess that a caller would act on.
+#[test]
+fn explain_path_says_which_rule_decides_a_path() {
+    let fixture = Fixture::new("explain-path");
+    let mut args = fixture.access_args();
+    for path in ["ro/file", "rw/file", "secret/file"] {
+        args.push("--explain-path".to_string());
+        args.push(fixture.arg(path));
+    }
+    let output = check_with_home(&fixture.path("ro"), &args);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !cfg!(target_os = "linux") {
+        assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{stdout}{stderr}");
+        assert!(
+            stderr.contains("--explain-path is not available"),
+            "{stderr}"
+        );
+        return;
+    }
+    assert!(output.status.success(), "{stdout}{stderr}");
+    for (path, answer) in [
+        (
+            "ro/file",
+            format!("the rule {} allows read", fixture.arg("ro")),
+        ),
+        (
+            "rw/file",
+            format!("the rule {} allows read and write", fixture.arg("rw")),
+        ),
+        ("secret/file", "no rule covers it".to_string()),
+    ] {
+        let line = format!("{}: {answer}", fixture.arg(path));
+        assert!(stdout.contains(&line), "no line {line:?} in:\n{stdout}");
+    }
+    // Control: the requirement lines a caller reads are still the first lines of the output.
+    assert!(stdout.starts_with("backend: "), "{stdout}");
+}
+
+/// The diagnostic mode belongs to `run`, and a backend that cannot report what it denied must
+/// refuse it: a mode that prints nothing would read as "nothing was denied".
+#[test]
+fn explain_is_refused_where_it_reports_nothing() {
+    let output = sandy(["check", "--explain"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{stderr}");
+    assert!(stderr.contains("--explain belongs to run"), "{stderr}");
+
+    let fixture = Fixture::new("explain-unavailable");
+    let mut args = fixture.access_args();
+    args.push("--explain".to_string());
+    let output = sandy(run_args(&args, &[("read", &fixture.arg("ro/file"))]));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if cfg!(target_os = "linux") {
+        assert!(output.status.success(), "{output:?}");
+        assert!(stderr.contains("sandy explain: "), "{stderr}");
+    } else {
+        assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{stderr}");
+        assert!(stderr.contains("--explain is not available"), "{stderr}");
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn check_refuses_system_none_without_the_root_directory() {

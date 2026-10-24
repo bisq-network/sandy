@@ -25,6 +25,10 @@ pub struct TargetCommand {
     /// For `process.end_with_parent`: the process that started sandy. `None` lets the backend
     /// find the parent itself.
     pub parent: Option<ParentProcess>,
+    /// `--explain`: report what the sandbox denied while the program runs. It must change
+    /// nothing the sandbox enforces. A backend that has no sound way to report it refuses the
+    /// run, because silence would read as "nothing was denied".
+    pub explain: bool,
 }
 
 /// For `process.end_with_parent`: the process sandy watches.
@@ -143,6 +147,20 @@ pub trait Backend {
     /// leave the host as it found it.
     fn notes(&self, _policy: &ResolvedPolicy) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Whether this backend can report what the sandbox denied while the program runs
+    /// (`run --explain`). A backend without a sound way to do it says so here, and the CLI
+    /// refuses the option: a diagnostic that reports nothing would read as "nothing was denied".
+    fn can_explain(&self) -> bool {
+        false
+    }
+
+    /// What the sandbox of this policy allows for each of `paths` on this host, and which rule
+    /// decides it (`check --explain-path`). `None` from a backend that cannot answer; the CLI
+    /// then says so instead of printing a guess. Reads host state like `verify`.
+    fn explain_paths(&self, _policy: &ResolvedPolicy, _paths: &[PathBuf]) -> Option<Vec<String>> {
+        None
     }
 
     /// One-time host preparation that needs elevated rights, for example on Windows. Must be

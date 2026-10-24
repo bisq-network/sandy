@@ -41,24 +41,28 @@ use std::ptr;
 
 use sandy_core::{SandboxError, StatusReport};
 
+use crate::explain::Explain;
 use crate::helper::{block_signals, close_descriptors_except, pipe, set_undumpable};
 use crate::launch::ensure_single_thread;
 
 /// Shells report a program that a signal ended with this status plus the signal number.
-const SIGNALED: i32 = 128;
+pub(crate) const SIGNALED: i32 = 128;
 /// The forked child's exit status when it cannot start the program. sandy reports the message
 /// from the pipe instead.
-const START_FAILED: i32 = 125;
+pub(crate) const START_FAILED: i32 = 125;
 
 /// Starts the program in a process group that sandy ends when the program ends, and returns the
 /// exit status for sandy. `start` runs in the forked child: it confines the child and executes
 /// the target, and returns only on failure.
 /// `ended` is the write end of the relay's pipe, if a relay runs: only the guard keeps it, so it
 /// ends when the guard has ended the group.
+/// `explain` is the diagnostic mode, which watches the program from here because sandy is
+/// already its parent.
 pub fn run(
     start: impl FnOnce() -> SandboxError,
     ended: Option<File>,
     status: &StatusReport,
+    mut explain: Option<&mut Explain>,
 ) -> Result<i32, SandboxError> {
     ensure_single_thread()?;
     set_child_subreaper()?;
@@ -87,6 +91,11 @@ pub fn run(
         }
     }
     drop(report_write);
+    // Before the report is read: the execve that ends the report pipe is a watched call and
+    // waits for the watcher.
+    if let Some(explain) = &mut explain {
+        explain.start()?;
+    }
     let mut message = Vec::new();
     report
         .read_to_end(&mut message)
@@ -99,6 +108,9 @@ pub fn run(
     status.started(group.program.expect("the program was started") as u32);
     let exited = group.supervise(&signals)?;
     group.end();
+    if let Some(explain) = &mut explain {
+        explain.finish();
+    }
     Ok(match exited.code {
         libc::CLD_EXITED => {
             status.exited(exited.status);
