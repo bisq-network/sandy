@@ -1125,6 +1125,38 @@ fn opening_for_ioctl_only_is_denied() {
     lines[1].assert_blocked();
 }
 
+/// Why `open` with access mode 3 has to be denied, and with it `openat2`: Landlock checks no
+/// right for such an open, so the descriptor reaches a file the policy grants nothing on, and
+/// the metadata calls on a descriptor then change that file. Landlock has no hook for them at
+/// any ABI, so no ABI makes `openat2` safe to allow. The day a kernel closes this, the run
+/// outside the sandbox fails here and the decision can be taken again (see "Access mode 3" in
+/// docs/linux.md).
+#[test]
+fn landlock_alone_allows_access_mode_3() {
+    let fixture = Fixture::new("linux-mode3");
+    let target = fixture.path("secret/file");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+    let argument = fixture.arg("secret/file");
+    let actions = [("landlock-ioctl-only", argument.as_str())];
+    probe_outside(&actions)[0].assert_ok();
+    let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "fchmod on the descriptor changed nothing");
+    probe_inside(&fixture.access_args(), &actions)[0].assert_blocked();
+}
+
+/// `openat2` is not in the allowlist, so it fails with `ENOSYS`. Its flags live in an
+/// `open_how` structure in memory, which seccomp cannot read, so the rule against access mode 3
+/// cannot be applied to it (see `landlock_alone_allows_access_mode_3`). Every kernel with
+/// Landlock has `openat2`, so the run outside the sandbox needs no host check.
+#[test]
+fn openat2_is_not_in_the_allowlist() {
+    let fixture = Fixture::new("linux-openat2");
+    let argument = fixture.arg("ro/file");
+    let lines = controlled(&fixture.access_args(), &[("openat2-read", &argument)]);
+    lines[0].assert_blocked();
+    assert!(lines[0].detail.contains("os error 38"), "{lines:?}");
+}
+
 #[test]
 fn system_v_shared_memory_is_unreachable() {
     struct Segment(libc::c_int);

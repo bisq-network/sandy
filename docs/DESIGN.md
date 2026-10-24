@@ -388,6 +388,8 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   pathname Unix sockets when `unix_sockets = "none"`; ABI 4 denies TCP when `ip = "none"`.
 - Seccomp allowlist: the reviewed system call table of Linux 7.2; every other number, x32 numbers,
   `clone3`, `openat2` and `fanotify_init` fail with `ENOSYS`; other CPU architectures are killed.
+  `openat2` stays out because its flags live in memory, so the rule against access mode 3 below
+  cannot be applied to it. The cost is GNU tar, which does not fall back (docs/linux.md).
 - Seccomp socket family filter: `socket` with a family outside the policy (an allowlist) fails
   with `EAFNOSUPPORT`, so that programs fall back as they would on a kernel without the family.
 - Seccomp extended attribute filter: with `path_metadata = "deny"`, the reads that take a path

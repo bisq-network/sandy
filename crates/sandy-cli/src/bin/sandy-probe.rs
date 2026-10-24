@@ -619,6 +619,8 @@ mod linux {
         "list-fd",
         "getpwuid",
         "current-exe",
+        "openat2-read",
+        "landlock-ioctl-only",
     ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
@@ -646,6 +648,8 @@ mod linux {
             "enable-verity" => enable_verity(target),
             "open" => fs::File::open(target).map(|_| String::new()),
             "open-ioctl-only" => open_ioctl_only(target),
+            "openat2-read" => openat2_read(target),
+            "landlock-ioctl-only" => landlock_ioctl_only(target),
             "fchmod-readonly" => fchmod_readonly(target),
             "status-field" => status_field(target),
             "read-fd" => read_fd(number(target)?),
@@ -1252,6 +1256,83 @@ mod linux {
         let fd = check(unsafe { libc::open(path.as_ptr(), libc::O_ACCMODE | libc::O_CLOEXEC) })?;
         close(fd);
         Ok(String::new())
+    }
+
+    /// Opens with openat2, the call GNU tar uses for the directories of an archive.
+    fn openat2_read(target: &str) -> io::Result<String> {
+        /// `struct open_how`, the flags of openat2. They live in memory, which is why the
+        /// seccomp filter cannot check them.
+        #[repr(C)]
+        struct OpenHow {
+            flags: u64,
+            mode: u64,
+            resolve: u64,
+        }
+        let path = CString::new(target)?;
+        let how = OpenHow {
+            flags: (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: 0,
+        };
+        // SAFETY: `path` is a valid C string, and the kernel reads `how` for the size given.
+        let fd = check(unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                &how,
+                size_of::<OpenHow>(),
+            ) as libc::c_int
+        })?;
+        close(fd);
+        Ok(String::new())
+    }
+
+    /// What Landlock alone does with access mode 3, the reason the filter denies openat2: the
+    /// probe puts itself in a Landlock domain that grants no path, and then opens `target` with
+    /// access mode 3 and changes its permissions through the descriptor. Handling the two rights
+    /// that decide an open is enough, because such an open asks for neither of them, so Landlock
+    /// checks no right for it (see "Access mode 3" in docs/linux.md).
+    ///
+    /// It restricts this process, so it must be the only action of a probe run.
+    fn landlock_ioctl_only(target: &str) -> io::Result<String> {
+        const READ_FILE: u64 = 1 << 2;
+        const WRITE_FILE: u64 = 1 << 1;
+        // The kernel reads as many bytes of the ruleset attribute as the size gives, so the
+        // first field on its own is the attribute of the first Landlock ABI.
+        let handled_access_fs: u64 = READ_FILE | WRITE_FILE;
+        // SAFETY: the kernel reads `handled_access_fs` for the size given.
+        let ruleset = check(unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                &handled_access_fs,
+                size_of::<u64>(),
+                0,
+            ) as libc::c_int
+        })?;
+        // SAFETY: prctl takes no pointer here, and restrict_self takes the ruleset descriptor.
+        let restricted = unsafe {
+            libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
+                && libc::syscall(libc::SYS_landlock_restrict_self, ruleset, 0) == 0
+        };
+        let failure = io::Error::last_os_error();
+        close(ruleset);
+        if !restricted {
+            return Err(failure);
+        }
+        let path = CString::new(target)?;
+        // SAFETY: `path` is a valid C string.
+        let readable = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if readable >= 0 {
+            close(readable);
+            return Err(io::Error::other("the domain allows a read-only open"));
+        }
+        // SAFETY: `path` is a valid C string.
+        let fd = check(unsafe { libc::open(path.as_ptr(), libc::O_ACCMODE | libc::O_CLOEXEC) })?;
+        // SAFETY: fchmod takes a descriptor this function owns.
+        let changed = check(unsafe { libc::fchmod(fd, 0o600) });
+        close(fd);
+        changed.map(|_| String::new())
     }
 
     /// Changes the permissions through an open descriptor (fchmod).

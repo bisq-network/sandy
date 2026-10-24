@@ -603,7 +603,8 @@ both filters allow without conditions skip the BPF code. Calls with argument che
 | `kexec_load`, `kexec_file_load`, `init_module`, `finit_module`, `delete_module`, `reboot`, `swapon`, `swapoff`, `acct`, `quotactl`, `quotactl_fd`, `syslog`, `iopl`, `ioperm`, `open_by_handle_at`, `uselib`, `settimeofday`, `clock_settime` | `EPERM` | All need capabilities. Second layer. |
 | `personality` except `0`, `0x8`, `0x20000`, `0x20008`, `0xffffffff` (the values Docker allows); `modify_ldt` | `EPERM` | Old exploit helpers. Flatpak denies `modify_ldt`; Docker allows it on x86. |
 | Path-based metadata calls and `fchmodat`, `fchmodat2`, `fchownat` (section 3.4, option a) | `EPERM` | Recommended default; needs the project owner's decision. |
-| `truncate`, `truncate64`; `open` and `openat` with `O_TRUNC` in read-only mode; `openat2` (`ENOSYS`) | `EPERM` | Only when the kernel's Landlock ABI is 1 or 2 (section 3.4). |
+| `truncate`, `truncate64`; `open` and `openat` with `O_TRUNC` in read-only mode | `EPERM` | Only when the kernel's Landlock ABI is 1 or 2 (section 3.4). |
+| `openat2` | `ENOSYS` | This section proposed it only below ABI 3. sandy returns it on every ABI: the flags of `openat2` live in memory, where no rule can look at them, and sandy needs a rule against access mode 3 (docs/linux.md). |
 
 Root and capabilities: `no_new_privs` stops `execve` from adding privileges, but it does not
 remove privileges that sandy already has. If a user runs sandy as root, the program keeps root

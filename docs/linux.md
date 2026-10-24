@@ -416,11 +416,33 @@ derives the rights it checks at open time from the read and write modes of the d
 checks no right for such an open. This is a limitation of Landlock, and sandy closes it with
 seccomp.
 
-Tested on Linux 7.2 with ABI 9 enforced: `open(path, 3)` on a file outside the policy succeeded,
-and `fchmod` and `fsetxattr` on that descriptor changed the file. On ABI 1 to 4 such a descriptor
-would also allow device ioctls on any device the user can open (derived from the kernel source,
-not tested). The denylist therefore denies `open` and `openat` with access mode 3, and `openat2`
-fails with `ENOSYS`, because seccomp cannot read its flags.
+Measured on Fedora 44 (Linux 7.2, Landlock ABI 10), in a domain that handles every right of ABI 9
+as sandy builds it, on a file that the policy grants nothing on and that the user may read and
+write:
+
+| On the descriptor of `open(path, 3)` | Result |
+|---|---|
+| the open itself | succeeds on every path the user may read and write; `EACCES` where the file permissions deny one of the two |
+| `fchmod`, `fchown`, `fsetxattr`, `futimens` | change the file |
+| `fstat`, `statx`, `fgetxattr`, `flistxattr` | read its metadata and its extended attributes |
+| `ioctl` on a regular file (`FIONREAD`, `FS_IOC_GETFLAGS`) | works |
+| `ioctl` on a device | `EACCES` from ABI 5; reaches the driver on ABI 1 to 4 |
+| `read`, `write`, `flock` | `EBADF` |
+| `ftruncate` | `EINVAL` |
+| `mmap`, `execveat` and `linkat` with `AT_EMPTY_PATH`, reopening through `/proc/self/fd` | `EACCES` |
+
+The descriptor does not reach the contents of the file, but it carries the metadata calls past
+Landlock in both directions, which is also a way around `path_metadata = "deny"`.
+`LANDLOCK_ACCESS_FS_IOCTL_DEV` (ABI 5) covers only the device ioctls. Landlock has no hook for
+the metadata calls on a descriptor at any ABI, ABI 10 included, so no ABI makes access mode 3
+harmless.
+
+The denylist therefore denies `open` and `openat` with access mode 3. `openat2` performs the same
+opens, and its flags live in an `open_how` structure in memory, which seccomp cannot read, so the
+rule cannot be applied to it and the call is left out of the allowlist (`ENOSYS`). Allowing it
+from some ABI upwards would reopen the hole on every kernel, so sandy does not. The cost is GNU
+tar (see "Structure" below). `landlock_alone_allows_access_mode_3` in `escape_linux.rs` holds the
+measurement, so a kernel that closes the hole is noticed.
 
 ## Seccomp
 
@@ -449,9 +471,14 @@ failure. `socketpair` keeps `EPERM`, because its denials are about the socket ty
 family. Arguments of type int (socket family, ioctl command, clone flags, open flags) are
 compared on their low 32 bits only, because the kernel ignores the high bits.
 
-Not every caller falls back. GNU tar 1.35 on glibc 2.43 opens a file in a subdirectory with
-`openat2` and gives up when that fails, so it extracts the top directory of an archive and
-nothing below it (measured on Fedora 44, under both settings of `path_metadata`).
+Not every caller falls back. GNU tar 1.35 on glibc 2.43 opens each directory of an archive with
+`openat2` (`O_PATH` with `RESOLVE_BENEATH`) and gives up when that fails, so it creates the top
+directory of an archive and extracts nothing below it. Another error code does not help: with a
+filter that failed `openat2` with `EPERM`, `EINVAL`, `EOPNOTSUPP`, `EACCES` or `ENOENT` instead,
+tar gave up the same way. Creating and listing an archive work, and so does extracting one that
+holds no directory, and `bsdtar` extracts the same archive in the sandbox. Measured on Fedora 44,
+under both settings of `path_metadata`. Why `openat2` is not allowed instead is in "Access
+mode 3".
 
 ### Denylist
 
@@ -938,8 +965,8 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   `mkfifo` and symbolic links in writable paths, metadata changes and extended attribute reads
   by path with the default setting, `fanotify`, `chattr` and the other file system ioctls that
   change a file, file leases, `ldattach`, job control in a shell and terminal resizing with
-  `signals = "isolated"`, GNU tar extracting files into subdirectories (it uses `openat2`), and
-  system calls newer than the reviewed table (`ENOSYS`).
+  `signals = "isolated"`, GNU tar extracting an archive that holds a directory (it uses
+  `openat2`), and system calls newer than the reviewed table (`ENOSYS`).
 - **Landlock errata.** sandy does not check the errata bitmask. A kernel without the fix for
   erratum 3 lets rights widen through renames of directories that a bind mount disconnected.
   The program cannot mount, and `refer` is granted only inside writable paths, so the practical

@@ -597,6 +597,10 @@ because it sets the metadata through the descriptor it wrote.
 - **`/proc` is not readable** by default. Landlock cannot limit it to the program's own entries,
   and `/proc` shows the command lines of every process. Add `--read /proc` only if the program
   needs it.
+- **GNU tar cannot extract** an archive that holds a directory. It opens each directory with
+  `openat2`, which sandy denies because seccomp cannot read that call's flags and therefore
+  cannot reject the open mode that gets past Landlock, and tar does not fall back. Creating and
+  listing archives work, and so does `bsdtar` ([docs/linux.md](docs/linux.md)).
 - **Tested** on Fedora 44 (kernel 7.2), Ubuntu 22.04 (6.8), Ubuntu 25.10 (6.17) and the GitHub
   Ubuntu 22.04, 24.04 and 24.04-arm runners. The code paths of older Landlock ABIs are tested on
   a newer kernel with the test harness `sandy-abi-cap`, which lowers the ABI sandy reads (see
