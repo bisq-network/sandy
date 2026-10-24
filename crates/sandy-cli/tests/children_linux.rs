@@ -36,7 +36,10 @@ fn supported(fixture: &Fixture) -> bool {
     }
     let output = sandy(run_args(&contained(fixture), &[("env", "PATH")]));
     assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
-    eprintln!("skipped: signal isolation needs Landlock ABI 6; sandy refused");
+    skip(
+        "landlock-abi-6",
+        "signal isolation needs Landlock ABI 6; sandy refused",
+    );
     false
 }
 
@@ -228,7 +231,7 @@ fn the_program_reads_the_terminal() {
         return;
     }
     let Some(pty) = open_pty() else {
-        eprintln!("skipped: no pseudo-terminal available");
+        skip("pty", "no pseudo-terminal available");
         return;
     };
     let mut command = Command::new(sandy_path());
@@ -268,7 +271,7 @@ fn a_program_that_stops_sandy_cannot_outlive_its_end() {
         return;
     }
     let Some(pty) = open_pty() else {
-        eprintln!("skipped: no pseudo-terminal available");
+        skip("pty", "no pseudo-terminal available");
         return;
     };
     let program = fixture.copy_probe("bin");
@@ -383,7 +386,7 @@ fn another_process_of_the_job_reads_the_terminal() {
         return;
     }
     let Some(pty) = open_pty() else {
-        eprintln!("skipped: no pseudo-terminal available");
+        skip("pty", "no pseudo-terminal available");
         return;
     };
     let quote = |arg: &String| format!("'{arg}'");

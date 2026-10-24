@@ -1,0 +1,2 @@
+# Expected skips, measured on the development host: Fedora 44, kernel 7.2, Landlock ABI 10,
+# Yama ptrace_scope 0, no GUI session.

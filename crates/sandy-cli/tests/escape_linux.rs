@@ -26,10 +26,6 @@ fn args(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| value.to_string()).collect()
 }
 
-fn skip(reason: &str) {
-    eprintln!("skipped: {reason}");
-}
-
 /// Runs the probe outside the sandbox with `configure` applied to the command.
 fn probe_outside_with(actions: &[(&str, &str)], configure: impl Fn(&mut Command)) -> Output {
     let mut command = Command::new(probe_path());
@@ -75,7 +71,7 @@ fn session_bus_is_unreachable() {
         .map(|path| path.split(',').next().unwrap_or(path).to_string())
         .unwrap_or_else(|| format!("/run/user/{uid}/bus"));
     if !Path::new(&socket).exists() {
-        return skip(&format!("no session bus socket at {socket}"));
+        return skip("session-bus", &format!("no socket at {socket}"));
     }
     let directory = Path::new(&socket).parent().unwrap().to_str().unwrap();
     // Reading the socket's directory is allowed, so only the socket rules stop the connection.
@@ -123,10 +119,10 @@ fn only_route_netlink_is_available_with_ip() {
     for family in ["netlink-sock-diag", "vsock", "alg"] {
         let control = probe_outside(&[("socket", family)]);
         if control[0].result != "ok" {
-            skip(&format!(
-                "socket {family} fails outside: {}",
-                control[0].detail
-            ));
+            skip(
+                "socket-family",
+                &format!("socket {family} fails outside: {}", control[0].detail),
+            );
             continue;
         }
         probe_inside(&ip, &[("socket", family)])[0].assert_blocked();
@@ -172,10 +168,13 @@ fn parent_memory_and_environment_are_unreadable() {
             actions.push(*action);
         } else if control.result == "denied" && yama_ptrace_scope().is_some_and(|scope| scope >= 1)
         {
-            skip(&format!(
-                "{} {}: Yama ptrace_scope blocks it outside the sandbox",
-                control.action, control.target
-            ));
+            skip(
+                "ptrace",
+                &format!(
+                    "{} {}: Yama ptrace_scope blocks it outside the sandbox",
+                    control.action, control.target
+                ),
+            );
         } else {
             control.assert_ok();
         }
@@ -195,7 +194,10 @@ fn parent_cannot_be_traced() {
     let parent = parent_pid();
     let control = probe_outside(&[("ptrace-seize", &parent)]);
     if control[0].result != "ok" {
-        return skip(&format!("ptrace fails outside: {}", control[0].detail));
+        return skip(
+            "ptrace",
+            &format!("ptrace fails outside: {}", control[0].detail),
+        );
     }
     probe_inside(&[], &[("ptrace-seize", &parent)])[0].assert_blocked();
 }
@@ -207,7 +209,10 @@ fn signals_to_outside_processes_follow_the_policy() {
     if landlock_abi() < 6 {
         let output = sandy(run_args(&isolated, &[("signal", &parent)]));
         assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
-        return skip("Landlock ABI 6 is required for signal isolation; sandy refused");
+        return skip(
+            "landlock-abi-6",
+            "signal isolation needs Landlock ABI 6; sandy refused",
+        );
     }
     controlled(&isolated, &[("signal", &parent)])[0].assert_blocked();
     probe_inside(&[], &[("signal", &parent)])[0].assert_ok();
@@ -216,7 +221,7 @@ fn signals_to_outside_processes_follow_the_policy() {
 #[test]
 fn terminal_input_injection_is_denied() {
     let Some(pty) = open_pty() else {
-        return skip("no pseudo-terminal available");
+        return skip("pty", "no pseudo-terminal available");
     };
     let actions = [("tiocgwinsz", "0"), ("tiocsti", "0")];
     let control = parse(&probe_outside_with(&actions, with_terminal(&pty)));
@@ -244,7 +249,10 @@ fn leases_and_delegations_are_denied() {
     if control[0].result == "ok" {
         actions.extend(delegations);
     } else {
-        skip(&format!("no delegations here: {}", control[0].detail));
+        skip(
+            "delegations",
+            &format!("no delegations here: {}", control[0].detail),
+        );
     }
     for line in controlled(&fixture.access_args(), &actions) {
         assert_eq!(line.result, "denied", "{line:?}");
@@ -257,7 +265,7 @@ fn leases_and_delegations_are_denied() {
 #[test]
 fn the_terminal_line_discipline_cannot_change() {
     let Some(pty) = open_pty() else {
-        return skip("no pseudo-terminal available");
+        return skip("pty", "no pseudo-terminal available");
     };
     let actions = [("tiocsetd", "0")];
     parse(&probe_outside_with(&actions, with_terminal(&pty)))[0].assert_ok();
@@ -391,13 +399,13 @@ fn isolated_job(actions: &[(&str, &str)]) -> Vec<String> {
 #[test]
 fn other_jobs_of_the_terminal_cannot_be_stopped() {
     if landlock_abi() < 6 {
-        return skip("Landlock ABI 6 is required for signal isolation");
+        return skip("landlock-abi-6", "signal isolation needs Landlock ABI 6");
     }
     let join = [("setpgid-join", "{job}")];
     let mut outside = vec![probe_path()];
     outside.extend(probe_args(&join));
     let Some(mut control) = JobSession::start(&outside) else {
-        return skip("no pseudo-terminal available");
+        return skip("pty", "no pseudo-terminal available");
     };
     // The control stops itself together with the victim, so it reports no line.
     assert!(control.job_line().is_none(), "the control was not stopped");
@@ -420,13 +428,13 @@ fn other_jobs_of_the_terminal_cannot_be_stopped() {
 #[test]
 fn the_terminal_cannot_be_taken_from_the_foreground_job() {
     if landlock_abi() < 6 {
-        return skip("Landlock ABI 6 is required for signal isolation");
+        return skip("landlock-abi-6", "signal isolation needs Landlock ABI 6");
     }
     let take = [("tcsetpgrp", "0")];
     let mut outside = vec![probe_path()];
     outside.extend(probe_args(&take));
     let Some(mut control) = JobSession::start(&outside) else {
-        return skip("no pseudo-terminal available");
+        return skip("pty", "no pseudo-terminal available");
     };
     let line = control.job_line().unwrap();
     line.assert_ok();
@@ -446,10 +454,10 @@ fn the_terminal_cannot_be_taken_from_the_foreground_job() {
 #[test]
 fn terminal_resize_cannot_signal_outside() {
     if landlock_abi() < 6 {
-        return skip("Landlock ABI 6 is required for signal isolation");
+        return skip("landlock-abi-6", "signal isolation needs Landlock ABI 6");
     }
     let Some(pty) = open_pty() else {
-        return skip("no pseudo-terminal available");
+        return skip("pty", "no pseudo-terminal available");
     };
     let resize = [("tiocswinsz", "0")];
     let on_the_terminal = |command: &mut Command| {
@@ -483,11 +491,71 @@ fn terminal_resize_cannot_signal_outside() {
     assert_ne!(victim.wait().unwrap().code(), Some(42));
 }
 
+/// Before Landlock ABI 3 the kernel cannot check truncation, so sandy's filter denies
+/// `truncate` and read-only opens with `O_TRUNC` for every path, also a writable one
+/// (docs/linux.md, "Truncation"). `sandy-abi-cap` runs that code path on this kernel: it answers
+/// the ABI query with 2, sandy then handles only the rights of ABI 2 and adds the filter rules.
+/// `EPERM` shows that the filter refused the call, where Landlock refuses with `EACCES`.
+#[test]
+fn truncation_is_denied_everywhere_before_abi_3() {
+    if landlock_abi() < 3 {
+        return skip(
+            "landlock-abi-3",
+            "this kernel runs the rules of ABI 1 and 2 without the cap",
+        );
+    }
+    let Some(cap) = abi_cap_path() else {
+        return skip("abi-cap", "sandy-abi-cap is not next to the other binaries");
+    };
+    let fixture = Fixture::new("linux-truncate-cap");
+    let (readable, writable) = (fixture.arg("ro/file"), fixture.arg("rw/file"));
+    let actions = [
+        ("truncate", readable.as_str()),
+        ("open-rdonly-trunc", readable.as_str()),
+        ("truncate", writable.as_str()),
+    ];
+    // Control: with the ABI of this kernel, Landlock checks truncation and the writable path
+    // allows it. `read_only_and_outside_files_cannot_be_truncated` checks the rest of that case.
+    probe_inside(&fixture.access_args(), &actions)[2].assert_ok();
+    fixture.reset();
+
+    let output = Command::new(&cap)
+        .arg("2")
+        .arg(sandy_path())
+        .args(run_args(&fixture.access_args(), &actions))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "sandy run under the ABI cap failed: {output:?}"
+    );
+    let lines = parse(&output);
+    assert_eq!(lines.len(), actions.len(), "probe output: {lines:?}");
+    for line in &lines {
+        assert_eq!(line.result, "denied", "{line:?}");
+        assert!(line.detail.contains("os error 1)"), "not EPERM: {line:?}");
+    }
+    assert_eq!(fs::read(fixture.path("rw/file")).unwrap(), b"content");
+
+    // The cap reached sandy: it reports the ABI it was given, not the one the kernel has.
+    let report = Command::new(cap)
+        .args(["2", &sandy_path(), "check"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&report.stdout);
+    assert!(report.status.success(), "{stdout}");
+    assert!(stdout.contains("Landlock ABI 2"), "{stdout}");
+    assert!(!stdout.contains("UNAVAILABLE"), "{stdout}");
+}
+
 #[test]
 fn io_uring_is_denied() {
     let control = probe_outside(&[("io-uring-setup", "-")]);
     if control[0].result != "ok" {
-        return skip(&format!("io_uring fails outside: {}", control[0].detail));
+        return skip(
+            "io-uring",
+            &format!("io_uring fails outside: {}", control[0].detail),
+        );
     }
     probe_inside(&[], &[("io-uring-setup", "-")])[0].assert_blocked();
 }
@@ -671,10 +739,10 @@ fn mount_and_namespace_listing_is_denied() {
     let actions: Vec<(&str, &str)> = calls.iter().map(|nr| ("raw-syscall", *nr)).collect();
     for control in probe_outside(&actions) {
         if control.detail.contains("os error 38") {
-            skip(&format!(
-                "system call {} is not in this kernel",
-                control.target
-            ));
+            skip(
+                "mount-listing-calls",
+                &format!("system call {} is not in this kernel", control.target),
+            );
         } else {
             assert!(control.detail.contains("os error 14"), "{control:?}");
         }
@@ -1066,7 +1134,7 @@ fn system_v_shared_memory_is_unreachable() {
     // SAFETY: creates a private segment; the guard removes it.
     let id = unsafe { libc::shmget(libc::IPC_PRIVATE, 4096, libc::IPC_CREAT | 0o600) };
     if id < 0 {
-        return skip("System V shared memory is unavailable");
+        return skip("sysv-shm", "System V shared memory is unavailable");
     }
     let segment = Segment(id);
     let id = segment.0.to_string();
@@ -1088,13 +1156,16 @@ fn effective_uid(line: &ProbeLine) -> &str {
 #[test]
 fn setuid_programs_do_not_gain_privileges() {
     let Some(su) = setuid_root_su() else {
-        return skip("no setuid-root su");
+        return skip("setuid-su", "no setuid-root su");
     };
     // su waits for a password on the open stdin pipe and is killed before it gets one.
     let command = format!("{} -c true nobody", su.display());
     let control = probe_outside(&[("setuid-exec", &command)]);
     if control[0].result != "ok" || effective_uid(&control[0]) != "0" {
-        return skip(&format!("su does not run as root outside: {control:?}"));
+        return skip(
+            "setuid-su",
+            &format!("su does not run as root outside: {control:?}"),
+        );
     }
     let sandbox_args = args(&["--read", "/proc", "--read-exec", su.to_str().unwrap()]);
     let lines = probe_inside(&sandbox_args, &[("setuid-exec", &command)]);
@@ -1109,7 +1180,10 @@ fn setuid_programs_do_not_gain_privileges() {
 fn foreign_system_call_abi_kills_the_program() {
     let control = probe_outside_with(&[("int80-getpid", "-")], |_| {});
     if !control.status.success() || parse(&control)[0].result != "ok" {
-        return skip("the 32-bit system call entry is unavailable outside");
+        return skip(
+            "int80",
+            "the 32-bit system call entry is unavailable outside",
+        );
     }
     let output = sandy(run_args(&[], &[("int80-getpid", "-")]));
     use std::os::unix::process::ExitStatusExt;
@@ -1131,7 +1205,10 @@ fn common_programs_run_under_the_default_policy() {
     ];
     for program in programs {
         let Ok(path) = Path::new(program[0]).canonicalize() else {
-            skip(&format!("{} is not installed", program[0]));
+            skip(
+                "common-programs",
+                &format!("{} is not installed", program[0]),
+            );
             continue;
         };
         let mut run = args(&["run", "--read", &readable, "--"]);
@@ -1205,7 +1282,7 @@ fn refuses_a_read_exec_alias_of_a_writable_subdirectory() {
         .args(["--user", "--map-root-user", "--mount", "sh", "-c", &script])
         .output()
     else {
-        return skip("unshare is not installed");
+        return skip("unshare", "unshare is not installed");
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let code = |name: &str| {
@@ -1214,11 +1291,14 @@ fn refuses_a_read_exec_alias_of_a_writable_subdirectory() {
             .find_map(|line| line.strip_prefix(name)?.parse::<i32>().ok())
     };
     let (Some(alias), Some(control)) = (code("alias="), code("control=")) else {
-        return skip(&format!(
-            "no unprivileged user namespace with a mount namespace: {:?}, {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        ));
+        return skip(
+            "unshare",
+            &format!(
+                "no unprivileged user namespace with a mount namespace: {:?}, {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        );
     };
     assert_eq!(control, 0, "the control alias was refused: {stdout}");
     assert_eq!(alias, EXIT_FAILURE, "{stdout}");

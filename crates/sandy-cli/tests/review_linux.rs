@@ -15,10 +15,6 @@ fn args(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| value.to_string()).collect()
 }
 
-fn skip(reason: &str) {
-    eprintln!("skipped: {reason}");
-}
-
 /// The Landlock ABI of the running kernel, 0 without Landlock.
 fn landlock_abi() -> i64 {
     // SAFETY: with a null attribute, size 0 and the VERSION flag the kernel only returns the ABI.
@@ -75,7 +71,7 @@ fn exit_code_within(victim: &mut Victim, grace: Duration) -> Option<i32> {
 #[test]
 fn sigio_signal_respects_signal_isolation() {
     if landlock_abi() < 6 {
-        return skip("signal isolation needs Landlock ABI 6");
+        return skip("landlock-abi-6", "signal isolation needs Landlock ABI 6");
     }
 
     // Control inside the sandbox with signals = any: the victim gets SIGUSR1 and exits 42.
@@ -109,7 +105,7 @@ fn sigio_signal_respects_signal_isolation() {
 #[test]
 fn pidfd_send_signal_respects_signal_isolation() {
     if landlock_abi() < 6 {
-        return skip("signal isolation needs Landlock ABI 6");
+        return skip("landlock-abi-6", "signal isolation needs Landlock ABI 6");
     }
     let victim = spawn_victim();
     let pid = victim.0.id().to_string();

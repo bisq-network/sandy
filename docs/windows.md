@@ -545,7 +545,8 @@ messages that reach processes outside the sandbox.
   before .258 [CVE-2021-41338]. The table lives in `crates/sandy-windows/src/version.rs`.
 - **Expected to work, not tested:** Windows 10 1809 (LTSC 2019), 21H2 (LTSC 2021) and 22H2.
 - **Tested:** Windows 11 build 26200 (VM, all tests), Windows Server 2022 and Windows Server
-  2025 (GitHub Actions; all tests except `executes_only_executable_paths`, see limitation 11).
+  2025 (GitHub Actions; all tests except the four that need AppContainer child processes, see
+  limitation 11).
 - **Nested jobs:** when sandy runs inside a job with UI restrictions, Windows refuses to put the
   program into sandy's own job (`ERROR_NOT_SUPPORTED`, measured on Windows 11), and the plan
   reports `NoPrivilegeEscalation` and `SignalsIsolated` as unavailable. Inside a job without UI
@@ -582,8 +583,16 @@ messages that reach processes outside the sandbox.
     out: file ACLs, the working directory, the console, job objects, process mitigation
     policies, Defender, attack surface reduction, AppLocker, Code Integrity and UAC. The cause in
     the configuration of these images is not known. On Windows 11 build 26200 child processes
-    work. The shared test `executes_only_executable_paths` therefore cannot pass on these
-    runners.
+    work. Four checks therefore cannot run on these runners and record the skip
+    `appcontainer-children`: `executes_only_executable_paths`,
+    `children_none_denies_starting_programs`,
+    `children_contained_ends_what_the_program_leaves_behind` and
+    `children_none_denies_starting_a_system_program`. The expected-skip list of the runner holds
+    them, so losing another check there is noticed. The execute right itself stays checkable
+    without a child process: `load-library` maps an image inside the program's own process and
+    needs `FILE_EXECUTE`, and `read_write_paths_are_not_executable` uses it with a copy in the
+    `read_exec` path as the positive control (measured on Windows 11: that copy maps, the one in
+    the read-write path does not).
 12. `std::fs::canonicalize` and `GetFinalPathNameByHandleW` with DOS names fail with
     `ERROR_ACCESS_DENIED` inside an AppContainer (Windows 11 and Server 2025); NT names work.
     Programs that canonicalize their paths need a fallback such as `std::path::absolute`.

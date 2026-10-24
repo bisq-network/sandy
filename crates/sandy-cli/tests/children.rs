@@ -66,7 +66,7 @@ fn children_contained_ends_what_the_program_leaves_behind() {
     if let Some(reason) = unsupported() {
         let output = sandy(run_args(&contained(&fixture), &[(START, &start)]));
         assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
-        eprintln!("skipped: {reason}; sandy refused");
+        skip("landlock-abi-6", &format!("{reason}; sandy refused"));
         return;
     }
 
@@ -251,19 +251,23 @@ mod unix {
             "--expose".to_string(),
             format!("127.0.0.1:{outer}={inner}"),
         ]);
+        // The program reports that it runs, then sleeps for a second and exits.
+        let file = fixture.arg("ro/file");
         let mut sandy = Command::new(sandy_path())
-            .args(run_args(&args, &[("sleep", "1000")]))
-            .stdout(Stdio::null())
+            .args(run_args(&args, &[("read", &file), ("sleep", "1000")]))
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        // The listen port is reachable as soon as sandy binds it, which is before it forks the
+        // relay, the guard and the program. Only the program's own report says that there is a
+        // program to end with; stopping sandy before its fork would leave none.
+        let mut stdout = BufReader::new(sandy.stdout.take().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        parse_line(line.trim_end()).assert_ok();
         let address = format!("127.0.0.1:{outer}").parse().unwrap();
         let reachable = || TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok();
-        // sandy starts the program only after the relay listens.
-        let deadline = Instant::now() + END_TIMEOUT;
-        while !reachable() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
         assert!(reachable(), "the relay never listened");
         signal(&sandy, libc::SIGSTOP);
         // The program exits after a second, the relay at most a second later.

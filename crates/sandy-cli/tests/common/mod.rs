@@ -5,6 +5,7 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -15,6 +16,15 @@ pub const EXIT_FAILURE: i32 = 125;
 /// Directory that holds `sandy` and `sandy-probe` when the tests run on another host than the
 /// one that built them (for example a test VM). Unset, the paths Cargo built are used.
 const BIN_DIR_VARIABLE: &str = "SANDY_TEST_BIN_DIR";
+
+/// Features that must be checkable on this host, separated by commas, or `all` for every
+/// feature. Skipping one of them fails the test instead of passing quietly.
+pub const REQUIRE_VARIABLE: &str = "SANDY_TEST_REQUIRE";
+
+/// File that each skip is appended to, one line
+/// `BINARY<TAB>TEST<TAB>FEATURE<TAB>REASON` per skip. `tests/runner.rs` compares the file with
+/// the skips the runner is expected to have.
+pub const SKIP_LOG_VARIABLE: &str = "SANDY_TEST_SKIP_LOG";
 
 fn binary(name: &str, built: &str) -> String {
     match std::env::var_os(BIN_DIR_VARIABLE) {
@@ -33,6 +43,85 @@ pub fn sandy_path() -> String {
 
 pub fn probe_path() -> String {
     binary("sandy-probe", env!("CARGO_BIN_EXE_sandy-probe"))
+}
+
+/// The harness that runs a program with a lower reported Landlock ABI, `None` when it is not
+/// next to the other binaries (see `SANDY_TEST_BIN_DIR`).
+#[cfg(target_os = "linux")]
+pub fn abi_cap_path() -> Option<String> {
+    let path = binary("sandy-abi-cap", env!("CARGO_BIN_EXE_sandy-abi-cap"));
+    Path::new(&path).exists().then_some(path)
+}
+
+/// Records that this test could not check `feature` on this host, and why.
+///
+/// libtest knows no outcome between ok and failed, so the test still reports ok and a check
+/// that did not run would look like one that passed. This makes the missing check visible: the
+/// skip goes to standard error (also for a test that passes, so the log of a run lists what it
+/// did not check) and to the skip log, which `tests/runner.rs` compares with the skips the
+/// runner is expected to have. A feature that `SANDY_TEST_REQUIRE` names must be checkable, so
+/// skipping it fails the test.
+///
+/// `feature` names what the host lacks, not the test: several tests skip the same feature, and
+/// the expected-skip lists stay readable when the name is stable (`pty`, `landlock-abi-6`). The
+/// reason carries the detail.
+pub fn skip(feature: &str, reason: &str) {
+    let reason = reason.replace(['\t', '\n', '\r'], " ");
+    // Straight to the descriptor: libtest captures `eprintln!` and shows it only for a test that
+    // fails.
+    let _ = writeln!(std::io::stderr(), "skipped: {feature}: {reason}");
+    record_skip(feature, &reason);
+    assert!(
+        !is_required(feature),
+        "{REQUIRE_VARIABLE} demands {feature} on this host, but the check was skipped: {reason}"
+    );
+}
+
+fn record_skip(feature: &str, reason: &str) {
+    let Some(path) = std::env::var_os(SKIP_LOG_VARIABLE) else {
+        return;
+    };
+    let line = format!("{}\t{}\t{feature}\t{reason}\n", test_binary(), test_name());
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "cannot open the skip log {}: {error}",
+                Path::new(&path).display()
+            )
+        });
+    // One append of one short line, so tests that run next to each other in this process and in
+    // other test binaries can share the log without interleaving.
+    log.write_all(line.as_bytes()).unwrap();
+}
+
+fn is_required(feature: &str) -> bool {
+    let Ok(list) = std::env::var(REQUIRE_VARIABLE) else {
+        return false;
+    };
+    list.split(',')
+        .map(str::trim)
+        .any(|wanted| wanted == feature || wanted == "all")
+}
+
+/// The name of the running test. libtest names each test's thread after the test.
+pub fn test_name() -> String {
+    std::thread::current().name().unwrap_or("unknown").into()
+}
+
+/// The name of the running test binary without Cargo's hash suffix, so it is the name the
+/// expected-skip lists use: `escape_linux-1f3c9a0b2d4e5f60` becomes `escape_linux`.
+pub fn test_binary() -> String {
+    let path = std::env::current_exe().unwrap_or_default();
+    let name = path.file_stem().unwrap_or_default().to_string_lossy();
+    match name.rsplit_once('-') {
+        Some((stem, hash)) if hash.len() == 16 && hash.chars().all(|c| c.is_ascii_hexdigit()) => {
+            stem.to_string()
+        }
+        _ => name.into_owned(),
+    }
 }
 
 /// A directory tree with one directory per access level and a file in each.
@@ -355,12 +444,10 @@ fn connects_while_running(child: &mut Child, address: SocketAddr) -> bool {
 /// Windows: whether this host refuses child processes of AppContainer processes. The GitHub
 /// Actions images windows-2022 and windows-2025 do (docs/windows.md, limitation 11). The canary
 /// starts a system program that every AppContainer may read and execute, outside and inside the
-/// sandbox; only a denial inside, with success outside, counts. The message goes to stderr
-/// directly, so it shows also when the test harness captures output.
+/// sandbox; only a denial inside, with success outside, counts. A caller that returns because of
+/// this leaves its check undone, so the canary records the skip for the calling test.
 #[cfg(windows)]
 pub fn appcontainer_children_blocked() -> bool {
-    use std::io::Write;
-
     let system = std::env::var("SystemRoot").expect("SystemRoot is set");
     let canary = format!(r"{system}\System32\whoami.exe");
     if probe_outside(&[("exec", &canary)])[0].result != "ok" {
@@ -368,10 +455,10 @@ pub fn appcontainer_children_blocked() -> bool {
     }
     let blocked = probe_inside(&[], &[("exec", &canary)])[0].result == "denied";
     if blocked {
-        let _ = writeln!(
-            std::io::stderr(),
-            "skipped: this host does not let AppContainer processes start child processes \
-             (see docs/windows.md limitation 11)"
+        skip(
+            "appcontainer-children",
+            "this host does not let AppContainer processes start child processes (see \
+             docs/windows.md limitation 11)",
         );
     }
     blocked

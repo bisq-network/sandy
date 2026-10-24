@@ -1,0 +1,6 @@
+# Expected skips, measured on macOS 26.5 (arm64) with System Integrity Protection on, over SSH.
+# Both are host refusals outside the sandbox, so there is nothing the sandbox could add:
+# the kernel does not let an ordinary user create PF_NDRV and PF_KEY sockets, or read
+# sysctl.proc_cputype of another process.
+review_macos dangerous_socket_families_cannot_be_created socket-family
+review_macos sysctl_proc_cputype_is_not_a_cross_process_oracle sysctl-proc-cputype

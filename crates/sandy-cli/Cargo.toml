@@ -19,6 +19,13 @@ name = "sandy-probe"
 path = "src/bin/sandy-probe.rs"
 test = false
 
+# Test helper: runs a program that sees a lower Landlock ABI than the kernel has, so the tests
+# can exercise the code paths of an older kernel. Linux only; elsewhere it refuses to run.
+[[bin]]
+name = "sandy-abi-cap"
+path = "src/bin/sandy-abi-cap.rs"
+test = false
+
 [dependencies]
 sandy-core.workspace = true
 sandy-relay.workspace = true

@@ -11,18 +11,44 @@ jobs:
   test:
     strategy:
       fail-fast: false
+      # Per runner: the lowest Landlock ABI it must report, and the features that must be
+      # checkable on it (skipping one of them fails that test). The check step prints the ABI
+      # the runner has, so raise the floor when a runner image moves to a newer kernel.
       matrix:
-        os: [ubuntu-24.04, ubuntu-22.04, ubuntu-24.04-arm, macos-15, windows-2025, windows-2022]
+        include:
+          - os: ubuntu-24.04
+            min_landlock_abi: 5
+            require: pty
+          - os: ubuntu-22.04
+            min_landlock_abi: 4
+            require: pty
+          - os: ubuntu-24.04-arm
+            min_landlock_abi: 5
+            require: pty
+          - os: macos-15
+            require: pty
+          - os: windows-2025
+          - os: windows-2022
     runs-on: ${{ matrix.os }}
+    env:
+      SANDY_TEST_RUNNER: ${{ matrix.os }}
+      SANDY_TEST_SKIP_LOG: ${{ runner.temp }}/sandy-skips.log
+      SANDY_TEST_MIN_LANDLOCK_ABI: ${{ matrix.min_landlock_abi }}
+      SANDY_TEST_REQUIRE: ${{ matrix.require }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Show toolchain
         run: rustc --version && cargo --version
       - name: Check how this runner enforces the default policy
         run: cargo run --bin sandy -- check ${{ runner.os == 'Windows' && '--appcontainer sandy.escape-tests' || '' }}
-        continue-on-error: true
       - name: Test
         run: cargo test --workspace --all-targets --no-fail-fast
+      - name: Compare the checks this runner skipped with its expected-skip list
+        # Also after a failed test: a check that stopped running is what this step looks for. A
+        # runner without a list in crates/sandy-cli/tests/expected-skips fails here and prints
+        # the list to commit.
+        if: ${{ !cancelled() }}
+        run: cargo test -p sandy-cli --test runner -- --ignored --exact skips_match_the_expected_list --nocapture
       - name: Show sandbox denials (macOS)
         if: failure() && runner.os == 'macOS'
         run: log show --last 10m --style compact --predicate 'sender == "Sandbox" OR eventMessage CONTAINS "Sandbox"' | tail -n 300

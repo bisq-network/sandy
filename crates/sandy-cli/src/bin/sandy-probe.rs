@@ -48,6 +48,8 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
         }
         "list" => Ok(format!("{} entries", fs::read_dir(target)?.count())),
         "write" => fs::write(target, b"probe").map(|()| String::new()),
+        "truncate" => truncate(target),
+        "open-rdonly-trunc" => open_read_only_truncate(target),
         "delete" => fs::remove_file(target).map(|()| String::new()),
         "mkdir" => fs::create_dir(target).map(|()| String::new()),
         "set-readonly" => set_readonly(target, true),
@@ -213,6 +215,61 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
             "unknown action",
         )),
     }
+}
+
+/// Empties a file through its path: `truncate(2)` on Unix, and on Windows an open that
+/// truncates, because there is no call for it. Both need the right to write the file's data,
+/// which no read grant gives.
+#[cfg(unix)]
+fn truncate(target: &str) -> io::Result<String> {
+    let path = path_argument(target)?;
+    // SAFETY: the path is NUL-terminated; truncate has no other requirement.
+    if unsafe { libc::truncate(path.as_ptr(), 0) } == 0 {
+        Ok(String::new())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn truncate(target: &str) -> io::Result<String> {
+    fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(target)
+        .map(|_| String::new())
+}
+
+/// Empties a file through a read-only open with `O_TRUNC`, which asks for no write access.
+/// Rust's `OpenOptions` refuses read with truncate before any system call, so this opens the
+/// file directly.
+#[cfg(unix)]
+fn open_read_only_truncate(target: &str) -> io::Result<String> {
+    let path = path_argument(target)?;
+    // SAFETY: the path is NUL-terminated.
+    let descriptor = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_TRUNC | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: open returned a descriptor that nothing else in this process uses.
+    unsafe { libc::close(descriptor) };
+    Ok(String::new())
+}
+
+#[cfg(not(unix))]
+fn open_read_only_truncate(_target: &str) -> io::Result<String> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported"))
+}
+
+#[cfg(unix)]
+fn path_argument(target: &str) -> io::Result<std::ffi::CString> {
+    std::ffi::CString::new(target)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))
 }
 
 /// Changes the permissions through the path (Unix `chmod`, Windows file attributes).

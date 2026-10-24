@@ -390,7 +390,7 @@ fn clones_and_links_stay_inside_the_policy() {
 /// A process outside the sandbox, attached the way debuggers attach. macOS lets a process of the
 /// same user attach only to a program signed with the get-task-allow entitlement, so the victim
 /// is a copy of the probe signed that way. If the host refuses the attach outside the sandbox
-/// anyway, there is nothing to check.
+/// anyway, nothing can be checked and the test records a skip.
 #[test]
 fn ptrace_cannot_attach_outside_the_sandbox() {
     let fixture = home_fixture("ptrace");
@@ -424,9 +424,12 @@ fn ptrace_cannot_attach_outside_the_sandbox() {
     let _ = outside_victim.kill();
     let _ = outside_victim.wait();
     if outside[0].result != "ok" {
-        eprintln!(
-            "control: this host refuses ptrace attach outside the sandbox ({}); nothing to check",
-            outside[0].detail
+        skip(
+            "ptrace",
+            &format!(
+                "this host refuses ptrace attach outside the sandbox: {}",
+                outside[0].detail
+            ),
         );
         return;
     }
@@ -1018,7 +1021,7 @@ fn sysctl_flag(name: &str) -> bool {
 #[test]
 fn code_that_needs_rosetta_is_refused_before_it_starts() {
     if !sysctl_flag("hw.optional.arm64") {
-        eprintln!("skipped: not Apple silicon");
+        skip("apple-silicon", "not Apple silicon");
         return;
     }
     let fixture = Fixture::new("macos-rosetta");

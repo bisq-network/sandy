@@ -498,7 +498,9 @@ change the metadata of every file the user owns.
   and `/proc` shows the command lines of every process. Add `--read /proc` only if the program
   needs it.
 - **Tested** on Fedora 44 (kernel 7.2), Ubuntu 22.04 (6.8), Ubuntu 25.10 (6.17) and the GitHub
-  Ubuntu 22.04 and 24.04 runners.
+  Ubuntu 22.04, 24.04 and 24.04-arm runners. The code paths of older Landlock ABIs are tested on
+  a newer kernel with the test harness `sandy-abi-cap`, which lowers the ABI sandy reads (see
+  [docs/linux.md](docs/linux.md)).
 - Details, the exact system set and all limitations: [docs/linux.md](docs/linux.md).
 
 ### macOS
@@ -624,10 +626,31 @@ cargo test --no-run --target x86_64-unknown-linux-musl -p sandy-cli
 SANDY_TEST_BIN_DIR=/path/to/dir ./escape-<hash>
 ```
 
-CI runs the tests on Ubuntu 22.04 and 24.04, macOS 15, and Windows Server 2022 and 2025. The
-`release` workflow builds archives for Linux, macOS and Windows on x86_64 and arm64 when a tag
-`v<version>` is pushed, and creates a draft release with `SHA256SUMS`. The arm64 Windows build is
-compiled but not tested.
+### Checks that cannot run on a host
+
+Some checks need something the host has to offer: a pseudo-terminal, a session bus, a Landlock
+right of a newer kernel, AppContainer processes that may start child processes. libtest has no
+outcome between ok and failed, so such a check would report ok like a check that ran. These
+variables keep that visible:
+
+| Variable | Effect |
+|---|---|
+| `SANDY_TEST_SKIP_LOG` | File every skipped check is appended to: binary, test, feature, reason. |
+| `SANDY_TEST_RUNNER` | The name of this runner. `crates/sandy-cli/tests/expected-skips/<runner>.txt` holds the checks it is expected to skip. |
+| `SANDY_TEST_REQUIRE` | Features that must be checkable here, separated by commas, or `all`. Skipping one fails that test. |
+| `SANDY_TEST_MIN_LANDLOCK_ABI` | The lowest Landlock ABI this runner must report (Linux). |
+
+After a run, `cargo test -p sandy-cli --test runner -- --ignored --exact
+skips_match_the_expected_list` compares the log with the list of the runner and fails on a skip
+that is not in the list, and on a listed skip that did not happen. A check that quietly stops
+running is then a diff to review, not a silent pass. A runner without a list fails that
+comparison and prints the list to commit.
+
+CI runs the tests on Ubuntu 22.04 and 24.04 (x86_64) and 24.04 (arm64), macOS 15, and Windows
+Server 2022 and 2025, each with its expected skips, its ABI floor and the features it must
+offer. The `release` workflow builds archives for Linux, macOS and Windows on x86_64 and arm64
+when a tag `v<version>` is pushed, and creates a draft release with `SHA256SUMS`. The arm64
+Windows build is compiled but not tested.
 
 ### Code layout
 
@@ -636,7 +659,7 @@ compiled but not tested.
 | `sandy-core` | Policy, validation, requirements, enforcement plan, backend contract |
 | `sandy-linux`, `sandy-macos`, `sandy-windows` | One backend each |
 | `sandy-relay` | The byte relay behind `expose` |
-| `sandy-cli` | The `sandy` command, backend selection, the test probe and the escape tests |
+| `sandy-cli` | The `sandy` command, backend selection, the test probe and harnesses, and the escape tests |
 
 ## Documentation
 

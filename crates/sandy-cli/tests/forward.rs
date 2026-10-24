@@ -118,9 +118,10 @@ fn a_forward_port_refuses_other_users() {
     let fixture = Fixture::new("forward-other-user");
     let probe = fixture.copy_probe("bin");
     let Some(other_user) = other_user(&probe) else {
-        eprintln!(
-            "skipped: cannot run a program as another user (no `sudo -n -u nobody`, and no user \
-             namespace with sub-user IDs)"
+        skip(
+            "other-user",
+            "cannot run a program as another user (no `sudo -n -u nobody`, and no user namespace \
+             with sub-user IDs)",
         );
         return;
     };

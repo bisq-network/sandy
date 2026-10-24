@@ -49,7 +49,7 @@ be listed, the Landlock-based requirements are unavailable.
 
 | Requirement | Mechanism |
 |---|---|
-| FilesystemConfined | Landlock with every file system right of the ABI handled. The seccomp filter denies opening a file with access mode 3 and `openat2` (see "Access mode 3"). Before ABI 3 it also denies truncation without write access. |
+| FilesystemConfined | Landlock with every file system right of the ABI handled. The seccomp filter denies opening a file with access mode 3 and `openat2` (see "Access mode 3"). Before ABI 3 it also denies `truncate` for every path and `O_TRUNC` on a read-only open. |
 | NoPrivilegeEscalation | no_new_privs. The filters deny namespaces, mounts, `bpf`, `perf_event_open`, io_uring, keyrings, `userfaultfd`, calls that need capabilities, setuid and setgid mode bits, unknown system calls and other CPU architectures. sandy refuses to run as root or with capabilities. |
 | ProcessMemoryIsolated | Landlock: a domain cannot ptrace, open `/proc/<pid>/mem` or `environ`, or use `process_vm_readv` on processes outside it (all ABIs). The denylist also denies `ptrace`, `process_vm_readv`, `process_vm_writev`, `pidfd_getfd`, `kcmp`, `process_madvise`, System V IPC and POSIX message queues, and changes of the limits, priority and CPU affinity of other processes. |
 | InheritedHandlesClosed | Close-on-exec on every descriptor above 2. |
@@ -302,7 +302,7 @@ seccomp filter denies IP sockets.
 |---|---|---|
 | none | | Refused. The reason names the fix: RHEL 9 needs 9.6 or newer; SLES 15 and openSUSE Leap 15 need `landlock` in the `lsm=` boot parameter; RHEL 8 has no Landlock. |
 | 1 | 5.13 | Renaming or linking a file into another directory fails with `EXDEV`, also inside writable paths. |
-| 1, 2 | | Landlock cannot restrict truncation. The denylist denies `truncate` and `open`/`openat` with `O_TRUNC` on a read-only open. |
+| 1, 2 | | Landlock cannot restrict truncation. The denylist denies `truncate` for every path, also inside a writable one, because the call carries no access mode the filter could look at, and `open`/`openat` with `O_TRUNC` on a read-only open. A program that empties a file in a writable path needs `O_TRUNC` with write access, or `ftruncate`; both stay allowed. |
 | 3 | 6.2 | Truncation is a Landlock right. |
 | 4 | 6.7 | TCP bind and connect are denied when IP is denied (a second layer). |
 | 1 to 4 | | Device ioctls are not checked by Landlock; the program can only open the devices of the policy and the system set. |
@@ -394,7 +394,7 @@ The rules return `EPERM`, except where the table says otherwise.
 | `setns` | always | Same. |
 | `personality` | other values than 0, 0x8, 0x20000, 0x20008, 0x40000, 0x40008, 0x60000, 0x60008, 0xffffffff | The values Docker allows, and `ADDR_NO_RANDOMIZE` (0x40000) alone and with those flags, which `setarch -R`, `rr` and the thread sanitizer need; it weakens address space randomization only inside the sandbox. The rest are old exploit helpers, for example `READ_IMPLIES_EXEC`. |
 | `open`, `openat` | access mode 3; before ABI 3 also `O_TRUNC` with read-only access | See "Access mode 3" and the ABI table. |
-| `truncate` | before ABI 3 | Landlock cannot check it. |
+| `truncate` | before ABI 3, for every path | Landlock cannot check it, and the call shows the filter no access mode. `ftruncate` and `O_TRUNC` with write access stay allowed, so a writable path still works. |
 | io_uring (3 calls) | always | io_uring operations bypass seccomp, including socket creation. |
 | `ptrace`, `process_vm_readv`, `process_vm_writev`, `pidfd_getfd`, `kcmp`, `process_madvise` | always | Second layer to Landlock. Debuggers do not work inside the sandbox. |
 | System V IPC (12 calls), POSIX message queues (6 calls) | always | These objects belong to all processes of the user and Landlock does not cover them. `shmat` would give access to the memory of processes outside the sandbox. |
@@ -696,11 +696,29 @@ path rules is refused before that, with exit code 125 and the paths it compared.
 `crates/sandy-cli/tests/escape_linux.rs` holds the Linux escape tests; the shared ones are in
 `escape.rs`. Every denial has a control run outside the sandbox. Checks that need a host feature
 (a session bus, a pseudo-terminal, ptrace or `/proc/<pid>/mem` under Yama `ptrace_scope` 1 or
-higher, a socket family) print why they skip.
+higher, a socket family) call `common::skip`, which records the skip; the README section
+"Testing" describes the accounting around it.
 Checks that depend on the Landlock ABI read it from the kernel: below ABI 6, the signal test
 expects sandy to refuse `signals = "isolated"`. The unit tests in `crates/sandy-linux` cover the
 planning function with invented host capabilities, and the filter decisions with a small BPF
 interpreter that applies both filters with the kernel's precedence.
+
+### A lower ABI on this kernel
+
+A host reports one ABI, so one kernel runs one of sandy's ABI branches. `sandy-abi-cap ABI
+PROGRAM [ARGUMENT]...` lowers the version that everything it starts reads: a seccomp filter
+notifies it for `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)` and answers
+with the cap, while every other call passes through. `sandy-abi-cap 2 cargo test` therefore runs
+a whole suite against the ABI 1 and 2 code paths, because the tests read the ABI with the same
+call.
+
+It changes what sandy handles, not what the kernel can do, which is enough for the rights of an
+ABI: under cap 1 a rename between directories fails with `EXDEV`, and under caps 1 and 2
+`truncate` fails with `EPERM` from the seccomp rules instead of `EACCES` from Landlock
+(`truncation_is_denied_everywhere_before_abi_3` checks that). It does not bring back a kernel
+without an errata fix or with an older system call table, so one real old kernel is still the
+only way to see those. It also sets `PR_SET_NO_NEW_PRIVS` for the whole run, so a check that
+needs a setuid program outside the sandbox cannot run under the cap.
 
 Static test binaries for another host, for example a test VM:
 
@@ -712,6 +730,7 @@ cargo test --no-run --target x86_64-unknown-linux-musl -p sandy-cli \
 
 The second command prints the paths of the test executables
 (`target/x86_64-unknown-linux-musl/debug/deps/escape-<hash>` and `escape_linux-<hash>`). Copy
-them and `target/x86_64-unknown-linux-musl/release/sandy` and `sandy-probe` to the host, put
-`sandy` and `sandy-probe` in one directory, and run each test executable with
-`SANDY_TEST_BIN_DIR` set to that directory.
+them and `target/x86_64-unknown-linux-musl/release/sandy`, `sandy-probe` and `sandy-abi-cap` to
+the host, put the three binaries in one directory, and run each test executable with
+`SANDY_TEST_BIN_DIR` set to that directory. Without `sandy-abi-cap` the checks that need the ABI
+cap record a skip.

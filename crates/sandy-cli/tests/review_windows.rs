@@ -52,7 +52,9 @@ fn delete_profile(container: &str) {
 /// child process. `exec` would, and AppContainer child processes are blocked on some hosts (see
 /// `escape.rs::executes_only_executable_paths` and docs/windows.md limitation 11), which would
 /// hide the result. A `read` of the same planted file is the control: read still works, so the
-/// denial is specific to execution, not a general loss of access.
+/// denial is specific to execution, not a general loss of access. That an image in a path with
+/// execute rights does map inside an AppContainer, so that such a denial is not vacuous, is the
+/// positive control of `escape_windows.rs::read_write_paths_are_not_executable`.
 #[test]
 fn profile_folder_is_a_persistent_writable_but_not_executable_store() {
     delete_profile(C_PERSIST);

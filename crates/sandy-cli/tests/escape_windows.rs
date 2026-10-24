@@ -79,25 +79,63 @@ fn cannot_write_to_a_startup_like_directory() {
 
 /// Read-write grants never contain FILE_EXECUTE or WRITE_DAC, also not for files the program
 /// creates itself.
+///
+/// `exec` alone would not show that: on the Server images no AppContainer process can start a
+/// child process at all (docs/windows.md limitation 11), so its denial would hold even if the
+/// grant did contain FILE_EXECUTE. `load-library` maps the image inside the program's own
+/// process and needs FILE_EXECUTE, and the same action on the `read_exec` copy is the positive
+/// control: only when that one loads does a denial in the writable path mean anything.
 #[test]
 fn read_write_paths_are_not_executable() {
     let fixture = Fixture::new("rwexec");
     let copied = fixture.copy_probe("rw");
+    // A name of its own: for a module name the process already has loaded, LoadLibraryExW could
+    // answer from its module list without opening the file.
+    let loadable = fixture.path("bin").join("loadable-copy.exe");
+    fs::copy(probe_path(), &loadable).unwrap();
+    let loadable = loadable.to_str().unwrap().to_string();
+
     let lines = controlled(
         &fixture.access_args(),
-        &[("exec", &copied), ("write-dac", &copied)],
+        &[
+            ("load-library", &loadable),
+            ("load-library", &copied),
+            ("exec", &copied),
+            ("write-dac", &copied),
+        ],
     );
-    lines[0].assert_blocked();
-    lines[1].assert_blocked();
+    let maps_images = lines[0].result == "ok";
+    if maps_images {
+        lines[1].assert_blocked();
+    } else {
+        skip(
+            "load-library-inside",
+            &format!(
+                "an image in a read_exec path does not map inside this host's AppContainer \
+                 ({}), so a denial in a read-write path shows nothing",
+                lines[0].detail
+            ),
+        );
+    }
+    lines[2].assert_blocked();
+    lines[3].assert_blocked();
 
     let made = fixture.arg("rw/made-inside.exe");
     let lines = probe_inside(
         &fixture.access_args(),
-        &[("copy-self", &made), ("exec", &made), ("write-dac", &made)],
+        &[
+            ("copy-self", &made),
+            ("load-library", &made),
+            ("exec", &made),
+            ("write-dac", &made),
+        ],
     );
     lines[0].assert_ok();
-    lines[1].assert_blocked();
+    if maps_images {
+        lines[1].assert_blocked();
+    }
     lines[2].assert_blocked();
+    lines[3].assert_blocked();
 }
 
 /// A writable directory where Windows lets every AppContainer execute new files, as below

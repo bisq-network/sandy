@@ -4,7 +4,7 @@
 mod common;
 
 use std::io::Read;
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -119,24 +119,40 @@ fn an_exposed_port_relays_many_connections_at_once() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let address = format!("127.0.0.1:{outer}").parse().unwrap();
+    let address: SocketAddr = format!("127.0.0.1:{outer}").parse().unwrap();
     let deadline = Instant::now() + WAIT * 3;
     let mut clients = Vec::with_capacity(CONNECTIONS);
-    // Every connection stays open, so all of them go through the relay at the same time. Before
-    // the program listens, the relay closes connections without a greeting; those are retried.
+    // Every connection stays open, so all of them go through the relay at the same time. The
+    // program counts every connection that reaches it and stops at CONNECTIONS, so a connection
+    // the test gives up on but the program counted would take a place the test never gets back.
+    // A connect without a timeout therefore either hands over the connection or made none, and a
+    // connection the relay accepted is waited for. Only a connection the relay closed without a
+    // greeting is retried, and only before the first greeting: the relay closes one when it
+    // cannot reach the program, which is before the program listens, so the program never saw
+    // it.
     while clients.len() < CONNECTIONS && Instant::now() < deadline {
-        let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(500))
-        else {
+        // Nothing listens until sandy binds the port, and a pending connect completes then.
+        let Ok(mut stream) = TcpStream::connect(address) else {
             std::thread::sleep(Duration::from_millis(50));
             continue;
         };
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
+        // Longer than the relay's own connect timeout, so a connection that waits for the
+        // program to listen is not given up on.
+        stream.set_read_timeout(Some(WAIT)).unwrap();
         let mut greeting = [0u8; 3];
         match stream.read_exact(&mut greeting) {
-            Ok(()) if &greeting == b"hi\n" => clients.push(stream),
-            _ => std::thread::sleep(Duration::from_millis(50)),
+            Ok(()) => {
+                assert_eq!(&greeting, b"hi\n", "the relay delivered other bytes");
+                clients.push(stream);
+            }
+            Err(error) => {
+                assert!(
+                    clients.is_empty(),
+                    "the relay closed connection {} of {CONNECTIONS} without a greeting: {error}",
+                    clients.len() + 1
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
     }
     let greeted = clients.len();

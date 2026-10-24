@@ -327,7 +327,8 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   `TIOCSWINSZ` and `setpgid` into a process group that exists, calls that need capabilities,
   `open` with access mode 3 (Landlock does not check it), the path-based metadata calls when
   `path_metadata = "deny"`, setuid and setgid mode bits, changes of the limits, priority and CPU
-  affinity of other processes, and before Landlock ABI 3 truncation without write access.
+  affinity of other processes, and before Landlock ABI 3 `truncate` for every path and
+  `O_TRUNC` on a read-only open.
 - `process.children = "none"`: the seccomp denylist allows `clone` only with `CLONE_THREAD` and
   denies `fork` and `vfork`; `clone3` fails with `ENOSYS`, so threads use `clone`.
 - `process.children = "contained"`: sandy becomes a child subreaper and forks a guard process,

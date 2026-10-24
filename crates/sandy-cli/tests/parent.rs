@@ -75,7 +75,7 @@ fn the_program_ends_with_sandys_parent() {
     if let Some(reason) = unsupported() {
         let output = sandy(run_args(&args, &[("env", "PATH")]));
         assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
-        eprintln!("skipped: {reason}; sandy refused");
+        skip("landlock-abi-6", &format!("{reason}; sandy refused"));
         return;
     }
 

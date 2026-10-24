@@ -280,7 +280,7 @@ fn the_program_inherits_only_the_standard_descriptors() {
 fn the_program_reads_the_terminal() {
     let fixture = Fixture::new("contained-terminal");
     let Some(pty) = open_pty() else {
-        eprintln!("skipped: no pseudo-terminal available");
+        skip("pty", "no pseudo-terminal available");
         return;
     };
     let mut command = Command::new(sandy_path());
@@ -318,7 +318,7 @@ fn the_program_reads_the_terminal() {
 fn a_program_that_stops_sandy_cannot_outlive_its_end() {
     let fixture = Fixture::new("contained-stop");
     let Some(pty) = open_pty() else {
-        eprintln!("skipped: no pseudo-terminal available");
+        skip("pty", "no pseudo-terminal available");
         return;
     };
     let program = fixture.copy_probe("bin");
@@ -428,7 +428,7 @@ fn sandy_does_not_wait_for_children_it_inherited() {
 fn another_process_of_the_job_reads_the_terminal() {
     let fixture = Fixture::new("contained-pipeline");
     let Some(pty) = open_pty() else {
-        eprintln!("skipped: no pseudo-terminal available");
+        skip("pty", "no pseudo-terminal available");
         return;
     };
     let quote = |arg: &String| format!("'{arg}'");

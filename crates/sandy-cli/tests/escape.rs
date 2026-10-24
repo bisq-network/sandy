@@ -84,6 +84,57 @@ fn writes_only_writable_paths() {
     assert!(!fixture.path("secret/new").exists());
 }
 
+/// Emptying a file needs the same right as writing it: a file in a read-only path and a file
+/// outside the policy keep their content, through `truncate` and, on Unix, through a read-only
+/// open with `O_TRUNC`.
+#[test]
+fn read_only_and_outside_files_cannot_be_truncated() {
+    let fixture = Fixture::new("truncate");
+    let (ro, secret, rw) = (
+        fixture.arg("ro/file"),
+        fixture.arg("secret/file"),
+        fixture.arg("rw/file"),
+    );
+    let mut actions = vec![("truncate", ro.as_str()), ("truncate", secret.as_str())];
+    if cfg!(unix) {
+        actions.push(("open-rdonly-trunc", ro.as_str()));
+        actions.push(("open-rdonly-trunc", secret.as_str()));
+    }
+    for line in probe_outside(&actions) {
+        line.assert_ok();
+    }
+    fixture.reset();
+
+    for line in probe_inside(&fixture.access_args(), &actions) {
+        line.assert_blocked();
+    }
+    assert_eq!(fs::read(fixture.path("ro/file")).unwrap(), b"content");
+    assert_eq!(fs::read(fixture.path("secret/file")).unwrap(), b"content");
+
+    // The positive control: in a writable path the program may empty a file. Where the kernel
+    // cannot check truncation, sandy denies the call for every path instead.
+    let line = &probe_inside(&fixture.access_args(), &[("truncate", rw.as_str())])[0];
+    if truncation_works_in_writable_paths() {
+        line.assert_ok();
+        assert!(fs::read(fixture.path("rw/file")).unwrap().is_empty());
+    } else {
+        line.assert_blocked();
+        assert_eq!(fs::read(fixture.path("rw/file")).unwrap(), b"content");
+    }
+}
+
+/// Whether the sandbox lets the program empty a file in a writable path. Before Landlock ABI 3
+/// the kernel cannot check truncation, so sandy's filter denies `truncate` for every path, also
+/// a writable one (docs/linux.md, "Truncation"). Seatbelt and Windows check truncation with the
+/// right to write the file's data.
+fn truncation_works_in_writable_paths() -> bool {
+    #[cfg(target_os = "linux")]
+    if common::linux::landlock_abi() < 3 {
+        return false;
+    }
+    true
+}
+
 #[test]
 fn executes_only_executable_paths() {
     #[cfg(windows)]

@@ -19,10 +19,6 @@ fn args(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| value.to_string()).collect()
 }
 
-fn skip(reason: &str) {
-    eprintln!("skipped: {reason}");
-}
-
 fn run_with(program: String, arguments: Vec<String>, configure: &dyn Fn(&mut Command)) -> Output {
     let mut command = Command::new(program);
     command.args(arguments);
@@ -61,7 +57,10 @@ fn process_models(base: &[String]) -> Vec<Vec<String>> {
         contained.extend(args(&["--children", "contained", "--signals", "isolated"]));
         models.push(contained);
     } else {
-        skip("children = contained needs Landlock ABI 6; only the exec model is checked");
+        skip(
+            "landlock-abi-6",
+            "children = contained needs Landlock ABI 6; only the exec model is checked",
+        );
     }
     models
 }
@@ -242,10 +241,10 @@ fn denylisted_calls_fail_with_eperm_on_the_kernel() {
     let mut checked = 0;
     for (control, line) in outside.iter().zip(&inside) {
         if control.result == "denied" || control.detail.contains("os error 38)") {
-            skip(&format!(
-                "{}: fails outside: {}",
-                control.target, control.detail
-            ));
+            skip(
+                "denylist-sample",
+                &format!("{}: fails outside: {}", control.target, control.detail),
+            );
             continue;
         }
         assert!(is_eperm(line), "control {control:?}, inside {line:?}");
@@ -273,7 +272,10 @@ fn every_metadata_call_by_path_follows_the_policy() {
     let usable: Vec<bool> = outside.iter().map(|line| line.result == "ok").collect();
     for (line, usable) in outside.iter().zip(&usable) {
         if !usable {
-            skip(&format!("{} fails outside: {}", line.action, line.detail));
+            skip(
+                "metadata-calls",
+                &format!("{} fails outside: {}", line.action, line.detail),
+            );
         }
     }
     let lines = probe_inside(&fixture.access_args(), &actions);
@@ -302,10 +304,10 @@ fn every_metadata_call_by_path_follows_the_policy() {
 #[test]
 fn device_ioctls_need_a_writable_path() {
     if landlock_abi() < 5 {
-        return skip("Landlock checks device ioctls from ABI 5");
+        return skip("landlock-abi-5", "Landlock checks device ioctls from ABI 5");
     }
     let Some(pty) = open_pty() else {
-        return skip("no pseudo-terminal available");
+        return skip("pty", "no pseudo-terminal available");
     };
     let terminal = fs::read_link(format!("/proc/self/fd/{}", pty.slave.as_raw_fd())).unwrap();
     let terminal = terminal.to_str().unwrap();
@@ -357,14 +359,17 @@ fn socket_pairs_cannot_take_abstract_names() {
 fn the_crypto_policy_files_are_readable() {
     let directory = Path::new("/etc/crypto-policies/back-ends");
     let Ok(entries) = fs::read_dir(directory) else {
-        return skip("no /etc/crypto-policies/back-ends on this host");
+        return skip(
+            "crypto-policies",
+            "no /etc/crypto-policies/back-ends on this host",
+        );
     };
     let files: Vec<String> = entries
         .filter_map(|entry| Some(entry.ok()?.path().to_str()?.to_string()))
         .filter(|path| fs::read(path).is_ok())
         .collect();
     if files.is_empty() {
-        return skip("no readable crypto policy files");
+        return skip("crypto-policies", "no readable crypto policy files");
     }
     let actions: Vec<(&str, &str)> = files.iter().map(|path| ("read", path.as_str())).collect();
     for line in probe_inside(&[], &actions) {
@@ -382,10 +387,13 @@ fn fanotify_watches_paths_outside_the_policy() {
     let secret = fixture.arg("secret");
     let outside = probe_outside(&[("fanotify-init", &secret)]);
     if outside[0].result != "ok" {
-        return skip(&format!(
-            "unprivileged fanotify does not work here: {}",
-            outside[0].detail
-        ));
+        return skip(
+            "fanotify",
+            &format!(
+                "unprivileged fanotify does not work here: {}",
+                outside[0].detail
+            ),
+        );
     }
     probe_inside(&fixture.access_args(), &[("fanotify-init", &secret)])[0].assert_ok();
 }
@@ -407,10 +415,10 @@ fn file_system_ioctls_cannot_change_readable_files() {
         let inside = probe_inside(&fixture.access_args(), &actions);
         for (control, line) in outside.iter().zip(&inside) {
             if control.result != "ok" {
-                skip(&format!(
-                    "{} fails outside: {}",
-                    control.action, control.detail
-                ));
+                skip(
+                    "file-system-ioctls",
+                    &format!("{} fails outside: {}", control.action, control.detail),
+                );
                 continue;
             }
             assert!(is_eperm(line), "control {control:?}, inside {line:?}");
@@ -418,7 +426,10 @@ fn file_system_ioctls_cannot_change_readable_files() {
     }
 
     let Ok(parent) = Path::new(env!("CARGO_TARGET_TMPDIR")).canonicalize() else {
-        return skip("the temporary directory of the build is not on this host");
+        return skip(
+            "build-tmpdir",
+            "the temporary directory of the build is not on this host",
+        );
     };
     let fixture = Fixture::new_in(&parent, "conformance-verity");
     let verity = [("enable-verity", fixture.arg("ro/file"))];
@@ -428,7 +439,10 @@ fn file_system_ioctls_cannot_change_readable_files() {
         .collect();
     let outside = probe_outside(&verity);
     if outside[0].result != "ok" {
-        return skip(&format!("no fs-verity here: {}", outside[0].detail));
+        return skip(
+            "fs-verity",
+            &format!("no fs-verity here: {}", outside[0].detail),
+        );
     }
     // The control made the file permanently read-only, so the run inside needs a new one.
     fixture.reset();
@@ -454,10 +468,10 @@ fn metadata_calls_on_a_read_only_descriptor_still_work() {
     let inside = probe_inside(&fixture.access_args(), &actions);
     for (control, line) in outside.iter().zip(&inside) {
         if control.result != "ok" {
-            skip(&format!(
-                "{} fails outside: {}",
-                control.action, control.detail
-            ));
+            skip(
+                "metadata-calls",
+                &format!("{} fails outside: {}", control.action, control.detail),
+            );
             continue;
         }
         line.assert_ok();

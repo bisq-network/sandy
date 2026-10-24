@@ -51,9 +51,9 @@ fn volfs_content_read_stays_inside_the_policy() {
 
     let outside = probe_outside(&actions);
     if outside[0].result != "ok" {
-        eprintln!(
-            "control: this host cannot read via /.vol ({}); nothing to check",
-            outside[0].detail
+        skip(
+            "volfs",
+            &format!("this host cannot read via /.vol: {}", outside[0].detail),
         );
         return;
     }
@@ -73,9 +73,12 @@ fn fsgetpath_does_not_disclose_out_of_policy_paths() {
 
     let outside = probe_outside(&actions);
     if outside[0].result != "ok" {
-        eprintln!(
-            "control: fsgetpath does not work on this host ({}); nothing to check",
-            outside[0].detail
+        skip(
+            "fsgetpath",
+            &format!(
+                "fsgetpath does not work on this host: {}",
+                outside[0].detail
+            ),
         );
         return;
     }
@@ -107,9 +110,12 @@ fn dangerous_socket_families_cannot_be_created() {
     let mut checked = 0;
     for ((family, out), inside) in families.iter().zip(&outside).zip(&inside) {
         if out.result != "ok" {
-            eprintln!(
-                "skip {family}: not creatable outside the sandbox ({})",
-                out.detail
+            skip(
+                "socket-family",
+                &format!(
+                    "{family}: not creatable outside the sandbox ({})",
+                    out.detail
+                ),
             );
             continue;
         }
@@ -135,7 +141,10 @@ fn ip_socket_creation_is_allowed_but_inert() {
     let actions = [("socket-family", "inet"), ("socket-family", "inet6")];
     let outside = probe_outside(&actions);
     if outside.iter().any(|line| line.result != "ok") {
-        eprintln!("control: IP sockets not creatable outside; nothing to check");
+        skip(
+            "ip-sockets",
+            "IP sockets are not creatable outside the sandbox",
+        );
         return;
     }
     let inside = probe_inside(&fixture.access_args(), &actions);
@@ -152,10 +161,12 @@ fn kernel_control_socket_is_unreachable() {
     let fixture = Fixture::new("macos-nstat");
     let outside = probe_outside(&[("nstat-open", "")]);
     if outside[0].result != "ok" {
-        eprintln!(
-            "control: this host does not let an ordinary user resolve the statistics control \
-             ({}); nothing to check",
-            outside[0].detail
+        skip(
+            "nstat-control",
+            &format!(
+                "this host does not let an ordinary user resolve the statistics control: {}",
+                outside[0].detail
+            ),
         );
         return;
     }
@@ -251,10 +262,13 @@ fn sysctl_proc_cputype_is_not_a_cross_process_oracle() {
     let outside_pid = std::process::id().to_string();
     let outside = probe_outside(&[("sysctl-proc-cputype", &outside_pid)]);
     if outside[0].result != "ok" {
-        eprintln!(
-            "macOS denies sysctl.proc_cputype for another process even outside the sandbox ({}); \
-             it is not an oracle",
-            outside[0].detail
+        skip(
+            "sysctl-proc-cputype",
+            &format!(
+                "macOS denies sysctl.proc_cputype for another process even outside the sandbox, \
+                 so it is not an oracle: {}",
+                outside[0].detail
+            ),
         );
         return;
     }
