@@ -15,6 +15,7 @@ mod peer;
 mod plan;
 mod relay;
 mod system;
+mod trust;
 mod watch;
 
 use sandy_core::{Backend, PlanItem, ResolvedPolicy, SandboxError, TargetCommand};

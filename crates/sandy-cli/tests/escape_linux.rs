@@ -22,6 +22,9 @@ use common::linux::*;
 use common::unix::*;
 use common::*;
 
+/// What `check` returns when this host cannot enforce a requirement of the policy.
+const EXIT_NOT_ENFORCEABLE: i32 = 1;
+
 fn args(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| value.to_string()).collect()
 }
@@ -1245,6 +1248,71 @@ fn a_writable_path_over_the_system_set_is_refused() {
     );
 }
 
+/// `check` with the environment the trusted locations are read from: a home directory and a PATH
+/// of the test's own, so the result does not depend on the account that runs the suite.
+fn check_with_environment(home: &str, path: &str, writable: &str) -> Output {
+    Command::new(sandy_path())
+        .args(["check", "--read-write", writable])
+        .env("HOME", home)
+        .env("PATH", path)
+        .output()
+        .unwrap()
+}
+
+/// A writable path that holds the home directory lets the program change shell startup files and
+/// autostart entries, which run outside the sandbox at the next login (README rule 8). sandy
+/// refuses such a policy; a directory below the home directory stays writable.
+#[test]
+fn refuses_a_writable_path_over_the_home_directory() {
+    let fixture = Fixture::new("trusted-home");
+    fs::create_dir_all(fixture.path("home/data")).unwrap();
+    let check = |writable: &str| check_with_environment(&fixture.arg("home"), "/usr/bin", writable);
+
+    let refused = check(&fixture.arg("home"));
+    let stdout = String::from_utf8_lossy(&refused.stdout);
+    assert_eq!(
+        refused.status.code(),
+        Some(EXIT_NOT_ENFORCEABLE),
+        "{stdout}"
+    );
+    assert!(stdout.contains("runs outside the sandbox"), "{stdout}");
+
+    let allowed = check(&fixture.arg("home/data"));
+    assert_eq!(
+        allowed.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&allowed.stdout)
+    );
+}
+
+/// A directory on PATH inside a writable path lets the program leave a command there that the
+/// user runs outside the sandbox by name. The same writable path without that PATH entry stays
+/// allowed.
+#[test]
+fn refuses_a_writable_path_that_holds_a_directory_on_path() {
+    let fixture = Fixture::new("trusted-path");
+    fs::create_dir_all(fixture.path("rw/bin")).unwrap();
+    let check = |path: &str| check_with_environment(&fixture.arg("home"), path, &fixture.arg("rw"));
+
+    let refused = check(&format!("{}:/usr/bin", fixture.arg("rw/bin")));
+    let stdout = String::from_utf8_lossy(&refused.stdout);
+    assert_eq!(
+        refused.status.code(),
+        Some(EXIT_NOT_ENFORCEABLE),
+        "{stdout}"
+    );
+    assert!(stdout.contains("runs outside the sandbox"), "{stdout}");
+
+    let allowed = check("/usr/bin");
+    assert_eq!(
+        allowed.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&allowed.stdout)
+    );
+}
+
 /// A bind mount of a subdirectory of a writable path shares no ancestor with that path, so
 /// comparing the identity of the ancestors alone does not see that read_exec on the alias makes
 /// the writable directory executable. sandy compares where the paths lie inside the file system.
@@ -1302,4 +1370,125 @@ fn refuses_a_read_exec_alias_of_a_writable_subdirectory() {
     };
     assert_eq!(control, 0, "the control alias was refused: {stdout}");
     assert_eq!(alias, EXIT_FAILURE, "{stdout}");
+}
+
+/// Runs `script` as the root of a new user and mount namespace, so that it can bind-mount, and
+/// returns the exit codes it printed as `<name>=<code>` lines, in the order of `names`. `None`
+/// when this host does not let an unprivileged user create such a namespace, or when the script
+/// could not set its mounts up.
+fn namespace_exit_codes(script: &str, names: &[&str]) -> Option<Vec<i32>> {
+    let Ok(output) = Command::new("unshare")
+        .args(["--user", "--map-root-user", "--mount", "sh", "-c", script])
+        .output()
+    else {
+        skip("unshare", "unshare is not installed");
+        return None;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let codes: Vec<i32> = names
+        .iter()
+        .filter_map(|name| {
+            let prefix = format!("{name}=");
+            stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix)?.parse().ok())
+        })
+        .collect();
+    if codes.len() == names.len() {
+        return Some(codes);
+    }
+    skip(
+        "unshare",
+        &format!(
+            "no unprivileged user namespace with a mount namespace: {:?}, {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    );
+    None
+}
+
+/// A 64-bit little-endian ELF file with one program header, which names `interpreter`. `check`
+/// reads the header to learn which loader the kernel would execute; it never runs the file.
+fn elf_with_interpreter(path: &Path, interpreter: &str) {
+    let mut bytes = vec![0u8; 64 + 56];
+    bytes[..6].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1]);
+    bytes[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+    bytes[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+    bytes[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes());
+    let interpreter = format!("{interpreter}\0");
+    let at = bytes.len() as u64;
+    bytes[64..68].copy_from_slice(&3u32.to_le_bytes());
+    bytes[72..80].copy_from_slice(&at.to_le_bytes());
+    bytes[96..104].copy_from_slice(&(interpreter.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(interpreter.as_bytes());
+    fs::write(path, bytes).unwrap();
+}
+
+/// The minimal system set is compared like the policy paths: an alias of a directory that holds
+/// entries of the set is that directory, so a writable path on an alias of /etc is refused like
+/// `--read-write /etc`. The control alias holds nothing of the set and stays allowed.
+#[test]
+fn refuses_a_writable_alias_of_a_system_set_directory() {
+    let fixture = Fixture::new("system-alias");
+    for dir in ["alias", "control"] {
+        fs::create_dir_all(fixture.path(dir)).unwrap();
+    }
+    let check = |path: &str| format!("{} check --read-write {path} >/dev/null 2>&1", sandy_path());
+    let script = format!(
+        "mount --bind /etc {} || exit 97\n\
+         mount --bind {} {} || exit 97\n\
+         exec unshare --user --map-user=1000 --map-group=1000 sh -c '\
+           {}; echo alias=$?; {}; echo control=$?'\n",
+        fixture.arg("alias"),
+        fixture.arg("ro"),
+        fixture.arg("control"),
+        check(&fixture.arg("alias")),
+        check(&fixture.arg("control")),
+    );
+    let Some(codes) = namespace_exit_codes(&script, &["alias", "control"]) else {
+        return;
+    };
+    assert_eq!(codes[1], 0, "the control alias was refused: {codes:?}");
+    assert_eq!(codes[0], EXIT_NOT_ENFORCEABLE, "{codes:?}");
+}
+
+/// sandy grants execute on the loader the program names in its header, but never when the loader
+/// lies in a writable path: the program could replace what the kernel executes. The writable path
+/// is an alias of the directory that holds the loader, which a comparison of path prefixes does
+/// not see. The control run grants the same loader with an unrelated writable path.
+#[test]
+fn refuses_a_loader_in_an_alias_of_a_writable_path() {
+    let fixture = Fixture::new("loader-alias");
+    for dir in ["alias", "control"] {
+        fs::create_dir_all(fixture.path(dir)).unwrap();
+    }
+    // A loader in a system location that the minimal system set does not name, as a
+    // distribution outside the FHS layout has. The tmpfs below makes it writable for the test.
+    let loader = "/usr/local/lib/ld-sandy-test.so";
+    let program = fixture.path("bin/program");
+    elf_with_interpreter(&program, loader);
+    let check = |path: &str| {
+        format!(
+            "{} check --read-write {path} {} >/dev/null 2>&1",
+            sandy_path(),
+            program.display()
+        )
+    };
+    let script = format!(
+        "mount -t tmpfs none /usr/local || exit 97\n\
+         mkdir -p /usr/local/lib || exit 97\n\
+         : > {loader} || exit 97\n\
+         mount --bind /usr/local {} || exit 97\n\
+         exec unshare --user --map-user=1000 --map-group=1000 sh -c '\
+           {}; echo alias=$?; {}; echo control=$?'\n",
+        fixture.arg("alias"),
+        check(&fixture.arg("alias")),
+        check(&fixture.arg("control")),
+    );
+    let Some(codes) = namespace_exit_codes(&script, &["alias", "control"]) else {
+        return;
+    };
+    assert_eq!(codes[1], 0, "the control run was refused: {codes:?}");
+    assert_eq!(codes[0], EXIT_NOT_ENFORCEABLE, "{codes:?}");
 }

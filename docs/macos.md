@@ -241,6 +241,13 @@ metadata is readable) are exempt. Most entries are on the sealed system volume o
 so file permissions forbid writing them anyway; the check keeps the guarantee independent of
 that.
 
+Paths are compared by what they lead to, as for rules 3 and 4 (see "Links and file identity" in
+[DESIGN.md](DESIGN.md)): sandy compares the identity of each entry with the writable path and
+with its parent directories. A second name of a directory of the set therefore counts as that
+directory. The spelling through the data volume, `/System/Volumes/Data/private/etc` for
+`/private/etc`, is such a name: a firmlink is no symbolic link, so `canonicalize` keeps it as
+written and a comparison of path prefixes would let a writable path on it pass.
+
 | Path | Access | Reason |
 |---|---|---|
 | `/` (the directory itself) | read | dyld opens the root directory while libignition locates the cryptex with the shared cache (macOS 13 and later); without it dyld aborts in `ignition_halt` before libSystem loads. This lists the names in `/`, nothing below. |
@@ -289,6 +296,40 @@ operating system; libSystem (`sysconf`, `uname`), dyld and language runtimes rea
 Chromium's `common.sb` list plus `hw.logicalcpu`, `hw.physicalcpu`, `hw.pagesize` and `kern.argmax`
 from the Codex CLI. No `kern.proc.*` name is readable, so the target cannot list processes or read
 their arguments and environment.
+
+## Trusted user locations
+
+Rule 12 of [DESIGN.md](DESIGN.md): a writable policy path may not reach a location of this user
+that other programs read or execute later. The list is in `trust::locations`:
+
+| Location | Protected | Why |
+|---|---|---|
+| the home directory | itself | holds the locations below; a writable path below it stays allowed |
+| `Library/LaunchAgents` | the tree | launchd starts the agents of this user at the next login |
+| `.zshenv`, `.zprofile`, `.zshrc`, `.zlogin`, `.zlogout`, `.bashrc`, `.bash_profile`, `.profile` | the file | zsh is the login shell of macOS, and bash is installed |
+| `.ssh` | the tree | `ProxyCommand` and `LocalCommand` in the configuration run programs, and `authorized_keys` admits logins |
+| `.gnupg` | the tree | `pinentry-program` names a program that gpg runs |
+| every absolute directory on sandy's `PATH` | itself | a program left there runs when the user types its name; a directory below one of them is on no `PATH` and stays allowed |
+
+The home directory comes from the password database (`getpwuid_r`) and from `HOME`, because a
+program that starts sandy with a minimal environment sets no `HOME`; when neither names one,
+only the `PATH` directories are checked. A location that does not exist counts, because the
+program could create it, and each counts where it lies and where its symbolic links lead.
+
+The profile could deny these paths inside a writable path instead of refusing the policy,
+because a later deny rule overrides an earlier allow. sandy refuses, so that one policy means
+the same on every platform: Landlock rules are allow-only, so the Linux backend cannot carve a
+file out of a writable tree.
+
+The list is a heuristic and can never be complete: no list knows which files the programs of
+this user trust. It also does not see a hard link that already gives one of these files a
+second name inside a writable path.
+
+sandy does not check the loader variables of its own environment (`DYLD_INSERT_LIBRARIES`,
+`DYLD_LIBRARY_PATH`, `DYLD_FRAMEWORK_PATH`). The release binaries are unsigned, so dyld honours
+them, and a caller that points them into a writable path runs that code as sandy, with no
+sandbox. An integrator who signs sandy with the hardened runtime, as notarization requires,
+gets them ignored unless the binary carries the `allow-dyld-environment-variables` entitlement.
 
 ## Networking
 
@@ -655,6 +696,12 @@ no privilege, and closing them would break ordinary programs:
   no `process-exec*`, so only `read_exec` paths execute. sandy follows one `#!` line; XNU follows
   more (measured on macOS 26: a script whose interpreter is a script runs), so sandy never names
   an interpreter the kernel would not reach.
+- A file the program writes can be executed outside the sandbox. The program gets no
+  `process-exec*` in a writable path, but a file it writes keeps the mode it gives it, and a
+  process of the user outside the sandbox can run it. The trusted-location check keeps the
+  writable paths out of the places where other programs run or read files on their own (see
+  "Trusted user locations"); whether a user runs a file from a writable path stays the user's
+  decision.
 - A `read_write` path itself cannot be deleted or replaced, and a writable file cannot be replaced
   by renaming another file over it. Programs must write such a file in place.
 - `getcwd` fails when the working directory is outside the policy.

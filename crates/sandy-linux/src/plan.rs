@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use landlock::{ABI, Access, AccessFs, AccessNet, BitFlags, Scope, make_bitflags};
 use sandy_core::{
-    ChildProcesses, NetworkAccess, PathAccess, PathMetadata, PathRule, PlanItem, Requirement,
-    ResolvedPolicy, SignalScope, SystemAccess,
+    ChildProcesses, NetworkAccess, PathAccess, PathIdentity, PathMetadata, PathRule, PlanItem,
+    ProtectedPath, Requirement, ResolvedPolicy, SignalScope, SystemAccess,
 };
 
 use crate::cgroup;
@@ -84,6 +84,7 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
         .ok()
         .map(|abi| landlock_config(policy, &host.system_paths, loader.as_deref(), abi));
     let conflict = system_conflict(policy, &host.system_locations)
+        .or_else(|| trust_conflict(policy, &host.trusted_locations))
         .or_else(|| loader_problem(loader.as_deref(), &executable_paths(landlock.as_ref()?)))
         .or_else(|| {
             policy.interpreter_problem(SHEBANG_LEVELS, &executable_paths(landlock.as_ref()?))
@@ -329,31 +330,55 @@ fn relay_mechanism(abi: ABI) -> String {
 /// inside a directory entry, would let the program change them for the next start and for
 /// programs outside the sandbox. Missing entries count, because the program could create them.
 /// /dev/null is writable in the set itself.
+///
+/// The comparison is the one of rules 3 and 4 (`PathIdentity`), so an alias of a directory of
+/// the set counts as that directory. Without the mount table sandy cannot see such an alias, so
+/// it refuses the policy, as the resolver does.
 fn system_conflict(policy: &ResolvedPolicy, system: &[SystemPath]) -> Option<String> {
     if policy.system != SystemAccess::Minimal {
         return None;
     }
-    let writable = policy
-        .paths
+    let protected: Vec<ProtectedPath> = system
         .iter()
-        .filter(|rule| rule.access == PathAccess::ReadWrite);
-    for rule in writable {
-        let protected = system.iter().filter(|s| s.usage != SystemUse::Discard);
-        for entry in protected {
-            let inside_writable = entry.path.starts_with(&rule.path);
-            let inside_entry = entry.is_dir && rule.path.starts_with(&entry.path);
-            if inside_writable || inside_entry {
-                return Some(format!(
-                    "writable path {} overlaps {} of the minimal system set; the program could \
-                     change code or configuration that the next start and programs outside the \
-                     sandbox use",
-                    rule.path.display(),
-                    entry.path.display()
-                ));
+        .filter(|entry| entry.usage != SystemUse::Discard)
+        .map(|entry| {
+            if entry.is_dir {
+                ProtectedPath::tree(&entry.path)
+            } else {
+                ProtectedPath::entry(&entry.path)
             }
-        }
-    }
-    None
+        })
+        .collect();
+    let identity = match PathIdentity::read() {
+        Ok(identity) => identity,
+        Err(error) => return Some(error.to_string()),
+    };
+    let (rule, entry) = policy.writable_conflict(&protected, &identity)?;
+    Some(format!(
+        "writable path {} overlaps {} of the minimal system set; the program could change code \
+         or configuration that the next start and programs outside the sandbox use",
+        rule.path.display(),
+        entry.path.display()
+    ))
+}
+
+/// The locations of this user that programs outside the sandbox read or execute later (see
+/// `trust`). They are no policy paths, so rules 3 and 4 do not cover them, and Landlock cannot
+/// carve one file out of a writable tree, so the only way to keep what the policy promises is to
+/// refuse it. Unlike the system set this applies with `system = "none"` as well: the locations
+/// belong to the user, not to the set.
+fn trust_conflict(policy: &ResolvedPolicy, trusted: &[ProtectedPath]) -> Option<String> {
+    let identity = match PathIdentity::read() {
+        Ok(identity) => identity,
+        Err(error) => return Some(error.to_string()),
+    };
+    let (rule, location) = policy.writable_conflict(trusted, &identity)?;
+    Some(format!(
+        "writable path {} overlaps {}, which programs outside the sandbox read or execute \
+         later; a file the program leaves there runs outside the sandbox",
+        rule.path.display(),
+        location.path.display()
+    ))
 }
 
 /// Where the loader of the program is, with symbolic links resolved. A program that names none,
@@ -400,8 +425,12 @@ fn loader_rule(
     if rules.iter().any(covered) {
         return None;
     }
-    let inside_writable =
-        |rule: &PathRule| rule.access == PathAccess::ReadWrite && loader.starts_with(&rule.path);
+    // Without the mount table an alias of a writable path is indistinguishable from any other
+    // directory, so sandy grants nothing; `loader_problem` then refuses the policy.
+    let identity = PathIdentity::read().ok()?;
+    let inside_writable = |rule: &PathRule| {
+        rule.access == PathAccess::ReadWrite && identity.within(loader, &rule.path)
+    };
     if policy.paths.iter().any(inside_writable) {
         return None;
     }
@@ -561,6 +590,7 @@ mod tests {
             pidfd: Ok(()),
             system_locations: [existing.clone(), vec![missing]].concat(),
             system_paths: existing,
+            trusted_locations: vec![sandy_core::ProtectedPath::entry("/home/someone")],
         }
     }
 
@@ -1007,6 +1037,22 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A writable path that reaches one of the user's trusted locations is refused, whatever the
+    /// system access, and a path below a location that protects only itself is not.
+    #[test]
+    fn a_writable_path_over_a_trusted_location_is_refused() {
+        let refused = |path: &str, system: SystemAccess| {
+            let mut policy = policy();
+            policy.system = system;
+            policy.paths.push(rule(path, PathAccess::ReadWrite, true));
+            let plan = plan_for(&policy, &host(Some(9)));
+            unavailable(&plan) == vec![Requirement::FilesystemConfined]
+        };
+        assert!(refused("/home", SystemAccess::Minimal));
+        assert!(refused("/home", SystemAccess::None));
+        assert!(!refused("/home/someone/data", SystemAccess::Minimal));
     }
 
     #[test]

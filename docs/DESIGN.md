@@ -101,9 +101,11 @@ Rules:
    writable policy path may overlap the set: contain one of its entries (also one that does not
    exist yet, such as `/etc/ld.so.preload`) or lie inside one of its directories. The entries are
    code and configuration that the next start and programs outside the sandbox trust, so rules 3
-   and 4 apply to them as to policy paths. The only exception is `/dev/null`, which the set makes
-   writable. The backend checks this, because only it knows its set; with `system = "none"` it
-   adds nothing, and every writable path is the policy's own choice.
+   and 4 apply to them as to policy paths, including how they compare paths: another name of a
+   directory of the set counts as that directory (see "Links and file identity"). The only
+   exception is `/dev/null`, which the set makes writable. The backend checks this, because only
+   it knows its set; with `system = "none"` it adds nothing, and every writable path is the
+   policy's own choice. Rule 12 holds in that case too.
 7. The environment of the program contains only `pass` and `set` variables, plus variables a
    backend must add for any process to start (documented per backend).
 8. `unix_sockets = "all"` allows every Unix socket the user can reach, independent of the
@@ -156,11 +158,36 @@ Rules:
    detected. The caller closes this gap with `--parent-pid` and its own process ID: sandy then
    refuses when its parent is another process. sandy also refuses when it sees that its parent
    has already ended.
+12. No writable policy path may reach a location of this user whose content other programs read
+   or execute later: the home directory (which it may not contain), the shell startup files,
+   autostart entries and user services, `~/.ssh`, the directories on sandy's `PATH`, and per
+   platform `~/Library/LaunchAgents`, the Startup folders, the PowerShell profile folders and
+   `WindowsApps`. A file the program leaves in one of them runs outside the sandbox with the
+   user's rights at the next login, the next shell or the next command, which would make the
+   whole policy pointless. The backend checks this, because only it knows the locations of its
+   platform, and it compares paths as rules 3 and 4 do. A path below the home directory, or
+   below a directory on `PATH`, stays writable: only the locations themselves and the trees of
+   those that hold code are protected.
+
+   The set is a heuristic. No list knows which files the programs of a user trust, and the set
+   covers the usual shell and desktop setups only. It also does not depend on the policy:
+   `system = "none"` changes nothing about it. The home directory comes from the password
+   database or the known-folder API and from the environment, because a program that starts
+   sandy with a minimal environment sets neither; when no source names one, only the locations
+   that do not depend on it are checked. The trade-off is that a few policies that worked
+   before are refused now, a writable project tree whose `bin` directory the caller has on
+   `PATH` for example; the answer is to grant the directories the program needs, or to start
+   sandy with a `PATH` that does not reach into the writable path.
 
 ## Links and file identity
 
-A path names a way to a file, not the file itself. Rules 3 and 4 therefore compare more than the
-spelling of a path.
+A path names a way to a file, not the file itself. Rules 3, 4, 6 and 12 therefore compare more
+than the spelling of a path. The resolver compares the policy paths with each other; the
+backends compare them with their system set and with the trusted locations of rule 12, through
+the same functions (`PathIdentity`, `ProtectedPath`), so one policy is refused for the same
+reason whichever check sees it first. A location of a backend counts twice: where it lies and
+where its symbolic links lead, because whoever can write the one can repoint it and whoever can
+write the other changes what programs read.
 
 - **Two paths, one directory.** sandy compares the identity (device and inode) of a writable
   path with the path it checks and with each of that path's parent directories, so an alias of
@@ -181,7 +208,10 @@ spelling of a path.
 - **What stays open.** A hard link between a writable path and a file that no rule names, or
   that only a `read` rule names, is allowed: the program can change that file through the
   writable name. Refusing it would stop the package managers that fill a project from a shared
-  cache with hard links, so the policy decides what a writable path may hold. Two names that different file systems show for one
+  cache with hard links, so the policy decides what a writable path may hold. The entries of the
+  system set and the locations of rule 12 are compared as paths and directories, not for second
+  names: a hard link of a shell startup file inside a writable path stays writable through that
+  name. Two names that different file systems show for one
   file, as a passthrough FUSE mount does, have different identities and stay unseen. The check
   runs at the start, so a link that a process outside the sandbox makes while the program runs
   is not covered. The program cannot make one itself: it gets no link right out of its writable

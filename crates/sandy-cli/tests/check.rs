@@ -37,7 +37,7 @@ fn check_with_home(home: &std::path::Path, args: &[String]) -> std::process::Out
 #[test]
 fn check_warns_about_settings_that_give_up_isolation() {
     let fixture = Fixture::new("check-warn");
-    let home = fixture.path("rw/home");
+    let home = fixture.path("ro/home");
     fs::create_dir_all(&home).unwrap();
     let output = check_with_home(
         &home,
@@ -63,10 +63,6 @@ fn check_warns_about_settings_that_give_up_isolation() {
     ] {
         assert!(stderr.contains(setting), "{setting} is not named: {stderr}");
     }
-    assert!(
-        stderr.contains(&fixture.path("rw").display().to_string()),
-        "the writable path that holds the home directory is not named: {stderr}"
-    );
 
     // Control: a policy that keeps the isolation, and a home directory outside the writable path.
     let output = check_with_home(
@@ -80,6 +76,40 @@ fn check_warns_about_settings_that_give_up_isolation() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains(WARNING), "{stderr}");
+}
+
+/// A writable path that holds the home directory lets the program change shell startup files
+/// and autostart entries, which run outside the sandbox (README rule 8). The backend refuses
+/// such a policy, and the warning says what the program could reach.
+#[test]
+fn check_refuses_a_writable_path_that_holds_the_home_directory() {
+    let fixture = Fixture::new("check-home");
+    let home = fixture.path("rw/home");
+    fs::create_dir_all(&home).unwrap();
+    let output = check_with_home(&home, &["--read-write".to_string(), fixture.arg("rw")]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(NOT_ENFORCEABLE),
+        "{stdout}{stderr}"
+    );
+    assert!(stdout.contains("runs outside the sandbox"), "{stdout}");
+    assert!(
+        stderr.contains(&fixture.path("rw").display().to_string()),
+        "the writable path that holds the home directory is not named: {stderr}"
+    );
+
+    // Control: the same policy with the home directory beside the writable path.
+    let output = check_with_home(
+        &fixture.path("ro"),
+        &["--read-write".to_string(), fixture.arg("rw")],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
 
 /// A command line option replaces the value of the policy file, also with a weaker one. The

@@ -4,10 +4,11 @@
 use std::io;
 use std::ptr;
 
-use sandy_core::{ChildProcesses, ResolvedPolicy};
+use sandy_core::{ChildProcesses, ProtectedPath, ResolvedPolicy};
 
 use crate::filter;
 use crate::system::{self, SystemPath};
+use crate::trust;
 
 /// `Ok` when a feature can be used, otherwise the reason why it cannot.
 pub type Support = Result<(), String>;
@@ -35,6 +36,8 @@ pub struct HostCapabilities {
     pub system_paths: Vec<SystemPath>,
     /// Where every candidate of the minimal system set is or would be, also missing ones.
     pub system_locations: Vec<SystemPath>,
+    /// The locations of this user that programs outside the sandbox read or execute later.
+    pub trusted_locations: Vec<ProtectedPath>,
 }
 
 impl HostCapabilities {
@@ -50,6 +53,7 @@ impl HostCapabilities {
             unprivileged: unprivileged(),
             system_paths: system::detect(),
             system_locations: system::locations(),
+            trusted_locations: trust::locations(),
         }
     }
 

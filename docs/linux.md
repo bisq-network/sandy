@@ -576,8 +576,10 @@ The loader of the program is read from the program file, which is untrusted inpu
 grants it only under `/usr`, `/lib`, `/lib64`, `/nix/store` and `/gnu/store`: the locations that
 belong to root and hold the loaders of the FHS layout and of the two package stores that do not
 follow it. It is never granted inside a writable path, where the program could replace what it
-executes. Every other loader is refused instead (see "Refusals"), so a program that names its
-own loader cannot gain execute on a file no policy rule covers.
+executes; that comparison is the one of "Links and the mount table", so a writable path that
+names an alias of the loader's directory counts too. Every other loader is refused instead (see
+"Refusals"), so a program that names its own loader cannot gain execute on a file no policy
+rule covers.
 
 Left out on purpose:
 
@@ -643,6 +645,44 @@ descriptor, and the cgroup limits (see "What the set does not cover").
 `the_programs_own_path_is_readable_without_proc`). Common runtimes (glibc, Rust, Python, Go,
 Java, Node.js) still start.
 
+## Trusted user locations
+
+Rule 12 of [DESIGN.md](DESIGN.md): a writable policy path may not reach a location of this user
+that other programs read or execute later. Landlock rules are allow-only and apply to a whole
+tree, so a writable home directory cannot leave out the shell startup file in it; refusing the
+policy is the only way to keep what it promises. The list is in `trust::locations`:
+
+| Location | Protected | Why |
+|---|---|---|
+| the home directory | itself | holds the files below; a writable path below it stays allowed |
+| `.bashrc`, `.bash_profile`, `.bash_login`, `.bash_logout`, `.profile`, `.zshenv`, `.zprofile`, `.zshrc`, `.zlogin`, `.zlogout` | the file | every shell of this user reads them at its start |
+| `.pam_environment`, `.xprofile`, `.xinitrc`, `.xsession` | the file | read when a session starts |
+| `.ssh` | the tree | `ProxyCommand` and `LocalCommand` in the configuration run programs, and `authorized_keys` admits logins |
+| `.gnupg` | the tree | `pinentry-program` and `photo-viewer` name programs that gpg runs |
+| `<config>/autostart` | the tree | desktop entries that run at the next login |
+| `<config>/systemd`, `<data>/systemd` | the tree | systemd user units, which the program can enable with a link of its own |
+| `<config>/environment.d` | the tree | variables for every program of the session |
+| `<config>/fish` | the tree | the startup files of the fish shell |
+| `<data>/applications` | the tree | desktop entries that say which program opens a file |
+| every absolute directory on sandy's `PATH` | itself | a program left there runs when the user types its name; a directory below one of them is on no `PATH` and stays allowed |
+
+`<config>` is `XDG_CONFIG_HOME` and `~/.config`, `<data>` is `XDG_DATA_HOME` and
+`~/.local/share`; both spellings count, because the variables are not set for every program that
+starts sandy. The home directory comes from the password database (`getpwuid_r`) and from
+`HOME`, for the same reason; when neither names one, only the `PATH` directories are checked. A
+location that does not exist counts, because the program could create it, and each counts where
+it lies and where its symbolic links lead.
+
+The list is a heuristic and can never be complete: no list knows which files the programs of
+this user trust. It also does not see a hard link that already gives one of these files a second
+name inside a writable path.
+
+sandy does not check the loader variables of its own environment (`LD_PRELOAD`, `LD_AUDIT`,
+`LD_LIBRARY_PATH`). A dynamically linked sandy loads what they name before it confines itself,
+so a caller that points them into a writable path runs that code as sandy, with no sandbox. The
+release binaries are statically linked against musl and ignore the variables; a build from
+source is dynamic by default.
+
 ## Links and the mount table
 
 Landlock binds a rule to the inode behind a path when sandy starts, and it checks the path a
@@ -692,7 +732,11 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   dynamic loader, shared libraries, the loader configuration or files such as `/etc/hosts`, which
   the next start and programs outside the sandbox use. File permissions usually forbid this
   anyway, because these files belong to root and sandy refuses to run as root; the check keeps
-  the guarantee independent of them.
+  the guarantee independent of them. Paths are compared as in "Links and the mount table", so a
+  bind alias of a directory of the set is refused like the directory itself; sandy refuses the
+  policy when it cannot read the mount table.
+- A writable policy path that overlaps a trusted user location, whatever the system access:
+  FilesystemConfined is unavailable. The locations are in "Trusted user locations" above.
 - `children = "contained"` while sandy itself runs in a sandbox that denies `setpgid`:
   ChildProcessesContained is unavailable. The program runs in a process group of its own, and
   sandy's own filter denies `setpgid` inside `contained`, so one contained sandbox cannot hold
@@ -761,6 +805,12 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   this includes ACLs and, on a host with SELinux, the security label. The file system ioctls of
   the same kind are denied (see "Metadata"). The test
   `metadata_calls_on_a_read_only_descriptor_still_work` records this.
+- **Files the program writes can be executed outside the sandbox.** The program gets no execute
+  right in a writable path, but a file it writes keeps the mode it gives it: the filter strips
+  only the setuid and setgid bits, and Landlock has no right over the execute bit. A process
+  outside the sandbox can run such a file. The trusted-location check keeps the writable paths
+  out of the places where other programs run or read files on their own (see "Trusted user
+  locations"); whether a user runs a file from a writable path stays the user's decision.
 - **Locks on readable files.** `flock` and POSIX and open file description locks need only a
   read descriptor, and seccomp cannot tell a descriptor's access mode. While the program holds
   one on a file in a `read` path, processes outside that lock the same file wait or fail. Read

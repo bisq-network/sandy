@@ -1238,3 +1238,91 @@ fn a_script_with_an_x86_64_interpreter_is_refused_before_it_starts() {
         "the reason does not name the interpreter: {report}"
     );
 }
+
+/// What `check` returns when this host cannot enforce a requirement of the policy.
+const EXIT_NOT_ENFORCEABLE: i32 = 1;
+
+/// The minimal system set is compared like the policy paths: /System/Volumes/Data/private/etc
+/// is a second name of /private/etc, which holds entries of the set, so a writable path on it is
+/// refused like `--read-write /private/etc`. A comparison of path prefixes does not see it,
+/// because the firmlink is no symbolic link and `canonicalize` keeps the spelling.
+#[test]
+fn refuses_a_writable_firmlink_spelling_of_a_system_set_directory() {
+    let alias = "/System/Volumes/Data/private/etc";
+    if !Path::new(alias).exists() {
+        return skip(
+            "data-volume-firmlink",
+            "this host has no /System/Volumes/Data spelling of /private",
+        );
+    }
+    let output = sandy(["check", "--read-write", alias]);
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(EXIT_NOT_ENFORCEABLE), "{report}");
+    assert!(report.contains("minimal system set"), "{report}");
+}
+
+/// `check` with the environment the trusted locations are read from: a home directory and a PATH
+/// of the test's own, so the result does not depend on the account that runs the suite.
+fn check_with_environment(home: &str, path: &str, writable: &str) -> std::process::Output {
+    Command::new(sandy_path())
+        .args(["check", "--read-write", writable])
+        .env("HOME", home)
+        .env("PATH", path)
+        .output()
+        .unwrap()
+}
+
+/// A writable path that holds the home directory lets the program write a launch agent, which
+/// launchd starts at the next login outside the sandbox, or a zsh startup file (README rule 8).
+/// sandy refuses such a policy; a directory below the home directory stays writable.
+#[test]
+fn refuses_a_writable_path_over_the_home_directory() {
+    let fixture = home_fixture("trusted-home");
+    let check = |writable: &str| check_with_environment(&fixture.arg("home"), "/usr/bin", writable);
+
+    for writable in ["home", "home/Library"] {
+        let refused = check(&fixture.arg(writable));
+        let report = String::from_utf8_lossy(&refused.stdout);
+        assert_eq!(
+            refused.status.code(),
+            Some(EXIT_NOT_ENFORCEABLE),
+            "{report}"
+        );
+        assert!(report.contains("runs outside the sandbox"), "{report}");
+    }
+
+    let allowed = check(&fixture.arg("home/Library/Keychains"));
+    assert_eq!(
+        allowed.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&allowed.stdout)
+    );
+}
+
+/// A directory on PATH inside a writable path lets the program leave a command there that the
+/// user runs outside the sandbox by name. The same writable path without that PATH entry stays
+/// allowed.
+#[test]
+fn refuses_a_writable_path_that_holds_a_directory_on_path() {
+    let fixture = home_fixture("trusted-path");
+    fs::create_dir_all(fixture.path("rw/bin")).unwrap();
+    let check = |path: &str| check_with_environment(&fixture.arg("home"), path, &fixture.arg("rw"));
+
+    let refused = check(&format!("{}:/usr/bin", fixture.arg("rw/bin")));
+    let report = String::from_utf8_lossy(&refused.stdout);
+    assert_eq!(
+        refused.status.code(),
+        Some(EXIT_NOT_ENFORCEABLE),
+        "{report}"
+    );
+    assert!(report.contains("runs outside the sandbox"), "{report}");
+
+    let allowed = check("/usr/bin");
+    assert_eq!(
+        allowed.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&allowed.stdout)
+    );
+}

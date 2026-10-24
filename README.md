@@ -403,18 +403,27 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
    never contains user data. Each platform documents its exact list. Programs that need more
    (locale files, configuration in `/etc`, framework resources) need `--read` for those paths.
    No writable path may overlap this set (for example `--read-write /etc`); sandy refuses such a
-   policy.
+   policy. The comparison is the one of rule 2: another name of a directory of the set, a bind
+   mount for example, counts as that directory.
 6. **The environment** contains only `pass` and `set` variables, plus what a platform must add
    for any program to start (on Windows `SystemRoot` and `LOCALAPPDATA`).
 7. **Children inherit the sandbox.** A program that starts other programs needs them in a
    `read_exec` path; they run with the same restrictions. A script needs its interpreter there
    too, because the kernel executes the interpreter; `sandy check` reads the `#!` line and says
    so instead of letting the program fail to start.
-8. **A writable path gives the program your write rights there.** sandy cannot know which of your
-   files other programs trust. Never make a directory writable that holds files other programs run
-   or read as configuration, such as shell startup files (`~/.bashrc`, `~/.profile`), autostart
-   entries, or the configuration of other applications. A compromised program could change them,
-   and they would run outside the sandbox.
+8. **No writable path over a trusted user location.** A writable path gives the program your
+   write rights there, and a file it leaves behind runs with your rights, outside the sandbox.
+   sandy refuses a writable path that reaches a location whose content another program reads or
+   runs later: your home directory, the shell startup files (`~/.bashrc`, `~/.profile`),
+   autostart entries and user services, `~/.ssh`, and the directories on your `PATH`; on macOS
+   also `~/Library/LaunchAgents`, on Windows the Startup folders, the PowerShell profile folders
+   and `WindowsApps`. Each platform documents its list. A directory below your home directory,
+   or below a directory on `PATH`, stays writable.
+
+   sandy cannot know which of your files other programs trust, so the list is a heuristic and
+   can never be complete. Keep the writable paths of a policy as narrow as the program needs,
+   and do not make a directory writable that holds files other programs run or read as
+   configuration.
 
 ### Network
 

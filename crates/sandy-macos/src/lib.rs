@@ -9,6 +9,7 @@ pub mod binary;
 pub mod plan;
 pub mod profile;
 pub mod system;
+pub mod trust;
 
 #[cfg(target_os = "macos")]
 mod macos;

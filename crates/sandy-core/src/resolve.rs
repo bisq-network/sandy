@@ -26,6 +26,86 @@ pub struct PathRule {
     pub is_dir: bool,
 }
 
+/// A location outside the policy paths that a writable path must not reach: an entry of a
+/// backend's system set, or one of the user's trusted locations. The backends define their own,
+/// because only they know their system set and their platform's locations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtectedPath {
+    /// The location as the backend names it.
+    pub path: PathBuf,
+    /// The same location with the symbolic links on the way resolved, so that it compares with
+    /// the canonical policy paths. Both spellings count: whoever can write where a link lies can
+    /// repoint it, and whoever can write where it leads changes what other programs read.
+    resolved: PathBuf,
+    /// Whether everything beneath the location is protected too. A directory whose content other
+    /// programs read or execute protects its tree; a location that must only not be contained in
+    /// a writable path, such as the home directory, does not.
+    pub subtree: bool,
+}
+
+impl ProtectedPath {
+    /// A location that protects everything beneath it.
+    pub fn tree(path: impl AsRef<Path>) -> ProtectedPath {
+        ProtectedPath::new(path.as_ref(), true)
+    }
+
+    /// A location that protects only itself: a file, or a directory whose own entries other
+    /// programs read while a writable path below it reaches none of them.
+    pub fn entry(path: impl AsRef<Path>) -> ProtectedPath {
+        ProtectedPath::new(path.as_ref(), false)
+    }
+
+    fn new(path: &Path, subtree: bool) -> ProtectedPath {
+        ProtectedPath {
+            path: path.to_path_buf(),
+            resolved: resolved_location(path),
+            subtree,
+        }
+    }
+
+    fn spellings(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.path.as_path())
+            .chain((self.resolved != self.path).then_some(self.resolved.as_path()))
+    }
+}
+
+/// The directories of a `PATH` variable as protected locations. A program the sandboxed one
+/// leaves in one of them runs outside the sandbox as soon as the user types its name. Only the
+/// directories themselves are protected: a writable path below one of them puts nothing on PATH.
+/// Entries that are not absolute name no fixed directory and are left out.
+pub fn path_directories(path: Option<&std::ffi::OsStr>) -> Vec<ProtectedPath> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    let mut directories: Vec<PathBuf> = std::env::split_paths(path)
+        .filter(|directory| directory.is_absolute())
+        .collect();
+    directories.sort();
+    directories.dedup();
+    directories.iter().map(ProtectedPath::entry).collect()
+}
+
+/// `path` in the canonical form that policy paths have, also when it does not exist: the
+/// canonical form of its nearest existing ancestor with the rest appended. A location that does
+/// not exist counts, because the program could create it.
+fn resolved_location(path: &Path) -> PathBuf {
+    let mut names = Vec::new();
+    let mut base = path;
+    loop {
+        if let Ok(canonical) = base.canonicalize() {
+            return names
+                .iter()
+                .rev()
+                .fold(canonical, |path, name| path.join(name));
+        }
+        let (Some(parent), Some(name)) = (base.parent(), base.file_name()) else {
+            return path.to_path_buf();
+        };
+        names.push(name);
+        base = parent;
+    }
+}
+
 /// A validated policy with canonical paths, ready for a backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPolicy {
@@ -272,6 +352,68 @@ impl ResolvedPolicy {
         }
         check_no_writable_trusted_name(&canonical, &self.paths)
     }
+
+    /// The first writable path that reaches one of `protected`, with the location it reaches.
+    /// A writable path reaches a location when it contains it, or when it lies inside one that
+    /// protects its tree. The comparison is the one of rules 3 and 4 (`PathIdentity`), so
+    /// another name of a protected directory counts as that directory.
+    ///
+    /// Backends call this for the locations outside the policy that their platform must keep out
+    /// of a writable path: the entries of the minimal system set, and the locations of this user
+    /// that other programs read or execute later.
+    pub fn writable_conflict<'policy, 'protected>(
+        &'policy self,
+        protected: &'protected [ProtectedPath],
+        identity: &PathIdentity,
+    ) -> Option<(&'policy PathRule, &'protected ProtectedPath)> {
+        let writable = self
+            .paths
+            .iter()
+            .filter(|rule| rule.access == PathAccess::ReadWrite);
+        for rule in writable {
+            for location in protected {
+                let contains = location
+                    .spellings()
+                    .any(|path| identity.within(path, &rule.path));
+                let inside = location.subtree
+                    && location
+                        .spellings()
+                        .any(|path| identity.within(&rule.path, path));
+                if contains || inside {
+                    return Some((rule, location));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// How this host compares two paths: by the file they lead to, not by how they are spelled. The
+/// resolver uses it for rules 3 and 4, and the backends for the locations a writable path must
+/// not reach, so one policy is refused for the same reason whichever check sees it first.
+///
+/// What it sees per platform is in `is_within`. On Windows it compares the spelling only, so a
+/// second name of a directory, a junction for example, passes it (see "Links and identity" in
+/// docs/windows.md).
+#[derive(Debug)]
+pub struct PathIdentity {
+    mounts: Mounts,
+}
+
+impl PathIdentity {
+    /// Reads what the comparison needs from the host: on Linux the mount table, which is the
+    /// only way to see a bind alias of a subdirectory. sandy refuses the policy when it cannot
+    /// be read, as the resolver does (`Mounts::read`).
+    pub fn read() -> Result<PathIdentity, PolicyError> {
+        Ok(PathIdentity {
+            mounts: Mounts::read()?,
+        })
+    }
+
+    /// Whether `inner` is `outer` or lies beneath it.
+    pub fn within(&self, inner: &Path, outer: &Path) -> bool {
+        is_within(inner, outer, &self.mounts)
+    }
 }
 
 /// The interpreter of a `#!` line: the first word after `#!`, or `None` when `file` does not
@@ -432,6 +574,7 @@ fn same_object_among_ancestors(_inner: &Path, _outer: &Path) -> bool {
 /// shares no ancestor with the first. The physical location, the path inside the file system
 /// that holds it, is the same for both spellings.
 #[cfg(target_os = "linux")]
+#[derive(Debug)]
 struct Mounts {
     /// Mount point and the path of the mount's root inside its file system, in mount order.
     entries: Vec<(PathBuf, PathBuf)>,
@@ -552,6 +695,7 @@ fn same_physical_location(inner: &Path, outer: &Path, mounts: &Mounts) -> bool {
 /// Only Linux has bind mounts. A macOS firmlink aliases a whole volume, which the identity of
 /// the ancestors already catches, and Windows is covered by `same_object_among_ancestors`.
 #[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
 struct Mounts;
 
 #[cfg(not(target_os = "linux"))]
@@ -1728,5 +1872,77 @@ mod tests {
         policy.process.signals = SignalScope::Isolated;
         let resolved = ResolvedPolicy::resolve(&policy, None).unwrap();
         assert_eq!(resolved.warnings(Some(&home)), Vec::<String>::new());
+    }
+
+    fn writable_conflict(
+        writable: &Path,
+        protected: &[ProtectedPath],
+    ) -> Option<(PathBuf, PathBuf)> {
+        let policy = policy_with(&[], &[], &[writable]);
+        let resolved = ResolvedPolicy::resolve(&policy, None).unwrap();
+        let identity = PathIdentity::read().unwrap();
+        resolved
+            .writable_conflict(protected, &identity)
+            .map(|(rule, location)| (rule.path.clone(), location.path.clone()))
+    }
+
+    #[test]
+    fn only_the_absolute_directories_of_a_path_variable_are_protected() {
+        let (separator, first, second) = if cfg!(windows) {
+            (";", "C:\\bin", "C:\\tools")
+        } else {
+            (":", "/usr/bin", "/usr/local/bin")
+        };
+        // A repeated entry, one that is not absolute, and an empty one.
+        let value = [first, "relative", "", first, second].join(separator);
+        let directories: Vec<PathBuf> = path_directories(Some(value.as_ref()))
+            .into_iter()
+            .map(|location| location.path)
+            .collect();
+        assert_eq!(
+            directories,
+            vec![PathBuf::from(first), PathBuf::from(second)]
+        );
+        assert!(path_directories(None).is_empty());
+    }
+
+    /// A protected location counts where it lies and where its symbolic links lead, also when
+    /// the location itself does not exist yet.
+    #[cfg(unix)]
+    #[test]
+    fn a_protected_location_counts_where_its_links_lead() {
+        let dir = temp_dir();
+        let (real, link) = (dir.join("real"), dir.join("link"));
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let shell_file = ProtectedPath::entry(link.join(".bashrc"));
+        assert_eq!(
+            writable_conflict(&real, &[shell_file]),
+            Some((real, link.join(".bashrc")))
+        );
+    }
+
+    #[test]
+    fn a_writable_path_that_reaches_a_protected_location_is_reported() {
+        let dir = temp_dir();
+        let home = dir.join("home");
+        let data = home.join("data");
+        fs::create_dir_all(&data).unwrap();
+        let conflict = writable_conflict;
+        // The writable path holds the location, which does not exist yet.
+        let shell_file = ProtectedPath::entry(home.join(".bashrc"));
+        assert_eq!(
+            conflict(&home, std::slice::from_ref(&shell_file)),
+            Some((home.clone(), home.join(".bashrc")))
+        );
+        // A writable path beside it is accepted, and so is one below a location that protects
+        // itself only.
+        assert_eq!(conflict(&data, std::slice::from_ref(&shell_file)), None);
+        assert_eq!(conflict(&data, &[ProtectedPath::entry(&home)]), None);
+        // A location that protects its tree also refuses a writable path below it.
+        assert_eq!(
+            conflict(&data, &[ProtectedPath::tree(&home)]),
+            Some((data.clone(), home.clone()))
+        );
     }
 }

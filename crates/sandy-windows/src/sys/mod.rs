@@ -15,8 +15,8 @@ use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::AsRawSocket;
 
 use sandy_core::{
-    Backend, ChildProcesses, NetworkAccess, PlanItem, ResolvedPolicy, SandboxError, Status,
-    TargetCommand,
+    Backend, ChildProcesses, NetworkAccess, PlanItem, ProtectedPath, ResolvedPolicy, SandboxError,
+    Status, TargetCommand, path_directories,
 };
 use windows_sys::Win32::Security::{
     WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientServerSid,
@@ -28,7 +28,8 @@ use windows_sys::Win32::System::LibraryLoader::{
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 use windows_sys::Win32::UI::Shell::{
-    FOLDERID_LocalAppData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, KF_FLAG_DEFAULT,
+    FOLDERID_CommonStartup, FOLDERID_Documents, FOLDERID_LocalAppData, FOLDERID_Profile,
+    FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_Startup, KF_FLAG_DONT_VERIFY,
 };
 
 use crate::cmdline::{command_line, is_batch_file, without_verbatim_prefix};
@@ -369,7 +370,7 @@ fn local_app_data() -> Result<Vec<u16>, SandboxError> {
 /// The directories of the system set that a writable path may neither contain nor lie in: the
 /// Windows directory and the program files directories, where Windows grants every
 /// AppContainer read and execute access (rule 6 in DESIGN.md).
-fn system_directories() -> Result<Vec<std::path::PathBuf>, SandboxError> {
+fn system_directories() -> Result<Vec<ProtectedPath>, SandboxError> {
     let mut directories = vec![windows_directory()?];
     directories.push(known_folder(
         &FOLDERID_ProgramFiles,
@@ -379,14 +380,10 @@ fn system_directories() -> Result<Vec<std::path::PathBuf>, SandboxError> {
         &FOLDERID_ProgramFilesX86,
         "cannot find the x86 program files folder",
     )?);
-    // Policy paths are canonical, so compare with the canonical form; a folder that does not
-    // exist cannot overlap one.
     Ok(directories
         .into_iter()
-        .filter_map(|directory| {
-            std::path::PathBuf::from(OsString::from_wide(&directory))
-                .canonicalize()
-                .ok()
+        .map(|directory| {
+            ProtectedPath::tree(std::path::PathBuf::from(OsString::from_wide(&directory)))
         })
         .collect())
 }
@@ -402,10 +399,95 @@ fn held_sids(policy: &ResolvedPolicy, container: &Sid) -> Result<Vec<Sid>, Sandb
     Ok(held)
 }
 
-/// Rules 3 and 6 for the writable paths of `policy`: none may overlap a system directory, and
-/// nobody the program's token carries may execute files in one. Changes nothing.
+/// Locations of this user that programs outside the sandbox read or execute later: the folders
+/// Windows runs programs from at logon, the PowerShell profile folders, the app execution
+/// aliases, the SSH configuration, and every directory on sandy's PATH. A writable path that
+/// reaches one of them lets the program leave a file there that runs outside the sandbox at the
+/// next logon or the next command, and a file the program creates keeps the user's own rights
+/// on it, including the right to execute it (see "Trusted user locations" in docs/windows.md).
+///
+/// The list is a heuristic and can never be complete: no list knows which files the programs of
+/// this user trust. The user profile and the PATH directories are protected only against a
+/// writable path that contains them, so an ordinary writable folder below the profile, or below
+/// a directory on PATH, keeps working.
+fn trusted_locations() -> Result<Vec<ProtectedPath>, SandboxError> {
+    let folder = |id, error| -> Result<std::path::PathBuf, SandboxError> {
+        Ok(std::path::PathBuf::from(OsString::from_wide(
+            &known_folder(id, error)?,
+        )))
+    };
+    let documents = folder(&FOLDERID_Documents, "cannot find the documents folder")?;
+    let local = folder(
+        &FOLDERID_LocalAppData,
+        "cannot find the local application data folder",
+    )?;
+    let mut locations = vec![
+        ProtectedPath::tree(folder(&FOLDERID_Startup, "cannot find the startup folder")?),
+        ProtectedPath::tree(folder(
+            &FOLDERID_CommonStartup,
+            "cannot find the common startup folder",
+        )?),
+        // Where PowerShell 5 and PowerShell 7 read their profile scripts from.
+        ProtectedPath::tree(documents.join("WindowsPowerShell")),
+        ProtectedPath::tree(documents.join("PowerShell")),
+        // The app execution aliases, which the default PATH holds.
+        ProtectedPath::tree(local.join("Microsoft").join("WindowsApps")),
+    ];
+    for profile in user_profiles()? {
+        locations.push(ProtectedPath::tree(profile.join(".ssh")));
+        // After the folders in it, so that a writable profile is reported with the folder that
+        // makes it dangerous.
+        locations.push(ProtectedPath::entry(profile));
+    }
+    locations.extend(path_directories(std::env::var_os("PATH").as_deref()));
+    Ok(locations)
+}
+
+/// The profile folder of this user, from the known folder and from USERPROFILE. The known
+/// folder, because a service that starts sandy with a minimal environment sets no USERPROFILE;
+/// the variable as well, because a user who moves their profile with it keeps their files there.
+fn user_profiles() -> Result<Vec<std::path::PathBuf>, SandboxError> {
+    let known = std::path::PathBuf::from(OsString::from_wide(&known_folder(
+        &FOLDERID_Profile,
+        "cannot find the user profile folder",
+    )?));
+    let named = std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute());
+    let mut profiles: Vec<std::path::PathBuf> = std::iter::once(known).chain(named).collect();
+    profiles.sort();
+    profiles.dedup();
+    Ok(profiles)
+}
+
+/// Rules 3 and 6 for the writable paths of `policy`: none may overlap a system directory or one
+/// of the user's trusted locations, and nobody the program's token carries may execute files in
+/// one. Changes nothing.
+///
+/// Paths are compared as rules 3 and 4 compare them (`PathIdentity`). On Windows that is the
+/// spelling only: the file identity hook of the resolver is still a stub there, so a second name
+/// of a directory, a junction for example, passes these checks (see "Links and identity" in
+/// docs/windows.md).
 fn check_writable_paths(policy: &ResolvedPolicy) -> Result<(), String> {
+    let identity = sandy_core::PathIdentity::read().map_err(|error| error.to_string())?;
     let system = system_directories().map_err(|error| error.to_string())?;
+    if let Some((rule, directory)) = policy.writable_conflict(&system, &identity) {
+        return Err(format!(
+            "writable path {} overlaps the system directory {}, where Windows lets every \
+             AppContainer read and execute files",
+            rule.path.display(),
+            directory.path.display()
+        ));
+    }
+    let trusted = trusted_locations().map_err(|error| error.to_string())?;
+    if let Some((rule, location)) = policy.writable_conflict(&trusted, &identity) {
+        return Err(format!(
+            "writable path {} overlaps {}, which programs outside the sandbox read or execute \
+             later; a file the program leaves there runs outside the sandbox",
+            rule.path.display(),
+            location.path.display()
+        ));
+    }
     let held = match policy.windows.appcontainer_name.as_deref() {
         Some(name) => {
             let container = appcontainer::sid(name).map_err(|error| error.to_string())?;
@@ -418,17 +500,6 @@ fn check_writable_paths(policy: &ResolvedPolicy) -> Result<(), String> {
         .iter()
         .filter(|rule| rule.access == sandy_core::PathAccess::ReadWrite);
     for rule in writable {
-        let overlap = system.iter().find(|directory| {
-            rule.path.starts_with(directory) || directory.starts_with(&rule.path)
-        });
-        if let Some(directory) = overlap {
-            return Err(format!(
-                "writable path {} overlaps the system directory {}, where Windows lets every \
-                 AppContainer read and execute files",
-                rule.path.display(),
-                directory.display()
-            ));
-        }
         acl::check_writable(rule, &held)?;
     }
     Ok(())
@@ -450,6 +521,10 @@ fn check_grants(appcontainer: &str, policy: &ResolvedPolicy) -> Result<(), Strin
     Ok(())
 }
 
+/// Where Windows puts a known folder. `KF_FLAG_DONT_VERIFY`, because the default verifies that
+/// the folder exists and fails when it does not: an account without a Documents folder would
+/// make every policy unenforceable, and a location that does not exist counts anyway, because
+/// the program could create it.
 fn known_folder(
     id: &windows_sys::core::GUID,
     error: &'static str,
@@ -458,8 +533,14 @@ fn known_folder(
     let mut path: windows_sys::core::PWSTR = std::ptr::null_mut();
     // SAFETY: the folder ID is a valid GUID, a null token selects the current user, and path is
     // a valid out pointer.
-    let hresult =
-        unsafe { known_folder_path(id, KF_FLAG_DEFAULT as u32, std::ptr::null_mut(), &mut path) };
+    let hresult = unsafe {
+        known_folder_path(
+            id,
+            KF_FLAG_DONT_VERIFY as u32,
+            std::ptr::null_mut(),
+            &mut path,
+        )
+    };
     let result = if hresult < 0 {
         Err(util::hresult_error(error, hresult))
     } else {

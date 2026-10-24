@@ -1,13 +1,15 @@
-//! The enforcement plan for a host with known capabilities. Pure code, so it runs and is tested on
-//! every platform.
+//! The enforcement plan for a host with known capabilities. Pure except for the trusted user
+//! locations it reads from the host (`trust`), so it runs and is tested on every platform.
 
 use std::path::Path;
 
 use sandy_core::{
-    ChildProcesses, NetworkAccess, PathAccess, PlanItem, Requirement, ResolvedPolicy, SystemAccess,
+    ChildProcesses, NetworkAccess, PathAccess, PathIdentity, PlanItem, ProtectedPath, Requirement,
+    ResolvedPolicy, SystemAccess,
 };
 
 use crate::system::{self, SystemAccess as Grant};
+use crate::trust;
 
 /// What the host offers. `MacosBackend` detects it; tests use fixed values.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +67,9 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<PlanIte
         )),
         (Ok(()), false, None, Ok(())) => Ok(()),
     };
-    let conflict = system_conflict(policy).or_else(|| host.interpreter.clone());
+    let conflict = system_conflict(policy)
+        .or_else(|| trust_conflict(policy, &trust::locations()))
+        .or_else(|| host.interpreter.clone());
     policy
         .requirements()
         .into_iter()
@@ -89,11 +93,14 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<PlanIte
 /// entry, would let the program change them for the next start and for programs outside the
 /// sandbox, as far as the user may write there. /dev/null is writable in the set itself, and the
 /// entries for /etc, /tmp and /var allow only reading the links.
+///
+/// The comparison is the one of rules 3 and 4 (`PathIdentity`), so a second name of a directory
+/// of the set, a firmlink spelling for example, counts as that directory.
 fn system_conflict(policy: &ResolvedPolicy) -> Option<String> {
     if policy.system == SystemAccess::None {
         return root_directory_missing(policy);
     }
-    let entries = system::MINIMAL
+    let protected: Vec<ProtectedPath> = system::MINIMAL
         .iter()
         .filter(|entry| {
             !matches!(
@@ -102,32 +109,45 @@ fn system_conflict(policy: &ResolvedPolicy) -> Option<String> {
             )
         })
         .map(|entry| {
-            let tree = matches!(entry.access, Grant::ReadTree | Grant::CodeTree);
-            (entry.path, tree)
+            if matches!(entry.access, Grant::ReadTree | Grant::CodeTree) {
+                ProtectedPath::tree(entry.path)
+            } else {
+                ProtectedPath::entry(entry.path)
+            }
         })
         .chain([
-            (system::HOSTS_FILE, false),
-            (system::DNS_RESOLVER_SOCKET, false),
-        ]);
-    let writable = policy
-        .paths
-        .iter()
-        .filter(|rule| rule.access == PathAccess::ReadWrite);
-    for rule in writable {
-        for (entry, tree) in entries.clone() {
-            let entry = Path::new(entry);
-            if entry.starts_with(&rule.path) || (tree && rule.path.starts_with(entry)) {
-                return Some(format!(
-                    "writable path {} overlaps {} of the minimal system set; the program could \
-                     change code or configuration that the next start and programs outside the \
-                     sandbox use",
-                    rule.path.display(),
-                    entry.display()
-                ));
-            }
-        }
-    }
-    None
+            ProtectedPath::entry(system::HOSTS_FILE),
+            ProtectedPath::entry(system::DNS_RESOLVER_SOCKET),
+        ])
+        .collect();
+    let identity = match PathIdentity::read() {
+        Ok(identity) => identity,
+        Err(error) => return Some(error.to_string()),
+    };
+    let (rule, entry) = policy.writable_conflict(&protected, &identity)?;
+    Some(format!(
+        "writable path {} overlaps {} of the minimal system set; the program could change code \
+         or configuration that the next start and programs outside the sandbox use",
+        rule.path.display(),
+        entry.path.display()
+    ))
+}
+
+/// The locations of this user that programs outside the sandbox read or execute later (see
+/// `trust`). They are no policy paths, so rules 3 and 4 do not cover them. Unlike the system set
+/// this applies with `system = "none"` as well: the locations belong to the user, not to the set.
+fn trust_conflict(policy: &ResolvedPolicy, trusted: &[ProtectedPath]) -> Option<String> {
+    let identity = match PathIdentity::read() {
+        Ok(identity) => identity,
+        Err(error) => return Some(error.to_string()),
+    };
+    let (rule, location) = policy.writable_conflict(trusted, &identity)?;
+    Some(format!(
+        "writable path {} overlaps {}, which programs outside the sandbox read or execute \
+         later; a file the program leaves there runs outside the sandbox",
+        rule.path.display(),
+        location.path.display()
+    ))
 }
 
 /// Reports every requirement that the Seatbelt profile enforces as unavailable with `reason`. For
@@ -352,6 +372,33 @@ mod tests {
             unavailable_with("/private/var/db", SystemAccess::None),
             refused
         );
+    }
+
+    /// A writable path that reaches one of the user's trusted locations is refused. The set of
+    /// this host is in `trust`; this checks the rule with a fixed set, so it runs everywhere.
+    #[test]
+    fn a_writable_path_over_a_trusted_location_is_refused() {
+        let home = Path::new("/Users/someone");
+        let trusted = vec![
+            ProtectedPath::entry(home.join(".zshrc")),
+            ProtectedPath::tree(home.join("Library/LaunchAgents")),
+            ProtectedPath::entry(home),
+        ];
+        let conflict = |path: &str| {
+            let mut policy = strictest();
+            policy.paths.push(sandy_core::PathRule {
+                path: path.into(),
+                access: PathAccess::ReadWrite,
+                is_dir: true,
+            });
+            trust_conflict(&policy, &trusted)
+        };
+        // Holds the startup file, holds the home directory, lies inside a protected tree.
+        assert!(conflict("/Users/someone").is_some());
+        assert!(conflict("/Users").is_some());
+        assert!(conflict("/Users/someone/Library/LaunchAgents/sub").is_some());
+        // A directory below the home directory stays writable.
+        assert!(conflict("/Users/someone/data").is_none());
     }
 
     /// `system = "none"` leaves out what dyld needs, so no program starts with it. A policy that

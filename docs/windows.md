@@ -253,6 +253,11 @@ reach the resolver through a backend hook that is not written yet. The stubs are
   and stay there after the run.
 - `sandy` is checked under the path `current_exe` reports. There is no second name to compare
   it with yet.
+- The backend's own checks, the system directories of rule 6 and the trusted user locations of
+  rule 12, go through the same comparison (`PathIdentity`), so they see the same and no more: a
+  writable path spelled through a junction that leads into `C:\Windows` or into the Startup
+  folder passes them. Both spellings of a location are compared, the one the backend names and
+  the one with its links resolved, which catches a location that itself leads through a link.
 - A grant is an entry on the object, so it travels with the object. A file renamed out of a
   granted directory, on the same volume, keeps the entry it inherited from that directory: a
   rename does not touch the security descriptor, and Windows recomputes inherited entries only
@@ -263,6 +268,40 @@ reach the resolver through a backend hook that is not written yet. The stubs are
   denied at once. `escape_windows::a_file_moved_out_of_a_granted_directory_keeps_its_grant`
   records this. Closing it would mean a new capability per run and a fresh propagation over
   every policy path on every run.
+
+### Trusted user locations
+
+Rule 12 of [DESIGN.md](DESIGN.md): a writable policy path may not reach a location of this user
+that programs outside the sandbox read or execute later. It weighs here as much as on the other
+platforms: a file the program creates keeps the entries it inherits from its parent, so the user
+keeps read, write and execute on it although the AppContainer has no `FILE_EXECUTE`, and a
+process of the user outside the sandbox runs it.
+`review_windows::profile_folder_is_a_persistent_writable_but_not_executable_store` records
+that for the profile folder: inside the sandbox the planted image does not load, outside it
+does. A deny entry
+for the package SID would not help, because the AppContainer access check ignores it
+(`acl::check_writable`), and rewriting the user's own DACLs is not something sandy does.
+
+The list is in `sys::trusted_locations`:
+
+| Location | Protected | Why |
+|---|---|---|
+| the user profile (`FOLDERID_Profile`, `USERPROFILE`) | itself | holds the locations below; a writable folder below it stays allowed |
+| `FOLDERID_Startup`, `FOLDERID_CommonStartup` | the tree | Windows runs what is there at the next logon |
+| `Documents\WindowsPowerShell`, `Documents\PowerShell` | the tree | the profile scripts of PowerShell 5 and PowerShell 7 |
+| `%LOCALAPPDATA%\Microsoft\WindowsApps` | the tree | the app execution aliases, which the default `PATH` holds |
+| `<profile>\.ssh` | the tree | `ProxyCommand` and `LocalCommand` in the configuration run programs |
+| every absolute directory on sandy's `PATH` | itself | a program left there runs when the user types its name; a folder below one of them is on no `PATH` and stays allowed |
+
+The profile folder comes from the known folder and from `USERPROFILE`, because a service that
+starts sandy with a minimal environment sets no variable. A location that does not exist counts,
+because the program could create it. Paths are compared as everywhere else on Windows, by their
+spelling (see "Links and identity").
+
+The list is a heuristic and can never be complete: no list knows which files the programs of
+this user trust. Among the things it does not cover are the registry autostart keys, which the
+program cannot reach anyway (`escape_windows::cannot_add_a_registry_autostart_entry`), and a
+hard link that already gives one of these files a second name inside a writable path.
 
 ### What the program can see
 

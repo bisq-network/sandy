@@ -1735,3 +1735,73 @@ fn cannot_create_children(process: &std::os::windows::io::OwnedHandle) -> bool {
     assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
     flags & 1 != 0
 }
+
+/// `check` with the PATH the trusted locations are read from, so the result does not depend on
+/// the account that runs the suite.
+fn check_with_path(path: &str, writable: &str) -> std::process::Output {
+    Command::new(sandy_path())
+        .args([
+            "check",
+            "--appcontainer",
+            &appcontainer_name(),
+            "--read-write",
+            writable,
+        ])
+        .env("PATH", path)
+        .output()
+        .unwrap()
+}
+
+/// A writable path that holds the Startup folder lets the program leave a program there that
+/// Windows runs at the next logon, outside the sandbox: a file the program creates keeps the
+/// user's own rights, including the right to execute it. `check` only reads state, so this is
+/// safe on the real folder.
+#[test]
+fn refuses_a_writable_path_over_the_startup_folder() {
+    let startup =
+        user_profile().join("AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup");
+    if !startup.exists() {
+        return skip(
+            "startup-folder",
+            "this account has no Startup folder below its profile",
+        );
+    }
+    let refused = check_with_path("C:\\Windows\\system32", startup.to_str().unwrap());
+    let report = String::from_utf8_lossy(&refused.stdout);
+    assert_eq!(
+        refused.status.code(),
+        Some(EXIT_NOT_ENFORCEABLE),
+        "{report}"
+    );
+    assert!(report.contains("runs outside the sandbox"), "{report}");
+}
+
+/// A directory on PATH inside a writable path lets the program leave a command there that the
+/// user runs outside the sandbox by name. The same writable path without that PATH entry stays
+/// allowed, and so does a writable path below the user profile.
+#[test]
+fn refuses_a_writable_path_that_holds_a_directory_on_path() {
+    let fixture = Fixture::new_in(&user_profile(), "trusted-path");
+    fs::create_dir_all(fixture.path("rw/bin")).unwrap();
+    let writable = fixture.arg("rw");
+
+    let refused = check_with_path(
+        &format!("{};C:\\Windows\\system32", fixture.arg("rw/bin")),
+        &writable,
+    );
+    let report = String::from_utf8_lossy(&refused.stdout);
+    assert_eq!(
+        refused.status.code(),
+        Some(EXIT_NOT_ENFORCEABLE),
+        "{report}"
+    );
+    assert!(report.contains("runs outside the sandbox"), "{report}");
+
+    let allowed = check_with_path("C:\\Windows\\system32", &writable);
+    assert_eq!(
+        allowed.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&allowed.stdout)
+    );
+}
