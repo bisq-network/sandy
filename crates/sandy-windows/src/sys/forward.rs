@@ -37,6 +37,12 @@ const SOCKET_ACCESS: u32 = FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUT
 /// The longest name below the base directory: a 16-digit run directory, a separator, and a port.
 const RUN_SUFFIX_BYTES: usize = 1 + 16 + 1 + 5;
 
+/// Marks a run directory as in use. The run holds it open without `FILE_SHARE_DELETE`, so a
+/// later run that can open it exclusively knows that no run owns the directory any more. The
+/// kernel closes the handle when the run ends, also after a kill, which is what makes the
+/// leftover directory of a killed run removable.
+const LOCK_NAME: &str = "lock";
+
 /// One forwarded port as its relay sees it: the program's address it listens on, and the socket
 /// it passes each connection to.
 pub struct Route {
@@ -47,6 +53,8 @@ pub struct Route {
 /// The sockets of one run and the threads that serve them.
 pub struct Forwarding {
     directory: PathBuf,
+    /// Dropped before the directory is removed, because the run itself holds it.
+    lock: Option<std::fs::File>,
     servers: Vec<(Stop, JoinHandle<()>)>,
 }
 
@@ -83,9 +91,13 @@ impl Forwarding {
         std::fs::create_dir_all(&base).map_err(|error| {
             SandboxError::io(format!("cannot create {}", base.display()), error)
         })?;
+        remove_dead_runs(&base);
         let directory = create_run_directory(&base)?;
+        // Before the entry below, so the relays cannot open the lock file: it is not a socket.
+        let lock = hold_run_directory(&directory)?;
         let mut forwarding = Forwarding {
             directory,
+            lock: Some(lock),
             servers: Vec::new(),
         };
         // Set before the sockets exist, so that each socket file inherits the entry.
@@ -141,8 +153,55 @@ impl Forwarding {
 
 impl Drop for Forwarding {
     fn drop(&mut self) {
+        // The lock file cannot be deleted while this run holds it open.
+        self.lock.take();
         // Windows deletes a socket file also while its socket listens; then no one can connect.
         let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+/// Opens the lock file of a run directory and keeps the handle. Without `FILE_SHARE_DELETE` no
+/// other process can delete it while this run lives.
+fn hold_run_directory(directory: &Path) -> Result<std::fs::File, SandboxError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    let path = directory.join(LOCK_NAME);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&path)
+        .map_err(|error| SandboxError::io(format!("cannot create {}", path.display()), error))
+}
+
+/// Removes the socket directories of runs that ended without cleaning up, for example after a
+/// kill. Best effort: a directory stays when something else holds a file in it.
+fn remove_dead_runs(base: &Path) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let directory = entry.path();
+        if directory.is_dir() && run_ended(&directory) {
+            let _ = std::fs::remove_dir_all(&directory);
+        }
+    }
+}
+
+/// Whether no run owns `directory`: its lock file opens with no sharing, which fails while the
+/// run that created it holds the file. A directory without a lock file comes from a sandy
+/// before 1.3.3 and counts as ended.
+fn run_ended(directory: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(directory.join(LOCK_NAME))
+    {
+        Ok(_) => true,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
     }
 }
 

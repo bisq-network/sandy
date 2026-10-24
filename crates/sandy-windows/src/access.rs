@@ -67,6 +67,11 @@ pub fn access_mask(access: PathAccess) -> u32 {
     }
 }
 
+/// Rights the AppContainer must not keep on its profile folder. Execute would let the program
+/// run what it writes there; `WRITE_DAC` and `WRITE_OWNER` would let it grant execute back.
+/// Windows creates the folder with `FILE_ALL_ACCESS`, which contains all three.
+pub const PROFILE_DENIED: u32 = FILE_EXECUTE | WRITE_DAC | WRITE_OWNER;
+
 /// ACE flags of a grant. A rule applies to everything beneath a directory, so the ACE on a
 /// directory is inherited by files and subdirectories.
 pub fn ace_flags(is_dir: bool) -> u8 {
@@ -80,6 +85,11 @@ pub fn ace_flags(is_dir: bool) -> u8 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AceKind {
     Allow,
+    /// An allow entry with a condition (`ACCESS_ALLOWED_CALLBACK_ACE_TYPE`), whose condition
+    /// sandy does not evaluate. It counts where counting it refuses something (`may_grant`) and
+    /// not where it would let sandy skip a grant (`grants`), so either way sandy errs towards
+    /// less access.
+    ConditionalAllow,
     Deny,
 }
 
@@ -99,7 +109,8 @@ pub struct Ace<'a> {
 /// Only ACEs for `sid` count. The result is meant for skipping a grant that Windows already
 /// gives, so an error towards "not granted" only causes a redundant grant.
 pub fn grants(aces: &[Ace<'_>], sid: &[u8], mask: u32, is_dir: bool) -> bool {
-    let on_object = evaluate(aces, sid, mask, |ace| ace.flags & INHERIT_ONLY_ACE == 0);
+    let evaluate = |applies: &dyn Fn(&Ace<'_>) -> bool| evaluate(aces, sid, mask, false, applies);
+    let on_object = evaluate(&|ace: &Ace<'_>| ace.flags & INHERIT_ONLY_ACE == 0);
     if !is_dir {
         return on_object;
     }
@@ -107,8 +118,8 @@ pub fn grants(aces: &[Ace<'_>], sid: &[u8], mask: u32, is_dir: bool) -> bool {
         move |ace: &Ace<'_>| ace.flags & bit != 0 && ace.flags & NO_PROPAGATE_INHERIT_ACE == 0
     };
     on_object
-        && evaluate(aces, sid, mask, inherited_by(OBJECT_INHERIT_ACE))
-        && evaluate(aces, sid, mask, inherited_by(CONTAINER_INHERIT_ACE))
+        && evaluate(&inherited_by(OBJECT_INHERIT_ACE))
+        && evaluate(&inherited_by(CONTAINER_INHERIT_ACE))
 }
 
 /// Whether `aces` may give `sid` `right` on the object itself or, for a directory, on a file or
@@ -116,14 +127,14 @@ pub fn grants(aces: &[Ace<'_>], sid: &[u8], mask: u32, is_dir: bool) -> bool {
 /// a writable path whose files an AppContainer could execute, so an error towards "granted" only
 /// refuses a policy.
 pub fn may_grant(aces: &[Ace<'_>], sid: &[u8], right: u32, is_dir: bool) -> bool {
-    let on_object = evaluate(aces, sid, right, |ace| ace.flags & INHERIT_ONLY_ACE == 0);
+    let evaluate = |applies: &dyn Fn(&Ace<'_>) -> bool| evaluate(aces, sid, right, true, applies);
+    let on_object = evaluate(&|ace: &Ace<'_>| ace.flags & INHERIT_ONLY_ACE == 0);
     if on_object || !is_dir {
         return on_object;
     }
     // NO_PROPAGATE_INHERIT_ACE still reaches the direct children, so it counts here.
     let inherited_by = |bit: u8| move |ace: &Ace<'_>| ace.flags & bit != 0;
-    evaluate(aces, sid, right, inherited_by(OBJECT_INHERIT_ACE))
-        || evaluate(aces, sid, right, inherited_by(CONTAINER_INHERIT_ACE))
+    evaluate(&inherited_by(OBJECT_INHERIT_ACE)) || evaluate(&inherited_by(CONTAINER_INHERIT_ACE))
 }
 
 /// Whether `aces` contain the ACE sandy adds: explicit (not inherited), allow, exactly `mask` and
@@ -139,13 +150,22 @@ pub fn has_explicit_ace(aces: &[Ace<'_>], sid: &[u8], mask: u32, flags: u8) -> b
 }
 
 /// Evaluates the ACEs in order, like the access check: a deny ACE that hits a right not granted
-/// yet ends the check.
-fn evaluate(aces: &[Ace<'_>], sid: &[u8], mask: u32, applies: impl Fn(&Ace<'_>) -> bool) -> bool {
+/// yet ends the check. `conditional` says whether an allow entry with a condition counts as
+/// granting; the caller picks the answer that errs towards less access.
+fn evaluate(
+    aces: &[Ace<'_>],
+    sid: &[u8],
+    mask: u32,
+    conditional: bool,
+    applies: &dyn Fn(&Ace<'_>) -> bool,
+) -> bool {
     let mut granted = 0;
     for ace in aces.iter().filter(|ace| ace.sid == sid && applies(ace)) {
         let rights = map_generic(ace.mask);
         match ace.kind {
             AceKind::Allow => granted |= rights,
+            AceKind::ConditionalAllow if conditional => granted |= rights,
+            AceKind::ConditionalAllow => {}
             AceKind::Deny if rights & mask & !granted != 0 => return false,
             AceKind::Deny => {}
         }
@@ -158,7 +178,7 @@ fn evaluate(aces: &[Ace<'_>], sid: &[u8], mask: u32, applies: impl Fn(&Ace<'_>) 
 
 /// Maps generic rights with the generic mapping of files. Inheritable ACEs often carry generic
 /// rights, for example `(OI)(CI)(IO)(GR,GE)`.
-fn map_generic(mask: u32) -> u32 {
+pub fn map_generic(mask: u32) -> u32 {
     let mut mapped = mask & !(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL);
     for (generic, specific) in [
         (GENERIC_READ, FILE_GENERIC_READ),
@@ -194,6 +214,31 @@ mod tests {
             kind: AceKind::Deny,
             ..allow(flags, mask, sid)
         }
+    }
+
+    fn conditional(flags: u8, mask: u32, sid: &[u8]) -> Ace<'_> {
+        Ace {
+            kind: AceKind::ConditionalAllow,
+            ..allow(flags, mask, sid)
+        }
+    }
+
+    /// An entry whose condition sandy cannot read counts where it refuses and not where it
+    /// would let sandy skip a grant.
+    #[test]
+    fn a_conditional_entry_refuses_but_never_satisfies() {
+        let aces = [conditional(
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+            RX,
+            ALL_APPLICATION_PACKAGES,
+        )];
+        assert!(may_grant(
+            &aces,
+            ALL_APPLICATION_PACKAGES,
+            FILE_EXECUTE,
+            true
+        ));
+        assert!(!grants(&aces, ALL_APPLICATION_PACKAGES, RX, true));
     }
 
     #[test]
@@ -237,6 +282,19 @@ mod tests {
         }
         assert_eq!(access_mask(PathAccess::Read) & FILE_WRITE_DATA, 0);
         assert_eq!(access_mask(PathAccess::ReadExec) & FILE_WRITE_DATA, 0);
+    }
+
+    /// What stays of the profile folder entry Windows creates: exactly the read-write rights,
+    /// so the program keeps its scratch space but can neither run what it writes there nor give
+    /// itself execute back.
+    #[test]
+    fn reducing_the_profile_entry_leaves_the_read_write_rights() {
+        assert_eq!(
+            FILE_ALL_ACCESS & !PROFILE_DENIED,
+            access_mask(PathAccess::ReadWrite)
+        );
+        // The 1.3.2 mask, which kept WRITE_DAC and WRITE_OWNER, still needs reducing.
+        assert_ne!((FILE_ALL_ACCESS & !FILE_EXECUTE) & PROFILE_DENIED, 0);
     }
 
     #[test]

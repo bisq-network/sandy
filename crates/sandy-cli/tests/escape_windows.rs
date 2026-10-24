@@ -166,6 +166,46 @@ fn a_writable_path_that_all_appcontainers_may_execute_is_refused() {
     assert!(stdout.contains("ALL APPLICATION PACKAGES"), "{stdout}");
 }
 
+/// A file below a writable path can carry an execute entry of its own, which the permissions of
+/// the path do not show. Together with sandy's write grant it would be writable and executable,
+/// so sandy refuses it. The walk runs when sandy first adds the grant, not on every run:
+/// `check` reads the path's own permissions only, which this test records.
+#[test]
+fn a_file_below_a_writable_path_that_all_appcontainers_may_execute_is_refused() {
+    let fixture = Fixture::new("rw-child-exec");
+    let child = fixture.arg("rw/file");
+    let check = || {
+        let mut args = vec!["check".to_string()];
+        args.extend(platform_args());
+        args.extend(fixture.access_args());
+        sandy(&args)
+    };
+
+    // Control: the same policy and the same tree without the entry work.
+    probe_inside(&fixture.access_args(), &[("read", &child)])[0].assert_ok();
+
+    // A new tree, so sandy adds the grant again instead of finding its entry in place.
+    fixture.reset();
+    let granted = Command::new("icacls")
+        .args([&child, "/grant", "*S-1-15-2-1:(RX)"])
+        .output()
+        .unwrap();
+    assert!(granted.status.success(), "{granted:?}");
+
+    let output = sandy(run_program(
+        &fixture.access_args(),
+        &probe_path(),
+        &["read", &child],
+    ));
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ALL APPLICATION PACKAGES"), "{stderr}");
+    assert!(stderr.contains(r"rw\file"), "{stderr}");
+
+    // Recorded: `check` only reads the permissions of the path itself.
+    assert!(check().status.success(), "{:?}", check());
+}
+
 /// sandy grants each path to a capability that only runs with this path in the policy hold.
 /// The access control entry stays on disk, but it must grant nothing to a later run.
 #[test]
@@ -177,6 +217,36 @@ fn a_path_removed_from_the_policy_is_denied_at_the_next_run() {
     let without_ro = args(&["--read-write", &fixture.arg("rw")]);
     let lines = probe_inside(&without_ro, &[("read", &file)]);
     lines[0].assert_blocked();
+}
+
+/// Recorded, not a guarantee: a grant on Windows is an entry on the object, not on the path. A
+/// file renamed out of a granted directory keeps the entry it inherited from it, and an
+/// AppContainer token keeps `SeChangeNotifyPrivilege`, so no traverse check stops the program
+/// from opening the file at its new place by its full path. The run's capability is the one of
+/// the directory, so the access ends only when the policy drops the directory. Linux and macOS
+/// bind the rule to the path, where the moved file is denied at once.
+///
+/// docs/windows.md, "Links and identity", carries the same statement. Closing it would mean a
+/// new capability generation per run and a fresh propagation over every policy path on every
+/// run; the test is here so the behaviour is not lost.
+#[test]
+fn a_file_moved_out_of_a_granted_directory_keeps_its_grant() {
+    let fixture = Fixture::new("movedout");
+    // The first run adds the entry on the read directory, which the file inherits.
+    probe_inside(&fixture.access_args(), &[("read", &fixture.arg("ro/file"))])[0].assert_ok();
+
+    fs::rename(fixture.path("ro/file"), fixture.path("secret/moved")).unwrap();
+    let lines = probe_inside(
+        &fixture.access_args(),
+        &[
+            ("read", &fixture.arg("secret/moved")),
+            ("read", &fixture.arg("secret/file")),
+        ],
+    );
+    lines[0].assert_ok();
+    // Control: a file of the same directory that never carried the entry stays unreadable, so
+    // the read above is the inherited entry and not general access to the directory.
+    lines[1].assert_blocked();
 }
 
 #[test]
@@ -217,6 +287,63 @@ fn cannot_open_processes_outside() {
     );
     lines[0].assert_blocked();
     lines[1].assert_blocked();
+}
+
+/// The two rights the test above uses are a sample. Every other right that would let the
+/// program change a process of the user must be refused too, and so must the rights on its
+/// threads. The outside control opens the same process and thread, which always succeeds for
+/// the owner, so a denial inside is the AppContainer boundary.
+#[test]
+fn cannot_open_processes_and_threads_outside_with_any_right() {
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+
+    let fixture = Fixture::new("process-rights");
+    // SAFETY: GetCurrentThreadId has no preconditions and no out parameters.
+    let thread = unsafe { GetCurrentThreadId() }.to_string();
+    let process = std::process::id().to_string();
+    let process_rights = [
+        "vm-write",
+        "vm-operation",
+        "dup-handle",
+        "create-thread",
+        "set-information",
+        "set-quota",
+        "suspend-resume",
+        "query-information",
+        "all-access",
+    ];
+    let thread_rights = [
+        "terminate",
+        "suspend-resume",
+        "get-context",
+        "set-context",
+        "set-information",
+        "query-information",
+        "all-access",
+    ];
+    let targets: Vec<(String, String)> = process_rights
+        .iter()
+        .map(|right| {
+            (
+                "open-process-right".to_string(),
+                format!("{process}\u{1f}{right}"),
+            )
+        })
+        .chain(thread_rights.iter().map(|right| {
+            (
+                "open-thread-right".to_string(),
+                format!("{thread}\u{1f}{right}"),
+            )
+        }))
+        .collect();
+    let actions: Vec<(&str, &str)> = targets
+        .iter()
+        .map(|(action, target)| (action.as_str(), target.as_str()))
+        .collect();
+
+    for line in controlled(&fixture.access_args(), &actions) {
+        line.assert_blocked();
+    }
 }
 
 /// sandy itself inherits every inheritable handle of this test, because the standard library
@@ -814,6 +941,74 @@ fn relays_reach_only_the_program() {
     assert!(accepts_within(&outside, Duration::from_secs(3)));
 }
 
+/// `setup --remove` takes back what sandy left: the access control entry of every policy path
+/// and the AppContainer profile with its folder. It must leave everything else alone, so the
+/// test checks that the entry of a path the policy does not name stays.
+#[test]
+fn setup_remove_takes_back_the_grant_and_the_profile() {
+    let name = "sandy.remove-test";
+    delete_profile(name);
+    let fixture = Fixture::new("remove");
+    let (granted, kept) = (fixture.arg("ro"), fixture.arg("rw"));
+    let folder = user_local_app_data().join("Packages").join(name);
+
+    // One run grants both paths and creates the profile.
+    let run = sandy(named_run(
+        name,
+        &["--read", &granted, "--read-write", &kept],
+        &[("read", &fixture.arg("ro/file"))],
+    ));
+    assert!(run.status.success(), "{run:?}");
+    assert!(capability_entries(&granted) > 0, "no entry on {granted}");
+    assert!(capability_entries(&kept) > 0, "no entry on {kept}");
+    assert!(folder.is_dir(), "no profile folder {}", folder.display());
+
+    // Remove with a policy that names only one of the two paths.
+    let removed = sandy([
+        "setup",
+        "--remove",
+        "--appcontainer",
+        name,
+        "--read",
+        &granted,
+    ]);
+    assert!(removed.status.success(), "{removed:?}");
+    assert_eq!(
+        capability_entries(&granted),
+        0,
+        "the entry on {granted} stayed"
+    );
+    assert!(
+        capability_entries(&kept) > 0,
+        "the entry on {kept} was removed, although the policy does not name it"
+    );
+    assert!(
+        !folder.exists(),
+        "the profile folder {} stayed",
+        folder.display()
+    );
+
+    // Idempotent: a second removal changes nothing and still succeeds.
+    let again = sandy([
+        "setup",
+        "--remove",
+        "--appcontainer",
+        name,
+        "--read",
+        &granted,
+    ]);
+    assert!(again.status.success(), "{again:?}");
+}
+
+/// How many capability entries (`S-1-15-3-1024-...`) the permissions of `path` carry.
+fn capability_entries(path: &str) -> usize {
+    let output = Command::new("icacls").arg(path).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8_lossy(&output.stdout)
+        .matches("S-1-15-3-1024-")
+        .count()
+}
+
 /// Deletes an AppContainer profile and its folder. Best effort, so a repeated run starts clean.
 fn delete_profile(name: &str) {
     use windows_sys::Win32::Security::Isolation::DeleteAppContainerProfile;
@@ -917,6 +1112,121 @@ fn a_concurrent_run_must_match_the_active_policy() {
     }
 
     delete_profile(name);
+}
+
+/// Starts a run in `name` that writes `ready` and then stays alive, so the test knows its
+/// coordination state is set. The caller ends it.
+fn long_run(name: &str, policy: &[&str], ready: &Path) -> Child {
+    let ready_arg = ready.to_str().unwrap();
+    let mut run = Command::new(sandy_path())
+        .args(named_run(
+            name,
+            policy,
+            &[("write", ready_arg), ("sleep", "20000")],
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !ready.exists() {
+        if let Some(status) = run.try_wait().unwrap() {
+            panic!("the run in {name} exited early: {status:?}");
+        }
+        assert!(Instant::now() < deadline, "the run in {name} never started");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    run
+}
+
+/// Windows derives the AppContainer SID from the name without regard to case, and so do the
+/// capability names and the profile folder. Two spellings of one name are therefore one
+/// AppContainer and one sandbox, so a concurrent run under the other spelling must be held to
+/// the active policy just like one under the same spelling.
+#[test]
+fn a_concurrent_run_under_another_spelling_must_match_the_active_policy() {
+    let (first, second) = ("sandy.Case-Test", "sandy.case-test");
+    assert_eq!(
+        appcontainer_sid(first),
+        appcontainer_sid(second),
+        "this host derives different SIDs for the two spellings, so they are not one sandbox"
+    );
+    delete_profile(first);
+    let fixture = Fixture::new("case");
+    let writable = ["--read-write", &fixture.arg("rw")];
+    let other_policy = [
+        "--read-write",
+        &fixture.arg("rw"),
+        "--read",
+        &fixture.arg("ro"),
+    ];
+    let ready = fixture.path("rw/ready");
+
+    let mut run = long_run(first, &writable, &ready);
+
+    // The same policy under the other spelling joins the sandbox, as it does under the same
+    // spelling.
+    let same = sandy(named_run(second, &writable, &[("env", "PATH")]));
+    assert!(
+        same.status.success(),
+        "a same-policy run under the other spelling was refused: {}",
+        String::from_utf8_lossy(&same.stderr)
+    );
+
+    // A different policy under the other spelling must be refused.
+    let different = sandy(named_run(second, &other_policy, &[("env", "PATH")]));
+    run.kill().unwrap();
+    run.wait().unwrap();
+    assert_eq!(different.status.code(), Some(EXIT_FAILURE), "{different:?}");
+    let reason = String::from_utf8_lossy(&different.stderr);
+    assert!(reason.contains("different policy"), "{reason}");
+
+    delete_profile(first);
+}
+
+/// Two policies that differ only in `--end-with-parent` confine differently: a run that ends
+/// with its parent can be kept alive through a sibling in the same AppContainer, which may open
+/// its processes. So the second one must be refused while the first runs.
+#[test]
+fn end_with_parent_separates_concurrent_policies() {
+    let name = "sandy.endparent-test";
+    delete_profile(name);
+    let fixture = Fixture::new("endparent");
+    // `end_with_parent` needs isolated signals, so both policies set them and differ only in
+    // the flag under test.
+    let writable = ["--read-write", &fixture.arg("rw"), "--signals", "isolated"];
+    let mut ends = writable.to_vec();
+    ends.push("--end-with-parent");
+    let ready = fixture.path("rw/ready");
+
+    let mut run = long_run(name, &writable, &ready);
+    let different = sandy(named_run(name, &ends, &[("env", "PATH")]));
+    run.kill().unwrap();
+    run.wait().unwrap();
+    assert_eq!(different.status.code(), Some(EXIT_FAILURE), "{different:?}");
+    let reason = String::from_utf8_lossy(&different.stderr);
+    assert!(reason.contains("different policy"), "{reason}");
+
+    delete_profile(name);
+}
+
+/// A name that Windows and sandy would read as different things, or that is the identity of an
+/// installed application package, is refused before anything runs.
+#[test]
+fn refuses_ambiguous_and_package_shaped_appcontainer_names() {
+    for name in [
+        "sandy.trailing.",
+        "sandy.trailing ",
+        "..",
+        "Microsoft.WindowsCalculator_8wekyb3d8bbwe",
+    ] {
+        let output = sandy(["check", "--appcontainer", name]);
+        assert_eq!(
+            output.status.code(),
+            Some(EXIT_NOT_ENFORCEABLE),
+            "{name:?}: {output:?}"
+        );
+    }
 }
 
 /// What the probe's tcp-send action writes.
@@ -1206,6 +1516,54 @@ fn forward_relay_ends_with_the_program() {
         started.elapsed() < Duration::from_secs(20),
         "{:?}",
         started.elapsed()
+    );
+}
+
+/// A run that is killed cannot remove its socket directory. Each run holds a lock file in its
+/// directory that only a live run can hold, so a later run removes what is left of dead ones.
+#[test]
+fn a_later_run_removes_the_socket_directory_of_a_killed_run() {
+    let fixture = Fixture::new("forward-leftover");
+    let service = TcpListener::bind("127.0.0.1:0").unwrap();
+    let service_port = service.local_addr().unwrap().port();
+    let inner = free_port();
+
+    let mut killed = Command::new(sandy_path())
+        .args(run_args(
+            &forward_args(&fixture, inner, service_port),
+            &[("sleep", "20000")],
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let directory = loop {
+        if let Some(socket) = forward_socket(inner) {
+            break socket.parent().unwrap().to_path_buf();
+        }
+        assert!(killed.try_wait().unwrap().is_none(), "sandy ended early");
+        assert!(Instant::now() < deadline, "no forward socket appeared");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    killed.kill().unwrap();
+    killed.wait().unwrap();
+    assert!(
+        directory.exists(),
+        "a killed run is expected to leave its socket directory behind"
+    );
+
+    // Any later run with a forwarded port sweeps the base directory before it creates its own.
+    let second = free_port();
+    let lines = probe_inside(
+        &forward_args(&fixture, second, service_port),
+        &[("tcp-connect", &format!("127.0.0.1:{second}"))],
+    );
+    lines[0].assert_ok();
+    assert!(
+        !directory.exists(),
+        "the socket directory of the killed run is still there: {}",
+        directory.display()
     );
 }
 

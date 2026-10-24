@@ -3,14 +3,15 @@
 use sandy_core::SandboxError;
 use windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS;
 use windows_sys::Win32::Security::Isolation::{
-    CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+    CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{FreeSid, PSID};
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_READ, RegCloseKey, RegOpenKeyExW,
 };
 
-use super::util::{SessionLock, Sid, hresult_error, wide_nul};
+use super::lockfile::{LOCKS, SERIALIZE, UserLock};
+use super::util::{Sid, hresult_error, wide_nul};
 
 /// The AppContainer SID for `name`. Deriving it is a computation; it registers nothing.
 pub fn sid(name: &str) -> Result<Sid, SandboxError> {
@@ -41,7 +42,7 @@ pub fn ensure_profile(name: &str) -> Result<Sid, SandboxError> {
     if is_registered(&container) {
         return Ok(container);
     }
-    let _lock = SessionLock::acquire(r"Local\sandy-appcontainer-profiles")?;
+    let _lock = UserLock::wait_for(LOCKS, "appcontainer-profiles", SERIALIZE, true)?;
     if is_registered(&container) {
         return Ok(container);
     }
@@ -68,6 +69,23 @@ fn is_registered(container: &Sid) -> bool {
     // SAFETY: the key is open and closed exactly once.
     unsafe { RegCloseKey(handle) };
     true
+}
+
+/// Removes the profile of `name` and its folder. Does nothing when there is no profile.
+pub fn delete_profile(name: &str) -> Result<(), SandboxError> {
+    if !is_registered(&sid(name)?) {
+        return Ok(());
+    }
+    let wide = wide_nul(name.as_ref());
+    // SAFETY: the name is NUL-terminated.
+    let hresult = unsafe { DeleteAppContainerProfile(wide.as_ptr()) };
+    if hresult < 0 {
+        return Err(hresult_error(
+            format!("cannot remove the profile of AppContainer {name:?}"),
+            hresult,
+        ));
+    }
+    Ok(())
 }
 
 fn create_profile(name: &str) -> Result<Sid, SandboxError> {

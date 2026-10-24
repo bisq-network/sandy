@@ -1,149 +1,89 @@
-//! One AppContainer name per resolved policy, enforced while runs overlap in time.
+//! One AppContainer per resolved policy, enforced while runs overlap in time.
 //!
 //! Processes in one AppContainer reach each other over loopback and can open each other's
-//! processes (same package SID). So two concurrent runs under the same AppContainer name share a
+//! processes (same package SID). So two concurrent runs in the same AppContainer share a
 //! sandbox: a weaker policy could take over a stronger one that runs at the same time. sandy
-//! refuses a second run with the same name but a different resolved policy while the first is
-//! active. The same policy may run concurrently; sequential runs with different policies stay
-//! allowed.
+//! refuses a second run in the same AppContainer with a different resolved policy while the
+//! first is active. The same policy may run concurrently; sequential runs with different
+//! policies stay allowed.
 //!
-//! The coordination state is a named file mapping in the `Local\` namespace, which an
-//! AppContainer process cannot open (it is redirected to its own AppContainer object namespace),
-//! so the sandboxed program cannot tamper with it. The mapping holds the active policy's
-//! fingerprint. Each active run holds a handle to it; the kernel frees the mapping when the last
-//! handle closes, so a crashed run leaves no stale state and cannot block a later run forever.
-
-use std::ffi::c_void;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::ptr;
+//! The identity is the AppContainer SID, not the name from the policy. Windows derives the SID
+//! from the name without regard to case, and so do the capability names and the profile folder,
+//! so `sandy.X` and `SANDY.x` are one sandbox and must be one policy.
+//!
+//! The coordination state is a file below `%LOCALAPPDATA%\sandy\runs`, which the sandboxed
+//! program cannot reach (see `lockfile`). It holds the active policy's fingerprint. Each active
+//! run holds a shared byte range lock on the file; the kernel releases the lock when the run
+//! ends or dies, so a crashed run leaves no state that blocks a later run.
 
 use sandy_core::{PathAccess, ResolvedPolicy, SandboxError};
-use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
-};
 
-use super::util::{SessionLock, last_error, wide_nul};
+use super::lockfile::{ACTIVE, RUNS, SERIALIZE, UserLock};
+use super::util::Sid;
 
-/// The shared region: a 4-byte little-endian length, then that many fingerprint bytes. Backed by
-/// the pagefile and committed lazily, so the generous size costs almost nothing until written.
-const REGION_SIZE: usize = 128 * 1024;
-const MAX_FINGERPRINT: usize = REGION_SIZE - 4;
-
-/// Held for the lifetime of a run. Dropping it closes the mapping handle; when the last run's
-/// handle closes, the kernel frees the mapping and the name becomes free for a different policy.
+/// Held for the lifetime of a run. Dropping it releases the lock that marks the AppContainer as
+/// in use, so the next run may set a different policy.
 pub struct RunGuard {
-    _mapping: OwnedHandle,
+    _active: UserLock,
 }
 
-/// Refuses the run when another run with the same AppContainer name but a different resolved
-/// policy is active. Returns a guard the caller holds until the program exits.
-pub fn hold(name: &str, policy: &ResolvedPolicy) -> Result<RunGuard, SandboxError> {
-    let fingerprint = fingerprint(policy)?;
-    // Serialize the check so two first runs do not both create the mapping.
-    let _lock = SessionLock::acquire(&format!(r"Local\sandy.singleton.{name}"))?;
+/// Refuses the run when another run in the same AppContainer with a different resolved policy is
+/// active. Returns a guard the caller holds until the program exits.
+pub fn hold(container: &Sid, policy: &ResolvedPolicy) -> Result<RunGuard, SandboxError> {
+    let fingerprint = fingerprint(policy);
+    let key = container.to_string();
+    // Serialize the check, so two first runs do not both set the policy.
+    let serialize = UserLock::wait_for(RUNS, &key, SERIALIZE, true)?;
 
-    let mapping_name = wide_nul(format!(r"Local\sandy.state.{name}").as_ref());
-    // SAFETY: INVALID_HANDLE_VALUE backs the mapping by the pagefile; the name is NUL-terminated.
-    // A zero size high word with REGION_SIZE as the low word sizes it.
-    let raw = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            ptr::null(),
-            PAGE_READWRITE,
-            0,
-            REGION_SIZE as u32,
-            mapping_name.as_ptr(),
-        )
-    };
-    if raw.is_null() {
-        return Err(last_error("cannot create the run coordination object"));
-    }
-    // GetLastError is read before any other call can overwrite it.
-    let existed =
-        std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32);
-    // SAFETY: CreateFileMappingW returned a new handle this process owns.
-    let mapping = unsafe { OwnedHandle::from_raw_handle(raw) };
-
-    let view = MappedView::map(&mapping)?;
-    if existed {
-        let active = view.read();
-        if active != fingerprint {
-            return Err(SandboxError::new(format!(
-                "another sandy run uses the AppContainer {name:?} with a different policy; \
-                 processes in one AppContainer can reach and control each other, so sandy does \
-                 not run a different policy under the same name at the same time; wait for the \
-                 other run to end, or use a different --appcontainer name"
-            )));
+    // An exclusive lock on ACTIVE succeeds exactly while no run holds the shared one.
+    match UserLock::take(RUNS, &key, ACTIVE, true, false)? {
+        Some(exclusive) => {
+            // No run is active, so this one sets the policy. Dropping the exclusive lock lets
+            // the shared one below take the byte; no other run can slip in between, because
+            // this one holds the serializing lock.
+            drop(exclusive);
+            serialize.write(&fingerprint)?;
         }
-    } else {
-        view.write(&fingerprint);
+        None => {
+            if serialize.read()? != fingerprint {
+                return Err(SandboxError::new(format!(
+                    "another sandy run uses the AppContainer {container} with a different \
+                     policy; processes in one AppContainer can reach and control each other, so \
+                     sandy does not run a different policy in the same AppContainer at the same \
+                     time; wait for the other run to end, or use a different --appcontainer name"
+                )));
+            }
+        }
     }
-    // The view is only needed for the check; the mapping stays alive through its handle.
-    drop(view);
-    Ok(RunGuard { _mapping: mapping })
+    Ok(RunGuard {
+        _active: UserLock::wait_for(RUNS, &key, ACTIVE, false)?,
+    })
 }
 
-/// A mapped view of the coordination region, unmapped on drop.
-struct MappedView(*mut c_void);
-
-impl MappedView {
-    fn map(mapping: &OwnedHandle) -> Result<MappedView, SandboxError> {
-        // SAFETY: the handle is a valid file mapping; mapping the whole region for read and write.
-        let address =
-            unsafe { MapViewOfFile(mapping.as_raw_handle(), FILE_MAP_WRITE, 0, 0, REGION_SIZE) };
-        if address.Value.is_null() {
-            return Err(last_error("cannot map the run coordination object"));
-        }
-        Ok(MappedView(address.Value))
-    }
-
-    fn read(&self) -> Vec<u8> {
-        // SAFETY: the view is REGION_SIZE bytes; the first four hold the length, written under the
-        // same mutex before any reader runs. A fresh mapping is zero, so a reader that somehow
-        // raced creation would see length 0, never a valid fingerprint.
-        let len = unsafe { ptr::read_unaligned(self.0.cast::<u32>()) } as usize;
-        let len = len.min(MAX_FINGERPRINT);
-        // SAFETY: len is at most MAX_FINGERPRINT, so the slice stays inside the view.
-        unsafe { std::slice::from_raw_parts(self.0.cast::<u8>().add(4), len) }.to_vec()
-    }
-
-    fn write(&self, fingerprint: &[u8]) {
-        // SAFETY: the caller guarantees fingerprint fits in MAX_FINGERPRINT (checked in
-        // `fingerprint`); the view has room for the length word and the bytes.
-        unsafe {
-            ptr::write_unaligned(self.0.cast::<u32>(), fingerprint.len() as u32);
-            ptr::copy_nonoverlapping(
-                fingerprint.as_ptr(),
-                self.0.cast::<u8>().add(4),
-                fingerprint.len(),
-            );
-        }
-    }
-}
-
-impl Drop for MappedView {
-    fn drop(&mut self) {
-        // SAFETY: self.0 came from MapViewOfFile and is unmapped once.
-        unsafe {
-            UnmapViewOfFile(
-                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: self.0 },
-            )
-        };
-    }
+/// Takes the AppContainer for a step that must not overlap a run, and refuses while one is
+/// active. The caller holds the lock until it is done.
+pub fn hold_idle(container: &Sid) -> Result<UserLock, SandboxError> {
+    let key = container.to_string();
+    let _serialize = UserLock::wait_for(RUNS, &key, SERIALIZE, true)?;
+    UserLock::take(RUNS, &key, ACTIVE, true, false)?.ok_or_else(|| {
+        SandboxError::new(format!(
+            "a sandy run is using the AppContainer {container}; wait for it to end"
+        ))
+    })
 }
 
 /// A deterministic encoding of everything in `policy` that affects confinement. Two resolved
 /// policies produce equal bytes exactly when they confine the program the same way. The program,
 /// its arguments, the working directory and the environment do not change the sandbox boundary
 /// and are excluded; the program's own read-and-execute rule is part of `paths` and is included.
-fn fingerprint(policy: &ResolvedPolicy) -> Result<Vec<u8>, SandboxError> {
+fn fingerprint(policy: &ResolvedPolicy) -> Vec<u8> {
     use std::os::windows::ffi::OsStrExt;
 
     let mut out = vec![
-        // Format version. 2 adds forwarded ports and `children`; a run of another sandy version
-        // then never matches by accident and is refused, which is the safe outcome.
-        2u8,
+        // Format version. 2 adds forwarded ports and `children`, 3 adds `end_with_parent` and
+        // keys the state on the SID; a run of another sandy version then never matches by
+        // accident and is refused, which is the safe outcome.
+        3u8,
         match policy.system {
             sandy_core::SystemAccess::Minimal => 0,
             sandy_core::SystemAccess::None => 1,
@@ -164,6 +104,9 @@ fn fingerprint(policy: &ResolvedPolicy) -> Result<Vec<u8>, SandboxError> {
             sandy_core::ChildProcesses::None => 1,
             sandy_core::ChildProcesses::Contained => 2,
         },
+        // A run that ends with its parent could be kept alive by a sibling that does not, which
+        // can open its processes because they share the AppContainer.
+        u8::from(policy.end_with_parent),
     ];
 
     // `paths` is sorted by path when the policy is resolved, so the order is deterministic.
@@ -201,18 +144,30 @@ fn fingerprint(policy: &ResolvedPolicy) -> Result<Vec<u8>, SandboxError> {
         out.extend((port.len() as u32).to_le_bytes());
         out.extend(port.as_bytes());
     }
-
-    if out.len() > MAX_FINGERPRINT {
-        return Err(SandboxError::new(
-            "the policy is too large to coordinate concurrent runs under one AppContainer name",
-        ));
-    }
-    Ok(out)
+    out
 }
 
 fn net(access: sandy_core::NetworkAccess) -> u8 {
     match access {
         sandy_core::NetworkAccess::None => 0,
         sandy_core::NetworkAccess::All => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy() -> ResolvedPolicy {
+        ResolvedPolicy::resolve(&sandy_core::Policy::default(), None).unwrap()
+    }
+
+    /// Every field that changes the sandbox must change the fingerprint, or a run with the field
+    /// set the other way could join the sandbox of a run that has it set.
+    #[test]
+    fn end_with_parent_changes_the_fingerprint() {
+        let mut ends = policy();
+        ends.end_with_parent = true;
+        assert_ne!(fingerprint(&policy()), fingerprint(&ends));
     }
 }

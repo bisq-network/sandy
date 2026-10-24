@@ -306,6 +306,35 @@ pub fn prepare_loopback_exemption() {
     );
 }
 
+/// The AppContainer SID of `container` in the `S-1-15-2-...` form that `icacls` and
+/// `CheckNetIsolation` take. Windows derives it from the name without regard to case.
+#[cfg(windows)]
+pub fn appcontainer_sid(container: &str) -> String {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::FreeSid;
+    use windows_sys::Win32::Security::Isolation::DeriveAppContainerSidFromAppContainerName;
+
+    let wide: Vec<u16> = container.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut sid = std::ptr::null_mut();
+    // SAFETY: the name is NUL-terminated and sid is a valid out pointer.
+    let hresult = unsafe { DeriveAppContainerSidFromAppContainerName(wide.as_ptr(), &mut sid) };
+    assert!(hresult >= 0, "cannot derive the SID of {container}");
+    let mut text: *mut u16 = std::ptr::null_mut();
+    // SAFETY: sid holds a SID the call above allocated; text is a valid out pointer.
+    assert_ne!(unsafe { ConvertSidToStringSidW(sid, &mut text) }, 0);
+    // SAFETY: text is a NUL-terminated string the function allocated.
+    let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
+    // SAFETY: text holds len units before its NUL.
+    let value = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+    // SAFETY: both buffers come from the calls above and are freed exactly once.
+    unsafe {
+        LocalFree(text.cast());
+        FreeSid(sid);
+    }
+    value
+}
+
 /// Removes this test's AppContainer profiles (both the plain and the loopback name). Best effort.
 #[cfg(windows)]
 pub fn delete_test_profiles() {

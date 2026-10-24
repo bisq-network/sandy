@@ -2,16 +2,12 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr;
 
 use sandy_core::SandboxError;
-use windows_sys::Win32::Foundation::{FALSE, HLOCAL, LocalFree, WAIT_ABANDONED, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
 use windows_sys::Win32::Security::{
     CreateWellKnownSid, GetLengthSid, IsValidSid, PSID, WELL_KNOWN_SID_TYPE,
-};
-use windows_sys::Win32::System::Threading::{
-    CreateMutexW, INFINITE, ReleaseMutex, WaitForSingleObject,
 };
 
 pub fn wide(text: &OsStr) -> Vec<u16> {
@@ -56,38 +52,6 @@ impl Drop for LocalBox {
             // it is freed exactly once.
             unsafe { LocalFree(self.0) };
         }
-    }
-}
-
-/// A named mutex of the logon session, held until drop. It serializes steps of concurrent sandy
-/// processes. The program cannot hold it: an AppContainer has its own `Local\` namespace.
-pub struct SessionLock(OwnedHandle);
-
-impl SessionLock {
-    pub fn acquire(name: &str) -> Result<SessionLock, SandboxError> {
-        let wide = wide_nul(name.as_ref());
-        // SAFETY: the name is NUL-terminated; null attributes give a handle that is not
-        // inheritable.
-        let handle = unsafe { CreateMutexW(ptr::null(), FALSE, wide.as_ptr()) };
-        if handle.is_null() {
-            return Err(last_error(format!("cannot create the lock {name}")));
-        }
-        // SAFETY: CreateMutexW succeeded, so the handle is new and owned by nobody else.
-        let lock = SessionLock(unsafe { OwnedHandle::from_raw_handle(handle) });
-        // SAFETY: the handle is a valid mutex handle.
-        match unsafe { WaitForSingleObject(lock.0.as_raw_handle(), INFINITE) } {
-            // An abandoned mutex belonged to a sandy process that died while it held it; the
-            // lock passes to this process.
-            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(lock),
-            _ => Err(last_error(format!("cannot wait for the lock {name}"))),
-        }
-    }
-}
-
-impl Drop for SessionLock {
-    fn drop(&mut self) {
-        // SAFETY: this process owns the mutex since `acquire` returned.
-        unsafe { ReleaseMutex(self.0.as_raw_handle()) };
     }
 }
 

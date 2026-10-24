@@ -446,11 +446,13 @@ Details, limitations and sources: `docs/windows.md`.
 - AppContainer named by `windows.appcontainer_name`; sandy creates its profile on first use.
   While a program runs, a second run under the same name with a different policy is refused,
   because processes in one AppContainer can reach and control each other (see "Local servers in the
-  sandbox" in `docs/windows.md`).
+  sandbox" in `docs/windows.md`). One policy per AppContainer while runs overlap, coordinated
+  through a lock file of the user and keyed on the AppContainer SID, because Windows derives the
+  SID from the name without regard to case.
 - File grants: one capability per policy path (named after the AppContainer, the level and the
   file ID), with one inheritable ACE on the path. The program starts with the capabilities of the
   current policy only, so grants of older policies grant nothing. sandy never removes grants and
-  serializes its DACL changes with a named mutex, so concurrent runs do not conflict. Read and read-write never contain `FILE_EXECUTE`; read levels
+  serializes its DACL changes with a lock file of the user, so concurrent runs do not conflict. Read and read-write never contain `FILE_EXECUTE`; read levels
   contain no right that changes metadata. sandy refuses to propagate a grant through junctions or
   symbolic links. The system set is what Windows grants ALL APPLICATION PACKAGES; `system =
   "none"` is unavailable.
@@ -462,14 +464,17 @@ Details, limitations and sources: `docs/windows.md`.
 - `UnixSocketsDenied` through the file ACL: AF_UNIX connect needs write access to the socket
   file, which the program has only in read-write paths and its profile folder.
 - The AppContainer profile folder (`...\Packages\<name>\AC`, which holds `TEMP`) is private,
-  writable scratch space that Windows always creates and sandy cannot remove. sandy removes
-  `FILE_EXECUTE` from the AppContainer's allow entry on it every run, so the program cannot
-  execute what it writes there (the writable-never-executable rule). A deny entry would not help:
-  the AppContainer access check ignores a deny ACE for the package SID. The folder holds no user
-  data and persists across runs.
+  writable scratch space that Windows always creates and sandy cannot remove. sandy reduces the
+  AppContainer's allow entry on it to the rights of a `read_write` path, so the entry loses
+  `FILE_EXECUTE`, `WRITE_DAC` and `WRITE_OWNER`: the program can neither execute what it writes
+  there (the writable-never-executable rule) nor rewrite the permissions to grant execute back.
+  A deny entry would not help: the AppContainer access check ignores a deny ACE for the package
+  SID. The folder holds no user data and persists across runs.
 - Writable paths (rules 3 and 6): the plan refuses a `read_write` path that overlaps the Windows
-  or a program files directory, or where Windows lets every AppContainer (ALL APPLICATION
-  PACKAGES, ALL RESTRICTED APPLICATION PACKAGES) execute files, also only files created later.
+  or a program files directory, or where ALL APPLICATION PACKAGES, ALL RESTRICTED APPLICATION
+  PACKAGES, the policy's AppContainer or one of its network capabilities may execute files, also
+  only files created later. When sandy adds the grant it walks the tree and refuses a file below
+  the path whose own permissions say the same.
 - sandy sets `SystemRoot` and `LOCALAPPDATA`; without the latter Windows refuses to create an
   AppContainer process. Windows sets `LOCALAPPDATA`, `TEMP` and `TMP` to the profile folder.
 - Job object with kill-on-close, no breakaway and all UI restrictions. The program is created

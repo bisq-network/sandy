@@ -68,6 +68,13 @@ pub trait Backend {
     fn setup(&self, _policy: &ResolvedPolicy) -> Result<(), SandboxError> {
         Ok(())
     }
+
+    /// Takes back what `setup` and the runs of this policy left on the host. Must be
+    /// idempotent, and must touch only what sandy itself created for this policy. A backend
+    /// that leaves nothing behind does nothing here.
+    fn remove(&self, _policy: &ResolvedPolicy) -> Result<(), SandboxError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]

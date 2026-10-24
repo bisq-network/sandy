@@ -2,6 +2,7 @@ mod acl;
 mod appcontainer;
 mod forward;
 mod host;
+mod lockfile;
 mod network;
 mod parent;
 mod process;
@@ -91,21 +92,23 @@ impl Backend for WindowsBackend {
             None
         };
 
-        // Refuse a concurrent run that shares this AppContainer name with a different policy.
-        // Held until the program exits, so an overlapping weaker policy cannot join the sandbox.
-        let _singleton = singleton::hold(name, policy)?;
+        // Refuse a concurrent run that shares this AppContainer with a different policy. Held
+        // until the program exits, so an overlapping weaker policy cannot join the sandbox. The
+        // SID is the identity, not the name: names that differ only in case give one SID.
+        let _singleton = singleton::hold(&appcontainer::sid(name)?, policy)?;
 
         let container = appcontainer::ensure_profile(name)?;
         // Windows gives the AppContainer a private, persistent, writable folder (its profile,
         // which holds TEMP). sandy removes execute there so the program cannot run what it
         // writes, keeping the writable-never-executable rule.
-        acl::deny_execute_in_profile(&container, &profile_folder(name)?)?;
+        acl::deny_execute_in_profile(&container, &profile_folder(&container)?)?;
         let mut capabilities = Vec::new();
         for capability in network_capabilities(policy.ip) {
             capabilities.push(network_capability_sid(*capability)?);
         }
+        let held = held_sids(policy, &container)?;
         for rule in &policy.paths {
-            capabilities.push(acl::grant(name, rule)?);
+            capabilities.push(acl::grant(name, rule, &held)?);
         }
 
         // The relays run sandy's own executable with one capability: read and execute access to
@@ -114,7 +117,7 @@ impl Backend for WindowsBackend {
             None
         } else {
             let rule = relay::relay_program(name).map_err(SandboxError::new)?;
-            Some((acl::grant(name, &rule)?, rule.path))
+            Some((acl::grant(name, &rule, &held)?, rule.path))
         };
         let mut relays = Vec::new();
         let mut forwarding = None;
@@ -200,9 +203,35 @@ impl Backend for WindowsBackend {
         let container = appcontainer::sid(name)?;
         network::set_loopback_exempt(&container, policy.ip == NetworkAccess::All)?;
         if !policy.expose.is_empty() || !policy.forward.is_empty() {
-            acl::grant(name, &relay::relay_rule().map_err(SandboxError::new)?)?;
+            // The relay rule is read and execute, so no writable-path check reads `held`.
+            acl::grant(name, &relay::relay_rule().map_err(SandboxError::new)?, &[])?;
         }
         Ok(())
+    }
+
+    /// Takes back what `setup` and the runs of this policy left behind: the loopback exemption,
+    /// the access control entry of every policy path and of sandy's own executable, and the
+    /// AppContainer profile with its folder. Only entries for the capability SIDs sandy derives
+    /// for this AppContainer are removed; other software uses capability SIDs too.
+    ///
+    /// Entries on objects that have left the policy stay, because nothing says where they are.
+    /// Needs administrator rights only where it changes the loopback exemption.
+    fn remove(&self, policy: &ResolvedPolicy) -> Result<(), SandboxError> {
+        let name = policy.windows.appcontainer_name.as_deref().ok_or_else(|| {
+            SandboxError::new("the policy names no AppContainer; pass --appcontainer NAME")
+        })?;
+        validate_appcontainer_name(name).map_err(SandboxError::new)?;
+        let container = appcontainer::sid(name)?;
+        // A run of this AppContainer would lose its access in the middle.
+        let _idle = singleton::hold_idle(&container)?;
+        network::set_loopback_exempt(&container, false)?;
+        for rule in &policy.paths {
+            acl::revoke(name, rule)?;
+        }
+        if let Ok(rule) = relay::relay_rule() {
+            acl::revoke(name, &rule)?;
+        }
+        appcontainer::delete_profile(name)
     }
 }
 
@@ -299,12 +328,35 @@ fn windows_directory() -> Result<Vec<u16>, SandboxError> {
 
 /// The AppContainer's profile folder, `<LOCALAPPDATA>\Packages\<name>\AC`. Windows redirects
 /// the program's `LOCALAPPDATA`, `TEMP` and `TMP` here [Implementing an AppContainer].
-fn profile_folder(name: &str) -> Result<std::path::PathBuf, SandboxError> {
-    let local = OsString::from_wide(&local_app_data()?);
-    Ok(std::path::PathBuf::from(local)
-        .join("Packages")
-        .join(name)
-        .join("AC"))
+///
+/// Asked of Windows rather than built from the name: the name and the folder it reaches are not
+/// the same function of the name, because Win32 normalizes a path component and
+/// `GetAppContainerFolderPath` takes the SID, which is what the access check uses. Building the
+/// path would change the permissions of another container's folder for a name Windows reads
+/// differently, and leave the real one executable.
+fn profile_folder(container: &Sid) -> Result<std::path::PathBuf, SandboxError> {
+    use windows_sys::Win32::Security::Isolation::GetAppContainerFolderPath;
+
+    let sid = wide_nul(container.to_string().as_ref());
+    let mut path: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: the SID string is NUL-terminated and path is a valid out pointer.
+    let hresult = unsafe { GetAppContainerFolderPath(sid.as_ptr(), &mut path) };
+    let result = if hresult < 0 {
+        Err(util::hresult_error(
+            format!("cannot find the profile folder of AppContainer {container}"),
+            hresult,
+        ))
+    } else {
+        // SAFETY: on success path is a NUL-terminated string from the function.
+        let len = (0..).take_while(|&i| unsafe { *path.add(i) } != 0).count();
+        // SAFETY: path holds `len` units before its NUL.
+        let wide = unsafe { std::slice::from_raw_parts(path, len) };
+        Ok(std::path::PathBuf::from(OsString::from_wide(wide)))
+    };
+    // SAFETY: the function allocated path with the COM allocator; it is freed exactly once and
+    // CoTaskMemFree accepts null.
+    unsafe { CoTaskMemFree(path.cast()) };
+    result
 }
 
 fn local_app_data() -> Result<Vec<u16>, SandboxError> {
@@ -339,10 +391,28 @@ fn system_directories() -> Result<Vec<std::path::PathBuf>, SandboxError> {
         .collect())
 }
 
+/// The SIDs the program's token will hold that could carry rights on a policy path: its
+/// AppContainer and its network capabilities. `acl::check_writable` says why the grant
+/// capabilities are not among them.
+fn held_sids(policy: &ResolvedPolicy, container: &Sid) -> Result<Vec<Sid>, SandboxError> {
+    let mut held = vec![container.clone()];
+    for capability in network_capabilities(policy.ip) {
+        held.push(network_capability_sid(*capability)?);
+    }
+    Ok(held)
+}
+
 /// Rules 3 and 6 for the writable paths of `policy`: none may overlap a system directory, and
-/// Windows must not let every AppContainer execute files in one. Changes nothing.
+/// nobody the program's token carries may execute files in one. Changes nothing.
 fn check_writable_paths(policy: &ResolvedPolicy) -> Result<(), String> {
     let system = system_directories().map_err(|error| error.to_string())?;
+    let held = match policy.windows.appcontainer_name.as_deref() {
+        Some(name) => {
+            let container = appcontainer::sid(name).map_err(|error| error.to_string())?;
+            held_sids(policy, &container).map_err(|error| error.to_string())?
+        }
+        None => Vec::new(),
+    };
     let writable = policy
         .paths
         .iter()
@@ -359,7 +429,7 @@ fn check_writable_paths(policy: &ResolvedPolicy) -> Result<(), String> {
                 directory.display()
             ));
         }
-        acl::check_writable(rule)?;
+        acl::check_writable(rule, &held)?;
     }
     Ok(())
 }

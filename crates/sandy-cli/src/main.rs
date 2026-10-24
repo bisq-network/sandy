@@ -237,6 +237,12 @@ fn execute(invocation: Invocation, parent_at_start: Option<u32>) -> Result<ExitC
                 .map_err(|error| format!("setup failed: {error}"))?;
             Ok(ExitCode::SUCCESS)
         }
+        Mode::Remove => {
+            backend
+                .remove(&resolved)
+                .map_err(|error| format!("setup --remove failed: {error}"))?;
+            Ok(ExitCode::SUCCESS)
+        }
         Mode::Run => {
             if !plan.is_enforceable() {
                 return Err(refusal(&plan));

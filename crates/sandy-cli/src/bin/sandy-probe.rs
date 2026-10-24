@@ -133,6 +133,9 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
         "afunix-accept" => windows_actions::afunix_accept(target),
         "com-activate" => windows_actions::com_activate(target),
         "load-library" => windows_actions::load_library(target),
+        "grant-all-packages" => windows_actions::grant_all_packages(target),
+        "open-process-right" => windows_actions::open_process_right(target),
+        "open-thread-right" => windows_actions::open_thread_right(target),
         // Connects to the AF_UNIX socket whose path the file `target` holds; the test writes the
         // path there while the program runs.
         "afunix-connect-file" => {
@@ -1666,6 +1669,170 @@ mod windows_actions {
             .map(|_| String::new())
     }
 
+    /// Grants ALL APPLICATION PACKAGES, which every AppContainer process belongs to, full access
+    /// to `target`, including `FILE_EXECUTE`. This is the self-re-grant an AppContainer can do
+    /// wherever it holds `WRITE_DAC`: the escape tests check that its own profile folder is not
+    /// such a place.
+    pub fn grant_all_packages(target: &str) -> io::Result<String> {
+        use windows_sys::Win32::Security::Authorization::{
+            EXPLICIT_ACCESS_W, GRANT_ACCESS, GetSecurityInfo, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT,
+            SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+        };
+        use windows_sys::Win32::Security::{
+            ACL, CONTAINER_INHERIT_ACE, CreateWellKnownSid, DACL_SECURITY_INFORMATION,
+            OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, WinBuiltinAnyPackageSid,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ALL_ACCESS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
+        };
+
+        let mut sid = [0u32; 17];
+        let mut size = (sid.len() * 4) as u32;
+        // SAFETY: the buffer is SECURITY_MAX_SID_SIZE bytes, aligned for a SID, and size tells
+        // the function its length.
+        if unsafe {
+            CreateWellKnownSid(
+                WinBuiltinAnyPackageSid,
+                ptr::null_mut(),
+                sid.as_mut_ptr().cast(),
+                &mut size,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let file = fs::OpenOptions::new()
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(target)?;
+        let handle = {
+            use std::os::windows::io::AsRawHandle;
+            file.as_raw_handle()
+        };
+        let mut current: *mut ACL = ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: the handle is open for READ_CONTROL; the out pointers are valid.
+        let error = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut current,
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        let access = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: FILE_ALL_ACCESS,
+            grfAccessMode: GRANT_ACCESS,
+            grfInheritance: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: ptr::null_mut(),
+                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_UNKNOWN,
+                ptstrName: sid.as_mut_ptr().cast(),
+            },
+        };
+        let mut merged: *mut ACL = ptr::null_mut();
+        // SAFETY: access names one entry whose SID outlives the call; current is the DACL of the
+        // file or null, which SetEntriesInAclW accepts.
+        let error = unsafe { SetEntriesInAclW(1, &access, current, &mut merged) };
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        // SAFETY: the handle is open for WRITE_DAC and merged is a valid ACL.
+        let error = unsafe {
+            SetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                merged,
+                ptr::null_mut(),
+            )
+        };
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        Ok(String::new())
+    }
+
+    /// `PID U+001F RIGHT`: opens the process with one named access right and closes it again.
+    /// Nothing is read, written or ended.
+    pub fn open_process_right(target: &str) -> io::Result<String> {
+        use windows_sys::Win32::System::Threading::{
+            PROCESS_ALL_ACCESS, PROCESS_CREATE_THREAD, PROCESS_DUP_HANDLE,
+            PROCESS_QUERY_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_SET_QUOTA,
+            PROCESS_SUSPEND_RESUME, PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
+        };
+        let (pid, right) = split_right(target)?;
+        let access = match right {
+            "vm-write" => PROCESS_VM_WRITE,
+            "vm-operation" => PROCESS_VM_OPERATION,
+            "dup-handle" => PROCESS_DUP_HANDLE,
+            "create-thread" => PROCESS_CREATE_THREAD,
+            "set-information" => PROCESS_SET_INFORMATION,
+            "set-quota" => PROCESS_SET_QUOTA,
+            "suspend-resume" => PROCESS_SUSPEND_RESUME,
+            "query-information" => PROCESS_QUERY_INFORMATION,
+            "all-access" => PROCESS_ALL_ACCESS,
+            _ => return Err(invalid("unknown process right")),
+        };
+        // SAFETY: OpenProcess has no memory safety preconditions.
+        let handle = unsafe { OpenProcess(access, FALSE, pid) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: handle is a new handle owned by this function.
+        unsafe { CloseHandle(handle) };
+        Ok(String::new())
+    }
+
+    /// `THREAD ID U+001F RIGHT`: opens the thread with one named access right and closes it
+    /// again. Nothing is suspended, resumed or changed.
+    pub fn open_thread_right(target: &str) -> io::Result<String> {
+        use windows_sys::Win32::System::Threading::{
+            OpenThread, THREAD_ALL_ACCESS, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION,
+            THREAD_SET_CONTEXT, THREAD_SET_INFORMATION, THREAD_SUSPEND_RESUME, THREAD_TERMINATE,
+        };
+        let (tid, right) = split_right(target)?;
+        let access = match right {
+            "terminate" => THREAD_TERMINATE,
+            "suspend-resume" => THREAD_SUSPEND_RESUME,
+            "get-context" => THREAD_GET_CONTEXT,
+            "set-context" => THREAD_SET_CONTEXT,
+            "set-information" => THREAD_SET_INFORMATION,
+            "query-information" => THREAD_QUERY_INFORMATION,
+            "all-access" => THREAD_ALL_ACCESS,
+            _ => return Err(invalid("unknown thread right")),
+        };
+        // SAFETY: OpenThread has no memory safety preconditions.
+        let handle = unsafe { OpenThread(access, FALSE, tid) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: handle is a new handle owned by this function.
+        unsafe { CloseHandle(handle) };
+        Ok(String::new())
+    }
+
+    /// `ID U+001F RIGHT`.
+    fn split_right(target: &str) -> io::Result<(u32, &str)> {
+        let (id, right) = target
+            .split_once('\u{1f}')
+            .ok_or_else(|| invalid("expected ID U+001F RIGHT"))?;
+        let id = id.parse().map_err(|_| invalid("invalid id"))?;
+        Ok((id, right))
+    }
+
     /// `KEY\VALUE` below HKEY_CURRENT_USER.
     fn registry_target(target: &str) -> io::Result<(Vec<u16>, Vec<u16>)> {
         let (key, value) = target
@@ -1903,10 +2070,18 @@ mod windows_actions {
         Ok(format!("loaded {target}"))
     }
 
-    /// Activates a named out-of-process COM server with CLSCTX_LOCAL_SERVER and reports whether an
-    /// interface pointer was returned. This triggers DCOM activation of a system service. If the
-    /// AppContainer cannot reach the service, the activation fails with an access or launch error.
-    /// A success means the AppContainer could start or bind to a process outside the sandbox.
+    /// Reaches a named COM service and reports whether it answered. Both targets end at a
+    /// process outside the AppContainer and the job; a success means the program could drive it.
+    ///
+    /// `bits` is an out-of-process server, so `CoCreateInstance` with `CLSCTX_LOCAL_SERVER` is
+    /// the whole attempt. `task-scheduler` is not: `CLSID_TaskScheduler` lives in `taskschd.dll`
+    /// and loads in the caller, which says nothing about the boundary and fails outside the
+    /// sandbox too with `CLSCTX_LOCAL_SERVER`. Its boundary is `ITaskService::Connect`, which
+    /// binds to the Schedule service over RPC, so the probe loads the class in process and
+    /// calls that.
+    ///
+    /// The detail carries the `HRESULT`, and `E_ACCESSDENIED` is reported as `denied`, so a test
+    /// can tell a refusal at the boundary from a failure to load COM at all.
     pub fn com_activate(target: &str) -> io::Result<String> {
         use std::ffi::c_void;
 
@@ -1916,8 +2091,19 @@ mod windows_actions {
         // ole32.dll is loaded at run time, not imported, so the probe process still starts in the
         // AppContainer (a static import of ole32 fails DllMain there with STATUS_DLL_INIT_FAILED).
         // This matches what an attacker with arbitrary native code would do.
+        const CLSCTX_INPROC_SERVER: u32 = 0x1;
         const CLSCTX_LOCAL_SERVER: u32 = 0x4;
         const COINIT_MULTITHREADED: u32 = 0x0;
+        const E_ACCESSDENIED: i32 = 0x8007_0005_u32 as i32;
+        /// `VARIANT`, 24 bytes; all zero is `VT_EMPTY`, which `Connect` reads as "this
+        /// computer, the caller's own credentials".
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        struct Variant {
+            vt: u16,
+            reserved: [u16; 3],
+            value: [u64; 2],
+        }
         type CoInitializeEx = unsafe extern "system" fn(*const c_void, u32) -> i32;
         type CoCreateInstance = unsafe extern "system" fn(
             *const GUID,
@@ -1928,24 +2114,6 @@ mod windows_actions {
         ) -> i32;
         type CoUninitialize = unsafe extern "system" fn();
 
-        // Named out-of-process servers that run in a system service.
-        let clsid = match target {
-            // CLSID_TaskScheduler: creating a task would run a process outside the AppContainer.
-            "task-scheduler" => GUID {
-                data1: 0x0f87_369f,
-                data2: 0xa4e5,
-                data3: 0x4cfc,
-                data4: [0xbd, 0x3e, 0x73, 0xe6, 0x15, 0x45, 0x72, 0xdd],
-            },
-            // CLSID_BackgroundCopyManager (BITS): a transfer would fetch from the network.
-            "bits" => GUID {
-                data1: 0x4991_d34b,
-                data2: 0x80a1,
-                data3: 0x4291,
-                data4: [0x83, 0xb6, 0x33, 0x28, 0x36, 0x6b, 0x90, 0x97],
-            },
-            _ => return Err(invalid("unknown CLSID name")),
-        };
         // IID_IUnknown.
         let iid_unknown = GUID {
             data1: 0,
@@ -1953,16 +2121,37 @@ mod windows_actions {
             data3: 0,
             data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46],
         };
-        // Only `release` is called; the first two entries fix the layout so `release` sits in the
-        // third slot of the vtable.
-        #[repr(C)]
-        #[allow(dead_code)]
-        struct IUnknownVtbl {
-            query_interface:
-                unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> i32,
-            add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
-            release: unsafe extern "system" fn(*mut c_void) -> u32,
-        }
+        let (clsid, iid, context) = match target {
+            // CLSID_TaskScheduler and IID_ITaskService: a task would run a process outside the
+            // AppContainer.
+            "task-scheduler" => (
+                GUID {
+                    data1: 0x0f87_369f,
+                    data2: 0xa4e5,
+                    data3: 0x4cfc,
+                    data4: [0xbd, 0x3e, 0x73, 0xe6, 0x15, 0x45, 0x72, 0xdd],
+                },
+                GUID {
+                    data1: 0x2fab_a4c7,
+                    data2: 0x4da9,
+                    data3: 0x4013,
+                    data4: [0x96, 0x97, 0x20, 0xcc, 0x3f, 0xd4, 0x0f, 0x85],
+                },
+                CLSCTX_INPROC_SERVER,
+            ),
+            // CLSID_BackgroundCopyManager (BITS): a transfer would fetch from the network.
+            "bits" => (
+                GUID {
+                    data1: 0x4991_d34b,
+                    data2: 0x80a1,
+                    data3: 0x4291,
+                    data4: [0x83, 0xb6, 0x33, 0x28, 0x36, 0x6b, 0x90, 0x97],
+                },
+                iid_unknown,
+                CLSCTX_LOCAL_SERVER,
+            ),
+            _ => return Err(invalid("unknown CLSID name")),
+        };
 
         let ole32 = wide("ole32.dll");
         // SAFETY: the name is NUL-terminated.
@@ -1997,29 +2186,50 @@ mod windows_actions {
         }
         let mut object: *mut c_void = ptr::null_mut();
         // SAFETY: both GUIDs are valid; object is a writable out pointer; no aggregation.
-        let hr = unsafe {
-            co_create(
-                &clsid,
-                ptr::null_mut(),
-                CLSCTX_LOCAL_SERVER,
-                &iid_unknown,
-                &mut object,
-            )
-        };
-        let outcome = if hr >= 0 && !object.is_null() {
-            // SAFETY: object points to a COM interface whose first field is its vtable; Release is
-            // the third IUnknown method.
-            unsafe {
-                let vtbl = *object.cast::<*const IUnknownVtbl>();
-                ((*vtbl).release)(object);
+        let mut hr = unsafe { co_create(&clsid, ptr::null_mut(), context, &iid, &mut object) };
+        if hr >= 0 && !object.is_null() {
+            if target == "task-scheduler" {
+                // ITaskService::Connect is the eleventh method: three of IUnknown, four more of
+                // IDispatch, then GetFolder, GetRunningTasks and NewTask.
+                type Connect = unsafe extern "system" fn(
+                    *mut c_void,
+                    Variant,
+                    Variant,
+                    Variant,
+                    Variant,
+                ) -> i32;
+                // SAFETY: object is an ITaskService; its first field is the vtable, whose slot
+                // 10 is Connect with this signature. Four VT_EMPTY arguments mean this
+                // computer and the caller's own credentials.
+                hr = unsafe {
+                    let vtbl = *object.cast::<*const *const c_void>();
+                    let connect: Connect = std::mem::transmute(*vtbl.add(10));
+                    connect(
+                        object,
+                        Variant::default(),
+                        Variant::default(),
+                        Variant::default(),
+                        Variant::default(),
+                    )
+                };
             }
-            Ok(format!("activated {target}"))
-        } else {
-            Err(io::Error::from_raw_os_error(hr))
-        };
+            // SAFETY: object points to a COM interface whose first field is its vtable; Release
+            // is the third IUnknown method.
+            unsafe {
+                let vtbl = *object.cast::<*const *const c_void>();
+                let release: unsafe extern "system" fn(*mut c_void) -> u32 =
+                    std::mem::transmute(*vtbl.add(2));
+                release(object);
+            }
+        }
         // SAFETY: COM was initialized on this thread above.
         unsafe { co_uninit() };
-        outcome
+        let detail = format!("hr={:#010x}", hr as u32);
+        match hr {
+            hr if hr >= 0 => Ok(format!("reached {target} {detail}")),
+            E_ACCESSDENIED => Err(io::Error::new(io::ErrorKind::PermissionDenied, detail)),
+            _ => Err(io::Error::other(detail)),
+        }
     }
 }
 
@@ -2072,6 +2282,18 @@ mod windows_actions {
     }
 
     pub fn load_library(_target: &str) -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn grant_all_packages(_target: &str) -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn open_process_right(_target: &str) -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn open_thread_right(_target: &str) -> io::Result<String> {
         unsupported()
     }
 }

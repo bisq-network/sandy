@@ -285,6 +285,8 @@ All three exit with status 125, and the program does not start.
 sandy run [OPTIONS] [--] PROGRAM [ARGS...]   run PROGRAM inside the sandbox
 sandy check [OPTIONS] [[--] PROGRAM]         show how this host enforces the policy
 sandy setup [OPTIONS]                        prepare the host (needs admin rights on Windows)
+sandy setup --remove [OPTIONS]               take back what setup and the runs of the policy
+                                             left on the host
 ```
 
 `sandy run` starts the program only if every requirement is enforced. Everything after `--` (or
@@ -304,6 +306,11 @@ program.
 
 `sandy setup` does the one-time host preparation that needs administrator rights. Today this
 matters only on Windows (see [Windows](#windows)); on Linux and macOS it does nothing.
+
+`sandy setup --remove`, with the same policy, takes that preparation back, together with what
+the runs of the policy left on the host: on Windows the loopback exemption, the access control
+entries of the policy paths and the AppContainer profile. It is idempotent, and on Linux and
+macOS it does nothing because those backends leave nothing behind.
 
 ### Options
 

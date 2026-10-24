@@ -13,6 +13,8 @@ Usage:
   sandy run [OPTIONS] [--] PROGRAM [ARGS...]   run PROGRAM inside the sandbox
   sandy check [OPTIONS] [[--] PROGRAM]         show how this host enforces the policy
   sandy setup [OPTIONS]                        prepare the host (needs admin rights on Windows)
+  sandy setup --remove [OPTIONS]               take back what setup and the runs of the policy
+                                               left on the host
 
 PROGRAM must be an absolute path. sandy refuses to start it when any restriction of the policy
 cannot be enforced on this host.
@@ -57,6 +59,8 @@ pub enum Mode {
     Run,
     Check,
     Setup,
+    /// `setup --remove`.
+    Remove,
 }
 
 #[derive(Debug, Default)]
@@ -284,6 +288,7 @@ where
                 })
             }
             Long("end-with-parent") => overrides.end_with_parent = true,
+            Long("remove") if invocation.mode == Mode::Setup => invocation.mode = Mode::Remove,
             Long("linux-path-metadata") => {
                 overrides.path_metadata = Some(match parser.value()?.string()?.as_str() {
                     "deny" => PathMetadata::Deny,
@@ -343,7 +348,7 @@ where
 
     match (invocation.mode, &invocation.program) {
         (Mode::Run, None) => return Err("run needs a PROGRAM".into()),
-        (Mode::Setup, Some(_)) => return Err("setup takes no PROGRAM".into()),
+        (Mode::Setup | Mode::Remove, Some(_)) => return Err("setup takes no PROGRAM".into()),
         _ => {}
     }
     Ok(Command::Sandbox(Box::new(invocation)))

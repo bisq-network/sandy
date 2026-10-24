@@ -104,21 +104,38 @@ fn expose_without_ip_is_refused() {
 fn an_exposed_port_relays_many_connections_at_once() {
     const CONNECTIONS: usize = 180;
     let fixture = Fixture::new("expose-many");
-    let (inner, outer) = (free_port(), free_port());
-    let mut sandbox_args = fixture.access_args();
-    sandbox_args.extend([
-        "--ip".to_string(),
-        "all".to_string(),
-        "--expose".to_string(),
-        format!("127.0.0.1:{outer}={inner}"),
-    ]);
-    let serve = format!("127.0.0.1:{inner}\u{1f}{CONNECTIONS}");
-    let server = Command::new(sandy_path())
-        .args(run_args(&sandbox_args, &[("tcp-serve", &serve)]))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    // `free_port` only reports a port that was free a moment ago, so another process on the host
+    // can take it before sandy binds it. That is the test's own race, not a refusal to enforce
+    // the policy, so it picks another pair instead of failing. Anything else sandy says fails.
+    let (server, outer) = loop {
+        let (inner, outer) = (free_port(), free_port());
+        let mut sandbox_args = fixture.access_args();
+        sandbox_args.extend([
+            "--ip".to_string(),
+            "all".to_string(),
+            "--expose".to_string(),
+            format!("127.0.0.1:{outer}={inner}"),
+        ]);
+        let serve = format!("127.0.0.1:{inner}\u{1f}{CONNECTIONS}");
+        let mut server = Command::new(sandy_path())
+            .args(run_args(&sandbox_args, &[("tcp-serve", &serve)]))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // sandy binds the relay's port before it starts anything else, so a port another
+        // process took shows up at once; a run still alive after this has the port.
+        let grace = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < grace && server.try_wait().unwrap().is_none() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if server.try_wait().unwrap().is_none() {
+            break (server, outer);
+        }
+        let output = server.wait_with_output().unwrap();
+        let message = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(message.contains("Address already in use"), "{output:?}");
+    };
     let address: SocketAddr = format!("127.0.0.1:{outer}").parse().unwrap();
     let deadline = Instant::now() + WAIT * 3;
     let mut clients = Vec::with_capacity(CONNECTIONS);

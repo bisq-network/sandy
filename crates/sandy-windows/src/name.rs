@@ -26,7 +26,40 @@ pub fn validate_appcontainer_name(name: &str) -> Result<(), String> {
             "the AppContainer name {name:?} contains {c:?}; allowed are A-Z, a-z, 0-9, '-', '_', '.' and space"
         ));
     }
+    // Windows strips a trailing period or space from a path component, and `.` and `..` name
+    // other directories, so such a name and the folder it reaches are not the same thing.
+    if name.starts_with(' ') || name.ends_with(' ') || name.ends_with('.') {
+        return Err(format!(
+            "the AppContainer name {name:?} starts or ends with a space or ends with a period; \
+             Windows drops those from a path, so the name would not match its folder"
+        ));
+    }
+    if name.chars().all(|c| c == '.') {
+        return Err(format!(
+            "the AppContainer name {name:?} is made of periods only, which names a directory"
+        ));
+    }
+    if let Some(publisher) = package_family_publisher(name) {
+        return Err(format!(
+            "the AppContainer name {name:?} is shaped like the family name of an installed \
+             application package ({publisher:?} looks like a publisher ID). An AppContainer SID \
+             is derived from the name, so such a name would be the identity of that package: \
+             sandy would change the permissions of its folder and share its sandbox. Use a name \
+             without a 13 character suffix after an underscore"
+        ));
+    }
     Ok(())
+}
+
+/// The publisher ID of `name` read as a package family name, `Publisher.App_<13 characters>`.
+/// Microsoft derives a package SID from the family name the same way sandy's AppContainer SID is
+/// derived from its name, so a collision is one identity for two things.
+fn package_family_publisher(name: &str) -> Option<&str> {
+    let (app, publisher) = name.rsplit_once('_')?;
+    let shaped = !app.is_empty()
+        && publisher.len() == 13
+        && publisher.chars().all(|c| c.is_ascii_alphanumeric());
+    shaped.then_some(publisher)
 }
 
 /// Identity of a file system object: volume serial number and file ID (`FILE_ID_INFO`). Unlike a
@@ -77,6 +110,23 @@ mod tests {
         for name in ["", &"x".repeat(65), "a/b", "a\\b", "ä", "a:b", "a\0"] {
             assert!(validate_appcontainer_name(name).is_err(), "{name:?}");
         }
+    }
+
+    /// Names that Windows and sandy would not read as the same thing.
+    #[test]
+    fn rejects_ambiguous_and_package_shaped_names() {
+        for name in ["a.", " a", "a ", ".", "..", "..."] {
+            assert!(validate_appcontainer_name(name).is_err(), "{name:?}");
+        }
+        for name in [
+            "Microsoft.WindowsCalculator_8wekyb3d8bbwe",
+            "MICROSOFT.WINDOWSCALCULATOR_8WEKYB3D8BBWE",
+        ] {
+            assert!(validate_appcontainer_name(name).is_err(), "{name:?}");
+        }
+        // A short suffix after an underscore is not a publisher ID.
+        assert_eq!(validate_appcontainer_name("My App-1_2"), Ok(()));
+        assert_eq!(validate_appcontainer_name(".hidden"), Ok(()));
     }
 
     #[test]

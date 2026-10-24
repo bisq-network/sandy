@@ -7,9 +7,9 @@ treats the AppContainer as a security boundary that it services with security up
 
 Status: the shared escape tests (`crates/sandy-cli/tests/escape.rs`) and the Windows escape
 tests (`escape_windows.rs`) pass on Windows 11 build 26200, both elevated and with a filtered
-(non-elevated, medium integrity) token; see "Verified on Windows 11". Statements that no test
-checks come from the cited sources. Wine does not implement AppContainers, so Wine runs prove
-nothing about isolation.
+(non-elevated) token; see "Verified on Windows 11". Statements that no test checks come from the
+cited sources. Wine does not implement AppContainers, so Wine runs prove nothing about
+isolation.
 
 ## Requirements and mechanisms
 
@@ -33,7 +33,16 @@ nothing about isolation.
 Every requirement also needs `windows.appcontainer_name` (or `--appcontainer NAME`). Without it,
 or with an invalid name, the plan reports the requirements that need the AppContainer as
 unavailable. A name has at most 64 characters from `A-Z a-z 0-9 - _ .` and space
-[CreateAppContainerProfile].
+[CreateAppContainerProfile]. sandy refuses three shapes beyond that:
+
+- a name that starts or ends with a space, or ends with a period. Windows drops those from a
+  path component, so the name and the folder it reaches would be different things;
+- a name made of periods only, which names a directory;
+- a name shaped like the family name of an application package, `Publisher.App` plus an
+  underscore and 13 characters. Windows derives a package SID from a family name the way it
+  derives an AppContainer SID from a name, so such a name would be the identity of that package:
+  sandy would change the permissions of its folder and share its sandbox. The check is on the
+  shape, so it also refuses a family name of a package that is not installed.
 
 ## The AppContainer
 
@@ -47,8 +56,13 @@ AppContainer made it fail with `E_UNEXPECTED`, and made a concurrent `CreateProc
 `ERROR_FILE_NOT_FOUND`. sandy recognizes a registered profile by the key
 `HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings\<SID>`,
 which Windows creates for it. The location is not documented; if it changes, sandy calls
-`CreateAppContainerProfile` on every run again, which reports an existing profile. A named mutex
-(`Local\sandy-appcontainer-profiles`) keeps two first runs from creating the profile at once.
+`CreateAppContainerProfile` on every run again, which reports an existing profile. A lock file
+(`%LOCALAPPDATA%\sandy\locks\appcontainer-profiles`) keeps two first runs of the user from
+creating the profile at once.
+
+sandy asks Windows for the folder of the AppContainer with `GetAppContainerFolderPath` on the
+SID string instead of building `%LOCALAPPDATA%\Packages\<name>\AC` itself, because the name and
+the path are not the same function of the name.
 
 The profile creates a folder for the AppContainer below `%LOCALAPPDATA%\Packages\<name>`. The
 program can read, write and execute files there; Windows points its `TEMP` and `TMP` to the
@@ -69,15 +83,27 @@ program could write a file that it may then execute (rule 3). The plan reports
 
 - contains or lies inside the Windows directory (`GetSystemWindowsDirectoryW`) or a program files
   directory (`FOLDERID_ProgramFiles`, `FOLDERID_ProgramFilesX86`);
-- has a DACL that gives ALL APPLICATION PACKAGES or ALL RESTRICTED APPLICATION PACKAGES
-  `FILE_EXECUTE`, on the path itself or through an entry that files or directories created in it
+- has a DACL that gives `FILE_EXECUTE` to ALL APPLICATION PACKAGES, to ALL RESTRICTED
+  APPLICATION PACKAGES, to the AppContainer of the policy or to one of its network
+  capabilities, on the path itself or through an entry that files or directories created in it
   inherit (`access::may_grant`). Effective access is the union of all allow entries, so the
-  execute right of the group would join the write right of sandy's capability. A writable data
-  folder below `C:\Program Files` inherits exactly such an entry;
-- has entries of a type the evaluator does not know, because then it cannot tell.
+  execute right would join the write right of sandy's capability. A writable data folder below
+  `C:\Program Files` inherits exactly such an entry;
+- has entries of a type the evaluator does not know, because then it cannot tell. An entry with
+  a condition (`ACCESS_ALLOWED_CALLBACK_ACE_TYPE`) is known but its condition is not read, so it
+  counts as granting here and never as a grant sandy may skip.
 
-sandy checks the path's own DACL. A file below it that carries an explicit entry for one of the
-groups is not found; software rarely sets one on files in a data folder.
+The grant capabilities are not on that list. A grant capability is derived from the identity of
+the object it is granted on, so it can appear on that object and nowhere else; a file that is
+writable and executable through a second name is the link question of "Links and identity".
+
+`check` reads the permissions of the path itself. When `run` adds the entry, it also walks the
+tree below the path and refuses a descendant whose own permissions may give one of them execute,
+in the same walk that refuses junctions. The walk runs only where sandy changes something, so it
+does not slow down a plan, and `check` can report a policy as enforceable that `run` then
+refuses for a file below the path. What outside software adds after the walk is not seen; the
+program cannot add it, because it holds no right to change permissions outside its profile
+folder.
 
 `system = "none"` is unavailable. A Less Privileged AppContainer (LPAC,
 `PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY`) drops ALL APPLICATION PACKAGES, but
@@ -94,17 +120,30 @@ The folder is always present, the program can write it, and it survives runs: Wi
 and sandy cannot remove it without breaking the program's `TEMP`.
 
 Windows creates the folder with an inheritable allow entry that grants the AppContainer SID full
-access, including `FILE_EXECUTE`. That would let the program write a file there and then execute
-it, which the writable-never-executable rule forbids for policy paths. On every run sandy removes
-`FILE_EXECUTE` from that allow entry (`SetNamedSecurityInfoW` re-propagates it to existing files
-too), so the program can use the folder for data but cannot run what it writes. A deny entry does
-not work here: the AppContainer access check ignores a deny ACE for the package SID, measured on
-Windows 11; reducing the allow entry is what the check honors. The change is idempotent.
+access, which contains `FILE_EXECUTE`, `WRITE_DAC` and `WRITE_OWNER`. Execute would let the
+program write a file there and then run it, which the writable-never-executable rule forbids for
+policy paths. The other two would let it write the file's own permissions and grant execute
+back, to ALL APPLICATION PACKAGES for example, which every AppContainer belongs to. sandy
+reduces the entry to the rights of a `read_write` policy path, so all three are gone
+(`SetNamedSecurityInfoW` re-propagates the reduced entry to existing files too). A deny entry
+does not work here: the AppContainer access check ignores a deny ACE for the package SID,
+measured on Windows 11; reducing the allow entry is what the check honors, for `WRITE_DAC` as
+much as for `FILE_EXECUTE` (measured on build 26200).
+
+The change is idempotent: a run writes only while the entry still carries one of the three
+rights. sandy 1.3.2 removed `FILE_EXECUTE` alone, so the first run of a later version reduces
+such a profile once more. That run also walks the folder and refuses a junction or symbolic link
+below it, because it re-propagates the entry and the program can write there.
 
 The folder holds no user data. It is the program's own scratch space, writable in every policy,
 also one with no writable path. `escape_windows` and `review_windows` confirm that the program
-can write and read it but cannot execute a file in it (`load-library` is denied while `read`
-succeeds).
+can write and read it, cannot execute a file in it (`load-library` is denied while `read`
+succeeds), and cannot grant itself execute back.
+
+What the reduction does not repair: a program that ran under sandy 1.3.2 could write an explicit
+entry of its own on a file in the folder, and re-propagation does not remove explicit entries.
+It cannot write new ones afterwards. `sandy setup --remove` deletes the profile and with it any
+entry left there.
 
 ## File grants
 
@@ -155,12 +194,12 @@ The consequences:
   process holds the old capability. The escape test
   `a_path_removed_from_the_policy_is_denied_at_the_next_run` checks this.
 - **Concurrent runs do not conflict.** No run removes an ACE that another run needs. Adding an
-  ACE means reading the DACL, adding the entry and writing the whole DACL back, so sandy holds a
-  named mutex of the logon session (`Local\sandy-dacl-changes`) while it changes a DACL.
+  ACE means reading the DACL, adding the entry and writing the whole DACL back, so sandy holds
+  a lock on `%LOCALAPPDATA%\sandy\locks\dacl-changes` while it changes a DACL.
   Without it, two runs that add different ACEs to the same object, such as one program in two
   AppContainers, could overwrite each other's ACE. The program cannot hold this mutex, because
-  an AppContainer has its own `Local\` namespace. Changes by other tools, such as `icacls`,
-  are not serialized.
+  a lock file below `%LOCALAPPDATA%\sandy\locks`, which an AppContainer cannot open. Changes by
+  other tools, such as `icacls`, are not serialized.
 - **System paths need no change.** If the DACL of a path already grants the level to ALL
   APPLICATION PACKAGES, for example `C:\Windows\System32\cmd.exe`, sandy adds nothing. Users
   usually cannot change these DACLs.
@@ -205,7 +244,7 @@ reach the resolver through a backend hook that is not written yet. The stubs are
 
 - A policy path or a trusted file reached through a junction or a symbolic link inside a
   writable path is not refused by the resolver. For `run`, the walk before a new grant refuses a
-  junction below a granted directory (`refuse_links_below`); `check`, and a grant that already
+  junction below a granted directory (`check_tree_below`); `check`, and a grant that already
   exists, do not.
 - A hard link between a `read_write` and a `read_exec` path, or one that leads to the program
   file, sandy's own executable or the policy file, is not refused. This weighs more here than on
@@ -214,25 +253,62 @@ reach the resolver through a backend hook that is not written yet. The stubs are
   and stay there after the run.
 - `sandy` is checked under the path `current_exe` reports. There is no second name to compare
   it with yet.
+- A grant is an entry on the object, so it travels with the object. A file renamed out of a
+  granted directory, on the same volume, keeps the entry it inherited from that directory: a
+  rename does not touch the security descriptor, and Windows recomputes inherited entries only
+  when something propagates from the new parent. The program holds the capability of the
+  directory for as long as the directory is in the policy, and an AppContainer token keeps
+  `SeChangeNotifyPrivilege`, so no traverse check stops it from opening the file at its new
+  place by the full path. Linux and macOS bind the rule to the path, where the moved file is
+  denied at once. `escape_windows::a_file_moved_out_of_a_granted_directory_keeps_its_grant`
+  records this. Closing it would mean a new capability per run and a fresh propagation over
+  every policy path on every run.
+
+### What the program can see
+
+The sandbox refuses access, it does not hide what exists. Paths outside the policy answer:
+
+| Path | Answer |
+|---|---|
+| An existing file outside the policy | `ERROR_ACCESS_DENIED` |
+| An existing directory outside the policy | `ERROR_ACCESS_DENIED` |
+| A name that does not exist next to it | `ERROR_FILE_NOT_FOUND`, `ERROR_PATH_NOT_FOUND` |
+
+So the program can tell whether a path exists, and from the names it guesses it learns what the
+user has. Hiding paths would need a separate view of the file system, which `DESIGN.md` names a
+non-goal. The same holds for the user's processes: the program cannot open them, but a Toolhelp
+snapshot still lists them.
+`review_windows::an_existing_path_outside_the_policy_is_told_apart_from_a_missing_one` records
+the file case.
 
 ### Removing the changes
 
 Old grants grant nothing, so removing them is cleanup, not a security step.
 
-- File grants, including the relay grant on `sandy.exe`: `icacls PATH` lists the grants as `*S-1-15-3-1024-...`. `icacls PATH /remove:g
-  *SID` removes one. The SID cannot be mapped back to its name, and other software (for example
-  Chromium) also uses capability SIDs, so remove only SIDs you know belong to sandy.
-- The AppContainer profile and its folder: `DeleteAppContainerProfile`, for example from
-  PowerShell:
+`sandy setup --remove`, with the policy whose changes should go, does all of it:
 
-  ```powershell
-  Add-Type -Namespace Win32 -Name UserEnv -MemberDefinition '[DllImport("userenv.dll", CharSet = CharSet.Unicode)] public static extern int DeleteAppContainerProfile(string name);'
-  [Win32.UserEnv]::DeleteAppContainerProfile("example.app")
-  ```
-- The loopback exemption: see below.
+- the loopback exemption of the AppContainer (administrator rights, and only when it is there);
+- the access control entry of every policy path, and of `sandy.exe` for the relays. Only the
+  capability SIDs sandy derives for this AppContainer and these objects are removed. Other
+  software (Chromium, for example) uses capability SIDs too, and a capability SID cannot be
+  mapped back to its name, so removing anything else would be guesswork;
+- the AppContainer profile and its folder, with whatever the program left in its `TEMP`.
 
-Proposed CLI change: `sandy setup --remove` with a policy could compute the capability SIDs of
-its paths, remove those ACEs, the loopback exemption and the profile.
+It is idempotent, it refuses while a run of that AppContainer is active, and it reaches nothing
+that has left the policy: an entry on an object that is no longer a policy path stays, because
+nothing records where it is. By hand, `icacls PATH` lists the entries as `*S-1-15-3-1024-...`
+and `icacls PATH /remove:g *SID` removes one; the profile goes with
+`DeleteAppContainerProfile`, for example from PowerShell:
+
+```powershell
+Add-Type -Namespace Win32 -Name UserEnv -MemberDefinition '[DllImport("userenv.dll", CharSet = CharSet.Unicode)] public static extern int DeleteAppContainerProfile(string name);'
+[Win32.UserEnv]::DeleteAppContainerProfile("example.app")
+```
+
+The socket directories of forwarded ports clean themselves up: each run holds a lock file in
+its own directory, opened without `FILE_SHARE_DELETE`, and every run with a forwarded port first
+removes the directories whose lock file it can open exclusively, which only the directories of
+ended runs are.
 
 ## Network
 
@@ -242,6 +318,16 @@ With `ip = "none"` the program gets no network capabilities. With `ip = "all"` i
 plan reports `IpNetworkDenied` as unavailable when the firewall service (`MpsSvc`) does not run:
 whether isolation holds without it is not documented, and Microsoft does not support stopping
 it.
+
+Turning the firewall profiles off is a different matter, and an ordinary one: a third-party
+firewall registered with Security Center, or a group policy, turns the Defender Firewall
+profiles off while `MpsSvc` keeps running. Measured on Windows 11 build 26200, isolation holds
+there. With `Set-NetFirewallProfile -All -Enabled False`, a connection from the program to a
+host outside the machine still failed at once with `WSAEACCES` (10013), while the same
+connection from outside the sandbox succeeded as the positive control; the profiles were then
+restored to the state they had. The filters that carry the AppContainer rules sit in the
+Windows Service Hardening sublayer, which the profiles do not switch. `sandy check` therefore
+reads the service and not the profiles.
 
 A child process could once bypass the isolation through firewall rules that matched only an
 executable path [Project Zero 2021]. Microsoft later published an update for it as
@@ -286,28 +372,42 @@ with `ip = "all"` and the exemption. Options, tested on Windows 11 build 26200:
 Processes in the same AppContainer reach each other over loopback in every configuration
 measured, also with `ip = "none"` and without exemption. `network.expose` builds on this fact.
 
-Because of the same fact, two sandboxes that use the same AppContainer name can talk over
-loopback, also when their policies differ (for example one with `ip = "all"`). Processes in one
-AppContainer can also open each other's processes. A program with a weaker policy could therefore
-take over a program with a stronger policy that runs at the same time under the same name.
+Because of the same fact, two sandboxes in the same AppContainer can talk over loopback, also
+when their policies differ (for example one with `ip = "all"`). Processes in one AppContainer can
+also open each other's processes. A program with a weaker policy could therefore take over a
+program with a stronger policy that runs at the same time in the same AppContainer.
 
-sandy enforces one policy per name at a time (`crates/sandy-windows/src/sys/singleton.rs`):
+sandy enforces one policy per AppContainer at a time
+(`crates/sandy-windows/src/sys/singleton.rs`):
 
-- While a program runs, sandy holds a named file mapping in the `Local\` object namespace that
-  stores a fingerprint of the resolved policy: the path rules (including the program's own read
-  and execute rule), the system set, `ip`, `unix_sockets`, the exposed ports, `signals` and
-  `path_metadata`. Arguments, working directory and environment are not part of it. A named mutex
-  serializes the check.
-- A second run under the same name with the same fingerprint may run at the same time. A run with
-  a different fingerprint is refused with exit status 125 and the reason, until every run of the
-  first policy has ended.
-- An AppContainer process sees its own object namespace, so the program cannot open or change the
-  mapping. The kernel removes the mapping when the last run that holds it exits, also after a
-  crash, so no stale state blocks later runs. Runs with different policies one after the other
-  stay allowed.
+- The identity is the AppContainer SID, not the name from the policy. Windows derives the SID
+  from the name without regard to case, and so do the capability names and the profile folder,
+  so `sandy.X` and `SANDY.x` are one sandbox (measured on build 26200: all spellings of a name
+  give one SID). Keying on the name would let the two spellings run different policies side by
+  side.
+- While a program runs, sandy holds a shared byte range lock on a file named after the SID below
+  `%LOCALAPPDATA%\sandy\runs`, which stores a fingerprint of the resolved policy: the path rules
+  (including the program's own read and execute rule), the system set, `ip`, `unix_sockets`, the
+  exposed and forwarded ports, `signals`, `children`, `end_with_parent` and `path_metadata`.
+  Arguments, working directory and environment are not part of it. A second byte of the same
+  file serializes the check.
+- A second run in the same AppContainer with the same fingerprint may run at the same time. A run
+  with a different fingerprint is refused with exit status 125 and the reason, until every run of
+  the first policy has ended.
+- The user's local application data grants nothing to AppContainers, so the program can neither
+  read nor change the file. The kernel releases the lock when the run that holds it exits, also
+  after a crash, so no stale state blocks later runs. Runs with different policies one after the
+  other stay allowed.
+- A file and not a named kernel object, because `Local\` is per logon session and in session 0,
+  which services and SSH sessions run in, it is shared by every user's session 0 processes:
+  another local user could hold sandy's mutex, which sandy waits for without a limit, or create
+  the state object with permissions of their own. The locks that serialize sandy's permission
+  changes and profile creation moved to `%LOCALAPPDATA%\sandy\locks` for the same reason. They
+  no longer serialize two users who grant on the same file, which `Local\` did only in session 0
+  anyway.
 
 Use one AppContainer name per policy anyway: file grants and the loopback exemption belong to the
-name, and two policies that share a name cannot run at the same time.
+AppContainer, and two policies that share one cannot run at the same time.
 
 ### Exposed ports
 
@@ -455,9 +555,13 @@ pipe grants nothing to AppContainers [CreateNamedPipeW] [Implementing an AppCont
   start its own console host and ends with `STATUS_DLL_INIT_FAILED` (`0xC0000142`) before it
   runs. Why not a job limit for the relays: with two relays, the program could end one to free a
   slot and use the other. Processes that a service outside starts on request are not children
-  of the program; an AppContainer cannot activate out-of-process COM servers
-  (`out_of_process_com_service_activation_is_blocked`), and sandy refuses `children = "none"`
-  together with `unix_sockets = "all"`.
+  of the program. The COM route to such a service is closed for the two services tested, BITS
+  and the Schedule service (`com_services_outside_the_sandbox_are_unreachable`), and sandy
+  refuses `children = "none"` together with `unix_sockets = "all"`. It is not closed by Windows
+  in general: a COM server whose launch permission admits ALL APPLICATION PACKAGES is reachable
+  by design, and DcomLaunch starts it outside the job. A default Windows 11 has no such server
+  (`no_dcom_server_admits_all_application_packages`), and no policy key would close it, so on a
+  host that has one the guarantee has to be measured again.
 - **Contained child processes.** `process.children = "contained"` needs nothing beyond the job
   described above: the program's children join the job, sandy ends the job when the program
   exits, and the job closes when sandy dies. The program holds no handle to the job, and the
@@ -583,14 +687,16 @@ messages that reach processes outside the sandbox.
 4. Windows sets `LOCALAPPDATA`, `TEMP` and `TMP` of the program; policy values for them have no
    effect.
 5. Children of a directory that have a protected DACL do not receive the grant.
-6. sandy refuses to grant a directory that contains junctions or symbolic links.
+6. sandy refuses to grant a directory that contains junctions or symbolic links, and a writable
+   directory with a file below it that AppContainers may execute.
 7. Ctrl+C ends the program; it cannot handle it.
 8. The program does not see a console. Programs that read passwords from `CONIN$` read from their
    own invisible console and wait forever.
 9. A volume without ACLs (FAT, exFAT) cannot hold grants; sandy fails when a policy path lies
    there. Whether the AppContainer can access such volumes outside the policy depends on the
    security descriptor of the volume device and is not verified.
-10. sandy cannot remove its grants (see "Removing the changes").
+10. sandy removes the grants of a policy only through `sandy setup --remove`, and only those
+    of the paths that policy names (see "Removing the changes").
 11. On the GitHub Actions images `windows-2022` and `windows-2025` (Windows Server 2022 and 2025
     Datacenter), a process in an AppContainer cannot start child processes: `CreateProcessW`
     fails with `ERROR_ACCESS_DENIED` for every program, while the console host still starts.
@@ -618,17 +724,19 @@ messages that reach processes outside the sandbox.
     Windows 11 over SSH; the same programs start from an interactive scheduled task. Programs
     without `user32.dll`, and the relays, are not affected.
 14. If sandy itself is killed during a run with forwarded ports, its socket directory below
-    `%LOCALAPPDATA%\sandy\forward` stays behind. Its sockets have no listener, so nobody can
-    connect through them; the directory can be deleted. sandy does not remove such directories
-    of other runs, because one of them may belong to a run that is still active.
+    `%LOCALAPPDATA%\sandy\forward` stays behind until the next run with a forwarded port
+    removes it. Its sockets have no listener while it is there, so nobody can connect through
+    them.
 
 ## Verified on Windows 11
 
 Host: Windows 11 build 26200 (VM), binaries built for `x86_64-pc-windows-gnu`. The tests run in
-an elevated SSH session and without administrator rights. Latest elevated run: `sandy_windows` 63
-of 63, `sandy_relay` 8 of 8, `escape` 10 of 10 (the Unix socket test is Unix-only),
-`escape_windows` 32 of 32, `expose` 3 of 3, `forward` 2 of 2, `children` 1 of 1,
-`review_windows` 3 of 3. Earlier
+an elevated SSH session and without administrator rights. Latest elevated run, every test
+passing: `sandy_core` 39, `sandy_relay` 11, `sandy_windows` 70, `escape` 15, `escape_windows`
+41, `expose` 4, `forward` 3, `children` 3, `parent` 3, `check` 4, `runner` 3, `review_windows`
+6. The COM check of `review_windows` is skipped there: the SSH session is session 0, where
+`ole32.dll` does not load in an AppContainer (limitation 13), so a denial would not be the COM
+boundary. Earlier
 non-administrator runs used a scheduled task with `/RL LIMITED` (medium integrity, Administrators
 deny-only). The latest one used `runas /trustlevel:0x20000` (Administrators deny-only, high
 integrity), because the VM had no interactive logon session for an `/IT` task: every test
@@ -663,6 +771,30 @@ Facts these runs established:
 - The program cannot connect to the forward socket (`WSAEACCES`); the relay and the user can.
 - With `children = "none"` the program and `cmd.exe` start, and starting `whoami.exe` fails;
   the relays report `NoChildProcessCreation` through `GetProcessMitigationPolicy` and still relay.
+- The AppContainer access check honors a reduced `WRITE_DAC` for the package SID, not only a
+  reduced `FILE_EXECUTE`: after the reduction the program cannot open its own profile folder or
+  a file in it for `WRITE_DAC`, and cannot grant ALL APPLICATION PACKAGES execute on it.
+- `DeriveAppContainerSidFromAppContainerName` ignores the case of the name: `sandy.Case-Test`,
+  `sandy.case-test` and `SANDY.CASE-TEST` give one SID.
+- `GetAppContainerFolderPath` on the SID string returns `...\Packages\<name>\AC` for a
+  registered profile.
+- IP isolation holds with the Defender Firewall profiles off. With all three profiles disabled
+  and `MpsSvc` running, a connection from the program to a host outside the machine still
+  failed with `WSAEACCES`, while the same connection succeeded outside the sandbox.
+- A connection from the program to this machine's own address outside loopback times out, with
+  the profiles on and off: that is the loopback filter, which answers with a timeout, not the
+  capability filter, which answers with `WSAEACCES`.
+- The program cannot open a process of the user for `PROCESS_VM_WRITE`, `PROCESS_VM_OPERATION`,
+  `PROCESS_DUP_HANDLE`, `PROCESS_CREATE_THREAD`, `PROCESS_SET_INFORMATION`, `PROCESS_SET_QUOTA`,
+  `PROCESS_SUSPEND_RESUME`, `PROCESS_QUERY_INFORMATION` or `PROCESS_ALL_ACCESS`, nor one of its
+  threads for `THREAD_TERMINATE`, `THREAD_SUSPEND_RESUME`, `THREAD_GET_CONTEXT`,
+  `THREAD_SET_CONTEXT`, `THREAD_SET_INFORMATION`, `THREAD_QUERY_INFORMATION` or
+  `THREAD_ALL_ACCESS`, while the owner outside the sandbox can.
+- No `AppID` under `HKLM\SOFTWARE\Classes\AppID` has a launch permission that allows ALL
+  APPLICATION PACKAGES, so no DCOM server is reachable that way on a default install.
+- `ITaskService::Connect` reaches the Schedule service from outside the sandbox, so the
+  task-scheduler probe is a real control. `CLSID_TaskScheduler` is an in-process class, which is
+  why activating it with `CLSCTX_LOCAL_SERVER` fails everywhere and proves nothing.
 
 ## Sources
 
