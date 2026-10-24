@@ -83,6 +83,7 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
             .map(|value| value.to_string_lossy().into_owned())
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not set")),
         "signal" => signal(target),
+        "signal-stop" => signal_stop(target),
         "sleep" => {
             let millis = target
                 .parse()
@@ -324,6 +325,34 @@ fn signal(_target: &str) -> io::Result<String> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported"))
 }
 
+/// Sends SIGSTOP to the process the target names. With `-` as the target the process ID comes
+/// from the first line of standard input, because a test cannot know the ID of a process that
+/// sandy starts before the program runs.
+#[cfg(unix)]
+fn signal_stop(target: &str) -> io::Result<String> {
+    let mut from_stdin = String::new();
+    let id = if target == "-" {
+        io::stdin().read_line(&mut from_stdin)?;
+        from_stdin.trim()
+    } else {
+        target
+    };
+    let pid: libc::pid_t = id
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"))?;
+    // SAFETY: kill takes a process ID and a signal.
+    if unsafe { libc::kill(pid, libc::SIGSTOP) } == 0 {
+        Ok(pid.to_string())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_stop(_target: &str) -> io::Result<String> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported"))
+}
+
 /// Actions for the Linux escape tests (`tests/escape_linux.rs`).
 #[cfg(target_os = "linux")]
 mod linux {
@@ -358,6 +387,7 @@ mod linux {
         "fchmod-setuid",
         "chmod-setuid",
         "renice-same",
+        "oom-raise",
         "prlimit-same",
         "affinity-same",
         "ioprio-same",
@@ -419,6 +449,7 @@ mod linux {
             "chmod-setuid" => fs::set_permissions(target, fs::Permissions::from_mode(SETUID_MODE))
                 .map(|()| String::new()),
             "renice-same" => renice_same(pid(target)?),
+            "oom-raise" => oom_raise(target),
             "prlimit-same" => prlimit_same(pid(target)?),
             "affinity-same" => affinity_same(pid(target)?),
             "ioprio-same" => ioprio_same(pid(target)?),
@@ -594,6 +625,24 @@ mod linux {
         // SAFETY: setpriority takes no pointers.
         check_long(unsafe { libc::syscall(libc::SYS_setpriority, libc::PRIO_PROCESS, pid, nice) })?;
         Ok(format!("nice {nice}"))
+    }
+
+    /// Raises the out-of-memory priority of a process to the maximum through `/proc`, which the
+    /// kernel allows for every process of the same user whose `/proc` entry may be written. The
+    /// target is `self`, `parent` for the process that started this one, `group` for the leader
+    /// of its process group, or a process ID.
+    fn oom_raise(target: &str) -> io::Result<String> {
+        let pid = match target {
+            // SAFETY: getppid and getpgrp have no preconditions.
+            "parent" => unsafe { libc::getppid() },
+            // SAFETY: as above.
+            "group" => unsafe { libc::getpgrp() },
+            id => pid(id)?,
+        };
+        let path = format!("/proc/{pid}/oom_score_adj");
+        let before = fs::read_to_string(&path)?;
+        fs::write(&path, b"1000")?;
+        Ok(format!("pid {pid} was {}", before.trim()))
     }
 
     fn prlimit_same(pid: libc::pid_t) -> io::Result<String> {

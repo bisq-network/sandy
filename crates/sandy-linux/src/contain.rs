@@ -25,6 +25,10 @@
 //!
 //! The group's ID is the guard's process ID. sandy reaps neither the guard nor the program before
 //! it has killed the group, so no other process can have these IDs while sandy may signal them.
+//!
+//! sandy and the guard make themselves undumpable once the program is forked, so a program with a
+//! write grant on `/proc` cannot raise their `oom_score_adj` and have the kernel end them under
+//! memory pressure. The kernel clears the flag when the program executes the target.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -34,7 +38,7 @@ use std::ptr;
 
 use sandy_core::SandboxError;
 
-use crate::helper::{block_signals, close_descriptors_except, pipe};
+use crate::helper::{block_signals, close_descriptors_except, pipe, set_undumpable};
 use crate::launch::ensure_single_thread;
 
 /// Shells report a program that a signal ended with this status plus the signal number.
@@ -68,7 +72,12 @@ pub fn run(start: impl FnOnce() -> SandboxError, ended: Option<File>) -> Result<
             drop(report);
             program_main(group.leader, &signals, &child_action, report_write, start)
         }
-        pid => group.program = Some(pid),
+        pid => {
+            group.program = Some(pid);
+            // After the fork, so that the program never has the flag: the kernel clears it on
+            // execve, but a child that fails before execve would keep it.
+            set_undumpable()?;
+        }
     }
     drop(report_write);
     group.tell_guard()?;
@@ -318,7 +327,10 @@ fn guard_main(end: File, ended: Option<File>) -> ! {
     let mut keep = vec![end.as_raw_fd()];
     keep.extend(ended.as_ref().map(AsRawFd::as_raw_fd));
     // SAFETY: setpgid takes process IDs.
-    if unsafe { libc::setpgid(0, 0) } != 0 || close_descriptors_except(&keep).is_err() {
+    if unsafe { libc::setpgid(0, 0) } != 0
+        || set_undumpable().is_err()
+        || close_descriptors_except(&keep).is_err()
+    {
         // SAFETY: ends the guard without running sandy's cleanup. sandy kills the group by ID.
         unsafe { libc::_exit(1) };
     }

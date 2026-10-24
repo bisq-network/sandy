@@ -231,4 +231,179 @@ fn relay_does_not_outlive_the_program_beyond_the_drain() {
     );
 }
 
+/// The relay must not hold sandy's standard error. A caller that reads sandy's output sees the
+/// end of the program as the end of that output; a relay that kept the descriptor would hold the
+/// pipe open for the whole drain, and for as long as it lives when it is stopped.
+#[test]
+fn the_relay_does_not_hold_standard_error() {
+    let (service_port, stop_service) = holding_service();
+    let inner = free_port();
+    let sandbox_args = [
+        "--ip".to_string(),
+        "all".to_string(),
+        "--forward".to_string(),
+        format!("{inner}=127.0.0.1:{service_port}"),
+    ];
+    let mut program = Command::new(sandy_path())
+        .args(run_args(&sandbox_args, &[("sleep", "3000")]))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // One relayed connection that the service holds open, so the relay has something to drain
+    // when the program ends.
+    let held = connect_when_relayed(inner, &mut program);
+    let mut stderr = program.stderr.take().unwrap();
+    program.wait().unwrap();
+    let ended = Instant::now();
+    let mut output = Vec::new();
+    stderr.read_to_end(&mut output).unwrap();
+    let eof = ended.elapsed();
+    drop(held);
+    let _ = stop_service.send(());
+    assert!(
+        output.is_empty(),
+        "sandy wrote to standard error: {}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        eof < Duration::from_millis(500),
+        "standard error reached its end only {eof:?} after the program ended, so the relay held it"
+    );
+}
+
+/// A program with the default `signals = "any"` may send SIGSTOP to its relay, which no process
+/// can block. The relay must still not outlive the program: while it is stopped the kernel
+/// completes handshakes for its listeners, and once someone continues it, it would relay
+/// connections that were made after the program ended (DESIGN.md, "Forwarded ports", rule 5).
+///
+/// Linux only. On macOS a stopped process cannot be woken by a timer of its own, so only
+/// `signals = "isolated"` keeps the bound there (docs/macos.md).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stopped_relay_ends_with_the_program() {
+    let (service_port, stop_service) = holding_service();
+    let inner = free_port();
+    let sandbox_args = [
+        "--ip".to_string(),
+        "all".to_string(),
+        "--forward".to_string(),
+        format!("{inner}=127.0.0.1:{service_port}"),
+    ];
+    // The program reads the relay's process ID from its standard input and stops it.
+    let mut program = Command::new(sandy_path())
+        .args(run_args(&sandbox_args, &[("signal-stop", "-")]))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let relay = relay_of(inner, &mut program);
+    let address = format!("127.0.0.1:{inner}").parse().unwrap();
+    // Control: the forward port serves while the program runs.
+    assert!(
+        TcpStream::connect_timeout(&address, HALF_SECOND).is_ok(),
+        "the forward port did not serve before the stop"
+    );
+
+    let mut stdin = program.stdin.take().unwrap();
+    writeln!(stdin, "{relay}").unwrap();
+    drop(stdin);
+    let mut stdout = program.stdout.take().unwrap();
+    program.wait().unwrap();
+    let mut report = String::new();
+    stdout.read_to_string(&mut report).unwrap();
+    assert!(
+        report.contains("signal-stop\t-\tok"),
+        "the program did not stop the relay: {report}"
+    );
+
+    // The stopped relay cannot see the end of the program, so its watchdog must end it.
+    let deadline = Duration::from_secs(8);
+    let gone = ends_soon(relay, deadline);
+    let refused = TcpStream::connect_timeout(&address, HALF_SECOND).is_err();
+    let _ = stop_service.send(());
+    if !gone {
+        // A relay that stays stopped would keep its port for as long as this host runs.
+        kill_process(relay);
+    }
+    assert!(
+        gone,
+        "the stopped relay was still alive {deadline:?} after the program ended"
+    );
+    assert!(
+        refused,
+        "the stopped relay still held its port after it ended"
+    );
+}
+
+/// The relay of the sandbox that `program` runs: the one process that listens on
+/// 127.0.0.1:`port`. Waits until it is there, and fails if the program ends first.
+#[cfg(target_os = "linux")]
+fn relay_of(port: u16, program: &mut std::process::Child) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(
+            program.try_wait().unwrap().is_none(),
+            "the program ended before the relay was ready"
+        );
+        if let Some(relay) = listening_process(port) {
+            return relay;
+        }
+        assert!(Instant::now() < deadline, "no relay listened on {port}");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The single process that listens on 127.0.0.1:`port`. /proc/net/tcp shows the local address in
+/// hexadecimal (127.0.0.1 is 0100007F on little-endian hosts) and LISTEN as 0A; the socket's
+/// inode names the descriptor that the holding process has open.
+#[cfg(target_os = "linux")]
+fn listening_process(port: u16) -> Option<u32> {
+    let local = format!("0100007F:{port:04X}");
+    let table = std::fs::read_to_string("/proc/net/tcp").ok()?;
+    let inode = table.lines().skip(1).find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let listening = fields.get(1) == Some(&local.as_str()) && fields.get(3) == Some(&"0A");
+        listening.then(|| fields.get(9).map(|inode| inode.to_string()))?
+    })?;
+    let socket = format!("socket:[{inode}]");
+    let holders: Vec<u32> = std::fs::read_dir("/proc")
+        .ok()?
+        .filter_map(|entry| {
+            let pid: u32 = entry.ok()?.file_name().to_str()?.parse().ok()?;
+            let mut descriptors = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+            let holds = descriptors.any(|fd| {
+                fd.and_then(|fd| std::fs::read_link(fd.path()))
+                    .is_ok_and(|link| link.as_os_str() == socket.as_str())
+            });
+            holds.then_some(pid)
+        })
+        .collect();
+    match holders[..] {
+        [relay] => Some(relay),
+        _ => None,
+    }
+}
+
+/// Connects to the relay's port on 127.0.0.1 once it listens, and waits until the relay has
+/// taken the connection. Fails if the program ends first.
+fn connect_when_relayed(port: u16, program: &mut std::process::Child) -> TcpStream {
+    let address = format!("127.0.0.1:{port}").parse().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(
+            program.try_wait().unwrap().is_none(),
+            "the program ended before the relay was ready"
+        );
+        if let Ok(stream) = TcpStream::connect_timeout(&address, HALF_SECOND) {
+            // The relay accepts in its poll loop and then connects to the other side.
+            thread::sleep(Duration::from_millis(300));
+            return stream;
+        }
+        assert!(Instant::now() < deadline, "the relay never listened");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 const HALF_SECOND: Duration = Duration::from_millis(500);

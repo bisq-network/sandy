@@ -413,3 +413,30 @@ fn another_process_of_the_job_reads_the_terminal() {
         .into_owned();
     assert!(output.contains("got=hello"), "{output}");
 }
+
+/// A program with a write grant on `/proc` could set the out-of-memory priority of sandy's own
+/// processes to the maximum, so that the kernel ends the supervisor and the guard before anything
+/// else and the program's group outlives them. Both are undumpable, which gives their `/proc`
+/// files to root. The first action is the control: the program may raise its own priority, so a
+/// denial for the other two is not the missing grant.
+#[test]
+fn a_program_cannot_raise_the_oom_priority_of_sandys_helpers() {
+    let fixture = Fixture::new("contained-oom");
+    if !supported(&fixture) {
+        return;
+    }
+    let mut args = contained(&fixture);
+    args.extend(["--read-write", "/proc"].map(String::from));
+    let lines = probe_inside(
+        &args,
+        &[
+            ("oom-raise", "self"),
+            ("oom-raise", "parent"),
+            ("oom-raise", "group"),
+        ],
+    );
+    lines[0].assert_ok();
+    // The supervisor, which is the program's parent, and the guard, which leads its group.
+    lines[1].assert_blocked();
+    lines[2].assert_blocked();
+}

@@ -337,6 +337,25 @@ The relay is a process of its own, outside the program's sandbox and confined by
 
 `sandy check` compiles the relay's profile together with the program's.
 
+### Who may connect, and who may stop the relay
+
+Any local process can connect to the relay's listeners, like to any loopback port. Through an
+exposed port it reaches the program, which is what an exposed port is for: the program's own
+listener is reachable directly on macOS anyway. A forwarded port is different. It exists for the
+program alone, and the relay reaches `to` as sandy's user, so a connection of another user would
+pass an owner rule of a packet filter or a peer credential check in that service. On Linux the
+relay asks the kernel who owns the other end and refuses the rest; macOS has no equivalent of
+`SO_PEERCRED` for TCP and no checked way to read the owner of another socket, so it serves every
+local user. Forward only to services that authenticate their clients.
+
+With the default `signals = "any"` the program can also stop the relay with `SIGSTOP`, which no
+process can block. A stopped relay keeps its listen ports bound until someone continues or kills
+it, so it can outlive the program by more than the one second of rule 5. macOS has no timer that
+kills a process that is not running (the Linux relay uses one), so only `signals = "isolated"`,
+which keeps the program from signalling the relay at all, holds that bound here. Connections
+that reach a stopped relay are not relayed: the kqueue reports the end of the program before
+anything that became ready after it, and the relay returns on that event without accepting.
+
 ## Contained child processes
 
 `process.children = "contained"` ends every process the target starts when the target ends, also
@@ -438,6 +457,13 @@ it.
 
 The policy requires `signals = "isolated"`, so the target cannot signal the watcher. `sandy check`
 compiles the watcher's profile together with the target's.
+
+Residual risk: if the watcher itself is ended from outside the sandbox, for example by `pkill -f
+sandy`, which matches it because it keeps sandy's command line, or by jetsam under memory
+pressure, nothing ends the target with its parent, and nothing reports that. The Linux watcher
+has one more route into it, through a writable `/proc`, which it closes by making itself
+undumpable (docs/linux.md); macOS has no `/proc`, so the target cannot change the watcher's
+standing with the memory pressure killer.
 
 ## Mach services and other IPC
 

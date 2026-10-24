@@ -233,7 +233,20 @@ Rules:
    `process.children = "contained"` on Linux and macOS, the relay watches the supervising sandy
    instead, which ends after the program's process group, and also a pipe that only the guard
    holds, so it ends with the group also while sandy is stopped.
-6. The relay passes the end of a stream on as it came: a normal end as a half close, and a reset,
+   With `signals = "any"` the program can also send SIGSTOP, which no process can block, and a
+   stopped relay sees nothing. On Linux the relay has a watchdog for that: the kernel kills it
+   two seconds after its poll loop last ran, so the bound for a stopped relay is two seconds
+   instead of one (docs/linux.md, "Exposed and forwarded ports"). Windows is not affected: sandy
+   terminates the relay's job object from outside the sandbox. On macOS a stopped process cannot
+   wake itself, so there the bound holds only with `signals = "isolated"` (docs/macos.md).
+6. Who may connect: an exposed port is meant for other processes, including those of other
+   users, and the program's own listener is reachable directly on Linux and macOS anyway, so
+   the relay serves every connection there. A forwarded port is for the program alone, and the
+   relay reaches `to` as sandy's user. On Linux it therefore refuses connections whose other end
+   belongs to another user, and refuses the run when the kernel cannot tell it the owner
+   (docs/linux.md). On macOS it cannot ask, so a forwarded port is reachable by every local user
+   (docs/macos.md). On Windows only the program's AppContainer reaches it.
+7. The relay passes the end of a stream on as it came: a normal end as a half close, and a reset,
    or data the relay cannot deliver, as a reset of the other side. After one direction of a
    connection has ended, the other ends when it stays idle for `sandy_relay::HALF_CLOSED_IDLE`
    (60 seconds), so a peer that never sends again cannot hold the connection and its slot.
@@ -326,12 +339,15 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   terminal signal reaches it. It confines itself with no_new_privs, Landlock without file access
   or TCP, and a seccomp filter limited to polling, `pidfd_send_signal`, the readiness report,
   ending and the memory and clock calls of the Rust runtime; it has no Landlock signal scope,
-  because it must signal the program.
+  because it must signal the program. Its filter allows the signal only through the program's
+  descriptor. It is also undumpable, so a program with a write grant on `/proc` cannot make the
+  out-of-memory killer end it first; the supervising sandy and its guard do the same.
 - Exposed and forwarded ports: one relay forked twice before sandy confines itself, so it is not
   a child of the program. It watches the program with a pidfd and ends at most one second after
-  it (rule 5 of "Forwarded ports"). It confines itself with no_new_privs, Landlock without file
+  it (rule 5 of "Forwarded ports"), or two seconds when the program stopped it, which a timer
+  the relay re-arms takes care of. It confines itself with no_new_privs, Landlock without file
   access (TCP connect only to the relay targets from ABI 4) and a seccomp filter limited to TCP,
-  copying and threads.
+  copying, threads and that timer. A forwarded port serves only sandy's own user (rule 6).
 - Refused: no Landlock (the reason names the fix), no seccomp, root or any capability, a writable
   path that overlaps the minimal system set (rule 6).
 

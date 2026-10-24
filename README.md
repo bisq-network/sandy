@@ -413,6 +413,12 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
   address, and may appear only once. They need `ip = "all"` in this version. At most 256
   connections per port are relayed at the same time. A connection that is still open when the
   relay ends, one second after the program, is reset, so a cut stream never looks complete.
+  With `signals = "any"` the program may stop its own relay. On Linux a stopped relay is killed
+  two seconds later and its ports are released; on macOS only `signals = "isolated"` keeps that
+  bound.
+- `forward` entries: on Linux the relay serves only sandy's own user. A connection from another
+  local user is closed without reaching the service (docs/linux.md). On macOS it is served, so
+  forward only to services that authenticate their clients.
 
 ### Processes
 

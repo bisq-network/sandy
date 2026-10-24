@@ -480,20 +480,22 @@ fn has_ended(pid: u32) -> bool {
 fn relay_is_confined_and_ends_with_the_program() {
     let (inner, outer) = (free_port(), free_port());
     let expose = format!("127.0.0.1:{outer}={inner}");
-    check_relay(&args(&["--ip", "all", "--expose", &expose]), outer);
+    check_relay(&args(&["--ip", "all", "--expose", &expose]), outer, 1);
 }
 
 #[test]
 fn forward_relay_is_confined_and_ends_with_the_program() {
     let (inner, service) = (free_port(), free_port());
     let forward = format!("{inner}=127.0.0.1:{service}");
-    // For a forwarded port the relay listens on the program's port.
-    check_relay(&args(&["--ip", "all", "--forward", &forward]), inner);
+    // For a forwarded port the relay listens on the program's port, and it holds a second
+    // socket: the netlink socket with which it checks who connects.
+    check_relay(&args(&["--ip", "all", "--forward", &forward]), inner, 2);
 }
 
 /// Runs a sleeping program with `sandbox_args`, finds the relay that listens on 127.0.0.1:`port`
-/// and checks its confinement, then kills the program and checks that the relay ends.
-fn check_relay(sandbox_args: &[String], port: u16) {
+/// and checks its confinement, then kills the program and checks that the relay ends. `sockets`
+/// is how many sockets the relay holds.
+fn check_relay(sandbox_args: &[String], port: u16, sockets: usize) {
     let mut program = Victim(
         Command::new(sandy_path())
             .args(run_args(sandbox_args, &[("sleep", "600000")]))
@@ -537,7 +539,8 @@ fn check_relay(sandbox_args: &[String], port: u16) {
         program_pid.to_string(),
         "{status}"
     );
-    // The relay holds standard error, its listener and the pidfd; nothing that opens files.
+    // The relay holds /dev/null as its standard descriptors, its sockets and the pidfd; nothing
+    // that opens files, and nothing of the caller's.
     let descriptors: Vec<String> = fs::read_dir(format!("/proc/{relay}/fd"))
         .unwrap()
         .map(|entry| {
@@ -545,15 +548,15 @@ fn check_relay(sandbox_args: &[String], port: u16) {
             link.to_string_lossy().into_owned()
         })
         .collect();
-    assert_eq!(descriptors.len(), 3, "{descriptors:?}");
-    assert!(
-        descriptors.iter().any(|d| d == "anon_inode:[pidfd]"),
+    let count = |kept: &dyn Fn(&String) -> bool| descriptors.iter().filter(|d| kept(d)).count();
+    assert_eq!(count(&|d| d == "/dev/null"), 3, "{descriptors:?}");
+    assert_eq!(count(&|d| d == "anon_inode:[pidfd]"), 1, "{descriptors:?}");
+    assert_eq!(
+        count(&|d| d.starts_with("socket:")),
+        sockets,
         "{descriptors:?}"
     );
-    assert!(
-        descriptors.iter().any(|d| d.starts_with("socket:")),
-        "{descriptors:?}"
-    );
+    assert_eq!(descriptors.len(), 4 + sockets, "{descriptors:?}");
     // The program does not hold the listener.
     let program_descriptors = fs::read_dir(format!("/proc/{program_pid}/fd"))
         .unwrap()

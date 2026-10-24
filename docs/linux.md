@@ -80,8 +80,8 @@ One relay process serves all pairs. sandy starts it before it confines itself:
    session of its own and blocks every signal except the fault signals, so that no process group
    or terminal signal (for example Ctrl+C) ends it while the program runs (see "Ending with the
    parent" for why these signals matter).
-3. The relay closes every descriptor except its listeners, the pidfd, standard error and a
-   readiness pipe. It then confines itself:
+3. The relay points 0, 1 and 2 at `/dev/null` and closes every descriptor except its listeners,
+   the pidfd, those three and a readiness pipe. It then confines itself:
    - no_new_privs;
    - Landlock with every file system right of the ABI handled and no rule, so it cannot open,
      create or execute any file; from ABI 4 TCP bind is denied and TCP connect is allowed only to
@@ -89,7 +89,8 @@ One relay process serves all pairs. sandy starts it before it confines itself:
      ABI 6 the signal and abstract socket scopes;
    - the shared allowlist filter and a relay filter that allows only TCP sockets, `accept`,
      `connect`, reading and writing, polling, memory calls, thread creation without namespace
-     flags and `FIONBIO`. Every other call fails with `EPERM`; `clone3` fails with `ENOSYS`.
+     flags, `timer_settime` for the watchdog below, `rt_sigtimedwait` and `FIONBIO`. Every other call fails with
+     `EPERM`; `clone3` fails with `ENOSYS`.
 4. The relay starts and joins one test thread (so a filter that blocks threads fails here) and
    reports "ready" over the pipe. sandy reads the report and continues only on success. Any
    failure of the relay is reported back, and sandy refuses to run. The relay then polls the
@@ -105,21 +106,48 @@ One relay process serves all pairs. sandy starts it before it confines itself:
    write end only the guard holds, which ends when the guard dies with the program's group, so
    the relay ends with the group also while sandy is stopped. If sandy fails after starting the
    relay, sandy's process ends and the relay with it.
+6. No process can block SIGSTOP, so with the default `signals = "any"` the program can stop its
+   relay. A stopped relay neither sees the program end nor accepts anything, while the kernel
+   keeps completing handshakes for its listeners; once someone continues it, it would relay
+   connections that were made after the program ended. The relay therefore arms a timer that
+   asks the kernel for SIGKILL two seconds later, and re-arms it on every turn of its poll loop,
+   which waits at most 250 ms. A stopped relay is killed within those two seconds and its ports
+   are released. The timer is created before the relay confines itself, so only `timer_settime`
+   has to pass the filter. A relay that the host does not schedule for two seconds is killed as
+   well, and its connections then end with a normal close instead of the reset of rule 5. The
+   relay also sees a stop exactly: the helper blocks SIGCONT like every other signal, so the
+   kernel continues the process and leaves SIGCONT pending, and the poll loop takes it from the
+   pending set on every turn. When the turn that finds the program ended also finds that the
+   relay was continued, it closes its listeners without accepting what the backlog collected
+   while it was stopped, because those connections may have been made after the program ended.
 
 The listeners and the pidfd are close-on-exec, and sandy closes its copies before it confines
-itself, so the program never holds them. The relay keeps standard error to report errors; a
-caller that waits for the end of that stream waits until the relay has exited, at most one
-second after the program ends.
+itself, so the program never holds them. The relay has `/dev/null` as its standard descriptors,
+as on macOS, so it holds nothing of the caller's: a caller that waits for the end of sandy's
+output sees it end with the program, not with the relay. A relay that panics after it reported
+readiness therefore leaves no message; a failure before that is reported over the readiness pipe.
 
 The relay runs in its own Landlock domain, a sibling of the program's domain, so neither can
-ptrace the other. With `signals = "any"` the program can kill the relay. Any local process can
-connect to the relay's listeners, like to any loopback port: through an exposed port it reaches
-the program, through a forwarded port it reaches `to`. A process of the same user could reach
-`to` directly. A process of another user reaches `to` through the relay as sandy's user, so a
-service that decides by the connecting user (an owner rule of the packet filter, a peer
-credential check) would let it in; forward only to services that authenticate their clients.
-macOS behaves the same; on Windows only the program's AppContainer reaches the forward
-listener.
+ptrace the other. With `signals = "any"` the program can kill or stop the relay; a kill ends the
+relayed connections at once, and a stop ends the relay within two seconds (step 6 above). Any local process can
+connect to the relay's listeners, like to any loopback port. Through an exposed port it reaches
+the program, which is what an exposed port is for: the program's own listener is reachable
+directly anyway, so the relay checks nobody there.
+
+A forwarded port is different. It exists for the program alone, and the relay reaches `to` as
+sandy's user, so a connection of another user would pass an owner rule of the packet filter or a
+peer credential check in that service. The relay therefore asks the kernel who owns the other
+end of every connection it accepts on a forwarded port, and closes it unless the owner is
+sandy's user. It asks over a `NETLINK_SOCK_DIAG` socket that sandy opens before the relay
+confines itself, with an exact lookup of the connection's four addresses
+(`SOCK_DIAG_BY_FAMILY`), and it compares the answer with what it asked, so a lookup that matched
+a listening socket instead, or that reports no owner, is refused like any other failure. Every
+failure closes the connection, and sandy checks the lookup on a connection of its own before it
+starts the relay, so a kernel without `inet_diag` refuses the run instead of refusing every
+connection later. Two limits are inherent: the owner is the user that created the socket, so a
+process of sandy's own user that acts for someone else still passes, and a descriptor passed
+between processes keeps the owner of its creator. macOS has no such check; on Windows only the
+program's AppContainer reaches the forward listener.
 
 
 ## Contained child processes
@@ -216,11 +244,15 @@ started sandy ends:
 4. sandy starts the watcher like the relay: it forks twice, so the watcher is not a child of the
    program, and continues only after the watcher has reported that it is confined. The watcher
    starts a session of its own (`setsid`) and blocks every signal except the fault signals. It
-   keeps only the two pidfds and the readiness pipe, and confines itself with no_new_privs,
+   keeps only the two pidfds, the readiness pipe and `/dev/null` as its standard descriptors,
+   and confines itself with no_new_privs,
    Landlock without file access and without TCP (from ABI 6 also the abstract socket scope), and
    a seccomp filter that allows only polling, `pidfd_send_signal`, the readiness report, ending,
    and the memory and clock calls of the Rust runtime. It has no Landlock signal scope: it must
-   signal the program, which runs in another Landlock domain.
+   signal the program, which runs in another Landlock domain. The filter allows
+   `pidfd_send_signal` only through the program's descriptor and only with SIGTERM, SIGCONT and
+   SIGKILL, so the watcher cannot reach the process that started sandy, whose pidfd it also
+   holds.
 5. The watcher polls both pidfds. When the program ends first, the watcher ends. When the parent
    ends, the watcher sends SIGTERM and SIGCONT through the program's pidfd (SIGCONT, so that a
    stopped program gets the request), waits at most 5 seconds for the program to end, and then
@@ -239,10 +271,20 @@ and SIGCONT to an orphaned group with a stopped member) without the permission c
 Landlock hooks, and the program can cause some of them. The relay starts the same way for the same
 reason.
 
+The watcher, the supervising sandy and its guard make themselves undumpable (`PR_SET_DUMPABLE`
+0), which gives their `/proc/<pid>` files to root. Without that, a program with a write grant on
+`/proc` could set their `oom_score_adj` to 1000 and let the out-of-memory killer end them first,
+which would take away the guarantee they stand for (measured: the write succeeded before this).
+The kernel clears the flag when the program executes the target, so the program itself is
+unaffected. The relay stays dumpable on purpose: it is the process that holds the relayed ports,
+and only a dumpable process can be attributed to a listening socket (`ss -ltnp`). A relay that
+the killer ends only closes those ports, which is the safe direction.
+
 Residual risk: if the watcher itself is killed from outside the sandbox, for example by the
-out-of-memory killer, nothing ends the program with its parent. The watcher uses about 2 MB, so the
-killer chooses it only after larger processes; an unprivileged process cannot lower its own
-priority for the killer.
+out-of-memory killer or by `pkill -f sandy`, which matches it, nothing ends the program with its
+parent. The watcher uses about 2 MB, so the killer chooses it only after larger processes. An
+unprivileged process can lower its own `oom_score_adj` only down to the value it inherited, so
+the watcher cannot take itself out of reach of the killer.
 
 ## Landlock
 
@@ -407,6 +449,13 @@ target's own process ID, which it keeps from sandy after `execve`. With `childre
 process the program started can outlive it, and once another process of the user has that ID,
 the exemption would cover it; there only 0 works. For `setpriority` and `ioprio_set` it also denies the process group and user forms,
 because sandy's process group can contain processes outside the sandbox.
+
+These are system calls. The out-of-memory priority of a process is not set by a call but by a
+write to `/proc/<pid>/oom_score_adj`, which the denylist cannot see. A policy with a write grant
+on `/proc` therefore lets the program raise the out-of-memory priority of every process of the
+user, and lower its own down to the value sandy inherited. sandy's own processes are out of
+reach, because they are undumpable (see "Ending with the parent"); other processes of the user
+are not. Grant `/proc` writable only to programs you would also run without a sandbox.
 
 Costs: children of the program cannot use these calls on each other, and a thread ID other than
 the one of the main thread counts as another process. For example,

@@ -8,9 +8,10 @@
 //!    program's process group.
 //! 2. Start the relay as a helper process (see `helper`): forked twice, so it is not a child of
 //!    the program and the program's wait never reaps it.
-//! 3. The relay closes every descriptor except the listeners, the pidfd, standard error and the
-//!    readiness pipe, then confines itself: no_new_privs, Landlock without any file access and
-//!    with TCP connect only to the target ports, and seccomp filters for its few system calls.
+//! 3. The relay closes every descriptor except the listeners, the pidfd, `/dev/null` as its
+//!    standard descriptors and the readiness pipe, then confines itself: no_new_privs, Landlock
+//!    without any file access and with TCP connect only to the target ports, and seccomp filters
+//!    for its few system calls.
 //! 4. It reports readiness; sandy continues only after that report. It then polls the pidfd and
 //!    the listeners and relays each accepted connection in its own threads.
 //! 5. When the pidfd becomes readable, that is when the program (with `contained`: sandy) ends,
@@ -18,6 +19,11 @@
 //!    second, and exits. With `contained` it also polls a pipe whose write end only the guard
 //!    holds: the pipe ends when the guard has ended the program's group, also while sandy is
 //!    stopped and therefore does not end.
+//! 6. With the default `signals = "any"` the program may send SIGSTOP to the relay, which no
+//!    process can block. A stopped relay sees neither the end of the program nor its own
+//!    listeners, so the kernel keeps completing handshakes for them. The relay therefore has a
+//!    watchdog: a timer that kills it when its poll loop has not run for `WATCHDOG` (see
+//!    `Watchdog`).
 //!
 
 use std::fs::File;
@@ -34,6 +40,7 @@ use sandy_core::{ExposedPort, ForwardedPort, SandboxError};
 
 use crate::filter;
 use crate::helper::{self, Ready};
+use crate::peer::PeerCheck;
 
 /// The relay accepts connections on `listen` and connects each one to `target`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +52,12 @@ pub struct RelayPair {
 /// What the relay needs from the plan.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RelayConfig {
+    /// The exposed pairs first, then the forwarded ones.
     pub pairs: Vec<RelayPair>,
+    /// How many of `pairs` are forwarded ports, which come last. A forwarded port serves the
+    /// program alone, so only there does the relay refuse connections from other users; an
+    /// exposed port is meant for other processes, which may belong to another user.
+    pub forwarded: usize,
     pub abi: ABI,
 }
 
@@ -61,44 +73,75 @@ impl RelayConfig {
             target: forward.to,
         });
         let pairs: Vec<RelayPair> = exposed.chain(forwarded).collect();
-        (!pairs.is_empty()).then_some(RelayConfig { pairs, abi })
+        (!pairs.is_empty()).then_some(RelayConfig {
+            pairs,
+            forwarded: forward.len(),
+            abi,
+        })
     }
+}
+
+/// One listening socket of the relay and what it does with the connections it accepts.
+struct Served {
+    listener: TcpListener,
+    listen: SocketAddr,
+    target: SocketAddr,
+    /// Whether only connections of sandy's own user are relayed (see `peer`).
+    only_our_user: bool,
 }
 
 /// Starts the relay and returns once it is confined and serving. `ended` is the read end of the
 /// guard's pipe with `children = "contained"` (see the module documentation).
 pub fn start(config: &RelayConfig, ended: Option<File>) -> Result<(), SandboxError> {
+    let exposed = config.pairs.len() - config.forwarded;
     let listeners = config
         .pairs
         .iter()
-        .map(|pair| {
+        .enumerate()
+        .map(|(index, pair)| {
             let listener = TcpListener::bind(pair.listen).map_err(|error| {
                 SandboxError::io(format!("cannot listen on {}", pair.listen), error)
             })?;
-            Ok((listener, pair.target))
+            Ok(Served {
+                listener,
+                listen: pair.listen,
+                target: pair.target,
+                only_our_user: index >= exposed,
+            })
         })
         .collect::<Result<Vec<_>, SandboxError>>()?;
+    // The check needs a netlink socket, which the relay cannot open once it is confined, and it
+    // refuses the run here when the kernel cannot answer.
+    let peers = (config.forwarded > 0).then(PeerCheck::open).transpose()?;
     // SAFETY: getpid has no preconditions.
     let program = helper::pidfd_open(unsafe { libc::getpid() }, "the program")?;
     helper::start("the relay", move |ready| {
-        relay_main(listeners, program, ended, ready, config)
+        relay_main(listeners, peers, program, ended, ready, config)
     })
 }
 
 fn relay_main(
-    listeners: Vec<(TcpListener, SocketAddr)>,
+    listeners: Vec<Served>,
+    peers: Option<PeerCheck>,
     program: OwnedFd,
     ended: Option<File>,
     ready: Ready,
     config: &RelayConfig,
 ) {
-    let mut keep: Vec<RawFd> = listeners.iter().map(|(l, _)| l.as_raw_fd()).collect();
-    keep.extend([program.as_raw_fd(), ready.fd(), libc::STDERR_FILENO]);
+    let mut keep: Vec<RawFd> = listeners
+        .iter()
+        .map(|served| served.listener.as_raw_fd())
+        .collect();
+    keep.extend([program.as_raw_fd(), ready.fd()]);
+    keep.extend(helper::STANDARD_DESCRIPTORS);
     keep.extend(ended.as_ref().map(AsRawFd::as_raw_fd));
+    keep.extend(peers.as_ref().map(PeerCheck::fd));
     let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         sandy_relay::raise_descriptor_limit(listeners.len()).map_err(|error| {
             SandboxError::io("cannot raise the relay's descriptor limit", error)
         })?;
+        // Created before the filter is installed, so only re-arming it has to pass the filter.
+        let watchdog = Watchdog::create()?;
         confine(&keep, config)?;
         // Every connection gets its own threads. Starting one now shows that the filter allows
         // it, so a missing system call fails the start instead of the first connection.
@@ -110,17 +153,24 @@ fn relay_main(
                     .map_err(|_| io::Error::other("the test thread panicked"))
             })
             .map_err(|error| SandboxError::io("cannot start a relay thread", error))?;
-        for (listener, _) in &listeners {
-            listener
+        for served in &listeners {
+            served
+                .listener
                 .set_nonblocking(true)
                 .map_err(|error| SandboxError::io("cannot prepare a listener", error))?;
         }
-        Ok::<(), SandboxError>(())
+        Ok::<Watchdog, SandboxError>(watchdog)
     }));
     match started {
-        Ok(Ok(())) => {
+        Ok(Ok(watchdog)) => {
             ready.report();
-            serve_until_exit(listeners, &program, ended.as_ref());
+            serve_until_exit(
+                listeners,
+                peers.as_ref(),
+                &program,
+                ended.as_ref(),
+                &watchdog,
+            );
         }
         Ok(Err(error)) => ready.fail(&error.to_string()),
         Err(_) => ready.fail("the relay panicked"),
@@ -133,14 +183,87 @@ const DRAIN: Duration = Duration::from_secs(1);
 const DRAIN_POLL: Duration = Duration::from_millis(10);
 const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(50);
 
+/// How long the relay lives after its poll loop stopped running. The loop re-arms the watchdog
+/// every `WATCHDOG_TICK`, so this is the bound a stopped relay dies within, and at the same time
+/// the margin a relay that the host is slow to schedule has before it is killed by mistake.
+const WATCHDOG: Duration = Duration::from_secs(2);
+/// How long the poll loop waits for work before it wakes to re-arm the watchdog.
+const WATCHDOG_TICK: Duration = Duration::from_millis(250);
+
+/// A timer that kills the relay when its poll loop stops running. SIGSTOP and SIGKILL cannot be
+/// blocked, and with the default `signals = "any"` the program may send either to the relay. A
+/// stopped relay keeps its ports bound and relays whatever its backlog collected once someone
+/// continues it, which would put it beyond the one second bound of rule 5. The timer asks the
+/// kernel for SIGKILL, which arrives also while the process is stopped.
+struct Watchdog(libc::c_int);
+
+impl Watchdog {
+    /// Creates the timer. It must be created before the relay confines itself, so that the
+    /// filter has to allow only `timer_settime`.
+    fn create() -> Result<Watchdog, SandboxError> {
+        // SAFETY: sigevent is plain data; zero is SIGEV_SIGNAL with an empty value.
+        let mut event: libc::sigevent = unsafe { std::mem::zeroed() };
+        event.sigev_notify = libc::SIGEV_SIGNAL;
+        event.sigev_signo = libc::SIGKILL;
+        let mut timer: libc::c_int = 0;
+        // SAFETY: timer_create reads `event` and writes the timer's ID into `timer`.
+        let created = unsafe {
+            libc::syscall(
+                libc::SYS_timer_create,
+                libc::CLOCK_MONOTONIC,
+                &raw const event,
+                &raw mut timer,
+            )
+        };
+        if created != 0 {
+            return Err(SandboxError::io(
+                "cannot create the relay's watchdog timer",
+                io::Error::last_os_error(),
+            ));
+        }
+        Ok(Watchdog(timer))
+    }
+
+    /// Gives the relay another `WATCHDOG`. A relay that cannot re-arm has lost the guarantee that
+    /// it ends with the program, so it ends now.
+    fn rearm(&self) {
+        let next = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: WATCHDOG.as_secs() as _,
+                tv_nsec: WATCHDOG.subsec_nanos() as _,
+            },
+        };
+        // SAFETY: timer_settime reads `next` and writes nothing, because the old value is null.
+        let armed = unsafe {
+            libc::syscall(
+                libc::SYS_timer_settime,
+                self.0,
+                0,
+                &raw const next,
+                std::ptr::null_mut::<libc::itimerspec>(),
+            )
+        };
+        if armed != 0 {
+            // SAFETY: ends the relay without running sandy's cleanup.
+            unsafe { libc::_exit(1) };
+        }
+    }
+}
+
 /// Accepts and relays connections until the program ends (or the guard's pipe `ended` ends),
 /// then closes the listeners at once and gives the accepted connections at most `DRAIN` to
 /// deliver what is left. A program that connects, writes and exits therefore does not lose its
 /// data, as it would not without a relay.
 fn serve_until_exit(
-    listeners: Vec<(TcpListener, SocketAddr)>,
+    listeners: Vec<Served>,
+    peers: Option<&PeerCheck>,
     program: &OwnedFd,
     ended: Option<&File>,
+    watchdog: &Watchdog,
 ) {
     // One count per listener: clients of one port cannot take the connections of another.
     let active: Vec<Arc<AtomicUsize>> = listeners
@@ -161,16 +284,18 @@ fn serve_until_exit(
     let mut polls: Vec<libc::pollfd> = ends
         .iter()
         .copied()
-        .chain(listeners.iter().map(|(listener, _)| listener.as_raw_fd()))
+        .chain(listeners.iter().map(|served| served.listener.as_raw_fd()))
         .map(|fd| libc::pollfd {
             fd,
             events: libc::POLLIN,
             revents: 0,
         })
         .collect();
+    let tick = WATCHDOG_TICK.as_millis() as libc::c_int;
     loop {
+        watchdog.rearm();
         // SAFETY: `polls` holds `len` valid pollfd entries.
-        let ready = unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, -1) };
+        let ready = unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, tick) };
         if ready < 0 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
@@ -178,14 +303,20 @@ fn serve_until_exit(
             // Without poll the relay cannot see the program end; it must not outlive it.
             break;
         }
-        // Connections that completed together with the end of the program are still taken.
-        let watched = polls[ends.len()..].iter().zip(&listeners).zip(&active);
-        for ((poll, (listener, target)), count) in watched {
-            if poll.revents != 0 {
-                accept_all(listener, *target, count);
+        let stopped = was_stopped();
+        let over = polls[..ends.len()].iter().any(|poll| poll.revents != 0);
+        // Connections that completed together with the end of the program are still taken. Not
+        // so after a stop: the relay did not run, so its backlog may hold connections that were
+        // made after the program ended.
+        if !(over && stopped) {
+            let watched = polls[ends.len()..].iter().zip(&listeners).zip(&active);
+            for ((poll, served), count) in watched {
+                if poll.revents != 0 {
+                    accept_all(served, peers, count);
+                }
             }
         }
-        if polls[..ends.len()].iter().any(|poll| poll.revents != 0) {
+        if over {
             break;
         }
     }
@@ -201,12 +332,34 @@ fn serve_until_exit(
     }
 }
 
-/// Accepts every waiting connection on `listener` and relays each one in its own thread, up to
-/// `sandy_relay::MAX_CONNECTIONS` of this listener at the same time.
-fn accept_all(listener: &TcpListener, target: SocketAddr, active: &Arc<AtomicUsize>) {
+/// Whether the relay was stopped and continued since the last turn of the poll loop. SIGSTOP
+/// cannot be blocked, but SIGCONT can: the helper blocks every signal except the faults, so the
+/// kernel continues the process and leaves SIGCONT pending. Taking it from the pending set
+/// reports the stop exactly, where a long turn would also mean a host that is merely busy.
+fn was_stopped() -> bool {
+    // SAFETY: sigset_t is plain data, and the two calls initialize and change it.
+    let cont = unsafe {
+        let mut cont: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut cont);
+        libc::sigaddset(&mut cont, libc::SIGCONT);
+        cont
+    };
+    let now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: takes a pending SIGCONT without waiting; the siginfo is not needed.
+    unsafe { libc::sigtimedwait(&cont, std::ptr::null_mut(), &now) >= 0 }
+}
+
+/// Accepts every waiting connection on `served` and relays each one in its own thread, up to
+/// `sandy_relay::MAX_CONNECTIONS` of this listener at the same time. A connection that may come
+/// only from sandy's own user is closed before it takes one of those places.
+fn accept_all(served: &Served, peers: Option<&PeerCheck>, active: &Arc<AtomicUsize>) {
+    let target = served.target;
     loop {
-        let client = match listener.accept() {
-            Ok((client, _)) => client,
+        let (client, peer) = match served.listener.accept() {
+            Ok(accepted) => accepted,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
             // A connection reset before accept, or no descriptors left: try again on the next
             // readiness report, after a pause so a lasting error does not spin.
@@ -215,6 +368,11 @@ fn accept_all(listener: &TcpListener, target: SocketAddr, active: &Arc<AtomicUsi
                 return;
             }
         };
+        if served.only_our_user
+            && !peers.is_some_and(|peers| peers.owned_by_us(peer, served.listen))
+        {
+            continue;
+        }
         if active.fetch_add(1, Ordering::AcqRel) >= sandy_relay::MAX_CONNECTIONS {
             active.fetch_sub(1, Ordering::AcqRel);
             continue;
@@ -305,6 +463,7 @@ mod tests {
                 listen: "127.0.0.1:1".parse().unwrap(),
                 target: target.local_addr().unwrap(),
             }],
+            forwarded: 0,
             abi: ABI::from(version),
         };
         let other = other.local_addr().unwrap();

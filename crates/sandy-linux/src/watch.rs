@@ -8,19 +8,23 @@
 //!    after execve. With `children = "contained"` the ID stays the supervising sandy's, which
 //!    forwards the signals and ends the program's process group.
 //! 2. sandy starts the watcher as a helper process (see `helper`), so it is not a child of the
-//!    program. The watcher keeps only the two pidfds and the readiness pipe and confines itself:
+//!    program. The watcher keeps only the two pidfds, the readiness pipe and `/dev/null` as its
+//!    standard descriptors, and confines itself:
 //!    no_new_privs, Landlock without file access and without TCP, and a seccomp filter that allows
-//!    only polling, `pidfd_send_signal`, the readiness report and ending. It has no Landlock signal
-//!    scope, because it must signal the program, which runs in another Landlock domain.
+//!    only polling, the readiness report, ending, and `pidfd_send_signal` through the program's
+//!    descriptor with the three signals below. It has no Landlock signal scope, because it must
+//!    signal the program, which runs in another Landlock domain.
 //! 3. The watcher polls both pidfds. When the program ends first, the watcher ends. When the
 //!    parent ends, the watcher sends SIGTERM and SIGCONT (so that a stopped program gets the
 //!    request) to the program, waits at most `GRACE` for it to end, then sends SIGKILL, and ends.
 //!
 //! The policy requires `signals = "isolated"`, so the program cannot signal the watcher, and the
 //! watcher is in a session of its own with every signal blocked (see `helper`), so no group or
-//! terminal signal reaches it either. A parent that ends before sandy has read its process ID
-//! cannot be detected without `--parent-pid`: sandy then already has another parent, the process
-//! it was re-parented to.
+//! terminal signal reaches it either. It is also undumpable, so a program with a write grant on
+//! `/proc` cannot raise its `oom_score_adj` and have the kernel end it under memory pressure.
+//!
+//! A parent that ends before sandy has read its process ID cannot be detected without
+//! `--parent-pid`: sandy then already has another parent, the process it was re-parented to.
 
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::ptr;
@@ -53,15 +57,18 @@ pub fn start(parent_id: libc::pid_t, abi: ABI) -> Result<(), SandboxError> {
 }
 
 fn watcher_main(parent: &OwnedFd, program: &OwnedFd, ready: Ready, abi: ABI) {
-    if let Err(error) = confine(&[parent.as_raw_fd(), program.as_raw_fd(), ready.fd()], abi) {
+    let mut keep = vec![parent.as_raw_fd(), program.as_raw_fd(), ready.fd()];
+    keep.extend(helper::STANDARD_DESCRIPTORS);
+    let confined = helper::set_undumpable().and_then(|()| confine(&keep, program.as_raw_fd(), abi));
+    if let Err(error) = confined {
         ready.fail(&error.to_string());
     }
     ready.report();
     watch(parent.as_raw_fd(), program.as_raw_fd());
 }
 
-fn confine(keep: &[RawFd], abi: ABI) -> Result<(), SandboxError> {
-    let filters = filter::watcher()
+fn confine(keep: &[RawFd], program: RawFd, abi: ABI) -> Result<(), SandboxError> {
+    let filters = filter::watcher(program)
         .map_err(|error| SandboxError::new(format!("cannot build the watcher filter: {error}")))?;
     helper::confine(
         "the watcher",
@@ -138,17 +145,18 @@ mod tests {
     use std::net::TcpListener;
     use std::process::{Command, Stdio};
 
-    const OUTCOMES: [&str; 5] = [
+    const OUTCOMES: [&str; 6] = [
         "ok",
         "confine failed",
         "a file could be opened",
         "a socket could be bound",
         "the program could not be signaled",
+        "another process could be signaled",
     ];
 
     /// What a confined watcher can still do. Returns an index into `OUTCOMES`.
-    fn try_escapes(program: RawFd, abi: ABI) -> i32 {
-        if confine(&[program], abi).is_err() {
+    fn try_escapes(program: RawFd, other: RawFd, abi: ABI) -> i32 {
+        if confine(&[program, other], program, abi).is_err() {
             return 1;
         }
         if File::open("/proc/self/status").is_ok() {
@@ -157,20 +165,27 @@ mod tests {
         if TcpListener::bind("127.0.0.1:0").is_ok() {
             return 3;
         }
-        // SAFETY: signal 0 only checks that the pidfd's process may be signaled.
-        let signaled = unsafe {
+        if send_signal(program, libc::SIGCONT) != 0 {
+            return 4;
+        }
+        // The filter names the program's descriptor, so the second pidfd is out of reach.
+        if send_signal(other, libc::SIGCONT) == 0 {
+            return 5;
+        }
+        0
+    }
+
+    fn send_signal(pidfd: RawFd, signal: libc::c_int) -> libc::c_long {
+        // SAFETY: pidfd_send_signal with a null siginfo sends the bare signal.
+        unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
-                program,
-                0,
+                pidfd,
+                signal,
                 ptr::null::<libc::siginfo_t>(),
                 0u32,
             )
-        };
-        if signaled != 0 {
-            return 4;
         }
-        0
     }
 
     /// The child process applies the watcher's confinement to itself. It never prints and leaves
@@ -187,10 +202,12 @@ mod tests {
             .spawn()
             .unwrap();
         let pidfd = helper::pidfd_open(program.id() as libc::pid_t, "the program").unwrap();
+        // SAFETY: getpid has no preconditions.
+        let other = helper::pidfd_open(unsafe { libc::getpid() }, "this process").unwrap();
         // SAFETY: the child only runs `try_escapes` and leaves through `_exit`.
         let child = unsafe { libc::fork() };
         if child == 0 {
-            let outcome = try_escapes(pidfd.as_raw_fd(), ABI::from(version));
+            let outcome = try_escapes(pidfd.as_raw_fd(), other.as_raw_fd(), ABI::from(version));
             // SAFETY: ends the child without running the test harness's cleanup.
             unsafe { libc::_exit(outcome) };
         }

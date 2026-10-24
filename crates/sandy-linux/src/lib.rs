@@ -8,6 +8,7 @@ mod filter;
 mod helper;
 mod host;
 mod launch;
+mod peer;
 mod plan;
 mod relay;
 mod system;

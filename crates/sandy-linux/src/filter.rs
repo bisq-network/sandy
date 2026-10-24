@@ -503,8 +503,8 @@ fn open_rules(flags: u8, restrict_truncate: bool) -> Result<Vec<SeccompRule>, Ba
 }
 
 /// What the relay for exposed ports needs: accept and connect TCP, copy bytes, start threads,
-/// wait for the program to end, and report an error on standard error. Everything else fails with
-/// EPERM. clone3 is listed so that the shared allowlist, installed with it, decides: ENOSYS.
+/// wait for the program to end, and keep its watchdog armed. Everything else fails with EPERM.
+/// clone3 is listed so that the shared allowlist, installed with it, decides: ENOSYS.
 const RELAY_CALLS: &[i64] = &[
     libc::SYS_read,
     libc::SYS_write,
@@ -539,10 +539,15 @@ const RELAY_CALLS: &[i64] = &[
     libc::SYS_rt_sigprocmask,
     libc::SYS_rt_sigaction,
     libc::SYS_rt_sigreturn,
+    // Takes a pending SIGCONT, which is how the relay sees that it was stopped.
+    libc::SYS_rt_sigtimedwait,
     libc::SYS_sigaltstack,
     libc::SYS_nanosleep,
     libc::SYS_clock_nanosleep,
     libc::SYS_clock_gettime,
+    // The relay re-arms its watchdog timer on every turn of the poll loop. The timer itself is
+    // created before the filter is installed, so timer_create is not allowed here.
+    libc::SYS_timer_settime,
     libc::SYS_getrandom,
     libc::SYS_restart_syscall,
     libc::SYS_exit,
@@ -551,10 +556,9 @@ const RELAY_CALLS: &[i64] = &[
 
 /// What the watcher of `end_with_parent` needs: poll two pidfds, signal the program through its
 /// pidfd, write the readiness report, and end. The memory calls cover allocations of the Rust
-/// runtime. Everything else fails with EPERM.
+/// runtime. Everything else fails with EPERM. `pidfd_send_signal` has rules of its own.
 const WATCHER_CALLS: &[i64] = &[
     libc::SYS_ppoll,
-    libc::SYS_pidfd_send_signal,
     libc::SYS_write,
     libc::SYS_close,
     libc::SYS_clock_gettime,
@@ -570,15 +574,34 @@ const WATCHER_CALLS: &[i64] = &[
     libc::SYS_exit_group,
 ];
 
+/// The signals the watcher sends to end the program: the request, a continue so that a stopped
+/// program receives the request, and the kill after the grace period.
+const WATCHER_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGCONT, libc::SIGKILL];
+
 /// Builds the filters of the watcher: the shared allowlist and a list that allows only
-/// `WATCHER_CALLS`.
-pub fn watcher() -> Result<Filters, BackendError> {
+/// `WATCHER_CALLS`, and `pidfd_send_signal` only with one of `WATCHER_SIGNALS` through
+/// `program`, the number of the program's pidfd. The watcher also holds a pidfd for the process
+/// that started sandy, which it must never signal.
+pub fn watcher(program: i32) -> Result<Filters, BackendError> {
     let target = arch::TARGET
         .ok_or_else(|| BackendError::InvalidTargetArch(std::env::consts::ARCH.to_string()))?;
     let mut rules = Rules::default();
     for &call in WATCHER_CALLS.iter().chain(arch::RELAY_CALLS) {
         rules.add(call, Vec::new());
     }
+    let send = WATCHER_SIGNALS
+        .into_iter()
+        .map(|signal| {
+            rule(vec![
+                low(0, SeccompCmpOp::Eq, program as u64)?,
+                low(1, SeccompCmpOp::Eq, signal as u64)?,
+                // No siginfo, so that the kernel fills it in, and no flags.
+                low(2, SeccompCmpOp::Eq, 0)?,
+                low(3, SeccompCmpOp::Eq, 0)?,
+            ])
+        })
+        .collect::<Result<Vec<SeccompRule>, BackendError>>()?;
+    rules.add(libc::SYS_pidfd_send_signal, send);
     let filter = SeccompFilter::new(
         rules.0,
         SeccompAction::Errno(libc::EPERM as u32),
@@ -1109,16 +1132,30 @@ mod tests {
 
     #[test]
     fn the_watcher_can_only_watch_and_signal() {
-        let filters = watcher().unwrap();
+        const PROGRAM: i32 = 4;
+        const PARENT: i32 = 3;
+        let filters = watcher(PROGRAM).unwrap();
         let watcher = |nr: i64| decide_with(&filters, NATIVE, nr, [0; 6]);
         for nr in [
             libc::SYS_ppoll,
-            libc::SYS_pidfd_send_signal,
             libc::SYS_write,
             libc::SYS_close,
             libc::SYS_exit_group,
         ] {
             assert_eq!(watcher(nr), RET_ALLOW, "system call {nr}");
+        }
+        // Only the program may be signalled, and only with the signals that end it. The watcher
+        // also holds a pidfd for the process that started sandy.
+        let send = |fd: i32, signal: i32| {
+            let args = args(&[fd as u64, signal as u64]);
+            decide_with(&filters, NATIVE, libc::SYS_pidfd_send_signal, args)
+        };
+        for signal in [libc::SIGTERM, libc::SIGCONT, libc::SIGKILL] {
+            assert_eq!(send(PROGRAM, signal), RET_ALLOW, "signal {signal}");
+            assert_eq!(send(PARENT, signal), RET_EPERM, "signal {signal}");
+        }
+        for signal in [0, libc::SIGSTOP, libc::SIGUSR1] {
+            assert_eq!(send(PROGRAM, signal), RET_EPERM, "signal {signal}");
         }
         for nr in [
             libc::SYS_openat,
@@ -1131,6 +1168,7 @@ mod tests {
         ] {
             assert_eq!(watcher(nr), RET_EPERM, "system call {nr}");
         }
+        assert_eq!(watcher(libc::SYS_pidfd_send_signal), RET_EPERM);
     }
 
     #[test]

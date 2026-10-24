@@ -8,7 +8,10 @@
 //!    a hangup, SIGTTIN, the SIGHUP to an orphaned group) skip the Landlock signal scope, and the
 //!    program can cause some of them; in its own session the helper is in none of these groups,
 //!    and a signal from another process of the user stays pending.
-//! 2. The helper confines itself (`confine`) and reports over a close-on-exec pipe that it is
+//! 2. It points 0, 1 and 2 at `/dev/null`, as the macOS helper does. A helper that kept sandy's
+//!    standard error would hold the caller's pipe open for as long as it runs, which the caller
+//!    sees as output that never ends.
+//! 3. The helper confines itself (`confine`) and reports over a close-on-exec pipe that it is
 //!    ready, or why it is not. sandy continues only after a ready report.
 //!
 //! A helper is a fork, not a new program. sandy is single-threaded when it forks (checked), so the
@@ -88,6 +91,11 @@ impl Ready {
 /// reported that it is ready. `main` runs in the helper and must call `Ready::report` after it has
 /// confined itself; the helper ends when `main` returns. What `main` owns is dropped in sandy.
 pub(crate) fn start(name: &str, main: impl FnOnce(Ready)) -> Result<(), SandboxError> {
+    let null = File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+        .map_err(|error| SandboxError::io("cannot open /dev/null", error))?;
     let (mut ready_read, ready_write) = pipe(&format!("{name}'s pipe"))?;
     ensure_single_thread()?;
 
@@ -113,6 +121,11 @@ pub(crate) fn start(name: &str, main: impl FnOnce(Ready)) -> Result<(), SandboxE
                     if let Err(error) = block_signals() {
                         Ready(ready_write).fail(&format!("{name} cannot block signals: {error}"));
                     }
+                    if let Err(error) = null_standard_descriptors(&null) {
+                        Ready(ready_write)
+                            .fail(&format!("{name} cannot drop the caller's stdio: {error}"));
+                    }
+                    drop(null);
                     // A panic must not unwind into sandy's code in this process.
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         main(Ready(ready_write))
@@ -150,6 +163,38 @@ pub(crate) fn start(name: &str, main: impl FnOnce(Ready)) -> Result<(), SandboxE
     }
     Ok(())
 }
+
+/// Gives this process's `/proc/<pid>` files to root, so that the program cannot change them even
+/// with a write grant on `/proc`. Without this the program can set `oom_score_adj` of sandy's
+/// processes to the maximum and let the kernel's out-of-memory killer end them before anything
+/// else, which takes away the guarantee they stand for. The kernel resets the flag on execve, so
+/// the program itself is unaffected.
+pub(crate) fn set_undumpable() -> Result<(), SandboxError> {
+    // SAFETY: PR_SET_DUMPABLE only sets a process flag.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(SandboxError::io(
+            "cannot hide the process from the program",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+/// Points 0, 1 and 2 at `/dev/null`. The helper keeps the three numbers, so a connection it
+/// accepts later cannot take one of them and receive what a panic writes to standard error.
+fn null_standard_descriptors(null: &File) -> io::Result<()> {
+    for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        // SAFETY: dup2 takes an open descriptor and the number it is copied to.
+        if unsafe { libc::dup2(null.as_raw_fd(), fd) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// The descriptor numbers every helper keeps: `/dev/null` as 0, 1 and 2.
+pub(crate) const STANDARD_DESCRIPTORS: [RawFd; 3] =
+    [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO];
 
 /// Closes every descriptor except `keep`, then applies no_new_privs, a Landlock ruleset without
 /// any file access that allows TCP connect only to `connect_ports` and no TCP bind (from ABI 4)
