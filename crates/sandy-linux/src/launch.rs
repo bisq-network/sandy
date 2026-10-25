@@ -3,21 +3,24 @@
 //! `process.children = "contained"` a forked child does that, and sandy supervises it (see
 //! `contain`).
 
+use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr};
 use std::io;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
 use std::ptr;
 
 use landlock::{
-    CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreated,
-    RulesetCreatedAttr, RulesetError, RulesetStatus,
+    CompatLevel, Compatible, PathBeneath, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr,
+    RulesetError, RulesetStatus,
 };
 use sandy_core::{ParentProcess, SandboxError, StatusReport, TargetCommand};
 
 use crate::explain::{self, Observer};
 use crate::filter::{FilterConfig, Filters};
 use crate::host::THREADS_DIR;
-use crate::plan::{LandlockConfig, Sandbox};
+use crate::plan::{FileIdentity, LandlockConfig, Sandbox};
 use crate::{contain, filter, relay, watch};
 
 /// Applies `sandbox` and executes the target. Without `contain`, sandy applies it to itself and
@@ -64,7 +67,7 @@ pub fn launch(
         });
         watch::start(parent, sandbox.landlock.abi)?;
     }
-    let ruleset = prepare_ruleset(&sandbox.landlock)?;
+    let ruleset = prepare_ruleset(&sandbox.landlock, &sandbox.identities)?;
     // The filter is built again in the forked child, whose process ID it needs, but a policy it
     // cannot express fails here, before anything starts.
     build_filters(&sandbox.filter)?;
@@ -132,8 +135,12 @@ fn landlock_error(error: RulesetError) -> SandboxError {
 }
 
 /// Builds the ruleset completely before anything is restricted. With `HardRequirement`, every
-/// right that the kernel does not support is an error instead of being dropped.
-fn prepare_ruleset(config: &LandlockConfig) -> Result<RulesetCreated, SandboxError> {
+/// right that the kernel does not support is an error instead of being dropped. Each rule binds
+/// the file its path named when sandy planned the run (`open_rule`).
+fn prepare_ruleset(
+    config: &LandlockConfig,
+    identities: &BTreeMap<PathBuf, FileIdentity>,
+) -> Result<RulesetCreated, SandboxError> {
     let mut ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)
         .handle_access(config.handled_fs)
@@ -148,14 +155,79 @@ fn prepare_ruleset(config: &LandlockConfig) -> Result<RulesetCreated, SandboxErr
     }
     let mut ruleset = ruleset.create().map_err(landlock_error)?;
     for rule in &config.rules {
-        let fd = PathFd::new(&rule.path).map_err(|error| {
-            SandboxError::new(format!("cannot open {}: {error}", rule.path.display()))
-        })?;
+        let fd = open_rule(&rule.path, identities.get(&rule.path).copied())?;
         ruleset = ruleset
             .add_rule(PathBeneath::new(fd, rule.access))
             .map_err(landlock_error)?;
     }
     Ok(ruleset)
+}
+
+/// Opens the canonical rule path `path` one component at a time without following a symbolic
+/// link, and checks that it is still `planned`, the file sandy planned with. The checks of the
+/// policy look at paths, and Landlock binds the file a descriptor refers to. A process that can
+/// write a parent of a policy path, for example one a previous run left behind, could otherwise
+/// replace the path with a link or with another directory after the checks, and the rule would
+/// grant access where no check looked. A change refuses the run.
+fn open_rule(path: &Path, planned: Option<FileIdentity>) -> Result<OwnedFd, SandboxError> {
+    let changed = |why: &str| {
+        SandboxError::new(format!(
+            "{} changed after sandy checked the policy: {why}",
+            path.display()
+        ))
+    };
+    let open_error = |error| SandboxError::io(format!("cannot open {}", path.display()), error);
+    let mut fd = open_path(None, Path::new("/")).map_err(open_error)?;
+    for component in path.components().skip(1) {
+        let Component::Normal(name) = component else {
+            return Err(SandboxError::new(format!(
+                "{} is not a canonical path",
+                path.display()
+            )));
+        };
+        fd = open_path(Some(&fd), Path::new(name)).map_err(open_error)?;
+        let file = std::fs::File::from(fd);
+        let metadata = file.metadata().map_err(open_error)?;
+        if metadata.file_type().is_symlink() {
+            return Err(changed("a symbolic link lies on its way now"));
+        }
+        fd = OwnedFd::from(file);
+    }
+    let file = std::fs::File::from(fd);
+    let found = identity_of(&file.metadata().map_err(open_error)?);
+    if planned != Some(found) {
+        return Err(changed("it names another file now"));
+    }
+    Ok(OwnedFd::from(file))
+}
+
+/// The identity of the file at the canonical path `path`, read as `open_rule` reads it: through
+/// an O_PATH open, which mounts an automount point where a `stat` would not.
+pub(crate) fn identity(path: &Path) -> Option<FileIdentity> {
+    let file = std::fs::File::from(open_path(None, path).ok()?);
+    Some(identity_of(&file.metadata().ok()?))
+}
+
+fn identity_of(metadata: &std::fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
+/// An O_PATH descriptor for `name`, below the directory `parent` or from the current
+/// directory, without following a symbolic link in `name`.
+fn open_path(parent: Option<&OwnedFd>, name: &Path) -> io::Result<OwnedFd> {
+    use std::os::fd::AsRawFd;
+    let name = CString::new(name.as_os_str().as_bytes())?;
+    let parent = parent.map_or(libc::AT_FDCWD, AsRawFd::as_raw_fd);
+    let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `name` is NUL-terminated and `parent` is a descriptor this process owns or
+    // AT_FDCWD.
+    let fd = unsafe { libc::openat(parent, name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor was just created and nothing else owns it.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// Landlock restricts only the calling thread. Another thread would keep running without the
@@ -334,5 +406,79 @@ mod tests {
         assert!(error.to_string().contains("threads"), "{error}");
         drop(stop);
         let _ = thread.join();
+    }
+
+    /// A directory with `rule/inner` and an unrelated `elsewhere`, canonical like a rule path.
+    fn tree(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("sandy-launch-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("rule/inner")).unwrap();
+        std::fs::create_dir_all(dir.join("elsewhere/inner")).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    /// Opens `target` as a rule after `change` ran between the plan and the launch.
+    fn open_after(name: &str, target: &str, change: impl FnOnce(&Path)) -> Result<(), String> {
+        let dir = tree(name);
+        let path = dir.join(target);
+        let planned = identity(&path);
+        assert!(planned.is_some());
+        change(&dir);
+        let result = open_rule(&path, planned)
+            .map(drop)
+            .map_err(|error| error.to_string());
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    #[test]
+    fn an_unchanged_rule_path_is_opened() {
+        assert_eq!(open_after("same", "rule/inner", |_| {}), Ok(()));
+    }
+
+    #[test]
+    fn a_rule_path_replaced_by_a_link_is_refused() {
+        let error = open_after("link", "rule", |dir| {
+            std::fs::rename(dir.join("rule"), dir.join("moved")).unwrap();
+            std::os::unix::fs::symlink(dir.join("elsewhere"), dir.join("rule")).unwrap();
+        })
+        .unwrap_err();
+        assert!(error.contains("changed after sandy checked"), "{error}");
+    }
+
+    /// A link in a parent of the rule path, with the same names below it.
+    #[test]
+    fn a_link_on_the_way_to_a_rule_path_is_refused() {
+        let error = open_after("parent-link", "rule/inner", |dir| {
+            std::fs::rename(dir.join("rule"), dir.join("moved")).unwrap();
+            std::os::unix::fs::symlink(dir.join("elsewhere"), dir.join("rule")).unwrap();
+        })
+        .unwrap_err();
+        assert!(error.contains("changed after sandy checked"), "{error}");
+    }
+
+    /// The resolver made the path canonical, so a link that is already there when sandy plans
+    /// the run appeared after the checks of the resolver, and the identity sandy recorded is
+    /// the link's target.
+    #[test]
+    fn a_link_that_appeared_before_the_plan_is_refused() {
+        let dir = tree("early-link");
+        std::fs::rename(dir.join("rule"), dir.join("moved")).unwrap();
+        std::os::unix::fs::symlink(dir.join("elsewhere"), dir.join("rule")).unwrap();
+        let path = dir.join("rule/inner");
+        let error = open_rule(&path, identity(&path)).unwrap_err().to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(error.contains("symbolic link"), "{error}");
+    }
+
+    #[test]
+    fn a_rule_path_replaced_by_another_directory_is_refused() {
+        let error = open_after("directory", "rule/inner", |dir| {
+            std::fs::rename(dir.join("rule"), dir.join("moved")).unwrap();
+            std::fs::rename(dir.join("elsewhere"), dir.join("rule")).unwrap();
+        })
+        .unwrap_err();
+        assert!(error.contains("changed after sandy checked"), "{error}");
     }
 }

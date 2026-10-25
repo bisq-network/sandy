@@ -1257,11 +1257,14 @@ mod linux {
         unsafe { libc::close(fd) };
     }
 
+    /// Access mode 3 as the kernel reads it. musl's `O_ACCMODE` also holds O_PATH.
+    const IOCTL_ONLY: libc::c_int = 3;
+
     /// Opens with access mode 3: no read or write access, only ioctl.
     fn open_ioctl_only(target: &str) -> io::Result<String> {
         let path = CString::new(target)?;
         // SAFETY: `path` is a valid C string.
-        let fd = check(unsafe { libc::open(path.as_ptr(), libc::O_ACCMODE | libc::O_CLOEXEC) })?;
+        let fd = check(unsafe { libc::open(path.as_ptr(), IOCTL_ONLY | libc::O_CLOEXEC) })?;
         close(fd);
         Ok(String::new())
     }
@@ -1336,7 +1339,7 @@ mod linux {
             return Err(io::Error::other("the domain allows a read-only open"));
         }
         // SAFETY: `path` is a valid C string.
-        let fd = check(unsafe { libc::open(path.as_ptr(), libc::O_ACCMODE | libc::O_CLOEXEC) })?;
+        let fd = check(unsafe { libc::open(path.as_ptr(), IOCTL_ONLY | libc::O_CLOEXEC) })?;
         // SAFETY: fchmod takes a descriptor this function owns.
         let changed = check(unsafe { libc::fchmod(fd, 0o600) });
         close(fd);

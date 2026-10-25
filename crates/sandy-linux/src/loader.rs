@@ -33,6 +33,7 @@ pub fn is_system_loader(path: &Path) -> bool {
 /// leaves the execution to `execve` and its own error.
 pub fn interpreter(program: &Path) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
 
     /// The longest path the kernel accepts.
     const PATH_MAX: u64 = 4096;
@@ -47,7 +48,16 @@ pub fn interpreter(program: &Path) -> Option<PathBuf> {
         u64::from_le_bytes(value)
     }
 
-    let mut file = File::open(program).ok()?;
+    // Without O_NONBLOCK, opening a named pipe waits for a writer, and sandy would hang. Only a
+    // regular file can be a program the kernel executes.
+    let mut file = File::options()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(program)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
     let mut header = [0u8; 64];
     file.read_exact(&mut header).ok()?;
     let little_endian_64 = header[..6] == [0x7f, b'E', b'L', b'F', 2, 1];
@@ -135,6 +145,23 @@ mod tests {
         assert_eq!(interpreter(&static_program), None);
         let _ = std::fs::remove_file(&script);
         let _ = std::fs::remove_file(&static_program);
+    }
+
+    /// A named pipe is no program. Reading its header must not wait for a writer that never
+    /// comes.
+    #[test]
+    fn a_named_pipe_has_no_loader_and_does_not_block() {
+        let pipe = temporary("pipe");
+        let _ = std::fs::remove_file(&pipe);
+        let path = std::ffi::CString::new(pipe.to_str().unwrap()).unwrap();
+        // SAFETY: the path is NUL-terminated.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o700) }, 0);
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = pipe.clone();
+        std::thread::spawn(move || send.send(interpreter(&reader)));
+        let result = receive.recv_timeout(std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_file(&pipe);
+        assert_eq!(result, Ok(None));
     }
 
     /// A 32-bit program is killed by the filter anyway, and its header has another layout, so

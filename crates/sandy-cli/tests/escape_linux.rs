@@ -452,6 +452,35 @@ fn the_terminal_cannot_be_taken_from_the_foreground_job() {
     assert_eq!(session.foreground(), session.leader.id() as libc::pid_t);
 }
 
+/// Records what `signals = "isolated"` leaves open (docs/linux.md, "Signals and the terminal"):
+/// in the exec model the program runs in the process group sandy was started in. When it reads
+/// the terminal from the background, the kernel stops that whole group, here the shell outside
+/// the sandbox that started sandy without job control. Another job keeps running.
+#[test]
+fn a_terminal_read_stops_the_group_sandy_was_started_in() {
+    if landlock_abi() < 6 {
+        return skip("landlock-abi-6", "signal isolation needs Landlock ABI 6");
+    }
+    let mut job = args(&["/bin/sh", "-c", "\"$@\"; true", "sh"]);
+    job.extend(isolated_job(&[("read-fd", "0")]));
+    let Some(session) = JobSession::start(&job) else {
+        return skip("pty", "no pseudo-terminal available");
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stopped = |pid| {
+        read_proc(pid, "status")
+            .is_some_and(|status| status_value(&status, "State").starts_with('T'))
+    };
+    while !stopped(session.job) {
+        assert!(
+            Instant::now() < deadline,
+            "the shell that started sandy did not stop"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!session.victim_stopped(), "the program stopped another job");
+}
+
 /// Changing the window size of a terminal makes the kernel send SIGWINCH to its foreground
 /// group, which is outside the sandbox when the program inherited the user's terminal.
 #[test]
@@ -597,8 +626,14 @@ fn no_new_privs_and_seccomp_are_active() {
     );
     assert_eq!(lines[0].detail, "1", "{lines:?}");
     assert_eq!(lines[1].detail, "2", "{lines:?}");
+    // The allowlist, the denylist, the extended attribute filter of the default
+    // path_metadata = "deny", and the socket family filter, on top of what this test inherited.
+    let inherited: u32 = probe_outside(&[("status-field", "Seccomp_filters")])[0]
+        .detail
+        .parse()
+        .unwrap();
     let filters: u32 = lines[2].detail.parse().unwrap();
-    assert!(filters >= 2, "{lines:?}");
+    assert_eq!(filters, inherited + 4, "{lines:?}");
 }
 
 #[test]

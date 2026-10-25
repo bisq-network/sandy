@@ -83,6 +83,14 @@ const CANDIDATES: &[(&str, SystemUse, Needed)] = &[
         Needed::Always,
     ),
     ("/etc/pki/tls/openssl.d", SystemUse::Read, Needed::Always),
+    // What the OpenSSL configuration of Ubuntu 25.10 includes: the local directory and the one
+    // of the system crypto profile (crypto-config).
+    ("/etc/ssl/openssl.conf.d", SystemUse::Read, Needed::Always),
+    (
+        "/var/lib/crypto-config/profiles/current/openssl.conf.d",
+        SystemUse::Read,
+        Needed::Always,
+    ),
     ("/etc/hosts", SystemUse::Read, Needed::WithIpNetwork),
     ("/etc/resolv.conf", SystemUse::Read, Needed::WithIpNetwork),
     ("/etc/nsswitch.conf", SystemUse::Read, Needed::WithIpNetwork),
@@ -289,6 +297,21 @@ mod tests {
         assert_eq!(location, dir.join("etc"));
         assert!(links.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The directories that the OpenSSL configuration of Ubuntu 25.10 includes are read
+    /// candidates, so a host that has them keeps them inside the sandbox.
+    #[test]
+    fn the_openssl_includes_of_ubuntu_are_candidates() {
+        for target in [
+            "/var/lib/crypto-config/profiles/current/openssl.conf.d",
+            "/etc/ssl/openssl.conf.d",
+        ] {
+            let read = candidates().any(|(path, usage, needed)| {
+                path == target && usage == SystemUse::Read && needed == Needed::Always
+            });
+            assert!(read, "{target}");
+        }
     }
 
     #[test]

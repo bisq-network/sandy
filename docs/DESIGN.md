@@ -458,7 +458,8 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   Everything that can fail on bad input is prepared before the first step. Landlock restricts
   the calling thread, so the thread check is what makes the domain cover the whole process.
 - Landlock (ABI 1 or newer, read from the kernel at run time) handles every file system right of
-  the ABI. Writable paths never get execute, symbolic link, named pipe or device rights. ABI 6
+  the ABI. Writable paths never get execute, symbolic link, named pipe or device rights. Each
+  rule path is opened without following links and must still be the file sandy planned with. ABI 6
   scopes signals (required for `signals = "isolated"`) and abstract Unix sockets; ABI 9 denies
   pathname Unix sockets when `unix_sockets = "none"`; ABI 4 denies TCP when `ip = "none"`.
 - Seccomp allowlist: the reviewed system call table of Linux 7.2; every other number, x32 numbers,
@@ -507,7 +508,7 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   `pidfd_open` instead of asking whether it is its own parent; a caller can also let the kernel
   do the whole job with `clone3(CLONE_PIDFD_AUTOKILL | CLONE_AUTOREAP | CLONE_NNP)` on Linux 7
   (see docs/linux.md).
-- - Exposed and forwarded ports: one relay, forked twice from the single-threaded sandy before it
+- Exposed and forwarded ports: one relay, forked twice from the single-threaded sandy before it
   confines itself, so it is not a child of the program. It watches the program with a pidfd and
   ends at most one second after it (rule 5 of "Forwarded ports"), or two seconds when the program
   stopped it, which a timer the relay re-arms takes care of. It confines itself with

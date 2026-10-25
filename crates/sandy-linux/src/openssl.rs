@@ -38,7 +38,7 @@ pub fn missing_includes(
         if !readable(&config) || !seen.insert(config.clone()) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&config) else {
+        let Some(text) = read_regular(&config) else {
             continue;
         };
         for target in includes(&text) {
@@ -89,9 +89,28 @@ fn includes(text: &str) -> Vec<PathBuf> {
 fn user_can_read(target: &Path) -> bool {
     match target.metadata() {
         Ok(metadata) if metadata.is_dir() => std::fs::read_dir(target).is_ok(),
-        Ok(_) => std::fs::File::open(target).is_ok(),
+        Ok(_) => open_regular(target).is_some(),
         Err(_) => false,
     }
+}
+
+/// Opens `path` for reading if it is a regular file. O_NONBLOCK, because a named pipe in an
+/// include directory would otherwise keep `check` waiting for a writer.
+fn open_regular(path: &Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
+fn read_regular(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    open_regular(path)?.read_to_string(&mut text).ok()?;
+    Some(text)
 }
 
 /// The configuration files inside an include target that is a directory. OpenSSL includes the
@@ -185,6 +204,25 @@ mod tests {
         );
         assert_eq!(missing_includes(&[config], &|_| false), []);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A named pipe among the configuration files is skipped. Opening it would wait for a
+    /// writer, and `check` would never end.
+    #[test]
+    fn a_named_pipe_in_an_include_directory_does_not_block() {
+        let dir = directory("pipe");
+        let config = dir.join("openssl.cnf");
+        let included = dir.join("parts");
+        std::fs::create_dir_all(&included).unwrap();
+        std::fs::write(&config, format!(".include {}\n", included.display())).unwrap();
+        let pipe = std::ffi::CString::new(included.join("pipe.cnf").to_str().unwrap()).unwrap();
+        // SAFETY: the path is NUL-terminated.
+        assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o600) }, 0);
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || send.send(missing_includes(&[config], &|_| true)));
+        let result = receive.recv_timeout(std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(result, Ok(Vec::new()));
     }
 
     /// A directory include covers the configuration files in it, and those can include further

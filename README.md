@@ -563,8 +563,10 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
   Landlock ABI 6 (kernel 6.12 or newer); older kernels refuse such a policy. The kernel also
   signals whole process groups for terminal job control, without that check, so on Linux the
   program can then neither join another job's process group nor take the terminal from the
-  foreground job nor resize it. A shell inside the sandbox therefore has no job control. On
-  macOS a profile cannot filter the arguments of `setpgid`, so the program can still join
+  foreground job nor resize it. A shell inside the sandbox therefore has no job control. The
+  program's reads from the terminal still stop the job that sandy runs in, including processes
+  of that job outside the sandbox, as they would without a sandbox. On macOS a profile cannot
+  filter the arguments of `setpgid`, so the program can still join
   another job's process group of its terminal session and have the kernel stop that job; taking
   the terminal and resizing it are denied there in every mode, and `children = "contained"`
   closes the rest (see [docs/macos.md](docs/macos.md)).

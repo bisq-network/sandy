@@ -315,20 +315,23 @@ const F_SETDELEG: u64 = 1040;
 ///
 /// - FS_IOC_SETFLAGS, its 32-bit form, and FS_IOC_FSSETXATTR change inode flags and attributes,
 ///   which is metadata like chmod (`chattr`).
-/// - FS_IOC_SETVERSION and its 32-bit form change the version a file carries, which is metadata
-///   the policy denies by path.
+/// - FS_IOC_SETVERSION, its 32-bit form, and EXT4_IOC_SETVERSION, which ext4 treats the same,
+///   change the version a file carries, which is metadata the policy denies by path.
 /// - FS_IOC_ENABLE_VERITY makes the content of a file permanently read-only.
 /// - FS_IOC_SET_ENCRYPTION_POLICY encrypts what the user later writes into an empty directory,
 ///   with a key the program chose. FS_IOC_REMOVE_ENCRYPTION_KEY and its all-users form lock
 ///   encrypted directories the user has unlocked, outside the policy.
 /// - The btrfs ioctls create, snapshot and delete subvolumes, or make them read-only, which
 ///   changes directories without the Landlock checks for creating and removing entries.
+///   BTRFS_IOC_SET_RECEIVED_SUBVOL and its 32-bit form, which 64-bit kernels also take, change
+///   the identity by which `btrfs receive` finds the parent of an incremental stream.
 const FILE_SYSTEM_IOCTLS: &[u32] = &[
     0x4008_6602,
     0x4004_6602,
     0x401c_5820,
     0x4008_7602,
     0x4004_7602,
+    0x4008_6604,
     0x4080_6685,
     0x800c_6613,
     0xc040_6618,
@@ -340,6 +343,8 @@ const FILE_SYSTEM_IOCTLS: &[u32] = &[
     0x5000_9418,
     0x5000_943f,
     0x4008_941a,
+    0xc0c8_9425,
+    0xc0c0_9425,
 ];
 
 /// The compiled filters, in the order they are installed. The relay and the watcher have no
@@ -655,19 +660,22 @@ fn namespace_rules(flags: &[i32]) -> Result<Vec<SeccompRule>, BackendError> {
         .collect()
 }
 
+/// The access mode bits of the open flags, as the kernel reads them. Not `libc::O_ACCMODE`: musl
+/// adds O_PATH to it, and the rules below then matched only opens with O_PATH set.
+const O_ACCMODE: u64 = 3;
+
 /// Access mode 3 opens a file for ioctl only. Landlock requires no right for such an open, and
 /// fchmod, fchown and fsetxattr work on the descriptor, so it would bypass both Landlock and the
 /// metadata rules. Before Landlock ABI 3, O_TRUNC also truncates a file that is opened read-only,
 /// without a Landlock check.
 fn open_rules(flags: u8, restrict_truncate: bool) -> Result<Vec<SeccompRule>, BackendError> {
-    let accmode = libc::O_ACCMODE as u64;
-    let ioctl_only = low(flags, SeccompCmpOp::MaskedEq(accmode), accmode)?;
+    let ioctl_only = low(flags, SeccompCmpOp::MaskedEq(O_ACCMODE), O_ACCMODE)?;
     let mut rules = vec![rule(vec![ioctl_only])?];
     if restrict_truncate {
         let trunc = libc::O_TRUNC as u64;
         let read_only_trunc = low(
             flags,
-            SeccompCmpOp::MaskedEq(accmode | trunc),
+            SeccompCmpOp::MaskedEq(O_ACCMODE | trunc),
             trunc | libc::O_RDONLY as u64,
         )?;
         rules.push(rule(vec![read_only_trunc])?);
@@ -768,8 +776,9 @@ pub fn watcher(program: i32) -> Result<Filters, BackendError> {
             rule(vec![
                 low(0, SeccompCmpOp::Eq, program as u64)?,
                 low(1, SeccompCmpOp::Eq, signal as u64)?,
-                // No siginfo, so that the kernel fills it in, and no flags.
-                low(2, SeccompCmpOp::Eq, 0)?,
+                // No siginfo, so that the kernel fills it in, and no flags. The siginfo is a
+                // pointer, so all 64 bits must be zero.
+                SeccompCondition::new(2, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0)?,
                 low(3, SeccompCmpOp::Eq, 0)?,
             ])
         })
@@ -1332,7 +1341,7 @@ mod tests {
         }
         for &(nr, flags_index) in arch::OPEN_CALLS {
             let mut ioctl_only = [0; 6];
-            ioctl_only[usize::from(flags_index)] = HIGH | libc::O_ACCMODE as u64;
+            ioctl_only[usize::from(flags_index)] = HIGH | 3;
             assert_eq!(call(&open(), nr, ioctl_only), RET_EPERM, "{nr}");
         }
         let setuid = args(&[3, HIGH | 0o4755]);
@@ -1385,6 +1394,18 @@ mod tests {
     #[test]
     fn file_system_ioctls_that_change_files_are_denied() {
         const HIGH: u64 = 0xffff_ffff_0000_0000;
+        // FS_IOC_SETFLAGS, FS_IOC_FSSETXATTR, FS_IOC_SETVERSION, ext4's own number for it, and
+        // both forms of BTRFS_IOC_SET_RECEIVED_SUBVOL.
+        for command in [
+            0x4008_6602,
+            0x401c_5820,
+            0x4008_7602,
+            0x4008_6604,
+            0xc0c8_9425,
+            0xc0c0_9425,
+        ] {
+            assert!(FILE_SYSTEM_IOCTLS.contains(&command), "{command:#x}");
+        }
         for &command in FILE_SYSTEM_IOCTLS {
             let args = args(&[3, HIGH | u64::from(command)]);
             for config in [strict(), open()] {
@@ -1693,6 +1714,12 @@ mod tests {
         for signal in [0, libc::SIGSTOP, libc::SIGUSR1] {
             assert_eq!(send(PROGRAM, signal), RET_EPERM, "signal {signal}");
         }
+        // A siginfo of the watcher's own, also one at an address whose low 32 bits are zero.
+        for info in [0x7fff_0000_1000, 1 << 32] {
+            let args = args(&[PROGRAM as u64, libc::SIGTERM as u64, info]);
+            let decision = decide_with(&filters, NATIVE, libc::SYS_pidfd_send_signal, args);
+            assert_eq!(decision, RET_EPERM, "siginfo {info:#x}");
+        }
         for nr in [
             libc::SYS_openat,
             libc::SYS_socket,
@@ -1868,9 +1895,12 @@ mod tests {
     #[test]
     fn open_for_ioctl_only_is_denied() {
         for &(nr, flags_index) in arch::OPEN_CALLS {
-            let mut ioctl_only = [0; 6];
-            ioctl_only[usize::from(flags_index)] = libc::O_ACCMODE as u64;
-            assert_eq!(call(&open(), nr, ioctl_only), RET_EPERM);
+            // The kernel's value, not libc's O_ACCMODE: musl adds O_PATH to that one.
+            for flags in [3, 3 | libc::O_PATH as u64, 3 | libc::O_CLOEXEC as u64] {
+                let mut ioctl_only = [0; 6];
+                ioctl_only[usize::from(flags_index)] = flags;
+                assert_eq!(call(&open(), nr, ioctl_only), RET_EPERM, "{flags:#x}");
+            }
             let mut read = [0; 6];
             read[usize::from(flags_index)] = (libc::O_RDONLY | libc::O_CLOEXEC) as u64;
             assert_eq!(call(&open(), nr, read), RET_ALLOW);

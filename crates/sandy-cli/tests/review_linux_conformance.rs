@@ -131,7 +131,7 @@ fn the_callers_signal_state_reaches_the_program() {
 
 /// The contained model forks the program, which confines itself (docs/linux.md, "Contained child
 /// processes", step 4). It must end up exactly as confined as in the exec model: no_new_privs,
-/// both filters, Landlock, no inherited descriptor, and none of sandy's or the guard's pipes.
+/// all four filters, Landlock, no inherited descriptor, and none of sandy's or the guard's pipes.
 #[test]
 fn the_contained_program_is_confined_like_the_exec_model() {
     let fixture = Fixture::new("conformance-contained");
@@ -175,8 +175,10 @@ fn the_contained_program_is_confined_like_the_exec_model() {
         assert_eq!(lines[3].detail, "4 entries", "{context}");
         assert_eq!(lines[4].detail, "1", "{context}");
         assert_eq!(lines[5].detail, "2", "{context}");
+        // The four filters of the default policy (see `no_new_privs_and_seccomp_are_active`).
+        let inherited: u32 = outside[6].detail.parse().unwrap();
         let filters: u32 = lines[6].detail.parse().unwrap();
-        assert!(filters >= 2, "{context}");
+        assert_eq!(filters, inherited + 4, "{context}");
     }
 }
 
@@ -389,15 +391,20 @@ fn the_crypto_policy_files_are_readable() {
 #[test]
 fn unreadable_openssl_includes_are_reported() {
     let configs = ["/etc/ssl/openssl.cnf", "/etc/pki/tls/openssl.cnf"];
+    // An include whose target is missing is skipped by OpenSSL and by sandy alike (Ubuntu 25.10
+    // names two that a default installation does not have), so only an existing one counts.
     let with_includes = configs.into_iter().find(|config| {
         let text = fs::read_to_string(config).unwrap_or_default();
-        text.lines()
-            .any(|line| line.trim_start().starts_with(".include"))
+        text.lines().any(|line| {
+            let target = line.trim().strip_prefix(".include").unwrap_or_default();
+            let target = target.trim_start().trim_start_matches('=').trim();
+            target.starts_with('/') && Path::new(target).exists()
+        })
     });
     let Some(config) = with_includes else {
         return skip(
             "openssl-includes",
-            "the OpenSSL configuration of this host includes no other file",
+            "the OpenSSL configuration of this host includes no file that exists",
         );
     };
     let probe = probe_path();
@@ -451,7 +458,22 @@ fn a_cgroup_limit_is_invisible_and_reported() {
         warnings.contains("536870912 bytes from memory.max"),
         "{warnings}"
     );
-    assert!(warnings.contains("--set-env GOMAXPROCS=1"), "{warnings}");
+    // systemd applies CPUQuota only where the user's manager has the cpu controller, which
+    // Ubuntu 22.04 does not delegate.
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let delegated = format!(
+        "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/cgroup.subtree_control"
+    );
+    let controllers = fs::read_to_string(&delegated).unwrap_or_default();
+    if controllers.split_whitespace().any(|name| name == "cpu") {
+        assert!(warnings.contains("--set-env GOMAXPROCS=1"), "{warnings}");
+    } else {
+        skip(
+            "user-cpu-controller",
+            &format!("{delegated} does not name the cpu controller: {controllers:?}"),
+        );
+    }
     // The program itself sees neither the value nor its own cgroup.
     let inside = probe_inside(&[], &[("read", "/proc/self/cgroup")]);
     inside[0].assert_blocked();

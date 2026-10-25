@@ -2,8 +2,10 @@
 //! exact configuration that `run` applies. Both come from the same function, so `run` applies
 //! what the plan names. The only state it reads besides the host capabilities is the `#!` line
 //! and the ELF interpreter of the program, which tell whether the kernel could execute it at
-//! all; that depends on the policy, so no detection step can answer it.
+//! all, and the identity of every rule path; both depend on the policy, so no detection step
+//! can answer them.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use landlock::{ABI, Access, AccessFs, AccessNet, BitFlags, Scope, make_bitflags};
@@ -15,6 +17,7 @@ use sandy_core::{
 use crate::cgroup;
 use crate::filter::FilterConfig;
 use crate::host::HostCapabilities;
+use crate::launch;
 use crate::loader;
 use crate::openssl;
 use crate::relay::RelayConfig;
@@ -38,7 +41,13 @@ pub struct Sandbox {
     pub contain: bool,
     /// `process.end_with_parent`: a watcher ends the program when sandy's parent ends.
     pub end_with_parent: bool,
+    /// The file each Landlock rule path named when sandy planned the run, before the checks of
+    /// this module. The launch binds a rule only to that file (`launch::open_rule`).
+    pub identities: BTreeMap<PathBuf, FileIdentity>,
 }
+
+/// The device and inode number of a file.
+pub type FileIdentity = (u64, u64);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LandlockConfig {
@@ -83,6 +92,12 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
     let landlock = abi
         .ok()
         .map(|abi| landlock_config(policy, &host.system_paths, loader.as_deref(), abi));
+    // Before the checks below, so that a file swapped in while they run is not the one bound.
+    let identities: BTreeMap<PathBuf, FileIdentity> = landlock
+        .iter()
+        .flat_map(|landlock| &landlock.rules)
+        .filter_map(|rule| Some((rule.path.clone(), launch::identity(&rule.path)?)))
+        .collect();
     let conflict = system_conflict(policy, &host.system_locations)
         .or_else(|| trust_conflict(policy, &host.trusted_locations))
         .or_else(|| loader_problem(loader.as_deref(), &executable_paths(landlock.as_ref()?)))
@@ -110,6 +125,7 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
             relay: RelayConfig::new(&policy.expose, &policy.forward, abi),
             contain: policy.children == ChildProcesses::Contained,
             end_with_parent: policy.end_with_parent,
+            identities,
         }),
         _ => None,
     };

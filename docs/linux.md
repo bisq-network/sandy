@@ -19,12 +19,13 @@ The research behind the design is in [research/linux-mechanisms.md](research/lin
 
 1. Detect the host: the Landlock ABI, seccomp support, no_new_privs, user IDs and capabilities,
    and which paths of the minimal system set exist. Detection only reads state.
-2. Plan: a pure function (`plan_for`) turns the policy and the host capabilities into the plan
-   items and the exact configuration to apply. If any requirement is unavailable, sandy refuses.
-3. Build the Landlock ruleset with all its rules, compile the seccomp filters, and build the
-   `execve` arguments and environment as C strings. Change to the working directory if the
-   policy sets one. Reset SIGPIPE to its default action, because the Rust runtime ignores it and
-   an ignored signal stays ignored across `execve`.
+2. Plan: `plan_for` turns the policy and the host capabilities into the plan items and the
+   exact configuration to apply. If any requirement is unavailable, sandy refuses. The plan also
+   records the device and inode of every path a Landlock rule names.
+3. Build the Landlock ruleset with all its rules (see "Rule paths" below), compile the seccomp
+   filters, and build the `execve` arguments and environment as C strings. Change to the working
+   directory if the policy sets one. Reset SIGPIPE to its default action, because the Rust
+   runtime ignores it and an ignored signal stays ignored across `execve`.
 
 Then sandy restricts itself, in this order:
 
@@ -47,6 +48,22 @@ exactly these restrictions. Every child inherits them. sandy does not use Landlo
 `LANDLOCK_RESTRICT_SELF_TSYNC` (ABI 8): with a verified single thread it changes nothing, it exists
 only on new kernels, and it would hide a thread that should not exist. If `/proc/self/task` cannot
 be listed, the Landlock-based requirements are unavailable.
+
+### Rule paths
+
+The checks of the policy look at paths, and a Landlock rule binds the file that a descriptor
+refers to. Between the two, a process that can write a parent of a policy path, for example one
+that a previous run left behind with `children = "allowed"`, could replace the path with a
+symbolic link or with another directory, and the rule would then grant access where no check
+looked. sandy therefore opens every rule path one component at a time with
+`O_PATH | O_NOFOLLOW` and refuses the run when a component is a symbolic link (the rule paths are
+canonical, so any link appeared after the resolver read them) or when the file it reaches is not
+the one recorded in step 2. The unit tests next to `open_rule` in `launch.rs` swap a path between
+the plan and the launch, which a real race cannot hit reliably.
+
+What stays open: a directory moved into place between the resolver's checks and step 2, a window
+in which sandy does not wait for anything. A process can only move a directory from a place it
+can write, so the rule then reaches nothing that this process could not reach already.
 
 ## Mechanism per requirement
 
@@ -618,8 +635,9 @@ program holds, also one of a file in a `read` path (measured on Linux 7.2):
 - `FS_IOC_SETFLAGS`, its 32-bit form and `FS_IOC_FSSETXATTR` change inode flags and attributes,
   which is metadata like `chmod`. Only `chattr` and tools that set `NOCOW` use them, and they
   have no counterpart that the metadata calls on a descriptor need.
-- `FS_IOC_SETVERSION` and its 32-bit form change the version a file carries, which is metadata
-  that the policy denies when the call takes a path.
+- `FS_IOC_SETVERSION`, its 32-bit form and `EXT4_IOC_SETVERSION`, which ext4 treats the same
+  way, change the version a file carries, which is metadata that the policy denies when the
+  call takes a path.
 - `FS_IOC_ENABLE_VERITY` makes the content of a file permanently read-only (measured on btrfs
   with a descriptor opened read-only).
 - `FS_IOC_SET_ENCRYPTION_POLICY` encrypts what the user later writes into an empty directory,
@@ -627,6 +645,9 @@ program holds, also one of a file in a `read` path (measured on Linux 7.2):
   encrypted directories the user has unlocked, which reaches files outside the policy.
 - The btrfs ioctls that create, snapshot and delete subvolumes, or make them read-only, change
   directories without the Landlock checks for creating and removing entries.
+  `BTRFS_IOC_SET_RECEIVED_SUBVOL` and its 32-bit form, which a 64-bit kernel also takes, change
+  the identity by which `btrfs receive` finds the parent of an incremental stream (measured on
+  Linux 7.2 with a descriptor opened read-only).
 
 The reading forms (`FS_IOC_GETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_MEASURE_VERITY`) stay
 allowed. The test `file_system_ioctls_cannot_change_readable_files` checks the denials.
@@ -681,7 +702,11 @@ group uses `setpgid(0, 0)` or `setsid`, which stay allowed. The three routes are
 Cost: a shell inside the sandbox has no job control, because it cannot put a pipeline in a group
 of its own and cannot hand the terminal to it. Programs that resize their terminal (`stty rows`,
 `resize`) fail with `EPERM`. What stays open: the program's own reads from the terminal still
-stop its own group, and `SIGTTIN` reaches no process outside it.
+stop its own process group. In the exec model that is the group sandy was started in, so the
+processes outside the sandbox that share it stop as well: the shell that ran sandy without job
+control, for example in a script, and the other commands of its pipeline. They are the job the
+user started, which stops as it would without a sandbox; no other job is reached.
+`a_terminal_read_stops_the_group_sandy_was_started_in` records this.
 
 ### Other processes
 
@@ -818,7 +843,7 @@ audit log is the better source and it costs the run nothing.
 | `/etc/ld.so.preload` | read | always | The system-wide preload list. Without it the program would start differently than outside the sandbox. |
 | `/etc/ld-musl-x86_64.path` (arm64: `-aarch64`) | read | always | The library path of the musl loader. |
 | `/etc/localtime`, `/usr/share/zoneinfo` | read | always | Time zone data. |
-| `/etc/ssl/openssl.cnf`, `/etc/pki/tls/openssl.cnf`, `/etc/pki/tls/openssl.d`, `/etc/crypto-policies/back-ends`, `/usr/share/crypto-policies` | read | always | OpenSSL configuration and the system crypto policy it includes on Fedora and RHEL (the back-ends are symbolic links into `/usr/share/crypto-policies`, and Landlock checks the target). OpenSSL drops an include it cannot read without an error and then runs with weaker built-in defaults; Node.js does not start when the configuration exists but cannot be read. |
+| `/etc/ssl/openssl.cnf`, `/etc/pki/tls/openssl.cnf`, `/etc/pki/tls/openssl.d`, `/etc/crypto-policies/back-ends`, `/usr/share/crypto-policies`, `/etc/ssl/openssl.conf.d`, `/var/lib/crypto-config/profiles/current/openssl.conf.d` | read | always | OpenSSL configuration and the system crypto policy it includes on Fedora and RHEL (the back-ends are symbolic links into `/usr/share/crypto-policies`, and Landlock checks the target), and the two directories the configuration of Ubuntu 25.10 includes, when they exist. OpenSSL drops an include it cannot read without an error and then runs with weaker built-in defaults; Node.js does not start when the configuration exists but cannot be read. |
 | `/dev/null` | read, write | always | Programs redirect output to it. Writes are discarded. No ioctl right. |
 | `/dev/zero`, `/dev/random`, `/dev/urandom` | read | always | Zero and random sources for programs that do not use `getrandom`. |
 | `/sys/devices/system/cpu/online`, `/sys/devices/system/cpu/possible` | read | always | The number of CPUs for glibc, Go and Java. |
@@ -856,15 +881,16 @@ Three things work outside the sandbox and behave differently inside it without t
 noticing. sandy reports the first two in `sandy check`, as `warning:` lines on standard error
 that change neither what it enforces nor the exit status.
 
-- **OpenSSL includes.** The set covers the configuration and the crypto policy files of Fedora
-  and RHEL. An administrator can include files from anywhere, and OpenSSL drops an include it
-  cannot read without an error, so the program then runs with weaker built-in defaults: measured
-  on Fedora with only `openssl.cnf` readable, `openssl ciphers -s -tls1_2` silently gained two
-  CBC suites and lost the CCM suites. sandy reads the `.include` lines of the configuration
-  files of the set, follows them, and names every target the policy does not cover, in every
-  policy and not only with `ip = "all"`, because the configuration is read for local
-  cryptography as well. It grants nothing on its own: the targets are chosen by the host, not by
-  sandy. The test is `unreadable_openssl_includes_are_reported`.
+- **OpenSSL includes.** The set covers the configuration and the crypto policy files of Fedora and
+  RHEL, and the directories that Ubuntu 25.10 includes. An administrator can include files from
+  anywhere, and OpenSSL drops an include it cannot read without an error, so the program then runs
+  with weaker built-in defaults: measured on Fedora with only `openssl.cnf` readable,
+  `openssl ciphers -s -tls1_2` silently gained two CBC suites and lost the CCM suites. sandy
+  reads the `.include` lines of the configuration files of the set, follows them, and names every
+  target the policy does not cover, in every policy and not only with `ip = "all"`, because the
+  configuration is read for local cryptography as well. It grants nothing on its own: the
+  targets are chosen by the host, not by sandy. The test is
+  `unreadable_openssl_includes_are_reported`.
 - **cgroup limits.** `/proc` and `/sys/fs/cgroup` are not in the set, so a program cannot find
   the memory and CPU limits of its cgroup and sizes its heap and its thread pool from the whole
   host instead: measured in a 512 MB scope, a JVM reports "No metrics available for this

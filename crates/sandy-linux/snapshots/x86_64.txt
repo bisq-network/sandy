@@ -9,8 +9,8 @@
 # A diff here means a filter, the reviewed table or seccompiler's code generation changed.
 
 [strict denylist]
-instructions 860
-checksum 0x3684c97c2d04d677
+instructions 875
+checksum 0xa2b6ad7373719cf0
 0-28 allow
 29-31 EPERM
 32-41 allow
@@ -126,8 +126,8 @@ checksum 0xa6412eeb0cbdfb53
 42-511 allow
 
 [open denylist]
-instructions 726
-checksum 0x080125d7d14a8a51
+instructions 741
+checksum 0x65c455e4b9b8d0be
 0-28 allow
 29-31 EPERM
 32-52 allow
@@ -196,8 +196,8 @@ checksum 0xdc64dcd9e8e5c2fb
 42-511 allow
 
 [watcher denylist]
-instructions 115
-checksum 0x22dbf2769c5e9ae8
+instructions 121
+checksum 0xa831fe02797704c0
 0 EPERM
 1 allow
 2 EPERM
