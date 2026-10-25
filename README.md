@@ -798,7 +798,10 @@ metadata through the descriptor they wrote.
   on Ubuntu"). Inside, files of other users and of root show the owner 65534, and `ping` does not work.
   Other users cannot reach the program's ports, but your own processes can enter the namespace,
   for example with `nsenter`, and `sandy check` warns about that
-  ([docs/linux.md](docs/linux.md), "Private network").
+  ([docs/linux.md](docs/linux.md), "Private network"). With `egress`, a broker in the host's
+  network namespace connects for the program. Other users cannot reach its port either, and with
+  `children = "contained"` sandy ends the program when the broker dies, as when its relay dies
+  ([docs/linux.md](docs/linux.md), "Egress broker").
 - **Name resolution across network changes.** A Landlock rule binds a file, so a file the
   system replaces by rename is lost to a program that is already running. With `--ip all` or
   `--ip client`, sandy grants systemd-resolved's directory, so name resolution keeps working when
@@ -1015,6 +1018,7 @@ variables keep that visible:
 | `SANDY_TEST_RUNNER` | The name of this runner. `crates/sandy-cli/tests/expected-skips/<runner>.txt` holds the checks it is expected to skip. |
 | `SANDY_TEST_REQUIRE` | Features that must be checkable here, separated by commas, or `all`. Skipping one fails that test. |
 | `SANDY_TEST_MIN_LANDLOCK_ABI` | The lowest Landlock ABI this runner must report (Linux). |
+| `SANDY_TEST_LOCAL_PEER` | `ADDRESS:PORT` of another host of the local network that takes TCP connections there, as an SSH server does. The test of `egress` with `reach = "public-and-local"` reaches it (Linux); without it that test skips `local-network-peer`. |
 
 After a run, `cargo test -p sandy-cli --test runner -- --ignored --exact
 skips_match_the_expected_list` compares the log with the list of the runner and fails on a skip

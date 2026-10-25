@@ -1,6 +1,7 @@
 //! `ip = "private"` on Linux: the program runs in a user and network namespace of its own, with
-//! only `lo`, and reaches the host only through the relays (docs/linux.md, "Private network").
-//! Every denial has a control: the same action with `ip = "all"`, which reaches the host.
+//! only `lo`, and reaches the host only through the relays, and the network only through the
+//! egress broker (docs/linux.md, "Private network"). Every denial has a control: the same action
+//! with `ip = "all"`, which reaches the host, or one the broker allows.
 #![cfg(target_os = "linux")]
 
 mod common;
@@ -605,8 +606,9 @@ fn check_reports_the_private_network_and_what_stays_open() {
 
 /// Ubuntu 23.10 and newer let an unconfined process create a user namespace but give it no
 /// rights there, so sandy cannot set one up until `sandy setup` installs an AppArmor profile for
-/// it. check exits with status 2 for that, which a caller can act on without reading text, and
-/// run refuses with the same reason. Elsewhere the check exits 0 (the test above).
+/// it. check exits with status 2 for that, also with an egress broker, which a caller can act on
+/// without reading text, and run refuses with the same reason. Elsewhere the check exits 0 (the
+/// test above).
 #[test]
 fn check_needs_setup_under_the_apparmor_restriction() {
     let read = |path: &str| {
@@ -633,6 +635,19 @@ fn check_needs_setup_under_the_apparmor_restriction() {
     assert!(line.starts_with("UNAVAILABLE  "), "{stdout}");
     assert!(line.contains(reason), "{line}");
     assert!(line.contains("`sandy setup`"), "{line}");
+    // The egress broker serves a listener in that namespace, so it needs the same setup.
+    let output = sandy(["check", "--ip", "private", "--egress", "1080"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(EXIT_NEEDS_SETUP), "{stdout}");
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("connections out only through the egress broker"))
+        .unwrap_or_default();
+    assert!(line.starts_with("UNAVAILABLE  "), "{stdout}");
+    assert!(
+        line.contains(reason) && line.contains("`sandy setup`"),
+        "{line}"
+    );
 
     let output = sandy(run_args(&private(), &[("pid", "-")]));
     assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
@@ -643,7 +658,8 @@ fn check_needs_setup_under_the_apparmor_restriction() {
 
 /// A host can allow user namespaces and still refuse them to sandy, for example inside a sandbox
 /// whose seccomp filter denies `unshare`, as sandy's own does. `plan` cannot see that without a
-/// trial; check makes one and reports the step that fails, and run refuses.
+/// trial; check makes one and reports the step that fails, for the egress broker too, and run
+/// refuses.
 #[test]
 fn check_tries_the_namespaces_inside_a_sandbox_that_denies_them() {
     if !private_network_works() {
@@ -661,7 +677,14 @@ fn check_tries_the_namespaces_inside_a_sandbox_that_denies_them() {
         "--",
     ]);
     let mut check = outer.clone();
-    check.extend(args(&[inner.to_str().unwrap(), "check", "--ip", "private"]));
+    check.extend(args(&[
+        inner.to_str().unwrap(),
+        "check",
+        "--ip",
+        "private",
+        "--egress",
+        "1080",
+    ]));
     let output = sandy(&check);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
@@ -678,6 +701,15 @@ fn check_tries_the_namespaces_inside_a_sandbox_that_denies_them() {
         line.starts_with("UNAVAILABLE  ")
             && line.contains("a trial of the sandbox's namespaces failed")
             && line.contains("user namespace"),
+        "{stdout}"
+    );
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("connections out only through the egress broker"))
+        .unwrap_or_default();
+    assert!(
+        line.starts_with("UNAVAILABLE  ")
+            && line.contains("a trial of the sandbox's namespaces failed"),
         "{stdout}"
     );
 
@@ -702,6 +734,533 @@ fn check_tries_the_namespaces_inside_a_sandbox_that_denies_them() {
         .unwrap();
     assert!(
         stderr.contains("cannot create the sandbox's user namespace"),
+        "{stderr}"
+    );
+}
+
+/// The options of a private network with an egress broker on the program's 127.0.0.1:`port`.
+fn egress(port: u16, reach: &str) -> Vec<String> {
+    args(&["--ip", "private", "--egress", &format!("{port}={reach}")])
+}
+
+/// The probe's request to the broker on 127.0.0.1:`port` for `destination`.
+fn socks(port: u16, destination: &str) -> String {
+    format!("127.0.0.1:{port}\u{1f}{destination}")
+}
+
+/// The IP addresses of this host's interfaces with their prefix lengths, from getifaddrs. IPv6
+/// link-local addresses are left out: a listener there needs a scope, which SOCKS5 cannot name.
+fn interface_addresses() -> Vec<(IpAddr, u32)> {
+    let ip_of = |address: *const libc::sockaddr| -> Option<IpAddr> {
+        if address.is_null() {
+            return None;
+        }
+        // SAFETY: getifaddrs gives socket addresses of the size their family implies.
+        unsafe {
+            match i32::from((*address).sa_family) {
+                libc::AF_INET => {
+                    let v4 = &*address.cast::<libc::sockaddr_in>();
+                    Some(IpAddr::from(u32::from_be(v4.sin_addr.s_addr).to_be_bytes()))
+                }
+                libc::AF_INET6 => {
+                    let v6 = &*address.cast::<libc::sockaddr_in6>();
+                    Some(IpAddr::from(v6.sin6_addr.s6_addr))
+                }
+                _ => None,
+            }
+        }
+    };
+    let mut addresses = Vec::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs writes a list that freeifaddrs releases below.
+    assert_eq!(unsafe { libc::getifaddrs(&mut head) }, 0);
+    let mut entry = head;
+    while !entry.is_null() {
+        // SAFETY: entry is a node of the list getifaddrs returned.
+        let node = unsafe { &*entry };
+        if let (Some(ip), Some(mask)) = (ip_of(node.ifa_addr), ip_of(node.ifa_netmask)) {
+            let prefix = match mask {
+                IpAddr::V4(mask) => mask.to_bits().count_ones(),
+                IpAddr::V6(mask) => mask.to_bits().count_ones(),
+            };
+            let link_local = matches!(ip, IpAddr::V6(v6) if v6.is_unicast_link_local());
+            if !link_local {
+                addresses.push((ip, prefix));
+            }
+        }
+        entry = node.ifa_next;
+    }
+    // SAFETY: head came from getifaddrs.
+    unsafe { libc::freeifaddrs(head) };
+    addresses
+}
+
+/// One address on each subnet of this host's interfaces that is not this host: the first of the
+/// subnet, or the second when the first is the host's. On a VM of a libvirt network that is the
+/// libvirt host. Hosts of the local network, which only `reach = "public-and-local"` allows.
+fn local_network_hosts() -> Vec<IpAddr> {
+    let addresses = interface_addresses();
+    let own: Vec<IpAddr> = addresses.iter().map(|(ip, _)| *ip).collect();
+    addresses
+        .iter()
+        .filter(|(ip, _)| !ip.is_loopback())
+        .filter_map(|&(ip, prefix)| {
+            let candidates: Vec<IpAddr> = match ip {
+                IpAddr::V4(ip) if prefix < 31 => {
+                    let network = ip.to_bits() & u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+                    vec![
+                        std::net::Ipv4Addr::from_bits(network + 1).into(),
+                        std::net::Ipv4Addr::from_bits(network + 2).into(),
+                    ]
+                }
+                IpAddr::V6(ip) if prefix < 127 => {
+                    let mask = u128::MAX.checked_shl(128 - prefix).unwrap_or(0);
+                    let network = ip.to_bits() & mask;
+                    vec![
+                        std::net::Ipv6Addr::from_bits(network + 1).into(),
+                        std::net::Ipv6Addr::from_bits(network + 2).into(),
+                    ]
+                }
+                _ => Vec::new(),
+            };
+            candidates
+                .into_iter()
+                .find(|candidate| !own.contains(candidate))
+        })
+        .collect()
+}
+
+/// Listeners where a connection of the broker to this host would end. `assert_untouched` fails
+/// once any of them took a connection.
+struct Canaries(Vec<TcpListener>);
+
+impl Canaries {
+    fn bind(addresses: impl IntoIterator<Item = IpAddr>) -> Canaries {
+        let listeners: Vec<TcpListener> = addresses
+            .into_iter()
+            .map(|ip| TcpListener::bind((ip, 0)).unwrap())
+            .collect();
+        for listener in &listeners {
+            listener.set_nonblocking(true).unwrap();
+        }
+        Canaries(listeners)
+    }
+
+    fn addresses(&self) -> Vec<SocketAddr> {
+        self.0
+            .iter()
+            .map(|listener| listener.local_addr().unwrap())
+            .collect()
+    }
+
+    fn assert_untouched(&self) {
+        for listener in &self.0 {
+            assert!(
+                listener.accept().is_err(),
+                "the broker reached {}",
+                listener.local_addr().unwrap()
+            );
+        }
+    }
+}
+
+/// The broker never connects to this host, under any of its names and whatever `reach` says:
+/// its loopback, every address of its interfaces, an IPv4-mapped form of them, and the
+/// unspecified addresses, which reach the host itself. Under `public` a host of the local
+/// network is refused as well. Each gets reply 2, and no listener of the host sees a
+/// connection.
+#[test]
+fn the_broker_refuses_this_host_with_reply_2() {
+    if !private_network_works() {
+        return;
+    }
+    let mut own = vec![IpAddr::from([127, 0, 0, 1])];
+    match TcpListener::bind("[::1]:0") {
+        Ok(_) => own.push("::1".parse().unwrap()),
+        Err(error) => skip("ipv6-loopback", &format!("cannot listen on ::1: {error}")),
+    }
+    own.extend(
+        interface_addresses()
+            .into_iter()
+            .map(|(ip, _)| ip)
+            .filter(|ip| !ip.is_loopback()),
+    );
+    let canaries = Canaries::bind(own);
+    let listening = canaries.addresses();
+    let loopback = listening[0].port();
+    let mut destinations: Vec<String> = listening.iter().map(ToString::to_string).collect();
+    destinations.extend([
+        format!("[::ffff:127.0.0.1]:{loopback}"),
+        format!("0.0.0.0:{loopback}"),
+        format!("[::]:{loopback}"),
+    ]);
+    destinations.extend(listening.iter().filter_map(|address| match address.ip() {
+        IpAddr::V4(ip) => Some(format!("[{}]:{}", ip.to_ipv6_mapped(), address.port())),
+        IpAddr::V6(_) => None,
+    }));
+    let neighbours: Vec<String> = local_network_hosts()
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, 9).to_string())
+        .collect();
+    for reach in ["public", "public-and-local"] {
+        let port = free_port();
+        let mut asked = destinations.clone();
+        // A host of the local network only where the broker must not connect to it.
+        if reach == "public" {
+            asked.extend(neighbours.iter().cloned());
+        }
+        let targets: Vec<String> = asked
+            .iter()
+            .map(|destination| socks(port, destination))
+            .collect();
+        let actions: Vec<(&str, &str)> = targets
+            .iter()
+            .map(|target| ("socks5-connect", target.as_str()))
+            .collect();
+        for (line, destination) in probe_inside(&egress(port, reach), &actions)
+            .iter()
+            .zip(&asked)
+        {
+            assert_eq!(line.detail, "reply 2", "{reach}: {destination}: {line:?}");
+        }
+    }
+    canaries.assert_untouched();
+}
+
+/// Names a host of the local network that is not this one, as `ADDRESS:PORT`, which takes TCP
+/// connections there, as an SSH server does. Unset, the test that needs one skips.
+const LOCAL_PEER: &str = "SANDY_TEST_LOCAL_PEER";
+
+/// `reach = "public-and-local"` reaches a host of the local network, while this host stays
+/// refused there. Control: `public` refuses the same host.
+#[test]
+fn public_and_local_reaches_a_host_of_the_local_network() {
+    if !private_network_works() {
+        return;
+    }
+    let Some(peer) = std::env::var(LOCAL_PEER)
+        .ok()
+        .filter(|peer| !peer.is_empty())
+    else {
+        return skip(
+            "local-network-peer",
+            &format!("{LOCAL_PEER} names no host of the local network to reach"),
+        );
+    };
+    let peer: SocketAddr = peer
+        .parse()
+        .unwrap_or_else(|_| panic!("{LOCAL_PEER} is not ADDRESS:PORT: {peer}"));
+    assert!(
+        TcpStream::connect_timeout(&peer, Duration::from_secs(5)).is_ok(),
+        "{LOCAL_PEER} {peer} does not take connections from this host"
+    );
+    let Some(address) = host_address() else {
+        return skip(
+            "host-address",
+            "this host has no route to other machines, so no address of its own to try",
+        );
+    };
+    let canaries = Canaries::bind([address]);
+    let own = canaries.addresses()[0].to_string();
+    let port = free_port();
+    let lines = probe_inside(
+        &egress(port, "public-and-local"),
+        &[
+            ("socks5-connect", &socks(port, &peer.to_string())),
+            ("socks5-connect", &socks(port, &own)),
+        ],
+    );
+    assert_eq!(lines[0].detail, "reply 0", "{lines:?}");
+    assert_eq!(lines[1].detail, "reply 2", "{lines:?}");
+    let lines = probe_inside(
+        &egress(port, "public"),
+        &[("socks5-connect", &socks(port, &peer.to_string()))],
+    );
+    assert_eq!(lines[0].detail, "reply 2", "{lines:?}");
+    canaries.assert_untouched();
+}
+
+/// A well-known public address, which the tests connect to only to show that the connection
+/// stands, and send nothing.
+const PUBLIC_ADDRESS: &str = "1.1.1.1:443";
+
+/// `reach = "public"` reaches a public address, also in its IPv4-mapped form, while the program
+/// itself reaches it only through the broker. Without a route to the internet from this host
+/// there is nothing to show.
+#[test]
+fn the_broker_reaches_a_public_address() {
+    if !private_network_works() {
+        return;
+    }
+    let public: SocketAddr = PUBLIC_ADDRESS.parse().unwrap();
+    if TcpStream::connect_timeout(&public, Duration::from_secs(5)).is_err() {
+        return skip(
+            "internet",
+            &format!("this host does not reach {PUBLIC_ADDRESS}"),
+        );
+    }
+    let port = free_port();
+    let lines = probe_inside(
+        &egress(port, "public"),
+        &[
+            ("socks5-connect", &socks(port, PUBLIC_ADDRESS)),
+            ("socks5-connect", &socks(port, "[::ffff:1.1.1.1]:443")),
+            ("tcp-connect", PUBLIC_ADDRESS),
+        ],
+    );
+    for line in &lines[..2] {
+        assert_eq!(line.detail, "reply 0", "{lines:?}");
+    }
+    lines[2].assert_blocked();
+}
+
+/// The broker resolves nothing for the program: a name gets reply 8, the answer of RFC 1928 for
+/// an address type it does not take.
+#[test]
+fn the_broker_refuses_names_with_reply_8() {
+    if !private_network_works() {
+        return;
+    }
+    let port = free_port();
+    let lines = probe_inside(
+        &egress(port, "public"),
+        &[
+            ("socks5-connect", &socks(port, "localhost:80")),
+            ("socks5-connect", &socks(port, "example.com:443")),
+        ],
+    );
+    for line in &lines {
+        assert_eq!(line.detail, "reply 8", "{lines:?}");
+    }
+}
+
+/// The process outside the sandbox that holds the listener on 127.0.0.1:`port` of the network
+/// namespace of process `pid`, which sees that namespace in `/proc/PID/net/tcp`. The broker is
+/// the only one: sandy keeps no copy of the listener it hands over.
+fn listener_holder(pid: u32, port: u16) -> Option<u32> {
+    let local = format!("0100007F:{port:04X}");
+    let table = std::fs::read_to_string(format!("/proc/{pid}/net/tcp")).ok()?;
+    let inode = table.lines().skip(1).find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let listening = fields.get(1) == Some(&local.as_str()) && fields.get(3) == Some(&"0A");
+        listening.then(|| fields.get(9).map(|inode| inode.to_string()))?
+    })?;
+    let socket = format!("socket:[{inode}]");
+    let holders: Vec<u32> = std::fs::read_dir("/proc")
+        .ok()?
+        .filter_map(|entry| {
+            let holder: u32 = entry.ok()?.file_name().to_str()?.parse().ok()?;
+            let mut descriptors = std::fs::read_dir(format!("/proc/{holder}/fd")).ok()?;
+            let holds = descriptors.any(|fd| {
+                fd.and_then(|fd| std::fs::read_link(fd.path()))
+                    .is_ok_and(|link| link.as_os_str() == socket.as_str())
+            });
+            holds.then_some(holder)
+        })
+        .collect();
+    match holders[..] {
+        [broker] => Some(broker),
+        _ => None,
+    }
+}
+
+/// The broker of the run that `program` runs, whose own process ID is `pid`, once it holds the
+/// listener on the egress `port`. Fails if the run ends first.
+fn broker_of(pid: u32, port: u16, run: &mut Child) -> u32 {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        assert!(
+            run.try_wait().unwrap().is_none(),
+            "the program ended before the broker was ready"
+        );
+        if let Some(broker) = listener_holder(pid, port) {
+            return broker;
+        }
+        assert!(Instant::now() < deadline, "no broker listened on {port}");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// With `children = "contained"` the guard watches the broker as it watches the relay, and ends
+/// the program when the broker is gone; sandy exits with status 125 and says why. Control: while
+/// the broker lives, the program runs on.
+#[test]
+fn a_dead_broker_ends_a_contained_program() {
+    if !private_network_works() {
+        return;
+    }
+    if common::linux::landlock_abi() < 6 {
+        return skip("landlock-abi-6", "signal isolation needs Landlock ABI 6");
+    }
+    let port = free_port();
+    let mut sandbox_args = egress(port, "public");
+    sandbox_args.extend(args(&["--children", "contained", "--signals", "isolated"]));
+    let mut run = Command::new(sandy_path())
+        .args(run_args(
+            &sandbox_args,
+            &[("pid", "-"), ("read-line", "-"), ("exit", "7")],
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(run.stdout.take().unwrap());
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut stdout, &mut line).unwrap();
+    let program: u32 = parse_line(line.trim_end()).detail.parse().unwrap();
+    let broker = broker_of(program, port, &mut run);
+    thread::sleep(Duration::from_secs(1));
+    assert!(
+        run.try_wait().unwrap().is_none(),
+        "sandy ended the program while its broker was alive"
+    );
+    kill_process(broker);
+    let deadline = Instant::now() + WAIT;
+    while run.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "sandy kept the program running after its broker was gone"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let output = run.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    let reason = String::from_utf8_lossy(&output.stderr);
+    assert!(reason.contains("egress broker ended"), "{reason}");
+}
+
+/// With the default `signals = "any"` the program may stop its broker, which then cannot see the
+/// program end. Its watchdog ends it within two seconds of the stop (rule 5 of "Forwarded
+/// ports"). Control: the broker answered before the stop.
+#[test]
+fn a_stopped_broker_ends_with_the_program() {
+    if !private_network_works() {
+        return;
+    }
+    let port = free_port();
+    let mut run = Command::new(sandy_path())
+        .args(run_args(
+            &egress(port, "public"),
+            &[
+                ("socks5-connect", &socks(port, "localhost:80")),
+                ("signal-stop", "-"),
+            ],
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // In the exec model the program keeps sandy's process ID.
+    let broker = broker_of(run.id(), port, &mut run);
+    writeln!(run.stdin.take().unwrap(), "{broker}").unwrap();
+    let output = run.wait_with_output().unwrap();
+    let lines = parse(&output);
+    assert_eq!(lines.len(), 2, "{output:?}");
+    assert_eq!(lines[0].detail, "reply 8", "{lines:?}");
+    lines[1].assert_ok();
+    let gone = ends_soon(broker, Duration::from_secs(8));
+    if !gone {
+        // A broker that stays stopped would keep its listener for as long as this host runs.
+        kill_process(broker);
+    }
+    assert!(gone, "the stopped broker outlived the program");
+}
+
+/// The egress listener is in the sandbox's network namespace, so another local user can neither
+/// connect to the port on the host's loopback, where nothing listens, nor enter the namespace,
+/// which belongs to sandy's user. A process of sandy's own user can enter it and reach the
+/// broker, which is the exception that `check` names.
+#[test]
+fn another_user_cannot_reach_the_egress_port() {
+    if !private_network_works() {
+        return;
+    }
+    let fixture = Fixture::new("egress-other-user");
+    let probe = fixture.copy_probe("bin");
+    let Some(other_user) = other_user(&probe) else {
+        return skip(
+            "other-user",
+            "cannot run a program as another user (no `sudo -n -u nobody`, and no user namespace \
+             with sub-user IDs)",
+        );
+    };
+    if Command::new("nsenter").arg("--version").output().is_err() {
+        return skip("nsenter", "nsenter of util-linux is not installed");
+    }
+    let port = free_port();
+    let mut program = Command::new(sandy_path())
+        .args(run_args(&egress(port, "public"), &[("sleep", "30000")]))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // A name gets an answer from the broker without a connection anywhere.
+    let target = socks(port, "localhost:80");
+    let ask = [("socks5-connect", target.as_str())];
+
+    // Control: this user enters the namespace and reaches the broker.
+    let own = [nsenter(program.id()), vec![probe.clone()]].concat();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        assert!(
+            program.try_wait().unwrap().is_none(),
+            "the program ended before the broker was ready"
+        );
+        let output = run(&own, &ask);
+        if output.status.success() && parse(&output)[0].detail == "reply 8" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the broker never answered: {output:?}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    // The other user, on the host's loopback.
+    let output = run(&other_user, &ask);
+    assert!(output.status.success(), "{output:?}");
+    let line = &parse(&output)[0];
+    line.assert_blocked();
+    assert!(line.detail.contains("refused"), "{line:?}");
+    // The other user, entering the namespace: nsenter fails before the probe runs.
+    let entering = [
+        other_user[..other_user.len() - 1].to_vec(),
+        nsenter(program.id()),
+        vec![probe.clone()],
+    ]
+    .concat();
+    let output = run(&entering, &ask);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(parse(&output).is_empty(), "{output:?}");
+
+    kill_process(program.id());
+    let _ = program.wait();
+}
+
+/// check names the broker and that this user's processes can enter the namespace and reach its
+/// port.
+#[test]
+fn check_reports_the_egress_broker() {
+    if !private_network_works() {
+        return;
+    }
+    let output = sandy(["check", "--ip", "private", "--egress", "1080"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}{stderr}");
+    assert!(
+        stdout.lines().any(|line| line.starts_with("enforced     ")
+            && line.contains("connections out only through the egress broker")
+            && line.contains("host's network namespace")),
+        "{stdout}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.starts_with("warning: ") && line.contains("and egress port there")),
         "{stderr}"
     );
 }

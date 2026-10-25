@@ -21,6 +21,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::time::Duration;
 
 use landlock::{
     ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, Ruleset,
@@ -169,6 +170,115 @@ pub(crate) fn start(name: &str, main: impl FnOnce(Ready)) -> Result<libc::pid_t,
     Ok(started)
 }
 
+/// How long a helper with a watchdog lives after its loop stopped running. The loop re-arms the
+/// watchdog every `WATCHDOG_TICK`, so this is the bound a stopped helper dies within, and at the
+/// same time the margin a helper that the host is slow to schedule has before it is killed by
+/// mistake.
+pub(crate) const WATCHDOG: Duration = Duration::from_secs(2);
+/// How long a loop with a watchdog waits for work before it wakes to re-arm it. Without a
+/// watchdog it waits until there is work.
+pub(crate) const WATCHDOG_TICK: Duration = Duration::from_millis(250);
+
+/// A timer that kills a helper that serves the program (the relay, the egress broker) when its
+/// loop stops running. SIGSTOP and SIGKILL cannot be blocked, and with the default
+/// `signals = "any"` the program may send either to the helper. A stopped helper keeps its
+/// listeners and serves whatever their backlog collected once someone continues it, which would
+/// put it beyond the one second bound of rule 5 of "Forwarded ports". The timer asks the kernel
+/// for SIGKILL, which arrives also while the process is stopped.
+///
+/// With `signals = "isolated"` a helper has none. The Landlock signal scope keeps the program
+/// from signalling it, and its own session keeps terminal and group signals away, so nothing the
+/// program does can stop it. The timer would only kill a helper the host did not schedule for
+/// `WATCHDOG`, which with `children = "contained"` ends the program too.
+pub(crate) struct Watchdog(libc::c_int);
+
+impl Watchdog {
+    /// Creates the timer of the helper `name`. It must be created before the helper confines
+    /// itself, so that the filter has to allow only `timer_settime`.
+    pub(crate) fn create(name: &str) -> Result<Watchdog, SandboxError> {
+        // SAFETY: sigevent is plain data; zero is SIGEV_SIGNAL with an empty value.
+        let mut event: libc::sigevent = unsafe { mem::zeroed() };
+        event.sigev_notify = libc::SIGEV_SIGNAL;
+        event.sigev_signo = libc::SIGKILL;
+        let mut timer: libc::c_int = 0;
+        // SAFETY: timer_create reads `event` and writes the timer's ID into `timer`.
+        let created = unsafe {
+            libc::syscall(
+                libc::SYS_timer_create,
+                libc::CLOCK_MONOTONIC,
+                &raw const event,
+                &raw mut timer,
+            )
+        };
+        if created != 0 {
+            return Err(SandboxError::io(
+                format!("cannot create {name}'s watchdog timer"),
+                io::Error::last_os_error(),
+            ));
+        }
+        Ok(Watchdog(timer))
+    }
+
+    /// Gives the helper another `WATCHDOG`. A helper that cannot re-arm has lost the guarantee
+    /// that it ends with the program, so it ends now.
+    pub(crate) fn rearm(&self) {
+        let next = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: WATCHDOG.as_secs() as _,
+                tv_nsec: WATCHDOG.subsec_nanos() as _,
+            },
+        };
+        // SAFETY: timer_settime reads `next` and writes nothing, because the old value is null.
+        let armed = unsafe {
+            libc::syscall(
+                libc::SYS_timer_settime,
+                self.0,
+                0,
+                &raw const next,
+                std::ptr::null_mut::<libc::itimerspec>(),
+            )
+        };
+        if armed != 0 {
+            // SAFETY: ends the helper without running sandy's cleanup.
+            unsafe { libc::_exit(1) };
+        }
+    }
+}
+
+/// Waits until one of `fds` is readable or ends, and keeps `watchdog` armed meanwhile. Returns
+/// which of them did, or `None` when polling fails.
+pub(crate) fn wait_for(fds: &[RawFd], watchdog: Option<&Watchdog>) -> Option<Vec<bool>> {
+    let mut polls: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|&fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    let tick = match watchdog {
+        Some(_) => WATCHDOG_TICK.as_millis() as libc::c_int,
+        None => -1,
+    };
+    loop {
+        if let Some(watchdog) = watchdog {
+            watchdog.rearm();
+        }
+        // SAFETY: `polls` holds `len` valid pollfd entries.
+        let ready = unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, tick) };
+        if ready > 0 {
+            return Some(polls.iter().map(|poll| poll.revents != 0).collect());
+        }
+        if ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return None;
+        }
+    }
+}
+
 /// Gives this process's `/proc/<pid>` files to root, so that the program cannot change them even
 /// with a write grant on `/proc`. Without this the program can set `oom_score_adj` of sandy's
 /// processes to the maximum and let the kernel's out-of-memory killer end them before anything
@@ -218,13 +328,15 @@ pub(crate) const STANDARD_DESCRIPTORS: [RawFd; 3] =
     [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO];
 
 /// Closes every descriptor except `keep`, then applies no_new_privs, a Landlock ruleset without
-/// any file access that allows TCP connect only to `connect_ports` and no TCP bind (from ABI 4)
-/// and has `scopes` (from ABI 6), and `filters`. `name` names the helper in errors.
+/// any file access that allows no TCP bind and TCP connect only to `connect_ports` (from ABI 4)
+/// and has `scopes` (from ABI 6), and `filters`. With `connect_ports` `None` TCP connect stays
+/// unhandled, for the egress broker, whose destination check decides where it connects. `name`
+/// names the helper in errors.
 pub(crate) fn confine(
     name: &str,
     keep: &[RawFd],
     abi: ABI,
-    connect_ports: impl IntoIterator<Item = u16>,
+    connect_ports: Option<&[u16]>,
     scopes: BitFlags<Scope>,
     filters: &Filters,
 ) -> Result<(), SandboxError> {
@@ -234,16 +346,18 @@ pub(crate) fn confine(
         .handle_access(AccessFs::from_all(abi))
         .map_err(landlock_error)?;
     if abi >= ABI::V4 {
-        ruleset = ruleset
-            .handle_access(AccessNet::BindTcp | AccessNet::ConnectTcp)
-            .map_err(landlock_error)?;
+        let mut handled: BitFlags<AccessNet> = AccessNet::BindTcp.into();
+        if connect_ports.is_some() {
+            handled |= AccessNet::ConnectTcp;
+        }
+        ruleset = ruleset.handle_access(handled).map_err(landlock_error)?;
     }
     if abi >= ABI::V6 && !scopes.is_empty() {
         ruleset = ruleset.scope(scopes).map_err(landlock_error)?;
     }
     let mut ruleset = ruleset.create().map_err(landlock_error)?;
     if abi >= ABI::V4 {
-        for port in connect_ports {
+        for &port in connect_ports.unwrap_or_default() {
             let connect: BitFlags<AccessNet> = AccessNet::ConnectTcp.into();
             ruleset = ruleset
                 .add_rule(NetPort::new(port, connect))

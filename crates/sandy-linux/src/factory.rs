@@ -205,7 +205,7 @@ fn factory_main(channel: &OwnedFd, ready: Ready, abi: ABI) {
                 "the socket factory",
                 &keep,
                 abi,
-                [],
+                Some(&[]),
                 Scope::Signal | Scope::AbstractUnixSocket,
                 &filters,
             )
@@ -276,7 +276,7 @@ mod tests {
             "the socket factory",
             &[libc::STDERR_FILENO],
             abi,
-            [],
+            Some(&[]),
             Scope::Signal | Scope::AbstractUnixSocket,
             &filters,
         );
@@ -307,6 +307,9 @@ mod tests {
     /// The child process applies the factory's confinement to itself and leaves through `_exit`.
     #[test]
     fn the_confined_factory_can_only_make_sockets() {
+        if !crate::alone::in_own_process() {
+            return;
+        }
         let Ok(version) = HostCapabilities::detect().landlock else {
             eprintln!("skipped: no Landlock");
             return;
@@ -333,6 +336,9 @@ mod tests {
     /// side closes.
     #[test]
     fn the_factory_serves_sockets_until_its_relay_ends() {
+        if !crate::alone::in_own_process() {
+            return;
+        }
         let Ok(version) = HostCapabilities::detect().landlock else {
             eprintln!("skipped: no Landlock");
             return;

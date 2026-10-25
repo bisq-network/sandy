@@ -585,7 +585,7 @@ exceptions:
 | Linux | `signals = "isolated"` without `children = "contained"` | a read from the terminal in the background stops the group sandy was started in, with the processes outside the sandbox in it |
 | Linux | `ip = "client"` | a UDP socket that is not connected receives datagrams from every sender, at the port the kernel chose for it, and before Landlock ABI 10 at any port the program binds |
 | Linux | `forward` with `ip = "client"` or `ip = "all"` | another local user can deliver a write to the forwarded service, through a connection it closed before the relay asked who owns it, and that no longer carries its user (from the close on Linux 6.8, after the timewait record on newer kernels) |
-| Linux | `ip = "private"` | processes of the user that runs sandy can enter the sandbox's network namespace, which belongs to that user, and reach the program's ports and forwarded ports there without a relay |
+| Linux | `ip = "private"` | processes of the user that runs sandy can enter the sandbox's network namespace, which belongs to that user, and reach the program's ports and forwarded ports there without a relay, and the egress port |
 | Linux | `path_metadata = "deny"` with a `read` or `read_exec` path | the mode, except the setuid and setgid bits, and the times of a file or directory the program may only read, through a descriptor it opened for reading (`fchmod`, `futimens`) |
 | macOS | `signals = "isolated"` | SIGIO (to a process of any user), and SIGURG with an `ip` other than `"none"`, through the owner ioctls of sockets and pipes; without `children = "contained"` also joining another job of the terminal session and stopping it |
 | macOS | `ip = "client"` | a UDP socket that is not connected receives datagrams from every sender, at any port the program binds |
@@ -710,15 +710,17 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   has one thread, Landlock `restrict_self`, up to four seccomp filters (TSYNC), `execve`.
   Everything that can fail on bad input is prepared before the first step. Landlock restricts
   the calling thread, so the thread check is what makes the domain cover the whole process.
-  With `ip = "private"` the namespaces come first, after the relay and the watcher have started.
+  With `ip = "private"` the namespaces come first, after the relay, the egress broker and the
+  watcher have started.
 - `ip = "private"`: one `unshare(CLONE_NEWUSER | CLONE_NEWNET)` in the process that becomes the
   program (sandy in the exec model, so the program keeps its process ID; the forked child with
   `contained` and with `--explain`), then `setgroups` denied and single-ID maps of the user's own
   user and group ID, never root, and `lo` up. sandy binds the forward listeners inside and hands
-  them to the relay over a socket pair, drops every capability of the namespace, the bounding set
-  included, and with exposed ports starts a socket factory there. The filters read their IDs
-  after the maps, and the program's filter is the one of `ip = "all"`; it still denies namespaces
-  and mounts. `plan` reads `user.max_user_namespaces`, `kernel.unprivileged_userns_clone`, and
+  them to the relay over a socket pair, and the egress listener to the broker, drops every
+  capability of the namespace, the bounding set included, and with exposed ports starts a socket
+  factory there. The filters read their IDs after the maps, and the program's filter is the one
+  of `ip = "all"`; it still denies namespaces and mounts. `plan` reads
+  `user.max_user_namespaces`, `kernel.unprivileged_userns_clone`, and
   `kernel.apparmor_restrict_unprivileged_userns` with sandy's AppArmor label: under the Ubuntu
   restriction an unconfined sandy gets no rights in its user namespace, and the requirement needs
   setup (an AppArmor profile). `check` also tries the steps in a forked child.
@@ -780,9 +782,9 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   program writes its own process ID into that pipe, after it has joined the group, so the guard
   learns it without sandy running again after the fork and never before a kill of the group would
   reach the program. sandy also kills the group when the program exits and waits until the group
-  is gone. With exposed or forwarded ports the guard also watches the relay with a pidfd; when
-  the relay ends first, it tells sandy before the kill, and sandy exits with status 125 (rule 5
-  of "Forwarded ports").
+  is gone. With exposed or forwarded ports the guard also watches the relay with a pidfd, and the
+  egress broker with another; when one ends first, it tells sandy before the kill, and sandy
+  exits with status 125 (rule 5 of "Forwarded ports").
 - `process.end_with_parent`: a watcher process, forked twice like the relay, polls pidfds for
   sandy's parent and for the program (with `contained`: the supervising sandy). When the parent
   ends, it sends SIGTERM and SIGCONT and, 5 seconds later, SIGKILL. Like the relay, it runs in a
@@ -812,10 +814,23 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   without capabilities, file access or TCP rights whose filter allows creating TCP sockets and
   passing them on, and nothing else. The relay ends when the factory ends, so the guard of
   `contained`, which watches the relay, ends the program then.
+- `network.egress`: a broker process, forked twice before the `unshare` like the relay, so it
+  stays in the host's network namespace and is no child of the program. Its listener on
+  `127.0.0.1:PORT` is bound inside the sandbox's namespace and handed to it as the forward
+  listeners are handed to the relay. It answers the host's part of the destination check over a
+  `NETLINK_ROUTE` socket that sandy opens and tries before it starts the broker (`RTM_GETROUTE`
+  and `RTM_GETADDR`), and confines itself with no_new_privs, Landlock without file access and
+  without TCP bind (from ABI 4) but with TCP connect left unhandled, the signal and abstract
+  socket scopes (from ABI 6), and a seccomp filter limited to TCP sockets, the route lookups,
+  copying, threads and its watchdog. It ends with the program as the relay does, with the same
+  watchdog under `signals = "any"`, but it takes its backlog also after a stop: only the
+  program's own processes and processes of sandy's user that entered the namespace reach it, and
+  every connection is still checked (docs/linux.md, "Egress broker").
 - Refused: no Landlock (the reason names the fix), no seccomp, root or any capability, a writable
   path that overlaps the minimal system set (rule 6), a program whose ELF loader no executable
-  path covers (the kernel opens it during `execve`), and `ip = "private"` where user namespaces
-  are disabled or a trial of them fails (under Ubuntu's AppArmor restriction it needs setup).
+  path covers (the kernel opens it during `execve`), `ip = "private"` where user namespaces
+  are disabled or a trial of them fails (under Ubuntu's AppArmor restriction it needs setup), and
+  `egress` with it, or where the kernel does not answer the broker's route lookups.
 
 ### macOS
 

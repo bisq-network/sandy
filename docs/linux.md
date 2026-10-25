@@ -29,8 +29,8 @@ The research behind the design is in [research/linux-mechanisms.md](research/lin
    filters, and build the `execve` arguments and environment as C strings. Change to the working
    directory if the policy sets one.
 
-With `ip = "private"` the process then enters its namespaces, after the relay and the watcher
-have started and before step 4 (see "Private network").
+With `ip = "private"` the process then enters its namespaces, after the relay, the egress broker
+and the watcher have started and before step 4 (see "Private network").
 
 Then sandy resets SIGPIPE to its default action, because the Rust runtime ignores it and an
 ignored signal stays ignored across `execve`. Not earlier: until then sandy writes for itself,
@@ -83,7 +83,8 @@ can write, so the rule then reaches nothing that this process could not reach al
 | InheritedHandlesClosed | Close-on-exec on every descriptor above 2. |
 | EnvironmentControlled | `execve` with exactly the policy environment. The backend adds no variables. |
 | IpNetworkDenied | The socket family allowlist has no `AF_INET`, `AF_INET6` or `AF_NETLINK`; io_uring is denied. From ABI 4, Landlock also denies TCP bind and connect. |
-| IpNetworkPrivate | A user and a network namespace with only `lo`, which the relays alone cross; the filters of `ip = "all"` and the denial of namespaces (see "Private network"). |
+| IpNetworkPrivate | A user and a network namespace with only `lo`, which the relays and the egress broker alone cross; the filters of `ip = "all"` and the denial of namespaces (see "Private network"). |
+| EgressBrokered | A broker process in the host's network namespace that serves a listener handed to it from inside the sandbox's, checks every destination with the kernel's routing tables, and is confined by its own Landlock domain and seccomp filter (see "Egress broker"). |
 | InboundIpDenied | The denylist denies `listen`, `accept` and `accept4` for every socket. A second Landlock ruleset lets sockets bind only port 0: TCP from ABI 4, UDP from ABI 10 (see "Client networking"). |
 | UnixSocketsDenied | The allowlist has no `AF_UNIX`, and socket pairs are limited to stream and seqpacket. From ABI 6, Landlock scopes abstract sockets; from ABI 9 it denies connections to pathname sockets. |
 | SignalsIsolated | Landlock signal scope (ABI 6) and the denylist, which denies `setpgid` into a process group that exists and the terminal ioctls `TIOCSPGRP`, `TIOCSWINSZ` and `TIOCSIG` (see "Signals and the terminal"). Unavailable on older ABIs. |
@@ -318,15 +319,16 @@ AppContainer reaches the forward listener.
 `ip = "private"` gives the program a network of its own: a user namespace and a network
 namespace that holds only `lo`. Inside it the program may use IP freely: the socket family filter
 allows what `ip = "all"` allows, and neither `listen` nor `bind` is restricted. No route leaves
-the namespace. The relays of `expose` and `forward` are the only ways in and out.
+the namespace. The relays of `expose` and `forward` are the only ways in and out, and the egress
+broker of `egress` is the only way to the network.
 
 ### Launch order
 
 The process that becomes the program enters the namespaces: sandy itself in the exec model, so
 the program keeps sandy's process ID, and the forked child with `children = "contained"` and with
-`--explain`, so the supervising sandy stays in the host's namespaces. It does so after the relay
-and the watcher have started, which must stay in the host's namespaces, and before step 4 of the
-launch sequence:
+`--explain`, so the supervising sandy stays in the host's namespaces. It does so after the relay,
+the egress broker and the watcher have started, which must stay in the host's namespaces, and
+before step 4 of the launch sequence:
 
 1. One `unshare(CLONE_NEWUSER | CLONE_NEWNET)`, with one thread, which sandy checks. The forked
    child of `contained` first makes itself dumpable again: it inherits sandy's undumpable flag,
@@ -338,7 +340,8 @@ launch sequence:
    user keeps none.
 3. `lo` up (`SIOCSIFFLAGS`), which needs `CAP_NET_ADMIN` in the new user namespace. The process
    holds every capability there until step 5.
-4. The forward listeners are bound inside and handed to the relay (see "The relays" below).
+4. The forward listeners are bound inside and handed to the relay, and the egress listener to the
+   broker (see "The relays" and "Egress broker" below).
 5. Every capability is dropped: the bounding set (`PR_CAPBSET_DROP`), the ambient set, and the
    effective, permitted and inheritable sets. All five read zero in the program's
    `/proc/self/status`.
@@ -387,6 +390,94 @@ host's namespace, where it listens for exposed ports and connects to forward tar
   both socket pairs right after the fork, so that the relay sees the end of the factory, and the
   end of a child that fails before it binds the forward listeners. With `signals = "any"` the
   program can stop or kill the factory, as it can the relay.
+
+### Egress broker
+
+`network.egress` adds a SOCKS5 broker on the program's `127.0.0.1:PORT`. DESIGN.md ("Private
+network and egress", "Egress broker") describes the handshake and the destination check, which
+every platform shares. On Linux the broker is a helper process of its own, apart from the relay:
+the relay's Landlock rules allow TCP connect only to its targets, and the broker must reach every
+port the check allows.
+
+1. Before the `unshare`, sandy opens a `NETLINK_ROUTE` socket and checks that the kernel answers
+   a route lookup and an address dump over it, so a kernel that cannot answer refuses the run
+   instead of every connection later. It opens a pidfd for its own process ID (with
+   `contained`: the supervising sandy's) and a socket pair for the listener.
+2. It forks the broker twice, as it forks the relay: in a session of its own, with every signal
+   except the fault signals blocked and `/dev/null` as its standard descriptors. The broker stays
+   in the host's network namespace.
+3. The broker raises its soft limit of open descriptors so that
+   `sandy_relay::broker::MAX_CONNECTIONS` (1000) connections fit, creates its watchdog under
+   `signals = "any"`, closes every descriptor except the netlink socket, the pidfd, the guard's
+   pipe with `contained`, its side of the socket pair and the readiness pipe, and confines
+   itself:
+   - no_new_privs;
+   - Landlock with every file system right of the ABI handled and no rule, so it opens, creates
+     and executes no file; from ABI 4 TCP bind handled with no rule, and TCP connect not handled,
+     because the destination check decides where it connects; from ABI 6 the signal and abstract
+     socket scopes;
+   - the shared allowlist filter and a broker filter that allows only accepting, connecting,
+     reading and writing sockets, the socket options it sets and reads, `getsockname` and
+     `getpeername` for the check after the connect, `sendto` and `recvfrom` for the route
+     lookups, `recvmsg` for the listener, polling, memory calls, `clone` for threads only,
+     `timer_settime` for the watchdog and `FIONBIO`. `socket` is allowed for IPv4 and IPv6 TCP
+     with protocol 0 alone; the netlink socket exists already. Every other call fails with
+     `EPERM`, among them `bind`, `listen`, `sendmsg`, `read` and every call on a file; `clone3`
+     fails with `ENOSYS`.
+4. It starts and joins one test thread and reports ready. In step 4 of "Launch order" the process
+   that enters the namespace binds `127.0.0.1:PORT` there and sends the listener over the socket
+   pair; a port below 1024 works, because the capability that binds one is still there. The
+   broker waits for it as the relay waits for its forward listeners: it watches the end of the
+   program and of the guard's pipe meanwhile, and keeps its watchdog armed.
+5. It serves the listener with `sandy_relay::broker::serve`, which asks the kernel for every
+   connection whether the destination is this host (`RTM_GETROUTE` for the destination, and
+   `RTM_GETADDR` for the addresses and subnets of every interface), and connects from the host's
+   namespace. A thread polls the pidfd and the guard's pipe, keeps the watchdog armed, and asks
+   the serve loop to stop when either ends.
+
+Its lifetime follows rule 5 of "Forwarded ports":
+
+- When the program ends (with `contained`: when the guard's pipe or sandy ends), the broker takes
+  the connections its backlog holds, closes its listener, gives the accepted connections at most
+  one second, and resets the rest.
+- With `signals = "any"` the program can stop the broker. Its watchdog then kills it two seconds
+  after the watching thread last ran, as the relay's does
+  (`a_stopped_broker_ends_with_the_program`). With `signals = "isolated"` it has no watchdog, for
+  the reason the relay has none.
+- Unlike the relay, the broker takes its backlog also after it was stopped and continued. The
+  relay refuses that backlog because a connection in it may have been made after the program
+  ended and would reach whatever holds the relay's target by then. Only processes inside the
+  sandbox's network namespace reach the broker's listener: the program's own, which are confined
+  as the program is, and processes of sandy's user that entered it, which reach the network
+  directly anyway. Every connection is still checked and gets at most the drain second, so a
+  late one reaches nothing the program could not reach while it ran.
+- With `contained` the guard watches the broker with a pidfd, as it watches the relay, and ends
+  the program's group when the broker ends first: sandy exits with status 125 and says that the
+  egress broker ended (`a_dead_broker_ends_a_contained_program`). Without `contained` nothing
+  watches it, and a broker that something outside the sandbox kills leaves the program without
+  its way out.
+
+Who reaches it: the listener is in the sandbox's network namespace, so another user can neither
+connect to it, because nothing listens at that port on the host's loopback, nor enter the
+namespace (`another_user_cannot_reach_the_egress_port`). Processes of sandy's own user can enter
+it, the exception that "What stays open" names.
+
+What the program gets, measured on Fedora 44:
+
+- `curl --socks5 127.0.0.1:1080 http://1.1.1.1/` works. curl's `--socks5-hostname` and
+  `socks5h://` send the name, which gets reply 8, and no name server is reachable from inside,
+  unless a forwarded port reaches one over TCP. A program therefore needs the address of each
+  destination, or a resolver of its own behind a forwarded port.
+- Only TCP leaves; ICMP and UDP stay inside.
+- The broker reaches what the host's routes reach, as sandy's user, VPN tunnels and the bridges
+  of containers and virtual machines included. Their subnets are subnets of the host's
+  interfaces, so `public` refuses their hosts and `public-and-local` allows them (measured: the
+  SSH ports of the VMs of a libvirt network), while their bridge addresses, which are this host,
+  stay refused.
+- The start takes about 1.8 ms more than without the broker: 6.2 to 6.4 ms against 4.3 to 4.7 ms,
+  as the median of 100 runs of `sandy run --ip private -- /usr/bin/true` with the release build
+  (kernel 7.2, a busy 24 CPU host). Each connection costs a route lookup and an address dump over
+  netlink, two threads with 256 KiB stacks and two descriptors.
 
 ### Detection
 
@@ -440,8 +531,9 @@ answer: a step that fails refuses the run with the step's error.
 - **Processes of the user that runs sandy.** The namespaces belong to that user, so its processes
   outside the sandbox hold every capability in them (the owner rule of `cap_capable`). A
   single-threaded one can enter them (`nsenter --target PID --user --net --preserve-credentials`)
-  and reach the program's ports and the forward listeners without a relay. With `ip = "all"` such
-  a process reaches the program's ports directly. A process of another user can do neither:
+  and reach the program's ports and the forward listeners without a relay, and the egress port,
+  through which it reaches nothing it does not reach directly. With `ip = "all"` such a process
+  reaches the program's ports directly. A process of another user can do neither:
   opening the program's `/proc/PID/ns` files fails with `EACCES`, and `setns` through a pidfd,
   as `nsenter` does it, with `EPERM` (measured with a sub-user ID on Fedora 44). This is an exception of
   `IpNetworkPrivate` (DESIGN.md, "Requirements and the enforcement plan"): `sandy check` warns
@@ -725,13 +817,14 @@ when the program ends. sandy does not replace itself with the program:
 2. sandy forks the guard. The guard creates a process group of its own and closes every
    descriptor except the read end of a pipe. sandy holds the write end; the forked program in
    step 3 has a copy until `execve` closes it, so the pipe ends only once sandy is gone and the
-   program has started or ended. With exposed or forwarded ports the guard also keeps a pidfd
-   for the relay, the write end of the relay's pipe, and the write end of a pipe back to sandy
-   (step 7 of "Exposed and forwarded ports").
+   program has started or ended. With exposed or forwarded ports, or an egress broker, the guard
+   also keeps a pidfd for the relay and one for the broker, the write end of their pipe, and the
+   write end of a pipe back to sandy (step 7 of "Exposed and forwarded ports").
 3. sandy forks the program. Once the program has reported its process ID (step 4), the guard
-   opens a pidfd for it and polls that and the pipe, and the relay's pidfd if there is a relay.
+   opens a pidfd for it and polls that and the pipe, and the pidfds of the relay and the broker.
    When the program ends, when the pipe ends because sandy died (also by `SIGKILL`), or when the
-   relay ends, the guard checks that it leads its group and kills the group with `SIGKILL`. The group therefore ends with the program even while sandy is stopped.
+   relay or the broker ends, the guard checks that it leads its group and kills the group with
+   `SIGKILL`. The group therefore ends with the program even while sandy is stopped.
 4. The forked program joins the guard's group and then writes its own process ID into the guard's
    pipe, in that order. The guard therefore learns the ID even if sandy never runs again after
    the fork, for example because it was stopped or killed in that moment, and it never learns it
@@ -1835,7 +1928,10 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   `kernel.unprivileged_userns_clone` 0), or where a trial of the namespaces fails, for example
   inside another sandbox: IpNetworkPrivate is unavailable. Under Ubuntu's AppArmor restriction of
   unprivileged user namespaces it needs setup, and `sandy check` exits with status 2 (see
-  "Private network" and "Setup on Ubuntu").
+  "Private network" and "Setup on Ubuntu"). EgressBrokered follows it, because the broker serves
+  a listener in that namespace. It is also unavailable when the kernel does not answer a route
+  lookup and an address dump over a `NETLINK_ROUTE` socket, which `check` tries and `run` asks
+  before it starts the broker.
 - A listening address of a relay that another process holds: ExposedPortsRelayed or
   ForwardedPortsRelayed is unavailable. `sandy check` binds the same addresses for a moment and
   releases them again, so it reports what `run` refuses. The answer can be stale one moment
@@ -2005,10 +2101,13 @@ higher, a socket family) call `common::skip`, which records the skip; the README
 from the kernel: below ABI 6, the signal test expects sandy to refuse `signals = "isolated"`.
 The unit tests in `crates/sandy-linux` cover the planning function with invented host
 capabilities, and the filter decisions with a small BPF interpreter that applies every
-installed filter with the kernel's precedence. `setup_linux.rs` covers `sandy setup`; its tests
-that change the host take root with `sudo -n`, skip where sudo asks for a password
-(`passwordless-sudo`) or the restriction does not apply, run one at a time, and remove what they
-installed without sandy's help, so a failed test leaves nothing behind either.
+installed filter with the kernel's precedence. A unit test whose forked child allocates or starts
+threads runs again in a process of its own (`alone.rs`): libtest runs the tests on many threads,
+and a child that `fork` makes from one of them inherits the locks the others hold at that moment,
+which hung the relay's test in about 1 of 40 runs of the binary. `setup_linux.rs` covers
+`sandy setup`; its tests that change the host take root with `sudo -n`, skip where sudo asks for a
+password (`passwordless-sudo`) or the restriction does not apply, run one at a time, and remove
+what they installed without sandy's help, so a failed test leaves nothing behind either.
 
 ### A lower ABI on this kernel
 

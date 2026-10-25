@@ -3,6 +3,9 @@
 //! `docs/linux.md`.
 #![cfg(target_os = "linux")]
 
+#[cfg(test)]
+mod alone;
+mod broker;
 mod cgroup;
 mod contain;
 mod elevate;
@@ -20,10 +23,6 @@ mod peer;
 mod plan;
 mod relaunch;
 mod relay;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the Linux egress broker, a later task, uses it")
-)]
 mod routes;
 mod setup;
 mod system;
@@ -58,7 +57,8 @@ impl Backend for LinuxBackend {
     /// The trial binds of the relay ports, and with `ip = "private"` a trial of the namespace
     /// steps when the host says nothing against them. The forward listeners then bind inside the
     /// sandbox's new network namespace, where no port is taken, so a busy port on the host's
-    /// loopback says nothing about them.
+    /// loopback says nothing about them. The egress broker needs the namespace too, and the
+    /// kernel's answers about this host's addresses, which `run` asks for before it starts it.
     fn verify(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
         let private = policy.ip == IpAccess::Private;
         let mut items = sandy_core::verify::relay_listeners(policy);
@@ -67,11 +67,23 @@ impl Backend for LinuxBackend {
             if namespace::support().is_ok()
                 && let Err(reason) = namespace::probe(Namespaces { network: true })
             {
+                let reason = format!("a trial of the sandbox's namespaces failed: {reason}");
                 items.push(PlanItem::unavailable(
                     Requirement::IpNetworkPrivate,
-                    format!("a trial of the sandbox's namespaces failed: {reason}"),
+                    reason.clone(),
                 ));
+                if policy.egress.is_some() {
+                    items.push(PlanItem::unavailable(Requirement::EgressBrokered, reason));
+                }
             }
+        }
+        if policy.egress.is_some()
+            && let Err(error) = routes::Routes::open()
+        {
+            items.push(PlanItem::unavailable(
+                Requirement::EgressBrokered,
+                error.to_string(),
+            ));
         }
         items
     }

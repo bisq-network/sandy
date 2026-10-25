@@ -413,6 +413,9 @@ mod tests {
     /// one with the AppArmor restriction they fail at the first map write.
     #[test]
     fn the_probe_agrees_with_the_host() {
+        if !crate::alone::in_own_process() {
+            return;
+        }
         let tried = probe(Namespaces { network: true });
         match support() {
             Ok(()) if tried.is_err() => {
@@ -432,6 +435,9 @@ mod tests {
     /// no capability in any set, and an `lo` that takes a listener.
     #[test]
     fn the_namespace_maps_the_own_ids_and_leaves_no_capability() {
+        if !crate::alone::in_own_process() {
+            return;
+        }
         if support().is_err() || probe(Namespaces { network: true }).is_err() {
             eprintln!("skipped: this host gives sandy no user namespace");
             return;

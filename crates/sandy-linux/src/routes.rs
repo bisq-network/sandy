@@ -16,8 +16,8 @@
 use std::io;
 use std::mem::size_of;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::Mutex;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use sandy_core::SandboxError;
@@ -124,6 +124,15 @@ impl Routes {
             )),
             Err(error) => Err(failed(error)),
         }
+    }
+
+    /// The netlink socket, which the broker keeps when it closes its other descriptors.
+    pub(crate) fn fd(&mut self) -> RawFd {
+        let socket = self
+            .socket
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        socket.fd.as_raw_fd()
     }
 
     /// The type of the route to `ip` (`RTN_*`), or `None` when the kernel has no route there,
@@ -567,8 +576,7 @@ mod tests {
 
     /// An answer that an earlier lookup left unread, for example after a timeout, is never taken
     /// for the answer to a later one. The broker's threads take turns on the socket, so this is
-    /// what keeps their answers apart. A test with threads would also do, but other tests here
-    /// fork, and a thread that starts while they fork can leave the child deadlocked.
+    /// what keeps their answers apart.
     #[test]
     fn a_late_answer_is_not_taken_for_the_current_one() {
         let routes = Routes::open().unwrap();

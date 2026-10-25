@@ -21,7 +21,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 use sandy_core::SandboxError;
 
-use crate::helper::{receive_descriptor, send_descriptor, socket_pair};
+use crate::helper::{self, Watchdog, receive_descriptor, send_descriptor, socket_pair};
 
 /// The side of the process that enters the namespace: what to bind there, and where the
 /// listeners go.
@@ -84,6 +84,21 @@ impl Inbox {
         self.socket.as_raw_fd()
     }
 
+    /// Waits for the listeners as `receive` does, while it watches `ends`, the end of the program
+    /// and of the guard's pipe, and keeps `watchdog` armed. `None` when one of `ends` ended first
+    /// or the listeners never came.
+    pub fn wait(self, ends: &[RawFd], watchdog: Option<&Watchdog>) -> Option<Vec<TcpListener>> {
+        let fds: Vec<RawFd> = [self.fd()]
+            .into_iter()
+            .chain(ends.iter().copied())
+            .collect();
+        let ready = helper::wait_for(&fds, watchdog)?;
+        if ready[1..].contains(&true) {
+            return None;
+        }
+        self.receive().ok()
+    }
+
     /// Waits for the listeners, in the order of the addresses. An error when the other end
     /// ended before it sent all of them.
     pub fn receive(self) -> io::Result<Vec<TcpListener>> {
@@ -107,51 +122,50 @@ mod tests {
     use super::*;
     use std::net::TcpStream;
 
-    /// The listeners arrive in order and accept, and the sender keeps none of them. In a forked
-    /// child: a process that another test thread forks would hold copies of the listeners.
+    /// The listeners arrive in order and accept, and the sender keeps none of them. In a process
+    /// of its own (`alone`): a child that another test forks meanwhile would hold copies of them.
     #[test]
     fn listeners_arrive_in_order_and_the_sender_keeps_none() {
-        // SAFETY: the child only runs the checks below and leaves through `_exit`.
-        let child = unsafe { libc::fork() };
-        if child == 0 {
-            let outcome = (|| {
-                let addresses: Vec<SocketAddr> = (0..2)
-                    .map(|_| TcpListener::bind("127.0.0.1:0")?.local_addr())
-                    .collect::<io::Result<_>>()
-                    .map_err(|_| 1)?;
-                let (handover, inbox) = pair(addresses.clone(), "the test").map_err(|_| 2)?;
-                handover.send().map_err(|_| 3)?;
-                let listeners = inbox.receive().map_err(|_| 4)?;
-                for (listener, address) in listeners.iter().zip(&addresses) {
-                    if listener.local_addr().ok() != Some(*address) {
-                        return Err(5);
-                    }
-                    let _client = TcpStream::connect(address).map_err(|_| 6)?;
-                    listener.accept().map_err(|_| 7)?;
-                }
-                // Once the helper closes them, the ports are free: the sender held no copy.
-                drop(listeners);
-                if addresses
-                    .iter()
-                    .any(|address| TcpStream::connect(address).is_ok())
-                {
-                    return Err(8);
-                }
-                Ok(())
-            })();
-            // SAFETY: ends the child without running the test harness's cleanup.
-            unsafe { libc::_exit(outcome.err().unwrap_or(0)) };
+        if !crate::alone::in_own_process() {
+            return;
         }
-        let mut status = 0;
-        // SAFETY: waits for the child created above.
-        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
-        assert!(libc::WIFEXITED(status), "wait status {status}");
-        assert_eq!(
-            libc::WEXITSTATUS(status),
-            0,
-            "step {}",
-            libc::WEXITSTATUS(status)
-        );
+        // A port that was free a moment ago can be taken by any process of the host before the
+        // handover binds it again, so the test takes a few tries.
+        let (addresses, listeners) = (0..5)
+            .find_map(|_| {
+                let addresses: Vec<SocketAddr> = (0..2)
+                    .map(|_| {
+                        TcpListener::bind("127.0.0.1:0")
+                            .unwrap()
+                            .local_addr()
+                            .unwrap()
+                    })
+                    .collect();
+                let (handover, inbox) = pair(addresses.clone(), "the test").unwrap();
+                match handover.send() {
+                    Ok(()) => Some((addresses, inbox.receive().unwrap())),
+                    Err(error) => {
+                        let source = std::error::Error::source(&error)
+                            .and_then(|source| source.downcast_ref::<io::Error>());
+                        assert!(
+                            source.is_some_and(|source| source.kind() == io::ErrorKind::AddrInUse),
+                            "{error}"
+                        );
+                        None
+                    }
+                }
+            })
+            .expect("no two free ports in five tries");
+        for (listener, address) in listeners.iter().zip(&addresses) {
+            assert_eq!(listener.local_addr().unwrap(), *address);
+            let _client = TcpStream::connect(address).unwrap();
+            listener.accept().unwrap();
+        }
+        // Once the helper closes them, the ports are free: the sender held no copy.
+        drop(listeners);
+        for address in &addresses {
+            assert!(TcpStream::connect(address).is_err(), "{address}");
+        }
     }
 
     #[test]

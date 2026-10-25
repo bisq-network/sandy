@@ -53,8 +53,12 @@ use sandy_core::{ExposedPort, ForwardedPort, SandboxError, SignalScope};
 use crate::factory::{self, Factory};
 use crate::filter;
 use crate::handover::{self, Handover, Inbox};
-use crate::helper::{self, Ready};
+use crate::helper::{self, Ready, WATCHDOG_TICK, Watchdog};
 use crate::peer::PeerCheck;
+
+/// Why a contained program ends when its relay ends first (`contain::Helper`).
+pub const ENDED_FIRST: &str = "the relay of the exposed or forwarded ports ended before the \
+    program; the ports it served are gone and the program has been ended with it";
 
 /// The relay accepts connections on `listen` and connects each one to `target`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,7 +251,10 @@ fn relay_main(relay: Relay, ready: Ready, config: &RelayConfig) {
             SandboxError::io("cannot raise the relay's descriptor limit", error)
         })?;
         // Created before the filter is installed, so only re-arming it has to pass the filter.
-        let watchdog = config.watchdog.then(Watchdog::create).transpose()?;
+        let watchdog = config
+            .watchdog
+            .then(|| Watchdog::create("the relay"))
+            .transpose()?;
         confine(&keep, config)?;
         // Every connection gets its own threads. Starting one now shows that the filter allows
         // it, so a missing system call fails the start instead of the first connection.
@@ -276,7 +283,7 @@ fn relay_main(relay: Relay, ready: Ready, config: &RelayConfig) {
     let mut ends = vec![program.as_raw_fd()];
     ends.extend(ended.as_ref().map(AsRawFd::as_raw_fd));
     if let Some(inbox) = inbox {
-        let Some(received) = wait_for_listeners(inbox, &ends, watchdog.as_ref()) else {
+        let Some(received) = inbox.wait(&ends, watchdog.as_ref()) else {
             return;
         };
         for (listener, pair) in received.into_iter().zip(config.forwarded()) {
@@ -295,130 +302,11 @@ fn relay_main(relay: Relay, ready: Ready, config: &RelayConfig) {
     );
 }
 
-/// Waits for the forward listeners that sandy binds inside the namespace (`handover`), while it
-/// watches `ends` as the poll loop does and keeps the watchdog armed. `None` when the program
-/// ended first or the listeners never came.
-fn wait_for_listeners(
-    inbox: Inbox,
-    ends: &[RawFd],
-    watchdog: Option<&Watchdog>,
-) -> Option<Vec<TcpListener>> {
-    let mut polls: Vec<libc::pollfd> = [inbox.fd()]
-        .into_iter()
-        .chain(ends.iter().copied())
-        .map(|fd| libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        })
-        .collect();
-    let tick = match watchdog {
-        Some(_) => WATCHDOG_TICK.as_millis() as libc::c_int,
-        None => -1,
-    };
-    loop {
-        if let Some(watchdog) = watchdog {
-            watchdog.rearm();
-        }
-        // SAFETY: `polls` holds `len` valid pollfd entries.
-        let ready = unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, tick) };
-        if ready < 0 {
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return None;
-        }
-        if polls[1..].iter().any(|poll| poll.revents != 0) {
-            return None;
-        }
-        if polls[0].revents != 0 {
-            return inbox.receive().ok();
-        }
-    }
-}
-
 /// How long accepted connections may outlive the program (rule 5 of "Forwarded ports" in
 /// DESIGN.md).
 const DRAIN: Duration = Duration::from_secs(1);
 const DRAIN_POLL: Duration = Duration::from_millis(10);
 const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(50);
-
-/// How long the relay lives after its poll loop stopped running. The loop re-arms the watchdog
-/// every `WATCHDOG_TICK`, so this is the bound a stopped relay dies within, and at the same time
-/// the margin a relay that the host is slow to schedule has before it is killed by mistake.
-const WATCHDOG: Duration = Duration::from_secs(2);
-/// How long the poll loop waits for work before it wakes to re-arm the watchdog. Without a
-/// watchdog it waits until there is work.
-const WATCHDOG_TICK: Duration = Duration::from_millis(250);
-
-/// A timer that kills the relay when its poll loop stops running. SIGSTOP and SIGKILL cannot be
-/// blocked, and with the default `signals = "any"` the program may send either to the relay. A
-/// stopped relay keeps its ports bound and relays whatever its backlog collected once someone
-/// continues it, which would put it beyond the one second bound of rule 5. The timer asks the
-/// kernel for SIGKILL, which arrives also while the process is stopped.
-///
-/// With `signals = "isolated"` the relay has none. The Landlock signal scope keeps the program
-/// from signalling it, and its own session keeps terminal and group signals away, so nothing the
-/// program does can stop it. The timer would only kill a relay the host did not schedule for
-/// `WATCHDOG`, which with `children = "contained"` ends the program too.
-struct Watchdog(libc::c_int);
-
-impl Watchdog {
-    /// Creates the timer. It must be created before the relay confines itself, so that the
-    /// filter has to allow only `timer_settime`.
-    fn create() -> Result<Watchdog, SandboxError> {
-        // SAFETY: sigevent is plain data; zero is SIGEV_SIGNAL with an empty value.
-        let mut event: libc::sigevent = unsafe { std::mem::zeroed() };
-        event.sigev_notify = libc::SIGEV_SIGNAL;
-        event.sigev_signo = libc::SIGKILL;
-        let mut timer: libc::c_int = 0;
-        // SAFETY: timer_create reads `event` and writes the timer's ID into `timer`.
-        let created = unsafe {
-            libc::syscall(
-                libc::SYS_timer_create,
-                libc::CLOCK_MONOTONIC,
-                &raw const event,
-                &raw mut timer,
-            )
-        };
-        if created != 0 {
-            return Err(SandboxError::io(
-                "cannot create the relay's watchdog timer",
-                io::Error::last_os_error(),
-            ));
-        }
-        Ok(Watchdog(timer))
-    }
-
-    /// Gives the relay another `WATCHDOG`. A relay that cannot re-arm has lost the guarantee that
-    /// it ends with the program, so it ends now.
-    fn rearm(&self) {
-        let next = libc::itimerspec {
-            it_interval: libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            },
-            it_value: libc::timespec {
-                tv_sec: WATCHDOG.as_secs() as _,
-                tv_nsec: WATCHDOG.subsec_nanos() as _,
-            },
-        };
-        // SAFETY: timer_settime reads `next` and writes nothing, because the old value is null.
-        let armed = unsafe {
-            libc::syscall(
-                libc::SYS_timer_settime,
-                self.0,
-                0,
-                &raw const next,
-                std::ptr::null_mut::<libc::itimerspec>(),
-            )
-        };
-        if armed != 0 {
-            // SAFETY: ends the relay without running sandy's cleanup.
-            unsafe { libc::_exit(1) };
-        }
-    }
-}
 
 /// Accepts and relays connections until the program ends (or the guard's pipe `ended` ends),
 /// then closes the listeners at once and gives the accepted connections at most `DRAIN` to
@@ -602,11 +490,12 @@ impl Drop for Slot {
 fn confine(keep: &[RawFd], config: &RelayConfig) -> Result<(), SandboxError> {
     let filters = filter::relay()
         .map_err(|error| SandboxError::new(format!("cannot build the relay filter: {error}")))?;
+    let targets: Vec<u16> = config.pairs.iter().map(|pair| pair.target.port()).collect();
     helper::confine(
         "the relay",
         keep,
         config.abi,
-        config.pairs.iter().map(|pair| pair.target.port()),
+        Some(&targets),
         Scope::Signal | Scope::AbstractUnixSocket,
         &filters,
     )
@@ -667,10 +556,12 @@ mod tests {
     }
 
     /// The child process applies the relay's confinement to itself. It never prints and leaves
-    /// through `_exit`; the allocator stays usable after fork in glibc and musl, also while other
-    /// test threads run.
+    /// through `_exit`. It starts a thread, so the test runs in a process of its own (`alone`).
     #[test]
     fn the_confined_relay_reaches_only_its_targets() {
+        if !crate::alone::in_own_process() {
+            return;
+        }
         let Ok(version) = HostCapabilities::detect().landlock else {
             eprintln!("skipped: no Landlock");
             return;

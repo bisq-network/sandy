@@ -1112,6 +1112,62 @@ const RELAY_CALLS: &[i64] = &[
     libc::SYS_exit_group,
 ];
 
+/// What the egress broker needs once it is confined: accept the program's connections, read the
+/// SOCKS5 request and answer it, ask the kernel's routing tables over the netlink socket it
+/// opened before (`sendto`, `recvfrom`), connect TCP and check where a connection ended
+/// (`getsockname`, `getpeername`), copy bytes, start threads, wait for the program to end, and
+/// keep its watchdog armed. `socket`, `clone` and `ioctl` have rules of their own; everything
+/// else fails with EPERM, `bind`, `listen` and every file among them. clone3 is listed so that
+/// the shared allowlist, installed with it, decides: ENOSYS.
+const BROKER_CALLS: &[i64] = &[
+    libc::SYS_write,
+    libc::SYS_close,
+    libc::SYS_recvfrom,
+    libc::SYS_sendto,
+    // The listener arrives over a socket pair (`handover`).
+    libc::SYS_recvmsg,
+    libc::SYS_accept,
+    libc::SYS_accept4,
+    libc::SYS_connect,
+    libc::SYS_shutdown,
+    // SO_ERROR of a connect that did not block.
+    libc::SYS_getsockopt,
+    // SO_LINGER, so that a cut connection ends with a reset; SO_RCVTIMEO for the handshake and
+    // the read tick.
+    libc::SYS_setsockopt,
+    libc::SYS_getsockname,
+    libc::SYS_getpeername,
+    libc::SYS_ppoll,
+    libc::SYS_mmap,
+    libc::SYS_munmap,
+    libc::SYS_mremap,
+    libc::SYS_mprotect,
+    libc::SYS_madvise,
+    libc::SYS_brk,
+    libc::SYS_clone3,
+    libc::SYS_set_robust_list,
+    libc::SYS_rseq,
+    libc::SYS_futex,
+    libc::SYS_sched_yield,
+    libc::SYS_sched_getaffinity,
+    libc::SYS_gettid,
+    libc::SYS_getpid,
+    libc::SYS_rt_sigprocmask,
+    libc::SYS_rt_sigaction,
+    libc::SYS_rt_sigreturn,
+    libc::SYS_sigaltstack,
+    libc::SYS_nanosleep,
+    libc::SYS_clock_nanosleep,
+    libc::SYS_clock_gettime,
+    // With signals = "any" the broker re-arms its watchdog timer, which it created before the
+    // filter was installed.
+    libc::SYS_timer_settime,
+    libc::SYS_getrandom,
+    libc::SYS_restart_syscall,
+    libc::SYS_exit,
+    libc::SYS_exit_group,
+];
+
 /// What the watcher of `end_with_parent` needs: poll two pidfds, signal the program through its
 /// pidfd, write the readiness report with its process ID, and end. The memory calls cover allocations of the Rust
 /// runtime. Everything else fails with EPERM. `pidfd_send_signal` has rules of its own.
@@ -1199,6 +1255,37 @@ pub fn watcher(program: i32) -> Result<Filters, BackendError> {
     })
 }
 
+/// `socket` of the helpers that connect: IPv4 and IPv6 stream sockets with protocol 0, which is
+/// TCP. Another stream protocol, such as SCTP or MPTCP, would make the kernel load its module.
+fn tcp_socket_rules() -> Result<Vec<SeccompRule>, BackendError> {
+    [libc::AF_INET, libc::AF_INET6]
+        .into_iter()
+        .map(|family| {
+            rule(vec![
+                low(0, SeccompCmpOp::Eq, family as u64)?,
+                low(
+                    1,
+                    SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
+                    libc::SOCK_STREAM as u64,
+                )?,
+                low(2, SeccompCmpOp::Eq, 0)?,
+            ])
+        })
+        .collect()
+}
+
+/// `clone` of the helpers that serve each connection in a thread and never start a process: it
+/// needs CLONE_THREAD and no namespace flag.
+fn thread_rules() -> Result<Vec<SeccompRule>, BackendError> {
+    let namespaces = CLONE_NAMESPACES
+        .iter()
+        .fold(0, |all, &flag| all | flag as u64);
+    let no_namespace = low(0, SeccompCmpOp::MaskedEq(namespaces), 0)?;
+    let thread = libc::CLONE_THREAD as u64;
+    let a_thread = low(0, SeccompCmpOp::MaskedEq(thread), thread)?;
+    Ok(vec![rule(vec![no_namespace, a_thread])?])
+}
+
 /// Builds the filters of the relay: the shared allowlist and the relay's own list, which allows
 /// only `RELAY_CALLS`, TCP sockets, threads without namespaces, and FIONBIO. The relay serves
 /// each connection in a thread and never starts a process, so clone needs CLONE_THREAD. A
@@ -1211,28 +1298,37 @@ pub fn relay() -> Result<Filters, BackendError> {
     for &call in RELAY_CALLS.iter().chain(arch::RELAY_CALLS) {
         rules.add(call, Vec::new());
     }
-    let tcp = |family: i32| -> Result<SeccompRule, BackendError> {
-        rule(vec![
-            low(0, SeccompCmpOp::Eq, family as u64)?,
-            low(
-                1,
-                SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
-                libc::SOCK_STREAM as u64,
-            )?,
-            low(2, SeccompCmpOp::Eq, 0)?,
-        ])
-    };
-    rules.add(
-        libc::SYS_socket,
-        vec![tcp(libc::AF_INET)?, tcp(libc::AF_INET6)?],
-    );
-    let namespaces = CLONE_NAMESPACES
-        .iter()
-        .fold(0, |all, &flag| all | flag as u64);
-    let no_namespace = low(0, SeccompCmpOp::MaskedEq(namespaces), 0)?;
-    let thread = libc::CLONE_THREAD as u64;
-    let a_thread = low(0, SeccompCmpOp::MaskedEq(thread), thread)?;
-    rules.add(libc::SYS_clone, vec![rule(vec![no_namespace, a_thread])?]);
+    rules.add(libc::SYS_socket, tcp_socket_rules()?);
+    rules.add(libc::SYS_clone, thread_rules()?);
+    let fionbio = low(1, SeccompCmpOp::Eq, u64::from(libc::FIONBIO as u32))?;
+    rules.add(libc::SYS_ioctl, vec![rule(vec![fionbio])?]);
+    let filter = SeccompFilter::new(
+        rules.0,
+        SeccompAction::Errno(libc::EPERM as u32),
+        SeccompAction::Allow,
+        target,
+    )?;
+    Ok(Filters {
+        allowlist: allowlist(target)?,
+        denylist: filter.try_into()?,
+        path_xattrs: None,
+        families: None,
+    })
+}
+
+/// Builds the filters of the egress broker: the shared allowlist and the broker's own list,
+/// which allows only `BROKER_CALLS`, TCP sockets with protocol 0, threads without namespaces, and
+/// FIONBIO. The netlink socket of the route lookups exists before the filter, so `socket` needs
+/// no rule for it.
+pub fn broker() -> Result<Filters, BackendError> {
+    let target = arch::TARGET
+        .ok_or_else(|| BackendError::InvalidTargetArch(std::env::consts::ARCH.to_string()))?;
+    let mut rules = Rules::default();
+    for &call in BROKER_CALLS.iter().chain(arch::RELAY_CALLS) {
+        rules.add(call, Vec::new());
+    }
+    rules.add(libc::SYS_socket, tcp_socket_rules()?);
+    rules.add(libc::SYS_clone, thread_rules()?);
     let fionbio = low(1, SeccompCmpOp::Eq, u64::from(libc::FIONBIO as u32))?;
     rules.add(libc::SYS_ioctl, vec![rule(vec![fionbio])?]);
     let filter = SeccompFilter::new(
@@ -1258,21 +1354,7 @@ pub fn factory() -> Result<Filters, BackendError> {
     for &call in FACTORY_CALLS {
         rules.add(call, Vec::new());
     }
-    let tcp = |family: i32| -> Result<SeccompRule, BackendError> {
-        rule(vec![
-            low(0, SeccompCmpOp::Eq, family as u64)?,
-            low(
-                1,
-                SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
-                libc::SOCK_STREAM as u64,
-            )?,
-            low(2, SeccompCmpOp::Eq, 0)?,
-        ])
-    };
-    rules.add(
-        libc::SYS_socket,
-        vec![tcp(libc::AF_INET)?, tcp(libc::AF_INET6)?],
-    );
+    rules.add(libc::SYS_socket, tcp_socket_rules()?);
     let filter = SeccompFilter::new(
         rules.0,
         SeccompAction::Errno(libc::EPERM as u32),
@@ -1691,6 +1773,7 @@ mod tests {
             let watcher = watcher(WATCHED_PROGRAM).unwrap();
             let relay = relay().unwrap();
             let factory = factory().unwrap();
+            let broker = broker().unwrap();
             let mut out = SNAPSHOT_HEADER.to_string();
             for (name, filters) in [
                 ("strict", &strict),
@@ -1698,6 +1781,7 @@ mod tests {
                 ("watcher", &watcher),
                 ("relay", &relay),
                 ("factory", &factory),
+                ("broker", &broker),
             ] {
                 assert_eq!(
                     checksum(&filters.allowlist),
@@ -2878,6 +2962,92 @@ mod tests {
         assert_eq!(relay(libc::SYS_ioctl, tiocsti), RET_EPERM);
         // The shared allowlist still decides clone3, so threads fall back to clone.
         assert_eq!(relay(libc::SYS_clone3, [0; 6]), RET_ENOSYS);
+    }
+
+    #[test]
+    fn the_broker_can_only_connect_out() {
+        let filters = broker().unwrap();
+        let broker = |nr: i64, args: [u64; 6]| decide_with(&filters, NATIVE, nr, args);
+        for nr in [
+            libc::SYS_accept4,
+            libc::SYS_connect,
+            libc::SYS_recvfrom,
+            libc::SYS_sendto,
+            libc::SYS_recvmsg,
+            libc::SYS_getsockopt,
+            libc::SYS_setsockopt,
+            libc::SYS_getsockname,
+            libc::SYS_getpeername,
+            libc::SYS_shutdown,
+            libc::SYS_write,
+            libc::SYS_close,
+            libc::SYS_ppoll,
+            libc::SYS_futex,
+            libc::SYS_timer_settime,
+            libc::SYS_exit_group,
+        ] {
+            assert_eq!(broker(nr, [0; 6]), RET_ALLOW, "system call {nr}");
+        }
+        for family in [libc::AF_INET, libc::AF_INET6] {
+            let tcp = socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            assert_eq!(broker(libc::SYS_socket, tcp), RET_ALLOW);
+            for protocol in [libc::IPPROTO_SCTP, libc::IPPROTO_MPTCP, libc::IPPROTO_TCP] {
+                let other = socket(family, libc::SOCK_STREAM, protocol);
+                assert_eq!(broker(libc::SYS_socket, other), RET_EPERM, "{protocol}");
+            }
+        }
+        // The netlink socket of the route lookups exists before the filter; no other socket can.
+        for (family, kind) in [
+            (libc::AF_UNIX, libc::SOCK_STREAM),
+            (libc::AF_INET, libc::SOCK_DGRAM),
+            (libc::AF_INET, libc::SOCK_RAW),
+            (libc::AF_NETLINK, libc::SOCK_RAW),
+            (libc::AF_PACKET, libc::SOCK_RAW),
+        ] {
+            let other = socket(family, kind, 0);
+            assert_eq!(
+                broker(libc::SYS_socket, other),
+                RET_EPERM,
+                "{family} {kind}"
+            );
+        }
+        let thread = (libc::CLONE_VM | libc::CLONE_THREAD | libc::CLONE_SIGHAND) as u64;
+        assert_eq!(broker(libc::SYS_clone, args(&[thread])), RET_ALLOW);
+        let fionbio = args(&[3, u64::from(libc::FIONBIO as u32)]);
+        assert_eq!(broker(libc::SYS_ioctl, fionbio), RET_ALLOW);
+        // No files, no listeners, no programs, no signals, no namespaces.
+        for nr in [
+            libc::SYS_read,
+            libc::SYS_openat,
+            libc::SYS_execve,
+            libc::SYS_bind,
+            libc::SYS_listen,
+            libc::SYS_sendmsg,
+            libc::SYS_socketpair,
+            libc::SYS_mkdirat,
+            libc::SYS_unlinkat,
+            libc::SYS_kill,
+            libc::SYS_pidfd_send_signal,
+            libc::SYS_ptrace,
+            libc::SYS_setns,
+            libc::SYS_unshare,
+            libc::SYS_timer_create,
+        ] {
+            assert_eq!(broker(nr, [0; 6]), RET_EPERM, "system call {nr}");
+        }
+        let user = thread | libc::CLONE_NEWUSER as u64;
+        assert_eq!(broker(libc::SYS_clone, args(&[user])), RET_EPERM);
+        let fork = libc::SIGCHLD as u64;
+        for flags in [fork, (1 << 32) | fork] {
+            assert_eq!(
+                broker(libc::SYS_clone, args(&[flags])),
+                RET_EPERM,
+                "{flags:#x}"
+            );
+        }
+        let tiocsti = args(&[0, u64::from(libc::TIOCSTI as u32)]);
+        assert_eq!(broker(libc::SYS_ioctl, tiocsti), RET_EPERM);
+        assert_eq!(broker(libc::SYS_clone3, [0; 6]), RET_ENOSYS);
     }
 
     #[test]

@@ -24,7 +24,7 @@ use crate::handover::Handover;
 use crate::host::THREADS_DIR;
 use crate::namespace::{self, Namespaces};
 use crate::plan::{FileIdentity, LandlockConfig, Sandbox};
-use crate::{contain, filter, relay, watch};
+use crate::{broker, contain, filter, relay, watch};
 
 /// Applies `sandbox` and executes the target. Without `contain`, sandy applies it to itself and
 /// returns only on failure. With `contain`, a forked child does, and sandy returns the exit
@@ -46,29 +46,49 @@ pub fn launch(
              guard of \"contained\" ends the program then",
         ));
     }
-    // With `contained`, the relay also ends when the guard has ended the program's group, and
-    // the guard watches the relay in turn (see `contain::run`).
+    // With `contained`, the relay and the broker also end when the guard has ended the
+    // program's group, and the guard watches them in turn (see `contain::run`).
     let mut group_ended = None;
-    let mut relay_alive = None;
+    let mut ended = None;
+    if sandbox.contain && (sandbox.relay.is_some() || sandbox.broker.is_some()) {
+        let (read, write) = crate::helper::pipe("the pipe of the group's end")?;
+        group_ended = Some(write);
+        ended = Some(read);
+    }
+    let ended_for = |name: &str| {
+        ended
+            .as_ref()
+            .map(|ended| ended.try_clone())
+            .transpose()
+            .map_err(|error| SandboxError::io(format!("cannot give {name} the group's end"), error))
+    };
+    let mut helpers = Vec::new();
     // What the process that enters the namespaces binds and starts there for the helpers
     // outside. A helper that serves a listener inside adds its handover here.
     let mut handovers = Vec::new();
     let mut factory = None;
     if let Some(relay) = &sandbox.relay {
-        let ended = if sandbox.contain {
-            let (read, write) = crate::helper::pipe("the pipe of the group's end")?;
-            group_ended = Some(write);
-            Some(read)
-        } else {
-            None
-        };
-        let (started, inside) = relay::start(relay, ended)?;
+        let (started, inside) = relay::start(relay, ended_for("the relay")?)?;
         handovers.extend(inside.handover);
         factory = inside.factory;
         if sandbox.contain {
-            relay_alive = Some(crate::helper::pidfd_open(started, "the relay")?);
+            helpers.push(contain::Helper {
+                pidfd: crate::helper::pidfd_open(started, "the relay")?,
+                failure: relay::ENDED_FIRST,
+            });
         }
     }
+    if let Some(config) = &sandbox.broker {
+        let (started, handover) = broker::start(config, ended_for("the egress broker")?)?;
+        handovers.push(handover);
+        if sandbox.contain {
+            helpers.push(contain::Helper {
+                pidfd: crate::helper::pidfd_open(started, "the egress broker")?,
+                failure: broker::ENDED_FIRST,
+            });
+        }
+    }
+    drop(ended);
     if sandbox.end_with_parent {
         let parent = command.parent.unwrap_or_else(|| ParentProcess {
             // SAFETY: getppid has no preconditions.
@@ -110,7 +130,7 @@ pub fn launch(
         }
     };
     if sandbox.contain {
-        contain::run(start, group_ended, relay_alive, status, explain.as_mut())
+        contain::run(start, group_ended, helpers, status, explain.as_mut())
     } else if let Some(explain) = explain {
         explain::supervise(start, explain, status)
     } else {

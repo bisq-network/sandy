@@ -14,6 +14,7 @@ use sandy_core::{
     PlanItem, ProtectedPath, Requirement, ResolvedPolicy, SignalScope, SystemAccess,
 };
 
+use crate::broker::BrokerConfig;
 use crate::cgroup;
 use crate::filter::FilterConfig;
 use crate::host::HostCapabilities;
@@ -40,6 +41,8 @@ pub struct Sandbox {
     pub filter: FilterConfig,
     /// The relay for exposed ports, when the policy has any.
     pub relay: Option<RelayConfig>,
+    /// The egress broker, when the policy has one.
+    pub broker: Option<BrokerConfig>,
     /// The namespaces the program runs in, `None` for the host's own (see `namespace`).
     pub namespaces: Option<Namespaces>,
     /// `process.children = "contained"`: sandy stays the program's parent and ends its process
@@ -88,8 +91,8 @@ const FILTER_PROCESSES: &str = "seccomp denies ptrace, process_vm_readv, process
 const PRIVATE_NETWORK: &str = "a user and a network namespace of the sandbox's own, created \
     before the sandbox is applied: only lo, up; the user's own user and group ID mapped to \
     themselves and setgroups denied, so root is not mapped; every capability in the namespace \
-    dropped, the bounding set included; the relays are the only ways in and out; seccomp denies \
-    the program new namespaces";
+    dropped, the bounding set included; the relays and the egress broker are the only ways in \
+    and out; seccomp denies the program new namespaces";
 const NO_WIN32K: &str =
     "nothing to deny: win32k is the GUI part of the Windows kernel, and Linux has none";
 
@@ -153,6 +156,7 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
                 abi,
                 private,
             ),
+            broker: BrokerConfig::new(policy.egress, policy.signals, abi),
             namespaces: private.then_some(Namespaces { network: true }),
             contain: policy.children == ChildProcesses::Contained,
             end_with_parent: policy.end_with_parent,
@@ -264,14 +268,17 @@ fn shortfalls(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
         );
     }
     if policy.ip == IpAccess::Private {
-        shortfalls.push(
+        let ports = match policy.egress {
+            Some(_) => "the program's ports, forwarded ports and egress port",
+            None => "the program's ports and forwarded ports",
+        };
+        shortfalls.push(format!(
             "ip = \"private\" keeps out other users, but not this user, on Linux: the sandbox's \
              network namespace belongs to the user that runs sandy, so a process of this user \
-             outside the sandbox can enter it (nsenter) and reach the program's ports and \
-             forwarded ports there without a relay, as it reaches them directly with \
-             ip = \"all\"; no process of another user can (docs/linux.md, \"Private network\")"
-                .to_string(),
-        );
+             outside the sandbox can enter it (nsenter) and reach {ports} there without a \
+             relay, as it reaches them directly with ip = \"all\"; no process of another user \
+             can (docs/linux.md, \"Private network\")"
+        ));
     }
     // With ip = "private" the forward listener is in the sandbox's network namespace, which no
     // other user reaches.
@@ -477,9 +484,26 @@ fn plan_item(
             (Err(Missing::Unavailable(reason)), _) | (_, Err(reason)) => unavailable(reason),
             (Ok(()), Ok(())) => enforced(PRIVATE_NETWORK.to_string()),
         },
-        Requirement::EgressBrokered | Requirement::PathsHidden => {
-            unavailable("the Linux backend does not enforce this yet")
+        // The broker serves a listener in the sandbox's network namespace, so it needs what the
+        // private network needs, and what the relay needs to confine itself and watch the program.
+        Requirement::EgressBrokered => {
+            match (
+                &host.user_namespaces,
+                &host.landlock,
+                &host.seccomp,
+                &host.pidfd,
+            ) {
+                (Err(Missing::NeedsSetup(reason)), ..) => {
+                    PlanItem::needs_setup(requirement, reason)
+                }
+                (Err(Missing::Unavailable(reason)), ..)
+                | (_, Err(reason), _, _)
+                | (_, _, Err(reason), _)
+                | (_, _, _, Err(reason)) => unavailable(reason),
+                _ => enforced(broker_mechanism(abi)),
+            }
         }
+        Requirement::PathsHidden => unavailable("the Linux backend does not enforce this yet"),
         // The kernel sends the job control signals of a terminal without the check that the
         // Landlock scope hooks, so the scope alone does not isolate signals.
         Requirement::SignalsIsolated => match &host.seccomp {
@@ -513,6 +537,26 @@ fn relay_mechanism(abi: ABI, private: bool) -> String {
              factory process there that can create TCP sockets and nothing else",
         );
     }
+    mechanism
+}
+
+fn broker_mechanism(abi: ABI) -> String {
+    let mut mechanism = format!(
+        "a broker process in the host's network namespace, not a child of the program, that ends \
+         with it (pidfd); its listener is bound inside the sandbox's network namespace and handed \
+         to it; it takes one SOCKS5 CONNECT to an IP address per connection, checks the \
+         destination against the IANA special-purpose registries and asks the kernel's routing \
+         tables (NETLINK_ROUTE) whether it is this host or its local network, refuses a \
+         connection that reached this host after all, and copies bytes; confined by \
+         no_new_privs, Landlock ABI {abi} without file access"
+    );
+    if abi >= ABI::V4 {
+        mechanism.push_str(" and without TCP bind");
+    }
+    mechanism.push_str(
+        ", and a seccomp filter that allows only TCP sockets, the route lookups, copying bytes \
+         and threads",
+    );
     mechanism
 }
 
@@ -765,7 +809,9 @@ fn system_rights(usage: SystemUse) -> BitFlags<AccessFs> {
 mod tests {
     use super::*;
     use crate::relay::RelayPair;
-    use sandy_core::{EnvironmentPolicy, ExposedPort, ForwardedPort, Status, WindowsPolicy};
+    use sandy_core::{
+        EgressReach, EnvironmentPolicy, ExposedPort, ForwardedPort, Status, WindowsPolicy,
+    };
 
     fn host(abi: Option<i32>) -> HostCapabilities {
         let system = |path: &str, is_dir, usage, needed| SystemPath {
@@ -1091,6 +1137,76 @@ mod tests {
         assert!(unavailable(&plan).contains(&Requirement::IpNetworkPrivate));
     }
 
+    /// The egress broker serves a listener in the sandbox's network namespace, so it is
+    /// enforced where the private network is, and needs setup or is unavailable where that is.
+    /// Its watchdog follows `signals` as the relay's does.
+    #[test]
+    fn the_egress_broker_follows_the_private_network() {
+        let mut policy = policy();
+        policy.ip = IpAccess::Private;
+        policy.egress = Some(sandy_core::Egress {
+            port: 1080,
+            reach: EgressReach::PublicAndLocal,
+        });
+        let plan = plan_for(&policy, &host(Some(9)));
+        assert_eq!(unavailable(&plan), vec![]);
+        let Status::Enforced { mechanism } = status(&plan, Requirement::EgressBrokered) else {
+            panic!("{plan:?}");
+        };
+        assert!(
+            mechanism.contains("host's network namespace"),
+            "{mechanism}"
+        );
+        assert!(mechanism.contains("without TCP bind"), "{mechanism}");
+        let broker = plan.sandbox.unwrap().broker.unwrap();
+        assert_eq!(broker.listen, "127.0.0.1:1080".parse().unwrap());
+        assert_eq!(broker.reach, EgressReach::PublicAndLocal);
+        assert!(!broker.watchdog);
+        policy.signals = SignalScope::Any;
+        let broker = plan_for(&policy, &host(Some(9))).sandbox.unwrap().broker;
+        assert!(broker.unwrap().watchdog);
+
+        let mut restricted = host(Some(9));
+        restricted.user_namespaces = Err(Missing::NeedsSetup("restricted".to_string()));
+        let plan = plan_for(&policy, &restricted);
+        for requirement in [Requirement::IpNetworkPrivate, Requirement::EgressBrokered] {
+            assert_eq!(
+                status(&plan, requirement),
+                &Status::NeedsSetup {
+                    reason: "restricted".to_string()
+                },
+                "{requirement:?}"
+            );
+        }
+        let mut disabled = host(Some(9));
+        disabled.user_namespaces = Err(Missing::Unavailable("disabled".to_string()));
+        let plan = plan_for(&policy, &disabled);
+        assert_eq!(
+            status(&plan, Requirement::EgressBrokered),
+            &Status::Unavailable {
+                reason: "disabled".to_string()
+            }
+        );
+        for broken in [
+            HostCapabilities {
+                landlock: Err("no Landlock".to_string()),
+                ..host(Some(9))
+            },
+            HostCapabilities {
+                pidfd: Err("no pidfd".to_string()),
+                ..host(Some(9))
+            },
+        ] {
+            let plan = plan_for(&policy, &broken);
+            assert!(unavailable(&plan).contains(&Requirement::EgressBrokered));
+        }
+        policy.egress = None;
+        assert_eq!(
+            plan_for(&policy, &host(Some(9))).sandbox.unwrap().broker,
+            None
+        );
+    }
+
     /// The forward warning of the other `ip` values does not apply in a namespace no other user
     /// reaches; the one of `ip = "private"` names the user's own processes instead.
     #[test]
@@ -1115,6 +1231,13 @@ mod tests {
         policy.ip = IpAccess::Private;
         assert!(!warned(&policy, forward));
         assert!(warned(&policy, own_user));
+        let egress_port = "and egress port there";
+        assert!(!warned(&policy, egress_port));
+        policy.egress = Some(sandy_core::Egress {
+            port: 1080,
+            reach: EgressReach::Public,
+        });
+        assert!(warned(&policy, egress_port));
     }
 
     #[test]

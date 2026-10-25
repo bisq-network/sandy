@@ -149,7 +149,7 @@ fn confine(keep: &[RawFd], program: RawFd, abi: ABI) -> Result<(), SandboxError>
         "the watcher",
         keep,
         abi,
-        [],
+        Some(&[]),
         Scope::AbstractUnixSocket.into(),
         &filters,
     )
@@ -288,6 +288,9 @@ mod tests {
     /// through `_exit`.
     #[test]
     fn the_confined_watcher_can_signal_the_program_and_nothing_else() {
+        if !crate::alone::in_own_process() {
+            return;
+        }
         let Ok(version) = HostCapabilities::detect().landlock else {
             eprintln!("skipped: no Landlock");
             return;

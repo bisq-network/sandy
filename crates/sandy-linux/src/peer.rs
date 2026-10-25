@@ -401,9 +401,13 @@ mod tests {
     /// answer no longer carries a user: on 6.8 from the close, on 6.17 and later once a timewait
     /// record has replaced the socket. Until then the user it still carries refuses it. The
     /// decision is taken from the answer itself, because the kernel replaces the socket at a
-    /// moment of its own.
+    /// moment of its own. In a process of its own (`alone`): a child that another test starts
+    /// meanwhile holds a copy of the socket until it executes, and the file with it.
     #[test]
     fn a_peer_that_closed_its_socket_has_no_owner() {
+        if !crate::alone::in_own_process() {
+            return;
+        }
         let check = PeerCheck::open().unwrap();
         let other = as_another_user(&check);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
