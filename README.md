@@ -840,8 +840,10 @@ metadata through the descriptor they wrote.
   and URLSession programs cannot use those ports. A forwarded or egress port needs
   `--signals isolated` there. The program can listen on its exposed ports at every address of
   the Mac, where other hosts reach it, every local user can connect out through the egress
-  broker, and a process of your user can take a forwarded or egress port at an address the Mac
-  gains while sandy runs; `sandy check` warns about each.
+  broker, a process of your user can take a forwarded or egress port at an address the Mac
+  gains while sandy runs, and the program can connect to those ports at a link-local address of
+  the Mac on another link, where another host may have it, such as a router at `fe80::1`;
+  `sandy check` warns about each.
 - The system writes the crash report of a program that sandy runs to
   `/Library/Logs/DiagnosticReports`, which administrators can read and standard users cannot,
   instead of the user's `~/Library/Logs/DiagnosticReports`.

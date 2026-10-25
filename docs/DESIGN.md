@@ -588,7 +588,7 @@ exceptions:
 
 | Platform | When | What stays open |
 |---|---|---|
-| All | `egress` | the broker refuses an address of this host with reply 2 and answers others with the result of its connect, so the program can tell this host's addresses, and with `reach = "public"` its subnets, by trying them (`sandy_relay` `every_forbidden_form_is_refused_with_reply_2` and `a_closed_port_gets_reply_5`); a NAT64 prefix of an operator other than the well-known ones cannot be recognised |
+| All | `egress` | the broker refuses an address of this host with reply 2 and answers others with the result of its connect, so the program can tell this host's addresses, and with `reach = "public"` its subnets, by trying them (`sandy_relay` `every_forbidden_form_is_refused_with_reply_2` and `a_closed_port_gets_reply_5`); a NAT64 prefix of an operator other than the well-known ones cannot be recognised; a public address that a router maps back to this host (a port forward with hairpin NAT) reaches the services of this host that the forward exposes, because the broker sees only the public address |
 | Linux | `signals = "isolated"` without `children = "contained"` | a read from the terminal in the background stops the group sandy was started in, with the processes outside the sandbox in it |
 | Linux | `ip = "client"` | a UDP socket that is not connected receives datagrams from every sender, at the port the kernel chose for it, and before Landlock ABI 10 at any port the program binds |
 | Linux | `forward` with `ip = "client"` or `ip = "all"` | another local user can deliver a write to the forwarded service, through a connection it closed before the relay asked who owns it, and that no longer carries its user (from the close on Linux 6.8, after the timewait record on newer kernels) |
@@ -600,7 +600,7 @@ exceptions:
 | macOS | `forward` | every local user reaches the forwarded service |
 | macOS | `expose` or `forward` with `signals = "any"` | a stopped relay has no time limit |
 | macOS | `ip = "private"` with `expose` | the program can listen on its exposed ports at every address of the Mac, where every local process and other hosts reach it without the relay |
-| macOS | `ip = "private"` with `forward` or `egress` | a process of sandy's own user that listens on a forwarded or egress port at an address the Mac gains while sandy runs receives the program's connections there, and once the relay or the broker has ended, without `children = "contained"`, any process that binds the port does |
+| macOS | `ip = "private"` with `forward` or `egress` | a process of sandy's own user that listens on a forwarded or egress port at an address the Mac gains while sandy runs receives the program's connections there, and once the relay or the broker has ended, without `children = "contained"`, any process that binds the port does; a host on another link of the Mac whose IPv6 link-local address equals one of the Mac's, such as `fe80::1`, receives the program's connections to those port numbers there |
 | macOS | `egress` | every local user reaches the broker and connects out through it, as sandy's user, to the destinations of `reach` |
 | macOS | `view = "policy"` | the names in the root directory, with their metadata through a bulk listing that asks for the type; the directories above each policy path; the volume and mount point that `statfs` names for a policy path |
 | Windows | a directory in the policy | a file moved out of a granted directory keeps its grant |

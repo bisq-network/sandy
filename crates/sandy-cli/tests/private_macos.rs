@@ -238,9 +238,10 @@ fn receive(listener: &TcpListener) -> Option<Vec<u8>> {
 }
 
 /// The program reaches its forwarded port and nothing else of IP: not the service behind it
-/// directly, not a listener at another address of the Mac, no datagram, no listening socket, no
-/// name resolver, no NECP. Every control succeeds outside the sandbox. `localhost` resolves from
-/// /etc/hosts, which getaddrinfo reads itself, and a name that only DNS knows does not.
+/// directly, not a listener at another address of the Mac, no datagram, no ICMP, no listening
+/// socket, no name resolver, no NECP. Every control succeeds outside the sandbox. `localhost`
+/// resolves from /etc/hosts, which getaddrinfo reads itself, and a name that only DNS knows does
+/// not.
 #[test]
 fn a_private_network_reaches_only_its_forwarded_ports() {
     let Some(others) = other_addresses() else {
@@ -257,6 +258,7 @@ fn a_private_network_reaches_only_its_forwarded_ports() {
         ("tcp-connect", direct.as_str()),
         ("tcp-connect", other_host_address.as_str()),
         ("udp-send", direct.as_str()),
+        ("icmp-socket-echo", "127.0.0.1"),
         ("tcp-listen", other_port.as_str()),
         ("necp-open", ""),
         ("unix-connect", DNS_RESOLVER),
@@ -403,6 +405,103 @@ fn a_held_port_refuses_signals_any() {
     exposed.extend(["--ip", "private", "--expose"].map(String::from));
     exposed.push(format!("127.0.0.1:{}={}", free_port(), free_port()));
     probe_inside(&exposed, &[("pid", "")])[0].assert_ok();
+}
+
+/// The exceptions row for `ip = "private"` with `forward` or `egress` on macOS: Seatbelt's
+/// `localhost` matches an IPv6 link-local address of this Mac with any interface as its scope, so
+/// the program may connect to its forwarded port at an address that is this Mac's on one link and
+/// may be another host's on another, where nothing of sandy's can hold it. The test asks with
+/// loopback as the scope, where no such address exists, so nothing leaves this Mac: the profile
+/// lets the connect through, and it times out on lo0. Control: a link-local address that is not
+/// this Mac's is denied at the same scope. When the first connect is denied, the route is closed
+/// and that part of the row has to go.
+#[test]
+fn a_link_local_address_of_this_mac_matches_at_every_scope() {
+    let Some(others) = other_addresses() else {
+        return skip_without_addresses();
+    };
+    let Some(SocketAddr::V6(own)) = others.iter().copied().find(|address| kind(address) == 1)
+    else {
+        return skip(
+            "ipv6-link-local",
+            "this Mac has no IPv6 link-local address outside loopback",
+        );
+    };
+    // SAFETY: the name is a C string.
+    let loopback = unsafe { libc::if_nametoindex(c"lo0".as_ptr()) };
+    assert_ne!(loopback, 0, "no lo0");
+    let fixture = Fixture::new("private-scope");
+    let (service, _) = counting_service();
+    let port = free_port();
+    let mut foreign = own.ip().segments();
+    foreign[7] ^= 0xffff;
+    let at_loopback = |ip: Ipv6Addr| SocketAddrV6::new(ip, port, 0, loopback).to_string();
+    let (own_there, foreign_there) = (at_loopback(*own.ip()), at_loopback(foreign.into()));
+    let inside = probe_inside(
+        &private_forward(&fixture, port, service),
+        &[
+            ("tcp-connect", own_there.as_str()),
+            ("tcp-connect", foreign_there.as_str()),
+        ],
+    );
+    assert_eq!(inside[1].result, "denied", "{:?}", inside[1]);
+    assert!(
+        inside[0].result == "error" && inside[0].detail.contains("timed out"),
+        "the profile no longer lets the program connect to {own_there}, a link-local address of \
+         this Mac at another scope, so that part of the exception for ip = \"private\" on macOS \
+         is stale: {:?}",
+        inside[0]
+    );
+}
+
+/// Under `signals = "isolated"` the program cannot stop or end its relay or its broker, which is
+/// what a forwarded or egress port needs on macOS (`a_held_port_refuses_signals_any`). Control:
+/// outside the sandbox this user may signal both. Afterwards both still serve.
+#[test]
+fn the_program_cannot_signal_its_relay_or_broker() {
+    let fixture = Fixture::new("private-signal-helpers");
+    let (service, accepted) = counting_service();
+    let (port, egress) = (free_port(), free_port());
+    let mut args = private_forward(&fixture, port, service);
+    args.extend(["--egress".to_string(), egress.to_string()]);
+    let forwarded = format!("127.0.0.1:{port}");
+    let refused = through(egress, "127.0.0.1:1");
+    let (mut program, mut stdout) = start(
+        &args,
+        &[
+            ("signal-stop", "-"),
+            ("signal-stop", "-"),
+            ("tcp-connect", forwarded.as_str()),
+            ("socks5-connect", refused.as_str()),
+        ],
+    );
+    wait_for_program(program.id());
+    let helpers = [relay_of(port), relay_of(egress)];
+    let pids = helpers.map(|pid| pid.to_string());
+    for line in probe_outside(&[("signal", &pids[0]), ("signal", &pids[1])]) {
+        line.assert_ok();
+    }
+    let mut stdin = program.stdin.take().unwrap();
+    for pid in &pids {
+        writeln!(stdin, "{pid}").unwrap();
+    }
+    drop(stdin);
+    let results: Vec<ProbeLine> = (0..4).map(|_| next_line(&mut stdout)).collect();
+    let output = program.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    for line in &results[..2] {
+        assert_eq!(line.result, "denied", "{line:?}");
+    }
+    results[2].assert_ok();
+    assert_eq!(reply_of(&results[3]), 2, "{results:?}");
+    let start = Instant::now();
+    while accepted.load(Ordering::SeqCst) == 0 {
+        assert!(
+            start.elapsed() < WAIT,
+            "the relay did not serve after the signals"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// The exceptions row for `ip = "private"` with `forward` on macOS: once the relay has ended,
@@ -631,31 +730,42 @@ fn the_broker_refuses_this_mac_its_network_and_names() {
     }
 }
 
-/// `public-and-local` allows the local network: the broker tries the gateway, so its reply is
+/// Names a host of the local network that is not this Mac, as `ADDRESS:PORT`, which takes TCP
+/// connections there. Unset, the test that needs one skips, so the suite sends nothing into the
+/// local network by itself.
+const LOCAL_PEER: &str = "SANDY_TEST_LOCAL_PEER";
+
+/// `public-and-local` allows the local network: the broker tries the named peer, so its reply is
 /// not 2, but it still refuses this Mac's own address there.
 #[test]
-fn public_and_local_reaches_the_gateway_but_not_this_mac() {
+fn public_and_local_reaches_the_local_network_but_not_this_mac() {
     let Some(others) = other_addresses() else {
         return skip_without_addresses();
     };
-    let Some(gateway) = gateway() else {
-        return skip("default-gateway", "this Mac has no default gateway");
+    let Some(peer) = std::env::var(LOCAL_PEER)
+        .ok()
+        .filter(|peer| !peer.is_empty())
+    else {
+        return skip(
+            "local-network-peer",
+            "SANDY_TEST_LOCAL_PEER names no host of the local network",
+        );
     };
     let fixture = Fixture::new("egress-local");
     let egress = free_port();
-    let to_gateway = through(egress, &format!("{gateway}:80"));
+    let to_peer = through(egress, &peer);
     let to_self = through(egress, &at(others[0], 80).to_string());
     let inside = probe_inside(
         &private_egress(&fixture, egress, "public-and-local"),
         &[
-            ("socks5-connect", to_gateway.as_str()),
+            ("socks5-connect", to_peer.as_str()),
             ("socks5-connect", to_self.as_str()),
         ],
     );
     let reply = reply_of(&inside[0]);
     assert!(
         reply != 2 && reply != 1,
-        "the broker did not try the gateway: {inside:?}"
+        "the broker did not try the peer: {inside:?}"
     );
     assert_eq!(reply_of(&inside[1]), 2, "{inside:?}");
 }

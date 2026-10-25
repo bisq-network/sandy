@@ -3241,6 +3241,7 @@ mod macos {
         "host-vm-stats",
         "symlink",
         "sysctl-proc-cputype",
+        "icmp-socket-echo",
         "fork",
         "vfork",
         "posix-spawn",
@@ -3341,6 +3342,7 @@ mod macos {
             "host-vm-stats" => host_vm_stats(),
             "symlink" => symlink(target),
             "sysctl-proc-cputype" => sysctl_proc_cputype(target),
+            "icmp-socket-echo" => icmp_socket_echo(target),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "unknown action",
@@ -3606,6 +3608,75 @@ mod macos {
             return Err(io::Error::last_os_error());
         }
         Ok(String::new())
+    }
+
+    /// Sends one ICMP echo request to the IPv4 address `target` through an ICMP datagram socket,
+    /// which an ordinary user may create, and waits up to three seconds for the reply.
+    fn icmp_socket_echo(target: &str) -> io::Result<String> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let address: std::net::Ipv4Addr = target
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid IPv4 address"))?;
+        // SAFETY: socket has no memory arguments.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_ICMP) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the descriptor is new and owned by nothing else.
+        let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+        let timeout = libc::timeval {
+            tv_sec: 3,
+            tv_usec: 0,
+        };
+        // SAFETY: the value is a timeval of the size passed.
+        let set = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                (&raw const timeout).cast(),
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        };
+        if set != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: sockaddr_in is plain data, and zero is a valid value for every field.
+        let mut raw: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        raw.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+        raw.sin_family = libc::AF_INET as libc::sa_family_t;
+        raw.sin_addr.s_addr = u32::from(address).to_be();
+        // Type 8 (echo request), code 0, identifier and sequence 0, and the checksum of that.
+        let request = [8u8, 0, 0xf7, 0xff, 0, 0, 0, 0];
+        // SAFETY: the buffer and the address are valid for the lengths passed.
+        let sent = unsafe {
+            libc::sendto(
+                socket.as_raw_fd(),
+                request.as_ptr().cast(),
+                request.len(),
+                0,
+                (&raw const raw).cast(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        };
+        if sent < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut reply = [0u8; 128];
+        // SAFETY: the buffer is valid for its length.
+        let received = unsafe {
+            libc::recv(
+                socket.as_raw_fd(),
+                reply.as_mut_ptr().cast(),
+                reply.len(),
+                0,
+            )
+        };
+        if received < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(format!("{received} bytes"))
     }
 
     /// Parses `DEV:INODE` (the st_dev and st_ino the test read outside the sandbox).

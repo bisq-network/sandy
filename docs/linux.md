@@ -662,6 +662,13 @@ more files. A name that holds a `:` cannot pass intact, and then sandy does not 
 program never sees the variable, also when the policy passes it on
 (`started_as_never_reaches_the_program`).
 
+**The parent of `end_with_parent`.** sandy reads its parent's process ID as its first step, and
+the copy reads its own again after the hand-over, a few milliseconds later. A parent that ends in
+between would make the copy's parent another process. So the portable sandy also passes the ID it
+read in `SANDY_PARENT_AT_START`; the copy removes that variable too, and with
+`end_with_parent` it refuses when its own parent is not that process. The variable decides
+nothing else, so it can only add that refusal.
+
 **Costs.** On a host with the restriction, every `run` and `check` of a portable sandy reads two
 small files. With a copy installed it also checks the copy's path, lists the loaded profiles and
 compares the copy with its own image, which is as large as sandy. Measured on Ubuntu 25.10 (two

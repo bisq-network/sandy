@@ -330,7 +330,8 @@ impl ResolvedPolicy {
                  other addresses with the result of its connect, so by trying addresses the \
                  program can tell which belong to this host and, with reach = \"public\", which \
                  belong to its subnets; a NAT64 prefix of an operator, other than the well-known \
-                 ones, looks like any public address, so the broker cannot recognise it \
+                 ones, looks like any public address, so the broker cannot recognise it, and \
+                 neither a public address that a router maps back to this host \
                  (docs/DESIGN.md, \"Egress broker\")"
                     .to_string(),
             );

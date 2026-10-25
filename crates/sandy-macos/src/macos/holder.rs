@@ -58,7 +58,7 @@ pub fn hold(port: u16, leave: &[IpAddr]) -> Result<Vec<OwnedFd>, SandboxError> {
         match bind_without_listening(address) {
             Ok(socket) => held.push(socket),
             // An address that is not ready yet, such as a tentative IPv6 address, takes no bind;
-            // the wildcard bind holds it.
+            // only the wildcard binds hold it, as an address the Mac gains later.
             Err(error) if error.raw_os_error() == Some(libc::EADDRNOTAVAIL) => {}
             Err(error) => return Err(refused(address, error)),
         }

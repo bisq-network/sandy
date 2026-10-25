@@ -79,7 +79,6 @@ fn serve(
         Ok(queue) => queue,
         Err(error) => ready.fail(&error.to_string()),
     };
-    ready.report();
     let stop = Stop::new();
     let request = stop.clone();
     let server = std::thread::Builder::new()
@@ -94,9 +93,11 @@ fn serve(
                 sandy_relay::DRAIN,
             );
         });
+    // Ready only once it serves: sandy starts the program after the report.
     let Ok(server) = server else {
-        return;
+        ready.fail("the egress broker cannot start its server thread");
     };
+    ready.report();
     // Any event is the end: the watched process exited or the group's pipe ended. An error of
     // kevent ends the broker too, so it never outlives a watch it lost.
     let mut events = [NO_EVENT; 2];

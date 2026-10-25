@@ -250,6 +250,16 @@ fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
              such as a new temporary IPv6 or VPN address, receives the program's connections \
              there{ended} (docs/macos.md, \"The private network\")"
         ));
+        shortfalls.push(
+            "ip = \"private\" keeps the program off the local network only in part on macOS: \
+             Seatbelt's localhost matches an IPv6 link-local address of this Mac with any \
+             interface as its scope, so the program may connect to its forwarded and egress \
+             ports at a link-local address that is this Mac's on one link and another host's \
+             on another, such as fe80::1, which every Mac has on its loopback and many routers \
+             use, and no socket of sandy's can hold an address of another host (docs/macos.md, \
+             \"The private network\")"
+                .to_string(),
+        );
     }
     if policy.egress.is_some() {
         shortfalls.push(
@@ -949,8 +959,9 @@ mod tests {
     }
 
     /// Seatbelt's localhost is every address of the Mac, so check names what a private network
-    /// leaves open there: listening on the exposed ports, and the forwarded and egress ports at
-    /// addresses the Mac gains later; and that every local user reaches the broker.
+    /// leaves open there: listening on the exposed ports, the forwarded and egress ports at
+    /// addresses the Mac gains later and at its link-local addresses on other links; and that
+    /// every local user reaches the broker.
     #[test]
     fn warns_where_a_private_network_reaches_other_addresses() {
         let count = |policy: &ResolvedPolicy, start: &str| {
@@ -961,10 +972,12 @@ mod tests {
         };
         let exposed = "ip = \"private\" keeps the program's exposed ports off the network";
         let held = "ip = \"private\" keeps the program off this Mac's other addresses";
+        let scoped = "ip = \"private\" keeps the program off the local network only in part";
         let broker = "the egress broker serves every local user";
         let mut private = private_network();
         assert_eq!(count(&private, exposed), 1);
         assert_eq!(count(&private, held), 1);
+        assert_eq!(count(&private, scoped), 1);
         assert_eq!(count(&private, broker), 1);
         let held_note = |policy: &ResolvedPolicy| {
             notes(policy)
@@ -987,17 +1000,24 @@ mod tests {
         let mut forward_only = private_network();
         forward_only.egress = None;
         assert_eq!(count(&forward_only, held), 1);
+        assert_eq!(count(&forward_only, scoped), 1);
         assert_eq!(count(&forward_only, broker), 0);
 
         let mut alone = private_network();
         alone.expose.clear();
         alone.forward.clear();
         alone.egress = None;
-        assert_eq!(count(&alone, exposed) + count(&alone, held), 0);
+        assert_eq!(
+            count(&alone, exposed) + count(&alone, held) + count(&alone, scoped),
+            0
+        );
         let mut all = private_network();
         all.ip = IpAccess::All;
         all.egress = None;
-        assert_eq!(count(&all, exposed) + count(&all, held), 0);
+        assert_eq!(
+            count(&all, exposed) + count(&all, held) + count(&all, scoped),
+            0
+        );
     }
 
     #[test]

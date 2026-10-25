@@ -689,6 +689,49 @@ fn writes_to_a_read_path_stay_refused() {
     assert!(fixture.path("ro/file").exists());
 }
 
+/// A call that creates, links or moves an entry in a directory outside the policy answers ENOENT,
+/// as it does in a directory that does not exist, so the program cannot find a directory by
+/// writing into it. Control: outside the sandbox each call works in the existing directory and
+/// fails in the missing one.
+#[test]
+fn creating_outside_the_policy_looks_missing() {
+    let fixture = Fixture::new("macos-create");
+    let calls = |dir: &str| {
+        let entry = |name: &str| fixture.arg(&format!("{dir}/{name}"));
+        let from = |source: &str, name: &str| {
+            format!("{}{ARGUMENT_SEPARATOR}{}", fixture.arg(source), entry(name))
+        };
+        vec![
+            ("write", entry("new")),
+            ("mkdir", entry("dir")),
+            ("symlink", format!("{}::file", entry("link"))),
+            ("rename", from("rw/file", "moved")),
+            ("hardlink", from("ro/file", "link-ro")),
+            ("copy", from("ro/file", "copy-ro")),
+        ]
+    };
+    let (existing, missing) = (calls("secret"), calls("none"));
+    let actions: Vec<(&str, &str)> = existing
+        .iter()
+        .chain(&missing)
+        .map(|(action, target)| (*action, target.as_str()))
+        .collect();
+    let outside = probe_outside(&actions);
+    let (made, failed) = outside.split_at(existing.len());
+    for line in made {
+        line.assert_ok();
+    }
+    for line in failed {
+        assert_eq!(line.result, "error", "{line:?}");
+    }
+    fixture.reset();
+    let inside = probe_inside(&fixture.access_args(), &actions);
+    let (existing, missing) = inside.split_at(existing.len());
+    for (existing, missing) in existing.iter().zip(missing) {
+        assert_looks_missing(existing, missing);
+    }
+}
+
 /// Programs spell paths through the links `/etc`, `/tmp` and `/var` of the system set, and so do
 /// the links of the time zone database. Seatbelt checks the existence of the spelled path too, so
 /// the profile allows the check for paths below these links; the real path is checked as well,

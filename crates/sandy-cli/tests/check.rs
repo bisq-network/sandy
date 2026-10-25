@@ -502,9 +502,11 @@ fn check_reports_a_private_network_and_warns_where_it_reaches_other_addresses() 
     );
     let exposed = "keeps the program's exposed ports off the network only in part";
     let forwarded = "keeps the program off this Mac's other addresses only in part";
+    let scoped = "keeps the program off the local network only in part";
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(warns(&stderr, exposed), "{stderr}");
     assert!(warns(&stderr, forwarded), "{stderr}");
+    assert!(warns(&stderr, scoped), "{stderr}");
     // The relay still cannot tell who connects, as with ip = "all", and neither can the broker.
     assert!(warns(&stderr, "serves every local user"), "{stderr}");
     assert!(
@@ -521,6 +523,7 @@ fn check_reports_a_private_network_and_warns_where_it_reaches_other_addresses() 
     let stderr = check_warnings(&["--ip", "private"]);
     assert!(!warns(&stderr, exposed), "{stderr}");
     assert!(!warns(&stderr, forwarded), "{stderr}");
+    assert!(!warns(&stderr, scoped), "{stderr}");
 }
 
 /// The ENOENT rule of the profile hides every path outside the policy, so the view is enforced,

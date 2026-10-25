@@ -30,6 +30,12 @@ const EXIT_SETUP_NOT_DONE: u8 = 3;
 /// the variable from its environment, so it can only add checks, and the program never sees it.
 const STARTED_AS_VARIABLE: &str = "SANDY_STARTED_AS";
 
+/// The parent process ID that a sandy read as its first step before it handed over to the copy
+/// that setup installs. The copy reads its own parent again, later; when the two differ, the
+/// parent ended in between, and `end_with_parent` refuses instead of watching another process.
+/// It can only add that refusal, and the program never sees it.
+const PARENT_AT_START_VARIABLE: &str = "SANDY_PARENT_AT_START";
+
 /// Marks the advice `check` writes to standard error. `run` prints none: its standard error
 /// belongs to the program.
 const WARNING_PREFIX: &str = "warning: ";
@@ -39,6 +45,7 @@ fn main() -> ExitCode {
     // (`process.end_with_parent`).
     let parent_at_start = parent_process_id();
     let started_as = take_started_as();
+    let handed_parent = take_handed_parent();
     let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
     let command = match args::parse(arguments.clone()) {
         Ok(command) => command,
@@ -61,10 +68,11 @@ fn main() -> ExitCode {
         Command::Broker { listener, reach } => broker(listener, reach),
         Command::Sandbox(invocation) => {
             if matches!(invocation.mode, Mode::Run | Mode::Check) {
-                hand_over(&started_as);
+                hand_over(&started_as, handed_parent.or(parent_at_start));
             }
             let context = Context {
                 parent_at_start,
+                handed_parent,
                 started_as,
                 arguments,
             };
@@ -82,10 +90,37 @@ fn main() -> ExitCode {
 /// What `main` learns before the invocation runs.
 struct Context {
     parent_at_start: Option<u32>,
+    /// The value of `PARENT_AT_START_VARIABLE`.
+    handed_parent: Option<u32>,
     /// The names of `STARTED_AS_VARIABLE`.
     started_as: Vec<PathBuf>,
     /// sandy's arguments, without the program name.
     arguments: Vec<OsString>,
+}
+
+/// Reads and removes `PARENT_AT_START_VARIABLE`, before any thread starts. A value that is not
+/// a process ID counts as a parent that differs, so the refusal it can add is not lost.
+fn take_handed_parent() -> Option<u32> {
+    let value = std::env::var_os(PARENT_AT_START_VARIABLE)?;
+    // SAFETY: sandy has one thread here, so nothing reads the environment at the same time.
+    unsafe { std::env::remove_var(PARENT_AT_START_VARIABLE) };
+    Some(value.to_str().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// Why `end_with_parent` cannot hold after a hand-over: the parent that the first sandy saw is
+/// not this process's parent any more, so it ended while sandy handed over.
+fn parent_ended_during_hand_over(
+    handed: Option<u32>,
+    at_start: Option<u32>,
+    end_with_parent: bool,
+) -> Option<String> {
+    let handed = handed?;
+    (end_with_parent && Some(handed) != at_start).then(|| {
+        format!(
+            "the process that started sandy ({handed}) ended while sandy handed over to its \
+             installed copy, so there is no parent left to end the program with"
+        )
+    })
 }
 
 /// Reads and removes `STARTED_AS_VARIABLE`, before any thread starts.
@@ -107,7 +142,7 @@ fn take_started_as() -> Vec<PathBuf> {
 /// again. Returns when there is no such copy, or when the names cannot be passed intact; this
 /// sandy then runs on as itself.
 #[cfg(target_os = "linux")]
-fn hand_over(started_as: &[PathBuf]) {
+fn hand_over(started_as: &[PathBuf], parent_at_start: Option<u32>) {
     use std::ffi::CString;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
@@ -138,6 +173,8 @@ fn hand_over(started_as: &[PathBuf]) {
     let mut variable = OsString::from(STARTED_AS_VARIABLE);
     variable.push("=");
     variable.push(&joined);
+    let parent =
+        parent_at_start.map(|id| OsString::from(format!("{PARENT_AT_START_VARIABLE}={id}")));
     let environment: Option<Vec<CString>> = std::env::vars_os()
         .map(|(name, value)| {
             let mut entry = name;
@@ -146,6 +183,7 @@ fn hand_over(started_as: &[PathBuf]) {
             entry
         })
         .chain(std::iter::once(variable))
+        .chain(parent)
         .map(|entry| c_string(entry.as_bytes().to_vec()))
         .collect();
     let (Some(arguments), Some(environment)) = (arguments, environment) else {
@@ -170,7 +208,7 @@ fn hand_over(started_as: &[PathBuf]) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn hand_over(_started_as: &[PathBuf]) {}
+fn hand_over(_started_as: &[PathBuf], _parent_at_start: Option<u32>) {}
 
 fn relay(listener: u64, target: std::net::SocketAddr) -> ExitCode {
     // SAFETY: a backend starts this command only with a listening socket it passed to this
@@ -384,6 +422,13 @@ fn sandbox(
     let resolved = ResolvedPolicy::resolve(&policy, invocation.program.as_deref())
         .map_err(|error| error.to_string())?;
     // Checked in every mode, so that check reports what run would refuse.
+    if let Some(reason) = parent_ended_during_hand_over(
+        context.handed_parent,
+        context.parent_at_start,
+        resolved.end_with_parent,
+    ) {
+        return Err(reason);
+    }
     let parent = parent_for(
         invocation.parent_pid,
         invocation.parent_start,
@@ -727,5 +772,16 @@ mod tests {
             "{error}"
         );
         assert!(parent_for(Some(7), Some(99), Some(7), false).is_err());
+    }
+
+    /// After a hand-over the copy refuses `end_with_parent` when its parent is not the one the
+    /// first sandy saw, and the variable decides nothing else.
+    #[test]
+    fn a_parent_that_ended_during_the_hand_over_is_refused() {
+        assert!(parent_ended_during_hand_over(Some(7), Some(1), true).is_some());
+        assert!(parent_ended_during_hand_over(Some(0), Some(7), true).is_some());
+        assert_eq!(parent_ended_during_hand_over(Some(7), Some(7), true), None);
+        assert_eq!(parent_ended_during_hand_over(Some(7), Some(1), false), None);
+        assert_eq!(parent_ended_during_hand_over(None, Some(1), true), None);
     }
 }

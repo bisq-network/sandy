@@ -17,3 +17,5 @@ escape a_connected_unix_socket_on_standard_input_still_runs unix-socket-pair
 # Only root can create a raw IP socket, so the test cannot hand sandy one; the unit test
 # raw_ip_sockets_are_refused_under_every_policy checks the decision instead.
 escape a_raw_ip_socket_on_standard_input_is_refused raw-socket
+# The suite sends nothing into the local network unless SANDY_TEST_LOCAL_PEER names a host there.
+private_macos public_and_local_reaches_the_local_network_but_not_this_mac local-network-peer

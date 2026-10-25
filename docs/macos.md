@@ -725,6 +725,13 @@ of the VPN interfaces, but not 127.0.0.2, which lo0 does not carry, and not the 
 of the local network address. So the rules above let the program reach a forwarded or egress
 port, and listen on an exposed port, at every address the Mac has.
 
+For an IPv6 link-local address `localhost` ignores the scope: an address of the Mac matches with
+any interface as its scope, also one where the Mac does not have it. Measured on macOS 27.0.1 with
+loopback as the scope, where nothing leaves the Mac: the en1 link-local address at the scope of
+lo0 passed the profile and the connect timed out on lo0, while another link-local address at the
+same scope was denied with `EPERM`. With the scope of another link the connect goes out on that
+link, to whatever host has the address there.
+
 For each forwarded port the relay therefore binds the port with `SO_REUSEADDR` and without
 listening at `0.0.0.0`, at `[::]` (IPv6 only) and at every address that `getifaddrs` lists for
 the Mac, also of an interface that is down, except where its own listener or the program listens
@@ -754,7 +761,8 @@ part is not measured, because the test Mac has no second standard user. A socket
 listens on P, at a wildcard address or at an address of the Mac, makes the bind fail, and `run`
 refuses with "cannot hold port P at ADDRESS for ip = "private""; `check` tries the same binds and
 reports the failure for `IpNetworkPrivate`. An address that is not ready, such as a tentative
-IPv6 address, takes no bind, and the wildcard bind holds it. Without `SO_REUSEADDR`, a
+IPv6 address, takes no bind, so only the wildcard binds hold it, as an address that the Mac gains
+later (below). Without `SO_REUSEADDR`, a
 connection of an earlier run that the relay accepted at 127.0.0.1:P and that waits in
 `TIME_WAIT` would make the bind fail for 30 seconds (measured). The tests are
 `the_relay_holds_the_forwarded_ports_at_every_address`,
@@ -775,6 +783,16 @@ What stays open with `forward` and `egress`, an exception of DESIGN.md:
   program's connections there. The program has to connect to that address on purpose, so the
   route serves a program and a process outside that work together. No test records it, because
   no test can add an address to the Mac without administrator rights.
+- A link-local address of the Mac at the scope of another link, where that address belongs to
+  another host or to nobody (see above). The program may connect to its forwarded and egress
+  ports there, and the connection leaves the Mac on that link. No socket of sandy's can hold such
+  an address, because it is not the Mac's. The reach is narrow but real: only the port numbers of
+  the forwarded and egress ports, and only a host whose link-local address equals one of the
+  Mac's, which in practice means `fe80::1`: every Mac has it on lo0, and many routers use it on
+  the local network (`a_link_local_address_of_this_mac_matches_at_every_scope`). A rule for
+  `tcp4` alone would close this for IPv4 ports, but it also denies `::ffff:127.0.0.1` from an
+  IPv6 socket (measured on macOS 27.0.1), the form in which Java and .NET connect to an IPv4
+  address by default, so the profile keeps `tcp`.
 - Once the relay or the broker has ended, also because something outside the sandbox ended it,
   its holder sockets and its listener are gone, and the port reaches whatever binds it next, at
   any address (`a_forwarded_port_reaches_whatever_binds_it_once_the_relay_has_ended`). With
@@ -784,8 +802,8 @@ What stays open with `forward` and `egress`, an exception of DESIGN.md:
   [Who may connect, and who may stop the relay](#who-may-connect-and-who-may-stop-the-relay)),
   and the broker (see [The egress broker](#the-egress-broker)).
 
-`sandy check` warns about the first two for every private network with a forwarded or egress
-port, and about the third for every forwarded port and for the broker.
+`sandy check` warns about the first three for every private network with a forwarded or egress
+port, and about the fourth for every forwarded port and for the broker.
 
 What stays open with `expose`, an exception of DESIGN.md: the program can listen on its exposed
 ports at every address of the Mac, 0.0.0.0 included, and there every local process and other
@@ -834,8 +852,8 @@ connects only to the destinations that `sandy_core::destination` allows for the 
    - `(allow sysctl-read (sysctl-name-prefix "net.route"))`, for `getifaddrs`;
    - `FIONBIO` and `FIOASYNC`, and the closing denials of every profile: no files, no Mach
      services, no processes.
-4. Under that profile it checks that it can read the Mac's addresses, and only then reports that
-   it is ready. sandy refuses to start the program without that report.
+4. Under that profile it checks that it can read the Mac's addresses and starts serving, and only
+   then reports that it is ready. sandy refuses to start the program without that report.
 5. It serves `sandy_relay::broker::serve` until the program ends, then closes its listener and
    its holder sockets at once and gives the connections a second, like the relay.
 
@@ -867,7 +885,9 @@ reply 2; a name got reply 8. With `reach = "public-and-local"` the gateway conne
 Mac's own address still got reply 2. The program itself could connect neither to 1.1.1.1 nor to
 the egress port at another address of the Mac. The tests are
 `the_broker_refuses_this_mac_its_network_and_names`,
-`public_and_local_reaches_the_gateway_but_not_this_mac`,
+`public_and_local_reaches_the_local_network_but_not_this_mac` (it runs only when
+`SANDY_TEST_LOCAL_PEER` names a host of the local network, so the suite sends nothing there by
+itself),
 `the_broker_connects_to_a_public_address`, `the_broker_ends_with_the_program` and
 `a_dead_broker_ends_a_contained_program`.
 
@@ -1356,8 +1376,9 @@ none, so the backend answers nothing and sandy refuses the option.
   resolve only from `/etc/hosts`, Network.framework and URLSession cannot use the forwarded or
   egress ports, forwarded and egress ports need `signals = "isolated"`, the program can listen
   on its exposed ports at every address of the Mac, a process of sandy's user can take a
-  forwarded or egress port at an address the Mac gains later, and every local user reaches the
-  egress broker (see [The private network](#the-private-network) and
+  forwarded or egress port at an address the Mac gains later, the program can reach those
+  ports at a link-local address of the Mac on another link, where another host may have it, and
+  every local user reaches the egress broker (see [The private network](#the-private-network) and
   [The egress broker](#the-egress-broker)).
 - With `process.children = "contained"` the target cannot use `posix_spawn`, so programs that
   start processes through it (Rust's `std::process::Command`, Java, Node.js, `system()`,

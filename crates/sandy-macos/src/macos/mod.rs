@@ -498,9 +498,9 @@ mod tests {
     /// The broker's profile denies connections to `localhost`, every address of this Mac, after
     /// the allow of TCP out. Seatbelt's compiler drops some denials that follow a broad allow,
     /// depending on the rest of the profile (docs/macos.md, "The egress broker"), so this applies
-    /// the real profile, in a child process of its own, and connects to listeners at loopback and
-    /// at this Mac's address on the local network: both are refused. The control is the same
-    /// profile without the deny, which reaches both. The child also reads this Mac's addresses,
+    /// the real profile, in a child process of its own, and connects to listeners at 127.0.0.1,
+    /// at ::1 and at this Mac's address on the local network: each is refused. The control is the
+    /// same profile without the deny, which reaches each. The child also reads this Mac's addresses,
     /// which the destination check needs under the profile.
     #[test]
     fn the_broker_profile_keeps_this_mac_out_of_reach() {
@@ -510,7 +510,10 @@ mod tests {
         let _binds = BINDS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut listeners = vec![std::net::TcpListener::bind("127.0.0.1:0").unwrap()];
+        let mut listeners = vec![
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+            std::net::TcpListener::bind("[::1]:0").unwrap(),
+        ];
         let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         if probe.connect("192.0.2.1:9").is_ok() {
             let own = probe.local_addr().unwrap().ip();
