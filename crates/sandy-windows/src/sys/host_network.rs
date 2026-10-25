@@ -10,7 +10,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 
 use sandy_core::destination::{HostNetwork, Subnet};
-use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
+use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_NETWORK_UNREACHABLE, NO_ERROR};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_FRIENDLY_NAME,
     GAA_FLAG_SKIP_MULTICAST, GetAdaptersAddresses, GetBestRoute2, IP_ADAPTER_ADDRESSES_LH,
@@ -132,7 +132,13 @@ fn collect_addresses(first: *const IP_ADAPTER_ADDRESSES_LH) -> Vec<InterfaceAddr
 
 /// The best route to `ip`, or `None` when the host has no route to it.
 fn best_route(ip: IpAddr) -> io::Result<Option<MIB_IPFORWARD_ROW2>> {
-    let destination = inet(ip);
+    route_to(&inet(ip))
+}
+
+/// `best_route` for a destination in the form `GetBestRoute2` takes. Any failure other than
+/// "no route" leaves open whether the address is this host's, so it is an error, which the
+/// broker answers with reply 1.
+fn route_to(destination: &SOCKADDR_INET) -> io::Result<Option<MIB_IPFORWARD_ROW2>> {
     // SAFETY: the structure is plain data; zero is a valid value for every field.
     let mut route: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
     // SAFETY: zero is a valid value for every field.
@@ -144,7 +150,7 @@ fn best_route(ip: IpAddr) -> io::Result<Option<MIB_IPFORWARD_ROW2>> {
             std::ptr::null(),
             0,
             std::ptr::null(),
-            &destination,
+            destination,
             0,
             &mut route,
             &mut source,
@@ -153,7 +159,8 @@ fn best_route(ip: IpAddr) -> io::Result<Option<MIB_IPFORWARD_ROW2>> {
     match error {
         NO_ERROR => Ok(Some(route)),
         // No route to the destination: it is not one of this host's own addresses.
-        _ => Ok(None),
+        ERROR_NETWORK_UNREACHABLE => Ok(None),
+        error => Err(io::Error::from_raw_os_error(error as i32)),
     }
 }
 
@@ -197,5 +204,24 @@ unsafe fn sockaddr_ip(sockaddr: *const SOCKADDR) -> Option<IpAddr> {
             Some(IpAddr::from(bytes))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A failure of the route lookup is not an answer about the address. A destination of no
+    /// address family makes `GetBestRoute2` fail with `ERROR_INVALID_PARAMETER`; an address
+    /// without a route is an answer, and 127.0.0.1 is a loopback route.
+    #[test]
+    fn a_failed_route_lookup_is_an_error_not_a_missing_route() {
+        // SAFETY: the structure is plain data; zero is a valid value for every field.
+        let no_family: SOCKADDR_INET = unsafe { std::mem::zeroed() };
+        assert!(route_to(&no_family).is_err());
+        // A documentation address: routed only on a host with a default IPv6 route.
+        assert!(best_route("2001:db8::1".parse().unwrap()).is_ok());
+        let loopback = best_route(Ipv4Addr::LOCALHOST.into()).unwrap();
+        assert!(loopback.is_some_and(|route| route.Loopback));
     }
 }

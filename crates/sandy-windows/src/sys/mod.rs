@@ -137,7 +137,8 @@ impl Backend for WindowsBackend {
         }
 
         // The egress broker runs in a sandbox of its own, so prepare it before the relays that
-        // name the AppContainer they belong to. Its container and capabilities outlive the run.
+        // name the AppContainer they belong to. Its profile stays like the program's: the runs
+        // of one policy share it, and one that ends must not take it from one that starts.
         let broker = match policy.egress {
             None => None,
             Some(egress) => Some(EgressBroker::prepare(name, egress, &held)?),
@@ -254,18 +255,15 @@ impl Backend for WindowsBackend {
         if let Some(forwarding) = forwarding {
             forwarding.stop(ended.deadline);
         }
-        // The broker's AppContainer profile is this run's alone; its folder holds no user data.
-        if let Some(broker) = &broker {
-            let _ = appcontainer::delete_profile(&broker.name);
-        }
         Ok(ended.code)
     }
 
     /// Makes the loopback exemption of the policy's AppContainer match the policy: present with
     /// `ip = "client"` and `ip = "all"`, absent with `ip = "none"` and `ip = "private"`
-    /// (`plan::loopback_exemption`). With exposed or forwarded ports, also lets the relays run
-    /// sandy's executable, which a user without the right to change its permissions cannot do at
-    /// run time. Without administrator rights it changes nothing (`elevate::needs_rights`).
+    /// (`plan::loopback_exemption`), and always absent for the egress broker's. With exposed or
+    /// forwarded ports or egress, also lets the relays run sandy's executable, which a user
+    /// without the right to change its permissions cannot do at run time. Without administrator
+    /// rights it changes nothing (`elevate::needs_rights`).
     fn setup(
         &self,
         policy: &ResolvedPolicy,
@@ -290,18 +288,23 @@ impl Backend for WindowsBackend {
             let rule = relay::relay_rule().map_err(SandboxError::new)?;
             acl::grant(name, &rule, &[])?;
             done.push_str(", and its relays may run sandy.exe");
-            // The egress broker runs sandy's executable from an AppContainer of its own.
+            // The egress broker runs sandy's executable from an AppContainer of its own, which
+            // loopback isolation keeps off this machine only without the exemption.
             if policy.egress.is_some() {
                 let broker = crate::name::egress_broker_name(name).map_err(SandboxError::new)?;
+                network::set_loopback_exempt(&appcontainer::sid(&broker)?, false)?;
                 acl::grant(&broker, &rule, &[])?;
-                done.push_str(", and so may its egress broker");
+                done.push_str(
+                    ", and so may its egress broker, whose AppContainer is not in the loopback \
+                     exemption",
+                );
             }
         }
         Ok(SetupOutcome::Done(done))
     }
 
-    /// Takes back what `setup` and the runs of this policy left behind: the loopback exemption,
-    /// the access control entry of every policy path and of sandy's own executable, and the
+    /// Takes back what `setup` and the runs of this policy left behind: the loopback exemptions
+    /// of its AppContainer and of the egress broker's, the access control entry of every policy path and of sandy's own executable, and the
     /// AppContainer profile with its folder. Only entries for the capability SIDs sandy derives
     /// for this AppContainer are removed; other software uses capability SIDs too.
     ///
@@ -323,6 +326,9 @@ impl Backend for WindowsBackend {
         // A run of this AppContainer would lose its access in the middle.
         let _idle = singleton::hold_idle(&container)?;
         network::set_loopback_exempt(&container, false)?;
+        if let Ok(broker) = crate::name::egress_broker_name(name) {
+            network::set_loopback_exempt(&appcontainer::sid(&broker)?, false)?;
+        }
         for rule in &policy.paths {
             acl::revoke(name, rule)?;
         }
@@ -365,7 +371,6 @@ impl Backend for WindowsBackend {
 /// sandy's executable. Its loopback isolation stops it from reaching this machine at the kernel
 /// level, and `sandy_core::destination` keeps it to the destinations `reach` allows.
 struct EgressBroker {
-    name: String,
     container: Sid,
     capabilities: Vec<Sid>,
 }
@@ -386,7 +391,6 @@ impl EgressBroker {
             capabilities.push(network_capability_sid(*capability)?);
         }
         Ok(EgressBroker {
-            name,
             container,
             capabilities,
         })
@@ -440,15 +444,32 @@ fn detect(policy: &ResolvedPolicy) -> HostCapabilities {
         outer_job_ui: host::outer_job_ui(),
         firewall: network::firewall_running(),
         loopback_exempt: container.and_then(|sid| network::is_loopback_exempt(&sid)),
+        broker_loopback_exempt: match policy.windows.appcontainer_name.as_deref() {
+            Some(name) if policy.egress.is_some() => match crate::name::egress_broker_name(name) {
+                Ok(broker) => appcontainer::sid(&broker)
+                    .map_err(|error| error.to_string())
+                    .and_then(|sid| network::is_loopback_exempt(&sid)),
+                // The plan reports a name with no room for the broker's suffix.
+                Err(_) => Ok(false),
+            },
+            _ => Ok(false),
+        },
         // The relay requirements and the egress broker read these; the broker runs sandy's
-        // executable too, and reaches the program over an AF_UNIX socket like a forwarded port.
+        // executable too, from its own AppContainer, which needs a grant of its own, and reaches
+        // the program over an AF_UNIX socket like a forwarded port.
         relay_program: match policy.windows.appcontainer_name.as_deref() {
             Some(name)
                 if !policy.expose.is_empty()
                     || !policy.forward.is_empty()
                     || policy.egress.is_some() =>
             {
-                relay::relay_program(name).map(|rule| rule.path)
+                relay::relay_program(name).and_then(|rule| {
+                    match policy.egress.map(|_| crate::name::egress_broker_name(name)) {
+                        Some(Ok(broker)) => relay::relay_program(&broker).map(|_| rule.path),
+                        // The plan reports a name with no room for the broker's suffix.
+                        Some(Err(_)) | None => Ok(rule.path),
+                    }
+                })
             }
             _ => Err("no relay is needed".into()),
         },

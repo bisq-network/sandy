@@ -4,7 +4,7 @@
 use std::fs;
 use std::mem::size_of;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 
 use sandy_core::{PathAccess, PathRule, SandboxError};
@@ -402,8 +402,24 @@ fn capability_sid(name: &str) -> Result<Sid, SandboxError> {
 /// right there that changes it (`CHANGES_FILE`), or owns or holds a right on the directory that
 /// holds it that adds or replaces an entry (`ADDS_LIBRARY`: Windows looks for a program's
 /// libraries next to it first), or on a directory above that replaces an entry
-/// (`REPLACES_ENTRY`). `Err` says who else can.
-pub fn administrators_only(path: &Path) -> Result<(), String> {
+/// (`REPLACES_ENTRY`). `Ok` is the path to run the program by, which is the one checked.
+/// `Err` says who else can.
+///
+/// The check is on `path` with its links and junctions resolved. A junction answers for its
+/// own permissions, not for those of its target, and changing its target needs only the right
+/// to write its data or attributes, which every user holds on one below `C:\ProgramData`.
+/// A file on a network share is refused: its permissions name the accounts of the machine that
+/// serves it, whose administrators are not this machine's.
+pub fn administrators_only(path: &Path) -> Result<PathBuf, String> {
+    let path = path
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve {}: {error}", path.display()))?;
+    if crate::plan::is_network_path(&path) {
+        return Err(format!(
+            "{} lies on a network share, whose administrators are not this machine's",
+            path.display()
+        ));
+    }
     let mut rights = CHANGES_FILE;
     for entry in path.ancestors() {
         if let Some(who) = changeable_by(entry, rights)? {
@@ -415,7 +431,7 @@ pub fn administrators_only(path: &Path) -> Result<(), String> {
             REPLACES_ENTRY
         };
     }
-    Ok(())
+    Ok(path)
 }
 
 /// Who other than administrators holds `rights` on `path` or owns it, `None` when no one does.

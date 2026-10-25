@@ -345,11 +345,13 @@ pub fn appcontainer_sid(container: &str) -> String {
     value
 }
 
-/// Removes this test's AppContainer profiles (both the plain and the loopback name). Best effort.
+/// Removes this test's AppContainer profiles (the plain and the loopback name, and the egress
+/// broker's of the plain one). Best effort.
 #[cfg(windows)]
 pub fn delete_test_profiles() {
     use windows_sys::Win32::Security::Isolation::DeleteAppContainerProfile;
-    for name in [appcontainer_name(), appcontainer_loopback_name()] {
+    let broker = format!("{}.sandy-egress", appcontainer_name());
+    for name in [appcontainer_name(), appcontainer_loopback_name(), broker] {
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: the name is NUL-terminated.
         unsafe { DeleteAppContainerProfile(wide.as_ptr()) };

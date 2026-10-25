@@ -391,6 +391,15 @@ fn sandy_without_administrator_rights(sandy_args: &[String]) -> (u32, String) {
 /// Runs sandy with `sandy_args` under the token of this process restricted with `flags`
 /// (`CreateRestrictedToken`). Returns the exit code and the standard output and error.
 fn sandy_with_restricted_token(flags: u32, sandy_args: &[String]) -> (u32, String) {
+    executable_with_restricted_token(&sandy_path(), flags, sandy_args)
+}
+
+/// Runs the sandy executable `sandy` as `sandy_with_restricted_token` does.
+fn executable_with_restricted_token(
+    sandy: &str,
+    flags: u32,
+    sandy_args: &[String],
+) -> (u32, String) {
     use std::io::Read;
     use std::os::windows::io::{FromRawHandle, OwnedHandle};
     use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
@@ -453,7 +462,7 @@ fn sandy_with_restricted_token(flags: u32, sandy_args: &[String]) -> (u32, Strin
             HANDLE_FLAG_INHERIT,
         )
     };
-    let mut line = format!("\"{}\"", sandy_path());
+    let mut line = format!("\"{sandy}\"");
     for arg in sandy_args {
         line.push_str(&format!(" \"{arg}\""));
     }
@@ -808,6 +817,37 @@ fn setup_without_administrator_rights_is_not_done() {
     assert!(exempt(), "the removal without rights changed the exemption");
     let removed = sandy(["setup", "--remove", "--appcontainer", name]);
     assert!(removed.status.success(), "{removed:?}");
+    assert!(!exempt());
+    delete_profile(name);
+}
+
+/// `--elevate` without administrator rights asks for them only for a `sandy.exe` that only
+/// administrators can change. The tests' `sandy.exe` lies in the user's profile, so it refuses
+/// with status 3 and names who else can change it, before any prompt, and changes nothing.
+/// Control: `elevate_with_administrator_rights_runs_setup_directly`.
+#[test]
+fn elevate_refuses_a_sandy_that_others_can_change() {
+    let name = "sandy.elevate-refused-test";
+    let exempt = || {
+        String::from_utf8_lossy(&sandy(["check", "--appcontainer", name]).stdout)
+            .contains("is exempt from loopback isolation")
+    };
+    let (code, output) = sandy_without_administrator_rights(&args(&[
+        "setup",
+        "--elevate",
+        "--appcontainer",
+        name,
+        "--ip",
+        "all",
+    ]));
+    assert_eq!(code as i32, 3, "{output}");
+    for part in [
+        "only administrators can change",
+        "can change",
+        "nothing changed",
+    ] {
+        assert!(output.contains(part), "{part}: {output}");
+    }
     assert!(!exempt());
     delete_profile(name);
 }
@@ -3188,6 +3228,20 @@ fn gateway() -> Option<std::net::Ipv4Addr> {
     (error == 0 && !hop.is_unspecified()).then_some(hop)
 }
 
+/// The directed broadcast address of the IPv4 subnet the gateway is on, if this machine has a
+/// gateway on a subnet with room for one: the best route to the gateway is that subnet's.
+fn subnet_broadcast() -> Option<std::net::Ipv4Addr> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{GetBestRoute, MIB_IPFORWARDROW};
+    let gateway = gateway()?;
+    // SAFETY: the structure is plain data; zero is a valid value for every field.
+    let mut route: MIB_IPFORWARDROW = unsafe { std::mem::zeroed() };
+    // SAFETY: route is writable; the address is in network byte order.
+    let error = unsafe { GetBestRoute(u32::from_ne_bytes(gateway.octets()), 0, &mut route) };
+    let mask = u32::from_be_bytes(route.dwForwardMask.to_ne_bytes());
+    let subnet = u32::from_be_bytes(route.dwForwardDest.to_ne_bytes());
+    (error == 0 && mask.leading_ones() < 31).then(|| std::net::Ipv4Addr::from(subnet | !mask))
+}
+
 /// The program and its own processes talk over loopback, IPv4 and IPv6: the reason for
 /// `ip = "private"`.
 #[test]
@@ -3647,7 +3701,8 @@ fn egress_under_public_refuses_this_machine_and_the_local_network() {
 }
 
 /// With `reach = "public-and-local"` the broker reaches the gateway (the host of the test VM's
-/// network, which runs a resolver on port 53), but still refuses this machine itself.
+/// network, which runs a resolver on port 53), but still refuses this machine itself, also by
+/// the broadcast address of its subnet, which only the host's part of the check knows.
 #[test]
 fn egress_under_public_and_local_allows_the_gateway_but_not_this_machine() {
     let Some(gateway) = gateway() else {
@@ -3679,6 +3734,14 @@ fn egress_under_public_and_local_allows_the_gateway_but_not_this_machine() {
         assert_eq!(
             through_broker(&args, port, &with_port(lan, 53)).detail,
             "reply 2"
+        );
+    }
+    // Nor the broadcast address of the gateway's subnet, which is this machine's too.
+    if let Some(broadcast) = subnet_broadcast() {
+        assert_eq!(
+            through_broker(&args, port, &with_port(broadcast.into(), 53)).detail,
+            "reply 2",
+            "{broadcast}"
         );
     }
 }
@@ -3731,23 +3794,260 @@ fn the_egress_broker_ends_with_the_program() {
     }
 }
 
+/// The runs of one policy share the broker's AppContainer, so its profile stays when a run ends,
+/// like the program's: a run that removed it made a run that was starting at that moment fail
+/// when it reduced the rights on the profile folder. `sandy setup --remove` removes it.
+#[test]
+fn the_egress_brokers_profile_outlives_the_run() {
+    let fixture = Fixture::new("egress-profile");
+    let broker = format!("{}.sandy-egress", appcontainer_name());
+    let folder = user_local_app_data().join("Packages").join(&broker);
+    delete_profile(&broker);
+    assert!(!folder.exists(), "{}", folder.display());
+    let port = free_port();
+    probe_inside(&egress_args(&fixture, port, "public"), &[("sleep", "0")])[0].assert_ok();
+    assert!(folder.exists(), "the run removed {}", folder.display());
+
+    let removed = sandy(["setup", "--remove", "--appcontainer", &appcontainer_name()]);
+    if removed.status.code() == Some(3) {
+        skip(
+            "administrator-rights",
+            "sandy setup --remove needs administrator rights",
+        );
+        return;
+    }
+    assert!(removed.status.success(), "{removed:?}");
+    assert!(!folder.exists(), "setup --remove left {}", folder.display());
+}
+
+/// Starts a run with egress whose program sleeps for 20 seconds, and returns it with its relays
+/// once both the egress relay and the broker run.
+fn egress_run_with_relays(fixture: &Fixture) -> (Child, Vec<std::os::windows::io::OwnedHandle>) {
+    let mut run = Command::new(sandy_path())
+        .args(run_args(
+            &egress_args(fixture, free_port(), "public"),
+            &[("sleep", "20000")],
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut children = relay_processes(run.id());
+    while children.len() < 2 {
+        if Instant::now() > deadline {
+            run.kill().unwrap();
+            run.wait().unwrap();
+            panic!("the broker never started");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        children = relay_processes(run.id());
+    }
+    (run, children)
+}
+
+/// A killed run leaves no broker behind with its network capabilities: the relay job's
+/// kill-on-close ends it when sandy dies, and so does the end of its standard input, whose other
+/// end sandy holds (either alone passes this test).
+#[test]
+fn a_killed_run_leaves_no_egress_broker_behind() {
+    let fixture = Fixture::new("egress-killed");
+    let (mut run, children) = egress_run_with_relays(&fixture);
+    // Control: they run while sandy does, so their end below is sandy's death.
+    for child in &children {
+        assert!(!ends_within(child, Duration::ZERO));
+    }
+    run.kill().unwrap();
+    run.wait().unwrap();
+    for child in &children {
+        assert!(
+            ends_within(child, END_TIMEOUT),
+            "a relay or the broker outlived sandy"
+        );
+    }
+}
+
+/// The broker holds network capabilities the program must not have, so no process in another
+/// AppContainer may open it, with any right. The probe stands in for the program, in an
+/// AppContainer of its own with `ip = "private"`, because the broker's process ID is not known
+/// when the program starts; the control outside opens the egress relay and the broker.
+#[test]
+fn another_appcontainer_cannot_open_the_egress_broker() {
+    use windows_sys::Win32::System::Threading::GetProcessId;
+    let stand_in = "sandy.egress-stand-in-test";
+    delete_profile(stand_in);
+    let fixture = Fixture::new("egress-open");
+    let (mut run, children) = egress_run_with_relays(&fixture);
+    let rights = [
+        "vm-write",
+        "vm-operation",
+        "dup-handle",
+        "create-thread",
+        "set-information",
+        "suspend-resume",
+        "query-information",
+        "all-access",
+    ];
+    let targets: Vec<(&str, String)> = children
+        .iter()
+        // SAFETY: each handle is a process handle this test owns.
+        .map(|child| unsafe { GetProcessId(child.as_raw_handle()) })
+        .flat_map(|pid| {
+            [
+                ("open-process-read", pid.to_string()),
+                ("open-process-terminate", pid.to_string()),
+            ]
+            .into_iter()
+            .chain(rights.map(|right| ("open-process-right", format!("{pid}\u{1f}{right}"))))
+        })
+        .collect();
+    let actions: Vec<(&str, &str)> = targets
+        .iter()
+        .map(|(action, target)| (*action, target.as_str()))
+        .collect();
+    let mut sandbox_args = fixture.access_args();
+    sandbox_args.extend(args(&["--ip", "private", "--appcontainer", stand_in]));
+    let outside = probe_outside(&actions);
+    let inside = probe_inside(&sandbox_args, &actions);
+    run.kill().unwrap();
+    run.wait().unwrap();
+    delete_profile(stand_in);
+    for (control, line) in outside.iter().zip(&inside) {
+        control.assert_ok();
+        line.assert_blocked();
+    }
+}
+
+/// The broker's AppContainer must not be exempt from loopback isolation, or nothing below the
+/// destination check keeps the broker off this machine. sandy refuses the broker's name for a
+/// policy, so only an administrator can exempt it, by hand; `check` then names setup (status 2),
+/// and `sandy setup` with the policy removes the exemption. Needs administrator rights.
+#[test]
+fn setup_takes_the_loopback_exemption_from_the_egress_broker() {
+    let name = appcontainer_name();
+    let broker = format!("{name}.sandy-egress");
+    let sid = format!("-p={}", appcontainer_sid(&broker));
+    let exemption = |change: &str| {
+        Command::new("CheckNetIsolation")
+            .args(["LoopbackExempt", change, &sid])
+            .output()
+            .unwrap()
+    };
+    if !exemption("-a").status.success() {
+        skip(
+            "administrator-rights",
+            "CheckNetIsolation cannot exempt the broker's AppContainer",
+        );
+        return;
+    }
+    let port = free_port().to_string();
+    let policy = [
+        "--appcontainer",
+        &name,
+        "--ip",
+        "private",
+        "--egress",
+        &port,
+    ];
+    let check = || sandy(["check"].iter().chain(&policy));
+    let refused = check();
+    let setup = sandy(["setup"].iter().chain(&policy));
+    let checked = check();
+    // Also when an assertion fails below.
+    exemption("-d");
+    assert_eq!(refused.status.code(), Some(EXIT_NEEDS_SETUP), "{refused:?}");
+    let stdout = String::from_utf8_lossy(&refused.stdout);
+    assert!(
+        stdout.contains(&broker) && stdout.contains("exempt"),
+        "{stdout}"
+    );
+    assert!(setup.status.success(), "{setup:?}");
+    assert!(checked.status.success(), "{checked:?}");
+}
+
+/// The broker runs `sandy.exe` from an AppContainer of its own, which needs a grant of its own on
+/// the file. For a `sandy.exe` whose permissions the user cannot change, setup adds both grants;
+/// when only the relays' grant is there, from a setup without egress, `check` names setup
+/// (status 2) as `run` refuses, and after setup with egress both pass. sandy runs under the token
+/// UAC gives an administrator without elevation; setup needs administrator rights.
+#[test]
+fn check_names_setup_when_only_the_brokers_grant_is_missing() {
+    let name = "sandy.broker-grant-test";
+    delete_profile(name);
+    let directory = PathBuf::from(std::env::var_os("ProgramFiles").expect("ProgramFiles is set"))
+        .join(format!("sandy-broker-grant-{}", std::process::id()));
+    if fs::create_dir(&directory).is_err() {
+        skip(
+            "administrator-rights",
+            "this session cannot create a folder in Program Files",
+        );
+        return;
+    }
+    let sandy = directory.join("sandy.exe");
+    fs::copy(sandy_path(), &sandy).unwrap();
+    let sandy = sandy.to_str().unwrap().to_string();
+    // Only administrators may change the file; every user may run it.
+    let locked = Command::new("icacls")
+        .arg(&sandy)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-3-4:(RX)",
+            "*S-1-5-11:(RX)",
+            "*S-1-5-32-544:(F)",
+            "*S-1-5-18:(F)",
+        ])
+        .output()
+        .unwrap();
+    let port = free_port().to_string();
+    let policy = args(&["--appcontainer", name, "--ip", "private"]);
+    let with = |command: &[&str], extra: &[&str]| -> Vec<String> {
+        let mut list = args(command);
+        list.extend_from_slice(&policy);
+        list.extend(args(extra));
+        list
+    };
+    let egress = ["--egress", port.as_str()];
+    let as_admin = |list: Vec<String>| Command::new(&sandy).args(list).output().unwrap();
+    let limited = |list: Vec<String>| {
+        executable_with_restricted_token(&sandy, windows_sys::Win32::Security::LUA_TOKEN, &list)
+    };
+    let forward_setup = as_admin(with(&["setup"], &["--forward", "1=127.0.0.1:2"]));
+    let refused = limited(with(&["check"], &egress));
+    let mut run = with(&["run"], &egress);
+    run.extend(args(&[
+        "--",
+        &probe_path(),
+        "socks5-connect",
+        "127.0.0.1:1",
+    ]));
+    let run = limited(run);
+    let egress_setup = as_admin(with(&["setup"], &egress));
+    let checked = limited(with(&["check"], &egress));
+    let removed = as_admin(with(&["setup", "--remove"], &egress));
+    let _ = fs::remove_dir_all(&directory);
+    delete_profile(name);
+
+    assert!(locked.status.success(), "{locked:?}");
+    assert!(forward_setup.status.success(), "{forward_setup:?}");
+    assert_eq!(refused.0 as i32, EXIT_NEEDS_SETUP, "{}", refused.1);
+    assert!(refused.1.contains("sandy setup"), "{}", refused.1);
+    assert_eq!(run.0 as i32, EXIT_FAILURE, "{}", run.1);
+    assert!(egress_setup.status.success(), "{egress_setup:?}");
+    assert_eq!(checked.0, 0, "{}", checked.1);
+    assert!(removed.status.success(), "{removed:?}");
+}
+
 /// The broker runs with the internetClient capability and no loopback exemption, so Windows
 /// Firewall and loopback isolation stop it from reaching this machine at the kernel level, even
-/// if the destination check (`sandy_core::destination`) ever let such an address through. Measured
-/// with that same capability profile: a connect to a loopback listener and to this machine's own
-/// address on the network is blocked, while the control outside the sandbox connects. When the
-/// firewall's events can be read (administrator rights), the drops are keyed on the AppContainer.
+/// if the destination check (`sandy_core::destination`) ever let such an address through. The
+/// probe stands in for the broker, whose destination check cannot be bypassed from outside, in
+/// an AppContainer with that same capability and no exemption: a connect to a loopback listener
+/// and to this machine's own address on the network is blocked, while the control outside the
+/// sandbox connects.
 #[test]
 fn the_broker_appcontainer_cannot_reach_this_machine() {
     let fixture = Fixture::new("broker-isolation");
-    // internetClient without the loopback exemption: the broker's reach = "public" profile.
-    let mut client = fixture.access_args();
-    client.extend(args(&[
-        "--ip",
-        "client",
-        "--appcontainer",
-        &appcontainer_name(),
-    ]));
     let loopback = TcpListener::bind("127.0.0.1:0").unwrap();
     let mut targets = vec![loopback.local_addr().unwrap().to_string()];
     let lan = lan_address().map(|address| TcpListener::bind((address, 0)).unwrap());
@@ -3762,7 +4062,14 @@ fn the_broker_appcontainer_cannot_reach_this_machine() {
         .iter()
         .map(|target| ("tcp-connect", target.as_str()))
         .collect();
-    for line in controlled(&client, &actions) {
-        line.assert_blocked();
+    // Without the loopback exemption: internetClient alone is the broker of reach = "public";
+    // ip = "all" holds privateNetworkClientServer as the broker of "public-and-local" does, and
+    // internetClientServer, which adds only connections in.
+    for ip in ["client", "all"] {
+        let mut sandbox_args = fixture.access_args();
+        sandbox_args.extend(args(&["--ip", ip, "--appcontainer", &appcontainer_name()]));
+        for line in controlled(&sandbox_args, &actions) {
+            line.assert_blocked();
+        }
     }
 }

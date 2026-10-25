@@ -7,7 +7,7 @@ use sandy_core::{
     EgressReach, IpAccess, PathAccess, PlanItem, Requirement, ResolvedPolicy, SystemAccess,
 };
 
-use crate::name::validate_appcontainer_name;
+use crate::name::{EGRESS_BROKER_SUFFIX, validate_appcontainer_name};
 use crate::version::{WindowsVersion, below_minimum, firewall_bypass};
 
 /// What the host offers. Each field is `Err(reason)` when it could not be determined or the
@@ -34,8 +34,11 @@ pub struct HostCapabilities {
     pub firewall: Result<(), String>,
     /// Whether the AppContainer of the policy is exempt from loopback isolation.
     pub loopback_exempt: Result<bool, String>,
-    /// sandy's own executable, which runs the relays of exposed and forwarded ports, if sandy can
-    /// allow the AppContainer to run it.
+    /// Whether the egress broker's AppContainer is exempt from loopback isolation; `Ok(false)`
+    /// without `network.egress`.
+    pub broker_loopback_exempt: Result<bool, String>,
+    /// sandy's own executable, which runs the relays of exposed and forwarded ports and the egress
+    /// broker, if sandy can allow the AppContainer, and with egress the broker's, to run it.
     pub relay_program: Result<PathBuf, String>,
     /// AF_UNIX sockets work and the socket paths of forwarded ports fit into `sun_path`.
     pub forward_sockets: Result<(), String>,
@@ -357,36 +360,54 @@ fn contained(
              it; job UI restrictions and low integrity block window messages"
         )),
         Requirement::Win32kDenied => enforced(WIN32K_LOCKDOWN.to_string()),
-        Requirement::EgressBrokered => match (&host.firewall, &host.loopback_exempt) {
-            (Err(reason), _) => unavailable(format!(
+        Requirement::EgressBrokered => match (
+            &host.firewall,
+            &host.loopback_exempt,
+            &host.broker_loopback_exempt,
+        ) {
+            (Err(reason), _, _) => unavailable(format!(
                 "AppContainer network isolation depends on the Windows Firewall service: {reason}"
             )),
-            (_, Err(reason)) => unavailable(format!(
+            (_, Err(reason), _) | (_, _, Err(reason)) => unavailable(format!(
                 "cannot read the loopback exemptions of AppContainers: {reason}"
             )),
-            (_, Ok(true)) => needs_setup(format!(
+            (_, Ok(true), _) => needs_setup(format!(
                 "AppContainer {name:?} is exempt from loopback isolation and could reach \
                  127.0.0.1 outside the sandbox without network capabilities; run `sandy setup \
                  --appcontainer {name} --ip private` as administrator to remove the exemption, \
                  or use another name for this policy"
             )),
-            (Ok(()), Ok(false)) => match crate::name::egress_broker_name(name) {
+            (_, _, Ok(true)) => needs_setup(format!(
+                "the egress broker's AppContainer \"{name}{EGRESS_BROKER_SUFFIX}\" is exempt from \
+                 loopback isolation, so nothing below the destination check keeps the broker off \
+                 this machine; run `sandy setup` with this policy as administrator to remove the \
+                 exemption"
+            )),
+            (Ok(()), Ok(false), Ok(false)) => match crate::name::egress_broker_name(name) {
                 Err(reason) => unavailable(reason),
                 Ok(broker) => relay(policy, host, &|sandy| match &host.forward_sockets {
                     Err(reason) => unavailable(reason.clone()),
                     Ok(()) => enforced(format!(
                         "`sandy __broker` in AppContainer {broker:?}, its own sandbox with the \
-                         internetClient capability and a job of its own, serves SOCKS5 on an \
-                         AF_UNIX socket that a `sandy __forward` relay in AppContainer {name:?} \
-                         passes the program's connections to; it connects out only to {reach} \
-                         destinations (sandy_core::destination) and never to this host, which its \
-                         own loopback isolation also denies at the kernel; the broker has only \
-                         read and execute access to {}; {RELAY_END}",
+                         internetClient capability{capabilities}, in the relay job, serves SOCKS5 \
+                         on an AF_UNIX socket that a `sandy __forward` relay in AppContainer \
+                         {name:?} passes the program's connections to; it connects out only to \
+                         {reach} destinations (sandy_core::destination) and never to this host, \
+                         which its own loopback isolation also denies at the kernel; the broker \
+                         has only read and execute access to {}; {RELAY_END}",
                         sandy.display(),
                         reach = policy
                             .egress
                             .map(|egress| egress.reach.name())
                             .unwrap_or("public"),
+                        capabilities = match policy.egress.map(|egress| egress.reach) {
+                            Some(EgressReach::PublicAndLocal) => {
+                                " and privateNetworkClientServer, which also admits connections \
+                                 from hosts of a private network to a socket it listens on, \
+                                 although it listens on none"
+                            }
+                            _ => "",
+                        },
                     )),
                 }),
             },
@@ -460,7 +481,7 @@ fn network_path_problem(policy: &ResolvedPolicy) -> Option<String> {
 /// Whether `path` reaches its file through a network share: `\\server\share`, or
 /// `\\?\UNC\server\share`, which `canonicalize` returns for a share and for a mapped network
 /// drive. The other forms that start with two backslashes, `\\?\` and `\\.\`, are local.
-fn is_network_path(path: &Path) -> bool {
+pub(crate) fn is_network_path(path: &Path) -> bool {
     let text = path.as_os_str().to_string_lossy();
     let verbatim = text
         .get(..8)
@@ -554,6 +575,7 @@ mod tests {
             outer_job_ui: Ok(None),
             firewall: Ok(()),
             loopback_exempt: Ok(false),
+            broker_loopback_exempt: Ok(false),
             relay_program: Ok(sandy_exe(Path::new(r"C:\Program Files\sandy"))),
             forward_sockets: Ok(()),
         }
@@ -1229,8 +1251,9 @@ mod tests {
         );
     }
 
-    /// The broker needs the firewall, no exemption and the CVE fix, like `ip = "private"`, and an
-    /// AppContainer name that leaves room for the broker's reserved suffix.
+    /// The broker needs the firewall, no exemption and the CVE fix, like `ip = "private"`, no
+    /// exemption for its own AppContainer, and an AppContainer name that leaves room for the
+    /// broker's reserved suffix.
     #[test]
     fn egress_is_unavailable_under_the_same_conditions_as_private() {
         let policy = with_egress(sandy_core::EgressReach::Public);
@@ -1268,6 +1291,27 @@ mod tests {
         assert!(
             needs_setup(status(&policy, &ungrantable, Requirement::EgressBrokered))
                 .contains("permissions")
+        );
+        // The broker's own AppContainer must not be exempt either; `sandy setup` removes it.
+        let broker_exempt = HostCapabilities {
+            broker_loopback_exempt: Ok(true),
+            ..host()
+        };
+        let reason = needs_setup(status(&policy, &broker_exempt, Requirement::EgressBrokered));
+        assert!(reason.contains("example.app.sandy-egress"), "{reason}");
+        assert!(reason.contains("exempt"), "{reason}");
+        assert!(plan(&policy, &broker_exempt).needs_only_setup());
+        let broker_unreadable = HostCapabilities {
+            broker_loopback_exempt: Err("access denied".into()),
+            ..host()
+        };
+        assert!(
+            unavailable(status(
+                &policy,
+                &broker_unreadable,
+                Requirement::EgressBrokered
+            ))
+            .contains("loopback exemptions")
         );
         // A name with no room for the broker suffix.
         let mut long = with_egress(sandy_core::EgressReach::Public);

@@ -25,7 +25,7 @@ use windows_sys::core::{BOOL, HRESULT};
 
 use super::acl;
 use super::util::{last_error, system_function, wide, wide_nul, win32_error};
-use crate::cmdline::parameters;
+use crate::cmdline::{parameters, without_verbatim_prefix};
 
 /// `SW_HIDE`: the elevated sandy's console stays out of sight.
 const HIDE: i32 = 0;
@@ -79,18 +79,23 @@ pub fn is_elevated() -> Result<bool, SandboxError> {
 pub fn run_elevated(args: &[OsString]) -> Result<SetupOutcome, SandboxError> {
     let own = std::env::current_exe()
         .map_err(|error| SandboxError::io("cannot find the file of this sandy", error))?;
-    if let Err(reason) = acl::administrators_only(&own) {
-        return Ok(SetupOutcome::Refused(format!(
-            "--elevate runs sandy with administrator rights only from a file that only \
-             administrators can change, and {reason}; install sandy where only administrators \
-             can write, such as below Program Files, or run setup from an elevated prompt; \
-             {FALLBACK}"
-        )));
-    }
+    // The path the check resolved, so the file that runs is the one checked.
+    let own = match acl::administrators_only(&own) {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            return Ok(SetupOutcome::Refused(format!(
+                "--elevate runs sandy with administrator rights only from a file that only \
+                 administrators can change, and {reason}; install sandy where only \
+                 administrators can write, such as below Program Files, or run setup from an \
+                 elevated prompt; {FALLBACK}"
+            )));
+        }
+    };
     let arguments: Vec<Vec<u16>> = args.iter().map(|arg| wide(arg)).collect();
     let parameters = parameters(&arguments)
         .map_err(|error| SandboxError::new(format!("invalid arguments: {error}")))?;
-    let program = wide_nul(own.as_os_str());
+    let mut program = without_verbatim_prefix(&wide(own.as_os_str())).to_vec();
+    program.push(0);
     let directory = std::env::current_dir()
         .map_err(|error| SandboxError::io("cannot read the current directory", error))?;
     let directory = wide_nul(directory.as_os_str());
@@ -167,10 +172,12 @@ pub fn run_elevated(args: &[OsString]) -> Result<SetupOutcome, SandboxError> {
         0 => Ok(SetupOutcome::Done(String::new())),
         // Its console closed with it, so only the status arrives here.
         3 => Ok(SetupOutcome::Refused(format!(
-            "the elevated sandy did not do it (status 3); {FALLBACK}; run the same command from              an elevated prompt to see why"
+            "the elevated sandy did not do it (status 3); {FALLBACK}; run the same command from \
+             an elevated prompt to see why"
         ))),
         code => Err(SandboxError::new(format!(
-            "the elevated sandy ended with status {code}; run the same command from an elevated              prompt to see why"
+            "the elevated sandy ended with status {code}; run the same command from an elevated \
+             prompt to see why"
         ))),
     }
 }
@@ -211,5 +218,44 @@ mod tests {
         let reason = refused.unwrap_err();
         assert!(reason.contains("can change"), "{reason}");
         assert!(is_elevated().is_ok());
+    }
+
+    /// The check resolves junctions, and the path it returns, which `--elevate` runs, is the
+    /// resolved one: a junction answers for its own permissions, not for its target's, and below
+    /// ProgramData every user may change the target of one an administrator made there (with
+    /// the right to write its data or attributes alone; measured on build 26200). Here such a
+    /// junction leads to the Windows folder, so the check passes, for cmd.exe there.
+    #[test]
+    fn the_check_resolves_junctions_and_runs_what_it_checked() {
+        let windows = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap();
+        let link = std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap()
+            .join(format!("sandy-elevate-{}", std::process::id()));
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&windows)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        let checked = acl::administrators_only(&link.join(r"System32\cmd.exe"));
+        std::fs::remove_dir(&link).unwrap();
+        let cmd = windows.join(r"System32\cmd.exe").canonicalize().unwrap();
+        assert_eq!(checked, Ok(cmd));
+    }
+
+    /// The permissions of a file on a share name the accounts of the machine that serves it, so
+    /// a share is refused, here the administrative share of this machine's system drive.
+    #[test]
+    fn a_program_on_a_share_is_refused() {
+        let windows = std::env::var("SystemRoot").unwrap();
+        let (drive, folder) = windows.split_once(r":\").unwrap();
+        let share = PathBuf::from(format!(r"\\localhost\{drive}$\{folder}\System32\cmd.exe"));
+        let reason = acl::administrators_only(&share).unwrap_err();
+        // Without the share (no administrator rights, no server service) it cannot be resolved.
+        if share.exists() {
+            assert!(reason.contains("network share"), "{reason}");
+        }
     }
 }

@@ -23,7 +23,7 @@ isolation.
 | `EnvironmentControlled` | Environment block built from the policy, plus `SystemRoot` and `LOCALAPPDATA` | never |
 | `IpNetworkDenied` | No network capabilities, no loopback exemption | AppContainer exempt from loopback isolation; firewall service not running; no fix for CVE-2021-41338 |
 | `IpNetworkPrivate` | No network capabilities, no loopback exemption; the program's processes and the relays reach each other over loopback (see "Private network") | AppContainer exempt from loopback isolation; firewall service not running; no fix for CVE-2021-41338 |
-| `EgressBrokered` | `sandy __broker` in an AppContainer of its own with the `internetClient` capability, reached from the program over AF_UNIX; `sandy_core::destination` limits where it connects (see "Egress broker") | AppContainer exempt from loopback isolation; firewall service not running; no fix for CVE-2021-41338; the broker's AppContainer name would exceed 64 characters |
+| `EgressBrokered` | `sandy __broker` in an AppContainer of its own with the `internetClient` capability, reached from the program over AF_UNIX; `sandy_core::destination` limits where it connects (see "Egress broker") | the program's or the broker's AppContainer exempt from loopback isolation; firewall service not running; no fix for CVE-2021-41338; the broker's AppContainer name would exceed 64 characters; as for `ForwardedPortsRelayed`, with a grant on `sandy.exe` for the broker's AppContainer too |
 | `PathsHidden` | None: Windows cannot hide paths from an AppContainer without administrator rights (see "What the program can see") | always |
 | `InboundIpDenied` | The `internetClient` capability only; loopback isolation | firewall service not running; no fix for CVE-2021-41338 |
 | `UnixSocketsDenied` | No write access to socket files outside read-write paths | no AppContainer |
@@ -420,8 +420,9 @@ Processes are different: the AppContainer gives the program a narrower view than
 does. The program cannot open the user's processes (see "Other processes"), and it cannot list
 them either. Every enumerator that reads the whole process list outside the sandbox returns,
 inside the AppContainer, only the pid 0 placeholder and the program's own AppContainer processes:
-the program itself, its console host, and the relays of `expose` or `forward`, which run
-`sandy.exe` in the same AppContainer. Measured on build 26200 for a Toolhelp snapshot
+the program itself, its console host, and the relays of `expose`, `forward` or `egress`, which
+run `sandy.exe` in the same AppContainer, but not the egress broker, which runs in an AppContainer
+of its own (`the_egress_broker_is_not_in_the_programs_process_list`). Measured on build 26200 for a Toolhelp snapshot
 (`CreateToolhelp32Snapshot`), `EnumProcesses`, `NtQuerySystemInformation(SystemProcessInformation)`
 and `WTSEnumerateProcessesW`; all four agree, and the control outside the sandbox lists the whole
 machine. The low box (AppContainer) token filters the system process list, so this does not
@@ -463,8 +464,9 @@ Old grants grant nothing, so removing them is cleanup, not a security step.
 
 `sandy setup --remove`, with the policy whose changes should go, does all of it:
 
-- the loopback exemption of the AppContainer, when it is there. The removal needs
-  administrator rights as a whole: without them it changes nothing and exits with status 3;
+- the loopback exemption of the AppContainer and of its egress broker's, when it is there. The
+  removal needs administrator rights as a whole: without them it changes nothing and exits with
+  status 3;
 - the access control entry of every policy path, and of `sandy.exe` for the relays. Only the
   capability SIDs sandy derives for this AppContainer and these objects are removed. Other
   software (Chromium, for example) uses capability SIDs too, and a capability SID cannot be
@@ -634,27 +636,41 @@ sandy runs the broker as `sandy __broker` in an AppContainer of its own, alongsi
    `appcontainer_name` is at most 51 characters.
 2. The broker's token holds the `internetClient` capability for `reach = "public"`, and
    `internetClient` plus `privateNetworkClientServer` for `"public-and-local"` so it may reach the
-   local network. It only connects out, so it needs neither the server capabilities nor the
-   loopback exemption. It also has read and execute access to `sandy.exe`, granted like the
-   relays' (see "Exposed ports"); `sandy setup` adds that grant for the broker's AppContainer too.
+   local network. It also has read and execute access to `sandy.exe`, granted like the relays'
+   (see "Exposed ports"); `sandy setup` adds that grant for the broker's AppContainer too. It
+   only connects out, so it needs neither the server capabilities nor the loopback exemption. It
+   must not have the exemption: sandy never gives it one, but an administrator can by hand, and
+   then the plan reports `EgressBrokered` as needing setup and `sandy setup` with the policy
+   removes it (`setup_takes_the_loopback_exemption_from_the_egress_broker`). Windows has no
+   capability for TCP alone, so a flaw in the broker's parser would give its capabilities whole:
+   datagrams, which `ip = "client"` sends (see "Client networking"), and with
+   `"public-and-local"` connections in from hosts of a private network, which
+   `privateNetworkClientServer` admits to a socket the broker listens on, although it listens on
+   none.
 3. The program reaches the broker through a `sandy __forward` relay in the program's own
    AppContainer, exactly as a forwarded port: the relay listens on `127.0.0.1:<egress port>`
    inside the sandbox and passes each connection over an AF_UNIX socket. sandy binds that socket
    outside the AppContainers and hands the listening handle to the broker, which inherits it and
    accepts on it; the broker needs no access to the socket file. The relay connects to the socket
    file with the capability it already holds.
-4. The broker is in the program's relay job, so it ends with the program and within one second of
-   it (docs/DESIGN.md, "Forwarded ports", rule 5); kill-on-close ends it if sandy dies. Its
-   AppContainer profile is this run's alone and sandy removes it when the run ends.
+4. The broker is in the relay job, so it ends with the program and within one second of it
+   (docs/DESIGN.md, "Forwarded ports", rule 5); kill-on-close ends it if sandy dies, and so does
+   the end of its standard input (`a_killed_run_leaves_no_egress_broker_behind`). No process of
+   another AppContainer can open it (`another_appcontainer_cannot_open_the_egress_broker`). Its
+   AppContainer profile stays between runs like the program's, because the runs of one policy
+   share it: a run that removed it when it ended made a run that was starting fail
+   (`the_egress_brokers_profile_outlives_the_run`). `sandy setup --remove` removes it.
 
 What the broker connects to is decided by `sandy_core::destination`, the same on every platform,
-with the host's own addresses and subnets answered by `GetAdaptersAddresses` and `GetBestRoute2`.
+with the host's own addresses and subnets answered by `GetAdaptersAddresses` and `GetBestRoute2`;
+a lookup that fails for another reason than a missing route refuses the destination with reply 1.
 It refuses a domain name (reply 8), so it resolves nothing for the program. On Windows there is a
-second line of defense: the broker's own AppContainer has no loopback exemption, so loopback
-isolation drops any connection to this machine at the kernel level even if the destination check
-were wrong. The escape tests `egress_reaches_an_allowed_public_destination`,
+second line of defense: the broker's own AppContainer has no loopback exemption (the plan checks
+it), so loopback isolation drops any connection to this machine at the kernel level even if the
+destination check were wrong. The escape tests `egress_reaches_an_allowed_public_destination`,
 `egress_under_public_refuses_this_machine_and_the_local_network`,
-`egress_under_public_and_local_allows_the_gateway_but_not_this_machine`, `egress_refuses_a_name`,
+`egress_under_public_and_local_allows_the_gateway_but_not_this_machine` (which also refuses the
+broadcast address of the gateway's subnet), `egress_refuses_a_name`,
 `the_egress_broker_ends_with_the_program` and `the_broker_appcontainer_cannot_reach_this_machine`
 cover it.
 
@@ -696,7 +712,9 @@ sandy enforces one policy per AppContainer at a time
   file serializes the check.
 - A second run in the same AppContainer with the same fingerprint may run at the same time. A run
   with a different fingerprint is refused with exit status 125 and the reason, until every run of
-  the first policy has ended.
+  the first policy has ended. With `forward` or `egress` a second run of the same policy fails
+  with 125 while the first runs: its relay cannot listen on the port inside the AppContainer
+  that the relay of the first run holds (measured with `egress`).
 - The user's local application data grants nothing to AppContainers, so the program can neither
   read nor change the file (`the_program_cannot_reach_the_coordination_files`), and a policy
   that makes `%LOCALAPPDATA%\sandy` writable is refused (see "Trusted user locations"). The kernel
@@ -811,8 +829,10 @@ the program's end (`relay_stops_listening_as_soon_as_the_program_ends`).
 ### The setup step
 
 `sandy setup` makes the loopback exemption of the policy's AppContainer match the policy: present
-with `ip = "client"` and `ip = "all"`, absent with `ip = "none"` and `ip = "private"`. With
-`--expose`, it also grants the relays read and execute on `sandy.exe` (see "Exposed ports"). Run
+with `ip = "client"` and `ip = "all"`, absent with `ip = "none"` and `ip = "private"`, and with
+`--egress` absent for the broker's AppContainer as well. With `--expose`, `--forward` or
+`--egress`, it also grants the relays read and execute on `sandy.exe` (see "Exposed ports"), and
+with `--egress` the broker too. Run
 it once per machine as administrator. Without administrator rights and without `--elevate`,
 `setup` and `setup --remove` change nothing and exit with status 3, as on Linux, also where
 nothing would change, because whether something changes shows only once it is tried
@@ -842,7 +862,14 @@ DACL or the owner), owns or holds a right on its directory that adds or replaces
 (Windows looks for a program's libraries in its directory first), or owns or holds a right on a
 directory above that replaces an entry (delete a child, delete, change the DACL or the owner).
 Allow entries count with or without a condition, deny entries are ignored, and an entry of a
-kind sandy does not read refuses, so the check errs towards refusing. The account of an
+kind sandy does not read refuses, so the check errs towards refusing. sandy checks the path of
+`sandy.exe` with its links and junctions resolved and runs that path: a junction answers for its
+own permissions, not for its target's, and below `C:\ProgramData` every user may change the target
+of a junction that an administrator made there, with the right to write its data or its
+attributes alone (measured on build 26200;
+`elevate::tests::the_check_resolves_junctions_and_runs_what_it_checked`). A `sandy.exe` on a
+network share is refused, because its permissions name the accounts of the machine that serves
+it. The account of an
 administrator does not count as administrators: its processes without elevation hold its SID
 too. Below `C:\Program Files` the check passes; in a user's profile it fails, and sandy refuses
 with status 3. A dismissed UAC prompt also ends with status 3. The elevated process's messages

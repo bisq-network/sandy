@@ -24,6 +24,7 @@ const C_PROCLIST: &str = "sandy.review.proclist";
 const C_WTS: &str = "sandy.review.wts";
 const C_PIDORACLE: &str = "sandy.review.pidoracle";
 const C_SESSION: &str = "sandy.review.session";
+const C_BROKERLIST: &str = "sandy.review.brokerlist";
 
 /// The executable names a minimal sandbox run shows in its own process list: the always-present
 /// pid 0 placeholder, the program, its console host, and (with `expose`/`forward`) the relays,
@@ -310,7 +311,8 @@ fn com_services_outside_the_sandbox_are_unreachable() {
         if inside[0].detail.contains("ole32") {
             skip(
                 "com-in-appcontainer",
-                "COM does not load in an AppContainer in this session (docs/windows.md                  limitation 13), so the denial would not be the COM boundary",
+                "COM does not load in an AppContainer in this session (docs/windows.md \
+                 limitation 13), so the denial would not be the COM boundary",
             );
             continue;
         }
@@ -474,6 +476,45 @@ fn the_sandbox_process_list_holds_only_its_own_processes() {
     delete_profile(C_PROCLIST);
 }
 
+/// Held: with `network.egress` the program's process list holds its egress relay, a `sandy.exe`
+/// in its AppContainer, but not the broker, which runs in an AppContainer of its own and starts
+/// before the program. Toolhelp shows at most the placeholder, the program, its console host and
+/// the relay.
+#[test]
+fn the_egress_broker_is_not_in_the_programs_process_list() {
+    delete_profile(C_BROKERLIST);
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+        .to_string();
+    let inside = probe_inside(
+        &args(&[
+            "--appcontainer",
+            C_BROKERLIST,
+            "--ip",
+            "private",
+            "--egress",
+            &port,
+        ]),
+        &[("list-processes", ".")],
+    );
+    let (counts, names) = parse_process_list(&inside[0].detail);
+    assert!(
+        names.iter().any(|name| name == "sandy.exe"),
+        "the program does not see its egress relay: {:?}",
+        inside[0]
+    );
+    assert!(
+        counts[0] <= OWN_PROCESS_NAMES.len(),
+        "the program sees more than its own processes, the broker among them: {:?}",
+        inside[0]
+    );
+    delete_profile(C_BROKERLIST);
+    delete_profile(&format!("{C_BROKERLIST}.sandy-egress"));
+}
+
 /// Recorded: `WTSEnumerateProcessesW`, a route to the process list that does not go through
 /// Toolhelp or the NT process information class, is filtered the same way. Inside the sandbox it
 /// returns only the program's own processes; the control outside returns the whole machine. So
@@ -495,26 +536,19 @@ fn wts_process_enumeration_is_also_filtered() {
     );
 
     let inside = probe_inside(&args(&["--appcontainer", C_WTS]), &[("wts-processes", ".")]);
-    // WTS may be filtered (a small count) or denied outright; either way it is no bypass. A
-    // success must carry a count no larger than the program's own set.
-    if inside[0].result == "ok" {
-        let count = inside[0]
-            .detail
-            .strip_prefix("wts=")
-            .and_then(|n| n.parse::<usize>().ok())
-            .unwrap_or_else(|| panic!("sandbox WTS count unreadable: {:?}", inside[0]));
-        assert!(
-            count <= OWN_PROCESS_NAMES.len(),
-            "WTS listed more than the program's own processes: {:?}",
-            inside[0]
-        );
-    } else {
-        assert_eq!(
-            inside[0].result, "denied",
-            "unexpected WTS result: {:?}",
-            inside[0]
-        );
-    }
+    // Measured on build 26200: WTS answers with the filtered list, as the other enumerators do
+    // (docs/windows.md). A denial would be no bypass either, but a change of the record.
+    inside[0].assert_ok();
+    let count = inside[0]
+        .detail
+        .strip_prefix("wts=")
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or_else(|| panic!("sandbox WTS count unreadable: {:?}", inside[0]));
+    assert!(
+        (1..=OWN_PROCESS_NAMES.len()).contains(&count),
+        "WTS listed other than the program's own processes: {:?}",
+        inside[0]
+    );
 
     delete_profile(C_WTS);
 }

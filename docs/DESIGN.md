@@ -469,7 +469,8 @@ Rules:
 7. The broker is a process of its own, apart from the relay, so the relay keeps its narrower
    rights. It is confined like the relay (no file access, no processes), parses nothing but the
    fixed handshake, and ends with the program as the relay does (rule 5 of "Forwarded ports").
-   A flaw in its parser would give what `ip = "client"` gives a program today, minus datagrams.
+   A flaw in its parser would give what `ip = "client"` gives a program today, minus datagrams
+   (on Windows with datagrams, docs/windows.md).
 
 ## Egress broker
 
@@ -1000,8 +1001,9 @@ Details, limitations and sources: `docs/windows.md`.
   a reserved suffix, so no program shares it) with the `internetClient` capability, and
   `privateNetworkClientServer` for `reach = "public-and-local"`. The program reaches it through a
   `sandy __forward` relay over an AF_UNIX socket that sandy binds and the broker inherits; the
-  broker is in the program's job, so it ends with the program. `sandy_core::destination` limits
-  where it connects, and the broker's own loopback isolation also keeps it off this machine.
+  broker is in the relay job, so it ends with the program. `sandy_core::destination` limits
+  where it connects, and the broker's own loopback isolation also keeps it off this machine; the
+  plan refuses a broker AppContainer with the loopback exemption, which `sandy setup` removes.
 - `filesystem.view = "policy"` is unavailable: Windows hides no path from an AppContainer
   without administrator rights, and the sandbox answers `ERROR_ACCESS_DENIED` for an existing
   path outside the policy.
