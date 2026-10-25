@@ -166,7 +166,7 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
     let pid = pid_namespace(policy, host);
     let sandbox = match (abi, landlock) {
         (Ok(abi), Some(landlock)) if enforceable => Some(Sandbox {
-            view: hidden.then(|| view_config(policy, &landlock, &host.system_paths, pid)),
+            view: hidden.then(|| view_config(policy, &landlock, &host.system_paths)),
             landlock,
             client_binds: match policy.ip {
                 IpAccess::Client => port_zero_binds(host),
@@ -205,13 +205,14 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
 }
 
 /// Whether the program of `children = "contained"` runs in a PID namespace of its own. Only where
-/// the host gives one, and not where the program sees the host's `/proc` without a file system
-/// view: the host's `/proc` names processes by their IDs outside the namespace, so a program that
-/// reads `/proc/<getpid()>` would read another process. In a view it gets a `/proc` of its own.
+/// the host gives one, and not where the policy grants a path of `/proc`, with or without a file
+/// system view: the host's `/proc` names processes by their IDs outside the namespace, so a
+/// program that reads `/proc/<getpid()>` would read another process, and a `/proc` of the
+/// namespace (`subset=pid`) would hide the host's files the policy grants, such as `meminfo`.
 fn pid_namespace(policy: &ResolvedPolicy, host: &HostCapabilities) -> bool {
     policy.children == ChildProcesses::Contained
         && host.pid_namespace.is_ok()
-        && (policy.view == FileView::Policy || !sees_proc(policy, "/proc"))
+        && !sees_proc(policy, "/proc")
 }
 
 /// Whether a policy path holds `path` or lies below it.
@@ -376,6 +377,14 @@ fn shortfalls(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
 /// What a file system view leaves visible of the host (docs/linux.md, "File system view").
 fn view_shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
     let hides = "filesystem.view = \"policy\" hides paths only in part on Linux";
+    if policy.paths.iter().any(|rule| rule.path == Path::new("/")) {
+        return vec![
+            "filesystem.view = \"policy\" hides nothing here: the policy makes / readable, so the \
+             view holds the whole file system of the host; grant the directories the program \
+             needs instead of / (docs/linux.md, \"File system view\")"
+                .to_string(),
+        ];
+    }
     let mut shortfalls = vec![
         format!(
             "{hides}: statfs on a path of the view reports the host's file system there, its \
@@ -634,8 +643,8 @@ fn plan_item(
                         format!(", and no PID namespace for children = \"contained\": {reason}")
                     }
                     (Ok(()), ChildProcesses::Contained) => {
-                        ", and children = \"contained\" gets no PID namespace while the program \
-                         sees the host's /proc; grant /proc only with filesystem.view = \"policy\""
+                        ", and children = \"contained\" gets no PID namespace while the policy \
+                         grants a path of /proc"
                             .to_string()
                     }
                     _ => ", or with children = \"contained\" a PID namespace".to_string(),
@@ -654,12 +663,7 @@ fn plan_item(
 /// way to them. A bind gets the rights of every path that holds it, as Landlock grants them: it
 /// is writable inside a writable path, and executable inside a path with an execute rule or a
 /// library directory of the system set, which the loader maps as code.
-fn view_config(
-    policy: &ResolvedPolicy,
-    landlock: &LandlockConfig,
-    system: &[SystemPath],
-    pid: bool,
-) -> View {
+fn view_config(policy: &ResolvedPolicy, landlock: &LandlockConfig, system: &[SystemPath]) -> View {
     let writable = |path: &Path| {
         policy
             .paths
@@ -708,15 +712,7 @@ fn view_config(
             Some(Link { path: name, target })
         })
         .collect();
-    // In a PID namespace the program gets a /proc of its own where the policy grants /proc, with
-    // the rights the rules of /proc and of the directories above it give.
-    let proc_rights = landlock
-        .rules
-        .iter()
-        .filter(|rule| Path::new("/proc").starts_with(&rule.path))
-        .fold(BitFlags::empty(), |rights, rule| rights | rule.access);
-    let proc = (pid && !proc_rights.is_empty()).then_some(proc_rights);
-    View { binds, links, proc }
+    View { binds, links }
 }
 
 /// The symbolic links that the kernel passes when it executes the program: the names of its
@@ -1602,6 +1598,29 @@ mod tests {
         assert!(unavailable(&plan_for(&policy, &no_seccomp)).contains(&Requirement::PathsHidden));
     }
 
+    /// A view of a policy that makes / readable holds the whole host, which the notes say instead
+    /// of what a narrower view leaves visible.
+    #[test]
+    fn a_view_of_the_whole_root_is_warned_about() {
+        let mut policy = policy();
+        policy.view = FileView::Policy;
+        let hides_nothing = |policy: &ResolvedPolicy| {
+            notes(policy, &host(Some(9)))
+                .iter()
+                .any(|note| note.contains("hides nothing here"))
+        };
+        assert!(!hides_nothing(&policy));
+        policy.paths.push(rule("/", PathAccess::Read, true));
+        assert!(hides_nothing(&policy));
+        let notes = notes(&policy, &host(Some(9)));
+        assert!(
+            !notes.iter().any(|note| note.contains("statfs on a path")),
+            "{notes:?}"
+        );
+        policy.view = FileView::All;
+        assert!(!hides_nothing(&policy));
+    }
+
     /// The view closes the metadata exception of `read` paths and adds its own, the mount table
     /// one only with /proc in the policy.
     #[test]
@@ -1714,21 +1733,25 @@ mod tests {
         );
         assert!(mechanism(&policy, &no_namespace).contains("whose leader is a guard"));
 
-        // The host's /proc names processes by their IDs outside the namespace.
-        let mut with_proc = policy.clone();
-        with_proc.paths.push(rule("/proc", PathAccess::Read, true));
-        assert_eq!(
-            plan_for(&with_proc, &host(Some(9)))
+        // The host's /proc names processes by their IDs outside the namespace, and a /proc of the
+        // namespace would hide the host's files of the grant; also with a view.
+        for path in ["/proc", "/proc/meminfo", "/"] {
+            let mut with_proc = policy.clone();
+            with_proc.paths.push(rule(path, PathAccess::Read, true));
+            assert_eq!(
+                plan_for(&with_proc, &host(Some(9)))
+                    .sandbox
+                    .unwrap()
+                    .namespaces,
+                None
+            );
+            with_proc.view = FileView::Policy;
+            let namespaces = plan_for(&with_proc, &host(Some(9)))
                 .sandbox
                 .unwrap()
-                .namespaces,
-            None
-        );
-        // A view gives the program a /proc of its own instead, with the rights of the policy's.
-        with_proc.view = FileView::Policy;
-        let sandbox = plan_for(&with_proc, &host(Some(9))).sandbox.unwrap();
-        assert!(sandbox.namespaces.unwrap().pid);
-        assert_eq!(sandbox.view.unwrap().proc, Some(READ));
+                .namespaces;
+            assert!(!namespaces.unwrap().pid, "{path}");
+        }
 
         for children in [ChildProcesses::Allowed, ChildProcesses::None] {
             policy.children = children;

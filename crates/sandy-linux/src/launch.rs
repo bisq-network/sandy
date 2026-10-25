@@ -127,19 +127,11 @@ pub fn launch(
             Ok(threads) => threads,
             Err(error) => return error,
         };
-        let proc = match sandbox.namespaces {
-            Some(namespaces) => {
-                match enter(namespaces, sandbox, handovers, factory, &mut threads, split) {
-                    Ok(proc) => proc,
-                    Err(error) => return error,
-                }
-            }
-            None => None,
-        };
-        let ruleset = match proc_rule(ruleset, proc, sandbox) {
-            Ok(ruleset) => ruleset,
-            Err(error) => return error,
-        };
+        if let Some(namespaces) = sandbox.namespaces
+            && let Err(error) = enter(namespaces, sandbox, handovers, factory, &mut threads, split)
+        {
+            return error;
+        }
         match confine(ruleset, binds, &sandbox.filter, observer.as_ref(), &threads) {
             Ok(()) => exec.execute(),
             Err(error) => error,
@@ -178,17 +170,16 @@ fn enter(
     factory: Option<factory::Pending>,
     threads: &mut Threads,
     split: Option<&contain::Split>,
-) -> Result<Option<OwnedFd>, SandboxError> {
+) -> Result<(), SandboxError> {
     namespaces.enter()?;
     if let Some(split) = split {
         split.run()?;
         // The list named the process that split itself and has ended.
         *threads = Threads::open()?;
     }
-    let proc = match &sandbox.view {
-        Some(view) => view::enter(view, &sandbox.identities, terminal_on_standard_streams())?,
-        None => None,
-    };
+    if let Some(view) = &sandbox.view {
+        view::enter(view, &sandbox.identities, terminal_on_standard_streams())?;
+    }
     for handover in handovers {
         handover.send()?;
     }
@@ -196,23 +187,7 @@ fn enter(
     if let Some(factory) = factory {
         factory.start(sandbox.landlock.abi, threads)?;
     }
-    Ok(proc)
-}
-
-/// The rule of the new `/proc` of a PID namespace (`View::proc`), which the rules of the policy
-/// do not reach.
-fn proc_rule(
-    ruleset: RulesetCreated,
-    proc: Option<OwnedFd>,
-    sandbox: &Sandbox,
-) -> Result<RulesetCreated, SandboxError> {
-    let rights = sandbox.view.as_ref().and_then(|view| view.proc);
-    match (proc, rights) {
-        (Some(proc), Some(rights)) => ruleset
-            .add_rule(PathBeneath::new(proc, rights))
-            .map_err(landlock_error),
-        _ => Ok(ruleset),
-    }
+    Ok(())
 }
 
 /// A directory that a standard stream carries was opened in the host's mount namespace, and the

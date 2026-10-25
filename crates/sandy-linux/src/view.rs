@@ -34,7 +34,6 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
-use landlock::{AccessFs, BitFlags};
 use sandy_core::SandboxError;
 
 use crate::launch::{open_path, open_rule};
@@ -48,11 +47,6 @@ pub struct View {
     /// The symbolic links that the names of the policy paths, the system set, the program's
     /// loader and its interpreters pass, where they lie outside every bind.
     pub links: Vec<Link>,
-    /// A new `/proc` of the program's PID namespace, mounted over the one the policy grants, which
-    /// lists only the sandbox's processes, with the Landlock rights of the policy's `/proc`. Its
-    /// own rule: Landlock skips a mount point that another mount covers, so the rule of the bound
-    /// `/proc` does not reach the new mount on top of it (measured on Linux 7.2: EACCES).
-    pub proc: Option<BitFlags<AccessFs>>,
 }
 
 /// A path of the host, mounted at the same path in the view.
@@ -124,13 +118,12 @@ impl Bind {
 
 /// Builds `view` in this process's new mount namespace and makes it the root, steps 1 to 5 of the
 /// module documentation. `terminal` adds `/dev/tty` and a private `/dev/pts`. Afterwards the
-/// working directory is the one before, when the view holds it, and `/` otherwise. Returns the
-/// new `/proc` of `View::proc`, for its Landlock rule.
+/// working directory is the one before, when the view holds it, and `/` otherwise.
 pub fn enter(
     view: &View,
     identities: &BTreeMap<PathBuf, FileIdentity>,
     terminal: bool,
-) -> Result<Option<OwnedFd>, SandboxError> {
+) -> Result<(), SandboxError> {
     let working = std::env::current_dir().ok();
     make_root_private()?;
     let mut sources = Vec::with_capacity(view.binds.len());
@@ -168,10 +161,6 @@ pub fn enter(
             .map_err(|error| failed(format!("mount {}", bind.path.display()), error))?;
         bound.push((&bind.path, tree));
     }
-    let proc = match view.proc {
-        Some(_) => Some(mount_proc(&bound)?),
-        None => None,
-    };
     for link in &view.links {
         make_link(&root, link)?;
     }
@@ -191,7 +180,7 @@ pub fn enter(
         std::env::set_current_dir("/")
             .map_err(|error| failed("change to the new root".to_string(), error))?;
     }
-    Ok(proc)
+    Ok(())
 }
 
 fn failed(what: String, error: io::Error) -> SandboxError {
@@ -541,42 +530,6 @@ fn mount_point(root: &OwnedFd, bind: &Bind) -> Result<OwnedFd, SandboxError> {
     drop(unsafe { OwnedFd::from_raw_fd(file) });
     open_path(Some(&parent), Path::new(name))
         .map_err(|error| failed(format!("open the place of {}", bind.path.display()), error))
-}
-
-/// Mounts a new `/proc` of this process's PID namespace over the one the bind of `/proc`, or of a
-/// directory above it, shows: with `subset=pid` it holds only the namespace's processes and
-/// `self`, none of the host's files. Before `pivot_root`, because Linux 6.8 lets a user namespace
-/// mount `/proc` only while a complete one is visible in the mount namespace (EPERM after the old
-/// root is detached, measured). Returns the new mount's root.
-fn mount_proc(bound: &[(&Path, OwnedFd)]) -> Result<OwnedFd, SandboxError> {
-    let proc_path = Path::new("/proc");
-    let Some((outer, outer_tree)) = bound
-        .iter()
-        .rev()
-        .find(|(path, _)| proc_path.starts_with(path))
-    else {
-        return Err(SandboxError::new(
-            "cannot mount /proc for the file system view: no bind holds it",
-        ));
-    };
-    let open_error = |error| failed("open /proc".to_string(), error);
-    let mut target = outer_tree.try_clone().map_err(open_error)?;
-    for name in names_below(proc_path, outer) {
-        target = open_path(Some(&target), Path::new(name)).map_err(open_error)?;
-    }
-    if status_of(&target).map_err(open_error)?.st_mode & libc::S_IFMT != libc::S_IFDIR {
-        return Err(SandboxError::new(
-            "cannot mount /proc for the file system view: /proc is no directory",
-        ));
-    }
-    let proc = new_mount(
-        "proc",
-        &[("subset", Some("pid"))],
-        MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC,
-        "the /proc of the sandbox's PID namespace",
-    )?;
-    move_onto(&proc, &target).map_err(|error| failed("mount /proc".to_string(), error))?;
-    Ok(proc)
 }
 
 /// `/dev` of the view: a tmpfs with the nodes of `devices` bound read-only, and with a terminal

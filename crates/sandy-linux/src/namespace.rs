@@ -387,7 +387,7 @@ pub fn probe(namespaces: Namespaces) -> Result<(), String> {
                         false => Ok(()),
                     })
                     .and_then(|()| match namespaces.mount {
-                        true => view::enter(&View::default(), &BTreeMap::new(), false).map(drop),
+                        true => view::enter(&View::default(), &BTreeMap::new(), false),
                         false => Ok(()),
                     })
                     .and_then(|()| drop_capabilities())
@@ -585,6 +585,9 @@ mod tests {
     #[test]
     fn the_probe_tries_the_mount_steps() {
         use landlock::{AccessFs, Ruleset, RulesetAttr};
+        if !crate::alone::in_own_process() {
+            return;
+        }
         let network = Namespaces {
             network: true,
             mount: false,

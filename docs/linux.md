@@ -658,7 +658,9 @@ exception of "Metadata through open files" does not apply in the view
   (`dev_holds_the_minimal_devices`). Other devices are bound only when the policy grants them.
 - **`/proc`** exists only when the policy grants a path of it, and holds what the policy grants,
   bound from the host's `/proc` (measured: binds of procfs and sysfs files and directories work in
-  the user namespace on Linux 6.8 and 7.2). It lists the host's processes as without the view.
+  the user namespace on Linux 6.8 and 7.2). It lists the host's processes as without the view,
+  also with `children = "contained"`, which then runs without a PID namespace (see "A PID
+  namespace").
 
 ### Detection and refusals
 
@@ -704,6 +706,10 @@ exception of "Metadata through open files" does not apply in the view
 - On Ubuntu every run adds the AppArmor audit records of the `unshare` to the kernel log.
 
 ### What stays visible
+
+A policy that makes `/` readable gives the view the whole file system of the host, so it hides
+nothing; `sandy check` warns about that instead of the items below, and sandy runs it as asked
+(`a_view_of_the_whole_root_is_warned_about` in `plan.rs`).
 
 These are exceptions of `PathsHidden` (DESIGN.md, "Requirements and the enforcement plan"):
 `sandy check` warns about each, and a test records it.
@@ -1128,18 +1134,22 @@ mechanism too, without needing setup.
    program can still signal its own processes, the init, which ignores it, and with exposed ports
    the socket factory, which ends the program when it ends (step 7 of "Exposed and forwarded
    ports"); from ABI 6 the factory's own signal scope keeps it out of reach as well.
-5. With `filesystem.view = "policy"` and `/proc` in the policy, the view mounts a new `/proc` of
-   the namespace (`subset=pid`, read-only) over the granted one, before the old root is detached,
-   which Linux 6.8 needs (`EPERM` after, measured). It lists only the namespace's processes and
-   `self`, none of the host's files such as `meminfo` or `sys`
-   (`proc_shows_only_the_sandboxs_processes`). It gets a Landlock rule of its own with the rights
-   of the policy's `/proc`, because Landlock skips a mount point that another mount covers, and
-   the rule of the bound `/proc` would not reach it (`EACCES`, measured on Linux 7.2). `/proc/1`
-   is sandy's init, whose command line is sandy's.
+5. The init is undumpable, so its `/proc` files belong to root: no process of the user reads its
+   environment, which is sandy's (`the_init_is_undumpable`). Its command line, which is sandy's,
+   stays readable as every process's is. The program itself never sees the init in a `/proc`: it
+   has none in the namespace, by the rule below.
 
-Without a view, a policy that grants `/proc` keeps `contained` without the namespace: the host's
-`/proc` names processes by their IDs outside it, and a program that reads `/proc/<its pid>` would
-read another process. `/proc/self` would still be right, but not every program uses it.
+A policy that grants a path of `/proc`, or of a directory above it such as `/`, keeps `contained`
+without the namespace, with or without the file system view. The host's `/proc` names processes
+by their IDs outside the namespace, so a program that reads `/proc/<its pid>` would read another
+process, and a `/proc` of the namespace (`subset=pid`), which lists only its processes, would
+hide the host's files the policy grants, such as `meminfo` or `sys`. A grant of a process
+directory alone does not help: the resolver makes `/proc/self` the directory of sandy's process
+ID when it plans, which names no process of the namespace. So with a `/proc` grant `/proc/meminfo`
+stays readable and `/proc` lists the host's processes, as without `contained`
+(`a_proc_grant_keeps_its_host_files_with_contained`). Below Landlock ABI 6 such a policy with
+`signals = "isolated"` is refused, and the reason says that `contained` gets no PID namespace
+while the policy grants a path of `/proc`.
 
 The denylist still denies `setsid` and `setpgid`, although the namespace, not the group, now ends
 the processes. That keeps one behaviour for one policy on hosts with and without the namespace:

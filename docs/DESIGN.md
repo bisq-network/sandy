@@ -818,9 +818,10 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   through a pidfd, which ends every process of the namespace. The guard, sandy and the init are
   outside the program's group and namespace, so below Landlock ABI 6 the namespace isolates
   signals: `kill`, `pidfd_open`, `F_SETOWN` and the priority calls reach no outside process by
-  ID. With the file system view and `/proc` granted, a new `/proc` of the namespace
-  (`subset=pid`) replaces the granted one. `setsid` and `setpgid` stay denied, so a policy
-  behaves the same with and without the namespace.
+  ID. A policy that grants a path of `/proc` keeps `contained` without the namespace, also with
+  the file system view: the host's `/proc` names processes by their IDs outside it, and a
+  `/proc` of the namespace would hide the host's files of the grant. `setsid` and `setpgid` stay
+  denied, so a policy behaves the same with and without the namespace.
 - `process.end_with_parent`: a watcher process, forked twice like the relay, polls pidfds for
   sandy's parent and for the program (with `contained`: the supervising sandy). When the parent
   ends, it sends SIGTERM and SIGCONT and, 5 seconds later, SIGKILL. Like the relay, it runs in a

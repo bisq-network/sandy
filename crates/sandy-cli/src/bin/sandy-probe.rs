@@ -5288,7 +5288,7 @@ mod view {
         "kill-signal",
         "pidfd-open",
         "proc-pids",
-        "orphan-zombies",
+        "orphan-reaped",
     ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
@@ -5392,38 +5392,41 @@ mod view {
                 let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
                 Ok(pids.join(","))
             }
-            // Leaves an orphan behind: a child forks a grandchild and ends, and the grandchild
-            // ends a moment later. Counts the zombies the /proc at `target` lists after another
-            // moment; an orphan that nobody reaps is one.
-            "orphan-zombies" => {
-                // SAFETY: the probe has one thread; the children only sleep and end.
-                unsafe {
+            // Leaves an orphan behind: a child forks a grandchild, reports its ID and ends, and the
+            // grandchild ends a moment later. After another moment the grandchild is gone when
+            // something reaped it, and a zombie, which signal 0 still reaches, when nothing did.
+            "orphan-reaped" => {
+                let mut ends = [0; 2];
+                // SAFETY: pipe2 writes two new descriptors into `ends`.
+                check(unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) })?;
+                // SAFETY: the probe has one thread; the children only write, sleep and end.
+                let orphan = unsafe {
                     let child = libc::fork();
                     if child == 0 {
-                        if libc::fork() == 0 {
+                        let grandchild = libc::fork();
+                        if grandchild == 0 {
                             libc::usleep(100_000);
                             libc::_exit(0);
                         }
+                        libc::write(ends[1], (&raw const grandchild).cast(), 4);
                         libc::_exit(0);
                     }
+                    libc::close(ends[1]);
                     libc::waitpid(child, std::ptr::null_mut(), 0);
+                    let mut orphan: libc::pid_t = 0;
+                    let read = libc::read(ends[0], (&raw mut orphan).cast(), 4);
+                    libc::close(ends[0]);
+                    if read != 4 {
+                        return Err(io::Error::other("the child reported no grandchild"));
+                    }
                     libc::usleep(500_000);
-                }
-                let zombie = |stat: &str| {
-                    stat.rfind(')')
-                        .is_some_and(|end| stat[end + 1..].trim_start().starts_with('Z'))
+                    orphan
                 };
-                let zombies = fs::read_dir(target)?
-                    .flatten()
-                    .filter(|entry| {
-                        let name = entry.file_name();
-                        name.to_str()
-                            .is_some_and(|name| name.parse::<u32>().is_ok())
-                    })
-                    .filter_map(|entry| fs::read_to_string(entry.path().join("stat")).ok())
-                    .filter(|stat| zombie(stat))
-                    .count();
-                Ok(zombies.to_string())
+                // SAFETY: kill with signal 0 only checks that the process exists.
+                match unsafe { libc::kill(orphan, 0) } {
+                    0 => Ok("a zombie".to_string()),
+                    _ => Ok("reaped".to_string()),
+                }
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

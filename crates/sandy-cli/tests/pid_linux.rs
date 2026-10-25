@@ -50,68 +50,105 @@ fn pid_namespace_works() -> bool {
     false
 }
 
-/// The view with /proc and `contained`: the program gets a /proc of its own.
-fn with_proc() -> Vec<String> {
-    let mut sandbox_args = contained();
-    sandbox_args.extend(args(&["--view", "policy", "--read", "/proc"]));
-    sandbox_args
-}
-
-/// The program is PID 2, PID 1 is sandy's init, and a signal from the program to its init, even
-/// SIGKILL, ends nothing: the program goes on to its next action.
+/// The program is PID 2, and a signal from the program to its init, PID 1, even SIGKILL, ends
+/// nothing: the program goes on to its next action.
 #[test]
 fn the_program_runs_as_pid_2_below_an_init_of_sandy() {
     if !pid_namespace_works() {
         return;
     }
     let lines = probe_inside(
-        &with_proc(),
+        &contained(),
         &[
             ("pid", "-"),
-            ("read", "/proc/1/cmdline"),
             ("kill-signal", "1:15"),
             ("kill-signal", "1:9"),
             ("pid", "-"),
         ],
     );
     assert_eq!(lines[0].detail, "2", "{lines:?}");
-    lines[1].assert_ok();
     // With the Landlock signal scope the init is outside the program's domain (EPERM); without,
     // the kernel drops a signal from inside the namespace to a PID 1 without a handler.
-    for line in &lines[2..4] {
+    for line in &lines[1..3] {
         assert!(
             line.result == "ok" || has_errno(line, libc::EPERM),
             "{lines:?}"
         );
     }
-    assert_eq!(lines[4].detail, "2", "{lines:?}");
+    assert_eq!(lines[3].detail, "2", "{lines:?}");
 }
 
-/// An orphan of the program is re-parented to the init, which reaps it: no zombie stays in the
-/// namespace's /proc.
+/// An orphan of the program is re-parented to the init, which reaps it: no zombie stays.
 #[test]
 fn orphans_are_reaped() {
     if !pid_namespace_works() {
         return;
     }
-    let lines = probe_inside(&with_proc(), &[("orphan-zombies", "/proc")]);
-    assert_eq!(lines[0].detail, "0", "{lines:?}");
+    let lines = probe_inside(&contained(), &[("orphan-reaped", "-")]);
+    assert_eq!(lines[0].detail, "reaped", "{lines:?}");
 }
 
-/// /proc of the program lists only the processes of its namespace: the init, the program and what
-/// the program starts. Without `contained` the bound /proc of the host lists every process.
+/// A policy that grants /proc keeps `contained` without a PID namespace, also with the file system
+/// view: a /proc of the namespace would hide the host's files the policy grants. So /proc/meminfo
+/// stays readable, and /proc lists the host's processes as without `contained`.
 #[test]
-fn proc_shows_only_the_sandboxs_processes() {
+fn a_proc_grant_keeps_its_host_files_with_contained() {
     if !pid_namespace_works() {
         return;
     }
-    let lines = probe_inside(&with_proc(), &[("proc-pids", "/proc")]);
-    assert_eq!(lines[0].detail, "1,2", "{lines:?}");
-    let host = probe_inside(
-        &args(&["--view", "policy", "--read", "/proc"]),
-        &[("proc-pids", "/proc")],
+    let mut sandbox_args = contained();
+    sandbox_args.extend(args(&["--view", "policy", "--read", "/proc"]));
+    let mut check = vec!["check".to_string()];
+    check.extend(sandbox_args.iter().cloned());
+    let stdout = String::from_utf8_lossy(&sandy(&check).stdout).into_owned();
+    if common::linux::landlock_abi() < 6 {
+        // Without the namespace nothing isolates signals below ABI 6.
+        assert!(
+            stdout.contains("gets no PID namespace while the policy"),
+            "{stdout}"
+        );
+        return;
+    }
+    assert!(!stdout.contains(MECHANISM), "{stdout}");
+    let lines = probe_inside(
+        &sandbox_args,
+        &[("read", "/proc/meminfo"), ("proc-pids", "/proc")],
     );
-    assert!(host[0].detail.split(',').count() > 10, "{host:?}");
+    lines[0].assert_ok();
+    assert!(lines[1].detail.split(',').count() > 10, "{lines:?}");
+}
+
+/// The init is undumpable, so its /proc files belong to root: no other process of the user reads
+/// its environment, which is sandy's. Control: the program's, which execve made dumpable again.
+#[test]
+fn the_init_is_undumpable() {
+    if !pid_namespace_works() {
+        return;
+    }
+    let (reader, mut child) = spawn_with_status(&contained(), &[("sleep", "3000")]);
+    let mut first = String::new();
+    BufReader::new(reader).read_line(&mut first).unwrap();
+    let program: u32 = first.trim().strip_prefix("pid ").unwrap().parse().unwrap();
+    let init = children_of(child.id())
+        .into_iter()
+        .find(|&pid| {
+            let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("NSpid:"))
+                .is_some_and(|ids| ids.split_whitespace().nth(1) == Some("1"))
+        })
+        .expect("no init");
+    let environ = |pid: u32| fs::read(format!("/proc/{pid}/environ"));
+    let init_environ = environ(init);
+    let program_environ = environ(program);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(
+        init_environ.map_err(|error| error.kind()),
+        Err(std::io::ErrorKind::PermissionDenied)
+    );
+    assert!(program_environ.is_ok(), "{program_environ:?}");
 }
 
 /// Processes outside the namespace have no process ID inside it, so the program reaches none of
