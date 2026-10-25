@@ -5,6 +5,13 @@
 //!
 //! The relay only copies bytes; it never interprets them. Each backend decides where the relay
 //! process runs, how it is confined, and how it ends together with the program.
+//!
+//! The egress broker behind `network.egress` (`broker`) is separate from the relay. It reads one
+//! SOCKS5 request per connection (`socks`), checks the destination, connects, and then copies
+//! bytes as the relay does; the handshake is the only thing it parses.
+
+pub mod broker;
+pub mod socks;
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -12,6 +19,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+// The listening sockets that `serve_until` and `broker::serve` wait on.
+#[cfg(unix)]
+use std::os::fd::AsRawFd as AsRawListener;
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket as AsRawListener;
 
 /// Connections of one listener beyond this number are closed at once, so clients cannot exhaust
 /// threads. Each exposed or forwarded port has its own limit, so clients of one cannot take the
@@ -56,7 +69,7 @@ where
     A: FnMut() -> io::Result<TcpStream>,
     C: Fn() -> io::Result<TcpStream> + Send + Sync + 'static,
 {
-    let connections = Connections::new(connect);
+    let connections = relayed(connect);
     loop {
         match accept() {
             Ok(client) => {
@@ -71,37 +84,56 @@ where
     }
 }
 
-/// The relayed connections of one server: it starts each on its own thread and counts the
-/// active ones.
-struct Connections<C> {
-    connect: Arc<C>,
+/// The connections of one server: it handles each on its own thread and counts the active ones.
+struct Connections<H> {
+    handle: Arc<H>,
     active: Arc<AtomicUsize>,
+    limit: usize,
+    stack_size: Option<usize>,
 }
 
-impl<C> Connections<C>
+/// The connections of a relay: each one is relayed to a connection from `connect`.
+fn relayed<C>(connect: C) -> Connections<impl Fn(TcpStream) + Send + Sync + 'static>
 where
     C: Fn() -> io::Result<TcpStream> + Send + Sync + 'static,
 {
-    fn new(connect: C) -> Connections<C> {
+    Connections::new(MAX_CONNECTIONS, None, move |client| {
+        if let Ok(server) = connect() {
+            let _ = relay_streams(client, server);
+        }
+    })
+}
+
+impl<H> Connections<H>
+where
+    H: Fn(TcpStream) + Send + Sync + 'static,
+{
+    /// At most `limit` connections at a time, each handled by `handle` on a thread with
+    /// `stack_size` (the standard library's default when `None`).
+    fn new(limit: usize, stack_size: Option<usize>, handle: H) -> Connections<H> {
         Connections {
-            connect: Arc::new(connect),
+            handle: Arc::new(handle),
             active: Arc::new(AtomicUsize::new(0)),
+            limit,
+            stack_size,
         }
     }
 
-    /// Relays `client` on a new thread, or closes it while `MAX_CONNECTIONS` are active. Returns
-    /// false if no thread could start.
+    /// Handles `client` on a new thread, or closes it while `limit` connections are active.
+    /// Returns false if no thread could start.
     fn start(&self, client: TcpStream) -> bool {
-        if self.active.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
+        if self.active.fetch_add(1, Ordering::AcqRel) >= self.limit {
             self.active.fetch_sub(1, Ordering::AcqRel);
             return true;
         }
         let active = Arc::clone(&self.active);
-        let connect = Arc::clone(&self.connect);
-        let spawned = thread::Builder::new().spawn(move || {
-            if let Ok(server) = connect() {
-                let _ = relay_streams(client, server);
-            }
+        let handle = Arc::clone(&self.handle);
+        let mut thread = thread::Builder::new();
+        if let Some(size) = self.stack_size {
+            thread = thread.stack_size(size);
+        }
+        let spawned = thread.spawn(move || {
+            handle(client);
             active.fetch_sub(1, Ordering::AcqRel);
         });
         if spawned.is_err() {
@@ -111,13 +143,13 @@ where
         true
     }
 
-    #[cfg(windows)]
     fn active(&self) -> usize {
         self.active.load(Ordering::Acquire)
     }
 }
 
-/// A request to stop a server that `serve_until` runs. Clones share the request.
+/// A request to stop a server that `serve_until` or `broker::serve` runs. Clones share the
+/// request.
 #[derive(Debug, Clone, Default)]
 pub struct Stop(Arc<AtomicBool>);
 
@@ -136,7 +168,6 @@ impl Stop {
 }
 
 /// How long `serve_until` waits for a connection before it checks for a stop request again.
-#[cfg(windows)]
 const STOP_CHECK: Duration = Duration::from_millis(50);
 
 /// Serves like `serve_with` until `stop` is requested, then ends the way docs/DESIGN.md rule 5
@@ -151,13 +182,28 @@ const STOP_CHECK: Duration = Duration::from_millis(50);
 /// It never blocks in `accept` without a pending connection, so the stop takes effect within
 /// `STOP_CHECK` without closing the listener under another thread.
 #[cfg(windows)]
-pub fn serve_until<L, A, C>(listener: L, mut accept: A, connect: C, stop: &Stop, drain: Duration)
+pub fn serve_until<L, A, C>(listener: L, accept: A, connect: C, stop: &Stop, drain: Duration)
 where
-    L: std::os::windows::io::AsRawSocket,
+    L: AsRawListener,
     A: FnMut(&L) -> io::Result<TcpStream>,
     C: Fn() -> io::Result<TcpStream> + Send + Sync + 'static,
 {
-    let connections = Connections::new(connect);
+    serve_connections_until(listener, accept, &relayed(connect), stop, drain);
+}
+
+/// The loop of `serve_until`, which `broker::serve` shares: it hands each accepted connection to
+/// `connections` until `stop` is requested, then ends as `serve_until` describes.
+fn serve_connections_until<L, A, H>(
+    listener: L,
+    mut accept: A,
+    connections: &Connections<H>,
+    stop: &Stop,
+    drain: Duration,
+) where
+    L: AsRawListener,
+    A: FnMut(&L) -> io::Result<TcpStream>,
+    H: Fn(TcpStream) + Send + Sync + 'static,
+{
     let mut deadline: Option<Instant> = None;
     loop {
         if deadline.is_none() && stop.is_requested() {
@@ -165,7 +211,7 @@ where
         }
         let stopping = deadline.is_some();
         let wait = if stopping { Duration::ZERO } else { STOP_CHECK };
-        match pending(listener.as_raw_socket(), wait) {
+        match pending(raw_listener(&listener), wait) {
             Ok(true) => match accept(&listener) {
                 Ok(client) => {
                     if !connections.start(client) {
@@ -194,9 +240,41 @@ where
     }
 }
 
+#[cfg(unix)]
+fn raw_listener(listener: &impl AsRawListener) -> RawSocket {
+    listener.as_raw_fd()
+}
+
+#[cfg(windows)]
+fn raw_listener(listener: &impl AsRawListener) -> RawSocket {
+    listener.as_raw_socket()
+}
+
+/// Whether a connection waits on the listening `socket`, waiting at most `wait`.
+#[cfg(unix)]
+fn pending(socket: RawSocket, wait: Duration) -> io::Result<bool> {
+    let mut entry = libc::pollfd {
+        fd: socket,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = libc::c_int::try_from(wait.as_millis()).unwrap_or(libc::c_int::MAX);
+    loop {
+        // SAFETY: entry is one valid pollfd and the count is 1.
+        let ready = unsafe { libc::poll(&mut entry, 1, millis) };
+        if ready >= 0 {
+            return Ok(ready > 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 /// Whether a connection waits on the listening `socket`, waiting at most `wait`.
 #[cfg(windows)]
-fn pending(socket: std::os::windows::io::RawSocket, wait: Duration) -> io::Result<bool> {
+fn pending(socket: RawSocket, wait: Duration) -> io::Result<bool> {
     use windows_sys::Win32::Networking::WinSock::{
         POLLRDNORM, SOCKET, SOCKET_ERROR, WSAGetLastError, WSAPOLLFD, WSAPoll,
     };
@@ -236,11 +314,17 @@ pub fn relay(client: TcpStream, target: SocketAddr) -> io::Result<()> {
 /// that fails (a reset, or a write the other peer refuses) aborts the connection: both sockets
 /// close with a reset, so neither peer takes a cut stream for a complete one.
 pub fn relay_streams(client: TcpStream, server: TcpStream) -> io::Result<()> {
-    relay_streams_with(client, server, HALF_CLOSED_IDLE)
+    relay_streams_with(client, server, HALF_CLOSED_IDLE, None)
 }
 
-/// `relay_streams` with `idle` instead of `HALF_CLOSED_IDLE`.
-fn relay_streams_with(client: TcpStream, server: TcpStream, idle: Duration) -> io::Result<()> {
+/// `relay_streams` with `idle` instead of `HALF_CLOSED_IDLE`, and the second direction on a
+/// thread with `stack_size` (the standard library's default when `None`).
+fn relay_streams_with(
+    client: TcpStream,
+    server: TcpStream,
+    idle: Duration,
+    stack_size: Option<usize>,
+) -> io::Result<()> {
     let _registered = Registered::new(&client, &server);
     let state = Connection::default();
     // Without a timeout a read would block until the peer sends, also after an abort. Both are
@@ -254,8 +338,12 @@ fn relay_streams_with(client: TcpStream, server: TcpStream, idle: Duration) -> i
         state.abort([&client, &server]);
         return Ok(());
     }
+    let mut thread = thread::Builder::new();
+    if let Some(size) = stack_size {
+        thread = thread.stack_size(size);
+    }
     thread::scope(|scope| {
-        thread::Builder::new().spawn_scoped(scope, || {
+        thread.spawn_scoped(scope, || {
             pump(
                 &client,
                 &server,
@@ -449,7 +537,13 @@ pub fn abort_all() {
 /// soft limit of 256, which would allow only about 125 connections.
 #[cfg(unix)]
 pub fn raise_descriptor_limit(listeners: usize) -> io::Result<()> {
-    let needed = (listeners * 2 * MAX_CONNECTIONS + 64) as libc::rlim_t;
+    raise_descriptor_limit_to(listeners * 2 * MAX_CONNECTIONS + 64)
+}
+
+/// Raises the soft limit of open descriptors to at least `needed`, or to the hard limit.
+#[cfg(unix)]
+fn raise_descriptor_limit_to(needed: usize) -> io::Result<()> {
+    let needed = needed as libc::rlim_t;
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -755,7 +849,7 @@ mod tests {
         let (mut client, client_end) = pair();
         let (target, target_end) = pair();
         let idle = Duration::from_millis(100);
-        let relay = thread::spawn(move || relay_streams_with(client_end, target_end, idle));
+        let relay = thread::spawn(move || relay_streams_with(client_end, target_end, idle, None));
         // The target ends its side; the client stays open and silent.
         drop(target);
         let mut rest = Vec::new();
@@ -776,7 +870,7 @@ mod tests {
         let (client, client_end) = pair();
         let (mut target, target_end) = pair();
         let idle = Duration::from_millis(300);
-        let relay = thread::spawn(move || relay_streams_with(client_end, target_end, idle));
+        let relay = thread::spawn(move || relay_streams_with(client_end, target_end, idle, None));
         // The target ends its side first; the client then sends for longer than the limit.
         target.shutdown(Shutdown::Write).unwrap();
         for _ in 0..8 {

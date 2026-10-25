@@ -18,6 +18,11 @@ mod openssl;
 mod peer;
 mod plan;
 mod relay;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the Linux egress broker, a later task, uses it")
+)]
+mod routes;
 mod system;
 mod trust;
 mod watch;

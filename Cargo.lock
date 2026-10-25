@@ -134,6 +134,7 @@ name = "sandy-relay"
 version = "2.1.0"
 dependencies = [
  "libc",
+ "sandy-core",
  "windows-sys",
 ]
 

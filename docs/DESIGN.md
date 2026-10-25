@@ -458,6 +458,42 @@ Rules:
    fixed handshake, and ends with the program as the relay does (rule 5 of "Forwarded ports").
    A flaw in its parser would give what `ip = "client"` gives a program today, minus datagrams.
 
+## Egress broker
+
+The detail behind rules 5 to 7 of "Private network and egress". `sandy_relay::broker` serves the
+broker on every platform and `sandy_core::destination` decides, so a destination means the same
+everywhere; a backend adds only its answer about its own addresses (`HostNetwork`).
+
+1. The handshake (`sandy_relay::socks`) takes method 0 only and answers any other greeting with
+   `X'FF'`. It has 10 seconds in total, every read has a size the protocol fixes, and a request is
+   read whole before it is judged, so a refusal ends with its reply and a normal close, and data
+   that a client sends behind its request reaches the destination.
+2. The static check follows the IANA special-purpose registries, copied in
+   `crates/sandy-core/data`. A test pins the tables to the copies, and a weekly workflow
+   (`.github/workflows/iana.yml`) fails when IANA changes a registry. IPv4 is a denylist of the
+   registry's blocks. IPv6 is an allowlist of `2000::/3` minus the registry's blocks inside it, so
+   a block that IANA adds elsewhere is refused before the tables change. `192.0.0.0/24` and
+   `2001::/23` are refused as a whole, with the anycast addresses in them that no program needs.
+   The forms other than the mapped one that embed an IPv4 address (IPv4-compatible `::/96`,
+   NAT64 `64:ff9b::/96` and `64:ff9b:1::/48`, 6to4 `2002::/16`, Teredo `2001::/32`) are refused
+   whatever `reach` says: whether a translator or a tunnel takes them to the embedded address
+   depends on the network. Port 0 is refused.
+3. The host's part: whether an address is the host's own (an interface address, a subnet
+   broadcast address, or a local, broadcast, anycast or multicast route), and which subnets its
+   interfaces are on, asked for every connection. An address on such a subnet is the local
+   network. `public` refuses it also when it is globally reachable, because on IPv6 a local
+   network often has a global prefix. `public-and-local` allows it also in a block that is not
+   globally reachable, but a subnet never opens what rule 6 never allows, such as loopback or
+   link-local. When the host cannot tell, the broker refuses with reply 1. Linux asks the
+   kernel's routing tables (`RTM_GETROUTE` and `RTM_GETADDR`) over a `NETLINK_ROUTE` socket that
+   it opens before the broker confines itself.
+4. The broker connects to the address it checked, an IPv4-mapped one as IPv4, within 10
+   seconds. A refused, unreachable or timed-out connect gets reply 5, 3 or 4, any other failure
+   reply 1.
+5. It serves at most `sandy_relay::broker::MAX_CONNECTIONS` (1000) connections at the same time,
+   more than a relayed port, because a program that talks to many peers needs them. Each takes
+   two threads with small stacks and two descriptors; macOS allows a process 2048 threads.
+
 ## The file system view
 
 `filesystem.view = "policy"` makes every path outside the policy paths and the system set look
@@ -1005,5 +1041,5 @@ until the certificates exist.
 |---|---|---|
 | `sandy-core` | policy, validation, requirements, plan, backend trait | no other sandy crate; `libc` on Unix, `windows-sys` on Windows |
 | `sandy-linux`, `sandy-macos`, `sandy-windows` | one backend each; empty on other platforms | `sandy-core`, `sandy-relay` |
-| `sandy-relay` | byte relay behind `expose` and `forward` | no other sandy crate; `libc` or `windows-sys` |
+| `sandy-relay` | byte relay behind `expose` and `forward`, and the egress broker | `sandy-core`; `libc` or `windows-sys` |
 | `sandy-cli` | command line, backend selection, test probe | all of the above |

@@ -5,6 +5,7 @@
 //! why it cannot. sandy starts the target only when every requirement is enforced.
 
 mod backend;
+pub mod destination;
 mod env;
 mod plan;
 mod policy;
