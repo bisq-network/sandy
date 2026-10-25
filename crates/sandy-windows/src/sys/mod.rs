@@ -84,7 +84,7 @@ impl Backend for WindowsBackend {
         // below is one the plan named.
         if let Some(item) = self.plan(policy).into_iter().find(|i| !i.is_enforced()) {
             let reason = match item.status {
-                Status::Unavailable { reason } => reason,
+                Status::Unavailable { reason } | Status::NeedsSetup { reason } => reason,
                 Status::Enforced { .. } => unreachable!(),
             };
             return Err(SandboxError::new(format!(

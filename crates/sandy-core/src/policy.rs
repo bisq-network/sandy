@@ -68,6 +68,30 @@ pub struct FilesystemPolicy {
     /// Read, list, create, modify and delete. Never execute.
     #[serde(default)]
     pub read_write: Vec<PathBuf>,
+    /// Whether paths outside the policy are visible to the target.
+    #[serde(default)]
+    pub view: FileView,
+}
+
+/// What the target sees of the paths outside the policy (and the system set).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileView {
+    /// They exist for the target as on the host; the sandbox denies access to them.
+    #[default]
+    All,
+    /// They look missing: every call that names one answers as for a path that does not exist.
+    Policy,
+}
+
+impl FileView {
+    /// The value as the policy writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            FileView::All => "all",
+            FileView::Policy => "policy",
+        }
+    }
 }
 
 /// Which operating system files the target may use in addition to the policy paths.
@@ -98,6 +122,54 @@ pub struct NetworkPolicy {
     /// Loopback services outside the sandbox that the target can reach through a relay.
     #[serde(default)]
     pub forward: Vec<ForwardedPort>,
+    /// A SOCKS5 broker through which a target with `ip = "private"` connects out.
+    #[serde(default)]
+    pub egress: Option<Egress>,
+}
+
+/// A broker that lets a target with `ip = "private"` connect out to the destinations `reach`
+/// allows, and nowhere else.
+///
+/// The target connects to `port` on 127.0.0.1 and asks for a destination with SOCKS5 CONNECT
+/// (RFC 1928), as an IPv4 or IPv6 address. sandy checks the destination outside the sandbox,
+/// connects to it and relays the bytes. Names are refused, so the broker resolves nothing for the
+/// target. Only TCP goes out this way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Egress {
+    pub port: u16,
+    #[serde(default)]
+    pub reach: EgressReach,
+}
+
+impl Egress {
+    /// The address inside the sandbox that the target connects to.
+    pub fn listen(&self) -> SocketAddr {
+        SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), self.port)
+    }
+}
+
+/// Which destinations the egress broker connects to. The host itself, under any of its
+/// addresses, is never one of them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EgressReach {
+    /// Globally reachable unicast addresses only (`sandy_core::destination`).
+    #[default]
+    Public,
+    /// Public addresses and the local network: the private, shared and unique local ranges and
+    /// the subnets of the host's interfaces.
+    PublicAndLocal,
+}
+
+impl EgressReach {
+    /// The value as the policy writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            EgressReach::Public => "public",
+            EgressReach::PublicAndLocal => "public-and-local",
+        }
+    }
 }
 
 /// A relay that makes a loopback port of the target reachable from outside the sandbox.
@@ -165,6 +237,10 @@ pub enum NetworkAccess {
 pub enum IpAccess {
     #[default]
     None,
+    /// IP only among the target's own processes, on a loopback that belongs to the sandbox. The
+    /// host, the local network and the internet are reachable only through `expose`, `forward`
+    /// and `egress`.
+    Private,
     /// Connections and datagrams the target starts, name resolution included, but no listening
     /// socket and no accepted connection. What a datagram socket receives differs per platform
     /// (DESIGN.md, "Requirements and the enforcement plan").
@@ -177,6 +253,7 @@ impl IpAccess {
     pub fn name(self) -> &'static str {
         match self {
             IpAccess::None => "none",
+            IpAccess::Private => "private",
             IpAccess::Client => "client",
             IpAccess::All => "all",
         }
@@ -338,6 +415,10 @@ pub enum PolicyError {
         forward: ForwardedPort,
         reason: &'static str,
     },
+    InvalidEgress {
+        egress: Egress,
+        reason: &'static str,
+    },
     ChildrenNeedUnixSocketsDenied(ChildProcesses),
     ContainedChildrenNeedIsolatedSignals,
     EndWithParentNeedsIsolatedSignals,
@@ -432,6 +513,9 @@ impl fmt::Display for PolicyError {
                 "invalid forward port {} -> {}: {reason}",
                 forward.port, forward.to
             ),
+            PolicyError::InvalidEgress { egress, reason } => {
+                write!(f, "invalid egress port {}: {reason}", egress.port)
+            }
             PolicyError::InvalidExpose { expose, reason } => write!(
                 f,
                 "invalid expose {} -> port {}: {reason}",
@@ -475,6 +559,8 @@ mod tests {
         assert_eq!(policy.linux.path_metadata, PathMetadata::Deny);
         assert_eq!(policy.process.children, ChildProcesses::Allowed);
         assert_eq!(policy.windows.win32k, Win32k::Allow);
+        assert_eq!(policy.filesystem.view, FileView::All);
+        assert_eq!(policy.network.egress, None);
     }
 
     #[test]
@@ -546,6 +632,44 @@ mod tests {
         let error =
             Policy::from_toml("version = 1\n[network]\nunix_sockets = \"client\"").unwrap_err();
         assert!(matches!(error, PolicyError::Parse(_)), "{error}");
+    }
+
+    #[test]
+    fn parses_the_private_network_and_the_view() {
+        let policy = Policy::from_toml(
+            r#"
+            version = 1
+            [filesystem]
+            view = "policy"
+            [network]
+            ip = "private"
+            egress = { port = 1080 }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(policy.filesystem.view, FileView::Policy);
+        assert_eq!(policy.network.ip, IpAccess::Private);
+        let egress = policy.network.egress.unwrap();
+        assert_eq!(egress.reach, EgressReach::Public);
+        assert_eq!(egress.listen(), "127.0.0.1:1080".parse().unwrap());
+        let local = Policy::from_toml(
+            "version = 1\n[network]\negress = { port = 1, reach = \"public-and-local\" }",
+        )
+        .unwrap();
+        assert_eq!(
+            local.network.egress.unwrap().reach,
+            EgressReach::PublicAndLocal
+        );
+        for bad in [
+            "version = 1\n[network]\negress = { port = 1, reach = \"local\" }",
+            "version = 1\n[network]\negress = { port = 1, host = \"x\" }",
+            "version = 1\n[filesystem]\nview = \"none\"",
+        ] {
+            assert!(
+                matches!(Policy::from_toml(bad), Err(PolicyError::Parse(_))),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

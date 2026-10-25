@@ -85,6 +85,7 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<PlanIte
                 Err(reason) => PlanItem::unavailable(requirement, reason.clone()),
             },
             Mechanism::Exec(text) => PlanItem::enforced(requirement, text),
+            Mechanism::Missing(reason) => PlanItem::unavailable(requirement, reason),
         })
         .collect()
 }
@@ -300,7 +301,12 @@ enum Mechanism {
     /// Enforced by how sandy starts the target, or by macOS itself. Needs no host capability
     /// beyond posix_spawn and execve.
     Exec(String),
+    /// Not enforced by this backend.
+    Missing(&'static str),
 }
+
+/// For the requirements of sandy 2.1 that this backend does not enforce yet.
+const NOT_YET: &str = "the macOS backend does not enforce this yet";
 
 fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
     let contained = policy.children == ChildProcesses::Contained;
@@ -393,6 +399,9 @@ fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
              addresses; not a child of the target (forked twice), its own profile without files \
              or Mach services, ends when the target ends (kqueue NOTE_EXIT)"
         }
+        Requirement::IpNetworkPrivate | Requirement::EgressBrokered | Requirement::PathsHidden => {
+            return Mechanism::Missing(NOT_YET);
+        }
         Requirement::Win32kDenied => {
             return Mechanism::Exec(
                 "nothing to deny: win32k is the GUI part of the Windows kernel, and macOS has \
@@ -427,6 +436,8 @@ mod tests {
             unix_sockets,
             expose: Vec::new(),
             forward: Vec::new(),
+            egress: None,
+            view: sandy_core::FileView::All,
             signals,
             children: sandy_core::ChildProcesses::Allowed,
             end_with_parent: false,

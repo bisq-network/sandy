@@ -315,6 +315,8 @@ mod tests {
             unix_sockets: NetworkAccess::None,
             expose: Vec::new(),
             forward: Vec::new(),
+            egress: None,
+            view: sandy_core::FileView::All,
             signals: SignalScope::Any,
             children: sandy_core::ChildProcesses::Allowed,
             end_with_parent: false,

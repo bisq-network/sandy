@@ -18,11 +18,14 @@ everything else is denied. sandy supports Linux, macOS and Windows.
 
 ## Non-goals
 
-- Limiting where the program connects on the network. `ip` decides between no IP networking,
-  connections the program makes (`client`) and all of it; it never filters destinations.
+- Filtering where a program with `ip = "client"` or `ip = "all"` connects. Those values decide
+  the direction of IP networking, not its destinations. The one place where sandy checks
+  destinations is the egress broker of `ip = "private"` (see "Private network and egress").
 - Protecting the program from the user, or protecting secrets the program itself holds.
 - Resource limits (memory, CPU, process count). They can come later.
-- Containers, images or a separate root file system.
+- Containers, images or a root file system of their own. The view of
+  `filesystem.view = "policy"` shows the host's own paths, only fewer of them (see "The file
+  system view").
 - Filtering what the program writes to a terminal. A program whose standard output is the user's
   terminal can send escape sequences that some terminal emulators act on, for example to set the
   clipboard, and on Linux it can also change the terminal's modes. These are ordinary writes, so
@@ -49,12 +52,16 @@ system = "minimal"            # "minimal" | "none"
 read = ["/opt/app/share"]     # read files, list directories
 read_exec = ["/opt/app/bin"]  # read, list, execute
 read_write = ["/var/lib/app"] # read, list, create, change, delete; never execute
+view = "all"                  # "all" | "policy"; policy: paths outside the policy look missing
 
 [network]
-ip = "none"                   # "none" | "client" | "all"; IPv4 and IPv6 including loopback
+ip = "none"                   # "none" | "private" | "client" | "all"; IPv4 and IPv6 including
+                              # loopback; private: only the sandbox's own loopback
 unix_sockets = "none"         # "none" | "all"; "none" reaches no socket outside read_write
 expose = [{ listen = "127.0.0.1:18080", port = 8080 }]  # relay into the program's port 8080
 forward = [{ port = 18081, to = "127.0.0.1:8081" }]     # relay out to a local service
+egress = { port = 1080, reach = "public" }  # with ip = "private": a SOCKS5 broker on the
+                              # program's 127.0.0.1:1080; reach = "public" | "public-and-local"
 
 [process]
 signals = "any"               # "any" | "isolated"
@@ -407,6 +414,67 @@ Rules:
    connection has ended, the other ends when it stays idle for `sandy_relay::HALF_CLOSED_IDLE`
    (60 seconds), so a peer that never sends again cannot hold the connection and its slot.
 
+## Private network and egress
+
+`ip = "private"` gives the program IP networking among its own processes only, on a loopback
+that belongs to the sandbox. It is the value for a program that serves or reaches the host only
+through named ports, and the network only through a checked broker.
+
+Rules:
+
+1. The program may bind, listen and connect on its own loopback addresses. Nothing outside the
+   sandbox reaches those sockets except through `expose`, and they reach nothing outside except
+   through `forward` and `egress`: not the host's loopback services, not the host's other
+   addresses, not the local network and not the internet, also not with datagrams, ICMP or name
+   resolution. How each platform gives the program a loopback of its own, and where it gives
+   less, is in the platform docs.
+2. `expose` and `forward` work as with `ip = "all"`. A forwarded port, and the egress port,
+   should be reachable by the program alone; a platform that cannot keep other local users away
+   from them names that in the exceptions table.
+3. A socket on a standard stream belongs to the network it was created in, so `run` refuses
+   every IP socket there (rule 13 of "Policy").
+4. `network.egress` adds a broker that speaks SOCKS5 (RFC 1928) on `127.0.0.1:<port>` inside the
+   sandbox. It needs `ip = "private"`: with any other value the program either has no network or
+   reaches it without the broker. Its address must differ from every address of `expose` and
+   `forward`.
+5. The broker accepts one request per connection: `CONNECT` with an IPv4 or IPv6 address, no
+   authentication. It refuses a domain name (reply 8), so it resolves nothing for the program,
+   and every other command (reply 7). It checks the destination outside the sandbox, connects
+   from there, and from then on copies bytes like the relay. Only TCP leaves this way.
+6. Destinations (`sandy_core::destination`): `reach = "public"`, the default, allows only
+   globally reachable unicast addresses, from the IANA special-purpose registries.
+   `"public-and-local"` also allows the private, shared and unique local ranges and the subnets
+   of the host's interfaces. Never allowed, whatever `reach` says: an address of the host itself
+   (what the kernel calls a local, broadcast or multicast route), loopback, `0.0.0.0`,
+   link-local and multicast. An IPv4-mapped IPv6 address is judged as the IPv4 address it maps.
+   After the connect the broker also closes a connection whose local address is loopback or
+   equal to its peer, which is what a connection to the host itself looks like. A refused
+   destination gets reply 2, and the program learns nothing about the host's addresses: the
+   success reply names `0.0.0.0:0`.
+7. The broker is a process of its own, apart from the relay, so the relay keeps its narrower
+   rights. It is confined like the relay (no file access, no processes), parses nothing but the
+   fixed handshake, and ends with the program as the relay does (rule 5 of "Forwarded ports").
+   A flaw in its parser would give what `ip = "client"` gives a program today, minus datagrams.
+
+## The file system view
+
+`filesystem.view = "policy"` makes every path outside the policy paths and the system set look
+missing to the program: a call that names one answers as for a path that does not exist. It
+closes what a denial still tells: which files exist, their sizes, times and owners, and what
+appears in a watched directory.
+
+Rules:
+
+1. The view hides; it grants nothing. Landlock, the profile or the AppContainer still decide what
+   the program may do with what it sees.
+2. Execute stays a right of its own. On Linux every path the policy does not make executable, a
+   writable path or a `read` path, is mounted without execute, so a file there can be neither
+   executed nor mapped as code; `read_exec` is how a policy grants both.
+3. A platform that cannot hide paths reports the requirement as unavailable, and `run` refuses
+   (Windows: docs/windows.md).
+4. What the view changes for programs is in the platform docs: on Linux a rename or a link
+   between two writable paths fails with `EXDEV`, and files of other users show the owner 65534.
+
 ## Requirements and the enforcement plan
 
 `ResolvedPolicy::requirements` derives the guarantees a policy needs:
@@ -419,6 +487,9 @@ Rules:
 | `InheritedHandlesClosed` | always |
 | `EnvironmentControlled` | always |
 | `IpNetworkDenied` | `network.ip = "none"` |
+| `IpNetworkPrivate` | `network.ip = "private"` |
+| `EgressBrokered` | `network.egress` is set |
+| `PathsHidden` | `filesystem.view = "policy"` |
 | `InboundIpDenied` | `network.ip = "client"` |
 | `UnixSocketsDenied` | `network.unix_sockets = "none"` |
 | `SignalsIsolated` | `process.signals = "isolated"` |
@@ -822,6 +893,7 @@ Details, limitations and sources: `docs/windows.md`.
 | 128 + signal number | Linux and macOS with `process.children = "contained"`, and Linux with `--explain`: a signal ended the program |
 | 125 | sandy failed or refused (invalid policy, unenforceable policy, a socket on a standard stream the policy denies, a pseudo-terminal master on one with `signals = "isolated"`, setup failure); where sandy stays the parent also a failure while it supervises the program |
 | 0 / 1 | `sandy check`: enforceable / not enforceable |
+| 2 | `sandy check`: not enforceable on this host until `sandy setup`, run once with administrator rights, prepares it; nothing else is missing |
 
 The caller sees sandy's process ID where sandy stays the parent, and 125 means both "sandy
 refused" and "the program exited with 125". These are additions, not changes: `--status-fd`
@@ -829,6 +901,13 @@ carries the program's process ID and how it ended on a descriptor of the caller'
 which sandy makes close-on-exec and keeps out of what the program inherits. The lines are
 `pid N`, then `exited N` or `signaled N`, or `failed` when sandy itself failed. See README.md,
 "The status record". No exit status changes meaning, because callers parse the documented ones.
+
+Status 2 of `check` lets a calling program tell "this host needs preparing" from "this host
+cannot do it" without parsing text: it can ask the user for administrator rights, run
+`sandy setup` with the same policy, and check again. A plan item that needs setup says so
+(`Status::NeedsSetup`), and when several reports cover one requirement, one that setup cannot fix
+wins, so status 2 never promises more than setup gives. `run` still refuses such a policy with
+status 125.
 
 ## Testing
 

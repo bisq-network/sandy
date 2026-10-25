@@ -203,6 +203,13 @@ pub fn refusal(
                      datagrams from others through it",
                     "allow what the socket gives with ip = \"all\"".to_string(),
                 ),
+                // The socket belongs to the network it was created in, outside the sandbox's
+                // own, so it would be a way out that no relay checks.
+                IpAccess::Private => (
+                    "ip = \"private\" cannot hold for it: the socket belongs to a network \
+                     outside the sandbox",
+                    "reach that network through expose, forward or egress instead".to_string(),
+                ),
                 IpAccess::None if connection => (
                     "ip = \"none\" cannot hold for it",
                     format!("allow what the socket gives with ip = \"client\": {INETD}"),
@@ -214,13 +221,18 @@ pub fn refusal(
             }
         }
         Family::Other { .. } if socket.creatable_with_ip(ip_also_allows).is_some() => {
-            if policy.ip != IpAccess::None {
-                return None;
+            match policy.ip {
+                IpAccess::Client | IpAccess::All => return None,
+                IpAccess::Private => (
+                    "ip = \"private\" cannot hold for it: the socket belongs to a network \
+                     outside the sandbox",
+                    "allow what the socket gives with ip = \"client\"".to_string(),
+                ),
+                IpAccess::None => (
+                    "ip = \"none\" cannot hold for it",
+                    "allow what the socket gives with ip = \"client\"".to_string(),
+                ),
             }
-            (
-                "ip = \"none\" cannot hold for it",
-                "allow what the socket gives with ip = \"client\"".to_string(),
-            )
         }
         // A raw IP socket needs privileges: CAP_NET_RAW on Linux, which sandy refuses to start
         // with, root on macOS and administrator rights on Windows. It is refused also where the
@@ -278,10 +290,15 @@ mod tests {
 
     fn every_policy() -> Vec<ResolvedPolicy> {
         let unix = [NetworkAccess::None, NetworkAccess::All];
-        [IpAccess::None, IpAccess::Client, IpAccess::All]
-            .iter()
-            .flat_map(|&ip| unix.iter().map(move |&unix| policy(ip, unix)))
-            .collect()
+        [
+            IpAccess::None,
+            IpAccess::Private,
+            IpAccess::Client,
+            IpAccess::All,
+        ]
+        .iter()
+        .flat_map(|&ip| unix.iter().map(move |&unix| policy(ip, unix)))
+        .collect()
     }
 
     fn socket(family: Family, kind: Kind, connected: bool, listening: bool) -> Socket {
@@ -497,6 +514,31 @@ mod tests {
                 assert!(message.contains("Pass a pipe"), "{message}");
                 assert!(!message.contains("\"all\""), "{message}");
             }
+        }
+    }
+
+    /// Under `ip = "private"` the program's network is the sandbox's own, and an inherited socket
+    /// belongs to the caller's network, so none is accepted: also not a connected stream socket,
+    /// which `client` takes, and not what `ip_also_allows` names.
+    #[test]
+    fn ip_private_accepts_no_ip_socket() {
+        let private = policy(IpAccess::Private, NetworkAccess::None);
+        let route = other(16, Some("AF_NETLINK"), Kind::Raw, 0);
+        for case in [
+            socket(Family::Ip, Kind::Stream, true, false),
+            socket(Family::Ip, Kind::Stream, false, true),
+            socket(Family::Ip, Kind::Datagram, true, false),
+            route,
+        ] {
+            let message =
+                refusal(&private, StandardStream::Input, case, &[ROUTE_NETLINK]).expect("refused");
+            assert!(
+                message.contains(
+                    "ip = \"private\" cannot hold for it: the socket belongs to a network outside \
+                     the sandbox"
+                ),
+                "{message}"
+            );
         }
     }
 

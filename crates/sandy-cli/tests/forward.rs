@@ -80,7 +80,10 @@ fn forward_without_ip_is_refused() {
     assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
     assert!(output.stdout.is_empty(), "{output:?}");
     let reason = String::from_utf8_lossy(&output.stderr);
-    assert!(reason.contains("ip = \"client\" or \"all\""), "{reason}");
+    assert!(
+        reason.contains("ip = \"private\", \"client\" or \"all\""),
+        "{reason}"
+    );
 }
 
 /// A program that writes more than the target reads in time, and exits. When the one second of

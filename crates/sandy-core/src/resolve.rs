@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 
 use crate::plan::Requirement;
 use crate::policy::{
-    ChildProcesses, EnvironmentPolicy, ExposedPort, ForwardedPort, IpAccess, NetworkAccess,
-    PathMetadata, Policy, PolicyError, ProcessPolicy, SignalScope, SystemAccess, Win32k,
-    WindowsPolicy,
+    ChildProcesses, Egress, EnvironmentPolicy, ExposedPort, FileView, ForwardedPort, IpAccess,
+    NetworkAccess, NetworkPolicy, PathMetadata, Policy, PolicyError, ProcessPolicy, SignalScope,
+    SystemAccess, Win32k, WindowsPolicy,
 };
 
 #[cfg(windows)]
@@ -143,6 +143,8 @@ pub struct ResolvedPolicy {
     pub unix_sockets: NetworkAccess,
     pub expose: Vec<ExposedPort>,
     pub forward: Vec<ForwardedPort>,
+    pub egress: Option<Egress>,
+    pub view: FileView,
     pub signals: SignalScope,
     pub children: ChildProcesses,
     pub end_with_parent: bool,
@@ -194,6 +196,7 @@ impl ResolvedPolicy {
         }
         validate_forward(&policy.network.forward, policy.network.ip)?;
         validate_relay_addresses(&policy.network.expose, &policy.network.forward)?;
+        validate_egress(&policy.network)?;
 
         Ok(ResolvedPolicy {
             paths,
@@ -203,6 +206,8 @@ impl ResolvedPolicy {
             unix_sockets: policy.network.unix_sockets,
             expose: policy.network.expose.clone(),
             forward: policy.network.forward.clone(),
+            egress: policy.network.egress,
+            view: filesystem.view,
             signals: policy.process.signals,
             children: policy.process.children,
             end_with_parent: policy.process.end_with_parent,
@@ -224,8 +229,15 @@ impl ResolvedPolicy {
         ];
         match self.ip {
             IpAccess::None => requirements.push(Requirement::IpNetworkDenied),
+            IpAccess::Private => requirements.push(Requirement::IpNetworkPrivate),
             IpAccess::Client => requirements.push(Requirement::InboundIpDenied),
             IpAccess::All => {}
+        }
+        if self.egress.is_some() {
+            requirements.push(Requirement::EgressBrokered);
+        }
+        if self.view == FileView::Policy {
+            requirements.push(Requirement::PathsHidden);
         }
         if self.unix_sockets == NetworkAccess::None {
             requirements.push(Requirement::UnixSocketsDenied);
@@ -1255,7 +1267,7 @@ fn for_each_linked_file(
 }
 
 /// Exposed ports listen on loopback only, so a relay never makes the target reachable from other
-/// machines. The target must be able to listen, which only `ip = "all"` allows.
+/// machines. The target must be able to listen, which `ip = "all"` and `ip = "private"` allow.
 fn validate_expose(expose: &[ExposedPort], ip: IpAccess) -> Result<(), PolicyError> {
     let invalid = |expose: &ExposedPort, reason| PolicyError::InvalidExpose {
         expose: *expose,
@@ -1264,7 +1276,10 @@ fn validate_expose(expose: &[ExposedPort], ip: IpAccess) -> Result<(), PolicyErr
     for entry in expose {
         match ip {
             IpAccess::None => {
-                return Err(invalid(entry, "the program needs ip = \"all\" to listen"));
+                return Err(invalid(
+                    entry,
+                    "the program needs ip = \"all\" or \"private\" to listen",
+                ));
             }
             IpAccess::Client => {
                 return Err(invalid(
@@ -1273,7 +1288,7 @@ fn validate_expose(expose: &[ExposedPort], ip: IpAccess) -> Result<(), PolicyErr
                      denies listening; use ip = \"all\"",
                 ));
             }
-            IpAccess::All => {}
+            IpAccess::Private | IpAccess::All => {}
         }
         if !entry.listen.ip().is_loopback() {
             return Err(invalid(entry, "listen must be a loopback address"));
@@ -1292,7 +1307,7 @@ fn validate_expose(expose: &[ExposedPort], ip: IpAccess) -> Result<(), PolicyErr
 }
 
 /// Forwarded ports reach loopback services only, so a relay never opens a way to other machines.
-/// The target connects over IP, which `ip = "client"` and `ip = "all"` allow.
+/// The target connects over IP, which every `ip` value but `none` allows.
 fn validate_forward(forward: &[ForwardedPort], ip: IpAccess) -> Result<(), PolicyError> {
     let invalid = |forward: &ForwardedPort, reason| PolicyError::InvalidForward {
         forward: *forward,
@@ -1302,7 +1317,7 @@ fn validate_forward(forward: &[ForwardedPort], ip: IpAccess) -> Result<(), Polic
         if ip == IpAccess::None {
             return Err(invalid(
                 entry,
-                "the program needs ip = \"client\" or \"all\" to connect",
+                "the program needs ip = \"private\", \"client\" or \"all\" to connect",
             ));
         }
         if !entry.to.ip().is_loopback() {
@@ -1390,6 +1405,42 @@ fn validate_relay_addresses(
             {
                 return Err(relay.error("to leads back into the sandbox (an exposed port)"));
             }
+        }
+    }
+    Ok(())
+}
+
+/// The egress broker is the only way out of a private network. Under `client` or `all` the
+/// program reaches the network itself, so a broker would check nothing. Its address inside the
+/// sandbox must not be one another relay or the program uses.
+fn validate_egress(network: &NetworkPolicy) -> Result<(), PolicyError> {
+    let Some(egress) = network.egress else {
+        return Ok(());
+    };
+    let invalid = |reason| PolicyError::InvalidEgress { egress, reason };
+    if network.ip != IpAccess::Private {
+        return Err(invalid(
+            "egress needs ip = \"private\": with any other value the program either has no \
+             network or reaches it without the broker",
+        ));
+    }
+    if egress.port == 0 {
+        return Err(invalid("the port must not be 0"));
+    }
+    let listen = egress.listen();
+    let taken = network
+        .expose
+        .iter()
+        .flat_map(|expose| [expose.listen, expose.target()])
+        .chain(
+            network
+                .forward
+                .iter()
+                .flat_map(|forward| [forward.listen(), forward.to]),
+        );
+    for address in taken {
+        if address == listen {
+            return Err(invalid("address is used by an exposed or forwarded port"));
         }
     }
     Ok(())
@@ -1969,6 +2020,102 @@ mod tests {
             .unwrap()
             .requirements();
         assert!(no_children.contains(&Requirement::ChildProcessesDenied));
+    }
+
+    #[test]
+    fn the_private_network_the_egress_broker_and_the_view_add_their_requirements() {
+        let mut policy = Policy::default();
+        let plain = ResolvedPolicy::resolve(&policy, None)
+            .unwrap()
+            .requirements();
+        for requirement in [
+            Requirement::IpNetworkPrivate,
+            Requirement::EgressBrokered,
+            Requirement::PathsHidden,
+        ] {
+            assert!(!plain.contains(&requirement), "{requirement:?}");
+        }
+        policy.network.ip = IpAccess::Private;
+        policy.network.egress = Some(Egress {
+            port: 1080,
+            reach: crate::policy::EgressReach::Public,
+        });
+        policy.filesystem.view = FileView::Policy;
+        let all = ResolvedPolicy::resolve(&policy, None)
+            .unwrap()
+            .requirements();
+        for requirement in [
+            Requirement::IpNetworkPrivate,
+            Requirement::EgressBrokered,
+            Requirement::PathsHidden,
+        ] {
+            assert!(all.contains(&requirement), "{requirement:?}");
+        }
+        assert!(!all.contains(&Requirement::IpNetworkDenied));
+        assert!(!all.contains(&Requirement::InboundIpDenied));
+    }
+
+    /// The program listens and connects on its own loopback, so exposed and forwarded ports work
+    /// with a private network.
+    #[test]
+    fn expose_and_forward_accept_a_private_network() {
+        let mut policy = with_expose(IpAccess::Private, &[expose("127.0.0.1:18080", 8080)]);
+        policy.network.forward = vec![forward(18081, "127.0.0.1:8081")];
+        ResolvedPolicy::resolve(&policy, None).unwrap();
+    }
+
+    #[test]
+    fn egress_needs_a_private_network_and_an_address_of_its_own() {
+        let egress = |port| Egress {
+            port,
+            reach: crate::policy::EgressReach::Public,
+        };
+        let with = |ip: IpAccess, port: u16| {
+            let mut policy = with_expose(ip, &[]);
+            policy.network.egress = Some(egress(port));
+            policy
+        };
+        assert!(ResolvedPolicy::resolve(&with(IpAccess::Private, 1080), None).is_ok());
+        for ip in [IpAccess::None, IpAccess::Client, IpAccess::All] {
+            let error = ResolvedPolicy::resolve(&with(ip, 1080), None).unwrap_err();
+            assert!(
+                error.to_string().contains("egress needs ip = \"private\""),
+                "{error}"
+            );
+        }
+        let error = ResolvedPolicy::resolve(&with(IpAccess::Private, 0), None).unwrap_err();
+        assert!(
+            matches!(error, PolicyError::InvalidEgress { .. }),
+            "{error}"
+        );
+
+        // The broker's address may not be one the program or another relay uses.
+        let mut clashes = Vec::new();
+        let mut on_forward = with(IpAccess::Private, 18081);
+        on_forward.network.forward = vec![forward(18081, "127.0.0.1:8081")];
+        clashes.push(on_forward);
+        let mut on_forward_target = with(IpAccess::Private, 8081);
+        on_forward_target.network.forward = vec![forward(18081, "127.0.0.1:8081")];
+        clashes.push(on_forward_target);
+        let mut on_program = with(IpAccess::Private, 8080);
+        on_program.network.expose = vec![expose("127.0.0.1:18080", 8080)];
+        clashes.push(on_program);
+        let mut on_listen = with(IpAccess::Private, 18080);
+        on_listen.network.expose = vec![expose("127.0.0.1:18080", 8080)];
+        clashes.push(on_listen);
+        for policy in clashes {
+            let error = ResolvedPolicy::resolve(&policy, None).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("used by an exposed or forwarded port"),
+                "{error}"
+            );
+        }
+        // Another family is another address.
+        let mut other_family = with(IpAccess::Private, 8080);
+        other_family.network.expose = vec![expose("[::1]:18080", 8080)];
+        assert!(ResolvedPolicy::resolve(&other_family, None).is_ok());
     }
 
     /// `windows.win32k` is opt-in: the default asks for nothing, `deny` for the requirement,

@@ -81,11 +81,12 @@ fn fingerprint(policy: &ResolvedPolicy) -> Vec<u8> {
 
     let mut out = vec![
         // Format version. 2 adds forwarded ports and `children`, 3 adds `end_with_parent` and
-        // keys the state on the SID, 4 adds `win32k`; a run of another sandy version that reads
+        // keys the state on the SID, 4 adds `win32k`, 5 adds `ip = "private"`, `egress` and
+        // `view`; a run of another sandy version that reads
         // this file then never matches by accident and is refused, which is the safe outcome.
         // sandy 1.3.2 (version 2) kept the state in a named kernel object, which this version
         // does not read.
-        4u8,
+        5u8,
         match policy.system {
             sandy_core::SystemAccess::Minimal => 0,
             sandy_core::SystemAccess::None => 1,
@@ -94,6 +95,7 @@ fn fingerprint(policy: &ResolvedPolicy) -> Vec<u8> {
             sandy_core::IpAccess::None => 0,
             sandy_core::IpAccess::All => 1,
             sandy_core::IpAccess::Client => 2,
+            sandy_core::IpAccess::Private => 3,
         },
         net(policy.unix_sockets),
         match policy.signals {
@@ -118,7 +120,22 @@ fn fingerprint(policy: &ResolvedPolicy) -> Vec<u8> {
             sandy_core::Win32k::Allow => 0,
             sandy_core::Win32k::Deny => 1,
         },
+        match policy.view {
+            sandy_core::FileView::All => 0,
+            sandy_core::FileView::Policy => 1,
+        },
     ];
+    // A program without egress could connect out through a sibling's broker.
+    match policy.egress {
+        None => out.push(0),
+        Some(egress) => {
+            out.push(match egress.reach {
+                sandy_core::EgressReach::Public => 1,
+                sandy_core::EgressReach::PublicAndLocal => 2,
+            });
+            out.extend(egress.port.to_le_bytes());
+        }
+    }
 
     // `paths` is sorted by path when the policy is resolved, so the order is deterministic.
     out.extend((policy.paths.len() as u32).to_le_bytes());
@@ -189,10 +206,15 @@ mod tests {
             policy.ip = ip;
             fingerprint(&policy)
         };
-        let none = with(sandy_core::IpAccess::None);
-        let client = with(sandy_core::IpAccess::Client);
-        let all = with(sandy_core::IpAccess::All);
-        assert!(none != client && client != all && none != all);
+        let prints = [
+            with(sandy_core::IpAccess::None),
+            with(sandy_core::IpAccess::Private),
+            with(sandy_core::IpAccess::Client),
+            with(sandy_core::IpAccess::All),
+        ];
+        for (index, print) in prints.iter().enumerate() {
+            assert!(!prints[index + 1..].contains(print), "value {index}");
+        }
     }
 
     #[test]
@@ -200,5 +222,29 @@ mod tests {
         let mut denied = policy();
         denied.windows.win32k = sandy_core::Win32k::Deny;
         assert_ne!(fingerprint(&policy()), fingerprint(&denied));
+    }
+
+    #[test]
+    fn the_view_and_egress_change_the_fingerprint() {
+        let mut hidden = policy();
+        hidden.view = sandy_core::FileView::Policy;
+        assert_ne!(fingerprint(&policy()), fingerprint(&hidden));
+        let egress = |port, reach| {
+            let mut policy = policy();
+            policy.ip = sandy_core::IpAccess::Private;
+            policy.egress = Some(sandy_core::Egress { port, reach });
+            fingerprint(&policy)
+        };
+        let mut private = policy();
+        private.ip = sandy_core::IpAccess::Private;
+        let prints = [
+            fingerprint(&private),
+            egress(1080, sandy_core::EgressReach::Public),
+            egress(1081, sandy_core::EgressReach::Public),
+            egress(1080, sandy_core::EgressReach::PublicAndLocal),
+        ];
+        for (index, print) in prints.iter().enumerate() {
+            assert!(!prints[index + 1..].contains(print), "value {index}");
+        }
     }
 }

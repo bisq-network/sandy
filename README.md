@@ -16,7 +16,7 @@ sandy run \
   -- /srv/app/bin/server --port 8080
 ```
 
-Version 2.0.0. Policies use format `version = 1`.
+Version 2.1.0. Policies use format `version = 1`.
 
 ## Contents
 
@@ -98,7 +98,7 @@ Release archives for each platform are built by the `release` workflow (see
 names the workflow, the commit and the run that built it:
 
 ```sh
-gh attestation verify sandy-2.0.0-x86_64-unknown-linux-musl.tar.gz --repo <owner>/sandy
+gh attestation verify sandy-2.1.0-x86_64-unknown-linux-musl.tar.gz --repo <owner>/sandy
 ```
 
 `SHA256SUMS` in the release lists the sum of every archive. It says that the archives belong
@@ -349,7 +349,8 @@ idempotent, and on Linux and macOS it does nothing because those backends leave 
 | `--read-exec PATH` | Allow reading and executing below `PATH`. | |
 | `--read-write PATH` | Allow reading, creating, changing and deleting below `PATH`. Never executing. | |
 | `--system minimal\|none` | Add the minimal set of system paths programs need to start. | `minimal` |
-| `--ip all\|client\|none` | IPv4 and IPv6 networking, including loopback. `client` connects out but cannot listen or accept. | `none` |
+| `--view all\|policy` | `policy` makes every path outside the policy look missing. See [The file system view](#the-file-system-view). | `all` |
+| `--ip all\|client\|private\|none` | IPv4 and IPv6 networking, including loopback. `client` connects out but cannot listen or accept. `private` keeps the program on a loopback of its own. | `none` |
 | `--unix-sockets all\|none` | Unix domain sockets. Read the warning below before using `all`. | `none` |
 | `--signals any\|isolated` | Whether the program may signal processes outside its sandbox. | `any` |
 | `--end-with-parent` | End the program when the process that started sandy ends. Needs `--signals isolated`. See [Processes](#processes). | off |
@@ -359,8 +360,9 @@ idempotent, and on Linux and macOS it does nothing because those backends leave 
 | `--explain` | Name the paths of the run that the policy does not grant, on standard error. `run` only, Linux only. See [Finding the grants a program needs](#finding-the-grants-a-program-needs). | off |
 | `--explain-path PATH` | Say what the policy allows for `PATH` and which rule decides it. `check` only, Linux only. | |
 | `--children allowed\|none\|contained` | Whether the program may start other processes, and whether they may outlive it. See [Processes](#processes). | `allowed` |
-| `--expose ADDRESS=PORT` | Relay connections on the loopback `ADDRESS` to the program's loopback `PORT`. Needs `--ip all`. | |
-| `--forward PORT=ADDRESS` | Relay the program's connections to its loopback `PORT` to the loopback `ADDRESS` outside the sandbox. Needs `--ip client` or `--ip all`. | |
+| `--expose ADDRESS=PORT` | Relay connections on the loopback `ADDRESS` to the program's loopback `PORT`. Needs `--ip all` or `--ip private`. | |
+| `--forward PORT=ADDRESS` | Relay the program's connections to its loopback `PORT` to the loopback `ADDRESS` outside the sandbox. Needs `--ip private`, `client` or `all`. | |
+| `--egress PORT[=REACH]` | A SOCKS5 broker on the program's `127.0.0.1:PORT` that connects out only to `REACH`: `public` or `public-and-local`, never to this host. Needs `--ip private`. | `public` |
 | `--linux-path-metadata deny\|allow` | On Linux, whether `chmod`, `chown`, `utimensat` and `setxattr` by path are allowed. | `deny` |
 | `--pass-env NAME` | Copy the variable `NAME` into the program's environment, if it is set. | |
 | `--set-env NAME=VALUE` | Set a variable in the program's environment. Overrides `--pass-env`. | |
@@ -419,6 +421,11 @@ it.
 | 128 + signal number | Linux and macOS with `children = "contained"`, and Linux with `--explain`: a signal ended the program |
 | 125 | sandy failed or refused: invalid policy, a requirement this host cannot enforce, a socket on a standard stream that the policy denies, a pseudo-terminal master on one with `signals = "isolated"`, a setup error; with `children = "contained"` or `--explain` also a failure while sandy supervises the program |
 | 0 / 1 | `sandy check`: the policy is enforceable / not enforceable |
+| 2 | `sandy check`: not enforceable until `sandy setup`, run once with administrator rights, prepares this host, and nothing else is missing |
+
+A program that starts sandy can act on status 2 without reading text: ask the user for
+administrator rights, run `sandy setup` with the same policy (for example through `pkexec` or
+`sudo` on Linux), and run `check` again.
 
 On Windows the program's 32-bit exit code is passed through unchanged.
 
@@ -455,12 +462,14 @@ system = "minimal"              # "minimal" | "none"
 read = ["/path"]                # read files, list directories
 read_exec = ["/path"]           # read, list, execute
 read_write = ["/path"]          # read, list, create, change, delete; never execute
+view = "all"                    # "all" | "policy"; policy hides paths outside the policy
 
 [network]
-ip = "none"                     # "none" | "client" | "all"
+ip = "none"                     # "none" | "private" | "client" | "all"
 unix_sockets = "none"           # "none" | "all"
 expose = [{ listen = "127.0.0.1:18080", port = 8080 }]
 forward = [{ port = 18081, to = "127.0.0.1:8081" }]
+egress = { port = 1080, reach = "public" }  # needs ip = "private"; "public" | "public-and-local"
 
 [process]
 signals = "any"                 # "any" | "isolated"
@@ -480,8 +489,8 @@ win32k = "allow"                # "allow" | "deny"; deny blocks win32k system ca
 ```
 
 The block names every key; it is not a policy that runs as written, because `expose` needs
-`ip = "all"`, `forward` needs `ip = "client"` or `"all"`, and one path cannot be both `read_exec`
-and `read_write`. Unknown keys are errors, so a misspelled key never becomes a silent default.
+`ip = "all"` or `"private"`, `forward` needs any `ip` but `"none"`, `egress` needs
+`ip = "private"`, and one path cannot be both `read_exec` and `read_write`. Unknown keys are errors, so a misspelled key never becomes a silent default.
 
 ### Rules
 
@@ -547,6 +556,16 @@ and `read_write`. Unknown keys are errors, so a misspelled key never becomes a s
 
 - `ip = "none"` denies IPv4 and IPv6, including loopback. `ip = "all"` allows every destination
   and listening.
+- `ip = "private"` gives the program a loopback of its own: it may listen and connect there, but
+  reaches nothing outside the sandbox, not the host, not the local network, not the internet,
+  except through `expose`, `forward` and `egress`. `egress = { port = 1080 }` adds a SOCKS5
+  broker on the program's `127.0.0.1:1080`. The program asks it for a destination by IPv4 or IPv6
+  address (names are refused), and sandy connects only when the destination is a public internet
+  address, or with `reach = "public-and-local"` also one of the local network, and never an
+  address of this host. Point the program's SOCKS5 proxy option there (for example curl's
+  `--socks5 127.0.0.1:1080` or `ALL_PROXY=socks5://127.0.0.1:1080`). A program without such an
+  option gets no way out. See docs/DESIGN.md, "Private network and egress", and the platform
+  notes for what each platform gives.
 - `ip = "client"` lets the program connect and send to every destination, loopback included,
   resolve names and receive the answers, but not listen for or accept a connection. On Linux
   `listen` and `accept` fail with `EPERM` for every socket, Unix sockets too (`check` warns when
@@ -685,6 +704,19 @@ and `read_write`. Unknown keys are errors, so a misspelled key never becomes a s
   ([docs/windows.md](docs/windows.md)).
 - Debugging and reading the memory of processes outside the sandbox are always denied, and the
   program can never gain privileges, for example through setuid programs.
+
+### The file system view
+
+- `view = "all"`, the default, shows the program every path as the host has it; the sandbox
+  denies access to the ones outside the policy, but the program can tell that they exist.
+- `view = "policy"` makes every path outside the policy paths and the system set look missing:
+  `stat`, `access`, `readlink`, `open` and a directory watch answer as for a path that does not
+  exist. On Linux the program then runs in a view of the file system that holds only those paths
+  (a mount namespace), and every path the policy does not make executable is mounted without
+  execute, so a `read` or writable path also cannot hold code that the program maps. A rename or
+  a link between two writable paths fails there with `EXDEV`, and files of other users show the
+  owner 65534. Windows cannot hide paths and refuses the setting. See docs/DESIGN.md, "The file
+  system view".
 
 ### Linux metadata
 

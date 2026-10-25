@@ -343,7 +343,8 @@ fn network_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
     );
     writer.line("(allow system-socket (socket-domain AF_UNIX))");
     match policy.ip {
-        IpAccess::None => {}
+        // The plan refuses `private` until the backend enforces it; the profile then denies IP.
+        IpAccess::None | IpAccess::Private => {}
         IpAccess::Client => {
             writer.comment(
                 "IP networking out, and name resolution: getaddrinfo asks mDNSResponder through\n\
@@ -571,6 +572,8 @@ mod tests {
             unix_sockets: NetworkAccess::None,
             expose: Vec::new(),
             forward: Vec::new(),
+            egress: None,
+            view: sandy_core::FileView::All,
             signals: SignalScope::Any,
             children: sandy_core::ChildProcesses::Allowed,
             end_with_parent: false,

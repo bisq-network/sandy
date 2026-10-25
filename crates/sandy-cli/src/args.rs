@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use lexopt::prelude::*;
 use sandy_core::{
-    ChildProcesses, ExposedPort, ForwardedPort, IpAccess, NetworkAccess, PathMetadata, Policy,
-    SignalScope, SystemAccess, Win32k,
+    ChildProcesses, Egress, EgressReach, ExposedPort, FileView, ForwardedPort, IpAccess,
+    NetworkAccess, PathMetadata, Policy, SignalScope, SystemAccess, Win32k,
 };
 
 pub const USAGE: &str = "\
@@ -25,8 +25,11 @@ Options (they extend the policy file):
   --read-exec PATH           allow reading and executing PATH (repeatable)
   --read-write PATH          allow reading and writing PATH (repeatable)
   --system minimal|none      add the minimal system paths (default: minimal)
-  --ip all|client|none       IP networking; client connects out but takes no connections
-                             (default: none)
+  --view all|policy          policy makes paths outside the policy look missing (default: all)
+  --ip all|client|private|none
+                             IP networking; client connects out but takes no connections;
+                             private keeps the program on a loopback of its own, reached only
+                             through --expose, --forward and --egress (default: none)
   --unix-sockets all|none    Unix domain sockets (default: none)
   --signals any|isolated     who the program may signal (default: any)
   --children allowed|none|contained
@@ -48,10 +51,13 @@ Options (they extend the policy file):
                              (repeatable; check only)
   --expose ADDRESS=PORT      relay connections on the loopback ADDRESS to the program's
                              loopback PORT, for example 127.0.0.1:18080=8080 (repeatable;
-                             needs --ip all)
+                             needs --ip all or --ip private)
   --forward PORT=ADDRESS     relay connections from the program to its loopback PORT to the
                              loopback ADDRESS outside, for example 18081=127.0.0.1:8081
-                             (repeatable; needs --ip client or --ip all)
+                             (repeatable; needs --ip private, client or all)
+  --egress PORT[=REACH]      a SOCKS5 broker on the program's 127.0.0.1:PORT that connects out
+                             only to REACH: public (the default) or public-and-local; never to
+                             this host (needs --ip private)
   --linux-path-metadata deny|allow
                              metadata changes by path on Linux (default: deny)
   --pass-env NAME            copy variable NAME into the program environment (repeatable)
@@ -65,7 +71,8 @@ Options (they extend the policy file):
   -V, --version              show the version
 
 Exit status: the program's status; 125 when sandy fails or refuses; for check, 0 when the policy
-is enforceable and 1 when it is not.
+is enforceable, 1 when it is not, and 2 when only `sandy setup`, run once with administrator
+rights, is missing.
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +90,9 @@ pub struct Overrides {
     read_exec: Vec<PathBuf>,
     read_write: Vec<PathBuf>,
     system: Option<SystemAccess>,
+    view: Option<FileView>,
     ip: Option<IpAccess>,
+    egress: Option<Egress>,
     unix_sockets: Option<NetworkAccess>,
     signals: Option<SignalScope>,
     children: Option<ChildProcesses>,
@@ -124,11 +133,31 @@ impl Overrides {
             }
             filesystem.system = system;
         }
+        if let Some(view) = self.view {
+            if view == FileView::All && policy.filesystem.view == FileView::Policy {
+                note("--view", "all", "view", "policy");
+            }
+            policy.filesystem.view = view;
+        }
         if let Some(ip) = self.ip {
             if ip_strictness(ip) < ip_strictness(policy.network.ip) {
                 note("--ip", ip.name(), "ip", policy.network.ip.name());
             }
             policy.network.ip = ip;
+        }
+        if let Some(egress) = self.egress {
+            let value = format!("{}={}", egress.port, egress.reach.name());
+            match policy.network.egress {
+                None => note("--egress", &value, "egress", "none"),
+                Some(before)
+                    if before.reach == EgressReach::Public
+                        && egress.reach == EgressReach::PublicAndLocal =>
+                {
+                    note("--egress", &value, "egress reach", before.reach.name())
+                }
+                Some(_) => {}
+            }
+            policy.network.egress = Some(egress);
         }
         if let Some(unix_sockets) = self.unix_sockets {
             if unix_sockets == NetworkAccess::All
@@ -188,7 +217,8 @@ fn ip_strictness(ip: IpAccess) -> u8 {
     match ip {
         IpAccess::All => 0,
         IpAccess::Client => 1,
-        IpAccess::None => 2,
+        IpAccess::Private => 2,
+        IpAccess::None => 3,
     }
 }
 
@@ -312,10 +342,34 @@ where
                     other => return Err(format!("invalid --system value {other:?}").into()),
                 })
             }
+            Long("view") => {
+                overrides.view = Some(match parser.value()?.string()?.as_str() {
+                    "all" => FileView::All,
+                    "policy" => FileView::Policy,
+                    other => return Err(format!("invalid --view value {other:?}").into()),
+                })
+            }
+            Long("egress") => {
+                let value = parser.value()?.string()?;
+                let (port, reach) = match value.split_once('=') {
+                    Some((port, reach)) => (port, Some(reach)),
+                    None => (value.as_str(), None),
+                };
+                let port = port
+                    .parse()
+                    .map_err(|_| format!("invalid --egress port {port:?}"))?;
+                let reach = match reach {
+                    None | Some("public") => EgressReach::Public,
+                    Some("public-and-local") => EgressReach::PublicAndLocal,
+                    Some(other) => return Err(format!("invalid --egress reach {other:?}").into()),
+                };
+                overrides.egress = Some(Egress { port, reach });
+            }
             Long("ip") => {
                 overrides.ip = Some(match parser.value()?.string()?.as_str() {
                     "all" => IpAccess::All,
                     "client" => IpAccess::Client,
+                    "private" => IpAccess::Private,
                     "none" => IpAccess::None,
                     other => return Err(format!("invalid --ip value {other:?}").into()),
                 })
@@ -528,6 +582,89 @@ mod tests {
                 listen: "127.0.0.1:18080".parse().unwrap(),
                 port: 8080
             }]
+        );
+    }
+
+    #[test]
+    fn parses_the_view_the_private_network_and_egress() {
+        let parsed = invocation(&[
+            "check", "--view", "policy", "--ip", "private", "--egress", "1080",
+        ]);
+        let mut policy = Policy::default();
+        assert!(parsed.overrides.apply(&mut policy, false).is_empty());
+        assert_eq!(policy.filesystem.view, FileView::Policy);
+        assert_eq!(policy.network.ip, IpAccess::Private);
+        assert_eq!(
+            policy.network.egress,
+            Some(Egress {
+                port: 1080,
+                reach: EgressReach::Public
+            })
+        );
+        let local = invocation(&["check", "--egress", "1080=public-and-local"]);
+        let mut policy = Policy::default();
+        local.overrides.apply(&mut policy, false);
+        assert_eq!(
+            policy.network.egress.unwrap().reach,
+            EgressReach::PublicAndLocal
+        );
+        for bad in [
+            &["check", "--view", "none"][..],
+            &["check", "--egress", "x"],
+            &["check", "--egress", "1080=local"],
+            &["check", "--ip", "loopback"],
+        ] {
+            assert!(parse_strs(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// An option that shows more of the file system, or adds or widens the egress broker, over
+    /// a file that does not is named like a wider `--ip`.
+    #[test]
+    fn a_wider_view_or_egress_over_the_file_is_named() {
+        let mut policy = Policy::default();
+        policy.filesystem.view = FileView::Policy;
+        let notes = invocation(&["check", "--view", "all"])
+            .overrides
+            .apply(&mut policy, true);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+
+        let mut policy = Policy::default();
+        let notes = invocation(&["check", "--egress", "1080"])
+            .overrides
+            .apply(&mut policy, true);
+        assert_eq!(
+            notes,
+            [
+                "--egress 1080=public replaces egress = \"none\" from the policy file and allows \
+              more than the file does"
+            ]
+        );
+        let notes = invocation(&["check", "--egress", "1080=public-and-local"])
+            .overrides
+            .apply(&mut policy, true);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let notes = invocation(&["check", "--egress", "1081=public"])
+            .overrides
+            .apply(&mut policy, true);
+        assert!(notes.is_empty(), "{notes:?}");
+
+        let mut policy = Policy::default();
+        policy.network.ip = IpAccess::Private;
+        assert_eq!(
+            invocation(&["check", "--ip", "client"])
+                .overrides
+                .apply(&mut policy, true)
+                .len(),
+            1
+        );
+        let mut policy = Policy::default();
+        assert_eq!(
+            invocation(&["check", "--ip", "private"])
+                .overrides
+                .apply(&mut policy, true)
+                .len(),
+            1
         );
     }
 

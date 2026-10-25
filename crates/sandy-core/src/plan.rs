@@ -19,6 +19,16 @@ pub enum Requirement {
     EnvironmentControlled,
     /// IPv4 and IPv6 networking is denied, including loopback.
     IpNetworkDenied,
+    /// The target reaches IPv4 and IPv6 addresses only inside its sandbox, on a loopback of its
+    /// own: not the host's loopback services, not the host's other addresses, not the local
+    /// network and not the internet, also not with datagrams. The exposed, forwarded and egress
+    /// relays are the only ways in and out.
+    IpNetworkPrivate,
+    /// Connections out leave only through the egress broker, which connects only to the
+    /// destinations of the policy's `reach` and never to the host itself.
+    EgressBrokered,
+    /// Paths outside the policy paths and the system set look missing to the target.
+    PathsHidden,
     /// The target can connect out over IPv4 and IPv6, loopback included, but cannot listen for
     /// TCP connections or accept one, so no other process can connect to it. A datagram socket
     /// that is not connected still receives from every sender on Linux and macOS (DESIGN.md,
@@ -67,6 +77,9 @@ impl Requirement {
             }
             Requirement::EnvironmentControlled => "environment limited to policy",
             Requirement::IpNetworkDenied => "IP networking denied",
+            Requirement::IpNetworkPrivate => "IP networking limited to the sandbox's own loopback",
+            Requirement::EgressBrokered => "connections out only through the egress broker",
+            Requirement::PathsHidden => "paths outside the policy hidden",
             Requirement::InboundIpDenied => "no inbound IP connections",
             Requirement::UnixSocketsDenied => "Unix sockets outside writable paths denied",
             Requirement::SignalsIsolated => "signals limited to the sandbox",
@@ -83,8 +96,17 @@ impl Requirement {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
-    Enforced { mechanism: String },
-    Unavailable { reason: String },
+    Enforced {
+        mechanism: String,
+    },
+    Unavailable {
+        reason: String,
+    },
+    /// Unavailable on this host until `sandy setup`, run once with administrator rights,
+    /// prepares it. `check` exits with `EXIT_NEEDS_SETUP` when nothing else is missing.
+    NeedsSetup {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +134,17 @@ impl PlanItem {
         }
     }
 
+    /// Unavailable until `sandy setup` prepares the host. `reason` says what is missing; the plan
+    /// adds that setup fixes it.
+    pub fn needs_setup(requirement: Requirement, reason: impl Into<String>) -> Self {
+        PlanItem {
+            requirement,
+            status: Status::NeedsSetup {
+                reason: reason.into(),
+            },
+        }
+    }
+
     pub fn is_enforced(&self) -> bool {
         matches!(self.status, Status::Enforced { .. })
     }
@@ -127,21 +160,24 @@ impl EnforcementPlan {
     /// Builds the plan for `required` from the backend's report. A requirement the backend did
     /// not report counts as unavailable, and a requirement reported more than once counts as
     /// unavailable if any report says so. A backend therefore cannot weaken the sandbox by
-    /// omission.
+    /// omission. Among several reports that it is missing, one that setup cannot fix wins over one
+    /// that it can, so the plan never promises that setup is enough when it is not.
     pub fn new(required: &[Requirement], reported: Vec<PlanItem>) -> Self {
         let items = required
             .iter()
             .map(|&requirement| {
-                let mut reports = reported.iter().filter(|i| i.requirement == requirement);
-                let first = reports.next();
-                let unavailable = first
-                    .into_iter()
-                    .chain(reports)
-                    .find(|item| !item.is_enforced());
-                match (first, unavailable) {
-                    (_, Some(item)) => item.clone(),
-                    (Some(item), None) => item.clone(),
-                    (None, None) => PlanItem::unavailable(
+                let reports: Vec<&PlanItem> = reported
+                    .iter()
+                    .filter(|i| i.requirement == requirement)
+                    .collect();
+                let worst = reports
+                    .iter()
+                    .find(|item| matches!(item.status, Status::Unavailable { .. }))
+                    .or_else(|| reports.iter().find(|item| !item.is_enforced()))
+                    .or(reports.first());
+                match worst {
+                    Some(item) => (*item).clone(),
+                    None => PlanItem::unavailable(
                         requirement,
                         "the platform backend does not support this requirement",
                     ),
@@ -162,6 +198,15 @@ impl EnforcementPlan {
     pub fn unavailable(&self) -> impl Iterator<Item = &PlanItem> {
         self.items.iter().filter(|item| !item.is_enforced())
     }
+
+    /// Whether `sandy setup` would make this plan enforceable: something is missing, and all of
+    /// it is something setup prepares.
+    pub fn needs_only_setup(&self) -> bool {
+        !self.is_enforceable()
+            && self
+                .unavailable()
+                .all(|item| matches!(item.status, Status::NeedsSetup { .. }))
+    }
 }
 
 impl fmt::Display for EnforcementPlan {
@@ -175,6 +220,11 @@ impl fmt::Display for EnforcementPlan {
                 Status::Unavailable { reason } => {
                     writeln!(f, "UNAVAILABLE  {description}: {reason}")?
                 }
+                Status::NeedsSetup { reason } => writeln!(
+                    f,
+                    "UNAVAILABLE  {description}: {reason}; `sandy setup`, run once with \
+                     administrator rights, prepares this host"
+                )?,
             }
         }
         Ok(())
@@ -224,6 +274,62 @@ mod tests {
             ],
         );
         assert!(!plan.is_enforceable());
+    }
+
+    #[test]
+    fn setup_is_enough_only_when_all_that_is_missing_needs_it() {
+        let only_setup = EnforcementPlan::new(
+            &REQUIRED,
+            vec![
+                PlanItem::enforced(Requirement::FilesystemConfined, "a"),
+                PlanItem::needs_setup(Requirement::IpNetworkDenied, "b"),
+            ],
+        );
+        assert!(!only_setup.is_enforceable());
+        assert!(only_setup.needs_only_setup());
+        assert!(only_setup.to_string().contains("sandy setup"));
+
+        let more = EnforcementPlan::new(
+            &REQUIRED,
+            vec![
+                PlanItem::unavailable(Requirement::FilesystemConfined, "a"),
+                PlanItem::needs_setup(Requirement::IpNetworkDenied, "b"),
+            ],
+        );
+        assert!(!more.needs_only_setup());
+
+        let enforceable = EnforcementPlan::new(
+            &REQUIRED,
+            vec![
+                PlanItem::enforced(Requirement::FilesystemConfined, "a"),
+                PlanItem::enforced(Requirement::IpNetworkDenied, "b"),
+            ],
+        );
+        assert!(!enforceable.needs_only_setup());
+    }
+
+    #[test]
+    fn a_report_setup_cannot_fix_wins_over_one_it_can() {
+        for reports in [
+            vec![
+                PlanItem::needs_setup(Requirement::IpNetworkDenied, "setup"),
+                PlanItem::unavailable(Requirement::IpNetworkDenied, "kernel"),
+            ],
+            vec![
+                PlanItem::unavailable(Requirement::IpNetworkDenied, "kernel"),
+                PlanItem::needs_setup(Requirement::IpNetworkDenied, "setup"),
+                PlanItem::enforced(Requirement::IpNetworkDenied, "x"),
+            ],
+        ] {
+            let plan = EnforcementPlan::new(&[Requirement::IpNetworkDenied], reports);
+            assert_eq!(
+                plan.items()[0].status,
+                Status::Unavailable {
+                    reason: "kernel".to_string()
+                }
+            );
+            assert!(!plan.needs_only_setup());
+        }
     }
 
     #[test]

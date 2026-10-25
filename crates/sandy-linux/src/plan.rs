@@ -125,7 +125,7 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
             landlock,
             client_binds: match policy.ip {
                 IpAccess::Client => port_zero_binds(host),
-                IpAccess::None | IpAccess::All => 0,
+                IpAccess::None | IpAccess::Private | IpAccess::All => 0,
             },
             filter: FilterConfig {
                 allow_ip: policy.ip != IpAccess::None,
@@ -443,6 +443,9 @@ fn plan_item(
             Ok(()) => enforced(FILTER_METADATA.to_string()),
         },
         Requirement::Win32kDenied => enforced(NO_WIN32K.to_string()),
+        Requirement::IpNetworkPrivate | Requirement::EgressBrokered | Requirement::PathsHidden => {
+            unavailable("the Linux backend does not enforce this yet")
+        }
         // The kernel sends the job control signals of a terminal without the check that the
         // Landlock scope hooks, so the scope alone does not isolate signals.
         Requirement::SignalsIsolated => match &host.seccomp {
@@ -780,6 +783,8 @@ mod tests {
             unix_sockets: NetworkAccess::None,
             expose: Vec::new(),
             forward: Vec::new(),
+            egress: None,
+            view: sandy_core::FileView::All,
             signals: SignalScope::Isolated,
             children: sandy_core::ChildProcesses::Allowed,
             end_with_parent: false,

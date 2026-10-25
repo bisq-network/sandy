@@ -306,6 +306,9 @@ fn contained(
              it; job UI restrictions and low integrity block window messages"
         )),
         Requirement::Win32kDenied => enforced(WIN32K_LOCKDOWN.to_string()),
+        Requirement::IpNetworkPrivate | Requirement::EgressBrokered | Requirement::PathsHidden => {
+            unavailable("the Windows backend does not enforce this yet".into())
+        }
         Requirement::InheritedHandlesClosed | Requirement::EnvironmentControlled => {
             unreachable!("reported in plan_for")
         }
@@ -385,7 +388,7 @@ fn writable_parent<'a>(policy: &'a ResolvedPolicy, path: &Path) -> Option<&'a Pa
 /// `ip = "client"` reaches the internet only (docs/windows.md, "Client networking").
 pub fn network_capabilities(ip: IpAccess) -> &'static [NetworkCapability] {
     match ip {
-        IpAccess::None => &[],
+        IpAccess::None | IpAccess::Private => &[],
         IpAccess::Client => &[NetworkCapability::InternetClient],
         IpAccess::All => &[
             NetworkCapability::InternetClientServer,
@@ -493,6 +496,7 @@ mod tests {
     fn unavailable(status: Status) -> String {
         match status {
             Status::Unavailable { reason } => reason,
+            Status::NeedsSetup { reason } => panic!("needs setup: {reason}"),
             Status::Enforced { mechanism } => panic!("enforced: {mechanism}"),
         }
     }
@@ -686,7 +690,9 @@ mod tests {
                 );
                 assert!(mechanism.contains("relays"), "{mechanism}");
             }
-            Status::Unavailable { reason } => panic!("unavailable: {reason}"),
+            Status::Unavailable { reason } | Status::NeedsSetup { reason } => {
+                panic!("unavailable: {reason}")
+            }
         }
         // The program never starts without an AppContainer, so nothing is enforced.
         policy.windows.appcontainer_name = None;
@@ -812,7 +818,9 @@ mod tests {
                 assert!(mechanism.contains("sandy __relay"), "{mechanism}");
                 assert!(mechanism.contains("sandy.exe"), "{mechanism}");
             }
-            Status::Unavailable { reason } => panic!("unavailable: {reason}"),
+            Status::Unavailable { reason } | Status::NeedsSetup { reason } => {
+                panic!("unavailable: {reason}")
+            }
         }
     }
 
@@ -863,7 +871,9 @@ mod tests {
                     "{mechanism}"
                 );
             }
-            Status::Unavailable { reason } => panic!("unavailable: {reason}"),
+            Status::Unavailable { reason } | Status::NeedsSetup { reason } => {
+                panic!("unavailable: {reason}")
+            }
         }
         // The limit lives in sandy's job, which an outer job with UI restrictions prevents.
         let nested = HostCapabilities {
@@ -904,7 +914,9 @@ mod tests {
                 assert!(mechanism.contains("AF_UNIX"), "{mechanism}");
                 assert!(mechanism.contains("no loopback exemption"), "{mechanism}");
             }
-            Status::Unavailable { reason } => panic!("unavailable: {reason}"),
+            Status::Unavailable { reason } | Status::NeedsSetup { reason } => {
+                panic!("unavailable: {reason}")
+            }
         }
     }
 

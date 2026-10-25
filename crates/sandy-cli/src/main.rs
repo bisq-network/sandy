@@ -16,6 +16,9 @@ use sandy_core::{
 
 const EXIT_FAILURE: u8 = 125;
 const EXIT_NOT_ENFORCEABLE: u8 = 1;
+/// `check`: not enforceable, and `sandy setup` with administrator rights would make it so. A
+/// caller can then ask for those rights and run setup, which it cannot tell from status 1.
+const EXIT_NEEDS_SETUP: u8 = 2;
 
 /// Marks the advice `check` writes to standard error. `run` prints none: its standard error
 /// belongs to the program.
@@ -284,6 +287,8 @@ fn sandbox(
             }
             if plan.is_enforceable() {
                 Ok(ExitCode::SUCCESS)
+            } else if plan.needs_only_setup() {
+                Ok(ExitCode::from(EXIT_NEEDS_SETUP))
             } else {
                 Ok(ExitCode::from(EXIT_NOT_ENFORCEABLE))
             }
@@ -448,11 +453,17 @@ fn refusal(plan: &EnforcementPlan) -> String {
     let mut message =
         String::from("refusing to start the program; this host cannot enforce the policy:");
     for item in plan.unavailable() {
-        if let sandy_core::Status::Unavailable { reason } = &item.status {
-            message.push_str(&format!(
+        match &item.status {
+            sandy_core::Status::Unavailable { reason } => message.push_str(&format!(
                 "\n  - {}: {reason}",
                 item.requirement.description()
-            ));
+            )),
+            sandy_core::Status::NeedsSetup { reason } => message.push_str(&format!(
+                "\n  - {}: {reason}; `sandy setup`, run once with administrator rights, \
+                 prepares this host",
+                item.requirement.description()
+            )),
+            sandy_core::Status::Enforced { .. } => {}
         }
     }
     message
