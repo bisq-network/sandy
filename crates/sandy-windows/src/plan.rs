@@ -3,7 +3,9 @@
 
 use std::path::{Path, PathBuf};
 
-use sandy_core::{IpAccess, PathAccess, PlanItem, Requirement, ResolvedPolicy, SystemAccess};
+use sandy_core::{
+    EgressReach, IpAccess, PathAccess, PlanItem, Requirement, ResolvedPolicy, SystemAccess,
+};
 
 use crate::name::validate_appcontainer_name;
 use crate::version::{WindowsVersion, below_minimum, firewall_bypass};
@@ -170,6 +172,16 @@ pub fn notes(policy: &ResolvedPolicy) -> Vec<String> {
                 .to_string(),
         );
     }
+    if matches!(policy.ip, IpAccess::None | IpAccess::Private) {
+        notes.push(
+            "the program's own processes in its AppContainer reach each other over loopback, \
+             also with ip = \"none\" and ip = \"private\": Windows isolates loopback between the \
+             AppContainer and the rest of the machine, not within one AppContainer, so a program \
+             that starts helper processes (or a relay of expose, forward or egress) can talk to \
+             them on 127.0.0.1 and ::1 (docs/windows.md, \"Private network\")"
+                .to_string(),
+        );
+    }
     notes
 }
 
@@ -182,6 +194,14 @@ fn contained(
 ) -> PlanItem {
     let enforced = |mechanism: String| PlanItem::enforced(requirement, mechanism);
     let unavailable = |reason: String| PlanItem::unavailable(requirement, reason);
+    // `sandy setup`, run once as administrator, would make this enforceable; `check` exits 2.
+    let needs_setup = |reason: String| PlanItem::needs_setup(requirement, reason);
+    let relay = |policy, host, sandy: &dyn Fn(&Path) -> PlanItem| match relay_program(policy, host)
+    {
+        Err(RelayProblem::NeedsSetup(reason)) => needs_setup(reason),
+        Err(RelayProblem::Fixed(reason)) => unavailable(reason),
+        Ok(path) => sandy(path),
+    };
     if needs_job(requirement)
         && let Some(reason) = job_problem(host)
     {
@@ -194,7 +214,10 @@ fn contained(
         .copied()
         .and_then(firewall_bypass);
     if let (
-        Requirement::IpNetworkDenied | Requirement::IpNetworkPrivate | Requirement::InboundIpDenied,
+        Requirement::IpNetworkDenied
+        | Requirement::IpNetworkPrivate
+        | Requirement::InboundIpDenied
+        | Requirement::EgressBrokered,
         Some(reason),
     ) = (requirement, bypass)
     {
@@ -241,20 +264,18 @@ fn contained(
              sandy dies; the program holds no handle to the job"
                 .to_string(),
         ),
-        Requirement::ExposedPortsRelayed => match relay_program(policy, host) {
-            Err(reason) => unavailable(reason),
-            Ok(sandy) => enforced(format!(
+        Requirement::ExposedPortsRelayed => relay(policy, host, &|sandy| {
+            enforced(format!(
                 "`sandy __relay` in AppContainer {name:?} and a job of its own, on a listening \
                  socket that sandy creates outside the AppContainer; the relay has no network \
                  capability and only read and execute access to {}; {RELAY_END}",
                 sandy.display()
-            )),
-        },
+            ))
+        }),
         Requirement::ForwardedPortsRelayed => {
-            match (relay_program(policy, host), &host.forward_sockets) {
-                (Err(reason), _) => unavailable(reason),
-                (_, Err(reason)) => unavailable(reason.clone()),
-                (Ok(sandy), Ok(())) => enforced(format!(
+            relay(policy, host, &|sandy| match &host.forward_sockets {
+                Err(reason) => unavailable(reason.clone()),
+                Ok(()) => enforced(format!(
                     "`sandy __forward` in AppContainer {name:?} and a job of its own listens on \
                      the program's loopback port and passes each connection over an AF_UNIX \
                      socket that only the relays may open to sandy outside, which connects to \
@@ -262,7 +283,7 @@ fn contained(
                      capability and only read and execute access to {}; {RELAY_END}",
                     sandy.display()
                 )),
-            }
+            })
         }
         Requirement::MetadataConfined => enforced(format!(
             "AppContainer {name:?} holds no WRITE_DAC, WRITE_OWNER, FILE_WRITE_ATTRIBUTES or \
@@ -283,7 +304,7 @@ fn contained(
             (_, Err(reason)) => unavailable(format!(
                 "cannot read the loopback exemptions of AppContainers: {reason}"
             )),
-            (_, Ok(true)) => unavailable(format!(
+            (_, Ok(true)) => needs_setup(format!(
                 "AppContainer {name:?} is exempt from loopback isolation and could reach \
                  127.0.0.1 without network capabilities; run `sandy setup --appcontainer \
                  {name}` without --ip as administrator to remove the exemption, or use another \
@@ -301,7 +322,7 @@ fn contained(
             (_, Err(reason)) => unavailable(format!(
                 "cannot read the loopback exemptions of AppContainers: {reason}"
             )),
-            (_, Ok(true)) => unavailable(format!(
+            (_, Ok(true)) => needs_setup(format!(
                 "AppContainer {name:?} is exempt from loopback isolation and could reach \
                  127.0.0.1 outside the sandbox without network capabilities; run `sandy setup \
                  --appcontainer {name} --ip private` as administrator to remove the exemption, \
@@ -336,9 +357,40 @@ fn contained(
              it; job UI restrictions and low integrity block window messages"
         )),
         Requirement::Win32kDenied => enforced(WIN32K_LOCKDOWN.to_string()),
-        Requirement::EgressBrokered => {
-            unavailable("the Windows backend does not enforce this yet".into())
-        }
+        Requirement::EgressBrokered => match (&host.firewall, &host.loopback_exempt) {
+            (Err(reason), _) => unavailable(format!(
+                "AppContainer network isolation depends on the Windows Firewall service: {reason}"
+            )),
+            (_, Err(reason)) => unavailable(format!(
+                "cannot read the loopback exemptions of AppContainers: {reason}"
+            )),
+            (_, Ok(true)) => needs_setup(format!(
+                "AppContainer {name:?} is exempt from loopback isolation and could reach \
+                 127.0.0.1 outside the sandbox without network capabilities; run `sandy setup \
+                 --appcontainer {name} --ip private` as administrator to remove the exemption, \
+                 or use another name for this policy"
+            )),
+            (Ok(()), Ok(false)) => match crate::name::egress_broker_name(name) {
+                Err(reason) => unavailable(reason),
+                Ok(broker) => relay(policy, host, &|sandy| match &host.forward_sockets {
+                    Err(reason) => unavailable(reason.clone()),
+                    Ok(()) => enforced(format!(
+                        "`sandy __broker` in AppContainer {broker:?}, its own sandbox with the \
+                         internetClient capability and a job of its own, serves SOCKS5 on an \
+                         AF_UNIX socket that a `sandy __forward` relay in AppContainer {name:?} \
+                         passes the program's connections to; it connects out only to {reach} \
+                         destinations (sandy_core::destination) and never to this host, which its \
+                         own loopback isolation also denies at the kernel; the broker has only \
+                         read and execute access to {}; {RELAY_END}",
+                        sandy.display(),
+                        reach = policy
+                            .egress
+                            .map(|egress| egress.reach.name())
+                            .unwrap_or("public"),
+                    )),
+                }),
+            },
+        },
         Requirement::InheritedHandlesClosed
         | Requirement::EnvironmentControlled
         | Requirement::PathsHidden => {
@@ -357,20 +409,33 @@ const WIN32K_LOCKDOWN: &str = "PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY with \
 const RELAY_END: &str = "when the program ends, the relay takes no new connection, lets \
      accepted ones finish, and ends within one second";
 
-/// sandy's executable for the relays, unless sandy cannot let the AppContainer run it or it lies
-/// in a read-write path.
+/// Why the relays and the egress broker cannot run sandy's executable, and whether `sandy setup`
+/// would fix it.
+enum RelayProblem {
+    /// The current user cannot grant the AppContainer read and execute on sandy's executable;
+    /// `sandy setup`, run as administrator, adds the grant.
+    NeedsSetup(String),
+    /// sandy's executable lies in a read-write path; setup does not help.
+    Fixed(String),
+}
+
+/// sandy's executable for the relays, unless sandy cannot let the AppContainer run it (which
+/// setup fixes) or it lies in a read-write path (which it does not).
 fn relay_program<'a>(
     policy: &ResolvedPolicy,
     host: &'a HostCapabilities,
-) -> Result<&'a Path, String> {
-    let sandy = host.relay_program.as_ref().map_err(Clone::clone)?;
+) -> Result<&'a Path, RelayProblem> {
+    let sandy = host
+        .relay_program
+        .as_ref()
+        .map_err(|reason| RelayProblem::NeedsSetup(reason.clone()))?;
     match writable_parent(policy, sandy) {
-        Some(writable) => Err(format!(
+        Some(writable) => Err(RelayProblem::Fixed(format!(
             "the relays run sandy's executable {}, which lies in the read-write path {}; the \
              program could replace it",
             sandy.display(),
             writable.display()
-        )),
+        ))),
         None => Ok(sandy),
     }
 }
@@ -435,6 +500,21 @@ pub fn network_capabilities(ip: IpAccess) -> &'static [NetworkCapability] {
         IpAccess::Client => &[NetworkCapability::InternetClient],
         IpAccess::All => &[
             NetworkCapability::InternetClientServer,
+            NetworkCapability::PrivateNetworkClientServer,
+        ],
+    }
+}
+
+/// The network capabilities the egress broker gets. It only ever connects out, so it needs
+/// `internetClient`, not `internetClientServer`; `reach = "public-and-local"` adds
+/// `privateNetworkClientServer` so it may reach the local network the broker's destination check
+/// allows. The broker's own loopback isolation still stops it from reaching this machine
+/// (docs/windows.md, "Egress broker").
+pub fn broker_network_capabilities(reach: EgressReach) -> &'static [NetworkCapability] {
+    match reach {
+        EgressReach::Public => &[NetworkCapability::InternetClient],
+        EgressReach::PublicAndLocal => &[
+            NetworkCapability::InternetClient,
             NetworkCapability::PrivateNetworkClientServer,
         ],
     }
@@ -540,6 +620,14 @@ mod tests {
         match status {
             Status::Unavailable { reason } => reason,
             Status::NeedsSetup { reason } => panic!("needs setup: {reason}"),
+            Status::Enforced { mechanism } => panic!("enforced: {mechanism}"),
+        }
+    }
+
+    fn needs_setup(status: Status) -> String {
+        match status {
+            Status::NeedsSetup { reason } => reason,
+            Status::Unavailable { reason } => panic!("unavailable: {reason}"),
             Status::Enforced { mechanism } => panic!("enforced: {mechanism}"),
         }
     }
@@ -667,8 +755,10 @@ mod tests {
             loopback_exempt: Ok(true),
             ..host()
         };
-        let reason = unavailable(status(&policy(), &host, Requirement::IpNetworkDenied));
+        // `sandy setup` removes the exemption, so it is NeedsSetup, not plain Unavailable.
+        let reason = needs_setup(status(&policy(), &host, Requirement::IpNetworkDenied));
         assert!(reason.contains("exempt"), "{reason}");
+        assert!(plan(&policy(), &host).needs_only_setup());
 
         let mut allowed = policy();
         allowed.ip = IpAccess::All;
@@ -873,12 +963,14 @@ mod tests {
             relay_program: Err("the current user may not change its permissions".into()),
             ..host()
         };
-        let reason = unavailable(status(
+        // `sandy setup` adds the grant, so the relay grant is NeedsSetup.
+        let reason = needs_setup(status(
             &exposing(policy()),
             &host,
             Requirement::ExposedPortsRelayed,
         ));
         assert!(reason.contains("permissions"), "{reason}");
+        assert!(plan(&exposing(policy()), &host).needs_only_setup());
         // Policies without exposed ports do not need it.
         assert!(plan(&policy(), &host).is_enforceable());
     }
@@ -1004,6 +1096,20 @@ mod tests {
         assert!(super::notes(&all).is_empty());
     }
 
+    #[test]
+    fn none_and_private_note_the_loopback_within_the_appcontainer() {
+        for ip in [IpAccess::None, IpAccess::Private] {
+            let mut policy = policy();
+            policy.ip = ip;
+            let notes = notes(&policy);
+            assert_eq!(notes.len(), 1, "{ip:?}: {notes:?}");
+            assert!(
+                notes[0].contains("reach each other over loopback"),
+                "{notes:?}"
+            );
+        }
+    }
+
     fn private(mut policy: ResolvedPolicy) -> ResolvedPolicy {
         policy.ip = IpAccess::Private;
         policy
@@ -1039,9 +1145,10 @@ mod tests {
             loopback_exempt: Ok(true),
             ..host()
         };
-        let reason = unavailable(status(&policy, &exempt, Requirement::IpNetworkPrivate));
+        let reason = needs_setup(status(&policy, &exempt, Requirement::IpNetworkPrivate));
         assert!(reason.contains("exempt"), "{reason}");
         assert!(reason.contains("--ip private"), "{reason}");
+        assert!(plan(&policy, &exempt).needs_only_setup());
         let stopped = HostCapabilities {
             firewall: Err("MpsSvc stopped".into()),
             ..host()
@@ -1089,15 +1196,85 @@ mod tests {
         assert!(reason.contains("administrator rights"), "{reason}");
     }
 
-    #[test]
-    fn egress_is_not_enforced_yet() {
+    fn with_egress(reach: sandy_core::EgressReach) -> ResolvedPolicy {
         let mut policy = private(policy());
-        policy.egress = Some(sandy_core::Egress {
-            port: 1080,
-            reach: sandy_core::EgressReach::Public,
-        });
-        let reason = unavailable(status(&policy, &host(), Requirement::EgressBrokered));
-        assert!(reason.contains("does not enforce"), "{reason}");
+        policy.egress = Some(sandy_core::Egress { port: 1080, reach });
+        policy
+    }
+
+    /// The broker runs as `sandy __broker` in a sandbox of its own, reached over AF_UNIX.
+    #[test]
+    fn egress_is_enforced_by_a_broker_in_its_own_sandbox() {
+        let policy = with_egress(sandy_core::EgressReach::Public);
+        assert!(plan(&policy, &host()).is_enforceable());
+        match status(&policy, &host(), Requirement::EgressBrokered) {
+            Status::Enforced { mechanism } => {
+                assert!(mechanism.contains("sandy __broker"), "{mechanism}");
+                assert!(mechanism.contains("AF_UNIX"), "{mechanism}");
+                assert!(mechanism.contains("public"), "{mechanism}");
+                assert!(mechanism.contains("loopback isolation"), "{mechanism}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            broker_network_capabilities(sandy_core::EgressReach::Public),
+            &[NetworkCapability::InternetClient]
+        );
+        assert_eq!(
+            broker_network_capabilities(sandy_core::EgressReach::PublicAndLocal),
+            &[
+                NetworkCapability::InternetClient,
+                NetworkCapability::PrivateNetworkClientServer
+            ]
+        );
+    }
+
+    /// The broker needs the firewall, no exemption and the CVE fix, like `ip = "private"`, and an
+    /// AppContainer name that leaves room for the broker's reserved suffix.
+    #[test]
+    fn egress_is_unavailable_under_the_same_conditions_as_private() {
+        let policy = with_egress(sandy_core::EgressReach::Public);
+        let exempt = HostCapabilities {
+            loopback_exempt: Ok(true),
+            ..host()
+        };
+        assert!(
+            needs_setup(status(&policy, &exempt, Requirement::EgressBrokered)).contains("exempt")
+        );
+        let stopped = HostCapabilities {
+            firewall: Err("MpsSvc stopped".into()),
+            ..host()
+        };
+        assert!(
+            unavailable(status(&policy, &stopped, Requirement::EgressBrokered))
+                .contains("Windows Firewall")
+        );
+        let unpatched = HostCapabilities {
+            windows: Ok(WindowsVersion {
+                build: 19043,
+                revision: Some(1287),
+            }),
+            ..host()
+        };
+        assert!(
+            unavailable(status(&policy, &unpatched, Requirement::EgressBrokered))
+                .contains("CVE-2021-41338")
+        );
+        // The relay grant on sandy.exe that the broker's AppContainer also needs: setup adds it.
+        let ungrantable = HostCapabilities {
+            relay_program: Err("the current user may not change its permissions".into()),
+            ..host()
+        };
+        assert!(
+            needs_setup(status(&policy, &ungrantable, Requirement::EgressBrokered))
+                .contains("permissions")
+        );
+        // A name with no room for the broker suffix.
+        let mut long = with_egress(sandy_core::EgressReach::Public);
+        long.windows.appcontainer_name = Some("a".repeat(60));
+        assert!(
+            unavailable(status(&long, &host(), Requirement::EgressBrokered)).contains("longer")
+        );
     }
 
     #[test]

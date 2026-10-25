@@ -257,6 +257,13 @@ pub enum Command {
         listen: SocketAddr,
         socket: PathBuf,
     },
+    /// Internal: run the egress broker (`network.egress`). A backend starts sandy this way, in a
+    /// sandbox of its own, with a listening socket it passed by descriptor or handle number; the
+    /// broker serves SOCKS5 on it and connects out to the destinations `reach` allows.
+    Broker {
+        listener: u64,
+        reach: EgressReach,
+    },
 }
 
 /// The internal command that runs a relay. It is not part of the documented interface.
@@ -264,6 +271,9 @@ pub const RELAY_COMMAND: &str = "__relay";
 
 /// The internal command that runs a forward relay. It is not part of the documented interface.
 pub const FORWARD_COMMAND: &str = "__forward";
+
+/// The internal command that runs the egress broker. It is not part of the documented interface.
+pub const BROKER_COMMAND: &str = "__broker";
 
 #[derive(Debug)]
 pub struct Invocation {
@@ -316,6 +326,15 @@ where
                 let listen = parser.value()?.parse()?;
                 let socket = PathBuf::from(parser.value()?);
                 return Ok(Command::Forward { listen, socket });
+            }
+            Some(BROKER_COMMAND) => {
+                let listener = parser.value()?.parse()?;
+                let value = parser.value()?;
+                let reach = [EgressReach::Public, EgressReach::PublicAndLocal]
+                    .into_iter()
+                    .find(|reach| value.to_str() == Some(reach.name()))
+                    .ok_or_else(|| format!("unknown egress reach {value:?}"))?;
+                return Ok(Command::Broker { listener, reach });
             }
             _ => return Err(format!("unknown command {value:?}").into()),
         },
@@ -838,6 +857,24 @@ mod tests {
         }
         assert!(parse_strs(&[FORWARD_COMMAND, "8081", "socket"]).is_err());
         assert!(parse_strs(&[FORWARD_COMMAND, "127.0.0.1:8081"]).is_err());
+    }
+
+    #[test]
+    fn parses_the_internal_broker_command() {
+        match parse_strs(&[BROKER_COMMAND, "9", "public"]).unwrap() {
+            Command::Broker { listener, reach } => {
+                assert_eq!(listener, 9);
+                assert_eq!(reach, EgressReach::Public);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse_strs(&[BROKER_COMMAND, "9", "public-and-local"]).unwrap() {
+            Command::Broker { reach, .. } => assert_eq!(reach, EgressReach::PublicAndLocal),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(parse_strs(&[BROKER_COMMAND, "x", "public"]).is_err());
+        assert!(parse_strs(&[BROKER_COMMAND, "9", "local"]).is_err());
+        assert!(parse_strs(&[BROKER_COMMAND, "9"]).is_err());
     }
 
     #[test]

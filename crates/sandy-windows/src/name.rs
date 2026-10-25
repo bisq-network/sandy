@@ -7,6 +7,28 @@ use sandy_core::PathAccess;
 /// must fit into the pattern described by the regular expression `[-_. A-Za-z0-9]+`."
 pub const MAX_APPCONTAINER_NAME: usize = 64;
 
+/// The suffix that `egress_broker_name` adds to the program's AppContainer name. A program may
+/// not use a name ending in it, so the egress broker, which holds network capabilities, always
+/// runs in a sandbox of its own and never one a program shares.
+pub const EGRESS_BROKER_SUFFIX: &str = ".sandy-egress";
+
+/// The AppContainer name of the egress broker for a program whose AppContainer is `name`: `name`
+/// plus `EGRESS_BROKER_SUFFIX`. It differs from every name a program may use, so the broker never
+/// shares a sandbox with a program. Fails when the result would be longer than Windows allows;
+/// the fix is a shorter `appcontainer_name`.
+pub fn egress_broker_name(name: &str) -> Result<String, String> {
+    let broker = format!("{name}{EGRESS_BROKER_SUFFIX}");
+    if broker.chars().count() > MAX_APPCONTAINER_NAME {
+        return Err(format!(
+            "the egress broker needs the AppContainer name {broker:?}, which is longer than \
+             {MAX_APPCONTAINER_NAME} characters; with network.egress use an appcontainer_name of \
+             at most {} characters",
+            MAX_APPCONTAINER_NAME - EGRESS_BROKER_SUFFIX.chars().count()
+        ));
+    }
+    Ok(broker)
+}
+
 /// Checks an AppContainer name against the documented rules. sandy enforces them for
 /// `DeriveAppContainerSidFromAppContainerName` too, so a name works with every AppContainer API.
 pub fn validate_appcontainer_name(name: &str) -> Result<(), String> {
@@ -37,6 +59,13 @@ pub fn validate_appcontainer_name(name: &str) -> Result<(), String> {
     if name.chars().all(|c| c == '.') {
         return Err(format!(
             "the AppContainer name {name:?} is made of periods only, which names a directory"
+        ));
+    }
+    // An AppContainer SID ignores case, so reserve the broker suffix in either case.
+    if name.to_ascii_lowercase().ends_with(EGRESS_BROKER_SUFFIX) {
+        return Err(format!(
+            "the AppContainer name {name:?} ends with {EGRESS_BROKER_SUFFIX:?}, which sandy \
+             reserves for the egress broker's own sandbox; use another name"
         ));
     }
     if let Some(publisher) = package_family_publisher(name) {
@@ -171,5 +200,28 @@ mod tests {
             names[0],
             "sandy.grant.r.0000000000000001.00000000000000000000000000000002.a"
         );
+    }
+
+    #[test]
+    fn the_broker_name_adds_the_reserved_suffix_and_is_refused_as_a_program_name() {
+        assert_eq!(
+            egress_broker_name("example.app"),
+            Ok("example.app.sandy-egress".to_string())
+        );
+        // A program may not use a name that ends with the suffix, in either case, so it never
+        // shares the broker's sandbox.
+        for name in ["example.app.sandy-egress", "EXAMPLE.APP.SANDY-EGRESS"] {
+            assert!(validate_appcontainer_name(name).is_err(), "{name}");
+        }
+        // The broker name itself is still a valid AppContainer name for the API.
+        let broker = egress_broker_name("example.app").unwrap();
+        assert!(broker.chars().count() <= MAX_APPCONTAINER_NAME);
+    }
+
+    #[test]
+    fn the_broker_name_fails_when_it_would_be_too_long() {
+        let longest = MAX_APPCONTAINER_NAME - EGRESS_BROKER_SUFFIX.chars().count();
+        assert!(egress_broker_name(&"a".repeat(longest)).is_ok());
+        assert!(egress_broker_name(&"a".repeat(longest + 1)).is_err());
     }
 }

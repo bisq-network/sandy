@@ -874,6 +874,12 @@ metadata through the descriptor they wrote.
   program or is reached by it. Names do not resolve, and a datagram the program sends out is
   dropped although the send reports success. `sandy setup` removes the exemption for it, as for
   `ip = "none"`.
+- **Egress broker.** `egress` adds a SOCKS5 broker that the program reaches on its loopback. On
+  Windows it runs as a separate `sandy` process in an AppContainer of its own, with only the
+  capability it needs to connect out, reached from the program over the same AF_UNIX path as
+  `forward`. It ends with the program. It connects only where `reach` allows and never to this
+  host, and its own AppContainer isolation keeps it off this machine even if that check were
+  wrong. See [docs/windows.md](docs/windows.md), "Egress broker".
 - **No hidden paths.** `view = "policy"` is refused: Windows cannot hide paths from an
   AppContainer without administrator rights, so the program can tell an existing path outside
   the policy from a missing one.

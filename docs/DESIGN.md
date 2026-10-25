@@ -591,6 +591,7 @@ exceptions:
 | macOS | `ip = "private"` with `forward` | a process of sandy's own user that listens on a forwarded port at another address of the Mac receives the program's connections there, and once the relay has ended any process that binds the port does |
 | macOS | `view = "policy"` | the names in the root directory, with their metadata through a bulk listing that asks for the type; the directories above each policy path; the volume and mount point that `statfs` names for a policy path |
 | Windows | a directory in the policy | a file moved out of a granted directory keeps its grant |
+| Windows | `ip = "none"` or `ip = "private"` | the program's own processes in its AppContainer reach each other over loopback (127.0.0.1 and ::1), because Windows isolates loopback between the AppContainer and the rest of the machine, not within one |
 
 `children = "contained"` on macOS gets a warning as well, although it gives its full
 guarantee: it denies `posix_spawn`, which many runtimes start processes with, and that cost is
@@ -930,6 +931,12 @@ Details, limitations and sources: `docs/windows.md`.
   processes and the relays reach each other over loopback; loopback isolation and the missing
   capability cut off the rest of the machine and the network, a datagram out is dropped at the
   connect layer, and the DNS Client service resolves no name for it.
+- `network.egress`: `sandy __broker` runs in an AppContainer of its own (the program's name plus
+  a reserved suffix, so no program shares it) with the `internetClient` capability, and
+  `privateNetworkClientServer` for `reach = "public-and-local"`. The program reaches it through a
+  `sandy __forward` relay over an AF_UNIX socket that sandy binds and the broker inherits; the
+  broker is in the program's job, so it ends with the program. `sandy_core::destination` limits
+  where it connects, and the broker's own loopback isolation also keeps it off this machine.
 - `filesystem.view = "policy"` is unavailable: Windows hides no path from an AppContainer
   without administrator rights, and the sandbox answers `ERROR_ACCESS_DENIED` for an existing
   path outside the policy.

@@ -97,13 +97,36 @@ const CHILD_PROCESS_RESTRICTED: u32 = 0x01;
 /// define: the process cannot make win32k system calls.
 pub const WIN32K_SYSTEM_CALL_DISABLE: u64 = 1 << 28;
 
-/// A relay process: `sandy __relay` for an exposed port or `sandy __forward` for a forwarded
-/// port. Its standard input is a pipe that sandy closes when the program ends; the relay then
-/// stops taking connections and ends within `sandy_relay::DRAIN`.
+/// A listening socket a relay process inherits: the backend creates it outside the AppContainer
+/// and passes its handle in the handle list. The handle keeps its value in the child, which the
+/// command line also names.
+pub trait InheritedSocket: Send {
+    fn raw(&self) -> HANDLE;
+}
+
+impl InheritedSocket for TcpListener {
+    fn raw(&self) -> HANDLE {
+        self.as_raw_socket() as HANDLE
+    }
+}
+
+impl InheritedSocket for sandy_relay::unix::Listener {
+    fn raw(&self) -> HANDLE {
+        self.as_raw_socket() as HANDLE
+    }
+}
+
+/// A relay process: `sandy __relay` for an exposed port, `sandy __forward` for a forwarded port,
+/// or `sandy __broker` for the egress broker. Its standard input is a pipe that sandy closes when
+/// the program ends; the relay then stops taking connections and ends within `sandy_relay::DRAIN`.
+/// The broker runs in a sandbox of its own, so each relay names the AppContainer it belongs to.
 pub struct Relay<'a> {
     pub process: Process<'a>,
-    /// The listening socket an exposed-port relay receives.
-    pub socket: Option<TcpListener>,
+    /// The AppContainer the relay runs in: the program's for `__relay` and `__forward`, the
+    /// broker's own for `__broker`.
+    pub appcontainer: &'a Sid,
+    /// The listening socket an exposed-port relay or the broker receives.
+    pub socket: Option<Box<dyn InheritedSocket>>,
     /// The relay writes the line "ready" to standard output once it listens, and the program
     /// starts only after that. A forwarded-port relay creates its listener itself.
     pub reports_ready: bool,
@@ -180,13 +203,7 @@ fn start_and_wait(
     let mut running = Vec::with_capacity(port_relays.len());
     if let Some(relay_job) = &relay_job {
         for relay in port_relays {
-            running.push(start_relay(
-                relay,
-                appcontainer,
-                relay_job,
-                &stdio,
-                deny_win32k,
-            )?);
+            running.push(start_relay(relay, relay_job, &stdio, deny_win32k)?);
         }
     }
     let stdio_handles = stdio.child.each_ref().map(|handle| handle.as_raw_handle());
@@ -276,7 +293,6 @@ struct RunningRelay {
 /// "ready" reporting on standard output if it asks for it, and the program's standard error.
 fn start_relay(
     mut relay: Relay<'_>,
-    appcontainer: &Sid,
     relay_job: &OwnedHandle,
     stdio: &StandardHandles,
     deny_win32k: bool,
@@ -295,13 +311,10 @@ fn start_relay(
         output.as_raw_handle(),
         stdio.child[2].as_raw_handle(),
     ];
-    let socket = relay
-        .socket
-        .as_ref()
-        .map(|socket| socket.as_raw_socket() as HANDLE);
+    let socket = relay.socket.as_ref().map(|socket| socket.raw());
     let process = start(
         &mut relay.process,
-        appcontainer,
+        relay.appcontainer,
         relay_job,
         relay_stdio,
         socket.as_slice(),

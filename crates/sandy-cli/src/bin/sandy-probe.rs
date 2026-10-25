@@ -9,7 +9,7 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::mem::ManuallyDrop;
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -80,6 +80,11 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
         // Listens on ADDRESS and connects to that listener from the same process, as the parts of
         // one program talk over loopback, and passes one byte through.
         "tcp-self" => tcp_self(target),
+        // BROKER<U+001F>DESTINATION: asks the SOCKS5 broker on BROKER to CONNECT to DESTINATION, a
+        // program's egress through `network.egress`. DESTINATION is `IP:port`, sent as an address,
+        // or `name:port`, sent as a domain name (which the broker refuses). Reports the SOCKS5
+        // reply code and, when the broker allows it, exchanges one byte.
+        "socks5-connect" => socks5_connect(target),
         "tcp-listen" => {
             let listener = TcpListener::bind(socket_address(target)?)?;
             Ok(listener.local_addr()?.to_string())
@@ -545,6 +550,60 @@ fn pair(target: &str) -> io::Result<(&str, &str)> {
     target
         .split_once(ARGUMENT_SEPARATOR)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "expected FROM U+001F TO"))
+}
+
+/// Speaks SOCKS5 to the broker on the first address and asks it to CONNECT to the second. The
+/// second is `IP:port`, sent as an IPv4 or IPv6 address (ATYP 1 or 4), or `name:port`, sent as a
+/// domain name (ATYP 3). Reports `reply N`, the SOCKS5 reply code; reply 0 means the broker made
+/// the connection. It does not exchange data, so it never waits on what the destination says.
+fn socks5_connect(target: &str) -> io::Result<String> {
+    let (broker, destination) = pair(target)?;
+    let (host, port) = destination
+        .rsplit_once(':')
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "expected host:port"))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid port"))?;
+    // A bracketed IPv6 literal, as in [::1]:80.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host);
+    let mut request = vec![5u8, 1, 0];
+    match host.parse() {
+        Ok(IpAddr::V4(ip)) => {
+            request.push(1);
+            request.extend(ip.octets());
+        }
+        Ok(IpAddr::V6(ip)) => {
+            request.push(4);
+            request.extend(ip.octets());
+        }
+        Err(_) => {
+            let length = u8::try_from(host.len())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name too long"))?;
+            request.push(3);
+            request.push(length);
+            request.extend(host.as_bytes());
+        }
+    }
+    request.extend(port.to_be_bytes());
+
+    let mut stream = TcpStream::connect_timeout(&socket_address(broker)?, CONNECT_TIMEOUT)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.write_all(&[5, 1, 0])?;
+    let mut greeting = [0u8; 2];
+    stream.read_exact(&mut greeting)?;
+    if greeting != [5, 0] {
+        return Err(io::Error::other(format!("bad method answer {greeting:?}")));
+    }
+    stream.write_all(&request)?;
+    let mut reply = [0u8; 10];
+    stream.read_exact(&mut reply)?;
+    if reply[0] != 5 {
+        return Err(io::Error::other(format!("bad reply version {}", reply[0])));
+    }
+    Ok(format!("reply {}", reply[1]))
 }
 
 /// Reads an inherited file descriptor to its end.

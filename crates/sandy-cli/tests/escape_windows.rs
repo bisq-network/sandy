@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use common::*;
 
 const EXIT_NOT_ENFORCEABLE: i32 = 1;
+/// `check`: not enforceable, but `sandy setup` with administrator rights would make it so.
+const EXIT_NEEDS_SETUP: i32 = 2;
 
 /// The status of a program that Ctrl+C or Ctrl+Break ended (`STATUS_CONTROL_C_EXIT`).
 const STATUS_CONTROL_C_EXIT: i32 = 0xC000_013A_u32 as i32;
@@ -712,16 +714,13 @@ fn loopback_to_the_program_is_blocked_with_and_without_exemption() {
 }
 
 /// An exempt AppContainer reaches 127.0.0.1 even without network capabilities, so sandy must
-/// refuse it for a policy without IP networking.
+/// refuse it for a policy without IP networking. `sandy setup` removes the exemption, so `check`
+/// reports it as needing setup and exits with the setup status (2), not the plain refusal (1).
 #[test]
 fn an_exempt_appcontainer_cannot_deny_ip() {
     prepare_loopback_exemption();
     let output = sandy(["check", "--appcontainer", &appcontainer_loopback_name()]);
-    assert_eq!(
-        output.status.code(),
-        Some(EXIT_NOT_ENFORCEABLE),
-        "{output:?}"
-    );
+    assert_eq!(output.status.code(), Some(EXIT_NEEDS_SETUP), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("exempt"), "{stdout}");
 }
@@ -3138,6 +3137,21 @@ fn ip_private_connects_on_its_own_loopback() {
     lines[1].assert_ok();
 }
 
+/// Records the exceptions-table row (docs/DESIGN.md): with `ip = "none"` the program's own
+/// processes in its AppContainer still reach each other over loopback, so a Windows release that
+/// closed that would fail here and the exception could go. One process reaching its own loopback
+/// listener stands in for two of the program's processes, which `children = "none"` would forbid.
+#[test]
+fn loopback_within_the_appcontainer_works_under_ip_none() {
+    let fixture = Fixture::new("none-loopback");
+    let lines = controlled(
+        &fixture.access_args(),
+        &[("tcp-self", "127.0.0.1:0"), ("tcp-self", "[::1]:0")],
+    );
+    lines[0].assert_ok();
+    lines[1].assert_ok();
+}
+
 /// Nothing on this machine outside the AppContainer: a listener on 127.0.0.1, on ::1 and on the
 /// machine's own address on the network, and a socket on 127.0.0.1 and ::1 that waits for a
 /// datagram. Each works outside the sandbox.
@@ -3461,19 +3475,15 @@ fn a_forwarded_port_works_with_ip_private() {
 }
 
 /// An exempt AppContainer reaches 127.0.0.1 outside also without capabilities, so `check`
-/// refuses `ip = "private"` there, and `sandy setup` with the policy takes the exemption away.
-/// Needs administrator rights, like `prepare_loopback_exemption`.
+/// refuses `ip = "private"` there with the setup status (2), and `sandy setup` with the policy
+/// takes the exemption away. Needs administrator rights, like `prepare_loopback_exemption`.
 #[test]
 fn setup_takes_the_loopback_exemption_from_a_private_network() {
     prepare_loopback_exemption();
     let name = appcontainer_loopback_name();
     let check = || sandy(["check", "--appcontainer", &name, "--ip", "private"]);
     let output = check();
-    assert_eq!(
-        output.status.code(),
-        Some(EXIT_NOT_ENFORCEABLE),
-        "{output:?}"
-    );
+    assert_eq!(output.status.code(), Some(EXIT_NEEDS_SETUP), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("exempt"), "{stdout}");
 
@@ -3502,4 +3512,193 @@ fn the_policy_view_is_refused() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("administrator rights"), "{stdout}");
     assert!(stdout.contains("What the program can see"), "{stdout}");
+}
+
+// `network.egress`: the SOCKS5 broker, a separate `sandy __broker` process in an AppContainer of
+// its own, reached from the program through the egress port over the forward path
+// (docs/windows.md, "Egress broker").
+
+/// `--ip private --egress PORT[=REACH]` for this test's AppContainer, which is not exempt.
+fn egress_args(fixture: &Fixture, port: u16, reach: &str) -> Vec<String> {
+    let egress = if reach.is_empty() {
+        port.to_string()
+    } else {
+        format!("{port}={reach}")
+    };
+    let mut sandbox_args = fixture.access_args();
+    sandbox_args.extend(args(&["--ip", "private", "--egress", &egress]));
+    sandbox_args
+}
+
+/// Asks the broker on the egress port to connect to `destination`, and returns the probe's line.
+fn through_broker(sandbox_args: &[String], port: u16, destination: &str) -> ProbeLine {
+    let target = format!("127.0.0.1:{port}\u{1f}{destination}");
+    let mut lines = probe_inside(sandbox_args, &[("socks5-connect", &target)]);
+    lines.remove(0)
+}
+
+/// A bracketed form for an IPv6 address, plain for IPv4, with a port.
+fn with_port(address: std::net::IpAddr, port: u16) -> String {
+    std::net::SocketAddr::new(address, port).to_string()
+}
+
+/// With `reach = "public"` the broker connects to a public internet address. Skipped where this
+/// host has no route to one.
+#[test]
+fn egress_reaches_an_allowed_public_destination() {
+    let public = "1.1.1.1:443";
+    if probe_outside(&[("tcp-connect", public)])[0].result != "ok" {
+        skip("internet", "this host has no route to a public address");
+        return;
+    }
+    let fixture = Fixture::new("egress-public");
+    let port = free_port();
+    let line = through_broker(&egress_args(&fixture, port, "public"), port, public);
+    assert_eq!(line.detail, "reply 0", "{line:?}");
+}
+
+/// With `reach = "public"` the broker refuses this machine and the local network, in every form,
+/// with reply 2, and connects to none of them.
+#[test]
+fn egress_under_public_refuses_this_machine_and_the_local_network() {
+    let fixture = Fixture::new("egress-refuse");
+    let port = free_port();
+    let args = egress_args(&fixture, port, "public");
+    let mut destinations = vec![
+        "127.0.0.1:53".to_string(),
+        "[::1]:53".to_string(),
+        "0.0.0.0:53".to_string(),
+        "[::ffff:127.0.0.1]:53".to_string(),
+    ];
+    if let Some(gateway) = gateway() {
+        destinations.push(with_port(gateway.into(), 53));
+    }
+    if let Some(lan) = lan_address() {
+        destinations.push(with_port(lan, 53));
+    }
+    for destination in destinations {
+        let line = through_broker(&args, port, &destination);
+        assert_eq!(line.detail, "reply 2", "{destination}: {line:?}");
+    }
+}
+
+/// With `reach = "public-and-local"` the broker reaches the gateway (the host of the test VM's
+/// network, which runs a resolver on port 53), but still refuses this machine itself.
+#[test]
+fn egress_under_public_and_local_allows_the_gateway_but_not_this_machine() {
+    let Some(gateway) = gateway() else {
+        skip(
+            "network-gateway",
+            "this machine has no route to other hosts",
+        );
+        return;
+    };
+    let dest = with_port(gateway.into(), 53);
+    if probe_outside(&[("tcp-connect", &dest)])[0].result != "ok" {
+        skip("network-gateway", "the gateway runs no service on port 53");
+        return;
+    }
+    let fixture = Fixture::new("egress-local");
+    let port = free_port();
+    let args = egress_args(&fixture, port, "public-and-local");
+    assert_eq!(
+        through_broker(&args, port, &dest).detail,
+        "reply 0",
+        "the gateway was refused under public-and-local"
+    );
+    // This machine stays refused even under public-and-local.
+    assert_eq!(
+        through_broker(&args, port, "127.0.0.1:53").detail,
+        "reply 2"
+    );
+    if let Some(lan) = lan_address() {
+        assert_eq!(
+            through_broker(&args, port, &with_port(lan, 53)).detail,
+            "reply 2"
+        );
+    }
+}
+
+/// The broker refuses a domain name with reply 8, so it resolves nothing for the program.
+#[test]
+fn egress_refuses_a_name() {
+    let fixture = Fixture::new("egress-name");
+    let port = free_port();
+    let line = through_broker(
+        &egress_args(&fixture, port, "public"),
+        port,
+        "example.com:80",
+    );
+    assert_eq!(line.detail, "reply 8", "{line:?}");
+}
+
+/// The broker is in the program's relay job, so it ends with the program. Its process is a
+/// `sandy.exe` child of the run, like the relays.
+#[test]
+fn the_egress_broker_ends_with_the_program() {
+    let fixture = Fixture::new("egress-end");
+    let port = free_port();
+    let run = Command::new(sandy_path())
+        .args(run_args(
+            &egress_args(&fixture, port, "public"),
+            &[("sleep", "2000")],
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let children = loop {
+        let children = relay_processes(run.id());
+        // The egress forward relay and the broker are both sandy.exe children.
+        if children.len() >= 2 {
+            break children;
+        }
+        assert!(Instant::now() < deadline, "the broker never started");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let output = run.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    for child in &children {
+        assert!(
+            ends_within(child, END_TIMEOUT),
+            "a broker outlived the program"
+        );
+    }
+}
+
+/// The broker runs with the internetClient capability and no loopback exemption, so Windows
+/// Firewall and loopback isolation stop it from reaching this machine at the kernel level, even
+/// if the destination check (`sandy_core::destination`) ever let such an address through. Measured
+/// with that same capability profile: a connect to a loopback listener and to this machine's own
+/// address on the network is blocked, while the control outside the sandbox connects. When the
+/// firewall's events can be read (administrator rights), the drops are keyed on the AppContainer.
+#[test]
+fn the_broker_appcontainer_cannot_reach_this_machine() {
+    let fixture = Fixture::new("broker-isolation");
+    // internetClient without the loopback exemption: the broker's reach = "public" profile.
+    let mut client = fixture.access_args();
+    client.extend(args(&[
+        "--ip",
+        "client",
+        "--appcontainer",
+        &appcontainer_name(),
+    ]));
+    let loopback = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut targets = vec![loopback.local_addr().unwrap().to_string()];
+    let lan = lan_address().map(|address| TcpListener::bind((address, 0)).unwrap());
+    match &lan {
+        Some(listener) => targets.push(listener.local_addr().unwrap().to_string()),
+        None => skip(
+            "network-address",
+            "this machine has no route to other hosts",
+        ),
+    }
+    let actions: Vec<(&str, &str)> = targets
+        .iter()
+        .map(|target| ("tcp-connect", target.as_str()))
+        .collect();
+    for line in controlled(&client, &actions) {
+        line.assert_blocked();
+    }
 }

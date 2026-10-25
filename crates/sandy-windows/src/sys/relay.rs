@@ -21,6 +21,9 @@ pub const RELAY_COMMAND: &str = "__relay";
 /// The internal command of the sandy command line that runs a forward relay.
 pub const FORWARD_COMMAND: &str = "__forward";
 
+/// The internal command of the sandy command line that runs the egress broker.
+pub const BROKER_COMMAND: &str = "__broker";
+
 /// The rule that lets the relays run sandy's own executable. The backend runs inside the sandy
 /// command line, so this is `sandy.exe`.
 pub fn relay_rule() -> Result<PathRule, String> {

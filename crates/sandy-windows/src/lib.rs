@@ -17,4 +17,4 @@ pub mod version;
 mod sys;
 
 #[cfg(windows)]
-pub use sys::WindowsBackend;
+pub use sys::{WindowsBackend, WindowsHost};

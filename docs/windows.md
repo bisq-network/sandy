@@ -21,9 +21,9 @@ isolation.
 | `ProcessMemoryIsolated` | Processes outside the AppContainer grant its SID no access | no AppContainer |
 | `InheritedHandlesClosed` | `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` with the three standard handles | never |
 | `EnvironmentControlled` | Environment block built from the policy, plus `SystemRoot` and `LOCALAPPDATA` | never |
-| `IpNetworkDenied` | No network capabilities, no loopback exemption | AppContainer exempt from loopback isolation; firewall service not running |
+| `IpNetworkDenied` | No network capabilities, no loopback exemption | AppContainer exempt from loopback isolation; firewall service not running; no fix for CVE-2021-41338 |
 | `IpNetworkPrivate` | No network capabilities, no loopback exemption; the program's processes and the relays reach each other over loopback (see "Private network") | AppContainer exempt from loopback isolation; firewall service not running; no fix for CVE-2021-41338 |
-| `EgressBrokered` | Not enforced yet | always |
+| `EgressBrokered` | `sandy __broker` in an AppContainer of its own with the `internetClient` capability, reached from the program over AF_UNIX; `sandy_core::destination` limits where it connects (see "Egress broker") | AppContainer exempt from loopback isolation; firewall service not running; no fix for CVE-2021-41338; the broker's AppContainer name would exceed 64 characters |
 | `PathsHidden` | None: Windows cannot hide paths from an AppContainer without administrator rights (see "What the program can see") | always |
 | `InboundIpDenied` | The `internetClient` capability only; loopback isolation | firewall service not running; no fix for CVE-2021-41338 |
 | `UnixSocketsDenied` | No write access to socket files outside read-write paths | no AppContainer |
@@ -616,6 +616,47 @@ Like `ip = "none"`, `ip = "private"` needs the firewall service, the fix for CVE
 an AppContainer without the loopback exemption. `sandy setup` with the policy removes an
 exemption the AppContainer has (`setup_takes_the_loopback_exemption_from_a_private_network`).
 
+### Egress broker
+
+`network.egress` adds a SOCKS5 broker that lets a program with `ip = "private"` connect out to the
+destinations `reach` allows (docs/DESIGN.md, "Private network and egress" and "Egress broker").
+The program has no network capability, so the broker, not the program, makes every outbound
+connection.
+
+sandy runs the broker as `sandy __broker` in an AppContainer of its own, alongside the program:
+
+1. The broker's AppContainer is the program's AppContainer name plus the reserved suffix
+   `.sandy-egress`, so it is never a name a program may use (sandy refuses one that ends with the
+   suffix) and the broker never shares a sandbox with a program. A program could otherwise open
+   and control a process in its own AppContainer, and the broker holds network capabilities the
+   program must not reach. The name must fit Windows's 64 character limit, so with `egress` the
+   `appcontainer_name` is at most 51 characters.
+2. The broker's token holds the `internetClient` capability for `reach = "public"`, and
+   `internetClient` plus `privateNetworkClientServer` for `"public-and-local"` so it may reach the
+   local network. It only connects out, so it needs neither the server capabilities nor the
+   loopback exemption. It also has read and execute access to `sandy.exe`, granted like the
+   relays' (see "Exposed ports"); `sandy setup` adds that grant for the broker's AppContainer too.
+3. The program reaches the broker through a `sandy __forward` relay in the program's own
+   AppContainer, exactly as a forwarded port: the relay listens on `127.0.0.1:<egress port>`
+   inside the sandbox and passes each connection over an AF_UNIX socket. sandy binds that socket
+   outside the AppContainers and hands the listening handle to the broker, which inherits it and
+   accepts on it; the broker needs no access to the socket file. The relay connects to the socket
+   file with the capability it already holds.
+4. The broker is in the program's relay job, so it ends with the program and within one second of
+   it (docs/DESIGN.md, "Forwarded ports", rule 5); kill-on-close ends it if sandy dies. Its
+   AppContainer profile is this run's alone and sandy removes it when the run ends.
+
+What the broker connects to is decided by `sandy_core::destination`, the same on every platform,
+with the host's own addresses and subnets answered by `GetAdaptersAddresses` and `GetBestRoute2`.
+It refuses a domain name (reply 8), so it resolves nothing for the program. On Windows there is a
+second line of defense: the broker's own AppContainer has no loopback exemption, so loopback
+isolation drops any connection to this machine at the kernel level even if the destination check
+were wrong. The escape tests `egress_reaches_an_allowed_public_destination`,
+`egress_under_public_refuses_this_machine_and_the_local_network`,
+`egress_under_public_and_local_allows_the_gateway_but_not_this_machine`, `egress_refuses_a_name`,
+`the_egress_broker_ends_with_the_program` and `the_broker_appcontainer_cannot_reach_this_machine`
+cover it.
+
 ### Local servers in the sandbox
 
 A program in the sandbox cannot accept loopback TCP connections from processes outside it, also
@@ -1157,8 +1198,8 @@ about a path is worse than none, so the backend answers nothing and sandy refuse
 
 Host: Windows 11 build 26200 (VM), binaries built for `x86_64-pc-windows-gnu`. The tests run in
 an elevated SSH session and without administrator rights. Latest elevated run, every test
-passing: `sandy_core` 72, `sandy_relay` 12, `sandy_windows` 83, `sandy` 16, `escape` 27,
-`escape_windows` 73, `expose` 5, `forward` 3, `children` 5, `parent` 5, `check` 11, `runner` 3,
+passing: `sandy_core` 85, `sandy_relay` 41, `sandy_windows` 87, `sandy` 17, `escape` 27,
+`escape_windows` 80, `expose` 5, `forward` 3, `children` 5, `parent` 5, `check` 11, `runner` 3,
 `review_windows` 11. The
 COM check of `review_windows` is skipped there: the SSH session is session 0, where `ole32.dll`
 does not load in an AppContainer (limitation 13), so a denial would not be the COM boundary.
@@ -1218,8 +1259,17 @@ Facts these runs established:
   datagrams from outside do not reach the program. Each works outside the sandbox. Windows
   Firewall logs a datagram to the gateway as dropped outbound at `ALE_AUTH_CONNECT_V4` by "UWP
   Default Outbound Block Rule", for the program's package SID, although `sendto` succeeded.
+- With `network.egress` the broker, `sandy __broker` in an AppContainer of its own, lets the
+  program reach an allowed public address (`reply 0`) over the egress port, and the gateway under
+  `reach = "public-and-local"`, while it refuses this machine and the local network under
+  `reach = "public"`, refuses this machine's own address and loopback under either reach
+  (`reply 2`), and refuses a domain name (`reply 8`). The broker ends with the program. The same
+  capability profile (internetClient, no loopback exemption) cannot reach a loopback listener or
+  this machine's network address even directly, so the broker's AppContainer isolation backs up
+  the destination check.
 - A user without the right to change the DACL of `sandy.exe` gets `ExposedPortsRelayed` as
-  unavailable; after `sandy setup` with the policy, run as administrator, the plan enforces it.
+  needing `sandy setup`; after `sandy setup` with the policy, run as administrator, the plan
+  enforces it.
 - A program in an AppContainer without the loopback exemption reaches a loopback service outside
   through `network.forward`, while its direct connection to a listener outside times out.
 - An AF_UNIX stream socket works through the standard library's `TcpStream` for reading,

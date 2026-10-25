@@ -692,6 +692,16 @@ pub mod unix {
             Ok(listener)
         }
 
+        /// Adopts a listening AF_UNIX socket that another process bound and passed on, by its
+        /// raw handle value. A backend uses it for a socket it created outside an AppContainer
+        /// and let an AppContainer process inherit: the handle keeps its value in the child.
+        ///
+        /// # Safety
+        /// `raw` must be a listening socket handle that this process owns and nothing else owns.
+        pub unsafe fn from_inherited(raw: u64) -> Listener {
+            Listener(raw as SOCKET)
+        }
+
         /// Waits for the next connection.
         pub fn accept(&self) -> io::Result<TcpStream> {
             // SAFETY: the socket listens; null pointers ask for no peer address.

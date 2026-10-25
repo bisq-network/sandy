@@ -58,6 +58,7 @@ fn main() -> ExitCode {
         }
         Command::Relay { listener, target } => relay(listener, target),
         Command::Forward { listen, socket } => forward(listen, &socket),
+        Command::Broker { listener, reach } => broker(listener, reach),
         Command::Sandbox(invocation) => {
             if matches!(invocation.mode, Mode::Run | Mode::Check) {
                 hand_over(&started_as);
@@ -271,6 +272,39 @@ fn forward(listen: std::net::SocketAddr, socket: &std::path::Path) -> ExitCode {
 #[cfg(not(windows))]
 fn forward(_listen: std::net::SocketAddr, _socket: &std::path::Path) -> ExitCode {
     eprintln!("sandy: {} is used only on Windows", args::FORWARD_COMMAND);
+    ExitCode::from(EXIT_FAILURE)
+}
+
+/// The egress broker (`network.egress`). The Windows backend starts it as a separate sandy
+/// process in a sandbox of its own, with the AF_UNIX listener that the forward relay inside the
+/// program's AppContainer passes the program's connections to. It serves SOCKS5 on that listener
+/// and connects out to the destinations `reach` allows, asking the Windows host which addresses
+/// are its own. It ends like a relay when sandy closes its standard input.
+#[cfg(windows)]
+fn broker(listener: u64, reach: sandy_core::EgressReach) -> ExitCode {
+    // The inherited socket came from another process, so this one must start Winsock before it
+    // uses it, or `accept` fails with WSANOTINITIALISED (`sandy_relay::unix`).
+    if let Err(error) = sandy_relay::unix::available() {
+        eprintln!("sandy: broker failed: {error}");
+        return ExitCode::from(EXIT_FAILURE);
+    }
+    // SAFETY: a backend starts this command only with a listening AF_UNIX socket it passed to
+    // this process and that nothing else here owns.
+    let listener = unsafe { sandy_relay::unix::Listener::from_inherited(listener) };
+    sandy_relay::broker::serve(
+        listener,
+        |listener| listener.accept(),
+        reach,
+        sandy_windows::WindowsHost,
+        &stop_at_end_of_input(),
+        sandy_relay::DRAIN,
+    );
+    ExitCode::SUCCESS
+}
+
+#[cfg(not(windows))]
+fn broker(_listener: u64, _reach: sandy_core::EgressReach) -> ExitCode {
+    eprintln!("sandy: {} is used only on Windows", args::BROKER_COMMAND);
     ExitCode::from(EXIT_FAILURE)
 }
 
