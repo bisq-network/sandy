@@ -327,8 +327,9 @@ matters only on Windows (see [Windows](#windows)); on Linux and macOS it does no
 
 `sandy setup --remove`, with the same policy, takes that preparation back, together with what
 the runs of the policy left on the host: on Windows the loopback exemption, the access control
-entries of the policy paths and the AppContainer profile. It is idempotent, and on Linux and
-macOS it does nothing because those backends leave nothing behind.
+entries of the policy paths and the AppContainer profile. The entry on the program file goes only
+when the removal names the program as a `read_exec` path (see docs/windows.md). It is
+idempotent, and on Linux and macOS it does nothing because those backends leave nothing behind.
 
 ### Options
 
@@ -502,8 +503,8 @@ Unknown keys are errors, so a misspelled key never becomes a silent default.
    sandy refuses a writable path that reaches a location whose content another program reads or
    runs later: your home directory, the shell startup files (`~/.bashrc`, `~/.profile`),
    autostart entries and user services, `~/.ssh`; on macOS also `~/Library/LaunchAgents`, on
-   Windows the Startup folders, the PowerShell profile folders and `WindowsApps`. Each platform
-   documents its list. A directory below your home directory stays writable.
+   Windows the Startup folders, the PowerShell profile folders, `WindowsApps` and sandy's own
+   state folder. Each platform documents its list. A directory below your home directory stays writable.
 
    A directory on your `PATH` gets a warning instead, naming it, because a writable path that
    holds one is often what you mean: `--read-write ~/.cargo` with `~/.cargo/bin` on `PATH`, or

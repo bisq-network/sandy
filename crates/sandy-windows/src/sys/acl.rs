@@ -58,7 +58,11 @@ pub fn grant(appcontainer: &str, rule: &PathRule, held: &[Sid]) -> Result<Sid, S
     let dacl = Dacl::read(&path, &rule.path)?;
     if lacks_grant(rule, &capability, &dacl)? {
         if rule.is_dir {
-            check_tree_below(&rule.path, &executors(rule, held))?;
+            check_tree_below(
+                &rule.path,
+                &executors(rule, held),
+                "Remove the link, or list its target in the policy",
+            )?;
         }
         add_ace(
             &path,
@@ -240,7 +244,12 @@ pub fn deny_execute_in_profile(appcontainer: &Sid, folder: &Path) -> Result<(), 
     if let Some(mask) = excess_profile_rights(&dacl, folder, appcontainer)? {
         // Writing the entry re-propagates it to everything below the folder, and the program
         // can write there, so refuse a planted link first, as `grant` does for a policy path.
-        check_tree_below(folder, &[])?;
+        check_tree_below(
+            folder,
+            &[],
+            "Remove the link; the folder is the AppContainer's profile, whose rights sandy is \
+             reducing",
+        )?;
         set_access(
             &path,
             folder,
@@ -388,7 +397,7 @@ fn capability_sid(name: &str) -> Result<Sid, SandboxError> {
 }
 
 /// Checks the tree below a directory that is about to receive an inheritable ACE. Called only
-/// when sandy adds the ACE, not on every run.
+/// when sandy adds the ACE, not on every run. `advice` ends the message that refuses a link.
 ///
 /// Links: applying an inheritable ACE to a directory also changes every object below it.
 /// Whether this propagation follows junctions and symbolic links is not documented. A program
@@ -402,7 +411,11 @@ fn capability_sid(name: &str) -> Result<Sid, SandboxError> {
 /// it would make that file writable and executable, so the walk refuses it. The program cannot
 /// add such an entry later: it holds no right to change permissions outside its profile folder.
 /// Software outside the sandbox can, which stays a residual risk because the walk runs once.
-fn check_tree_below(directory: &Path, who: &[(Vec<u8>, String)]) -> Result<(), SandboxError> {
+fn check_tree_below(
+    directory: &Path,
+    who: &[(Vec<u8>, String)],
+    advice: &str,
+) -> Result<(), SandboxError> {
     let mut pending = vec![directory.to_path_buf()];
     while let Some(dir) = pending.pop() {
         let entries = fs::read_dir(&dir)
@@ -418,9 +431,8 @@ fn check_tree_below(directory: &Path, who: &[(Vec<u8>, String)]) -> Result<(), S
             })?;
             if kind.is_symlink() {
                 return Err(SandboxError::new(format!(
-                    "{} is a junction or symbolic link inside the policy path {}; sandy does not \
-                     grant access to a tree that contains links. Remove the link, or list its \
-                     target in the policy",
+                    "{} is a junction or symbolic link inside {}; sandy does not change the \
+                     permissions of a tree that contains links. {advice}",
                     entry.path().display(),
                     directory.display()
                 )));

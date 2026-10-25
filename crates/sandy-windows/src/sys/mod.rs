@@ -381,6 +381,12 @@ fn local_app_data() -> Result<Vec<u16>, SandboxError> {
     )
 }
 
+/// sandy's own folder, `%LOCALAPPDATA%\sandy`: the lock files that coordinate its runs
+/// (`lockfile`) and the socket directories of forwarded ports (`forward`).
+fn state_directory() -> Result<std::path::PathBuf, SandboxError> {
+    Ok(std::path::PathBuf::from(OsString::from_wide(&local_app_data()?)).join("sandy"))
+}
+
 /// The directories of the system set that a writable path may neither contain nor lie in: the
 /// Windows directory and the program files directories, where Windows grants every
 /// AppContainer read and execute access (rule 6 in DESIGN.md).
@@ -415,11 +421,11 @@ fn held_sids(policy: &ResolvedPolicy, container: &Sid) -> Result<Vec<Sid>, Sandb
 
 /// Locations of this user that programs outside the sandbox read or execute later: the folders
 /// Windows runs programs from at logon, the PowerShell profile folders, the app execution
-/// aliases and the SSH configuration. A writable path that reaches one of them lets the program
-/// leave a file there that runs outside the sandbox at the next logon, and a file the program
-/// creates keeps the user's own rights on it, including the right to execute it (see "Trusted
-/// user locations" in docs/windows.md). Such a path is refused; the directories on sandy's PATH
-/// only warn (`path_locations`).
+/// aliases, the SSH configuration and sandy's own state. A writable path that reaches one of them
+/// lets the program leave a file there that runs outside the sandbox at the next logon, and a
+/// file the program creates keeps the user's own rights on it, including the right to execute it
+/// (see "Trusted user locations" in docs/windows.md). Such a path is refused; the directories on
+/// sandy's PATH only warn (`path_locations`).
 ///
 /// The list is a heuristic and can never be complete: no list knows which files the programs of
 /// this user trust. The user profile is protected only against a writable path that contains it,
@@ -446,6 +452,8 @@ fn trusted_locations() -> Result<Vec<ProtectedPath>, SandboxError> {
         ProtectedPath::tree(documents.join("PowerShell")),
         // The app execution aliases, which the default PATH holds.
         ProtectedPath::tree(local.join("Microsoft").join("WindowsApps")),
+        // The state that decides which policy may join a running AppContainer.
+        ProtectedPath::tree(state_directory()?),
     ];
     for profile in user_profiles()? {
         locations.push(ProtectedPath::tree(profile.join(".ssh")));
@@ -502,9 +510,16 @@ fn check_writable_paths(policy: &ResolvedPolicy) -> Result<(), String> {
     }
     let trusted = trusted_locations().map_err(|error| error.to_string())?;
     if let Some((rule, location)) = policy.writable_conflict(&trusted, &identity) {
+        let state = state_directory().map_err(|error| error.to_string())?;
+        let why = if location.path == state {
+            "where sandy keeps the state of its runs; the program could let a run with another \
+             policy join its AppContainer, or make every later run wait"
+        } else {
+            "which programs outside the sandbox read or execute later; a file the program leaves \
+             there runs outside the sandbox"
+        };
         return Err(format!(
-            "writable path {} overlaps {}, which programs outside the sandbox read or execute \
-             later; a file the program leaves there runs outside the sandbox",
+            "writable path {} overlaps {}, {why}",
             rule.path.display(),
             location.path.display()
         ));

@@ -274,6 +274,158 @@ fn refuses_to_grant_through_a_junction() {
     assert!(stderr.contains("junction"), "{stderr}");
 }
 
+/// sandy grants a policy path by adding an entry to its access control list, which needs the
+/// right to change that list. `check` reports a path where the user lacks it instead of calling
+/// the policy enforced, and `run` refuses it. An OWNER RIGHTS entry takes the right from the
+/// owner too.
+///
+/// sandy runs without the privileges of this process here: an administrator's SSH session has
+/// `SeRestorePrivilege` enabled, which lets sandy change every access list, as `check` then
+/// correctly reports. A standard user holds no such privilege.
+#[test]
+fn check_reports_a_path_whose_permissions_the_user_cannot_change() {
+    let fixture = Fixture::new("no-write-dac");
+    let file = fixture.arg("secret/file");
+    let policy = args(&["--read", &file]);
+    let mut check = vec!["check".to_string()];
+    check.extend(platform_args());
+    check.extend_from_slice(&policy);
+    // Control: the user may change the list, so the path is enforced.
+    let (code, output) = sandy_without_privileges(&check);
+    assert_eq!(code, 0, "{output}");
+
+    for change in [&["/grant:r", "*S-1-3-4:(R)"][..], &["/inheritance:r"]] {
+        let changed = Command::new("icacls")
+            .arg(&file)
+            .args(change)
+            .output()
+            .unwrap();
+        assert!(changed.status.success(), "{changed:?}");
+    }
+    let (code, output) = sandy_without_privileges(&check);
+    assert_eq!(code as i32, EXIT_NOT_ENFORCEABLE, "{output}");
+    assert!(output.contains(&file), "{output}");
+    let run = run_program(&policy, &probe_path(), &["read", &file]);
+    let (code, output) = sandy_without_privileges(&run);
+    assert_eq!(code as i32, EXIT_FAILURE, "{output}");
+}
+
+/// Runs sandy with `sandy_args` under the token of this process without its privileges. Returns
+/// the exit code and the standard output and error.
+fn sandy_without_privileges(sandy_args: &[String]) -> (u32, String) {
+    use std::io::Read;
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows_sys::Win32::Security::{
+        CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+        TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcessToken,
+        PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW, WaitForSingleObject,
+    };
+
+    let mut own: HANDLE = std::ptr::null_mut();
+    // SAFETY: the pseudo handle of this process needs no closing; own is a valid out pointer.
+    let opened = unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY,
+            &mut own,
+        )
+    };
+    assert_ne!(opened, 0, "{}", std::io::Error::last_os_error());
+    // SAFETY: OpenProcessToken returned a new handle that this function owns.
+    let own = unsafe { OwnedHandle::from_raw_handle(own) };
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: own is a token handle with TOKEN_DUPLICATE; no SIDs or privileges are listed.
+    let restricted = unsafe {
+        CreateRestrictedToken(
+            own.as_raw_handle(),
+            DISABLE_MAX_PRIVILEGE,
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            &mut token,
+        )
+    };
+    assert_ne!(restricted, 0, "{}", std::io::Error::last_os_error());
+    // SAFETY: CreateRestrictedToken returned a new handle that this function owns.
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+
+    let (mut read, mut write): (HANDLE, HANDLE) = (std::ptr::null_mut(), std::ptr::null_mut());
+    // SAFETY: both out pointers are valid.
+    let piped = unsafe { CreatePipe(&mut read, &mut write, std::ptr::null(), 0) };
+    assert_ne!(piped, 0);
+    // SAFETY: CreatePipe returned two new handles that this function owns.
+    let (read, write) = unsafe {
+        (
+            OwnedHandle::from_raw_handle(read),
+            OwnedHandle::from_raw_handle(write),
+        )
+    };
+    // SAFETY: write is a valid handle; only its inherit flag changes.
+    unsafe {
+        SetHandleInformation(
+            write.as_raw_handle(),
+            HANDLE_FLAG_INHERIT,
+            HANDLE_FLAG_INHERIT,
+        )
+    };
+    let mut line = format!("\"{}\"", sandy_path());
+    for arg in sandy_args {
+        line.push_str(&format!(" \"{arg}\""));
+    }
+    let mut line: Vec<u16> = line.encode_utf16().chain([0]).collect();
+    // SAFETY: the structure is plain data; zero is a valid value for every field.
+    let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdOutput = write.as_raw_handle();
+    startup.hStdError = write.as_raw_handle();
+    // SAFETY: the structure is plain data; zero is a valid value for every field.
+    let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: token is a primary token derived from this process's own; line is NUL-terminated
+    // and writable; startup and info outlive the call.
+    let created = unsafe {
+        CreateProcessAsUserW(
+            token.as_raw_handle(),
+            std::ptr::null(),
+            line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            &startup,
+            &mut info,
+        )
+    };
+    assert_ne!(created, 0, "{}", std::io::Error::last_os_error());
+    // SAFETY: CreateProcessAsUserW returned two new handles that this function owns.
+    let (process, _thread) = unsafe {
+        (
+            OwnedHandle::from_raw_handle(info.hProcess),
+            OwnedHandle::from_raw_handle(info.hThread),
+        )
+    };
+    drop(write);
+    let mut output = String::new();
+    let _ = fs::File::from(read).read_to_string(&mut output);
+    let mut code = 0u32;
+    // SAFETY: process is valid; code is a writable u32.
+    unsafe {
+        WaitForSingleObject(process.as_raw_handle(), INFINITE);
+        GetExitCodeProcess(process.as_raw_handle(), &mut code);
+    }
+    (code, output)
+}
+
 #[test]
 fn cannot_open_processes_outside() {
     let fixture = Fixture::new("process");
@@ -717,6 +869,11 @@ fn system_none_is_not_enforceable() {
 /// Starts sandy with `sandy_args` inside a new job with UI restrictions `ui`, like a CI agent or
 /// an IDE that runs it in a job. Returns the exit code and the standard output.
 fn sandy_in_job(ui: u32, sandy_args: &[String]) -> (u32, String) {
+    executable_in_job(&sandy_path(), ui, sandy_args)
+}
+
+/// `sandy_in_job` with the sandy executable at `sandy`.
+fn executable_in_job(sandy: &str, ui: u32, sandy_args: &[String]) -> (u32, String) {
     use std::io::Read;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
@@ -770,7 +927,7 @@ fn sandy_in_job(ui: u32, sandy_args: &[String]) -> (u32, String) {
         assert_ne!(ok, 0);
     }
 
-    let mut line = format!("\"{}\"", sandy_path());
+    let mut line = format!("\"{sandy}\"");
     for arg in sandy_args {
         line.push_str(&format!(" \"{arg}\""));
     }
@@ -844,6 +1001,24 @@ fn check_and_run_agree_inside_a_job_with_ui_restrictions() {
     assert_eq!(code as i32, EXIT_FAILURE, "{output}");
 
     delete_test_profiles();
+}
+
+/// `check` inside a job without UI restrictions tries whether sandy's job nests by starting a
+/// suspended process of `sandy.exe`. It must start that file and no other: from an unquoted
+/// command line Windows would start `<dir>\a.exe` for `<dir>\a b\sandy.exe`, here a file that
+/// is no program, and report the nesting as unavailable.
+#[test]
+fn the_nesting_trial_starts_sandy_from_a_path_with_a_space() {
+    let fixture = Fixture::new("trial-space");
+    let directory = fixture.path("a b");
+    fs::create_dir_all(&directory).unwrap();
+    let sandy = directory.join("sandy.exe");
+    fs::copy(sandy_path(), &sandy).unwrap();
+    fs::write(fixture.path("a.exe"), b"not a program").unwrap();
+
+    let check = args(&["check", "--appcontainer", &appcontainer_name()]);
+    let (code, output) = executable_in_job(sandy.to_str().unwrap(), 0, &check);
+    assert_eq!(code, 0, "{output}");
 }
 
 fn free_port() -> u16 {
@@ -1000,6 +1175,105 @@ fn setup_remove_takes_back_the_grant_and_the_profile() {
     assert!(again.status.success(), "{again:?}");
 }
 
+/// `setup --remove` takes the grants back, so it must not run while a program in that
+/// AppContainer runs: the program would lose its access in the middle. It refuses then, and
+/// succeeds once the run has ended.
+#[test]
+fn setup_remove_refuses_while_a_run_is_active() {
+    let name = "sandy.remove-active-test";
+    delete_profile(name);
+    let fixture = Fixture::new("remove-active");
+    let writable = fixture.arg("rw");
+    let remove = || {
+        sandy([
+            "setup",
+            "--remove",
+            "--appcontainer",
+            name,
+            "--read-write",
+            &writable,
+        ])
+    };
+
+    let mut run = long_run(
+        name,
+        &["--read-write", &writable],
+        &fixture.path("rw/ready"),
+    );
+    let during = remove();
+    let entries = capability_entries(&writable);
+    run.kill().unwrap();
+    run.wait().unwrap();
+    assert_eq!(during.status.code(), Some(EXIT_FAILURE), "{during:?}");
+    let stderr = String::from_utf8_lossy(&during.stderr);
+    assert!(stderr.contains("is using the AppContainer"), "{stderr}");
+    assert!(entries > 0, "the grant on {writable} went during the run");
+
+    // Control: with the run gone the same removal succeeds. The kernel releases the run's lock
+    // when its process is gone, which may take a moment after the kill.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let after = remove();
+        if after.status.success() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{after:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(capability_entries(&writable), 0);
+    delete_profile(name);
+}
+
+/// A run also grants the program file itself. `setup` takes no program, so `setup --remove`
+/// leaves that entry, unless the removal names the program as a `read_exec` path, which derives
+/// the same capability (docs/windows.md, "Removing the changes").
+#[test]
+fn setup_remove_takes_back_the_program_entry_only_when_named() {
+    let name = "sandy.remove-program-test";
+    delete_profile(name);
+    let fixture = Fixture::new("remove-program");
+    fs::create_dir_all(fixture.path("prog")).unwrap();
+    let program = fixture.path("prog").join("probe.exe");
+    fs::copy(probe_path(), &program).unwrap();
+    let program = program.to_str().unwrap();
+    let writable = fixture.arg("rw");
+    let remove = |extra: &[&str]| {
+        let mut remove = vec![
+            "setup",
+            "--remove",
+            "--appcontainer",
+            name,
+            "--read-write",
+            &writable,
+        ];
+        remove.extend_from_slice(extra);
+        sandy(remove)
+    };
+
+    let run = sandy([
+        "run",
+        "--appcontainer",
+        name,
+        "--read-write",
+        &writable,
+        "--",
+        program,
+        "env",
+        "PATH",
+    ]);
+    assert!(run.status.success(), "{run:?}");
+    assert_eq!(capability_entries(program), 1);
+
+    let removed = remove(&[]);
+    assert!(removed.status.success(), "{removed:?}");
+    assert_eq!(capability_entries(&writable), 0);
+    assert_eq!(capability_entries(program), 1, "recorded: the entry stays");
+    let removed = remove(&["--read-exec", program]);
+    assert!(removed.status.success(), "{removed:?}");
+    assert_eq!(capability_entries(program), 0);
+    delete_profile(name);
+}
+
 /// How many capability entries (`S-1-15-3-1024-...`) the permissions of `path` carry.
 fn capability_entries(path: &str) -> usize {
     let output = Command::new("icacls").arg(path).output().unwrap();
@@ -1039,9 +1313,10 @@ fn named_run(name: &str, extra: &[&str], actions: &[(&str, &str)]) -> Vec<String
 /// Two runs that share one AppContainer name share one sandbox: processes in it reach and control
 /// each other. So a second run with the same name must match the first run's resolved policy
 /// while the first is active. The same policy may run at the same time; a different one is
-/// refused until the first run ends, then allowed. The coordination uses a named kernel object
-/// the sandboxed program cannot reach, and the first run holds it only while it runs, so a
-/// crashed run does not block the name forever.
+/// refused until the first run ends, then allowed. The coordination uses a lock file the
+/// sandboxed program cannot reach (`the_program_cannot_reach_the_coordination_files`), and the
+/// first run holds its lock only while it runs, so a crashed run does not block the name
+/// forever.
 #[test]
 fn a_concurrent_run_must_match_the_active_policy() {
     let name = "sandy.concurrency-test";
@@ -1208,6 +1483,71 @@ fn end_with_parent_separates_concurrent_policies() {
     assert!(reason.contains("different policy"), "{reason}");
 
     delete_profile(name);
+}
+
+/// The kernel releases the lock that marks an AppContainer as in use when sandy dies, so the next
+/// run may set another policy. That is sound only because kill-on-close ends the program's job
+/// at the same time: a program that outlived sandy would share its AppContainer with that run.
+#[test]
+fn a_killed_run_leaves_no_program_behind() {
+    let name = "sandy.killed-test";
+    delete_profile(name);
+    let fixture = Fixture::new("killed");
+    let mut run = long_run(
+        name,
+        &["--read-write", &fixture.arg("rw")],
+        &fixture.path("rw/ready"),
+    );
+    let programs = child_processes(run.id(), "sandy-probe.exe");
+    assert_eq!(programs.len(), 1, "the program of sandy {}", run.id());
+    // Control: the program runs while sandy does, so its end below is sandy's death.
+    assert!(!ends_within(&programs[0], Duration::ZERO));
+    run.kill().unwrap();
+    run.wait().unwrap();
+    assert!(
+        ends_within(&programs[0], Duration::from_secs(5)),
+        "the program outlived sandy"
+    );
+    delete_profile(name);
+}
+
+/// Whether `process` ends within `wait`.
+fn ends_within(process: &std::os::windows::io::OwnedHandle, wait: Duration) -> bool {
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    let millis = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX);
+    // SAFETY: process is a process handle with SYNCHRONIZE access; the wait is limited.
+    unsafe { WaitForSingleObject(process.as_raw_handle(), millis) == WAIT_OBJECT_0 }
+}
+
+/// sandy's coordination files lie below `%LOCALAPPDATA%\sandy`, which grants nothing to
+/// AppContainers. The program cannot read the state of its own AppContainer, change it so that
+/// a run with another policy joins its sandbox, or open a lock file to make later runs wait.
+#[test]
+fn the_program_cannot_reach_the_coordination_files() {
+    let fixture = Fixture::new("coordination");
+    // The first run creates the state file of this AppContainer and adds grants, which creates
+    // the lock file of DACL changes.
+    probe_inside(&fixture.access_args(), &[("env", "PATH")]);
+    let directory = user_local_app_data().join("sandy");
+    let state = directory
+        .join("runs")
+        .join(appcontainer_sid(&appcontainer_name()));
+    let lock = directory.join("locks").join("dacl-changes");
+    let created = format!("{}.new", state.display());
+    let lines = controlled(
+        &fixture.access_args(),
+        &[
+            ("read", state.to_str().unwrap()),
+            ("read", lock.to_str().unwrap()),
+            ("list", directory.to_str().unwrap()),
+            ("write", &created),
+        ],
+    );
+    let _ = fs::remove_file(&created);
+    for line in &lines {
+        line.assert_blocked();
+    }
 }
 
 /// A name that Windows and sandy would read as different things, or that is the identity of an
@@ -1567,8 +1907,43 @@ fn a_later_run_removes_the_socket_directory_of_a_killed_run() {
     );
 }
 
+/// A run creates its socket directory first and its lock file next, so a directory without a
+/// lock file may belong to a run that is starting. The sweep of another run must leave it, or
+/// that run fails to create its lock file or loses its sockets.
+#[test]
+fn the_sweep_leaves_a_socket_directory_without_a_lock_file() {
+    let fixture = Fixture::new("forward-starting");
+    let service = TcpListener::bind("127.0.0.1:0").unwrap();
+    let service_port = service.local_addr().unwrap().port();
+    let starting = user_local_app_data()
+        .join("sandy")
+        .join("forward")
+        .join(format!("starting-{}", std::process::id()));
+    fs::create_dir_all(&starting).unwrap();
+
+    // The forwarded port works, so the run swept the base directory before it served it.
+    let inner = free_port();
+    let lines = probe_inside(
+        &forward_args(&fixture, inner, service_port),
+        &[("tcp-connect", &format!("127.0.0.1:{inner}"))],
+    );
+    let kept = starting.exists();
+    let _ = fs::remove_dir(&starting);
+    lines[0].assert_ok();
+    assert!(
+        kept,
+        "the sweep removed {}, which may belong to a run that is starting",
+        starting.display()
+    );
+}
+
 /// Handles of the `sandy.exe` processes whose parent is `parent`: the relays of that run.
 fn relay_processes(parent: u32) -> Vec<std::os::windows::io::OwnedHandle> {
+    child_processes(parent, "sandy.exe")
+}
+
+/// Handles of the processes named `executable` whose parent is `parent`.
+fn child_processes(parent: u32, executable: &str) -> Vec<std::os::windows::io::OwnedHandle> {
     use std::os::windows::io::FromRawHandle;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -1595,7 +1970,7 @@ fn relay_processes(parent: u32) -> Vec<std::os::windows::io::OwnedHandle> {
             .position(|&unit| unit == 0)
             .unwrap_or(0);
         let name = String::from_utf16_lossy(&entry.szExeFile[..length]);
-        if entry.th32ParentProcessID == parent && name.eq_ignore_ascii_case("sandy.exe") {
+        if entry.th32ParentProcessID == parent && name.eq_ignore_ascii_case(executable) {
             // SAFETY: OpenProcess has no memory preconditions.
             let handle = unsafe {
                 OpenProcess(
@@ -1774,6 +2149,44 @@ fn refuses_a_writable_path_over_the_startup_folder() {
         "{report}"
     );
     assert!(report.contains("runs outside the sandbox"), "{report}");
+}
+
+/// sandy keeps the state of its runs below `%LOCALAPPDATA%\sandy`. A program that could write
+/// there could rewrite the policy of its own AppContainer so that a run with another policy joins
+/// it, or hold a lock that makes every later run wait. A writable path that reaches the folder is
+/// refused by `check` and by `run`; a writable folder next to it is not.
+#[test]
+fn refuses_a_writable_path_into_sandys_state_folder() {
+    let local = user_local_app_data();
+    let state = local.join("sandy");
+    let runs = state.join("runs");
+    fs::create_dir_all(&runs).unwrap();
+    let beside = local.join(format!("sandy-state-control-{}", std::process::id()));
+    fs::create_dir_all(&beside).unwrap();
+
+    let control = check_with_path("C:\\Windows\\system32", beside.to_str().unwrap());
+    let _ = fs::remove_dir(&beside);
+    assert_eq!(control.status.code(), Some(0), "{control:?}");
+    for writable in [&state, &runs] {
+        let refused = check_with_path("C:\\Windows\\system32", writable.to_str().unwrap());
+        let report = String::from_utf8_lossy(&refused.stdout);
+        assert_eq!(
+            refused.status.code(),
+            Some(EXIT_NOT_ENFORCEABLE),
+            "{report}"
+        );
+        assert!(report.contains("state of its runs"), "{report}");
+    }
+    let target = runs.join(format!("{}.probe", appcontainer_sid(&appcontainer_name())));
+    let run = sandy(run_program(
+        &args(&["--read-write", runs.to_str().unwrap()]),
+        &probe_path(),
+        &["write", target.to_str().unwrap()],
+    ));
+    let written = target.exists();
+    let _ = fs::remove_file(&target);
+    assert_eq!(run.status.code(), Some(EXIT_FAILURE), "{run:?}");
+    assert!(!written, "the program wrote {}", target.display());
 }
 
 /// A directory on PATH inside a writable path lets the program leave a command there that the

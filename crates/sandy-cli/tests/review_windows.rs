@@ -19,6 +19,7 @@ const C_PERSIST: &str = "sandy.review.persist";
 const C_COM: &str = "sandy.review.com";
 const C_SYSSET: &str = "sandy.review.sysset";
 const C_REGRANT: &str = "sandy.review.regrant";
+const C_RELINK: &str = "sandy.review.relink";
 
 fn args(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| s.to_string()).collect()
@@ -176,6 +177,58 @@ fn the_program_cannot_grant_itself_execute_in_its_profile_folder() {
     attempt("profile reduced by 1.3.2");
 
     delete_profile(C_REGRANT);
+}
+
+/// The run that reduces a profile entry left by sandy 1.3.2 re-propagates it over the folder, which
+/// the program could write, so it first refuses a junction there, as `grant` does for a policy
+/// path. Once the entry is reduced nothing propagates, and the same junction refuses nothing.
+#[test]
+fn reducing_an_old_profile_entry_refuses_a_junction_in_the_folder() {
+    delete_profile(C_RELINK);
+    let fixture = Fixture::new("relink");
+    let temp = profile_temp(C_RELINK);
+    let folder = temp.parent().unwrap().to_path_buf();
+    let link = temp.join("link");
+    let policy = args(&["--appcontainer", C_RELINK]);
+    let run = || {
+        let mut run = vec!["run".to_string()];
+        run.extend_from_slice(&policy);
+        run.extend(["--".into(), probe_path(), "env".into(), "SystemRoot".into()]);
+        sandy(&run)
+    };
+
+    probe_inside(&policy, &[("env", "SystemRoot")])[0].assert_ok();
+    let made = Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(&link)
+        .arg(fixture.path("secret"))
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+    // Control: the folder is reduced, so the junction alone refuses nothing.
+    let reduced = run();
+
+    let restored = Command::new("icacls")
+        .args([
+            folder.to_str().unwrap(),
+            "/grant:r",
+            &format!("*{}:{MASK_1_3_2}", appcontainer_sid(C_RELINK)),
+        ])
+        .output()
+        .unwrap();
+    let old = run();
+    // The junction itself, not the directory it leads to.
+    std::fs::remove_dir(&link).unwrap();
+    delete_profile(C_RELINK);
+
+    assert!(reduced.status.success(), "{reduced:?}");
+    assert!(restored.status.success(), "{restored:?}");
+    assert_eq!(old.status.code(), Some(EXIT_FAILURE), "{old:?}");
+    let stderr = String::from_utf8_lossy(&old.stderr);
+    assert!(stderr.contains("junction"), "{stderr}");
+    assert!(stderr.contains(link.to_str().unwrap()), "{stderr}");
+    // The folder is no policy path, and listing the target in the policy would not help.
+    assert!(!stderr.contains("policy"), "{stderr}");
 }
 
 /// Held: a sandboxed program cannot reach a COM service that runs outside the AppContainer, so

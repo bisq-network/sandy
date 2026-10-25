@@ -11,10 +11,8 @@
 //! the sockets.
 
 use std::collections::hash_map::RandomState;
-use std::ffi::OsString;
 use std::hash::{BuildHasher, Hasher};
 use std::net::SocketAddr;
-use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -40,7 +38,8 @@ const RUN_SUFFIX_BYTES: usize = 1 + 16 + 1 + 5;
 /// Marks a run directory as in use. The run holds it open without `FILE_SHARE_DELETE`, so a
 /// later run that can open it exclusively knows that no run owns the directory any more. The
 /// kernel closes the handle when the run ends, also after a kill, which is what makes the
-/// leftover directory of a killed run removable.
+/// leftover directory of a killed run removable. The file inherits the relays' entry like the
+/// sockets do, which lets them open it but not delete it, and they end with the run.
 const LOCK_NAME: &str = "lock";
 
 /// One forwarded port as its relay sees it: the program's address it listens on, and the socket
@@ -60,8 +59,7 @@ pub struct Forwarding {
 
 /// The directory that holds the socket directories of all runs.
 fn base() -> Result<PathBuf, SandboxError> {
-    let local = OsString::from_wide(&super::local_app_data()?);
-    Ok(PathBuf::from(local).join("sandy").join("forward"))
+    Ok(super::state_directory()?.join("forward"))
 }
 
 /// Why forwarded ports cannot work on this host, if they cannot: AF_UNIX is missing, or the
@@ -93,7 +91,6 @@ impl Forwarding {
         })?;
         remove_dead_runs(&base);
         let directory = create_run_directory(&base)?;
-        // Before the entry below, so the relays cannot open the lock file: it is not a socket.
         let lock = hold_run_directory(&directory)?;
         let mut forwarding = Forwarding {
             directory,
@@ -190,19 +187,16 @@ fn remove_dead_runs(base: &Path) {
 }
 
 /// Whether no run owns `directory`: its lock file opens with no sharing, which fails while the
-/// run that created it holds the file. A directory without a lock file comes from a sandy
-/// before 1.3.3 and counts as ended.
+/// run that created it holds the file. A directory without a lock file counts as owned: a run
+/// creates its directory first and the lock file next, so another run can see it in between.
 fn run_ended(directory: &Path) -> bool {
     use std::os::windows::fs::OpenOptionsExt;
 
-    match std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .read(true)
         .share_mode(0)
         .open(directory.join(LOCK_NAME))
-    {
-        Ok(_) => true,
-        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
-    }
+        .is_ok()
 }
 
 /// A new directory with a random 16-digit name below `base`.

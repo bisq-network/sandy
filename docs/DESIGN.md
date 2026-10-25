@@ -167,9 +167,10 @@ Rules:
 12. No writable policy path may reach a location of this user whose content other programs read
    or execute later: the home directory (which it may not contain), the shell startup files,
    autostart entries and user services, `~/.ssh`, and per platform `~/Library/LaunchAgents`, the
-   Startup folders, the PowerShell profile folders and `WindowsApps`. A file the program leaves
-   in one of them runs outside the sandbox with the user's rights at the next login or the next
-   shell, which would make the whole policy pointless. The backend checks this, because only it
+   Startup folders, the PowerShell profile folders, `WindowsApps` and, on Windows, sandy's own
+   state folder, which decides which policy may join a running AppContainer. A file the program
+   leaves in one of the others runs outside the sandbox with the user's rights at the next login
+   or the next shell, which would make the whole policy pointless. The backend checks this, because only it
    knows the locations of its platform, and it compares paths as rules 3 and 4 do. A path below
    the home directory stays writable: only the locations themselves and the trees of those that
    hold code are protected.
@@ -595,8 +596,9 @@ Details, limitations and sources: `docs/windows.md`.
   SID from the name without regard to case.
 - File grants: one capability per policy path (named after the AppContainer, the level and the
   file ID), with one inheritable ACE on the path. The program starts with the capabilities of the
-  current policy only, so grants of older policies grant nothing. sandy never removes grants and
-  serializes its DACL changes with a lock file of the user, so concurrent runs do not conflict.
+  current policy only, so grants of older policies grant nothing. A run never removes grants
+  (`sandy setup --remove` does) and serializes its DACL changes with a lock file of the user, so
+  concurrent runs do not conflict.
   Read and read-write never contain `FILE_EXECUTE`; read levels contain no right that changes
   metadata. sandy refuses to propagate a grant through junctions or symbolic links. The system
   set is what Windows grants ALL APPLICATION PACKAGES; `system = "none"` is unavailable.

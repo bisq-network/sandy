@@ -39,10 +39,12 @@ unavailable. A name has at most 64 characters from `A-Z a-z 0-9 - _ .` and space
   path component, so the name and the folder it reaches would be different things;
 - a name made of periods only, which names a directory;
 - a name shaped like the family name of an application package, `Publisher.App` plus an
-  underscore and 13 characters. Windows derives a package SID from a family name the way it
-  derives an AppContainer SID from a name, so such a name would be the identity of that package:
-  sandy would change the permissions of its folder and share its sandbox. The check is on the
-  shape, so it also refuses a family name of a package that is not installed.
+  underscore and a 13 character publisher ID, which is a hash in Crockford's base32: digits and
+  the letters other than i, l, o and u, in either case. Windows derives a package SID from a
+  family name the way it derives an AppContainer SID from a name, so such a name would be the
+  identity of that package: sandy would change the permissions of its folder and share its
+  sandbox. The check is on the shape, so it also refuses a family name of a package that is not
+  installed.
 
 ## The AppContainer
 
@@ -133,7 +135,8 @@ much as for `FILE_EXECUTE` (measured on build 26200).
 The change is idempotent: a run writes only while the entry still carries one of the three
 rights. sandy 1.3.2 removed `FILE_EXECUTE` alone, so the first run of a later version reduces
 such a profile once more. That run also walks the folder and refuses a junction or symbolic link
-below it, because it re-propagates the entry and the program can write there.
+below it, because it re-propagates the entry and the program can write there
+(`review_windows::reducing_an_old_profile_entry_refuses_a_junction_in_the_folder`).
 
 The folder holds no user data. It is the program's own scratch space, writable in every policy,
 also one with no writable path. `escape_windows` and `review_windows` confirm that the program
@@ -188,8 +191,8 @@ new object at the old path needs a new one.
 
 The consequences:
 
-- **Grants stay on disk.** sandy never removes them. A run checks for its ACE and changes nothing
-  when the ACE exists.
+- **Grants stay on disk.** A run never removes them; `sandy setup --remove` does (see "Removing
+  the changes"). A run checks for its ACE and changes nothing when the ACE exists.
 - **Old grants grant nothing.** When a path leaves the policy, or its level changes, no later
   process holds the old capability. The escape test
   `a_path_removed_from_the_policy_is_denied_at_the_next_run` checks this.
@@ -197,9 +200,10 @@ The consequences:
   ACE means reading the DACL, adding the entry and writing the whole DACL back, so sandy holds
   a lock on `%LOCALAPPDATA%\sandy\locks\dacl-changes` while it changes a DACL.
   Without it, two runs that add different ACEs to the same object, such as one program in two
-  AppContainers, could overwrite each other's ACE. The program cannot hold this mutex, because
-  a lock file below `%LOCALAPPDATA%\sandy\locks`, which an AppContainer cannot open. Changes by
-  other tools, such as `icacls`, are not serialized.
+  AppContainers, could overwrite each other's ACE. The program cannot hold this lock: it is a
+  file below `%LOCALAPPDATA%\sandy\locks`, which an AppContainer cannot open
+  (`the_program_cannot_reach_the_coordination_files`). Changes by other tools, such as `icacls`,
+  are not serialized.
 - **System paths need no change.** If the DACL of a path already grants the level to ALL
   APPLICATION PACKAGES, for example `C:\Windows\System32\cmd.exe`, sandy adds nothing. Users
   usually cannot change these DACLs.
@@ -221,6 +225,12 @@ reparse point). Hard links cannot be found this way. Creating one is expected to
 access to the target, which the AppContainer lacks outside its paths, but that is not measured
 on a host yet.
 
+Measured once on Windows 11 build 26200: the propagation follows neither. After
+`SetNamedSecurityInfoW` added an inheritable entry to a directory, a junction below it carried
+the entry on the junction itself and nothing reached the directory it led to, and a directory
+symbolic link carried nothing into its target either. The walk stays, because the behaviour is
+not documented. `sandy setup --remove` does not walk: it only takes an entry away.
+
 A path whose DACL the user cannot change makes `sandy run` fail with an error that names the
 path, unless Windows already grants the level to all AppContainers. A path without DACL (NULL
 DACL, everyone has full access) also makes the run fail; adding an ACE would take the user's
@@ -229,8 +239,11 @@ access away.
 `sandy check` asks the same question for every policy path (`acl::grantable`, which opens the
 path for `WRITE_DAC` and changes nothing) and reports FilesystemConfined as unavailable with the
 path and the reason, so it does not report as enforced what `run` then refuses. A path whose
-entry is already in place needs no change and passes. The owner of a file always holds
-`WRITE_DAC`, whatever the DACL says, so only paths the user does not own can fail this way.
+entry is already in place needs no change and passes. The owner of a file holds `WRITE_DAC`
+whatever the DACL says, unless an OWNER RIGHTS entry (`S-1-3-4`) replaces the owner's rights,
+so only such paths and paths the user does not own can fail this way
+(`check_reports_a_path_whose_permissions_the_user_cannot_change`). A token with
+`SeRestorePrivilege` enabled may change every DACL; then `check` and `run` both pass.
 
 ### Links and identity
 
@@ -291,6 +304,7 @@ The locations that are refused are in `sys::trusted_locations`:
 | `Documents\WindowsPowerShell`, `Documents\PowerShell` | the tree | the profile scripts of PowerShell 5 and PowerShell 7 |
 | `%LOCALAPPDATA%\Microsoft\WindowsApps` | the tree | the app execution aliases, which the default `PATH` holds |
 | `<profile>\.ssh` | the tree | `ProxyCommand` and `LocalCommand` in the configuration run programs |
+| `%LOCALAPPDATA%\sandy` | the tree | sandy's own state: the policy of each running AppContainer, the lock files and the forwarded-port sockets |
 
 The profile folder comes from the known folder and from `USERPROFILE`, because a service that
 starts sandy with a minimal environment sets no variable. A location that does not exist counts,
@@ -304,6 +318,14 @@ exits 0 and prints a `warning:` line on standard error that names the writable p
 folder. A folder below one of them is on no `PATH` and says nothing. A writable path that
 reaches a refused location as well stays refused, `%LOCALAPPDATA%\Microsoft\WindowsApps` for
 example, which the default `PATH` holds: the warning never replaces a refusal.
+
+sandy's own folder is not a place a program runs from, but sandy reads it: a program that could
+write there could rewrite the policy recorded for its own AppContainer, so that a run with
+another policy joins the sandbox while it runs, or hold a lock byte that makes every later run of
+the user wait. The user's local application data grants nothing to AppContainers, so only a
+policy that makes the folder writable could open it, and that is refused
+(`refuses_a_writable_path_into_sandys_state_folder`). A writable `%LOCALAPPDATA%` was refused
+before already, because it holds `WindowsApps`.
 
 The list is a heuristic and can never be complete: no list knows which files the programs of
 this user trust. Among the things it does not cover are the registry autostart keys, which the
@@ -341,7 +363,9 @@ Old grants grant nothing, so removing them is cleanup, not a security step.
 
 It is idempotent, it refuses while a run of that AppContainer is active, and it reaches nothing
 that has left the policy: an entry on an object that is no longer a policy path stays, because
-nothing records where it is. By hand, `icacls PATH` lists the entries as `*S-1-15-3-1024-...`
+nothing records where it is. The same holds for the entry a run adds on the program file, unless
+a policy path covers the program: `setup` takes no program, so name the file with
+`--read-exec PROGRAM` for the removal, which derives the same capability. By hand, `icacls PATH` lists the entries as `*S-1-15-3-1024-...`
 and `icacls PATH /remove:g *SID` removes one; the profile goes with
 `DeleteAppContainerProfile`, for example from PowerShell:
 
@@ -353,7 +377,9 @@ Add-Type -Namespace Win32 -Name UserEnv -MemberDefinition '[DllImport("userenv.d
 The socket directories of forwarded ports clean themselves up: each run holds a lock file in
 its own directory, opened without `FILE_SHARE_DELETE`, and every run with a forwarded port first
 removes the directories whose lock file it can open exclusively, which only the directories of
-ended runs are.
+ended runs are. A directory without a lock file stays, because a run creates the file just after
+its directory (`the_sweep_leaves_a_socket_directory_without_a_lock_file`). sandy 1.3.2 created no
+lock file, so the directories it left behind stay too; they hold no listener and can be deleted.
 
 ## Network
 
@@ -440,9 +466,15 @@ sandy enforces one policy per AppContainer at a time
   with a different fingerprint is refused with exit status 125 and the reason, until every run of
   the first policy has ended.
 - The user's local application data grants nothing to AppContainers, so the program can neither
-  read nor change the file. The kernel releases the lock when the run that holds it exits, also
-  after a crash, so no stale state blocks later runs. Runs with different policies one after the
-  other stay allowed.
+  read nor change the file (`the_program_cannot_reach_the_coordination_files`), and a policy
+  that makes `%LOCALAPPDATA%\sandy` writable is refused (see "Trusted user locations"). The kernel
+  releases the lock when the run that holds it exits, also after a crash, so no stale state
+  blocks later runs. Runs with different policies one after the other stay allowed.
+- A killed sandy frees the AppContainer only together with its program: kill-on-close ends the
+  program's job when sandy dies (`a_killed_run_leaves_no_program_behind`).
+- sandy 1.3.2 coordinated through a named kernel object instead. A run of 1.3.2 and a run of a
+  later version do not see each other, so do not run both versions in one AppContainer at the
+  same time.
 - A file and not a named kernel object, because `Local\` is per logon session and in session 0,
   which services and SSH sessions run in, it is shared by every user's session 0 processes:
   another local user could hold sandy's mutex, which sandy waits for without a limit, or create
@@ -819,14 +851,14 @@ about a path is worse than none, so the backend answers nothing and sandy refuse
 14. If sandy itself is killed during a run with forwarded ports, its socket directory below
     `%LOCALAPPDATA%\sandy\forward` stays behind until the next run with a forwarded port
     removes it. Its sockets have no listener while it is there, so nobody can connect through
-    them.
+    them. A directory that sandy 1.3.2 left behind stays (see "Removing the changes").
 
 ## Verified on Windows 11
 
 Host: Windows 11 build 26200 (VM), binaries built for `x86_64-pc-windows-gnu`. The tests run in
 an elevated SSH session and without administrator rights. Latest elevated run, every test
-passing: `sandy_core` 43, `sandy_relay` 11, `sandy_windows` 70, `escape` 17, `escape_windows` 41,
-`expose` 4, `forward` 3, `children` 3, `parent` 3, `check` 4, `runner` 3, `review_windows` 6. The
+passing: `sandy_core` 46, `sandy_relay` 11, `sandy_windows` 71, `escape` 17, `escape_windows` 52,
+`expose` 4, `forward` 3, `children` 5, `parent` 5, `check` 7, `runner` 3, `review_windows` 7. The
 COM check of `review_windows` is skipped there: the SSH session is session 0, where `ole32.dll`
 does not load in an AppContainer (limitation 13), so a denial would not be the COM boundary.
 Earlier non-administrator runs used a scheduled task with `/RL LIMITED` (medium integrity,
@@ -887,6 +919,15 @@ Facts these runs established:
   `THREAD_ALL_ACCESS`, while the owner outside the sandbox can.
 - No `AppID` under `HKLM\SOFTWARE\Classes\AppID` has a launch permission that allows ALL
   APPLICATION PACKAGES, so no DCOM server is reachable that way on a default install.
+- The administrator's SSH session has `SeBackupPrivilege`, `SeRestorePrivilege` and
+  `SeTakeOwnershipPrivilege` enabled, so sandy there may change every DACL, also one that gives
+  OWNER RIGHTS read access only. A test about a DACL the user cannot change runs sandy without
+  privileges (`check_reports_a_path_whose_permissions_the_user_cannot_change`).
+- `SetNamedSecurityInfoW` did not carry an inheritable entry through a junction or a directory
+  symbolic link into its target (see "How sandy changes a DACL").
+- `setup --remove` leaves the entry of a run on the program file, and removes it when the
+  removal names the program with `--read-exec`
+  (`setup_remove_takes_back_the_program_entry_only_when_named`).
 - `ITaskService::Connect` reaches the Schedule service from outside the sandbox, so the
   task-scheduler probe is a real control. `CLSID_TaskScheduler` is an in-process class, which is
   why activating it with `CLSCTX_LOCAL_SERVER` fails everywhere and proves nothing.

@@ -7,9 +7,10 @@
 //!
 //! These locks are byte ranges of files below `%LOCALAPPDATA%\sandy`. The user's local
 //! application data grants access to the user, SYSTEM and the administrators only, and nothing
-//! to AppContainers, so the sandboxed program cannot reach them either. The kernel releases a
-//! byte range lock when its process dies, so a run that crashed leaves no lock behind; the file
-//! stays, which costs nothing because a lock, not the file, says that a run is active.
+//! to AppContainers, so the sandboxed program cannot reach them either; a policy that makes the
+//! folder writable is refused (`trusted_locations`). The kernel releases a byte range lock when
+//! its process dies, so a run that crashed leaves no lock behind; the file stays, which costs
+//! nothing because a lock, not the file, says that a run is active.
 
 use std::fs;
 use std::io;
@@ -170,11 +171,7 @@ impl Drop for UserLock {
 
 /// `%LOCALAPPDATA%\sandy\<kind>\<name>`, with the directory created if it is missing.
 fn path(kind: &str, name: &str) -> Result<PathBuf, SandboxError> {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
-
-    let local = OsString::from_wide(&super::local_app_data()?);
-    let directory = PathBuf::from(local).join("sandy").join(kind);
+    let directory = super::state_directory()?.join(kind);
     fs::create_dir_all(&directory).map_err(|error| {
         SandboxError::io(format!("cannot create {}", directory.display()), error)
     })?;

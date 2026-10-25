@@ -58,9 +58,15 @@ fn package_family_publisher(name: &str) -> Option<&str> {
     let (app, publisher) = name.rsplit_once('_')?;
     let shaped = !app.is_empty()
         && publisher.len() == 13
-        && publisher.chars().all(|c| c.is_ascii_alphanumeric());
+        && publisher
+            .chars()
+            .all(|c| PUBLISHER_ID_ALPHABET.contains(c.to_ascii_lowercase()));
     shaped.then_some(publisher)
 }
+
+/// The characters of a publisher ID, a hash of the publisher in Crockford's base32, which has no
+/// i, l, o or u. A suffix with one of them cannot be a publisher ID.
+const PUBLISHER_ID_ALPHABET: &str = "0123456789abcdefghjkmnpqrstvwxyz";
 
 /// Identity of a file system object: volume serial number and file ID (`FILE_ID_INFO`). Unlike a
 /// path, it stays with the object when the object is renamed or another object takes its path.
@@ -124,9 +130,26 @@ mod tests {
         ] {
             assert!(validate_appcontainer_name(name).is_err(), "{name:?}");
         }
-        // A short suffix after an underscore is not a publisher ID.
+        // A short suffix after an underscore is not a publisher ID, and neither is one with a
+        // letter that the alphabet of publisher IDs lacks; sandy 1.3.2 accepted both.
         assert_eq!(validate_appcontainer_name("My App-1_2"), Ok(()));
         assert_eq!(validate_appcontainer_name(".hidden"), Ok(()));
+        for name in [
+            "acme_productionenv",
+            "sandy_windowsrunner",
+            "CI_INTEGRATIONS1",
+        ] {
+            assert_eq!(validate_appcontainer_name(name), Ok(()), "{name}");
+        }
+        // Family names of installed packages, as Windows lists them.
+        for name in [
+            "Microsoft.WindowsTerminal_8wekyb3d8bbwe",
+            "Microsoft.Windows.ShellExperienceHost_cw5n1h2txyewy",
+            "Mozilla.Firefox_n80bbvh6b1yt2",
+            "PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0",
+        ] {
+            assert!(validate_appcontainer_name(name).is_err(), "{name:?}");
+        }
     }
 
     #[test]

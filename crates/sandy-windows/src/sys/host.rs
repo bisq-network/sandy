@@ -170,15 +170,20 @@ fn ui_restricted_job() -> Result<OwnedHandle, String> {
 fn suspended_process() -> Result<OwnedHandle, String> {
     let sandy = std::env::current_exe()
         .map_err(|error| format!("cannot find the path of sandy: {error}"))?;
-    let mut line = wide_nul(sandy.as_os_str());
+    // Passed as the application too: from the command line alone, Windows splits a path with a
+    // space and starts the first file its words name, `C:\Program.exe` for
+    // `C:\Program Files\sandy\sandy.exe` for example.
+    let application = wide_nul(sandy.as_os_str());
+    let mut line = application.clone();
     // SAFETY: the structures are plain data; zero is a valid value for every field.
     let (mut startup, mut info): (STARTUPINFOW, PROCESS_INFORMATION) =
         unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
     startup.cb = size_of::<STARTUPINFOW>() as u32;
-    // SAFETY: line is NUL-terminated and writable; startup and info outlive the call.
+    // SAFETY: application and line are NUL-terminated and line is writable; startup and info
+    // outlive the call.
     let created = unsafe {
         CreateProcessW(
-            ptr::null(),
+            application.as_ptr(),
             line.as_mut_ptr(),
             ptr::null(),
             ptr::null(),
