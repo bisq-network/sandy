@@ -554,17 +554,20 @@ mod tests {
         }
     }
 
+    /// The blocks that `public-and-local` adds (docs/DESIGN.md, "Private network and egress",
+    /// rule 6).
+    const LOCAL: [&str; 5] = [
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "fc00::/7",
+    ];
+
     /// `public-and-local` allows exactly the local blocks more, and still refuses the forms
     /// that embed an IPv4 address.
     #[test]
     fn public_and_local_adds_only_the_local_blocks() {
-        const LOCAL: [&str; 5] = [
-            "10.0.0.0/8",
-            "100.64.0.0/10",
-            "172.16.0.0/12",
-            "192.168.0.0/16",
-            "fc00::/7",
-        ];
         for entry in registry() {
             if ALLOWED_ON_PURPOSE
                 .iter()
@@ -686,6 +689,178 @@ mod tests {
                 Err(Refusal::Block(NOT_GLOBAL_UNICAST)),
                 "{ip}"
             );
+        }
+    }
+
+    /// Whether `text`, a block such as "10.0.0.0/8" or a single address, holds `ip`.
+    fn holds(text: &str, ip: IpAddr) -> bool {
+        let (network, prefix) = match text.split_once('/') {
+            Some(_) => block(text),
+            None => {
+                let ip: IpAddr = text.parse().unwrap();
+                (ip, if ip.is_ipv4() { 32 } else { 128 })
+            }
+        };
+        Subnet::new(network, prefix).unwrap().contains(ip)
+    }
+
+    /// What docs/DESIGN.md says `reach` allows, built from the registry copies and the
+    /// decisions it names ("Egress broker", rule 2), without the tables above: no registry
+    /// block that is not globally reachable, apart from `ALLOWED_ON_PURPOSE`, none of
+    /// `REFUSED_ON_PURPOSE`, no IPv4 multicast (outside the registry), IPv6 only in global
+    /// unicast space, and with `public-and-local` also the local blocks.
+    struct Documented {
+        refused: Vec<Subnet>,
+        local: Vec<Subnet>,
+        global_unicast: Subnet,
+    }
+
+    impl Documented {
+        fn new(registry: &[Entry]) -> Documented {
+            let parse = |text: &str| {
+                let (network, prefix) = block(text);
+                Subnet::new(network, prefix).unwrap()
+            };
+            let not_reachable = registry.iter().filter(|entry| {
+                !entry.globally_reachable
+                    && !ALLOWED_ON_PURPOSE
+                        .iter()
+                        .any(|(block, _)| *block == entry.block)
+            });
+            Documented {
+                refused: not_reachable
+                    .map(|entry| Subnet::new(entry.network, entry.prefix).unwrap())
+                    .chain(REFUSED_ON_PURPOSE.iter().map(|(outer, _)| parse(outer)))
+                    .chain([parse("224.0.0.0/4")])
+                    .collect(),
+                local: LOCAL.iter().map(|local| parse(local)).collect(),
+                global_unicast: parse("2000::/3"),
+            }
+        }
+
+        fn allows(&self, ip: IpAddr, reach: EgressReach) -> bool {
+            let ip = ip.to_canonical();
+            let public = !self.refused.iter().any(|block| block.contains(ip))
+                && (ip.is_ipv4() || self.global_unicast.contains(ip));
+            public || (reach == PublicAndLocal && self.local.iter().any(|block| block.contains(ip)))
+        }
+    }
+
+    /// A deterministic source of numbers (xorshift64*), so that a failure always reproduces.
+    struct Numbers(u64);
+
+    impl Numbers {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        fn wide(&mut self) -> u128 {
+            (u128::from(self.next()) << 64) | u128::from(self.next())
+        }
+    }
+
+    /// The addresses at both edges of a block, inside and just outside it, and `count` random
+    /// ones inside it.
+    fn around(network: IpAddr, prefix: u8, count: usize, numbers: &mut Numbers) -> Vec<IpAddr> {
+        let (bits, value) = match network {
+            IpAddr::V4(ip) => (32, u128::from(ip.to_bits())),
+            IpAddr::V6(ip) => (128, ip.to_bits()),
+        };
+        let width = u128::MAX >> (128 - bits);
+        let host_bits = width.checked_shr(u32::from(prefix)).unwrap_or(0);
+        let first = value & !host_bits & width;
+        let last = first | host_bits;
+        let at = |value: u128| match network {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::from_bits((value & width) as u32)),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::from_bits(value)),
+        };
+        let mut addresses: Vec<IpAddr> = [
+            first.wrapping_sub(1),
+            first,
+            first.wrapping_add(1),
+            last.wrapping_sub(1),
+            last,
+            last.wrapping_add(1),
+        ]
+        .into_iter()
+        .map(at)
+        .collect();
+        addresses.extend((0..count).map(|_| at(first | (numbers.wide() & host_bits))));
+        addresses
+    }
+
+    /// Fuzz-style: the tables decide as the documentation says at the edges of every block that
+    /// the tables, the registry or the documentation name, where a prefix one bit off shows
+    /// first, at random addresses inside each, and at random addresses of both families; and a
+    /// refusal names a block that holds the address. The existing tests sample three addresses
+    /// inside each registry block, which sees neither a block that is too wide nor one that the
+    /// tables add.
+    #[test]
+    fn the_tables_decide_as_documented_everywhere() {
+        let registry = registry();
+        let documented = Documented::new(&registry);
+        let mut numbers = Numbers(0x5eed_2026_1025_0001);
+        let named = LOCAL
+            .iter()
+            .chain(REFUSED_ON_PURPOSE.iter().map(|(outer, _)| outer))
+            .chain(&["224.0.0.0/4", "2000::/3"])
+            .map(|text| block(text));
+        let blocks: Vec<(IpAddr, u8)> = registry
+            .iter()
+            .map(|entry| (entry.network, entry.prefix))
+            .chain(
+                IPV4.iter()
+                    .map(|&(network, prefix, ..)| (network.into(), prefix)),
+            )
+            .chain(
+                IPV6.iter()
+                    .map(|&(network, prefix, ..)| (network.into(), prefix)),
+            )
+            .chain(named)
+            .collect();
+        let mut addresses: Vec<IpAddr> = blocks
+            .iter()
+            .flat_map(|&(network, prefix)| around(network, prefix, 32, &mut numbers))
+            .collect();
+        for _ in 0..20_000 {
+            addresses.push(Ipv4Addr::from_bits(numbers.next() as u32).into());
+            addresses.push(Ipv6Addr::from_bits(numbers.wide()).into());
+            // Global unicast space, where most of the IPv6 decisions are.
+            addresses.push(Ipv6Addr::from_bits((numbers.wide() >> 3) | (1 << 125)).into());
+        }
+        let mapped: Vec<IpAddr> = addresses
+            .iter()
+            .filter_map(|ip| match ip {
+                IpAddr::V4(v4) => Some(IpAddr::V6(v4.to_ipv6_mapped())),
+                IpAddr::V6(_) => None,
+            })
+            .collect();
+        addresses.extend(mapped);
+        for ip in addresses {
+            for reach in [Public, PublicAndLocal] {
+                let verdict = check_ip(ip, reach);
+                assert_eq!(
+                    verdict.is_ok(),
+                    documented.allows(ip, reach),
+                    "{ip} {reach:?}: {verdict:?}"
+                );
+                if let Err(Refusal::Block(name)) = verdict {
+                    let inner = name
+                        .split_once('(')
+                        .and_then(|(_, rest)| rest.split_once(')'))
+                        .map(|(inner, _)| inner)
+                        .unwrap();
+                    let canonical = ip.to_canonical();
+                    let right = match inner.strip_prefix("outside ") {
+                        Some(outer) => !holds(outer, canonical),
+                        None => holds(inner, canonical),
+                    };
+                    assert!(right, "{ip} is refused as {name}");
+                }
+            }
         }
     }
 

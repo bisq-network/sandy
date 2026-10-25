@@ -452,7 +452,8 @@ Rules:
    `forward`.
 5. The broker accepts one request per connection: `CONNECT` with an IPv4 or IPv6 address, no
    authentication. It refuses a domain name (reply 8), so it resolves nothing for the program,
-   and every other command (reply 7). It checks the destination outside the sandbox, connects
+   every other command (reply 7) and an unknown address type (reply 8, whatever the command,
+   because its length is unknown). It checks the destination outside the sandbox, connects
    from there, and from then on copies bytes like the relay. Only TCP leaves this way.
 6. Destinations (`sandy_core::destination`): `reach = "public"`, the default, allows only
    globally reachable unicast addresses, from the IANA special-purpose registries.
@@ -462,8 +463,9 @@ Rules:
    link-local and multicast. An IPv4-mapped IPv6 address is judged as the IPv4 address it maps.
    After the connect the broker also closes a connection whose local address is loopback or
    equal to its peer, which is what a connection to the host itself looks like. A refused
-   destination gets reply 2, and the program learns nothing about the host's addresses: the
-   success reply names `0.0.0.0:0`.
+   destination gets reply 2. The success reply names `0.0.0.0:0`, so a connection does not tell
+   the program the host's address; which destinations are refused does, by trying them (the
+   exceptions table, row "All").
 7. The broker is a process of its own, apart from the relay, so the relay keeps its narrower
    rights. It is confined like the relay (no file access, no processes), parses nothing but the
    fixed handshake, and ends with the program as the relay does (rule 5 of "Forwarded ports").
@@ -477,8 +479,12 @@ everywhere; a backend adds only its answer about its own addresses (`HostNetwork
 
 1. The handshake (`sandy_relay::socks`) takes method 0 only and answers any other greeting with
    `X'FF'`. It has 10 seconds in total, every read has a size the protocol fixes, and a request is
-   read whole before it is judged, so a refusal ends with its reply and a normal close, and data
-   that a client sends behind its request reaches the destination.
+   read whole before it is judged, so a refusal of a client that waits for its reply ends with
+   the reply and a normal close, and data that a client sends behind its request reaches the
+   destination. A client that sends data behind a refused request, or behind an address of an
+   unknown type, leaves it unread, and the close then ends with a reset. Linux still delivers
+   the reply before the reset; macOS often drops it and Windows always does (measured), so such
+   a client sees only the reset.
 2. The static check follows the IANA special-purpose registries, copied in
    `crates/sandy-core/data`. A test pins the tables to the copies, and a weekly workflow
    (`.github/workflows/iana.yml`) fails when IANA changes a registry. IPv4 is a denylist of the
@@ -582,6 +588,7 @@ exceptions:
 
 | Platform | When | What stays open |
 |---|---|---|
+| All | `egress` | the broker refuses an address of this host with reply 2 and answers others with the result of its connect, so the program can tell this host's addresses, and with `reach = "public"` its subnets, by trying them (`sandy_relay` `every_forbidden_form_is_refused_with_reply_2` and `a_closed_port_gets_reply_5`); a NAT64 prefix of an operator other than the well-known ones cannot be recognised |
 | Linux | `signals = "isolated"` without `children = "contained"` | a read from the terminal in the background stops the group sandy was started in, with the processes outside the sandbox in it |
 | Linux | `ip = "client"` | a UDP socket that is not connected receives datagrams from every sender, at the port the kernel chose for it, and before Landlock ABI 10 at any port the program binds |
 | Linux | `forward` with `ip = "client"` or `ip = "all"` | another local user can deliver a write to the forwarded service, through a connection it closed before the relay asked who owns it, and that no longer carries its user (from the close on Linux 6.8, after the timewait record on newer kernels) |

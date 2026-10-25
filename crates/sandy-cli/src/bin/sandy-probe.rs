@@ -83,7 +83,7 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
         // BROKER<U+001F>DESTINATION: asks the SOCKS5 broker on BROKER to CONNECT to DESTINATION, a
         // program's egress through `network.egress`. DESTINATION is `IP:port`, sent as an address,
         // or `name:port`, sent as a domain name (which the broker refuses). Reports the SOCKS5
-        // reply code and, when the broker allows it, exchanges one byte.
+        // reply code; it sends no data.
         "socks5-connect" => socks5_connect(target),
         "tcp-listen" => {
             let listener = TcpListener::bind(socket_address(target)?)?;
@@ -278,8 +278,6 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
         // Accepts one connection on the listening socket the caller passed as standard stream
         // STREAM (0, 1 or 2).
         "accept-fd" => accept_fd(target),
-        // BROKER<U+001F>DESTINATION: asks the SOCKS5 broker at BROKER for a connection to
-        // DESTINATION, a socket address or NAME:PORT, and reports the broker's reply code.
         action if win32k::ACTIONS.contains(&action) => win32k::perform(action, target),
         action if unix::ACTIONS.contains(&action) => unix::perform(action, target),
         action if linux::ACTIONS.contains(&action) => linux::perform(action, target),

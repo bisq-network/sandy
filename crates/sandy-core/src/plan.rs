@@ -276,6 +276,54 @@ mod tests {
         assert!(!plan.is_enforceable());
     }
 
+    /// Every order of up to three reports for one requirement, with a report for another
+    /// requirement among them: the first report that setup cannot fix wins, then the first that
+    /// it fixes, and only reports that all say enforced make the requirement enforced. Status 2
+    /// of `check` follows from a plan whose only gap setup fixes.
+    #[test]
+    fn the_worst_report_wins_in_every_order() {
+        let required = Requirement::IpNetworkDenied;
+        let report = |kind: usize, place: u32| {
+            let text = format!("report {place}");
+            match kind {
+                0 => PlanItem::enforced(required, text),
+                1 => PlanItem::needs_setup(required, text),
+                _ => PlanItem::unavailable(required, text),
+            }
+        };
+        let rank = |item: &PlanItem| match item.status {
+            Status::Enforced { .. } => 0,
+            Status::NeedsSetup { .. } => 1,
+            Status::Unavailable { .. } => 2,
+        };
+        let other = PlanItem::unavailable(Requirement::FilesystemConfined, "other");
+        for length in 0..=3u32 {
+            for index in 0..3usize.pow(length) {
+                let reports: Vec<PlanItem> = (0..length)
+                    .map(|place| report(index / 3usize.pow(place) % 3, place))
+                    .collect();
+                let mut reported = reports.clone();
+                reported.insert(index % (reports.len() + 1), other.clone());
+                let plan = EnforcementPlan::new(&[required], reported);
+                let merged = &plan.items()[0];
+                let worst = reports.iter().map(rank).max();
+                match reports.iter().find(|item| Some(rank(item)) == worst) {
+                    Some(expected) => assert_eq!(merged, expected, "{reports:?}"),
+                    None => assert!(
+                        matches!(merged.status, Status::Unavailable { .. }),
+                        "{merged:?}"
+                    ),
+                }
+                assert_eq!(
+                    plan.is_enforceable(),
+                    !reports.is_empty() && reports.iter().all(PlanItem::is_enforced),
+                    "{reports:?}"
+                );
+                assert_eq!(plan.needs_only_setup(), worst == Some(1), "{reports:?}");
+            }
+        }
+    }
+
     #[test]
     fn setup_is_enough_only_when_all_that_is_missing_needs_it() {
         let only_setup = EnforcementPlan::new(

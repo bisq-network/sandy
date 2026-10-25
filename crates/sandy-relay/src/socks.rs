@@ -54,9 +54,10 @@ impl Reply {
 /// request, which the caller answers with `reply`. Everything else ends in an error, after the
 /// answer that RFC 1928 has for it:
 /// - a greeting without method 0 gets `X'FF'` ("no acceptable methods");
+/// - an address type other than IPv4, IPv6 and a name gets reply 8 whatever the command, because
+///   the length of its address is unknown;
 /// - another command than CONNECT gets reply 7, whatever its address;
-/// - a CONNECT to a domain name gets reply 8, so the broker resolves nothing for the client, and
-///   so does any address type but IPv4, IPv6 and a name;
+/// - a CONNECT to a domain name gets reply 8, so the broker resolves nothing for the client;
 /// - another version than 5, the end of the stream and `HANDSHAKE_TIMEOUT` get no answer.
 ///
 /// The reserved byte of the request is ignored, as RFC 1928 gives it no meaning.
@@ -477,6 +478,171 @@ mod tests {
     #[test]
     fn the_default_timeout_is_ten_seconds() {
         assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(10));
+    }
+
+    /// What the handshake should make of `bytes` that a client sends whole before it ends its
+    /// side, by RFC 1928 and the comment of `read_request`: the destination and the length of
+    /// an accepted handshake, or the kind of error, and what the broker answers.
+    #[derive(Debug, PartialEq)]
+    struct Expected {
+        outcome: Result<(SocketAddr, usize), io::ErrorKind>,
+        answer: Vec<u8>,
+    }
+
+    fn expected(bytes: &[u8]) -> Expected {
+        use io::ErrorKind::{InvalidData, UnexpectedEof, Unsupported};
+        let end = |kind, answer: &[u8]| Expected {
+            outcome: Err(kind),
+            answer: answer.to_vec(),
+        };
+        let Some(&[version, count]) = bytes.get(..2) else {
+            return end(UnexpectedEof, &[]);
+        };
+        if version != 5 {
+            return end(InvalidData, &[]);
+        }
+        let header = 2 + usize::from(count);
+        let Some(methods) = bytes.get(2..header) else {
+            return end(UnexpectedEof, &[]);
+        };
+        if !methods.contains(&0) {
+            return end(Unsupported, &[5, 0xff]);
+        }
+        let Some(&[version, command, _, kind]) = bytes.get(header..header + 4) else {
+            return end(UnexpectedEof, &ACCEPTED);
+        };
+        if version != 5 {
+            return end(InvalidData, &ACCEPTED);
+        }
+        let at = header + 4;
+        let length = match (kind, bytes.get(at)) {
+            (1, _) => 6,
+            (4, _) => 18,
+            (3, Some(&name)) => 1 + usize::from(name) + 2,
+            (3, None) => return end(UnexpectedEof, &ACCEPTED),
+            _ => return end(Unsupported, &concat(&[&ACCEPTED, &reply_bytes(8)])),
+        };
+        let Some(address) = bytes.get(at..at + length) else {
+            return end(UnexpectedEof, &ACCEPTED);
+        };
+        if command != 1 {
+            return end(Unsupported, &concat(&[&ACCEPTED, &reply_bytes(7)]));
+        }
+        let port = u16::from_be_bytes([address[length - 2], address[length - 1]]);
+        let ip: std::net::IpAddr = match kind {
+            1 => Ipv4Addr::from(<[u8; 4]>::try_from(&address[..4]).unwrap()).into(),
+            4 => Ipv6Addr::from(<[u8; 16]>::try_from(&address[..16]).unwrap()).into(),
+            _ => return end(Unsupported, &concat(&[&ACCEPTED, &reply_bytes(8)])),
+        };
+        Expected {
+            outcome: Ok((SocketAddr::new(ip, port), at + length)),
+            answer: ACCEPTED.to_vec(),
+        }
+    }
+
+    /// A deterministic source of numbers (xorshift64*), so that a failure always reproduces.
+    struct Numbers(u64);
+
+    impl Numbers {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
+        }
+
+        fn bytes(&mut self, count: usize) -> Vec<u8> {
+            (0..count).map(|_| self.next() as u8).collect()
+        }
+    }
+
+    /// Random bytes, or a handshake that is valid or nearly so, then cut short, changed in one
+    /// byte, or followed by more bytes.
+    fn hostile_input(numbers: &mut Numbers) -> Vec<u8> {
+        if numbers.below(4) == 0 {
+            let length = numbers.below(40);
+            let mut bytes = numbers.bytes(length);
+            if let Some(first) = bytes.first_mut().filter(|_| numbers.below(2) == 0) {
+                *first = 5;
+            }
+            return bytes;
+        }
+        let count = numbers.below(6);
+        let mut methods = numbers.bytes(count);
+        if numbers.below(4) != 0 {
+            methods.push(0);
+        }
+        let command = [1, 1, 1, numbers.next() as u8][numbers.below(4)];
+        let kind = [1, 3, 4, numbers.next() as u8][numbers.below(4)];
+        let mut bytes = concat(&[&[5, methods.len() as u8], &methods, &[5, command, 0, kind]]);
+        match kind {
+            1 => bytes.extend(numbers.bytes(6)),
+            4 => bytes.extend(numbers.bytes(18)),
+            3 => {
+                let name = numbers.below(256);
+                bytes.push(name as u8);
+                bytes.extend(numbers.bytes(name + 2));
+            }
+            _ => {
+                let count = numbers.below(20);
+                bytes.extend(numbers.bytes(count));
+            }
+        }
+        match numbers.below(4) {
+            0 => bytes.truncate(numbers.below(bytes.len() + 1)),
+            1 => {
+                let at = numbers.below(bytes.len());
+                bytes[at] = numbers.next() as u8;
+            }
+            2 => {
+                let count = 1 + numbers.below(32);
+                bytes.extend(numbers.bytes(count));
+            }
+            _ => {}
+        }
+        bytes
+    }
+
+    /// Fuzz-style: hostile inputs, each sent whole and ended, give what the model says: the same
+    /// destination or error, the same answer, and for an accepted handshake exactly the bytes
+    /// behind it still in the socket. The broker's end ends with a half close before it closes,
+    /// so the answer arrives also where a close with unread data would reset the connection.
+    #[test]
+    fn hostile_input_gets_what_the_protocol_says() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut numbers = Numbers(0x5eed_2026_1025_0002);
+        for round in 0..2000 {
+            let bytes = hostile_input(&mut numbers);
+            let expected = expected(&bytes);
+            let mut client = TcpStream::connect(address).unwrap();
+            let (server, _) = listener.accept().unwrap();
+            client.write_all(&bytes).unwrap();
+            client.shutdown(Shutdown::Write).unwrap();
+            let result = read_request_within(&server, Duration::from_secs(5));
+            let mut rest = Vec::new();
+            if result.is_ok() {
+                (&server).read_to_end(&mut rest).unwrap();
+            }
+            server.shutdown(Shutdown::Write).unwrap();
+            let mut answer = Vec::new();
+            client.read_to_end(&mut answer).unwrap();
+            let outcome = result
+                .map(|destination| (destination, bytes.len() - rest.len()))
+                .map_err(|error| error.kind());
+            assert_eq!(
+                Expected { outcome, answer },
+                expected,
+                "round {round}: {bytes:?}"
+            );
+            if let Ok((_, length)) = expected.outcome {
+                assert_eq!(rest, bytes[length..], "round {round}: {bytes:?}");
+            }
+        }
     }
 
     #[test]

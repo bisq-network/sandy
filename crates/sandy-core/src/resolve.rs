@@ -324,6 +324,17 @@ impl ResolvedPolicy {
                     .to_string(),
             );
         }
+        if self.egress.is_some() {
+            warnings.push(
+                "egress: the broker refuses an address of this host with reply 2 and answers \
+                 other addresses with the result of its connect, so by trying addresses the \
+                 program can tell which belong to this host and, with reach = \"public\", which \
+                 belong to its subnets; a NAT64 prefix of an operator, other than the well-known \
+                 ones, looks like any public address, so the broker cannot recognise it \
+                 (docs/DESIGN.md, \"Egress broker\")"
+                    .to_string(),
+            );
+        }
         if self.path_metadata == PathMetadata::Allow {
             warnings.push(
                 "path_metadata = \"allow\" lets the program change the permissions, owner, \
@@ -2476,6 +2487,26 @@ mod tests {
         policy.process.signals = SignalScope::Isolated;
         let resolved = ResolvedPolicy::resolve(&policy, None).unwrap();
         assert_eq!(resolved.warnings(Some(&home)), Vec::<String>::new());
+    }
+
+    /// What every egress broker leaves open, named for every policy that has one.
+    #[test]
+    fn egress_names_what_its_refusals_tell() {
+        let mut policy = Policy::default();
+        policy.process.signals = SignalScope::Isolated;
+        let quiet = ResolvedPolicy::resolve(&policy, None).unwrap();
+        assert!(quiet.warnings(None).is_empty());
+        policy.network.ip = IpAccess::Private;
+        policy.network.egress = Some(Egress {
+            port: 1080,
+            reach: crate::policy::EgressReach::Public,
+        });
+        let warnings = ResolvedPolicy::resolve(&policy, None)
+            .unwrap()
+            .warnings(None)
+            .join("\n");
+        assert!(warnings.contains("which belong to this host"), "{warnings}");
+        assert!(warnings.contains("NAT64"), "{warnings}");
     }
 
     fn writable_conflict(

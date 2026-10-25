@@ -312,7 +312,8 @@ pub fn relay(client: TcpStream, target: SocketAddr) -> io::Result<()> {
 ///
 /// A direction that reaches the end of its stream passes the end on as a half close. A direction
 /// that fails (a reset, or a write the other peer refuses) aborts the connection: both sockets
-/// close with a reset, so neither peer takes a cut stream for a complete one.
+/// close with a reset, so neither peer takes a cut stream for a complete one. So does a
+/// connection whose second direction gets no thread.
 pub fn relay_streams(client: TcpStream, server: TcpStream) -> io::Result<()> {
     relay_streams_with(client, server, HALF_CLOSED_IDLE, None)
 }
@@ -343,7 +344,7 @@ fn relay_streams_with(
         thread = thread.stack_size(size);
     }
     thread::scope(|scope| {
-        thread.spawn_scoped(scope, || {
+        let spawned = thread.spawn_scoped(scope, || {
             pump(
                 &client,
                 &server,
@@ -351,7 +352,11 @@ fn relay_streams_with(
                 idle,
                 &state,
             )
-        })?;
+        });
+        if let Err(error) = spawned {
+            state.abort([&client, &server]);
+            return Err(error);
+        }
         pump(
             &server,
             &client,
@@ -851,6 +856,29 @@ mod tests {
             received.len()
         );
         relay.join().unwrap().unwrap();
+    }
+
+    /// A connection whose second direction gets no thread is relayed in neither direction, so
+    /// neither peer may see a normal end, which would look like a complete, empty stream. The
+    /// broker has already sent its success reply then.
+    #[test]
+    fn a_connection_without_its_second_thread_is_reset() {
+        let (client, client_end) = pair();
+        let (target, target_end) = pair();
+        // No system gives a thread a stack of a petabyte, so the second direction cannot start.
+        let result = relay_streams_with(client_end, target_end, HALF_CLOSED_IDLE, Some(1 << 50));
+        assert!(result.is_err(), "the thread started");
+        for mut peer in [client, target] {
+            // macOS refuses socket options on a socket that was reset (EINVAL).
+            let _ = peer.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut received = Vec::new();
+            let ended = peer.read_to_end(&mut received);
+            assert!(received.is_empty(), "{received:?}");
+            assert_eq!(
+                ended.map_err(|error| error.kind()),
+                Err(io::ErrorKind::ConnectionReset)
+            );
+        }
     }
 
     /// After one side has ended, a peer that never sends again does not keep the connection.
