@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use lexopt::prelude::*;
 use sandy_core::{
     ChildProcesses, ExposedPort, ForwardedPort, IpAccess, NetworkAccess, PathMetadata, Policy,
-    SignalScope, SystemAccess,
+    SignalScope, SystemAccess, Win32k,
 };
 
 pub const USAGE: &str = "\
@@ -57,6 +57,9 @@ Options (they extend the policy file):
   --pass-env NAME            copy variable NAME into the program environment (repeatable)
   --set-env NAME=VALUE       set a variable in the program environment (repeatable)
   --appcontainer NAME        AppContainer profile name (Windows)
+  --windows-win32k allow|deny
+                             the system calls of win32k, the GUI part of the Windows kernel;
+                             deny stops many programs that load user32.dll (default: allow)
   --cwd DIR                  working directory of the program
   -h, --help                 show this help
   -V, --version              show the version
@@ -86,6 +89,7 @@ pub struct Overrides {
     children: Option<ChildProcesses>,
     end_with_parent: bool,
     path_metadata: Option<PathMetadata>,
+    win32k: Option<Win32k>,
     pass_env: Vec<String>,
     set_env: Vec<(String, String)>,
     appcontainer: Option<String>,
@@ -168,6 +172,12 @@ impl Overrides {
         policy.network.forward.extend(self.forward);
         if let Some(name) = self.appcontainer {
             policy.windows.appcontainer_name = Some(name);
+        }
+        if let Some(win32k) = self.win32k {
+            if win32k == Win32k::Allow && policy.windows.win32k == Win32k::Deny {
+                note("--windows-win32k", "allow", "win32k", "deny");
+            }
+            policy.windows.win32k = win32k;
         }
         weakened
     }
@@ -350,6 +360,13 @@ where
                     .push((name.to_string(), value.to_string()));
             }
             Long("appcontainer") => overrides.appcontainer = Some(parser.value()?.string()?),
+            Long("windows-win32k") => {
+                overrides.win32k = Some(match parser.value()?.string()?.as_str() {
+                    "allow" => Win32k::Allow,
+                    "deny" => Win32k::Deny,
+                    other => return Err(format!("invalid --windows-win32k value {other:?}").into()),
+                })
+            }
             Long("forward") => {
                 let value = parser.value()?.string()?;
                 let (port, to) = value
@@ -475,6 +492,8 @@ mod tests {
             "A=b=c",
             "--appcontainer",
             "name",
+            "--windows-win32k",
+            "deny",
             "--expose",
             "127.0.0.1:18080=8080",
             "--forward",
@@ -495,6 +514,7 @@ mod tests {
         assert_eq!(policy.linux.path_metadata, PathMetadata::Allow);
         assert_eq!(policy.environment.set["A"], "b=c");
         assert_eq!(policy.windows.appcontainer_name.as_deref(), Some("name"));
+        assert_eq!(policy.windows.win32k, Win32k::Deny);
         assert_eq!(
             policy.network.forward,
             vec![ForwardedPort {
@@ -562,6 +582,28 @@ mod tests {
         );
         assert!(weakened(SystemAccess::Minimal, "none", true).is_empty());
         assert!(weakened(SystemAccess::None, "minimal", false).is_empty());
+    }
+
+    /// `--windows-win32k allow` gives the program back what a file with `win32k = "deny"` takes.
+    #[test]
+    fn win32k_allowed_over_a_file_that_denies_it_is_named() {
+        let weakened = |file: Win32k, option: &str| {
+            let mut policy = Policy::default();
+            policy.windows.win32k = file;
+            invocation(&["check", "--windows-win32k", option])
+                .overrides
+                .apply(&mut policy, true)
+        };
+        assert_eq!(
+            weakened(Win32k::Deny, "allow"),
+            vec![
+                "--windows-win32k allow replaces win32k = \"deny\" from the policy file and \
+                 allows more than the file does"
+                    .to_string()
+            ]
+        );
+        assert!(weakened(Win32k::Allow, "deny").is_empty());
+        assert!(parse_strs(&["check", "--windows-win32k", "none"]).is_err());
     }
 
     #[test]

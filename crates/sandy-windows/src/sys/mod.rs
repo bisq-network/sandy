@@ -15,8 +15,8 @@ use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::AsRawSocket;
 
 use sandy_core::{
-    Backend, ChildProcesses, IpAccess, PlanItem, ProtectedPath, ResolvedPolicy, SandboxError,
-    Status, StatusReport, TargetCommand, path_directories,
+    Backend, ChildProcesses, IpAccess, PlanItem, ProtectedPath, Requirement, ResolvedPolicy,
+    SandboxError, Status, StatusReport, TargetCommand, Win32k, path_directories,
 };
 use windows_sys::Win32::Security::{
     WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
@@ -54,6 +54,11 @@ impl Backend for WindowsBackend {
         let mut items = sandy_core::verify::relay_listeners(policy);
         if let Err(reason) = host::job_nests() {
             items.extend(crate::plan::job_unavailable(policy, &reason));
+        }
+        if policy.windows.win32k == Win32k::Deny
+            && let Err(reason) = host::win32k_lockdown()
+        {
+            items.push(PlanItem::unavailable(Requirement::Win32kDenied, reason));
         }
         items
     }
@@ -201,6 +206,7 @@ impl Backend for WindowsBackend {
                 program,
                 relays,
                 deny_children: policy.children == ChildProcesses::None,
+                deny_win32k: policy.windows.win32k == Win32k::Deny,
                 parent,
             },
             status,

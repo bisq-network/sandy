@@ -81,10 +81,11 @@ fn fingerprint(policy: &ResolvedPolicy) -> Vec<u8> {
 
     let mut out = vec![
         // Format version. 2 adds forwarded ports and `children`, 3 adds `end_with_parent` and
-        // keys the state on the SID; a run of another sandy version that reads this file then
-        // never matches by accident and is refused, which is the safe outcome. sandy 1.3.2
-        // (version 2) kept the state in a named kernel object, which this version does not read.
-        3u8,
+        // keys the state on the SID, 4 adds `win32k`; a run of another sandy version that reads
+        // this file then never matches by accident and is refused, which is the safe outcome.
+        // sandy 1.3.2 (version 2) kept the state in a named kernel object, which this version
+        // does not read.
+        4u8,
         match policy.system {
             sandy_core::SystemAccess::Minimal => 0,
             sandy_core::SystemAccess::None => 1,
@@ -112,6 +113,11 @@ fn fingerprint(policy: &ResolvedPolicy) -> Vec<u8> {
         // A run that ends with its parent could be kept alive by a sibling that does not, which
         // can open its processes because they share the AppContainer.
         u8::from(policy.end_with_parent),
+        // A program without win32k could make the calls through a sibling that has it.
+        match policy.windows.win32k {
+            sandy_core::Win32k::Allow => 0,
+            sandy_core::Win32k::Deny => 1,
+        },
     ];
 
     // `paths` is sorted by path when the policy is resolved, so the order is deterministic.
@@ -187,5 +193,12 @@ mod tests {
         let client = with(sandy_core::IpAccess::Client);
         let all = with(sandy_core::IpAccess::All);
         assert!(none != client && client != all && none != all);
+    }
+
+    #[test]
+    fn win32k_changes_the_fingerprint() {
+        let mut denied = policy();
+        denied.windows.win32k = sandy_core::Win32k::Deny;
+        assert_ne!(fingerprint(&policy()), fingerprint(&denied));
     }
 }

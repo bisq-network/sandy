@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use crate::plan::Requirement;
 use crate::policy::{
     ChildProcesses, EnvironmentPolicy, ExposedPort, ForwardedPort, IpAccess, NetworkAccess,
-    PathMetadata, Policy, PolicyError, ProcessPolicy, SignalScope, SystemAccess, WindowsPolicy,
+    PathMetadata, Policy, PolicyError, ProcessPolicy, SignalScope, SystemAccess, Win32k,
+    WindowsPolicy,
 };
 
 #[cfg(windows)]
@@ -248,6 +249,9 @@ impl ResolvedPolicy {
         }
         if !self.forward.is_empty() {
             requirements.push(Requirement::ForwardedPortsRelayed);
+        }
+        if self.windows.win32k == Win32k::Deny {
+            requirements.push(Requirement::Win32kDenied);
         }
         requirements
     }
@@ -1932,6 +1936,23 @@ mod tests {
             .unwrap()
             .requirements();
         assert!(no_children.contains(&Requirement::ChildProcessesDenied));
+    }
+
+    /// `windows.win32k` is opt-in: the default asks for nothing, `deny` for the requirement,
+    /// which every platform reports (the platforms without win32k as enforced).
+    #[test]
+    fn win32k_requirement_follows_the_policy() {
+        let mut policy = Policy::default();
+        let requirements = ResolvedPolicy::resolve(&policy, None)
+            .unwrap()
+            .requirements();
+        assert!(!requirements.contains(&Requirement::Win32kDenied));
+
+        policy.windows.win32k = Win32k::Deny;
+        let requirements = ResolvedPolicy::resolve(&policy, None)
+            .unwrap()
+            .requirements();
+        assert!(requirements.contains(&Requirement::Win32kDenied));
     }
 
     /// The program can replace an entry inside a writable path between two starts, so a policy

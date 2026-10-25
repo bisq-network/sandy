@@ -82,6 +82,8 @@ const FILTER_METADATA: &str = "seccomp denies chmod, chown, utime and xattr call
 const FILTER_PROCESSES: &str = "seccomp denies ptrace, process_vm_readv, process_vm_writev, \
     pidfd_getfd, kcmp, process_madvise, System V IPC and POSIX message queues, and changes of the \
     limits, priority and CPU affinity of other processes";
+const NO_WIN32K: &str =
+    "nothing to deny: win32k is the GUI part of the Windows kernel, and Linux has none";
 
 /// How many `#!` lines sandy follows when it checks whether the program can be executed. The
 /// kernel follows more (measured on Linux 7.2: a chain of five scripts runs, six fails with
@@ -426,6 +428,7 @@ fn plan_item(
             Err(reason) => unavailable(reason),
             Ok(()) => enforced(FILTER_METADATA.to_string()),
         },
+        Requirement::Win32kDenied => enforced(NO_WIN32K.to_string()),
         // The kernel sends the job control signals of a terminal without the check that the
         // Landlock scope hooks, so the scope alone does not isolate signals.
         Requirement::SignalsIsolated => match &host.seccomp {

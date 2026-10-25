@@ -51,6 +51,9 @@ pub enum Requirement {
     /// and, if it has not ended after a grace period, is killed. The target cannot keep this from
     /// happening; the policy also requires isolated signals for that.
     EndsWithParent,
+    /// The target cannot make the system calls of win32k, the GUI part of the Windows kernel.
+    /// Platforms without win32k give this without a mechanism.
+    Win32kDenied,
 }
 
 impl Requirement {
@@ -73,6 +76,7 @@ impl Requirement {
             Requirement::ChildProcessesDenied => "no child processes",
             Requirement::ChildProcessesContained => "child processes end with the program",
             Requirement::EndsWithParent => "the program ends when sandy's parent ends",
+            Requirement::Win32kDenied => "win32k system calls denied",
         }
     }
 }

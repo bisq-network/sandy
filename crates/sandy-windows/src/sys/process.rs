@@ -44,12 +44,13 @@ use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
     DETACHED_PROCESS, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    GetCurrentProcess, GetExitCodeProcess, GetProcessId, INFINITE,
+    GetCurrentProcess, GetExitCodeProcess, GetProcessId, GetProcessMitigationPolicy, INFINITE,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
     PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, ResumeThread,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForMultipleObjects, WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+    PROCESS_INFORMATION, ProcessSystemCallDisablePolicy, ResumeThread, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForMultipleObjects,
+    WaitForSingleObject,
 };
 
 use super::util::{Sid, last_error, wide_nul};
@@ -62,6 +63,9 @@ pub struct Launch<'a> {
     pub relays: Vec<Relay<'a>>,
     /// `process.children = "none"`: the program's job admits no process besides the program.
     pub deny_children: bool,
+    /// `windows.win32k = "deny"`: the program and the relays start with win32k system calls
+    /// disabled.
+    pub deny_win32k: bool,
     /// `process.end_with_parent`: the process that started sandy. When it ends, sandy ends the
     /// program's job.
     pub parent: Option<OwnedHandle>,
@@ -87,6 +91,11 @@ impl Role {
 /// (Windows 10 1607 and later): the process cannot create child processes. windows-sys defines it
 /// in a module that this crate does not otherwise need.
 const CHILD_PROCESS_RESTRICTED: u32 = 0x01;
+
+/// `PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON` for
+/// `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY` (Windows 8 and later), which windows-sys does not
+/// define: the process cannot make win32k system calls.
+pub const WIN32K_SYSTEM_CALL_DISABLE: u64 = 1 << 28;
 
 /// A relay process: `sandy __relay` for an exposed port or `sandy __forward` for a forwarded
 /// port. Its standard input is a pipe that sandy closes when the program ends; the relay then
@@ -157,6 +166,7 @@ fn start_and_wait(
         mut program,
         relays: port_relays,
         deny_children: _,
+        deny_win32k,
         parent,
     } = launch;
     // The relays start before the program, so a relay that cannot start ends the run before the
@@ -170,7 +180,13 @@ fn start_and_wait(
     let mut running = Vec::with_capacity(port_relays.len());
     if let Some(relay_job) = &relay_job {
         for relay in port_relays {
-            running.push(start_relay(relay, appcontainer, relay_job, &stdio)?);
+            running.push(start_relay(
+                relay,
+                appcontainer,
+                relay_job,
+                &stdio,
+                deny_win32k,
+            )?);
         }
     }
     let stdio_handles = stdio.child.each_ref().map(|handle| handle.as_raw_handle());
@@ -181,6 +197,7 @@ fn start_and_wait(
         stdio_handles,
         &[],
         Role::Program,
+        deny_win32k,
     )?;
     // sandy stays the parent on Windows, so its own process ID is not the program's.
     // SAFETY: process is a valid process handle with the rights CreateProcessW gives.
@@ -262,6 +279,7 @@ fn start_relay(
     appcontainer: &Sid,
     relay_job: &OwnedHandle,
     stdio: &StandardHandles,
+    deny_win32k: bool,
 ) -> Result<RunningRelay, SandboxError> {
     let (input_read, input) = pipe("input of a relay")?;
     make_inheritable(&input_read, "input of a relay")?;
@@ -288,6 +306,7 @@ fn start_relay(
         relay_stdio,
         socket.as_slice(),
         Role::Relay,
+        deny_win32k,
     )?;
     // The relay holds its own handles now. Without sandy's copies, the relay sees the end of its
     // input when sandy closes `input`, and clients of an exposed port are refused once the relay
@@ -432,6 +451,9 @@ fn set_job_information<T>(
 /// start processes through it. The policy is fixed when the process is created. A console
 /// program cannot have it: its console host is a child process, and without it the program ends
 /// with `STATUS_DLL_INIT_FAILED` before it runs (measured on Windows 11).
+///
+/// With `deny_win32k` the process starts with win32k system calls disabled, and sandy checks that
+/// Windows applied this before the process runs.
 fn start(
     launch: &mut Process<'_>,
     appcontainer: &Sid,
@@ -439,6 +461,7 @@ fn start(
     stdio: [HANDLE; 3],
     extra: &[HANDLE],
     role: Role,
+    deny_win32k: bool,
 ) -> Result<OwnedHandle, SandboxError> {
     let what = role.name();
     let mut capabilities: Vec<SID_AND_ATTRIBUTES> = launch
@@ -467,7 +490,7 @@ fn start(
         }
     }
 
-    let mut attributes = AttributeList::new(3)?;
+    let mut attributes = AttributeList::new(4)?;
     attributes.set(
         PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
         &security_capabilities,
@@ -478,6 +501,12 @@ fn start(
         attributes.set(
             PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
             &CHILD_PROCESS_RESTRICTED,
+        )?;
+    }
+    if deny_win32k {
+        attributes.set(
+            PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+            &WIN32K_SYSTEM_CALL_DISABLE,
         )?;
     }
 
@@ -537,6 +566,18 @@ fn start(
         unsafe { TerminateProcess(process.as_raw_handle(), 1) };
         error
     };
+    if deny_win32k {
+        match win32k_disabled(&process) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(abort(SandboxError::new(format!(
+                    "Windows started the {what} with win32k system calls enabled although sandy \
+                     asked to disable them"
+                ))));
+            }
+            Err(error) => return Err(abort(error)),
+        }
+    }
     // SAFETY: job and process are valid handles.
     if unsafe { AssignProcessToJobObject(job.as_raw_handle(), process.as_raw_handle()) } == 0 {
         return Err(abort(last_error(format!(
@@ -550,13 +591,37 @@ fn start(
     Ok(process)
 }
 
+/// Whether win32k system calls are disabled for `process`, as `GetProcessMitigationPolicy`
+/// reports it.
+pub fn win32k_disabled(process: &OwnedHandle) -> Result<bool, SandboxError> {
+    /// `DisallowWin32kSystemCalls` of `PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY`.
+    const DISALLOW_WIN32K: u32 = 0x1;
+    let mut flags = 0u32;
+    // SAFETY: the process handle has PROCESS_QUERY_INFORMATION; the policy structure is one u32
+    // of flags, and the length passed is its size.
+    let ok = unsafe {
+        GetProcessMitigationPolicy(
+            process.as_raw_handle(),
+            ProcessSystemCallDisablePolicy,
+            (&mut flags as *mut u32).cast(),
+            size_of::<u32>(),
+        )
+    };
+    if ok == 0 {
+        return Err(last_error(
+            "cannot read whether win32k system calls are disabled",
+        ));
+    }
+    Ok(flags & DISALLOW_WIN32K != 0)
+}
+
 /// A `PROC_THREAD_ATTRIBUTE_LIST`. The values it points to must outlive it.
-struct AttributeList {
+pub struct AttributeList {
     buffer: Vec<usize>,
 }
 
 impl AttributeList {
-    fn new(count: u32) -> Result<AttributeList, SandboxError> {
+    pub fn new(count: u32) -> Result<AttributeList, SandboxError> {
         let mut size = 0usize;
         // SAFETY: a null list with a size pointer only queries the required size.
         unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), count, 0, &mut size) };
@@ -573,11 +638,11 @@ impl AttributeList {
         Ok(list)
     }
 
-    fn as_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+    pub fn as_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
         self.buffer.as_mut_ptr().cast()
     }
 
-    fn set<T: ?Sized>(&mut self, attribute: u32, value: &T) -> Result<(), SandboxError> {
+    pub fn set<T: ?Sized>(&mut self, attribute: u32, value: &T) -> Result<(), SandboxError> {
         // SAFETY: the list is initialized; value points to `size_of_val(value)` bytes in the
         // layout the attribute expects, and the caller keeps it alive until CreateProcessW.
         let ok = unsafe {

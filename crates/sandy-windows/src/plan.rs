@@ -305,11 +305,18 @@ fn contained(
             "own console for the program; AppContainer {name:?} cannot open processes outside \
              it; job UI restrictions and low integrity block window messages"
         )),
+        Requirement::Win32kDenied => enforced(WIN32K_LOCKDOWN.to_string()),
         Requirement::InheritedHandlesClosed | Requirement::EnvironmentControlled => {
             unreachable!("reported in plan_for")
         }
     }
 }
+
+/// `windows.win32k = "deny"`. The relays get it too: the program can open them, because they
+/// run in its AppContainer, and would otherwise make the calls through them.
+const WIN32K_LOCKDOWN: &str = "PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY with \
+     PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON for the program and \
+     the relays, checked with GetProcessMitigationPolicy before they run";
 
 /// How the relays end, docs/DESIGN.md "Forwarded ports" rule 5.
 const RELAY_END: &str = "when the program ends, the relay takes no new connection, lets \
@@ -403,7 +410,7 @@ mod tests {
 
     use sandy_core::{
         ChildProcesses, EnforcementPlan, ExposedPort, ForwardedPort, PathAccess, PathMetadata,
-        PathRule, Policy, SignalScope, Status, WindowsPolicy,
+        PathRule, Policy, SignalScope, Status, Win32k, WindowsPolicy,
     };
 
     use super::*;
@@ -453,6 +460,7 @@ mod tests {
         let mut policy = ResolvedPolicy::resolve(&Policy::default(), None).unwrap();
         policy.windows = WindowsPolicy {
             appcontainer_name: Some("example.app".into()),
+            ..WindowsPolicy::default()
         };
         policy
     }
@@ -658,6 +666,34 @@ mod tests {
                 .iter()
                 .any(|item| item.requirement == Requirement::MetadataConfined)
         );
+    }
+
+    #[test]
+    fn win32k_requirement_follows_the_policy() {
+        let mut policy = policy();
+        assert!(
+            !plan_for(&policy, &host())
+                .iter()
+                .any(|item| item.requirement == Requirement::Win32kDenied)
+        );
+        policy.windows.win32k = Win32k::Deny;
+        assert!(plan(&policy, &host()).is_enforceable());
+        match status(&policy, &host(), Requirement::Win32kDenied) {
+            Status::Enforced { mechanism } => {
+                assert!(
+                    mechanism.contains("WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON"),
+                    "{mechanism}"
+                );
+                assert!(mechanism.contains("relays"), "{mechanism}");
+            }
+            Status::Unavailable { reason } => panic!("unavailable: {reason}"),
+        }
+        // The program never starts without an AppContainer, so nothing is enforced.
+        policy.windows.appcontainer_name = None;
+        assert!(matches!(
+            status(&policy, &host(), Requirement::Win32kDenied),
+            Status::Unavailable { .. }
+        ));
     }
 
     fn enforceable_on(host: &HostCapabilities) -> bool {

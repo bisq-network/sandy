@@ -276,6 +276,23 @@ pub struct WindowsPolicy {
     /// loopback exemption are bound to this name.
     #[serde(default)]
     pub appcontainer_name: Option<String>,
+    #[serde(default)]
+    pub win32k: Win32k,
+}
+
+/// Whether the target may make the system calls of win32k, the part of the Windows kernel that
+/// serves windows, input and drawing (`user32.dll` and `gdi32.dll` call it).
+///
+/// A command-line program needs none of them, but many load `user32.dll`, which calls win32k
+/// when it loads, and these end at startup under `deny` (docs/windows.md, "Win32k"). `deny`
+/// takes this part of the kernel out of the program's reach. Other platforms have no win32k, so
+/// there the requirement holds without a mechanism.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Win32k {
+    #[default]
+    Allow,
+    Deny,
 }
 
 #[derive(Debug)]
@@ -457,6 +474,7 @@ mod tests {
         assert_eq!(policy.filesystem.system, SystemAccess::Minimal);
         assert_eq!(policy.linux.path_metadata, PathMetadata::Deny);
         assert_eq!(policy.process.children, ChildProcesses::Allowed);
+        assert_eq!(policy.windows.win32k, Win32k::Allow);
     }
 
     #[test]
@@ -484,6 +502,7 @@ mod tests {
             path_metadata = "allow"
             [windows]
             appcontainer_name = "example"
+            win32k = "deny"
             "#,
         )
         .unwrap();
@@ -517,6 +536,7 @@ mod tests {
         assert_eq!(policy.environment.set["HOME"], "/c");
         assert_eq!(policy.linux.path_metadata, PathMetadata::Allow);
         assert_eq!(policy.windows.appcontainer_name.as_deref(), Some("example"));
+        assert_eq!(policy.windows.win32k, Win32k::Deny);
     }
 
     #[test]

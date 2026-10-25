@@ -264,6 +264,7 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
         // Accepts one connection on the listening socket the caller passed as standard stream
         // STREAM (0, 1 or 2).
         "accept-fd" => accept_fd(target),
+        action if win32k::ACTIONS.contains(&action) => win32k::perform(action, target),
         action if unix::ACTIONS.contains(&action) => unix::perform(action, target),
         action if linux::ACTIONS.contains(&action) => linux::perform(action, target),
         action if macos::ACTIONS.contains(&action) => macos::perform(action, target),
@@ -4487,6 +4488,171 @@ mod initial_signals {
     use std::io;
 
     pub fn disposition(_target: &str) -> io::Result<String> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported"))
+    }
+}
+
+/// Actions for `windows.win32k` (`tests/escape_windows.rs`): a win32k system call, and the
+/// lockdown that Windows reports for this process and for the processes it can query.
+#[cfg(windows)]
+mod win32k {
+    use std::io;
+    use std::process::{Command, Stdio};
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessMitigationPolicy, OpenProcess, PROCESS_QUERY_INFORMATION,
+        ProcessSystemCallDisablePolicy,
+    };
+
+    pub const ACTIONS: &[&str] = &["win32k-call", "win32k-policy", "win32k-of", "spawn-output"];
+
+    pub fn perform(action: &str, target: &str) -> io::Result<String> {
+        match action {
+            "win32k-call" => call(),
+            // SAFETY: the pseudo handle of this process has no preconditions.
+            "win32k-policy" => policy(unsafe { GetCurrentProcess() }),
+            "win32k-of" => policy_of(target),
+            "spawn-output" => spawn_output(target),
+            _ => unreachable!("listed in ACTIONS"),
+        }
+    }
+
+    type Export = unsafe extern "system" fn() -> isize;
+
+    /// Reaches win32k by creating a memory device context through `gdi32.dll`, which the probe
+    /// loads at run time, so the probe itself starts where gdi32 cannot. The call needs win32k:
+    /// under the lockdown gdi32 fails to initialize (`DisallowWin32kSystemCalls` stops the kernel
+    /// side), so the load fails and the action reports the error; without it the call returns a
+    /// device context handle. A raw `win32u` stub is not enough: it crashes without gdi32's
+    /// client-side setup, so the library is the honest vector.
+    fn call() -> io::Result<String> {
+        let wide: Vec<u16> = "gdi32.dll"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: the name is NUL-terminated.
+        let module = unsafe { LoadLibraryW(wide.as_ptr()) };
+        if module.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let export = |name: &std::ffi::CStr| {
+            // SAFETY: the module is loaded and the name is NUL-terminated.
+            unsafe { GetProcAddress(module, name.as_ptr().cast()) }
+                .ok_or_else(io::Error::last_os_error)
+        };
+        type Create = unsafe extern "system" fn(*mut core::ffi::c_void) -> *mut core::ffi::c_void;
+        type Delete = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
+        // SAFETY: the exports have these signatures.
+        let (create, delete) = unsafe {
+            (
+                std::mem::transmute::<Export, Create>(export(c"CreateCompatibleDC")?),
+                std::mem::transmute::<Export, Delete>(export(c"DeleteDC")?),
+            )
+        };
+        // SAFETY: a null device context asks for one compatible with the screen.
+        let context = unsafe { create(ptr::null_mut()) };
+        if context.is_null() {
+            return Err(io::Error::other("no device context"));
+        }
+        // SAFETY: context is the device context created above.
+        unsafe { delete(context) };
+        Ok(format!("{context:p}"))
+    }
+
+    /// The flags of `PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY` of `process`; bit 0 is
+    /// `DisallowWin32kSystemCalls`.
+    fn policy(process: HANDLE) -> io::Result<String> {
+        let mut flags = 0u32;
+        // SAFETY: the structure is one u32 of flags and its size is passed.
+        let ok = unsafe {
+            GetProcessMitigationPolicy(
+                process,
+                ProcessSystemCallDisablePolicy,
+                (&mut flags as *mut u32).cast(),
+                size_of::<u32>(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(format!("flags {flags:#x}"))
+    }
+
+    /// `policy` of every other process named `target` that this process may query, as
+    /// `PID=FLAGS` separated by spaces. In an AppContainer these are the processes of the same
+    /// AppContainer, such as the program's console host and the relays.
+    fn policy_of(target: &str) -> io::Result<String> {
+        // SAFETY: a process snapshot has no preconditions.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the structure is plain data; zero is a valid value for every field.
+        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = Vec::new();
+        // SAFETY: snapshot is valid and entry has its size set.
+        let mut more = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+        while more {
+            let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(0);
+            let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+            let pid = entry.th32ProcessID;
+            if pid != std::process::id() && name.eq_ignore_ascii_case(target) {
+                // SAFETY: OpenProcess has no memory safety preconditions.
+                let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid) };
+                if !handle.is_null() {
+                    let flags = policy(handle).unwrap_or_else(|error| error.to_string());
+                    found.push(format!("{pid}={}", flags.trim_start_matches("flags ")));
+                    // SAFETY: handle is open and owned here.
+                    unsafe { CloseHandle(handle) };
+                }
+            }
+            // SAFETY: as above.
+            more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+        }
+        // SAFETY: snapshot is a handle this function owns.
+        unsafe { CloseHandle(snapshot) };
+        if found.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no such process to query",
+            ));
+        }
+        Ok(found.join(" "))
+    }
+
+    /// Runs a program with arguments (separated by U+001F) and reports its exit status and
+    /// standard output.
+    fn spawn_output(target: &str) -> io::Result<String> {
+        let mut parts = target.split(super::ARGUMENT_SEPARATOR);
+        let program = parts.next().unwrap_or_default();
+        let output = Command::new(program)
+            .args(parts)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()?;
+        Ok(format!(
+            "{} {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim()
+        ))
+    }
+}
+
+#[cfg(not(windows))]
+mod win32k {
+    use std::io;
+
+    pub const ACTIONS: &[&str] = &[];
+
+    pub fn perform(_action: &str, _target: &str) -> io::Result<String> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported"))
     }
 }

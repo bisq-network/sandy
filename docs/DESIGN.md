@@ -64,6 +64,7 @@ path_metadata = "deny"        # "deny" | "allow"; chmod, chown, utimensat, setxa
 
 [windows]
 appcontainer_name = "example.app"  # required on Windows
+win32k = "allow"              # "allow" | "deny"; deny blocks win32k (GUI kernel) system calls
 ```
 
 Command line options extend the policy file (`sandy --help`): path options add paths, and every
@@ -420,6 +421,7 @@ Rules:
 | `ChildProcessesDenied` | `process.children = "none"` |
 | `ChildProcessesContained` | `process.children = "contained"` |
 | `EndsWithParent` | `process.end_with_parent = true` |
+| `Win32kDenied` | `windows.win32k = "deny"` |
 
 A requirement is a lower bound. A backend may deny more, but never less. For example,
 `UnixSocketsDenied` guarantees that the program cannot connect to Unix sockets outside the paths
@@ -428,6 +430,15 @@ to a socket through its file and therefore allows the sockets in the `read_write
 the program's private AppContainer folder (docs/windows.md).
 (On Linux with `ip = "all"` or `ip = "client"` a socket pair can still take a free abstract name;
 see `docs/linux.md`.)
+
+`MetadataConfined` and `Win32kDenied` come from a platform section of the policy
+(`linux.path_metadata`, `windows.win32k`) but are requirements like any other: every backend
+reports them. A platform without the mechanism the key names reports the requirement as enforced
+with nothing to do, because it has no such route to begin with. `Win32kDenied` (from
+`windows.win32k = "deny"`) is enforced on Linux and macOS, whose kernels have no win32k, and on
+Windows by a process mitigation that disables the win32k system calls (docs/windows.md, "Win32k").
+A platform key is never silently ignored off its platform; it maps to a requirement each backend
+answers.
 
 There is one exception to "never less". Some requirements mean less on one platform than their
 description says, because the platform has no mechanism that closes a route, or because sandy

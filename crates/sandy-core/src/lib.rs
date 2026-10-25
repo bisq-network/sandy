@@ -19,7 +19,7 @@ pub use plan::{EnforcementPlan, PlanItem, Requirement, Status};
 pub use policy::{
     ChildProcesses, EnvironmentPolicy, ExposedPort, FilesystemPolicy, ForwardedPort, IpAccess,
     LinuxPolicy, NetworkAccess, NetworkPolicy, POLICY_VERSION, PathMetadata, Policy, PolicyError,
-    ProcessPolicy, SignalScope, SystemAccess, WindowsPolicy,
+    ProcessPolicy, SignalScope, SystemAccess, Win32k, WindowsPolicy,
 };
 pub use resolve::{
     PathAccess, PathIdentity, PathRule, ProtectedPath, ResolvedPolicy, canonical_location,

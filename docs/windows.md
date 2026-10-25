@@ -30,6 +30,7 @@ isolation.
 | `EndsWithParent` | sandy finds its parent in a process snapshot, checks its creation time, waits for it next to the program, and ends the program's job when it ends | outer job with UI restrictions; no AppContainer |
 | `ChildProcessesContained` | Every child joins the program's job, which allows no breakaway; sandy ends the job when the program exits, and kill-on-close ends it when sandy dies | outer job with UI restrictions; no AppContainer |
 | `ForwardedPortsRelayed` | `sandy __forward` in the program's AppContainer and a job of its own listens on the program's port and passes each connection over an AF_UNIX socket to sandy, which connects to the target; no loopback exemption | as for `ExposedPortsRelayed`; AF_UNIX missing; socket paths longer than 107 bytes |
+| `Win32kDenied` | `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY` with `PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON` for the program and the relays, read back with `GetProcessMitigationPolicy` before they run (only with `windows.win32k = "deny"`) | Windows refuses to set or report the mitigation |
 
 Every requirement also needs `windows.appcontainer_name` (or `--appcontainer NAME`). Without it,
 or with an invalid name, the plan reports the requirements that need the AppContainer as
@@ -534,7 +535,8 @@ sandy enforces one policy per AppContainer at a time
 - While a program runs, sandy holds a shared byte range lock on a file named after the SID below
   `%LOCALAPPDATA%\sandy\runs`, which stores a fingerprint of the resolved policy: the path rules
   (including the program's own read and execute rule), the system set, `ip`, `unix_sockets`, the
-  exposed and forwarded ports, `signals`, `children`, `end_with_parent` and `path_metadata`.
+  exposed and forwarded ports, `signals`, `children`, `end_with_parent`, `path_metadata` and
+  `win32k`.
   Arguments, working directory and environment are not part of it. A second byte of the same
   file serializes the check.
 - A second run in the same AppContainer with the same fingerprint may run at the same time. A run
@@ -780,9 +782,64 @@ pipe grants nothing to AppContainers [CreateNamedPipeW] [Implementing an AppCont
 messages that reach processes outside the sandbox.
 
 Windows has no pseudo-terminal device for `run` to refuse, as Linux and macOS do with
-`signals = "isolated"` (DESIGN.md rule 13): a pseudoconsole (ConPTY) reads its input from an
-ordinary pipe, which sandy cannot tell from any other; whether a program can type Ctrl+C into a
-pseudoconsole through such a pipe is not measured.
+`signals = "isolated"` (DESIGN.md rule 13). A pseudoconsole (ConPTY) reads its input from an
+ordinary anonymous pipe. The write end of such a pipe, handed to the program as a standard
+stream, is a pipe like any other: `GetFileType` reports `FILE_TYPE_PIPE` for it, the same as for
+the pipe of `program | sandy`, and nothing in the handle marks it as a console's input. sandy
+therefore cannot tell it apart and cannot refuse it, and does not: rule 13 leaves the standard
+streams to the caller and accepts a connected pipe (the caller that creates the ConPTY and hands
+the program its input end chose that channel, as it chooses any pipe).
+
+What such a write could do is a separate question: whether the bytes of a Ctrl+C (`0x03`) or a
+Ctrl+Break reach the processes attached to the pseudoconsole as a console control event, which
+would signal them without the check that `signals = "isolated"` applies. This could not be
+measured here. A pseudoconsole does not run in the test VM's non-interactive SSH session: a
+`CreatePseudoConsole` succeeds, but the console host it starts pumps no input or output to a
+child (measured: a `cmd /c echo` attached to a ConPTY produced no output), the same window
+station limitation as limitation 13. The question is open (see the release notes); by the ConPTY
+design the delivery is expected, because a terminal's Ctrl+C reaches a ConPTY child exactly by
+the terminal writing `0x03` to that input pipe. If a measurement on an interactive session
+confirms it, it belongs in the exceptions table with a `check` warning for `signals = "isolated"`,
+because sandy cannot distinguish or refuse the pipe.
+
+## Win32k
+
+`windows.win32k = "deny"` starts the program, and every process it starts, with the system calls
+of win32k disabled (`PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON`,
+set through the process attribute list sandy already builds and inherited by every child, as
+Windows inherits an always-on mitigation). win32k is the part of the Windows kernel that serves
+windows, input and drawing; `user32.dll` and `gdi32.dll` call it. It is a large, historically
+bug-prone attack surface, and a command-line program needs none of it. The default is `"allow"`,
+which changes nothing. The relays get the mitigation too, because the program can open them
+(they run in its AppContainer) and would otherwise make the calls through them. sandy reads the
+mitigation back with `GetProcessMitigationPolicy` before it lets each process run and refuses the
+run if Windows did not apply it; `check` reports the requirement as enforced, or unavailable if
+the mitigation cannot be set or read.
+
+The key costs the program every library that needs win32k. **Many console programs load
+`user32.dll`, whose initializer calls win32k, so they end at startup** with
+`STATUS_DLL_INIT_FAILED` (`0xC0000142`) before their first instruction, whether in the sandbox or
+not. This is the same failure as limitation 13 and cannot be told apart from it at a glance. Only
+a program that loads no GUI library runs under the key.
+
+Measured on the Windows 11 VM (build 26200), each program started outside the sandbox with the
+mitigation and without it, so the AppContainer plays no part in the result:
+
+| Starts with `win32k = "deny"` | Ends at startup with `win32k = "deny"` |
+|---|---|
+| `cmd.exe`, `hostname.exe`, `tar.exe`, `curl.exe`, `findstr.exe`, `sort.exe`, `more.com`, `xcopy.exe`, `reg.exe`, `icacls.exe`, `ipconfig.exe`, `attrib.exe`, `sandy.exe`, the `sandy-probe` test helper (a Rust console program built for `x86_64-pc-windows-gnu`) | Windows PowerShell 5 (`powershell.exe`), `whoami.exe`, `robocopy.exe`, `certutil.exe`, `tasklist.exe`, `cscript.exe`, `ssh.exe`, `timeout.exe`, `git.exe` |
+
+PowerShell 7 (`pwsh`), `python` and `node` were not installed on the VM and were not measured;
+nothing was installed to measure them. The rule to expect is simple: a plain console filter or
+archiver tends to start, while anything that links `user32.dll` (much of the .NET and scripting
+world, and tools that show progress UI) does not. Turn the key on only for a program you have
+checked starts with it.
+
+The key is Windows-only. On Linux and macOS a policy with `windows.win32k = "deny"` is accepted,
+and the requirement is reported as enforced with the note that there is nothing to deny, because
+those kernels have no win32k. This is how the other platform keys behave (`linux.path_metadata`
+on Windows and macOS, for example): the key is never silently ignored, it maps to a requirement
+every platform answers.
 
 ## Handles, environment and command line
 
@@ -952,8 +1009,8 @@ about a path is worse than none, so the backend answers nothing and sandy refuse
 
 Host: Windows 11 build 26200 (VM), binaries built for `x86_64-pc-windows-gnu`. The tests run in
 an elevated SSH session and without administrator rights. Latest elevated run, every test
-passing: `sandy_core` 46, `sandy_relay` 11, `sandy_windows` 71, `escape` 17, `escape_windows` 52,
-`expose` 4, `forward` 3, `children` 5, `parent` 5, `check` 7, `runner` 3, `review_windows` 7. The
+passing: `sandy_core` 55, `sandy_relay` 11, `sandy_windows` 74, `escape` 20, `escape_windows` 59,
+`expose` 4, `forward` 3, `children` 5, `parent` 5, `check` 11, `runner` 3, `review_windows` 7. The
 COM check of `review_windows` is skipped there: the SSH session is session 0, where `ole32.dll`
 does not load in an AppContainer (limitation 13), so a denial would not be the COM boundary.
 Earlier non-administrator runs used a scheduled task with `/RL LIMITED` (medium integrity,
@@ -1051,6 +1108,16 @@ Facts these runs established:
 - `ITaskService::Connect` reaches the Schedule service from outside the sandbox, so the
   task-scheduler probe is a real control. `CLSID_TaskScheduler` is an in-process class, which is
   why activating it with `CLSCTX_LOCAL_SERVER` fails everywhere and proves nothing.
+- With `windows.win32k = "deny"`, `GetProcessMitigationPolicy` reports `DisallowWin32kSystemCalls`
+  set for the program, for every process it spawns, for its console host, and for the relays; a
+  win32k call (`CreateCompatibleDC` through `gdi32.dll`) then fails, and without the key it works.
+  Programs that load `user32.dll` (`whoami.exe`, Windows PowerShell 5, and the others in the
+  table under "Win32k") end with `STATUS_DLL_INIT_FAILED`; plain console programs (`cmd.exe`,
+  `tar.exe`, `curl.exe`, the Rust `sandy-probe`) run.
+- A pseudoconsole does not attach a child in the SSH session: `CreatePseudoConsole` returns
+  `S_OK`, but a `cmd /c echo` started with the pseudoconsole attribute produced no output on the
+  pipe and received no input, so the ConPTY Ctrl+C route could not be measured there (see
+  "Processes, privileges and signals").
 
 ## Sources
 

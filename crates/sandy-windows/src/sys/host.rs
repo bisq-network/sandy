@@ -17,11 +17,13 @@ use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress
 use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW};
 use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, GetCurrentProcess, PROCESS_INFORMATION,
-    STARTUPINFOW, TerminateProcess,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT,
+    GetCurrentProcess, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROCESS_INFORMATION,
+    STARTUPINFOEXW, TerminateProcess,
 };
 use windows_sys::core::{BOOL, PCWSTR};
 
+use super::process::AttributeList;
 use super::util::wide_nul;
 use crate::version::WindowsVersion;
 
@@ -113,7 +115,8 @@ pub fn job_nests() -> Result<(), String> {
         return Ok(());
     }
     let job = ui_restricted_job()?;
-    let process = suspended_process()?;
+    let process = suspended_process(None)
+        .map_err(|error| format!("cannot test whether sandy's job can be nested: {error}"))?;
     // SAFETY: both handles are open and owned here.
     let assigned =
         unsafe { AssignProcessToJobObject(job.as_raw_handle(), process.as_raw_handle()) };
@@ -165,9 +168,31 @@ fn ui_restricted_job() -> Result<OwnedHandle, String> {
     Ok(job)
 }
 
+/// Whether Windows starts a process with win32k system calls disabled, as `run` asks for the
+/// program and the relays under `windows.win32k = "deny"`. Like `job_nests` a trial, so only
+/// `verify` calls it: a suspended process of sandy's executable with the mitigation, which sandy
+/// reads back and terminates before it runs an instruction.
+pub fn win32k_lockdown() -> Result<(), String> {
+    let process = suspended_process(Some(super::process::WIN32K_SYSTEM_CALL_DISABLE))
+        .map_err(|error| format!("Windows refused to disable win32k system calls: {error}"))?;
+    let disabled = super::process::win32k_disabled(&process);
+    // SAFETY: the process is still suspended, so it ends without running anything.
+    unsafe { TerminateProcess(process.as_raw_handle(), 1) };
+    match disabled {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(
+            "Windows started a trial process with win32k system calls enabled although sandy \
+             asked to disable them"
+                .to_string(),
+        ),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// A suspended process of sandy's own executable, which joins sandy's job chain like the program
-/// would. It runs nothing: `job_nests` terminates it while it is still suspended.
-fn suspended_process() -> Result<OwnedHandle, String> {
+/// would, with the process mitigation flags `mitigations` if given. It runs nothing: the caller
+/// terminates it while it is still suspended.
+fn suspended_process(mitigations: Option<u64>) -> Result<OwnedHandle, String> {
     let sandy = std::env::current_exe()
         .map_err(|error| format!("cannot find the path of sandy: {error}"))?;
     // Passed as the application too: from the command line alone, Windows splits a path with a
@@ -175,12 +200,19 @@ fn suspended_process() -> Result<OwnedHandle, String> {
     // `C:\Program Files\sandy\sandy.exe` for example.
     let application = wide_nul(sandy.as_os_str());
     let mut line = application.clone();
+    let mut attributes = AttributeList::new(1).map_err(|error| error.to_string())?;
+    if let Some(mitigations) = &mitigations {
+        attributes
+            .set(PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, mitigations)
+            .map_err(|error| error.to_string())?;
+    }
     // SAFETY: the structures are plain data; zero is a valid value for every field.
-    let (mut startup, mut info): (STARTUPINFOW, PROCESS_INFORMATION) =
+    let (mut startup, mut info): (STARTUPINFOEXW, PROCESS_INFORMATION) =
         unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
-    startup.cb = size_of::<STARTUPINFOW>() as u32;
-    // SAFETY: application and line are NUL-terminated and line is writable; startup and info
-    // outlive the call.
+    startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+    startup.lpAttributeList = attributes.as_ptr();
+    // SAFETY: application and line are NUL-terminated and line is writable; startup, the
+    // attribute list and the value it points to, and info outlive the call.
     let created = unsafe {
         CreateProcessW(
             application.as_ptr(),
@@ -188,16 +220,16 @@ fn suspended_process() -> Result<OwnedHandle, String> {
             ptr::null(),
             ptr::null(),
             0,
-            CREATE_SUSPENDED | CREATE_NO_WINDOW,
+            CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
             ptr::null(),
             ptr::null(),
-            &startup,
+            &startup.StartupInfo,
             &mut info,
         )
     };
     if created == 0 {
         return Err(format!(
-            "cannot start a suspended process to test whether sandy's job can be nested: {}",
+            "cannot start a suspended process: {}",
             io::Error::last_os_error()
         ));
     }

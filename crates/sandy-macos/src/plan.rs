@@ -287,8 +287,8 @@ fn root_directory_missing(policy: &ResolvedPolicy) -> Option<String> {
 enum Mechanism {
     /// Enforced by the Seatbelt profile.
     Profile(String),
-    /// Enforced by how sandy starts the target. Needs no host capability beyond posix_spawn and
-    /// execve.
+    /// Enforced by how sandy starts the target, or by macOS itself. Needs no host capability
+    /// beyond posix_spawn and execve.
     Exec(String),
 }
 
@@ -372,6 +372,13 @@ fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
              the target's loopback port outside the sandbox and connects only to the forwarded \
              addresses; not a child of the target (forked twice), its own profile without files \
              or Mach services, ends when the target ends (kqueue NOTE_EXIT)"
+        }
+        Requirement::Win32kDenied => {
+            return Mechanism::Exec(
+                "nothing to deny: win32k is the GUI part of the Windows kernel, and macOS has \
+                 none"
+                    .to_string(),
+            );
         }
         Requirement::ExposedPortsRelayed => {
             "a relay process that is not a child of the target (forked twice, so launchd \

@@ -545,8 +545,10 @@ program alone, and the relay reaches `to` as sandy's user, so a connection of an
 pass an owner rule of a packet filter or a peer credential check in that service. On Linux the
 relay asks the kernel who owns the other end and refuses the rest; macOS has no equivalent of
 `SO_PEERCRED` for TCP and no checked way to read the owner of another socket, so it serves every
-local user. Forward only to services that authenticate their clients. `sandy check` prints this
-as a warning for every policy with a forwarded port.
+local user. Looking through the program's own processes for the socket cannot take the place of
+that check (see [Looking for the program's socket](#looking-for-the-programs-socket)). Forward
+only to services that authenticate their clients. `sandy check` prints this as a warning for
+every policy with a forwarded port.
 
 With the default `signals = "any"` the program can also stop the relay with `SIGSTOP`, which no
 process can block. A stopped relay keeps its listen ports bound until someone continues or kills
@@ -570,6 +572,65 @@ exposed port can answer once more, served by whatever now holds the program's ad
 With `process.children = "contained"` the program cannot stop its relay, because `contained`
 requires `signals = "isolated"`, and sandy ends the program when the relay is gone (see
 [Contained child processes](#contained-child-processes)).
+
+### Looking for the program's socket
+
+The relay cannot ask who owns the other end of a connection, but it can read the descriptors of
+processes of its own user. `proc_pidinfo(PROC_PIDLISTFDS)` lists them, and
+`proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` gives the addresses and the TCP state of a socket among
+them. A relay that knows the program's processes (in the exec model the program's process ID and
+its descendants, which `proc_listchildpids` names; with `contained` the program's process group)
+could look there for a TCP socket whose local address is the connection's peer and whose remote
+address is the listener, and refuse the connection when there is none. A prototype did this for
+every connection it accepted on a forwarded port, looking through the process the relay watches
+and its descendants. Measured on macOS 27.0.1 on an 8-core Mac mini, it found every connection
+the program held open, also in 100 child processes, and refused a connection that another user
+(`workstation`) held open and one that a process of sandy's own user outside the sandbox held
+open. Reading a process of another user fails with `EPERM`, so the relay learns nothing about it.
+Inside the relay's profile a lookup took 3 microseconds for a program of one process with a few
+descriptors, 130 with 100 other sockets, and 14 milliseconds for a chain of 100 processes, about
+140 microseconds per process, most of it in listing its children. sandy does not use it, for two
+reasons.
+
+It finds only a socket that is still open, and a program that connects and closes is always
+ahead of the relay: the kernel completes the handshake by itself, and the relay wakes, accepts
+and looks only after that. One run of a program making 100 connections through a forwarded
+port, counted at the service outside, with the relay refusing every connection it found no
+socket for, three runs each in the exec model and with `contained`, idle and with 16 busy loops
+on the 8 cores:
+
+| program | idle | loaded |
+| --- | --- | --- |
+| connect and close, one process | 0 of 100 | 0 of 100 |
+| connect, write and close, one process | 0 to 9 of 100 | 0 to 4 of 100 |
+| connect and exit, 100 processes | 0 of 100 | 0 to 2 of 100 |
+| connect, write and exit, 100 processes | 0 of 100 | 0 to 1 of 100 |
+| connect and read the answer, one process or 100 | 100 of 100 | 100 of 100 |
+
+So the relay would have to serve a connection it finds no socket for, as the Linux relay serves
+one the kernel names no owner for. On Linux that is safe because only a closed socket loses its
+owner, and a closed socket cannot read the answer. Here "no socket found" also means a socket
+that any process outside the program holds open, of another user or of sandy's own, and serving
+those is no check at all. A relay could instead pass such a connection in one direction only: the
+client's bytes reach the service and nothing comes back. That costs a closed socket nothing, and
+a peer that holds its socket open could deliver a blind write but not read the answer, which is
+the residual of Linux without its race. It would break a program whose open connection is held by
+a process the relay does not find, such as a descendant whose parent exited in the exec model,
+which launchd adopts.
+
+The relay's profile would also have to allow `process-info-listpids`, `process-info-pidinfo` and
+`process-info-pidfdinfo`, and no filter limits them to the program. `(target children)` matches
+only the relay's children and `(target same-sandbox)` only its own sandbox, `(target others)`
+matched no process in the measurement, sandboxed or not, and `(target pgrp)` matches the relay's
+own process group, which the program is not in. `(target-attribute is-sandboxed)`, the narrowest
+filter found that matches every program, matches any sandboxed process, and 314 of the 389
+processes of the logged-in user ran sandboxed, among them `secd`, `cloudd` and `tccd`. `process-info-pidinfo` also answers `kern.procargs2`,
+which holds the arguments and the environment of a process, and `proc_pidpath`;
+`process-info-pidfdinfo` gives the addresses of every socket. The relay would gain the
+environment of almost every process of the user, which is far more than the check needs. The
+kernel's own list of TCP connections (`net.inet.tcp.pcblist64`), which names the user of a closed
+socket as well, shows a program without Apple's private `com.apple.private.network.statistics`
+entitlement only its own sockets, and the relay's profile denies it anyway.
 
 ## Signals the profile does not cover
 

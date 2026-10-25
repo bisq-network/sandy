@@ -2674,3 +2674,339 @@ fn refuses_a_writable_path_that_holds_a_directory_on_path_and_the_startup_folder
     let names_it = |line: &str| line.starts_with("warning: ") && line.contains(&on_path);
     assert!(warnings.lines().any(names_it), "{warnings}");
 }
+
+/// `PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON`, the flag sandy sets
+/// under `windows.win32k = "deny"`.
+const WIN32K_SYSTEM_CALL_DISABLE: u64 = 1 << 28;
+
+/// `STATUS_DLL_INIT_FAILED`: a DLL, here `user32.dll`, failed to load before the program ran.
+const STATUS_DLL_INIT_FAILED: u32 = 0xC000_0142;
+
+/// Runs `program` outside the sandbox, with win32k system calls disabled when `lockdown` is set,
+/// as sandy starts the program: its own console without a window, standard input from NUL.
+/// Returns the exit code and standard output. This is the control that tells what the lockdown
+/// costs a program from what the AppContainer costs it.
+fn outside_with_lockdown(program: &str, program_args: &[&str], lockdown: bool) -> (u32, String) {
+    use std::io::Read;
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NO_WINDOW, CreateProcessW, DeleteProcThreadAttributeList,
+        EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
+        InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+    };
+
+    let (mut read, mut write): (HANDLE, HANDLE) = (std::ptr::null_mut(), std::ptr::null_mut());
+    // SAFETY: both out pointers are valid.
+    let piped = unsafe { CreatePipe(&mut read, &mut write, std::ptr::null(), 0) };
+    assert_ne!(piped, 0);
+    // SAFETY: CreatePipe returned two new handles that this function owns.
+    let (read, write) = unsafe {
+        (
+            OwnedHandle::from_raw_handle(read),
+            OwnedHandle::from_raw_handle(write),
+        )
+    };
+    let null: OwnedHandle = fs::File::open("NUL").unwrap().into();
+    for handle in [&write, &null] {
+        // SAFETY: handle is valid; only its inherit flag changes.
+        let ok = unsafe {
+            SetHandleInformation(
+                handle.as_raw_handle(),
+                HANDLE_FLAG_INHERIT,
+                HANDLE_FLAG_INHERIT,
+            )
+        };
+        assert_ne!(ok, 0);
+    }
+    // Only these two handles reach the child, whatever other test threads hold inheritable.
+    let inherited = [write.as_raw_handle(), null.as_raw_handle()];
+    let mut size = 0usize;
+    // SAFETY: a null list with a size pointer only asks for the size.
+    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut size) };
+    let mut list = vec![0usize; size.div_ceil(size_of::<usize>())];
+    let attributes = list.as_mut_ptr().cast();
+    // SAFETY: the buffer is at least `size` bytes and pointer-aligned.
+    let initialized = unsafe { InitializeProcThreadAttributeList(attributes, 2, 0, &mut size) };
+    assert_ne!(initialized, 0);
+    let set = |attribute: u32, value: *const std::ffi::c_void, size: usize| {
+        // SAFETY: the list is initialized; value points to `size` bytes in the layout of the
+        // attribute and outlives CreateProcessW below.
+        let ok = unsafe {
+            UpdateProcThreadAttribute(
+                attributes,
+                0,
+                attribute as usize,
+                value,
+                size,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+    };
+    set(
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        inherited.as_ptr().cast(),
+        size_of_val(&inherited),
+    );
+    if lockdown {
+        set(
+            PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+            (&WIN32K_SYSTEM_CALL_DISABLE as *const u64).cast(),
+            size_of::<u64>(),
+        );
+    }
+
+    let needs_quote = |arg: &str| arg.is_empty() || arg.contains([' ', '\t', '"']);
+    let mut line = format!("\"{program}\"");
+    for arg in program_args {
+        if needs_quote(arg) {
+            line.push_str(&format!(" \"{}\"", arg.replace('"', "\\\"")));
+        } else {
+            line.push_str(&format!(" {arg}"));
+        }
+    }
+    let mut line: Vec<u16> = line.encode_utf16().chain([0]).collect();
+    // SAFETY: the structure is plain data; zero is a valid value for every field.
+    let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = null.as_raw_handle();
+    startup.StartupInfo.hStdOutput = write.as_raw_handle();
+    startup.StartupInfo.hStdError = write.as_raw_handle();
+    startup.lpAttributeList = attributes;
+    // SAFETY: the structure is plain data; zero is a valid value for every field.
+    let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: line is NUL-terminated and writable; startup, the attribute list and the values it
+    // points to, and info outlive the call.
+    let created = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
+            std::ptr::null(),
+            std::ptr::null(),
+            &startup.StartupInfo,
+            &mut info,
+        )
+    };
+    let error = std::io::Error::last_os_error();
+    // SAFETY: the list was initialized above.
+    unsafe { DeleteProcThreadAttributeList(attributes) };
+    assert_ne!(created, 0, "cannot start {program}: {error}");
+    // SAFETY: CreateProcessW returned two new handles that this function owns.
+    let (process, _thread) = unsafe {
+        (
+            OwnedHandle::from_raw_handle(info.hProcess),
+            OwnedHandle::from_raw_handle(info.hThread),
+        )
+    };
+    drop((write, null));
+    // Drain the pipe on another thread, so a program whose output fills the pipe buffer does not
+    // block while this thread waits for it to end.
+    let reader = std::thread::spawn(move || {
+        let mut output = String::new();
+        let _ = fs::File::from(read).read_to_string(&mut output);
+        output
+    });
+    let mut code = 0u32;
+    // SAFETY: process is valid; code is a writable u32.
+    unsafe {
+        WaitForSingleObject(process.as_raw_handle(), INFINITE);
+        GetExitCodeProcess(process.as_raw_handle(), &mut code);
+    }
+    (code, reader.join().unwrap_or_default())
+}
+
+/// With `windows.win32k = "deny"` the program, every child it starts and its console host run
+/// with win32k system calls disabled, and a win32k call fails; without it they do not.
+///
+/// The call is the system call stub of `NtGdiCreateCompatibleDC`, so the answer is the kernel's.
+/// The outside control shows that the probe sees the lockdown: the same call works outside the
+/// sandbox and fails there once the flag is set. Inside, the program can open its console host,
+/// so the host must carry the flag too, or the program could make the calls through it.
+#[test]
+fn win32k_lockdown_reaches_the_program_its_children_and_its_console_host() {
+    let probe = probe_path();
+    let (code, output) = outside_with_lockdown(&probe, &["win32k-call", "x"], false);
+    assert_eq!(code, 0, "{output}");
+    parse_line(output.trim_end()).assert_ok();
+    let (code, output) = outside_with_lockdown(&probe, &["win32k-call", "x"], true);
+    assert_eq!(code, 0, "{output}");
+    parse_line(output.trim_end()).assert_blocked();
+
+    let children = !appcontainer_children_blocked();
+    let child = format!("{probe}\u{1f}win32k-policy\u{1f}x");
+    let mut actions = vec![
+        ("win32k-policy", "x"),
+        ("win32k-of", "conhost.exe"),
+        ("win32k-call", "x"),
+    ];
+    if children {
+        actions.push(("spawn-output", &child));
+    }
+    for (deny, flags) in [(true, "0x1"), (false, "0x0")] {
+        let sandbox_args = if deny {
+            args(&["--windows-win32k", "deny"])
+        } else {
+            Vec::new()
+        };
+        let lines = probe_inside(&sandbox_args, &actions);
+        assert_eq!(lines[0].detail, format!("flags {flags}"), "{lines:?}");
+        lines[1].assert_ok();
+        assert!(
+            lines[1]
+                .detail
+                .split(' ')
+                .all(|host| host.ends_with(&format!("={flags}"))),
+            "{lines:?}"
+        );
+        if children {
+            assert!(
+                lines[3].detail.contains(&format!("flags {flags}")),
+                "{lines:?}"
+            );
+        }
+        if deny {
+            lines[2].assert_blocked();
+        } else if lines[2].result != "ok" {
+            skip(
+                "win32k-in-appcontainer",
+                &format!(
+                    "this session refuses win32k calls of AppContainer processes also without the \
+                     lockdown ({}), as over SSH (docs/windows.md limitation 13), so the call shows \
+                     no difference",
+                    lines[2].detail
+                ),
+            );
+        }
+    }
+}
+
+/// The relays run in the program's AppContainer, where the program can open them, so they start
+/// with win32k system calls disabled too, and still relay. The program reads the flag of every
+/// relay it can query; without the key the flag is clear.
+#[test]
+fn the_relays_run_with_the_win32k_lockdown() {
+    let fixture = Fixture::new("win32k-relays");
+    let free_port = || {
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    };
+    for (deny, flags) in [(true, "0x1"), (false, "0x0")] {
+        let held = TcpListener::bind("127.0.0.1:0").unwrap();
+        let inner = held.local_addr().unwrap().port();
+        let outer = free_port();
+        drop(held);
+        let mut sandbox_args = fixture.access_args();
+        sandbox_args.extend(args(&["--ip", "all", "--expose"]));
+        sandbox_args.push(format!("127.0.0.1:{outer}={inner}"));
+        sandbox_args.push("--forward".into());
+        sandbox_args.push(format!("{}=127.0.0.1:{}", free_port(), free_port()));
+        if deny {
+            sandbox_args.extend(args(&["--windows-win32k", "deny"]));
+        }
+        let inner_address = format!("127.0.0.1:{inner}");
+        let mut server = Command::new(sandy_path())
+            .args(run_args(
+                &sandbox_args,
+                &[("win32k-of", "sandy.exe"), ("tcp-accept", &inner_address)],
+            ))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while server.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "the server never accepted");
+            let _ = TcpStream::connect_timeout(
+                &format!("127.0.0.1:{outer}").parse().unwrap(),
+                Duration::from_millis(500),
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let output = server.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let lines = parse(&output);
+        lines[0].assert_ok();
+        let relays: Vec<&str> = lines[0].detail.split(' ').collect();
+        assert_eq!(relays.len(), 2, "{lines:?}");
+        assert!(
+            relays
+                .iter()
+                .all(|relay| relay.ends_with(&format!("={flags}"))),
+            "{lines:?}"
+        );
+        lines[1].assert_ok();
+    }
+}
+
+/// What the lockdown costs (docs/windows.md, "Win32k"): a program that loads `user32.dll`
+/// cannot start, because the DLL calls win32k when it loads. Measured outside the sandbox, so
+/// the AppContainer plays no part; the run in the sandbox shows a program that needs no win32k
+/// working there with the key.
+#[test]
+fn win32k_lockdown_stops_programs_that_load_user32() {
+    let system = PathBuf::from(std::env::var("SystemRoot").unwrap()).join("System32");
+    let program = |name: &str| system.join(name).to_str().unwrap().to_string();
+    // Console programs that start with the lockdown (they load no GUI library), and ones that do
+    // not (they load user32.dll, which calls win32k when it initializes). Every one runs without
+    // the lockdown.
+    let starting = [
+        (program("cmd.exe"), vec!["/c", "echo", "ok"]),
+        (program("tar.exe"), vec!["--version"]),
+        (program("curl.exe"), vec!["--version"]),
+        (program("hostname.exe"), vec![]),
+    ];
+    let stopped = [
+        (
+            program(r"WindowsPowerShell\v1.0\powershell.exe"),
+            vec![
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Write-Output ok",
+            ],
+        ),
+        (program("whoami.exe"), vec![]),
+    ];
+    let mut failures = Vec::new();
+    let mut record = |path: &str, args: &[&str], lockdown: bool, want: u32| {
+        let (code, output) = outside_with_lockdown(path, args, lockdown);
+        if code != want {
+            let name = Path::new(path).file_name().unwrap().to_string_lossy();
+            let out = output.lines().next().unwrap_or("").trim();
+            failures.push(format!(
+                "{name} lockdown={lockdown}: exit {code:#x}, want {want:#x} [{out}]"
+            ));
+        }
+    };
+    for (path, program_args) in starting.iter().chain(&stopped) {
+        record(path, program_args, false, 0);
+    }
+    for (path, program_args) in &starting {
+        record(path, program_args, true, 0);
+    }
+    for (path, program_args) in &stopped {
+        record(path, program_args, true, STATUS_DLL_INIT_FAILED);
+    }
+    assert!(failures.is_empty(), "\n---- win32k programs: {failures:?}");
+
+    let output = sandy(run_program(
+        &args(&["--windows-win32k", "deny"]),
+        &program("cmd.exe"),
+        &["/c", "echo", "ok"],
+    ));
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
+}

@@ -364,6 +364,7 @@ idempotent, and on Linux and macOS it does nothing because those backends leave 
 | `--pass-env NAME` | Copy the variable `NAME` into the program's environment, if it is set. | |
 | `--set-env NAME=VALUE` | Set a variable in the program's environment. Overrides `--pass-env`. | |
 | `--appcontainer NAME` | The AppContainer name (Windows; required there). | |
+| `--windows-win32k allow\|deny` | On Windows, whether the program may make the system calls of win32k (the GUI part of the kernel). `deny` stops many programs that load `user32.dll`. | `allow` |
 | `--cwd DIR` | Working directory of the program. | sandy's |
 
 The options that take a path or a variable can be repeated.
@@ -474,6 +475,7 @@ path_metadata = "deny"          # "deny" | "allow"
 
 [windows]
 appcontainer_name = "example.app"
+win32k = "allow"                # "allow" | "deny"; deny blocks win32k system calls
 ```
 
 The block names every key; it is not a policy that runs as written, because `expose` needs
@@ -775,6 +777,10 @@ wrote.
   can always write there, but sandy makes sure it cannot execute anything it writes there.
 - **Console.** The program gets its own hidden console; sandy relays standard input and output.
   Ctrl+C ends the program.
+- **Win32k lockdown.** `win32k = "deny"` starts the program (and its children and relays) with
+  the system calls of win32k, the GUI part of the Windows kernel, disabled. It cuts a large
+  attack surface, but a program that loads `user32.dll` ends at startup, so turn it on only for a
+  program you have checked starts with it (see [docs/windows.md](docs/windows.md)).
 - Details and limitations: [docs/windows.md](docs/windows.md).
 
 ## Using sandy from another program

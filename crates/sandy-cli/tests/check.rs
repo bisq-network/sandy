@@ -222,6 +222,52 @@ fn check_warns_when_an_option_weakens_the_policy_file() {
     assert!(!stderr.contains("replaces"), "{stderr}");
 }
 
+/// `windows.win32k = "deny"` is a requirement on every platform: Windows enforces it with a
+/// process mitigation, which `check` tries on a suspended process, and the platforms without
+/// win32k report it as given. Without the key nothing is required, and an option that allows
+/// the calls again over a file that denies them is named.
+#[test]
+fn check_reports_the_win32k_requirement() {
+    let fixture = Fixture::new("check-win32k");
+    let policy = fixture.path("ro/policy.toml");
+    fs::write(&policy, "version = 1\n[windows]\nwin32k = \"deny\"\n").unwrap();
+    let policy = policy.to_str().unwrap();
+    let check = |args: &[&str]| {
+        let mut all = vec!["check".to_string()];
+        all.extend(platform_args());
+        all.extend(args.iter().map(|arg| arg.to_string()));
+        sandy(&all)
+    };
+
+    let output = check(&["--policy", policy]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("enforced     win32k system calls denied: ")),
+        "{stdout}"
+    );
+
+    // Control: the default asks for nothing.
+    let output = check(&[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(!stdout.contains("win32k"), "{stdout}");
+
+    let output = check(&["--policy", policy, "--windows-win32k", "allow"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("win32k"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        warns(
+            &stderr,
+            "--windows-win32k allow replaces win32k = \"deny\" from the policy file"
+        ),
+        "{stderr}"
+    );
+}
+
 /// Runs `sandy check` with `args` and returns its standard error.
 fn check_warnings(args: &[&str]) -> String {
     let mut all = vec!["check".to_string()];
