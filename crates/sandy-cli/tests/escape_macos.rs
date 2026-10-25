@@ -501,7 +501,7 @@ fn writable_roots_cannot_be_deleted_or_replaced() {
 fn sandy_refuses_to_run_inside_a_sandbox() {
     let fixture = Fixture::new("macos-nested");
     let inner = fixture.path("bin/sandy");
-    fs::copy(sandy_path(), &inner).unwrap();
+    copy_executable(sandy_path(), &inner);
     let inner = inner.to_str().unwrap().to_string();
     let probe = fixture.copy_probe("bin");
     let readable = fixture.arg("ro/file");

@@ -42,6 +42,10 @@ const EXPECTED_SKIPS: &[(&str, &str)] = &[
         "macos-26-arm",
         include_str!("expected-skips/macos-26-arm.txt"),
     ),
+    (
+        "macos-27-arm",
+        include_str!("expected-skips/macos-27-arm.txt"),
+    ),
 ];
 
 /// Set for the test binary that the self-checks below start, so that one test skips a feature.

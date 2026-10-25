@@ -180,7 +180,7 @@ impl Fixture {
         let probe = probe_path();
         let name = Path::new(&probe).file_name().unwrap();
         let destination = self.path(dir).join(name);
-        fs::copy(&probe, &destination).unwrap();
+        copy_executable(&probe, &destination);
         destination.to_str().unwrap().to_string()
     }
 }
@@ -373,6 +373,18 @@ where
         }
     }
     panic!("{} stayed busy for two seconds", program.display());
+}
+
+/// Copies the executable `from` to `to` for a test to run. A child that another thread forked
+/// while the copy was written still holds the descriptor the copy wrote through until it executes
+/// its own program, and until then the kernel refuses to execute the copy, also when the probe
+/// does so inside the sandbox, where nothing waits. Nobody opens the copy for writing again, so
+/// once one execve of it succeeds every later one does too: running it once here, with no
+/// arguments, waits out that window for every later use.
+pub fn copy_executable(from: impl AsRef<Path>, to: impl AsRef<Path>) {
+    fs::copy(from, &to).unwrap();
+    #[cfg(unix)]
+    run_copied(to.as_ref(), std::iter::empty::<&str>());
 }
 
 /// A socket as the standard input of a child, so a test can hand the program a socket it opened

@@ -707,7 +707,7 @@ wrote.
 
 ### macOS
 
-- **Tested** on macOS 15 (arm64) through GitHub Actions, and on macOS 26 (arm64).
+- **Tested** on macOS 15 (arm64) through GitHub Actions, and on macOS 26 and 27 (arm64).
 - **Not through Rosetta:** x86_64 code cannot run in the sandbox on Apple silicon, because Rosetta
   cannot load its runtime there. sandy refuses a program without arm64 code on Apple silicon,
   and for a script the interpreter of its `#!` line, which is what the kernel loads. Its x86_64

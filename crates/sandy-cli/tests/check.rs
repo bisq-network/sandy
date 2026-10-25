@@ -517,7 +517,7 @@ fn check_reports_contained_children_inside_a_contained_sandbox() {
     }
     let fixture = Fixture::new("check-nested");
     let inner = fixture.path("bin/sandy");
-    fs::copy(sandy_path(), &inner).unwrap();
+    copy_executable(sandy_path(), &inner);
     let contained = ["--signals", "isolated", "--children", "contained"];
     let inner_check: Vec<String> = [inner.to_str().unwrap(), "check"]
         .into_iter()

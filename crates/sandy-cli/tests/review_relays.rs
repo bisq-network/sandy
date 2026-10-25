@@ -61,46 +61,60 @@ fn holding_service() -> (u16, mpsc::Sender<()>) {
 /// stale listener from another owner would receive the outside connections.
 #[test]
 fn relay_bind_conflict_fails_closed() {
-    // Occupy the address the relay would listen on.
-    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
-    let outer = occupied.local_addr().unwrap().port();
-    let inner = free_port();
+    // The control frees the occupied port, and `free_port` only reports a port that was free a
+    // moment ago, so another process on the host can take either before sandy binds them. That
+    // is the test's own race, not a refusal to enforce the policy, so it picks another pair
+    // instead of failing. Anything else sandy says fails.
+    for _ in 0..10 {
+        // Occupy the address the relay would listen on.
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let outer = occupied.local_addr().unwrap().port();
+        let inner = free_port();
 
-    let sandbox_args = [
-        "--ip".to_string(),
-        "all".to_string(),
-        "--expose".to_string(),
-        format!("127.0.0.1:{outer}={inner}"),
-    ];
-    let output = Command::new(sandy_path())
-        .args(run_args(&sandbox_args, &[("env", "PATH")]))
-        .output()
-        .unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(EXIT_FAILURE),
-        "a run whose relay cannot bind must be refused: {output:?}"
-    );
-    assert!(
-        output.stdout.is_empty(),
-        "the program ran although the relay could not bind: {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
+        let sandbox_args = [
+            "--ip".to_string(),
+            "all".to_string(),
+            "--expose".to_string(),
+            format!("127.0.0.1:{outer}={inner}"),
+        ];
+        let output = Command::new(sandy_path())
+            .args(run_args(&sandbox_args, &[("env", "PATH")]))
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(EXIT_FAILURE),
+            "a run whose relay cannot bind must be refused: {output:?}"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "the program ran although the relay could not bind: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
 
-    // Control: with the address free, the identical run starts the program and produces output.
-    drop(occupied);
-    let output = Command::new(sandy_path())
-        .args(run_args(&sandbox_args, &[("env", "PATH")]))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "with a free listen address the run must start: {output:?}"
-    );
-    assert!(
-        !output.stdout.is_empty(),
-        "the control run produced no probe output: {output:?}"
-    );
+        // Control: with the address free, the identical run starts the program and produces
+        // output.
+        drop(occupied);
+        let output = Command::new(sandy_path())
+            .args(run_args(&sandbox_args, &[("env", "PATH")]))
+            .output()
+            .unwrap();
+        if !output.status.success()
+            && String::from_utf8_lossy(&output.stderr).contains("Address already in use")
+        {
+            continue;
+        }
+        assert!(
+            output.status.success(),
+            "with a free listen address the run must start: {output:?}"
+        );
+        assert!(
+            !output.stdout.is_empty(),
+            "the control run produced no probe output: {output:?}"
+        );
+        return;
+    }
+    panic!("another process took the control's ports ten times in a row");
 }
 
 /// The internal `__relay` and `__forward` commands are not part of the documented interface. A

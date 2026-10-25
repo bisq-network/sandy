@@ -590,7 +590,7 @@ fn sigio_through_f_setown_follows_no_signal_policy() {
 /// SIOCSPGRP (sockets) and TIOCSPGRP (pipes) set the same owner. Seatbelt checks `file-ioctl`
 /// only for files and devices, so the ioctl allowlist does not reach sockets and pipes, and no
 /// operation of the profile language does (`socket-ioctl` compiles and stops none of them,
-/// measured on macOS 26.5). This records that the signal still arrives under
+/// measured on macOS 26.5 and 27.0.1). This records that the signal still arrives under
 /// `signals = "isolated"`, as docs/macos.md says.
 #[test]
 fn sigio_through_owner_ioctls_follows_no_signal_policy() {

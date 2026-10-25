@@ -377,7 +377,7 @@ fn refuses_a_policy_file_reached_through_a_link_in_a_writable_path() {
 fn refuses_a_sandy_executable_a_writable_path_reaches() {
     let fixture = Fixture::new("sandy-link");
     let copy = fixture.path("bin/sandy");
-    fs::copy(sandy_path(), &copy).unwrap();
+    copy_executable(sandy_path(), &copy);
     let check = |program: &std::path::Path| {
         let mut args = vec!["check".to_string()];
         args.extend(platform_args());

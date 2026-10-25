@@ -6,9 +6,9 @@ process, and then replaces itself with the target. The target keeps sandy's proc
 process it starts inherits the sandbox.
 
 Status: the pure parts (profile generation and planning) are unit tested on every platform. The
-parts that call macOS run in the tests on the macOS 15 CI runner (arm64) and on macOS 26 (arm64);
-see [Verification](#verification). The x86_64 build has not run on an Intel Mac, and does not
-work through Rosetta (see "Known limitations"). An older macOS may reject an
+parts that call macOS run in the tests on the macOS 15 CI runner (arm64) and on macOS 26 and 27
+(arm64); see [Verification](#verification). The x86_64 build has not run on an Intel Mac, and
+does not work through Rosetta (see "Known limitations"). An older macOS may reject an
 operation or filter in the profile; `sandy check` then reports it and sandy refuses to run.
 
 ## What `sandy run` does
@@ -167,7 +167,10 @@ which still writes the crash report, but to `/Library/Logs/DiagnosticReports` in
 user's `~/Library/Logs/DiagnosticReports`. That directory and its reports are readable only by
 root and the group `_analyticsusers`: on the test Mac the administrator account was a member and
 the standard account was not. So a standard user cannot read the crash reports of a program
-that sandy runs, and the user's own ReportCrash agent does not see the crash.
+that sandy runs, and the user's own ReportCrash agent does not see the crash. Measured again on
+macOS 27.0.1: the report of a program that crashed under `sandy run` went to
+`/Library/Logs/DiagnosticReports`, readable only by root and `_analyticsusers`, and the standard
+user had no `~/Library/Logs/DiagnosticReports`.
 
 What stays: the host name port, which every process inherits (see "Information the target can
 still read").
@@ -337,7 +340,7 @@ Not in the set, on purpose:
 `/dev/fd` is the one tree of the set that the program may write to. It widens nothing:
 `/dev/fd/N` is another name for a descriptor the program already holds, and opening it
 duplicates that descriptor instead of opening the file again. XNU's `dupfdopen` refuses a mode
-the original lacks, measured on macOS 26.5 and in the escape test
+the original lacks, measured on macOS 26.5 and 27.0.1 in the escape test
 `a_descriptor_path_grants_no_more_than_the_descriptor`: `open("/dev/fd/0", O_WRONLY)` on a
 read-only standard input gives `EACCES` inside the sandbox and outside it, and so does
 `truncate("/dev/fd/0")`. `chmod`, `utimes`, `chflags` and `setattrlist` on `/dev/fd/N` do reach
@@ -536,7 +539,7 @@ and `signals = "any"`.
 A continued relay serves what its listeners collected while it was stopped. The kqueue reports
 a listener once when it becomes ready, and the relay then accepts its whole backlog, so when
 the program's own connection made the listener ready before the program ended, a connection
-made after the end is accepted with it. Measured on macOS 26.5
+made after the end is accepted with it. Measured on macOS 26.5 and 27.0.1
 (`a_continued_relay_serves_a_connection_made_after_the_program_ended`): the program connects
 through a forwarded port while its relay is stopped and ends, a client connects after the end,
 and once the relay is continued the forwarded service receives both connections. Without a
@@ -564,23 +567,25 @@ without that check, because the kernel sends those signals itself:
   pipes), `SIOCSPGRP` (sockets) and `TIOCSPGRP` (pipes) set the same owner, and Seatbelt checks
   `file-ioctl`, and with it the ioctl allowlist, only for files and devices. No operation of the
   profile language reaches them all: `socket-ioctl` stops only `SIOCSPGRP` on an IP socket, where
-  `FIOSETOWN` still works, and with an `ioctl-command` filter it matches nothing. Measured on
-  macOS 26.5, each of the four delivers SIGIO to a process outside the sandbox under
-  `signals = "isolated"` (`sigio_through_owner_ioctls_follows_no_signal_policy`). The owner may
+  `FIOSETOWN` still works, and never an ioctl on a Unix socket. With an `ioctl-command` filter it
+  matched nothing on macOS 26.5; on macOS 27.0.1 the filter matches, but still only `SIOCSPGRP`
+  on an IP socket, so it closes no route. Measured on macOS 26.5 and 27.0.1, each of the four
+  delivers SIGIO to a process outside the sandbox under `signals = "isolated"`
+  (`sigio_through_owner_ioctls_follows_no_signal_policy`). The owner may
   belong to another user: the kernel sends SIGIO across the user boundary with no owner check, so
-  that reach is a macOS kernel behaviour outside sandy's reach. Measured on macOS 26.5 with a
-  second account: from `sandy run --signals isolated` as one user (uid 502), SIGIO reached a
+  that reach is a macOS kernel behaviour outside sandy's reach. Measured on macOS 26.5 and 27.0.1
+  with a second account: from `sandy run --signals isolated` as one user (uid 502), SIGIO reached a
   process of another user (uid 501) that handled it, through each owner ioctl, by process id and
   by negative process group; `F_SETOWN` stayed denied. SIGURG was measured within one user only,
   and a target owned by root was not tested. The same owner
   gets SIGURG when urgent data arrives on a TCP socket, which with `ip = "all"` the program can
   send itself over loopback; measured the same way. Not even the `ioctl` system call as a whole
   can be denied: a `syscall-unix` rule for its number has no effect, while the same rule stops
-  `fsgetpath` (measured on macOS 26.5). The program cannot choose the signal, and the default
-  action of SIGIO and SIGURG is to discard it, so only a process that handles them notices; a
-  negative owner names a process group, so one ioctl reaches every such process of a group. With
-  the default `signals = "any"` the program may signal every process anyway, so the `F_SETOWN`
-  rule is only added for `isolated`.
+  `fsgetpath` (measured on macOS 26.5 and 27.0.1). The program cannot choose the signal, and the
+  default action of SIGIO and SIGURG is to discard it, so only a process that handles them
+  notices; a negative owner names a process group, so one ioctl reaches every such process of a
+  group. With the default `signals = "any"` the program may signal every process anyway, so the
+  `F_SETOWN` rule is only added for `isolated`.
 - Job control. The kernel stops a whole process group when one of its processes reads a terminal
   in the background, and that send has no check behind it either. A program can join the process
   group of another job of the terminal session it was started in: `setpgid` cannot be filtered by
@@ -675,11 +680,11 @@ ID, so it ends with the group, also while sandy is stopped and therefore does no
 No process may leave the group. The profile denies `setpgid` (82) and `setsid` (147) with
 `syscall-unix` rules, as it denies the lookups by file ID. That is not enough: `posix_spawn` with
 the flag `POSIX_SPAWN_SETSID` or `POSIX_SPAWN_SETPGROUP` puts the new process into a session or
-group of its own inside the kernel, without calling either system call, and a test on macOS 26
-moved a process out of the group this way with both calls denied. A profile rule sees only the
-system call number of `posix_spawn` (244), not its flags, so the profile denies `posix_spawn` as a
-whole. `fork`, `vfork` and `execve` stay allowed, and so does `process-fork`. The sandbox also
-cannot reach launchd or other services that would start a process for it (see
+group of its own inside the kernel, without calling either system call, and tests on macOS 26
+and 27.0.1 moved a process out of the group this way with both calls denied. A profile rule sees
+only the system call number of `posix_spawn` (244), not its flags, so the profile denies
+`posix_spawn` as a whole. `fork`, `vfork` and `execve` stay allowed, and so does `process-fork`.
+The sandbox also cannot reach launchd or other services that would start a process for it (see
 [Mach services and other IPC](#mach-services-and-other-ipc)).
 
 Programs that start processes with `posix_spawn` therefore get `EPERM`: Rust's
@@ -936,15 +941,15 @@ none, so the backend answers nothing and sandy refuses the option.
 - `getcwd` fails when the working directory is outside the policy.
 - A policy path spelled through the data volume, such as `/System/Volumes/Data/private/tmp/x`
   for `/private/tmp/x`, grants nothing. A firmlink is no symbolic link, so `canonicalize` keeps
-  that spelling, while Seatbelt matches the path through the firmlink: measured on macOS 26.5,
-  a program with that `read_write` path could write neither under it nor under `/private/tmp/x`.
-  Give the path without the prefix; the program may then use either spelling.
+  that spelling, while Seatbelt matches the path through the firmlink: measured on macOS 26.5
+  and 27.0.1, a program with that `read_write` path could write neither under it nor under
+  `/private/tmp/x`. Give the path without the prefix; the program may then use either spelling.
 - sandy cannot run inside another Seatbelt sandbox; `sandy check` reports this.
 - x86_64 code does not run in the sandbox on Apple silicon. Rosetta loads its runtime
   (`libRosettaRuntime`) into every translated process, and the profile does not allow it, so the
   program would abort with "rosetta error: Failed to open libRosettaRuntime" (measured on macOS
-  26). A translated process executes universal programs such as `/bin/echo` as x86_64 too. The
-  plan therefore refuses, before anything starts, when sandy itself runs translated
+  26 and 27.0.1). A translated process executes universal programs such as `/bin/echo` as x86_64
+  too. The plan therefore refuses, before anything starts, when sandy itself runs translated
   (`sysctl.proc_translated`), and on Apple silicon (`hw.optional.arm64`) when the file the kernel
   would load has no arm64 code (`binary::has_arm64_code` reads its header). For a script that is
   the interpreter of the `#!` line, one level deep, as for the `read_exec` check. A program that
@@ -952,9 +957,11 @@ none, so the backend answers nothing and sandy refuses the option.
   interpreter that `/usr/bin/env` finds on the PATH, because sandy judges only the file the
   kernel loads first. An arm64e slice counts as arm64 code: measured on macOS 26.5, a third
   party arm64e program built with the Command Line Tools runs, and in a file with an x86_64 and
-  an arm64e slice the kernel picks arm64e. Allowing Rosetta would need its
-  runtime, its translation cache and probably its Mach service in the profile, which has not been
-  evaluated.
+  an arm64e slice the kernel picks arm64e. Measured on macOS 27.0.1 with `sandbox-exec` and the
+  profile sandy generates: a small x86_64 C program ran once the profile also allowed reading and
+  mapping as executable `/Library/Apple/usr/libexec/oah`, where `libRosettaRuntime` lies. It
+  needed no Mach service, no write to the translation cache and nothing in
+  `/usr/libexec/rosetta`. Larger programs may need more; sandy grants none of it.
 - With `process.children = "contained"` the target cannot use `posix_spawn`, so programs that
   start processes through it (Rust's `std::process::Command`, Java, Node.js, `system()`,
   `popen()`) fail to start them (see [Contained child processes](#contained-child-processes)).
@@ -995,7 +1002,8 @@ macOS only:
   by-id calls and `getfsstat`), and the measurements that record what the sandbox does where it
   cannot stop something: `getattrlist`, the existence of paths outside the policy, process ids,
   SIGIO and the process groups of the terminal session. A check that this host cannot run reports
-  a skip, and `tests/expected-skips/macos-26-arm.txt` lists the ones that are expected.
+  a skip, and `macos-26-arm.txt` and `macos-27-arm.txt` in `tests/expected-skips/` list the ones
+  that are expected.
 
 To see what the sandbox denies on a Mac, from an administrator account (a standard user gets
 no log, see [Diagnostic mode](#diagnostic-mode)):
