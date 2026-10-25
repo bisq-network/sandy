@@ -263,6 +263,21 @@ fn name_resolver_follows_ip() {
     lines[1].assert_ok();
 }
 
+/// NECP is the kernel's network policy layer: Network.framework opens a NECP client for every
+/// connection, and `(deny default)` does not stop its calls. With `ip = "none"` the profile
+/// denies them by number. With `ip = "client"` and `"all"` they stay allowed, because URLSession
+/// and Network.framework fail without them.
+#[test]
+fn necp_follows_ip() {
+    let fixture = Fixture::new("macos-necp");
+    let actions = [("necp-open", "")];
+    controlled(&fixture.access_args(), &actions)[0].assert_blocked();
+    for value in ["client", "all"] {
+        let ip = with(fixture.access_args(), &["--ip", value]);
+        probe_inside(&ip, &actions)[0].assert_ok();
+    }
+}
+
 #[test]
 fn names_resolve_when_ip_is_allowed() {
     let fixture = home_fixture("resolve");
@@ -1483,8 +1498,10 @@ fn refuses_a_writable_firmlink_spelling_of_a_system_set_directory() {
 }
 
 /// Seatbelt matches a path through the firmlink, so a policy path spelled through the data
-/// volume grants nothing, under either spelling. This records the limitation in docs/macos.md;
-/// the control grants the same directory under its own name.
+/// volume grants nothing, under either spelling. It checks the existence of a path as the
+/// program spells it, and the profile grants only the plain spelling, so the data volume
+/// spelling of a granted path looks missing as well. This records both limitations in
+/// docs/macos.md; the control grants the same directory under its own name.
 #[test]
 fn a_policy_path_through_the_data_volume_grants_nothing() {
     let fixture = Fixture::new("macos-data-volume");
@@ -1498,15 +1515,22 @@ fn a_policy_path_through_the_data_volume_grants_nothing() {
     let plain = fixture.path("rw/plain").to_str().unwrap().to_string();
     let through = format!("{alias}/through");
     let actions = [("write", plain.as_str()), ("write", through.as_str())];
-    for line in probe_inside(
+    let missing = |line: &ProbeLine| {
+        assert!(
+            line.detail.ends_with("(os error 2)"),
+            "a data volume spelling reaches the file now; the documented limitation is stale: \
+             {line:?}"
+        );
+    };
+    let granted = probe_inside(
         &with(Vec::new(), &["--read-write", &fixture.arg("rw")]),
         &actions,
-    ) {
-        line.assert_ok();
-    }
+    );
+    granted[0].assert_ok();
+    missing(&granted[1]);
     for line in probe_inside(&with(Vec::new(), &["--read-write", &alias]), &actions) {
-        assert_eq!(
-            line.result, "denied",
+        assert_ne!(
+            line.result, "ok",
             "a data volume spelling grants access now; the documented limitation is stale: \
              {line:?}"
         );

@@ -465,6 +465,7 @@ exceptions:
 | Linux | `path_metadata = "deny"` with a `read` or `read_exec` path | the mode, except the setuid and setgid bits, and the times of a file or directory the program may only read, through a descriptor it opened for reading (`fchmod`, `futimens`) |
 | macOS | `signals = "isolated"` | SIGIO (to a process of any user), and SIGURG with `ip = "client"` or `ip = "all"`, through the owner ioctls of sockets and pipes; without `children = "contained"` also joining another job of the terminal session and stopping it |
 | macOS | `ip = "client"` | a UDP socket that is not connected receives datagrams from every sender, at any port the program binds |
+| macOS | `unix_sockets = "all"` | whether a path outside the policy exists, and its path through `getattrlist`, also by inode number through `/.vol` |
 | macOS | `forward` | every local user reaches the forwarded service |
 | macOS | `expose` or `forward` with `signals = "any"` | a stopped relay has no time limit |
 | Windows | a directory in the policy | a file moved out of a granted directory keeps its grant |
@@ -670,6 +671,12 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   pasteboard, through which another process could act for the target.
 - Setuid and setgid files never execute. The root of a writable path cannot be deleted or
   replaced, so the target cannot redirect the next run with a symbolic link.
+- Outside the policy every path answers `ENOENT`, as a path that does not exist, to every call,
+  and every other process `ESRCH`; `getpriority`, `getpgid` and `getsid` are denied by number.
+  Writes to a `read` path keep `EPERM`. With `unix_sockets = "all"`, `access`, `statfs`,
+  `chdir` and the path from `getattrlist` answer for every path again, because a connect to a
+  socket outside the policy needs that check. `kill(pid, 0)` still tells a live process ID from
+  an unused one.
 - Hard links are denied; clones (`std::fs::copy`) work only into writable paths and only from
   files the target may read. ptrace attach is denied (Seatbelt checks it as `system-debug`).
 - dyld needs the root directory itself (only the names in `/`) to find the shared cache, so the
@@ -677,6 +684,9 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   backend refuses that unless a policy path covers "/".
 - Name resolution is part of `ip = "all"` and `ip = "client"`: the profile allows exactly the
   Unix socket of mDNSResponder, so DNS does not need `unix_sockets = "all"`.
+- `ip = "none"` also denies by number the calls of NECP, the kernel's network policy layer that
+  Network.framework works through. With `ip = "client"` and `ip = "all"` they stay allowed,
+  because URLSession and Network.framework fail without them.
 - `ip = "client"`: `network-outbound` and `network-bind` for IP sockets, `network-inbound` for UDP
   only. Seatbelt checks `listen` and `accept` as `network-inbound`, so no TCP socket listens, and
   also every datagram that a socket which is not connected receives, which UDP clients need.

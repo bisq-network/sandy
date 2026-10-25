@@ -146,6 +146,11 @@ pub const HOSTS_FILE: &str = "/private/etc/hosts";
 /// Symbolic link the resolver library passes through: it connects to /var/run/mDNSResponder.
 pub const VAR_SYMLINK: &str = "/var";
 
+/// The links of the system set that lead to a directory. Programs spell paths through them
+/// (`/etc/hosts`, `/tmp/x`, `$TMPDIR` below `/var/folders`), and so do links inside the time
+/// zone database.
+pub const DIRECTORY_LINKS: &[&str] = &["/etc", "/tmp", "/var"];
+
 /// Readable sysctls: hardware and operating system facts that libSystem (sysconf, uname), dyld
 /// and language runtimes query. None of them describes other processes or user data. The list
 /// follows Chromium's common.sb, plus four names the OpenAI Codex CLI added for common tools.
@@ -240,6 +245,29 @@ pub const MACHINE_ID_SYSCALLS: &[(&str, u32)] = &[("gethostuuid", 142)];
 /// a path that the sandbox checks, are not denied. Numbers from XNU `bsd/kern/syscalls.master`.
 pub const VOLUME_LIST_SYSCALLS: &[(&str, u32)] = &[("getfsstat", 18), ("getfsstat64", 347)];
 
+/// The system calls of NECP, the kernel's network policy layer, and of its network agents,
+/// denied with `ip = "none"`: necp_match_policy asks for the policy result of a connection,
+/// necp_open and necp_client_action are the client descriptor that Network.framework opens for
+/// each connection, necp_session_open and necp_session_action change policies (they need a
+/// privilege), and netagent_trigger starts a network agent, such as a VPN on demand, in another
+/// process. `(deny default)` stops none of them. Numbers from `sys/syscall.h` of the macOS 27
+/// SDK.
+pub const NECP_SYSCALLS: &[(&str, u32)] = &[
+    ("necp_match_policy", 460),
+    ("netagent_trigger", 490),
+    ("necp_open", 501),
+    ("necp_client_action", 502),
+    ("necp_session_open", 522),
+    ("necp_session_action", 523),
+];
+
+/// System calls that answer for any process ID with its priority, process group or session,
+/// and no profile operation covers them: getpriority, getpgid, getsid. A `syscall-unix` rule sees
+/// only the number, so the denial also refuses the program's questions about itself. Numbers
+/// from `sys/syscall.h` of the macOS 27 SDK.
+pub const PROCESS_QUERY_SYSCALLS: &[(&str, u32)] =
+    &[("getpriority", 100), ("getpgid", 151), ("getsid", 310)];
+
 /// System calls that move a process out of its process group, denied with
 /// `process.children = "contained"`. posix_spawn is denied as a whole: its POSIX_SPAWN_SETSID and
 /// POSIX_SPAWN_SETPGROUP flags change the group inside the kernel, where no profile rule sees
@@ -268,6 +296,21 @@ mod tests {
             assert!(symlink || !below_link, "not a real path: {}", entry.path);
             assert!(!entry.reason.is_empty());
         }
+    }
+
+    /// The profile lets paths be tested through these links. Only links of the system set have
+    /// their own metadata granted, which a lookup through a link needs.
+    #[test]
+    fn directory_links_are_links_of_the_system_set() {
+        for link in DIRECTORY_LINKS {
+            assert!(
+                MINIMAL
+                    .iter()
+                    .any(|entry| entry.path == *link && entry.access == SystemAccess::Symlink),
+                "{link}"
+            );
+        }
+        assert!(DIRECTORY_LINKS.contains(&VAR_SYMLINK));
     }
 
     #[test]

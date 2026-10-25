@@ -220,7 +220,8 @@ own sandbox and no file access; on Windows it runs in the program's AppContainer
 This example also shows a typical first problem: Python's web server reads `/etc/mime.types`,
 which is not in the minimal system set. Without `--read /etc/mime.types`, each request fails with
 `PermissionError`. When a program fails inside the sandbox, look for "Permission denied" (Linux),
-the sandbox log (macOS, from an administrator account: `log show --last 5m --predicate
+"No such file or directory" and the sandbox log (macOS, where every path outside the policy looks
+missing; the log from an administrator account: `log show --last 5m --predicate
 'sender == "Sandbox"'`) or "Access is denied" (Windows), and add exactly the path it needs.
 
 ### A policy file
@@ -741,6 +742,12 @@ metadata through the descriptor they wrote.
   loader and the system library cache. sandy refuses it there unless a policy path covers "/".
 - No Mach services are reachable from the sandbox, so programs that need them (for example to open
   other apps, use the pasteboard or read preferences) do not work.
+- Every path outside the policy looks missing: calls answer "No such file or directory", not
+  "Operation not permitted". With `unix_sockets = "all"`, `access`, `statfs` and `chdir` still
+  tell whether a path exists, because reaching a socket needs that check. A program that saves
+  its working directory first, such as `cp -R`, fails when it starts in a directory outside the
+  policy. Other processes look gone, and the program cannot read the priority, group or session
+  of any process, its own included.
 - The system writes the crash report of a program that sandy runs to
   `/Library/Logs/DiagnosticReports`, which administrators can read and standard users cannot,
   instead of the user's `~/Library/Logs/DiagnosticReports`.
@@ -850,8 +857,10 @@ sandy does not protect:
 - against bugs in the operating system kernel.
 
 What remains visible from inside the sandbox differs by platform; for example, on Linux the
-program can see which paths exist outside the policy, but not their contents. Each platform
-document lists these limitations.
+program can see which paths exist outside the policy, but not their contents, while on macOS
+every path outside the policy looks missing (with `unix_sockets = "all"` a few calls still tell
+whether it exists) and every other process looks gone. Each platform document lists these
+limitations.
 
 Independent reviews tried to escape the sandbox on every platform. Their findings were fixed, or
 are written down as limitations in the platform documents. Either way a test holds the result

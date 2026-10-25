@@ -221,6 +221,16 @@ fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
                 .to_string(),
         );
     }
+    if policy.unix_sockets == NetworkAccess::All {
+        shortfalls.push(
+            "unix_sockets = \"all\" lets the program tell existing paths outside the policy \
+             from missing ones on macOS: a connect to a socket needs the existence check for \
+             every path, so access, statfs, chdir and the path from getattrlist answer again, \
+             also by inode number through /.vol (docs/macos.md, \"Information the target can \
+             still read\")"
+                .to_string(),
+        );
+    }
     if contained {
         shortfalls.push(
             "children = \"contained\" denies posix_spawn on macOS, because its flags can move a \
@@ -296,9 +306,18 @@ fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
     let contained = policy.children == ChildProcesses::Contained;
     let text = match requirement {
         Requirement::FilesystemConfined => {
-            "deny by default; read, write and execute only policy paths and the system set; \
-             no Mach or XPC services (LaunchServices, Apple events, launchd, pasteboard); \
-             policy paths cannot be replaced"
+            if policy.unix_sockets == NetworkAccess::All {
+                "deny by default; read, write and execute only policy paths and the system set; \
+                 paths outside the policy answer ENOENT except to existence checks, which Unix \
+                 sockets need (unix_sockets = \"all\"); no Mach or XPC services \
+                 (LaunchServices, Apple events, launchd, pasteboard); policy paths cannot be \
+                 replaced"
+            } else {
+                "deny by default; read, write and execute only policy paths and the system set; \
+                 paths outside the policy answer ENOENT; no Mach or XPC services \
+                 (LaunchServices, Apple events, launchd, pasteboard); policy paths cannot be \
+                 replaced"
+            }
         }
         Requirement::NoPrivilegeEscalation => {
             "only policy paths execute; setuid and setgid files never do (process-exec* denied \
@@ -307,7 +326,7 @@ fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
         }
         Requirement::ProcessMemoryIsolated => {
             "no task ports of other processes (mach-priv*, mach-task-name, mach-task-read, \
-             mach-task-inspect); process-info* only for the target itself"
+             mach-task-inspect); process-info* only for the target itself, ESRCH for others"
         }
         Requirement::InheritedHandlesClosed => {
             return Mechanism::Exec(if contained {
@@ -326,11 +345,12 @@ fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
         }
         Requirement::IpNetworkDenied => {
             if policy.unix_sockets == NetworkAccess::All {
-                "no IP network-bind, network-inbound or network-outbound; the name resolver \
-                 (mDNSResponder) stays reachable like every Unix socket (unix_sockets = \"all\")"
+                "no IP network-bind, network-inbound or network-outbound, no NECP calls; the name \
+                 resolver (mDNSResponder) stays reachable like every Unix socket \
+                 (unix_sockets = \"all\")"
             } else {
-                "no IP network-bind, network-inbound or network-outbound; the name resolver \
-                 (mDNSResponder) is unreachable"
+                "no IP network-bind, network-inbound or network-outbound, no NECP calls; the name \
+                 resolver (mDNSResponder) is unreachable"
             }
         }
         Requirement::InboundIpDenied => {
@@ -662,6 +682,29 @@ mod tests {
         assert!(!without.contains("mDNSResponder"), "{without}");
     }
 
+    /// `check` names what the program sees outside the policy, and what `unix_sockets = "all"`
+    /// gives back.
+    #[test]
+    fn names_what_looks_missing_outside_the_policy() {
+        let mechanism_of = |policy: &ResolvedPolicy, requirement| {
+            let item = plan_for(policy, &capable())
+                .into_iter()
+                .find(|item| item.requirement == requirement)
+                .unwrap();
+            format!("{:?}", item.status)
+        };
+        let strict = strictest();
+        let files = mechanism_of(&strict, Requirement::FilesystemConfined);
+        assert!(files.contains("answer ENOENT;"), "{files}");
+        let processes = mechanism_of(&strict, Requirement::ProcessMemoryIsolated);
+        assert!(processes.contains("ESRCH for others"), "{processes}");
+        let ip = mechanism_of(&strict, Requirement::IpNetworkDenied);
+        assert!(ip.contains("no NECP calls"), "{ip}");
+        let unix = policy(IpAccess::None, NetworkAccess::All, SignalScope::Isolated);
+        let files = mechanism_of(&unix, Requirement::FilesystemConfined);
+        assert!(files.contains("except to existence checks"), "{files}");
+    }
+
     /// `ip = "client"` is the profile's, and the UDP route it leaves open is named, as is
     /// SIGURG, which urgent data on its TCP connections can raise.
     #[test]
@@ -691,6 +734,19 @@ mod tests {
         );
         let all = policy(IpAccess::All, NetworkAccess::None, SignalScope::Isolated);
         assert!(!udp(&all));
+    }
+
+    #[test]
+    fn warns_that_unix_sockets_all_shows_which_paths_exist() {
+        let warned = |unix_sockets| {
+            let policy = policy(IpAccess::None, unix_sockets, SignalScope::Isolated);
+            notes(&policy)
+                .iter()
+                .filter(|note| note.starts_with("unix_sockets = \"all\" lets the program tell"))
+                .count()
+        };
+        assert_eq!(warned(NetworkAccess::All), 1);
+        assert_eq!(warned(NetworkAccess::None), 0);
     }
 
     #[test]

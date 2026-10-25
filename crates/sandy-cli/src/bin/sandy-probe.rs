@@ -3139,6 +3139,16 @@ mod macos {
         "sigio-signal",
         "spawn-join",
         "fd-metadata",
+        "access",
+        "statfs",
+        "chdir",
+        "pid-info",
+        "pid-path",
+        "list-pids",
+        "getpgid",
+        "getsid",
+        "getpriority",
+        "necp-open",
     ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
@@ -3157,6 +3167,27 @@ mod macos {
             "sigio-signal" => sigio_signal(target),
             "spawn-join" => spawn_join(target),
             "fd-metadata" => fd_metadata(target),
+            "access" => path_call(target, |path| {
+                // SAFETY: access reads the NUL-terminated path.
+                unsafe { libc::access(path, libc::F_OK) }
+            }),
+            "statfs" => statfs(target),
+            "chdir" => path_call(target, |path| {
+                // SAFETY: chdir reads the NUL-terminated path.
+                unsafe { libc::chdir(path) }
+            }),
+            "pid-info" => pid_info(pid(target)?),
+            "pid-path" => pid_path(pid(target)?),
+            "list-pids" => list_pids(),
+            // SAFETY: getpgid takes a process ID and changes nothing.
+            "getpgid" => process_query(target, |pid| unsafe { libc::getpgid(pid) }),
+            // SAFETY: getsid takes a process ID and changes nothing.
+            "getsid" => process_query(target, |pid| unsafe { libc::getsid(pid) }),
+            "getpriority" => process_query(target, |pid| {
+                // SAFETY: getpriority takes a process ID and changes nothing.
+                unsafe { libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t) }
+            }),
+            "necp-open" => necp_open(),
             "rename" => {
                 let (from, to) = super::pair(target)?;
                 fs::rename(from, to).map(|()| String::new())
@@ -3335,6 +3366,121 @@ mod macos {
 
     fn cstr(value: &str) -> io::Result<CString> {
         CString::new(value).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL byte"))
+    }
+
+    /// A call that takes only a path and returns 0 or -1.
+    fn path_call(target: &str, call: impl Fn(*const c_char) -> libc::c_int) -> io::Result<String> {
+        let path = cstr(target)?;
+        if call(path.as_ptr()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(String::new())
+    }
+
+    /// The volume a path lies on, with its device and the directory it is mounted on.
+    fn statfs(target: &str) -> io::Result<String> {
+        let path = cstr(target)?;
+        // SAFETY: statfs is plain data, and the call fills all of it.
+        let mut volume: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: the path is NUL-terminated and `volume` is a statfs the call may write.
+        if unsafe { libc::statfs(path.as_ptr(), &mut volume) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(format!(
+            "{} on {}",
+            c_text(&volume.f_mntfromname),
+            c_text(&volume.f_mntonname)
+        ))
+    }
+
+    /// The text of a NUL-terminated C string buffer.
+    fn c_text(field: &[c_char]) -> String {
+        let bytes: Vec<u8> = field
+            .iter()
+            .take_while(|byte| **byte != 0)
+            .map(|byte| *byte as u8)
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// A process ID, or `self` for the probe's own.
+    fn pid(target: &str) -> io::Result<libc::pid_t> {
+        if target == "self" {
+            return Ok(std::process::id() as libc::pid_t);
+        }
+        target
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"))
+    }
+
+    /// The name and owner of a process (`proc_pidinfo` with PROC_PIDTBSDINFO).
+    fn pid_info(pid: libc::pid_t) -> io::Result<String> {
+        // SAFETY: proc_bsdinfo is plain data.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: the call writes at most `size` bytes into `info`.
+        let written = unsafe {
+            libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size)
+        };
+        if written != size {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(format!(
+            "uid {} name {}",
+            info.pbi_uid,
+            c_text(&info.pbi_name)
+        ))
+    }
+
+    /// The executable of a process (`proc_pidpath`).
+    fn pid_path(pid: libc::pid_t) -> io::Result<String> {
+        let mut path = [0 as c_char; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: the call writes at most the buffer's length into it.
+        let length =
+            unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
+        if length <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(c_text(&path))
+    }
+
+    /// How many processes `proc_listallpids` names.
+    fn list_pids() -> io::Result<String> {
+        // SAFETY: a null buffer asks for the number of processes only.
+        let count = unsafe { libc::proc_listallpids(ptr::null_mut(), 0) };
+        if count <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(format!("{count} processes"))
+    }
+
+    /// getpgid, getsid or getpriority of the process `target` names: -1 with errno set means
+    /// the call failed. getpriority may return -1 as a priority, so errno is cleared first.
+    fn process_query(
+        target: &str,
+        call: impl Fn(libc::pid_t) -> libc::c_int,
+    ) -> io::Result<String> {
+        let pid = pid(target)?;
+        // SAFETY: __error returns the address of this thread's errno.
+        unsafe { *libc::__error() = 0 };
+        let value = call(pid);
+        let error = io::Error::last_os_error();
+        if value == -1 && error.raw_os_error() != Some(0) {
+            return Err(error);
+        }
+        Ok(value.to_string())
+    }
+
+    /// necp_open(2), the descriptor Network.framework asks NECP through. The descriptor is
+    /// guarded: closing it would raise EXC_GUARD, so it stays open until the probe exits.
+    fn necp_open() -> io::Result<String> {
+        const SYS_NECP_OPEN: libc::c_int = 501;
+        // SAFETY: necp_open takes flags and returns a descriptor or -1.
+        let descriptor = unsafe { libc::syscall(SYS_NECP_OPEN, 0) };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(String::new())
     }
 
     /// Parses `DEV:INODE` (the st_dev and st_ino the test read outside the sandbox).

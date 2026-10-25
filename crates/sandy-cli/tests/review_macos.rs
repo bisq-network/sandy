@@ -2,10 +2,9 @@
 //! outside the sandbox, like the other escape tests, so a test cannot pass because the action
 //! was impossible anyway. Tests whose name says "stays", "cannot" or "does not" encode an
 //! invariant that held. The others record what the sandbox does where it cannot stop something,
-//! so that a change shows up as a failing test: `getattrlist_discloses_paths_outside_the_policy`
-//! is a proof of concept for a confirmed finding, and the tests around process groups, process
-//! ids, mounted volumes and the existence of paths bound limitations that `docs/macos.md`
-//! describes.
+//! so that a change shows up as a failing test: the tests around process groups, process ids and
+//! the paths that `unix_sockets = "all"` lets the program test bound limitations that
+//! `docs/macos.md` describes.
 #![cfg(target_os = "macos")]
 
 mod common;
@@ -426,68 +425,252 @@ fn bulk_listing_reaches_only_the_root_directory() {
     inside[1].assert_blocked();
 }
 
-/// `stat` outside the policy tells an existing file from one that does not exist: the profile
-/// refuses the first with EPERM, and the path lookup of the second fails with ENOENT. Contents
-/// and metadata stay unreadable, but the program can test whether a path exists. Recorded, not
-/// a guarantee: closing it would need a file system of its own.
-#[test]
-fn metadata_outside_the_policy_tells_existing_from_missing() {
-    let fixture = Fixture::new("macos-visibility");
-    let secret = fixture.arg("secret/file");
-    let missing = fixture.arg("secret/no-such-file");
-    let actions = [
-        ("metadata", secret.as_str()),
-        ("metadata", missing.as_str()),
-    ];
-
+/// The answers inside the sandbox for `action` on an existing path outside the policy and on a
+/// path that does not exist. The control outside shows that the first one exists.
+fn existing_and_missing(
+    fixture: &Fixture,
+    action: &str,
+    existing: &str,
+    missing: &str,
+) -> Vec<ProbeLine> {
+    let actions = [(action, existing), (action, missing)];
     let outside = probe_outside(&actions);
     outside[0].assert_ok();
     assert_eq!(outside[1].result, "error", "{outside:?}");
-
-    let inside = probe_inside(&fixture.access_args(), &actions);
-    assert_eq!(inside[0].result, "denied", "{inside:?}");
-    assert_eq!(inside[1].result, "error", "{inside:?}");
-    assert_ne!(
-        inside[0].detail, inside[1].detail,
-        "both answers are the same now; the documented limitation is stale"
-    );
+    probe_inside(&fixture.access_args(), &actions)
 }
 
-/// `getattrlist` answers a request for ATTR_CMN_FULLPATH without reading the file's
-/// attributes, and the kernel runs no check for that path building. A program inside the
-/// sandbox therefore learns the path of a file outside the policy, and with a `/.vol` path the
-/// path of any inode number of the volume, which is the disclosure the fsgetpath denial closed.
-/// Every other attribute is denied, so contents and metadata stay protected.
-///
-/// This records the current behaviour. Denying the two system calls by number closes it, but it
-/// also breaks `realpath(3)`, which libSystem builds on the same call: measured on macOS 26.5,
-/// sandy itself could no longer resolve a policy path inside the sandbox.
-#[test]
-fn getattrlist_discloses_paths_outside_the_policy() {
-    let fixture = Fixture::new("macos-getattr");
-    let metadata = fs::metadata(fixture.path("secret/file")).unwrap();
-    let only_the_path = |path: String| format!("{path}{ARGUMENT_SEPARATOR}fullpath");
-    let secret = only_the_path(fixture.arg("secret/file"));
-    let volume = only_the_path(format!("/.vol/{}/{}", metadata.dev(), metadata.ino()));
-    // The attributes of the same file, which the profile does decide on.
-    let attributes = fixture.arg("secret/file");
-    let actions = [
-        ("getattr", secret.as_str()),
-        ("getattr", volume.as_str()),
-        ("getattr", attributes.as_str()),
-    ];
+/// An existing path outside the policy must answer exactly like a missing one: ENOENT.
+fn assert_looks_missing(existing: &ProbeLine, missing: &ProbeLine) {
+    assert_eq!(existing.result, "error", "{existing:?}");
+    assert!(existing.detail.ends_with("(os error 2)"), "{existing:?}");
+    assert_eq!(existing.detail, missing.detail, "{existing:?} {missing:?}");
+}
 
+/// `stat` of a path outside the policy answers ENOENT, as for a path that does not exist, so the
+/// program cannot tell whether the path exists. It once answered EPERM for an existing path.
+#[test]
+fn metadata_outside_the_policy_looks_missing() {
+    let fixture = Fixture::new("macos-visibility");
+    let lines = existing_and_missing(
+        &fixture,
+        "metadata",
+        &fixture.arg("secret/file"),
+        &fixture.arg("secret/no-such-file"),
+    );
+    assert_looks_missing(&lines[0], &lines[1]);
+}
+
+/// `access` reaches only file-test-existence, which `(deny default)` does not cover. It once
+/// answered for every path outside the policy.
+#[test]
+fn access_outside_the_policy_looks_missing() {
+    let fixture = Fixture::new("macos-access");
+    let lines = existing_and_missing(
+        &fixture,
+        "access",
+        &fixture.arg("secret/file"),
+        &fixture.arg("secret/no-such-file"),
+    );
+    assert_looks_missing(&lines[0], &lines[1]);
+    probe_inside(
+        &fixture.access_args(),
+        &[("access", &fixture.arg("ro/file"))],
+    )[0]
+    .assert_ok();
+}
+
+/// `statfs` once answered for every path outside the policy, with the device and the directory
+/// the volume is mounted on.
+#[test]
+fn statfs_outside_the_policy_looks_missing() {
+    let fixture = Fixture::new("macos-statfs");
+    let lines = existing_and_missing(
+        &fixture,
+        "statfs",
+        &fixture.arg("secret/file"),
+        &fixture.arg("secret/no-such-file"),
+    );
+    assert_looks_missing(&lines[0], &lines[1]);
+    probe_inside(
+        &fixture.access_args(),
+        &[("statfs", &fixture.arg("ro/file"))],
+    )[0]
+    .assert_ok();
+}
+
+/// `chdir` into a directory outside the policy once succeeded.
+#[test]
+fn chdir_outside_the_policy_looks_missing() {
+    let fixture = Fixture::new("macos-chdir");
+    let lines = existing_and_missing(
+        &fixture,
+        "chdir",
+        &fixture.arg("secret"),
+        &fixture.arg("no-such-directory"),
+    );
+    assert_looks_missing(&lines[0], &lines[1]);
+    probe_inside(&fixture.access_args(), &[("chdir", &fixture.arg("ro"))])[0].assert_ok();
+}
+
+/// `getattrlist` answers a request for ATTR_CMN_FULLPATH without reading the file's attributes,
+/// so the profile decides it by file-test-existence alone. It once disclosed the path of a file
+/// outside the policy; now that answers like a missing path. Inside the policy the path still
+/// comes back, which `realpath(3)` needs.
+#[test]
+fn getattrlist_does_not_disclose_paths_outside_the_policy() {
+    let fixture = Fixture::new("macos-getattr");
+    let only_the_path = |path: String| format!("{path}{ARGUMENT_SEPARATOR}fullpath");
+    let lines = existing_and_missing(
+        &fixture,
+        "getattr",
+        &only_the_path(fixture.arg("secret/file")),
+        &only_the_path(fixture.arg("secret/no-such-file")),
+    );
+    assert_looks_missing(&lines[0], &lines[1]);
+    let inside = probe_inside(
+        &fixture.access_args(),
+        &[("getattr", &only_the_path(fixture.arg("ro/file")))],
+    );
+    assert!(inside[0].detail.ends_with("/ro/file"), "{inside:?}");
+}
+
+/// `/.vol/DEV/INODE` names a file by its inode number, and `getattrlist` with ATTR_CMN_FULLPATH
+/// on it turned an inode number into a path, the disclosure that the `fsgetpath` denial closed.
+/// Seatbelt checks such a lookup against the real path of the file, so the inode of a file
+/// outside the policy now answers like an inode that does not exist, to every call.
+#[test]
+fn volfs_names_no_file_outside_the_policy() {
+    let fixture = Fixture::new("macos-volfs-names");
+    let metadata = fs::metadata(fixture.path("secret/file")).unwrap();
+    let secret = format!("/.vol/{}/{}", metadata.dev(), metadata.ino());
+    // An inode number far above every file of a test volume.
+    let unused = format!("/.vol/{}/{}", metadata.dev(), u64::from(u32::MAX) * 64);
+    if probe_outside(&[("access", secret.as_str())])[0].result != "ok" {
+        return skip("volfs", "this host has no /.vol");
+    }
+    for (action, existing, missing) in [
+        ("access", secret.clone(), unused.clone()),
+        ("statfs", secret.clone(), unused.clone()),
+        (
+            "getattr",
+            format!("{secret}{ARGUMENT_SEPARATOR}fullpath"),
+            format!("{unused}{ARGUMENT_SEPARATOR}fullpath"),
+        ),
+    ] {
+        let lines = existing_and_missing(&fixture, action, &existing, &missing);
+        assert_looks_missing(&lines[0], &lines[1]);
+    }
+}
+
+/// Paths outside the policy look missing, but a write to a `read` path must still say that it is
+/// refused: ENOENT would tell the program that a directory it can list does not exist. Outside
+/// the policy a write answers ENOENT like every other call.
+#[test]
+fn writes_to_a_read_path_stay_refused() {
+    let fixture = Fixture::new("macos-read-writes");
+    let new_file = fixture.arg("ro/new");
+    let new_dir = fixture.arg("ro/dir");
+    let file = fixture.arg("ro/file");
+    let secret = fixture.arg("secret/file");
+    let actions = [
+        ("write", file.as_str()),
+        ("write", new_file.as_str()),
+        ("mkdir", new_dir.as_str()),
+        ("delete", file.as_str()),
+        ("write", secret.as_str()),
+    ];
     for line in probe_outside(&actions) {
         line.assert_ok();
     }
+    fixture.reset();
     let inside = probe_inside(&fixture.access_args(), &actions);
-    assert!(
-        inside[0].detail.ends_with("/secret/file"),
-        "the path is no longer disclosed; the documented limitation is stale: {:?}",
-        inside[0]
+    for line in &inside[..4] {
+        assert_eq!(line.result, "denied", "{line:?}");
+    }
+    assert!(inside[4].detail.ends_with("(os error 2)"), "{inside:?}");
+    assert!(fixture.path("ro/file").exists());
+}
+
+/// Programs spell paths through the links `/etc`, `/tmp` and `/var` of the system set, and so do
+/// the links of the time zone database. Seatbelt checks the existence of the spelled path too, so
+/// the profile allows the check for paths below these links; the real path is checked as well,
+/// so a path the policy does not grant still looks missing.
+#[test]
+fn paths_through_the_system_links_reach_only_granted_files() {
+    let fixture = Fixture::new("macos-links");
+    let readable = fixture.arg("ro/file");
+    let Some(through_var) = readable.strip_prefix("/private") else {
+        return skip(
+            "private-temp-dir",
+            "the temporary directory is not below /private/var",
+        );
+    };
+    let actions = [
+        ("read", "/etc/localtime"),
+        ("read", through_var),
+        ("access", "/etc/passwd"),
+        ("access", "/etc/no-such-file"),
+    ];
+    let outside = probe_outside(&actions);
+    for line in &outside[..3] {
+        line.assert_ok();
+    }
+    let inside = probe_inside(&fixture.access_args(), &actions);
+    inside[0].assert_ok();
+    inside[1].assert_ok();
+    assert_looks_missing(&inside[2], &inside[3]);
+}
+
+/// With `unix_sockets = "all"` the program reaches every Unix socket of the user, also outside
+/// the policy. Seatbelt checks the lookup of the socket's path as file-test-existence before the
+/// kernel knows that the path is a socket, so the profile allows that check for every path. This
+/// records what it gives back: `access`, `statfs`, `chdir` and the path from `getattrlist`, also
+/// by inode number through `/.vol`, answer for paths outside the policy again (docs/macos.md).
+#[test]
+fn unix_sockets_all_reaches_sockets_and_tests_paths_outside_the_policy() {
+    use std::os::unix::net::UnixListener;
+
+    let fixture = Fixture::new("macos-unix-outside");
+    let socket = fixture.path("secret/socket");
+    let _listener = UnixListener::bind(&socket).unwrap();
+    let socket = socket.to_str().unwrap().to_string();
+    let directory = fixture.arg("secret");
+    let secret = fixture.arg("secret/file");
+    let missing = fixture.arg("secret/no-such-file");
+    let metadata = fs::metadata(fixture.path("secret/file")).unwrap();
+    let by_inode = format!(
+        "/.vol/{}/{}{ARGUMENT_SEPARATOR}fullpath",
+        metadata.dev(),
+        metadata.ino()
     );
-    assert_eq!(inside[1].detail, inside[0].detail, "{inside:?}");
-    inside[2].assert_blocked();
+    let actions = [
+        ("unix-connect", socket.as_str()),
+        ("access", missing.as_str()),
+        ("access", secret.as_str()),
+        ("statfs", secret.as_str()),
+        ("chdir", directory.as_str()),
+        ("getattr", by_inode.as_str()),
+        ("metadata", secret.as_str()),
+    ];
+    let denied = probe_inside(&fixture.access_args(), &actions);
+    denied[0].assert_blocked();
+    assert_looks_missing(&denied[2], &denied[1]);
+
+    let unix = with(fixture.access_args(), &["--unix-sockets", "all"]);
+    let inside = probe_inside(&unix, &actions);
+    inside[0].assert_ok();
+    assert_eq!(inside[1].result, "error", "{inside:?}");
+    for line in &inside[2..6] {
+        assert_eq!(
+            line.result, "ok",
+            "existence is hidden with unix_sockets = \"all\" now; the documented limitation \
+             is stale: {line:?}"
+        );
+    }
+    assert!(inside[5].detail.ends_with("/secret/file"), "{inside:?}");
+    // Every other call still answers like a missing path.
+    assert!(inside[6].detail.ends_with("(os error 2)"), "{inside:?}");
 }
 
 /// `setattrlist` writes the metadata that `getattrlist` reads, so it must be denied outside
@@ -527,10 +710,70 @@ fn the_volume_list_is_denied() {
     inside[0].assert_blocked();
 }
 
+/// `proc_pidinfo`, `proc_pidpath` and `proc_listallpids` once answered EPERM for a live process
+/// outside the sandbox and ESRCH for a process ID that nothing uses. Now every process but the
+/// program's own answers ESRCH, as if it did not exist.
+#[test]
+fn other_processes_look_gone() {
+    let fixture = Fixture::new("macos-pidinfo");
+    let live = std::process::id().to_string();
+    let unused = "99998";
+    let actions = [
+        ("pid-info", live.as_str()),
+        ("pid-info", unused),
+        ("pid-path", live.as_str()),
+        ("pid-path", unused),
+        ("list-pids", ""),
+        ("pid-info", "self"),
+        ("pid-path", "self"),
+    ];
+    let outside = probe_outside(&actions);
+    for index in [0, 2, 4, 5, 6] {
+        outside[index].assert_ok();
+    }
+    let inside = probe_inside(&fixture.access_args(), &actions);
+    for pair in [[0, 1], [2, 3]] {
+        let (live, unused) = (&inside[pair[0]], &inside[pair[1]]);
+        assert!(live.detail.ends_with("(os error 3)"), "{live:?}");
+        assert_eq!(live.detail, unused.detail, "{live:?} {unused:?}");
+    }
+    assert!(inside[4].detail.ends_with("(os error 3)"), "{inside:?}");
+    inside[5].assert_ok();
+    inside[6].assert_ok();
+}
+
+/// `getpriority`, `getpgid` and `getsid` answer for any process ID, and no profile operation
+/// covers them, so the profile denies them by system call number. That refuses the program's
+/// own process too.
+#[test]
+fn priority_group_and_session_queries_are_denied() {
+    let fixture = Fixture::new("macos-pidquery");
+    let live = std::process::id().to_string();
+    let unused = "99998";
+    let mut actions = Vec::new();
+    for call in ["getpriority", "getpgid", "getsid"] {
+        for pid in [live.as_str(), unused, "self"] {
+            actions.push((call, pid));
+        }
+    }
+    let outside = probe_outside(&actions);
+    let inside = probe_inside(&fixture.access_args(), &actions);
+    for (index, (out, inside)) in outside.iter().zip(&inside).enumerate() {
+        if index % 3 == 1 {
+            assert_eq!(out.result, "error", "control: {out:?}");
+        } else {
+            out.assert_ok();
+        }
+        assert_eq!(inside.result, "denied", "{inside:?}");
+    }
+}
+
 /// `kill(pid, 0)` checks permission without sending anything, so it tells a live process from a
 /// process ID that nothing uses: EPERM against ESRCH. `signals = "isolated"` stops the signal
-/// but not the answer, so the program can still find out which process ids exist. macOS itself
-/// gives the same answer for a process of another user, so this records a limit, not a defect.
+/// but not the answer, so the program can still find out which process ids exist. A
+/// `(with errno ESRCH)` on the signal rule does not change the answer, and denying `kill` by
+/// number would take every signal away, also to the program's own children. macOS itself gives
+/// the same answer for a process of another user, so this records a limit, not a defect.
 #[test]
 fn process_ids_outside_the_sandbox_stay_countable() {
     let fixture = Fixture::new("macos-pidprobe");
@@ -699,7 +942,7 @@ fn a_program_can_join_a_process_group_outside_the_sandbox() {
     let outside_group = unsafe { libc::getpgrp() }.to_string();
     let program = fixture.copy_probe("bin");
     let spawn = format!(
-        "{outside_group}{ARGUMENT_SEPARATOR}{program}{ARGUMENT_SEPARATOR}sleep{ARGUMENT_SEPARATOR}50"
+        "{outside_group}{ARGUMENT_SEPARATOR}{program}{ARGUMENT_SEPARATOR}sleep{ARGUMENT_SEPARATOR}5000"
     );
     let actions = [
         ("setpgid-join", outside_group.as_str()),
@@ -709,10 +952,18 @@ fn a_program_can_join_a_process_group_outside_the_sandbox() {
     let inside = probe_inside(&isolated, &actions);
     inside[0].assert_ok();
     inside[1].assert_ok();
-    assert!(
-        inside[1]
-            .detail
-            .ends_with(&format!("group {outside_group}")),
+    // The profile denies getpgid, so the group is read here, outside the sandbox.
+    let spawned: libc::pid_t = inside[1]
+        .detail
+        .split_whitespace()
+        .nth(1)
+        .and_then(|pid| pid.parse().ok())
+        .unwrap_or_else(|| panic!("no process ID: {:?}", inside[1]));
+    // SAFETY: getpgid takes a process ID.
+    let group = unsafe { libc::getpgid(spawned) };
+    assert_eq!(
+        group.to_string(),
+        outside_group,
         "the spawned process did not join the group: {:?}",
         inside[1]
     );

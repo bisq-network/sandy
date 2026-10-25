@@ -36,6 +36,7 @@ pub fn generate(policy: &ResolvedPolicy) -> Profile {
          ioctls. file-write* includes mode, owner, flags, times, extended attributes and ACLs.",
     );
     writer.line("(deny process-info* file-map-executable file-ioctl file-write*)");
+    hiding_rules(&mut writer);
     process_rules(&mut writer, policy.signals, policy.children);
     ioctl_rules(&mut writer);
     sysctl_rules(&mut writer);
@@ -45,6 +46,7 @@ pub fn generate(policy: &ResolvedPolicy) -> Profile {
     policy_path_rules(&mut writer, policy);
     network_rules(&mut writer, policy);
     ancestor_rules(&mut writer);
+    link_rules(&mut writer);
     protection_rules(&mut writer, policy);
     Profile {
         text: writer.text,
@@ -211,6 +213,21 @@ const CODE: &[&str] = &["file-read*", "file-test-existence", "file-map-executabl
 const READ_WRITE_DEVICE: &[&str] = &["file-read*", "file-test-existence", "file-write-data"];
 const METADATA: &[&str] = &["file-read-metadata", "file-test-existence"];
 
+/// Outside the policy every path answers like a path that does not exist, and every other
+/// process like a process that does not exist. The rules below allow the policy paths and the
+/// program's own process again. Writes keep EPERM: a write to a `read` path must not say that
+/// the path is missing.
+fn hiding_rules(writer: &mut Writer) {
+    writer.comment(
+        "Outside the policy, paths look missing and other processes look gone. (deny default)\n\
+         does not cover file-test-existence, the only check of access, statfs, chdir and of\n\
+         the path that getattrlist returns, so it is denied here. ENOENT and ESRCH are the\n\
+         answers for a path and a process that do not exist.",
+    );
+    writer.line("(deny file-read* file-test-existence (with errno ENOENT))");
+    writer.line("(deny process-info* (with errno ESRCH))");
+}
+
 fn process_rules(writer: &mut Writer, signals: SignalScope, children: ChildProcesses) {
     writer.comment("Processes. Children inherit the sandbox.");
     if children != ChildProcesses::None {
@@ -349,17 +366,27 @@ fn network_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
         }
     }
     if policy.ip != IpAccess::None {
+        // A connect looks up the socket's path first, which is a file-test-existence.
         let resolver = writer.grant("DNS", Path::new(system::DNS_RESOLVER_SOCKET));
-        writer.rule("allow", &["network-outbound"], &[literal(resolver)]);
+        writer.rule(
+            "allow",
+            &["network-outbound", "file-test-existence"],
+            &[literal(resolver)],
+        );
         let hosts = writer.grant("DNS", Path::new(system::HOSTS_FILE));
         writer.rule("allow", READ, &[literal(hosts)]);
         let var = writer.grant("DNS", Path::new(system::VAR_SYMLINK));
         writer.rule("allow", METADATA, &[literal(var)]);
     }
     if policy.unix_sockets == NetworkAccess::All {
-        writer.comment("Unix sockets.");
+        writer.comment(
+            "Unix sockets. A connect looks up the socket's path, which Seatbelt checks as\n\
+             file-test-existence before the kernel knows that the path is a socket, so a socket\n\
+             outside the policy needs it for every path.",
+        );
         writer.line("(allow network-outbound (remote unix-socket))");
         writer.line("(allow network-bind network-inbound (local unix-socket))");
+        writer.line("(allow file-test-existence)");
     }
 }
 
@@ -377,6 +404,27 @@ fn ancestor_rules(writer: &mut Writer) {
         .map(|path| literal(writer.param("ANCESTOR", path)))
         .collect();
     writer.rule("allow", METADATA, &filters);
+}
+
+/// Paths spelled through a granted link of the system set, such as `/etc/hosts` for
+/// `/private/etc/hosts`. Seatbelt checks file-test-existence for the path as the program spelled
+/// it and again for the path the link leads to, so this grants nothing that the rules for the
+/// real paths do not.
+fn link_rules(writer: &mut Writer) {
+    let links: Vec<&Path> = system::DIRECTORY_LINKS
+        .iter()
+        .map(Path::new)
+        .filter(|link| writer.granted.contains(*link))
+        .collect();
+    if links.is_empty() {
+        return;
+    }
+    writer.comment("Paths spelled through the links of the system set.");
+    let filters: Vec<String> = links
+        .into_iter()
+        .map(|link| subpath(writer.param("LINK", link)))
+        .collect();
+    writer.rule("allow", &["file-test-existence"], &filters);
 }
 
 fn protection_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
@@ -410,6 +458,28 @@ fn protection_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
              change the group inside the kernel. fork, vfork and execve stay possible.",
         );
         let filters: Vec<String> = system::GROUP_LEAVING_SYSCALLS
+            .iter()
+            .map(|(_, number)| format!("(syscall-number {number})"))
+            .collect();
+        writer.rule("deny", &["syscall-unix"], &filters);
+    }
+    writer.comment(
+        "The priority, process group and session of any process ID reach no profile operation:\n\
+         getpriority, getpgid, getsid. A rule cannot tell the program's own ID from another.",
+    );
+    let filters: Vec<String> = system::PROCESS_QUERY_SYSCALLS
+        .iter()
+        .map(|(_, number)| format!("(syscall-number {number})"))
+        .collect();
+    writer.rule("deny", &["syscall-unix"], &filters);
+    if policy.ip == IpAccess::None {
+        writer.comment(
+            "ip = \"none\": no NECP, the kernel's network policy layer that Network.framework\n\
+             works through, and no trigger of its network agents: necp_match_policy,\n\
+             netagent_trigger, necp_open, necp_client_action, necp_session_open,\n\
+             necp_session_action.",
+        );
+        let filters: Vec<String> = system::NECP_SYSCALLS
             .iter()
             .map(|(_, number)| format!("(syscall-number {number})"))
             .collect();
@@ -553,6 +623,13 @@ mod tests {
 ; ioctls. file-write* includes mode, owner, flags, times, extended attributes and ACLs.
 (deny process-info* file-map-executable file-ioctl file-write*)
 
+; Outside the policy, paths look missing and other processes look gone. (deny default)
+; does not cover file-test-existence, the only check of access, statfs, chdir and of
+; the path that getattrlist returns, so it is denied here. ENOENT and ESRCH are the
+; answers for a path and a process that do not exist.
+(deny file-read* file-test-existence (with errno ENOENT))
+(deny process-info* (with errno ESRCH))
+
 ; Processes. Children inherit the sandbox.
 (allow process-fork)
 (allow process-info* (target self))
@@ -602,6 +679,25 @@ mod tests {
 ; link's target. (Policy paths inside writable paths are rejected before this.)
 (deny file-write-unlink file-write-create
   (literal (param "ANCHOR_0")))
+
+; The priority, process group and session of any process ID reach no profile operation:
+; getpriority, getpgid, getsid. A rule cannot tell the program's own ID from another.
+(deny syscall-unix
+  (syscall-number 100)
+  (syscall-number 151)
+  (syscall-number 310))
+
+; ip = "none": no NECP, the kernel's network policy layer that Network.framework
+; works through, and no trigger of its network agents: necp_match_policy,
+; netagent_trigger, necp_open, necp_client_action, necp_session_open,
+; necp_session_action.
+(deny syscall-unix
+  (syscall-number 460)
+  (syscall-number 490)
+  (syscall-number 501)
+  (syscall-number 502)
+  (syscall-number 522)
+  (syscall-number 523))
 
 ; Operations that (deny default) may not cover and that nothing allows again: hard links
 ; (a link would make a file from outside reachable through a writable path), NVRAM and
@@ -809,12 +905,10 @@ mod tests {
                 .iter()
                 .find(|(_, path)| path == Path::new(system::DNS_RESOLVER_SOCKET))
                 .map(|(name, _)| format!("(literal (param \"{name}\"))"));
-            let resolver_rule = |action: &str| {
-                resolver.as_ref().is_some_and(|filter| {
-                    profile
-                        .text
-                        .contains(&format!("({action} network-outbound\n  {filter})"))
-                })
+            let resolver_rule = |rule: &str| {
+                resolver
+                    .as_ref()
+                    .is_some_and(|filter| profile.text.contains(&format!("({rule}\n  {filter})")))
             };
             [
                 profile
@@ -823,8 +917,8 @@ mod tests {
                 profile
                     .text
                     .contains("(allow network-outbound (remote unix-socket))"),
-                resolver_rule("allow"),
-                resolver_rule("deny"),
+                resolver_rule("allow network-outbound file-test-existence"),
+                resolver_rule("deny network-outbound"),
             ]
         };
         use NetworkAccess::{All, None};
@@ -1099,5 +1193,118 @@ mod tests {
         assert!(!system::ALLOWED_IOCTLS.contains(&system::TIOCSTI));
         let deny = format!("(deny file-ioctl (ioctl-command {}))", system::TIOCSTI);
         assert!(text.rfind(&deny).unwrap() > text.rfind("(allow").unwrap());
+    }
+
+    /// Paths outside the policy answer ENOENT, so the denial must come before every rule that
+    /// allows something again. Writes keep EPERM.
+    #[test]
+    fn paths_outside_the_policy_look_missing() {
+        let text = generate(&typical("/srv")).text;
+        let rule = "\n(deny file-read* file-test-existence (with errno ENOENT))\n";
+        assert_eq!(text.matches(rule).count(), 1);
+        assert!(text.find(rule).unwrap() < text.find("(allow").unwrap());
+        assert!(!text.contains("file-write* (with errno"));
+    }
+
+    /// Other processes answer ESRCH; the program's own process stays visible.
+    #[test]
+    fn other_processes_look_gone() {
+        let text = generate(&typical("/srv")).text;
+        let rule = "\n(deny process-info* (with errno ESRCH))\n";
+        assert_eq!(text.matches(rule).count(), 1);
+        let allow = text
+            .find("\n(allow process-info* (target self))\n")
+            .unwrap();
+        assert!(text.find(rule).unwrap() < allow);
+        assert!(text.find(rule).unwrap() < text.find("(allow").unwrap());
+    }
+
+    #[test]
+    fn link_spellings_follow_the_granted_links() {
+        let links = |system: SystemAccess, ip: IpAccess| {
+            let mut policy = typical("/srv");
+            policy.system = system;
+            policy.ip = ip;
+            let profile = generate(&policy);
+            let links: Vec<String> = profile
+                .parameters
+                .iter()
+                .filter(|(name, _)| name.starts_with("LINK_"))
+                .map(|(_, path)| path.to_str().unwrap().to_string())
+                .collect();
+            if !links.is_empty() {
+                let rule = profile
+                    .text
+                    .split("(allow file-test-existence\n")
+                    .nth(1)
+                    .unwrap();
+                assert!(rule.starts_with("  (subpath (param \"LINK_0\"))"), "{rule}");
+            }
+            links
+        };
+        assert_eq!(
+            links(SystemAccess::Minimal, IpAccess::None),
+            ["/etc", "/tmp", "/var"]
+        );
+        // The resolver reaches its socket through /var.
+        assert_eq!(links(SystemAccess::None, IpAccess::Client), ["/var"]);
+        assert!(links(SystemAccess::None, IpAccess::None).is_empty());
+    }
+
+    /// A connect to a Unix socket outside the policy needs file-test-existence for its path, so
+    /// `unix_sockets = "all"` allows it everywhere, after the rule that denies it.
+    #[test]
+    fn unix_sockets_all_lets_every_path_be_tested() {
+        let mut policy = typical("/srv");
+        let rule = "\n(allow file-test-existence)\n";
+        assert!(!generate(&policy).text.contains(rule));
+        policy.unix_sockets = NetworkAccess::All;
+        let text = generate(&policy).text;
+        let deny = text
+            .find("(deny file-read* file-test-existence (with errno ENOENT))")
+            .unwrap();
+        assert!(text.find(rule).unwrap() > deny);
+    }
+
+    #[test]
+    fn necp_is_denied_only_without_ip_networking() {
+        let necp = |ip| {
+            let mut policy = typical("/srv");
+            policy.ip = ip;
+            let text = generate(&policy).text;
+            let denied: Vec<bool> = system::NECP_SYSCALLS
+                .iter()
+                .map(|(_, number)| text.contains(&format!("(syscall-number {number})")))
+                .collect();
+            if denied.iter().any(|denied| *denied) {
+                let deny = text.find("(syscall-number 501)").unwrap();
+                assert!(deny > text.rfind("(allow").unwrap());
+            }
+            denied
+        };
+        assert!(necp(IpAccess::None).iter().all(|denied| *denied));
+        assert!(necp(IpAccess::Client).iter().all(|denied| !denied));
+        assert!(necp(IpAccess::All).iter().all(|denied| !denied));
+    }
+
+    #[test]
+    fn process_queries_are_denied_for_every_policy() {
+        for ip in [IpAccess::None, IpAccess::Client, IpAccess::All] {
+            for signals in [SignalScope::Any, SignalScope::Isolated] {
+                let mut policy = typical("/srv");
+                policy.ip = ip;
+                policy.signals = signals;
+                let text = generate(&policy).text;
+                let rule = "(deny syscall-unix\n  (syscall-number 100)\n  (syscall-number 151)\n  \
+                            (syscall-number 310))\n";
+                let deny = text.find(rule).unwrap();
+                assert!(deny > text.rfind("(allow").unwrap());
+            }
+        }
+        let names: Vec<&str> = system::PROCESS_QUERY_SYSCALLS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(names, ["getpriority", "getpgid", "getsid"]);
     }
 }

@@ -78,12 +78,12 @@ compiler fail, and sandy fails closed.
 
 | Requirement | Mechanism |
 |---|---|
-| `FilesystemConfined` | Profile: `(deny default)`; `file-read*` for every policy path and the system set; `file-write*` only for `read_write` paths; `process-exec*` and `file-map-executable` only for `read_exec` paths, the program and system code. No hard links; clones only into `read_write` paths and only from files the target may read. No Mach or XPC service, so no other process acts on files for the target. Policy paths cannot be deleted or replaced. |
+| `FilesystemConfined` | Profile: `(deny default)`, and every path outside the policy answers `ENOENT`; `file-read*` for every policy path and the system set; `file-write*` only for `read_write` paths; `process-exec*` and `file-map-executable` only for `read_exec` paths, the program and system code. No hard links; clones only into `read_write` paths and only from files the target may read. No Mach or XPC service, so no other process acts on files for the target. Policy paths cannot be deleted or replaced. |
 | `NoPrivilegeEscalation` | Only policy paths execute. Sandbox.kext refuses to execute setuid or setgid files from any sandboxed process, and the profile also denies `process-exec*` for files with mode bit `#o4000` or `#o2000`. No Mach service (authorization, privileged helpers, launchd). |
-| `ProcessMemoryIsolated` | Profile: `process-info*` (allowed by default) is denied and then allowed only for `(target self)`; task ports are denied (`mach-priv*`, `mach-task-name`, `mach-task-read`, `mach-task-inspect`); `ptrace` attach, which Seatbelt checks as `system-debug`, is denied. |
+| `ProcessMemoryIsolated` | Profile: `process-info*` (allowed by default) is denied with `ESRCH` and then allowed only for `(target self)`; task ports are denied (`mach-priv*`, `mach-task-name`, `mach-task-read`, `mach-task-inspect`); `ptrace` attach, which Seatbelt checks as `system-debug`, is denied. |
 | `InheritedHandlesClosed` | `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`; descriptors 0, 1 and 2 are named with `posix_spawn_file_actions_addinherit_np`. The kernel closes every other descriptor during the exec. With `children = "contained"` the forked target, a single thread, marks every descriptor above 2 close-on-exec (`PROC_PIDLISTFDS`) right before `execve`. |
 | `EnvironmentControlled` | `posix_spawn` (with `children = "contained"`: `execve`) receives exactly `command.env`. The backend adds no variable. |
-| `IpNetworkDenied` | Profile: no `network-*` rule for IP. The name resolver is unreachable unless `unix_sockets = "all"`. |
+| `IpNetworkDenied` | Profile: no `network-*` rule for IP, and the NECP calls are denied. The name resolver is unreachable unless `unix_sockets = "all"`. |
 | `InboundIpDenied` | Profile: `network-outbound` and `network-bind` for IP sockets, `network-inbound` only for UDP sockets, so `listen` and `accept` fail for TCP (see [Networking](#networking)). |
 | `UnixSocketsDenied` | Profile: no `network-bind` or `network-outbound` for Unix sockets. With `ip = "client"` or `ip = "all"`, the resolver socket is the one exception. |
 | `SignalsIsolated` | Profile: `(allow signal (target self) (target same-sandbox))` instead of `(allow signal)`, and `(deny system-fcntl (fcntl-command 6))`, which closes `F_SETOWN`, one of the ways to have the kernel send SIGIO to any process. The other ways, through ioctls on sockets and pipes, and the kernel's job control signals stay outside it (see [Signals the profile does not cover](#signals-the-profile-does-not-cover)). |
@@ -195,18 +195,32 @@ of earlier definitions"), so the protections come last. The unit test
    default", and Apple's own strict profiles deny `file-map-executable` explicitly. No public
    source lists all such operations, so the profile also denies `file-write*` here. The next
    sections allow these operations again narrowly.
-3. Processes: `(allow process-fork)` unless `process.children = "none"`,
+3. Paths and processes outside the policy: `(deny file-read* file-test-existence (with errno
+   ENOENT))` and `(deny process-info* (with errno ESRCH))`. `(deny default)` does not cover
+   `file-test-existence` either, and it is the only check of `access`, `statfs`, `chdir` and of
+   the path that `getattrlist` returns (`ATTR_CMN_FULLPATH`), so those calls answered for every
+   path, `statfs` with the device and the directory the volume is mounted on, and the other calls
+   answered an existing path (`EPERM`, `EACCES` or `EEXIST`) differently from a missing one
+   (`ENOENT`). Now every call on a path outside the policy answers `ENOENT`, as for a path that
+   does not exist, also through `/.vol/<dev>/<inode>`, and `proc_pidinfo`, `proc_pidpath` and
+   `proc_listallpids` answer `ESRCH` for every other process, as for a process that does not
+   exist (measured on macOS 27.0.1). Both rules come before every allow, so the policy's own
+   rules win. Writes keep `EPERM` from step 2, so a write to a `read` path does not say that the
+   path is missing; outside the policy a write answers `ENOENT` anyway, because the path lookup
+   fails first. With `unix_sockets = "all"` the profile allows `file-test-existence` again (see
+   [Networking](#networking)).
+4. Processes: `(allow process-fork)` unless `process.children = "none"`,
    `(allow process-info* (target self))`, and signals: `(allow signal)` or
    `(allow signal (target self) (target same-sandbox))`. With `children = "none"` the protections
    at the end also contain `(deny process-fork)`.
-4. ioctls: `(allow file-ioctl (ioctl-command N) ...)` for `FIONBIO` and `FIOASYNC` (XNU issues
+5. ioctls: `(allow file-ioctl (ioctl-command N) ...)` for `FIONBIO` and `FIOASYNC` (XNU issues
    them for `fcntl(F_SETFL)`, and `vn_ioctl` checks every request) and for `TIOCGETA` and
    `TIOCGWINSZ` (they only read terminal state, so `isatty` and stdio line buffering work). The
    numbers are written as numbers because older compilers do not know the symbols; a compile-time
    assertion compares them with the libc crate.
-5. Readable sysctls (see below).
-6. The system set, if `system = "minimal"`.
-7. Policy paths. A directory uses `subpath`, a file uses `literal`, so a file rule never covers
+6. Readable sysctls (see below).
+7. The system set, if `system = "minimal"`.
+8. Policy paths. A directory uses `subpath`, a file uses `literal`, so a file rule never covers
    the entries of a directory that later replaces the file.
 
    | Access | Operations |
@@ -225,11 +239,21 @@ of earlier definitions"), so the protections come last. The unit test
    clone of a file outside the policy into a `read_write` path, and a clone out of a
    `read_write` path to a place that is not writable, are denied.
 
-8. Networking (see below).
-9. Ancestors of every granted path: `file-read-metadata` and `file-test-existence` on each
-   directory above it, so `realpath`, `getcwd` and `mkdir -p` can reach the granted path. This
-   reveals no directory contents, because listing a directory needs `file-read-data`.
-10. Protections:
+9. Networking (see below).
+10. Ancestors of every granted path: `file-read-metadata` and `file-test-existence` on each
+    directory above it, so `realpath`, `getcwd` and `mkdir -p` can reach the granted path. This
+    reveals no directory contents, because listing a directory needs `file-read-data`.
+11. Paths spelled through the links of the system set: `(allow file-test-existence (subpath
+    ...))` for `/etc`, `/tmp` and `/var`, where the profile grants the link. Seatbelt checks
+    `file-test-existence` for the path as the program spelled it, such as `/etc/hosts`, and again
+    for the path the link leads to, `/private/etc/hosts`. Measured on macOS 27.0.1 with only the
+    real paths allowed: `/etc/hosts`, `/etc/localtime`, the resolver socket
+    `/var/run/mDNSResponder`, every path below `$TMPDIR` (which lies below `/var/folders`) and the
+    links inside the time zone database, which point to `/var/db/timezone/...`, answered
+    `ENOENT`. Because the real path is checked as well, the rule grants nothing that the rules
+    for the real paths do not: `access("/etc/passwd")` still answers `ENOENT`
+    (`paths_through_the_system_links_reach_only_granted_files`).
+12. Protections:
     - Anchors: `(deny file-write-unlink file-write-create (literal ...))` for the root of every
       `read_write` path. Without it the target could delete the root and put a symbolic link in
       its place. The next `sandy run` resolves symbolic links, so it would grant access to the
@@ -264,6 +288,16 @@ of earlier definitions"), so the protections come last. The unit test
       it at startup (measured on macOS 26.5: a shell, Python, git and curl start and run with it
       denied). Number 347 is the 64-bit inode variant that libc calls; 18 is the legacy call.
       `statfs` and `fstatfs`, which take a path the sandbox checks, stay allowed.
+    - `(deny syscall-unix (syscall-number 100) (syscall-number 151) (syscall-number 310))`:
+      `getpriority`, `getpgid` and `getsid` answer for every process ID with its priority,
+      process group and session, and no profile operation covers them. A `syscall-unix` rule sees
+      only the number, so the program cannot ask about itself either. Measured on macOS 27.0.1:
+      `sh`, `bash` (also on a terminal), `zsh`, Python, git, make, clang (also with modules) and
+      swiftc run without them. A program that calls one of them gets `EPERM`, for example
+      Python's `os.getpgid`, `os.getsid` and `os.getpriority`.
+    - With `ip = "none"`: `(deny syscall-unix (syscall-number 460) (syscall-number 490)
+      (syscall-number 501) (syscall-number 502) (syscall-number 522) (syscall-number 523))`, the
+      NECP calls (see [Networking](#networking)).
     - With `process.children = "contained"`: `(deny syscall-unix (syscall-number 82)
       (syscall-number 147) (syscall-number 244))`, that is `setpgid`, `setsid` and `posix_spawn`
       (see [Contained child processes](#contained-child-processes)).
@@ -457,7 +491,22 @@ gets them ignored unless the binary carries the `allow-dyld-environment-variable
   socket that had sent to another peer, and one reached a port the program had bound itself.
 - `unix_sockets = "all"`: `(allow network-outbound (remote unix-socket))` and `(allow network-bind
   network-inbound (local unix-socket))`. This allows every Unix socket the user can reach,
-  independent of the filesystem rules, as on every platform.
+  independent of the filesystem rules, as on every platform. A connect looks the socket's path up
+  first, which Seatbelt checks as `file-test-existence` before the kernel knows that the path is
+  a socket, and no filter tells a socket from a file there: `(vnode-type SOCKET)` does not match
+  (measured on macOS 27.0.1). So the profile also allows `file-test-existence` for every path,
+  and whether a path outside the policy exists answers again (see
+  [Information the target can still read](#information-the-target-can-still-read)).
+- NECP, the kernel's network policy layer: Network.framework, and URLSession through it, opens a
+  NECP client descriptor (`necp_open`) for every connection and asks it how to reach the
+  destination. `(deny default)` does not stop its calls: `necp_match_policy`, `necp_open`,
+  `necp_client_action`, `necp_session_open`, `necp_session_action`, and `netagent_trigger`,
+  which starts a network agent, such as a VPN on demand, in another process (numbers from
+  `sys/syscall.h` of the macOS 27 SDK). With `ip = "none"` the profile denies them by number, and
+  `necp_open` fails with `EPERM`. With `ip = "client"` and `ip = "all"` they stay allowed:
+  with them denied, URLSession answered "The Internet connection appears to be offline" and a
+  Network.framework connection "Network is down" for a listener on 127.0.0.1, while curl, which
+  uses plain sockets, kept working (measured on macOS 27.0.1). The test is `necp_follows_ip`.
 - A socket on a standard stream was created before the profile, and the profile covers only part
   of what such a socket still gives. Measured on macOS 26.5 with `ip = "none"`: `sendto` on an
   inherited unconnected UDP socket was denied, because `network-outbound` is checked per
@@ -476,11 +525,12 @@ gets them ignored unless the binary carries the `allow-dyld-environment-variable
 the Mach service `com.apple.dnssd.service`, which Network.framework uses; the profile does not
 allow it, so only `getaddrinfo` and the dns_sd API work.
 
-- `ip = "all"` and `ip = "client"`: the profile allows connecting to exactly this socket, reading
-  `/private/etc/hosts`, and passing through the `/var` link. Name resolution is part of IP
-  networking, so it does not require `unix_sockets = "all"`. Through the resolver the target can
-  only do what IP networking already allows (queries, service registration on the local network,
-  port mappings on the router). The plan names this exception for `UnixSocketsDenied`.
+- `ip = "all"` and `ip = "client"`: the profile allows connecting to exactly this socket (and
+  testing its existence, because the connect looks its path up), reading `/private/etc/hosts`,
+  and passing through the `/var` link. Name resolution is part of IP networking, so it does not
+  require `unix_sockets = "all"`. Through the resolver the target can only do what IP networking
+  already allows (queries, service registration on the local network, port mappings on the
+  router). The plan names this exception for `UnixSocketsDenied`.
 - `ip = "none"` and `unix_sockets = "none"`: the resolver is unreachable.
 - `ip = "none"` and `unix_sockets = "all"`: the resolver is reachable like every other Unix
   socket. The target cannot open IP sockets, but it can make mDNSResponder send DNS queries,
@@ -929,22 +979,32 @@ no privilege, and closing them would break ordinary programs:
   the routines with `syscall-mig`, but runtimes use them for memory heuristics (for example the
   JVM and libuv's `uv_get_free_memory`), so the profile leaves them open, as Chromium's and the
   Codex CLI's profiles do. The privileged host port stays denied (`mach-priv*`).
-- Whether a path outside the policy exists. `stat` of a file the policy does not grant fails
-  with `EPERM`, and of a path that does not exist with `ENOENT`, so the two can be told apart
-  (`metadata_outside_the_policy_tells_existing_from_missing`). Contents, metadata and directory
-  listings stay unreadable.
-- The path of a file, through `getattrlist` with `ATTR_CMN_FULLPATH`. The kernel builds that
-  path in the VFS layer without reading the file's attributes, so the check that decides every
-  other attribute does not run: a request for the modification time of the same file is denied,
-  one for the path alone answers. With a `/.vol/<dev>/<inode>` path this turns an inode number
-  into a path, which is the disclosure that the `fsgetpath` denial closed
-  (`getattrlist_discloses_paths_outside_the_policy`). Denying `getattrlist` and `getattrlistat`
-  by number closes it, but `realpath(3)` is built on the same call and then fails for every
-  program in the sandbox, so the profile leaves them open.
+- With `unix_sockets = "all"`, whether a path outside the policy exists, and its path. The
+  profile allows `file-test-existence` for every path there, because a socket outside the policy
+  can be reached no other way (see [Networking](#networking)), so `access`, `statfs` (with the
+  device and the directory the volume is mounted on), `chdir` and `getattrlist` with
+  `ATTR_CMN_FULLPATH` answer for every path, as they did under every policy before 2.0.0. With a
+  `/.vol/<dev>/<inode>` path `getattrlist` turns an inode number into a path, the disclosure that
+  the `fsgetpath` denial closed. No path rule can close it here: Seatbelt checks the lookup of a
+  `/.vol` path against the file's real path, so a denial of `/.vol` does not reach it (measured
+  on macOS 27.0.1). Every other call still answers `ENOENT`, and contents, metadata and listings
+  stay unreadable (`unix_sockets_all_reaches_sockets_and_tests_paths_outside_the_policy`).
+  `sandy check` warns about it.
+  Without `unix_sockets = "all"` every path outside the policy looks missing to every call
+  (`metadata_outside_the_policy_looks_missing` and the tests next to it), and `getattrlist`
+  returns the path only inside the policy, which `realpath(3)` needs
+  (`getattrlist_does_not_disclose_paths_outside_the_policy`).
 - Which process ids exist. `kill(pid, 0)` only asks for permission: with isolated signals a live
   process outside the sandbox answers `EPERM` and an unused process id `ESRCH`
-  (`process_ids_outside_the_sandbox_stay_countable`). macOS answers the same way for a process
-  of another user outside any sandbox.
+  (`process_ids_outside_the_sandbox_stay_countable`). A `(with errno ESRCH)` on the signal rule
+  does not change that answer, and denying `kill` by number would take every signal away, also
+  to the program's own children. macOS answers the same way for a process of another user
+  outside any sandbox. Nothing else about another process answers: `proc_pidinfo`,
+  `proc_pidpath` and `proc_listallpids` answer `ESRCH` as for a process that does not exist
+  (`other_processes_look_gone`), and `getpriority`, `getpgid` and `getsid` are denied
+  (`priority_group_and_session_queries_are_denied`). The program's own children are hidden the
+  same way; Seatbelt refused their information before as well (`EPERM`), and `waitpid` and
+  kqueue's `EVFILT_PROC` keep working for them (measured on macOS 27.0.1).
 - The names, file ids and metadata of the entries of the root directory, through
   `getattrlistbulk` on `/`, which the program may open
   (`bulk_listing_reaches_only_the_root_directory`). A directory the policy does not grant cannot
@@ -1028,12 +1088,31 @@ none, so the backend answers nothing and sandy refuses the option.
   decision.
 - A `read_write` path itself cannot be deleted or replaced, and a writable file cannot be replaced
   by renaming another file over it. Programs must write such a file in place.
-- `getcwd` fails when the working directory is outside the policy.
+- A path outside the policy answers "No such file or directory" (`ENOENT`), not "Operation not
+  permitted", so a denial no longer looks like one, and macOS has no `--explain` (see
+  [Diagnostic mode](#diagnostic-mode)). dyld says "no such file" instead of "blocked by sandbox"
+  for a library outside the policy. A program that fails on a file it cannot find may need a
+  grant for it. Programs that treat a missing optional file as normal gain from it: under
+  `EPERM`, LibreSSL stopped `curl` at startup on `/private/etc/ssl/openssl.cnf`, and under
+  `ENOENT` it starts (measured on macOS 27.0.1). A write to a `read` path still answers `EPERM`
+  (`writes_to_a_read_path_stay_refused`).
+- `getcwd` fails when the working directory is outside the policy, and so do programs that save
+  the working directory before they work: `cp -R` stops with "cp: current working directory: No
+  such file or directory" (measured on macOS 27.0.1; before 2.0.0 it worked). Start such a
+  program in a directory of the policy (`--cwd`).
+- `getpriority`, `getpgid` and `getsid` fail with `EPERM`, also when the program asks about
+  itself (see the protections of [The generated profile](#the-generated-profile)). After a
+  compiler crash, clang and swift do not detect their stale module cache lock and wait until
+  their lock timeout: LLVM's lock file code asks `getsid` whether the lock's owner still runs
+  (unverified, read from the code).
 - A policy path spelled through the data volume, such as `/System/Volumes/Data/private/tmp/x`
   for `/private/tmp/x`, grants nothing. A firmlink is no symbolic link, so `canonicalize` keeps
   that spelling, while Seatbelt matches the path through the firmlink: measured on macOS 26.5
   and 27.0.1, a program with that `read_write` path could write neither under it nor under
-  `/private/tmp/x`. Give the path without the prefix; the program may then use either spelling.
+  `/private/tmp/x`. Give the path without the prefix, and let the program use that spelling too:
+  Seatbelt checks the existence of a path as the program spells it, and the profile grants it
+  only for the plain spelling, so `/System/Volumes/Data/private/tmp/x/file` looks missing
+  (measured on macOS 27.0.1; before 2.0.0 the program could use either spelling).
 - sandy cannot run inside another Seatbelt sandbox; `sandy check` reports this.
 - x86_64 code does not run in the sandbox on Apple silicon. Rosetta loads its runtime
   (`libRosettaRuntime`) into every translated process, and the profile does not allow it, so the
@@ -1060,9 +1139,10 @@ none, so the backend answers nothing and sandy refuses the option.
 - With `signals = "any"`, the target can signal every process of the user, as on other platforms.
 - Open question that the escape tests do not answer: whether `(deny default)` covers every other
   operation that the profile never mentions. Chromium and WebKit name a few exceptions, and the
-  profile denies all of those explicitly. One that it does not cover is measured above:
-  `getattrlist` with `ATTR_CMN_FULLPATH`, which stays open because `realpath(3)` is built on it.
-  `getfsstat`, which it did not cover either, is now denied by number (see the protections above).
+  profile denies all of those explicitly. The ones measured that it does not cover are denied
+  now: `file-test-existence`, the only check of `access`, `statfs`, `chdir` and of the path from
+  `getattrlist` (step 3 of the profile), and the system calls `getfsstat`, `getpriority`,
+  `getpgid`, `getsid` and, with `ip = "none"`, the NECP calls (see the protections above).
 
 ## Verification
 
@@ -1089,11 +1169,12 @@ macOS only:
   `process.end_with_parent`, also with `contained` and against signals to the caller's process
   group.
 - `review_macos.rs` holds the checks the security reviews added, the denials they led to (the
-  by-id calls and `getfsstat`), and the measurements that record what the sandbox does where it
-  cannot stop something: `getattrlist`, the existence of paths outside the policy, process ids,
-  SIGIO and the process groups of the terminal session. A check that this host cannot run reports
-  a skip, and `macos-26-arm.txt` and `macos-27-arm.txt` in `tests/expected-skips/` list the ones
-  that are expected.
+  by-id calls, `getfsstat`, paths and processes outside the policy, the process queries), and
+  the measurements that record what the sandbox does where it cannot stop something: the paths
+  that `unix_sockets = "all"` lets the program test, process ids, SIGIO and the process groups
+  of the terminal session. A check that this host cannot run reports a skip, and
+  `macos-26-arm.txt` and `macos-27-arm.txt` in `tests/expected-skips/` list the ones that are
+  expected.
 
 To see what the sandbox denies on a Mac, from an administrator account (a standard user gets
 no log, see [Diagnostic mode](#diagnostic-mode)):
