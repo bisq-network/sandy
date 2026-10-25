@@ -309,7 +309,8 @@ fn prepare(options: SetupOptions) -> Step<String> {
 pub fn disabled(support: &namespace::Support) -> Option<String> {
     match support {
         Err(Missing::Unavailable(reason)) => Some(format!(
-            "{reason}; setup cannot change that, because an AppArmor profile does not enable              them"
+            "{reason}; setup cannot change that, because an AppArmor profile does not enable \
+             them"
         )),
         Err(Missing::NeedsSetup(_)) | Ok(()) => None,
     }

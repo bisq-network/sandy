@@ -276,6 +276,129 @@ fn the_namespace_ends_when_sandy_and_the_guard_are_killed() {
     );
 }
 
+/// A host can give sandy user and network namespaces and still refuse it a PID namespace, as one
+/// whose `user.max_pid_namespaces` is 0 does. With `ip = "private"` or `view = "policy"` the run of
+/// `contained` asks for all of them in one `unshare`, so `check` tries the PID namespace too and
+/// refuses where `run` does. `contained` alone tries it in every plan and keeps its process group
+/// without one, from Landlock ABI 6; below, where only the namespace isolates signals, both
+/// refuse. Control: without the outer filter all of them work.
+#[test]
+fn check_tries_the_pid_namespace_where_the_run_needs_one() {
+    if !pid_namespace_works() {
+        return;
+    }
+    let mut modes = vec![Vec::new(), args(&["--ip", "private"])];
+    if sandy(["check", "--view", "policy"]).status.success() {
+        modes.push(args(&["--view", "policy"]));
+    }
+    for mode in modes {
+        let mut sandbox_args = contained();
+        sandbox_args.extend(mode.iter().cloned());
+        let mut check = vec!["check".to_string()];
+        check.extend(sandbox_args.iter().cloned());
+        let run = run_args(&sandbox_args, &[("pid", "-")]);
+        assert_eq!(sandy(&check).status.code(), Some(0), "{mode:?}");
+        assert_eq!(sandy(&run).status.code(), Some(0), "{mode:?}");
+
+        let checked = without_pid_namespaces(&check);
+        let ran = without_pid_namespaces(&run);
+        if mode.is_empty() && common::linux::landlock_abi() >= 6 {
+            assert_eq!(checked.status.code(), Some(0), "{checked:?}");
+            assert!(
+                !String::from_utf8_lossy(&checked.stdout).contains(MECHANISM),
+                "{checked:?}"
+            );
+            assert_eq!(ran.status.code(), Some(0), "{ran:?}");
+        } else if mode.is_empty() {
+            // Below ABI 6 only the namespace isolates signals, so both refuse without it.
+            assert_eq!(checked.status.code(), Some(1), "{checked:?}");
+            assert_eq!(ran.status.code(), Some(EXIT_FAILURE), "{ran:?}");
+        } else {
+            assert_eq!(ran.status.code(), Some(EXIT_FAILURE), "{mode:?}: {ran:?}");
+            assert_eq!(checked.status.code(), Some(1), "{mode:?}: {checked:?}");
+            assert!(
+                String::from_utf8_lossy(&checked.stdout)
+                    .contains("a trial of the sandbox's namespaces failed"),
+                "{checked:?}"
+            );
+        }
+    }
+}
+
+/// Runs sandy with `arguments` where `unshare` and `clone` fail with EPERM whenever they ask for a
+/// new PID namespace, and every other call works.
+fn without_pid_namespaces(arguments: &[String]) -> std::process::Output {
+    use std::mem::offset_of;
+    let statement = |code: u32, k: u32| libc::sock_filter {
+        code: code as u16,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    let jump = |code: u32, k: u32, jt: u8, jf: u8| libc::sock_filter {
+        code: code as u16,
+        jt,
+        jf,
+        k,
+    };
+    let load = |offset: usize| statement(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, offset as u32);
+    let equals = libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K;
+    let filter = [
+        load(offset_of!(libc::seccomp_data, nr)),
+        jump(equals, libc::SYS_unshare as u32, 2, 0),
+        jump(equals, libc::SYS_clone as u32, 1, 0),
+        statement(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_ALLOW),
+        // The flags, the first argument of both calls; CLONE_NEWPID is in their low word.
+        load(offset_of!(libc::seccomp_data, args)),
+        jump(
+            libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K,
+            libc::CLONE_NEWPID as u32,
+            0,
+            1,
+        ),
+        statement(
+            libc::BPF_RET | libc::BPF_K,
+            libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        ),
+        statement(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_ALLOW),
+    ];
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr().cast_mut(),
+    };
+    let address = &program as *const libc::sock_fprog as usize;
+    let mut command = Command::new(sandy_path());
+    command.args(arguments);
+    // SAFETY: prctl is async-signal-safe, and the filter it reads lives until the child has
+    // started, because `output` returns only after the spawn.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                || libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, address) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.output().unwrap()
+}
+
+/// The PID namespace belongs to a user namespace of sandy's own, which maps only the user's own
+/// IDs, so files of root show the owner 65534 inside, as with `ip = "private"`. Control: without
+/// `contained` there is no namespace, and the owner is root.
+#[test]
+fn files_of_root_show_the_owner_65534_in_the_pid_namespace() {
+    if !pid_namespace_works() {
+        return;
+    }
+    let actions = [("lstat", "/")];
+    let outside = probe_inside(&[], &actions);
+    assert_eq!(outside[0].detail, "directory owner 0", "{outside:?}");
+    let inside = probe_inside(&contained(), &actions);
+    assert_eq!(inside[0].detail, "directory owner 65534", "{inside:?}");
+}
+
 /// The children of process `parent`, from the parent field of `/proc/PID/stat`.
 fn children_of(parent: u32) -> Vec<u32> {
     fs::read_dir("/proc")

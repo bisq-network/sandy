@@ -598,7 +598,7 @@ exceptions:
 | Linux | `view = "policy"` | `statfs` of a path in the view reports the host's file system there: its type, size, free space and number of files |
 | Linux | `view = "policy"` | the directories above a granted path exist in the view, with their names |
 | Linux | `view = "policy"` | the link count of a granted file counts its names outside the view |
-| Linux | `view = "policy"` with a `/proc` path | the mount table names the host's device, file system and mount options of every mount of the view |
+| Linux | `view = "policy"` with a `/proc` path | the mount table names the host's device, file system and mount options of every mount of the view, and the mount table of a process outside the sandbox lists the host's mounts with their paths |
 | macOS | `signals = "isolated"` | SIGIO (to a process of any user), and SIGURG with an `ip` other than `"none"`, through the owner ioctls of sockets and pipes; without `children = "contained"` also joining another job of the terminal session and stopping it |
 | macOS | `ip = "client"` | a UDP socket that is not connected receives datagrams from every sender, at any port the program binds |
 | macOS | `unix_sockets = "all"` | whether a path outside the policy exists, and its path through `getattrlist`, also by inode number through `/.vol` |

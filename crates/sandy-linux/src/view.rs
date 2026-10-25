@@ -142,7 +142,11 @@ pub fn enter(
     let _umask = Umask::clear();
     let root = new_tmpfs("the root of the file system view")?;
     attach(&root)?;
-    let dev = make_dev(&root, &devices, terminal)?;
+    let ptmx_bound = view
+        .binds
+        .iter()
+        .any(|bind| bind.path == Path::new("/dev/ptmx"));
+    let dev = make_dev(&root, &devices, terminal, !ptmx_bound)?;
     // The clones of the binds so far, by path: a path inside one is mounted inside it.
     let mut bound: Vec<(&Path, OwnedFd)> = Vec::new();
     for (bind, source) in sources {
@@ -533,12 +537,14 @@ fn mount_point(root: &OwnedFd, bind: &Bind) -> Result<OwnedFd, SandboxError> {
 }
 
 /// `/dev` of the view: a tmpfs with the nodes of `devices` bound read-only, and with a terminal
-/// a private devpts instance, whose `ptmx` makes ptys that only this sandbox sees, and a
-/// `/dev/ptmx` link to it.
+/// a private devpts instance, whose `ptmx` makes ptys that only this sandbox sees, and with
+/// `ptmx_link` a `/dev/ptmx` link to it. A policy that grants `/dev/ptmx` gets the host's node
+/// there instead.
 fn make_dev(
     root: &OwnedFd,
     devices: &[(&str, OwnedFd)],
     terminal: bool,
+    ptmx_link: bool,
 ) -> Result<OwnedFd, SandboxError> {
     let dev_path = Path::new("/dev");
     let place = directory_on_root(root, dev_path)?;
@@ -570,13 +576,15 @@ fn make_dev(
         let dev_fd = directory_on_root(root, dev_path)?;
         let place = make_directory(&dev_fd, OsStr::new("pts"), Path::new("/dev/pts"))?;
         move_onto(&pts, &place).map_err(|error| failed("mount /dev/pts".to_string(), error))?;
-        make_link(
-            root,
-            &Link {
-                path: PathBuf::from("/dev/ptmx"),
-                target: PathBuf::from("pts/ptmx"),
-            },
-        )?;
+        if ptmx_link {
+            make_link(
+                root,
+                &Link {
+                    path: PathBuf::from("/dev/ptmx"),
+                    target: PathBuf::from("pts/ptmx"),
+                },
+            )?;
+        }
     }
     Ok(dev)
 }

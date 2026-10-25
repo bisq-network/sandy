@@ -704,7 +704,8 @@ The block names every key; it is not a policy that runs as written, because `exp
     `setpgid`. On Linux, where unprivileged user namespaces work, the program also runs as process
     2 in a PID namespace of its own, below an init of sandy, and the namespace ends with the
     program or sandy, also when sandy and its guard are both killed; inside, the program's
-    parent and process group have no process ID, so `getppid` returns 0. On macOS they cannot call `posix_spawn` either, because its flags can move the new
+    parent and process group have no process ID, so `getppid` returns 0, and files of root and
+    of other users show the owner 65534. On macOS they cannot call `posix_spawn` either, because its flags can move the new
     process out of the group as well: programs that start processes with `fork` and `exec` (for
     example shells) work, but programs that use `posix_spawn` get `EPERM` when they start one.
     Among them are Rust's `std::process::Command` (unless it sets `pre_exec`), Java's
@@ -813,8 +814,8 @@ metadata through the descriptor they wrote.
   the fix of Landlock erratum 3. A rename between two writable paths fails with `EXDEV`, a file
   outside a `read_exec` path cannot be mapped as code, `/proc` is read-only, and `sandy check`
   warns about what the view still shows: the host's file systems through `statfs`, the
-  directories above granted paths, link counts, and with `/proc` the mount table
-  ([docs/linux.md](docs/linux.md), "File system view").
+  directories above granted paths, link counts, and with `/proc` the mount tables, also the
+  host's ([docs/linux.md](docs/linux.md), "File system view").
 - **Name resolution across network changes.** A Landlock rule binds a file, so a file the
   system replaces by rename is lost to a program that is already running. With `--ip all` or
   `--ip client`, sandy grants systemd-resolved's directory, so name resolution keeps working when

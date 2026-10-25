@@ -293,6 +293,36 @@ fn a_terminal_works_when_one_is_attached() {
     assert_eq!(lines[2].detail, "pts/ptmx", "{lines:?}");
 }
 
+/// A policy that grants `/dev/ptmx` and `/dev/pts` starts in the view, with a terminal as without
+/// one, but makes no pseudo-terminal there: the host's `ptmx` bound alone finds no devpts next to
+/// it, and the private devpts of the view is outside every Landlock rule (docs/linux.md, "File
+/// system view"). Control: without the view the same grants make one.
+#[test]
+fn a_pty_grant_starts_in_the_view_and_makes_no_pty() {
+    if !view_works() {
+        return;
+    }
+    let Some(pty) = open_pty() else {
+        return skip("pty", "cannot open a pseudo-terminal");
+    };
+    let grants = args(&["--read-write", "/dev/ptmx", "--read-write", "/dev/pts"]);
+    let actions = [("open", "/dev/ptmx")];
+    probe_inside(&grants, &actions)[0].assert_ok();
+    let view = with_view(grants);
+    let without_terminal = probe_inside(&view, &actions);
+    assert!(
+        has_errno(&without_terminal[0], libc::ENOENT),
+        "{without_terminal:?}"
+    );
+    let mut command = Command::new(sandy_path());
+    command.args(run_args(&view, &actions));
+    with_terminal(&pty)(&mut command);
+    let output = command.stderr(Stdio::piped()).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let lines = parse(&output);
+    assert!(has_errno(&lines[0], libc::ENOENT), "{lines:?}");
+}
+
 /// `ip = "client"` keeps the resolver configuration of the system set: `/etc/resolv.conf` is
 /// recreated as the link it is on the host, and names resolve inside as outside.
 #[test]
@@ -476,7 +506,8 @@ fn the_view_leaves_the_file_systems_the_parents_and_link_counts_visible() {
 }
 
 /// Records the last exception of `PathsHidden`: with /proc granted, the mount table of the view
-/// names the host's device of every bound path, the same source as outside.
+/// names the host's device of every bound path, the same source as outside, and the mount table
+/// of a process outside the sandbox, this test's, names a mount point that the view hides.
 #[test]
 fn the_mount_table_names_the_hosts_devices() {
     if !view_works() {
@@ -502,6 +533,22 @@ fn the_mount_table_names_the_hosts_devices() {
     sandbox_args.extend(args(&["--read", "/proc"]));
     let view = probe_inside(&sandbox_args, &[("mount-source", directory.as_str())]);
     assert_eq!(view[0].detail, source, "{view:?}");
+
+    let table = fs::read_to_string("/proc/self/mountinfo").unwrap();
+    let points: Vec<&str> = table
+        .lines()
+        .filter_map(|line| line.split(' ').nth(4))
+        .filter(|point| !point.contains('\\'))
+        .collect();
+    let lookups: Vec<(&str, &str)> = points.iter().map(|point| ("lstat", *point)).collect();
+    let hidden = probe_inside(&sandbox_args, &lookups)
+        .into_iter()
+        .zip(&points)
+        .find(|(line, _)| has_errno(line, libc::ENOENT))
+        .map(|(_, point)| *point)
+        .expect("the view hides no mount point of the host");
+    let listed = format!("{}:{hidden}", std::process::id());
+    probe_inside(&sandbox_args, &[("mount-listed", listed.as_str())])[0].assert_ok();
 }
 
 /// Without a PID namespace the view binds the /proc paths the policy grants from the host's

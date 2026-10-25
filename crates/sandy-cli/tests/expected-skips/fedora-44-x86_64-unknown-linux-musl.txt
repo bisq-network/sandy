@@ -19,6 +19,7 @@ private_linux public_and_local_reaches_a_host_of_the_local_network local-network
 # root's rights, which the setup tests take with sudo -n; this host restricts nothing and asks
 # sudo for a password.
 setup_linux elevate_without_an_authentication_agent_is_not_done apparmor-userns-restriction
+setup_linux elevate_installs_a_copy_that_only_root_can_change passwordless-sudo
 setup_linux install_copy_lets_a_portable_sandy_hand_over passwordless-sudo
 setup_linux setup_cannot_enable_disabled_user_namespaces passwordless-sudo
 setup_linux setup_leaves_a_profile_file_it_did_not_write passwordless-sudo

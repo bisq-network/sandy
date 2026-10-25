@@ -36,6 +36,13 @@ const NOT_AUTHORIZED: i32 = 127;
 /// its own process, so that sandy is the shell's parent; a process ID that is not the parent is
 /// refused before anything is written, and one whose process ended in between leaves no copy
 /// behind. The script's own failures exit with 125, so they never read as pkexec's 126 and 127.
+///
+/// A default ACL of a directory above gives its entries to what is created below it, limited by
+/// the mode of the call that creates it and not by the umask, and the `mkdir` of Ubuntu 25.10
+/// (uutils) leaves group write there even with `-m 0755`. So `mktemp` makes each missing
+/// directory, with mode 0700, which gets mode 0755 before it is renamed into place, and the
+/// temporary file of the copy, with mode 0600: no one but root can write either at any moment,
+/// and no one can change the copy before root runs it.
 const INSTALL_COPY: &str = r#"fail() { echo "sandy: setup --elevate: $1" >&2; exit 125; }
 caller=$1 version=$2
 case $caller in ''|*[!0-9]*) fail 'not a process ID' ;; esac
@@ -46,14 +53,20 @@ parent() {
 }
 parent || fail 'the process that asked is not the parent of this shell'
 dir=/usr/local/libexec/sandy/$version copy=/usr/local/libexec/sandy/$version/sandy
-tmp=$dir/.sandy-setup.sandy.$$ wrote=
+new= tmp= wrote=
 umask 022
-/usr/bin/mkdir -p "$dir" || fail "cannot create $dir"
-trap '/usr/bin/rm -f "$tmp"' EXIT
+trap '[ -z "$new" ] || /usr/bin/rmdir "$new"; [ -z "$tmp" ] || /usr/bin/rm -f "$tmp"' EXIT
+for d in /usr/local /usr/local/libexec /usr/local/libexec/sandy "$dir"; do
+  [ -d "$d" ] && continue
+  new=$(/usr/bin/mktemp -d "${d%/*}/.sandy-setup.XXXXXX") && /usr/bin/chmod 0755 "$new" &&
+    /usr/bin/mv "$new" "$d" || fail "cannot create $d"
+  new=
+done
 if ! /usr/bin/cmp -s "/proc/$caller/exe" "$copy"; then
-  /usr/bin/rm -f "$tmp" && /usr/bin/cat "/proc/$caller/exe" >"$tmp" &&
+  tmp=$(/usr/bin/mktemp "$dir/.sandy-setup.sandy.XXXXXX") &&
+    /usr/bin/cat "/proc/$caller/exe" >"$tmp" &&
     /usr/bin/chmod 0755 "$tmp" && /usr/bin/mv -f "$tmp" "$copy" || fail "cannot write $copy"
-  wrote=1
+  tmp= wrote=1
 fi
 if ! /usr/bin/cmp -s "/proc/$caller/exe" "$copy" || ! parent; then
   [ -z "$wrote" ] || /usr/bin/rm -f "$copy"
@@ -355,11 +368,57 @@ mod tests {
         assert!(INSTALL_COPY.contains(setup::COPY_DIRECTORY));
         for line in INSTALL_COPY.lines() {
             for word in line.split_whitespace() {
-                for tool in ["mkdir", "rm", "cmp", "cat", "chmod", "mv"] {
+                for tool in ["mktemp", "rmdir", "rm", "cmp", "cat", "chmod", "mv"] {
                     assert_ne!(word, tool, "{line}");
                 }
             }
         }
+    }
+
+    /// The script refuses what it does not take before it writes anything: a process ID that is
+    /// not a number or not its parent, and a version that could name another directory. Control:
+    /// its parent and this version pass these checks and reach the first write, which fails
+    /// without root's rights.
+    #[test]
+    fn the_script_refuses_other_inputs_before_it_writes() {
+        if setup::is_root() {
+            eprintln!("skipped: as root the script would install a copy of the test");
+            return;
+        }
+        let run = |caller: &str, version: &str| {
+            let output = Command::new("/bin/sh")
+                .args(["-c", INSTALL_COPY, SCRIPT_NAME, caller, version])
+                .output()
+                .unwrap();
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+        };
+        let parent = std::process::id().to_string();
+        let other = if parent == "1" { "2" } else { "1" };
+        let version = env!("CARGO_PKG_VERSION");
+        for (caller, version, refusal) in [
+            ("", version, "not a process ID"),
+            ("12a", version, "not a process ID"),
+            ("-1", version, "not a process ID"),
+            (&parent, "", "not a version"),
+            (&parent, "../../etc", "not a version"),
+            (&parent, ".hidden", "not a version"),
+            (&parent, "2.1.0/x", "not a version"),
+            (&parent, "2.1 0", "not a version"),
+            (other, version, "not the parent of this shell"),
+        ] {
+            let (status, stderr) = run(caller, version);
+            assert_eq!(status, Some(125), "{caller:?} {version:?}: {stderr}");
+            assert!(stderr.contains(refusal), "{caller:?} {version:?}: {stderr}");
+        }
+        let (status, stderr) = run(&parent, version);
+        assert_eq!(status, Some(125), "{stderr}");
+        assert!(
+            stderr.contains("cannot create") || stderr.contains("cannot write"),
+            "{stderr}"
+        );
     }
 
     #[test]

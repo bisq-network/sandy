@@ -505,8 +505,9 @@ What the program gets, measured on Fedora 44:
    allows user namespaces only a trial shows.
 
 When nothing of this rules the namespaces out, `check` also tries them (`Backend::verify`): a
-forked child runs steps 1 to 3 and 5 and reports the first that fails. The namespaces end with
-the child. On Ubuntu the kernel log keeps the AppArmor audit records of the `unshare`, which is
+forked child runs steps 1 to 3 and 5 and reports the first that fails, with `children =
+"contained"` together with the PID namespace that its run adds (see "A PID namespace"). The
+namespaces end with the child. On Ubuntu the kernel log keeps the AppArmor audit records of the `unshare`, which is
 all a trial leaves behind. The trial finds what the host does not say, for example a sandbox
 around sandy whose seccomp filter denies `unshare`, as sandy's own does
 (`check_tries_the_namespaces_inside_a_sandbox_that_denies_them`). `run` stays the authoritative
@@ -652,9 +653,9 @@ exception of "Metadata through open files" does not apply in the view
   still takes writes to `/dev/null`. The system set grants all of them but `full`, which the view
   shows but Landlock denies. With a terminal on a standard stream, `/dev` also gets `tty` and a
   devpts instance of its own at `/dev/pts` (`newinstance,ptmxmode=0666,mode=620`), with
-  `/dev/ptmx` a link to `pts/ptmx`; its pseudo-terminals are the sandbox's only. Opening
-  `/dev/tty` still needs a grant (`--read-write /dev/tty`), as without the view
-  (`a_terminal_works_when_one_is_attached`). Without a terminal there is no `/dev/tty`
+  `/dev/ptmx` a link to `pts/ptmx`, or the host's node there when the policy grants
+  `/dev/ptmx`. Opening `/dev/tty` still needs a grant (`--read-write /dev/tty`), as without the
+  view (`a_terminal_works_when_one_is_attached`). Without a terminal there is no `/dev/tty`
   (`dev_holds_the_minimal_devices`). Other devices are bound only when the policy grants them.
 - **`/proc`** exists only when the policy grants a path of it, and holds what the policy grants,
   bound from the host's `/proc` (measured: binds of procfs and sysfs files and directories work in
@@ -696,6 +697,11 @@ exception of "Metadata through open files" does not apply in the view
   which a writable path cannot be.
 - `/proc` is read-only, and holds only the granted paths.
 - A program started in a directory the view does not hold starts in `/`.
+- The program cannot create a pseudo-terminal, also when the policy grants `/dev/ptmx` and
+  `/dev/pts`: the host's `ptmx`, bound alone, finds no devpts next to it (`ENOENT`), and the
+  devpts instance of the view lies outside every Landlock rule
+  (`a_pty_grant_starts_in_the_view_and_makes_no_pty`). Terminal emulators, `script`, `expect`
+  and programs that run others in a pseudo-terminal need `view = "all"`.
 - `ttyname` of a terminal on a standard stream finds no name: the name the host gives it lies in
   the host's devpts, and the view's `/dev/pts` is another instance.
 - `/dev/fd`, `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and `/dev/shm` exist only when granted.
@@ -723,9 +729,12 @@ These are exceptions of `PathsHidden` (DESIGN.md, "Requirements and the enforcem
 - **Link counts.** The link count of a granted file still counts its names outside the view, so
   the program learns that a file has another name, though not where.
   `the_view_leaves_the_file_systems_the_parents_and_link_counts_visible` records the three.
-- **The mount table, with `/proc` granted.** `/proc/self/mountinfo` lists every mount of the view
-  with the host's device and file system and their mount options, for example the name of an
-  encrypted volume and a btrfs subvolume (`the_mount_table_names_the_hosts_devices`).
+- **The mount tables, with `/proc` granted.** `/proc/self/mountinfo` lists every mount of the
+  view with the host's device and file system and their mount options, for example the name of
+  an encrypted volume and a btrfs subvolume. The mount table of a process outside the sandbox,
+  `/proc/PID/mountinfo`, which every process may read, lists the mounts of the host with their
+  paths, also the ones the view hides, such as a removable disk under `/run/media`
+  (`the_mount_table_names_the_hosts_devices`).
 
 Also visible, and not an exception because the policy grants it: the text of a recreated link,
 which names its target, and the content of `/proc` when it is granted.
@@ -891,16 +900,23 @@ root can change:
   `--policy` path must be absolute.
 - A portable sandy with `--install-copy`: root must not run the portable file. `pkexec` runs
   `/bin/sh -c SCRIPT sandy-setup PID VERSION`. SCRIPT is fixed text in sandy that names every
-  tool by its absolute path (`/usr/bin/mkdir`, `cat`, `cmp`, `chmod`, `mv` and `rm`), and the
-  process ID and the version arrive as positional parameters, never as script text. The
+  tool by its absolute path (`/usr/bin/mktemp`, `chmod`, `mv`, `cat`, `cmp`, `rm` and `rmdir`),
+  and the process ID and the version arrive as positional parameters, never as script text. The
   script:
   1. refuses a process ID that is not its parent, and a version with other characters than
      letters, digits, `.`, `+` and `-` or with a leading `.`, before it writes anything. pkexec
      runs the shell in its own process, so its parent is the sandy that asked, which waits for
      it;
-  2. creates the copy's directory, copies `/proc/PID/exe`, the image of that sandy and never the
-     file at its path, to a temporary file there and renames it into place; an identical copy
-     stays;
+  2. creates each missing directory of the copy's path as a directory that `mktemp` makes with
+     mode 0700, gives it mode 0755 and renames it into place, then copies `/proc/PID/exe`, the
+     image of that sandy and never the file at its path, to a temporary file that `mktemp`
+     creates there with mode 0600, and renames it into place; an identical copy stays. A default
+     ACL of a directory above passes its entries on to what is created below it, limited by the
+     mode of the call that creates it and not by the umask, so these modes are what keeps
+     everyone but root from writing there before root runs the copy. `mkdir -m 0755` would not
+     do: under such an ACL the `mkdir` of Ubuntu 25.10 (uutils coreutils 0.2.2) gives the new
+     directory group write, and so its ACL's users (measured;
+     `elevate_installs_a_copy_that_only_root_can_change`);
   3. checks with `cmp` that the copy has the same bytes as that image, and that the sandy that
      asked is still its parent, so that the process ID named that sandy during both reads;
      otherwise it deletes a copy it wrote and fails;
@@ -1093,11 +1109,14 @@ Costs and differences from the exec model:
 Where the host gives sandy a user namespace, `contained` also runs the program in a PID namespace
 of its own, whose end ends every process in it. The detection is the one of "Private network".
 With `ip = "private"` or `filesystem.view = "policy"` the run needs the user namespace anyway and
-stays the authoritative answer. With `contained` alone the namespace only adds to the process
-group, so `plan` also tries one in a forked child on every run, and a host that allows user
-namespaces but refuses them to sandy, such as a container whose seccomp profile denies `unshare`,
-keeps `contained` as described above. Under Ubuntu's AppArmor restriction `contained` keeps that
-mechanism too, without needing setup.
+stays the authoritative answer; it asks for the PID namespace in the same `unshare`, so `check`
+tries both together and refuses where `run` would, on a host that gives sandy user namespaces but
+no PID namespace (`user.max_pid_namespaces` 0;
+`check_tries_the_pid_namespace_where_the_run_needs_one`). With `contained` alone the namespace
+only adds to the process group, so `plan` also tries one in a forked child on every run, and a
+host that allows user namespaces but refuses them to sandy, such as a container whose seccomp
+profile denies `unshare`, keeps `contained` as described above. Under Ubuntu's AppArmor
+restriction `contained` keeps that mechanism too, without needing setup.
 
 1. The forked child of step 3 does not join the guard's group. It adds `CLONE_NEWPID` to the
    `unshare` of its namespaces (with `contained` alone, `CLONE_NEWUSER | CLONE_NEWPID`) and forks
@@ -1163,6 +1182,13 @@ Costs and differences:
   its process group and session (`getpgrp` and `getsid` return 0). The record of `--status-fd`
   names the program by its ID outside, which a caller can signal
   (`the_status_record_names_the_program_outside_its_namespace`).
+- The PID namespace belongs to a user namespace of sandy's own, also with `contained` alone, so
+  inside, files of root and of other users show the owner and group 65534, and so does every
+  supplementary group except the user's own in `getgroups`, as in "Private network"
+  (`files_of_root_show_the_owner_65534_in_the_pid_namespace`). Without the namespace, as in
+  sandy 2.0, they show their owners. Processes of the user that runs sandy hold every capability
+  in that namespace, so Yama's `ptrace_scope` 1 no longer keeps them from tracing the program
+  (from the kernel source; not measured), as in "What stays open".
 - Start time: with `contained` alone, the trial of `plan` adds a fork and an `unshare` to every
   start, and the namespace and the init add another. As the median of 100 runs of
   `sandy run --children contained --signals isolated -- /usr/bin/true` with the release build,

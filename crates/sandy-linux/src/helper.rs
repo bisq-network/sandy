@@ -464,10 +464,14 @@ const CONTROL_SIZE: usize = {
     unsafe { libc::CMSG_SPACE(mem::size_of::<RawFd>() as u32) as usize }
 };
 
+/// A buffer for that control message, aligned like the `cmsghdr` that `CMSG_FIRSTHDR` points
+/// into it.
+type Control = [u64; CONTROL_SIZE.div_ceil(mem::size_of::<u64>())];
+
 /// Sends a copy of `descriptor` over the Unix socket `socket` (`SCM_RIGHTS`), with one byte.
 pub(crate) fn send_descriptor(socket: RawFd, descriptor: RawFd) -> io::Result<()> {
     let mut body = [0u8; 1];
-    let mut buffer = [0u8; CONTROL_SIZE];
+    let mut buffer: Control = [0; CONTROL_SIZE.div_ceil(mem::size_of::<u64>())];
     let mut iov = libc::iovec {
         iov_base: body.as_mut_ptr().cast(),
         iov_len: body.len(),
@@ -478,7 +482,7 @@ pub(crate) fn send_descriptor(socket: RawFd, descriptor: RawFd) -> io::Result<()
     message.msg_iov = &mut iov;
     message.msg_iovlen = 1;
     message.msg_control = buffer.as_mut_ptr().cast();
-    message.msg_controllen = buffer.len() as _;
+    message.msg_controllen = CONTROL_SIZE as _;
     // SAFETY: the control buffer is large enough for one descriptor (CONTROL_SIZE), so
     // CMSG_FIRSTHDR returns a pointer into it.
     unsafe {
@@ -500,7 +504,7 @@ pub(crate) fn send_descriptor(socket: RawFd, descriptor: RawFd) -> io::Result<()
 /// closed first, or sent no descriptor.
 pub(crate) fn receive_descriptor(socket: &OwnedFd) -> Option<OwnedFd> {
     let mut body = [0u8; 1];
-    let mut buffer = [0u8; CONTROL_SIZE];
+    let mut buffer: Control = [0; CONTROL_SIZE.div_ceil(mem::size_of::<u64>())];
     let mut iov = libc::iovec {
         iov_base: body.as_mut_ptr().cast(),
         iov_len: body.len(),
@@ -510,7 +514,7 @@ pub(crate) fn receive_descriptor(socket: &OwnedFd) -> Option<OwnedFd> {
     message.msg_iov = &mut iov;
     message.msg_iovlen = 1;
     message.msg_control = buffer.as_mut_ptr().cast();
-    message.msg_controllen = buffer.len() as _;
+    message.msg_controllen = CONTROL_SIZE as _;
     loop {
         // SAFETY: receives into the buffers above.
         let received =

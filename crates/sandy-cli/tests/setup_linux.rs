@@ -745,3 +745,146 @@ fn elevate_without_an_authentication_agent_is_not_done() {
     );
     assert_no_profile(&installed.sandy);
 }
+
+/// A polkit rule that lets this user run pkexec without a password, as an administrator's
+/// password would for one call. Dropping it takes the rule back.
+struct PasswordlessPkexec(PathBuf);
+
+impl PasswordlessPkexec {
+    /// `None` when polkit does not take the rule within a few seconds.
+    fn install(user: &str) -> Option<PasswordlessPkexec> {
+        let rule = PathBuf::from(format!(
+            "/etc/polkit-1/rules.d/00-sandy-test-{}.rules",
+            std::process::id()
+        ));
+        let text = format!(
+            "polkit.addRule(function(action, subject) {{\n  if (action.id == \
+             \"org.freedesktop.policykit.exec\" && subject.user == \"{user}\") {{\n    return \
+             polkit.Result.YES;\n  }}\n}});\n"
+        );
+        let mut tee = Command::new("sudo")
+            .args(["-n", "tee"])
+            .arg(&rule)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(&mut tee.stdin.take().unwrap(), text.as_bytes()).unwrap();
+        assert!(
+            tee.wait().unwrap().success(),
+            "cannot write {}",
+            rule.display()
+        );
+        let installed = PasswordlessPkexec(rule);
+        // polkitd reads its rules again when the directory changes.
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(20) {
+            let tried = output_within(
+                Command::new("/usr/bin/pkexec").arg("/bin/true"),
+                Duration::from_secs(30),
+            );
+            if tried.status.success() {
+                return Some(installed);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        None
+    }
+}
+
+impl Drop for PasswordlessPkexec {
+    fn drop(&mut self) {
+        sudo(["rm".as_ref(), "-f".as_ref(), self.0.as_os_str()]);
+    }
+}
+
+/// The directory of the copies, made by the test with a default ACL that gives this user every
+/// right in what is created below it. Dropping it removes it, and `/usr/local/libexec` when the
+/// test made that too.
+struct SharedCopyDirectory {
+    libexec_existed: bool,
+}
+
+impl Drop for SharedCopyDirectory {
+    fn drop(&mut self) {
+        sudo(["rm", "-rf", COPY_DIRECTORY]);
+        if !self.libexec_existed {
+            sudo(["rmdir", "/usr/local/libexec"]);
+        }
+    }
+}
+
+/// (f) `--elevate --install-copy` through pkexec, as an administrator who types the password runs
+/// it: the fixed script creates the copy's directories and the copy so that only root can change
+/// them, also below a directory whose default ACL gives this user write in everything created
+/// there. Otherwise this user could replace the copy before root runs it. The copy's setup then
+/// loads the profile, and the portable sandy hands over to it.
+#[test]
+fn elevate_installs_a_copy_that_only_root_can_change() {
+    let _serial = serial();
+    if !root_on_a_restricted_host() {
+        return;
+    }
+    if !Path::new("/usr/bin/pkexec").exists() {
+        return skip("pkexec", "pkexec is not installed");
+    }
+    if Path::new(COPY_DIRECTORY).exists() {
+        return skip(
+            "no-installed-copy",
+            "a copy of sandy is installed, and the test leaves it alone",
+        );
+    }
+    if Command::new("setfacl").arg("--version").output().is_err() {
+        return skip("setfacl", "setfacl is not installed");
+    }
+    let user = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout).unwrap();
+    let user = user.trim();
+    let Some(_pkexec) = PasswordlessPkexec::install(user) else {
+        return skip(
+            "passwordless-pkexec",
+            "polkit did not take a rule that lets this user run pkexec",
+        );
+    };
+    let _shared = SharedCopyDirectory {
+        libexec_existed: Path::new("/usr/local/libexec").exists(),
+    };
+    let made = sudo(["install", "-d", "-m", "0755", COPY_DIRECTORY]);
+    assert!(made.status.success(), "{}", text(&made));
+    let acl = sudo([
+        "setfacl",
+        "-d",
+        "-m",
+        &format!("u:{user}:rwx"),
+        COPY_DIRECTORY,
+    ]);
+    assert!(acl.status.success(), "{}", text(&acl));
+    let _removal = CopyRemoval {
+        directory_existed: true,
+    };
+
+    let portable = PathBuf::from(sandy_path()).canonicalize().unwrap();
+    let output = output_within(
+        Command::new(&portable).args(["setup", "--elevate", "--install-copy"]),
+        Duration::from_secs(120),
+    );
+    let copy = copy_path();
+    let planted = copy.parent().unwrap().join("planted");
+    let created = fs::File::create(&planted).map(drop);
+    assert_eq!(
+        created.map_err(|error| error.kind()),
+        Err(std::io::ErrorKind::PermissionDenied),
+        "this user can create files next to the copy: {}",
+        text(&output)
+    );
+    let opened = fs::OpenOptions::new().write(true).open(&copy).map(drop);
+    assert_eq!(
+        opened.map_err(|error| error.kind()),
+        Err(std::io::ErrorKind::PermissionDenied),
+        "this user can change the copy: {}",
+        text(&output)
+    );
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(is_loaded(&profile_name(&copy)));
+    let check = check_private(&portable);
+    assert!(check.status.success(), "{}", text(&check));
+}

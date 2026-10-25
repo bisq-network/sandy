@@ -60,6 +60,8 @@ impl Backend for LinuxBackend {
     /// forward listeners then bind inside the sandbox's new network namespace, where no port is taken, so a busy port on the host's
     /// loopback says nothing about them. The egress broker needs the namespace too, and the
     /// kernel's answers about this host's addresses, which `run` asks for before it starts it.
+    /// The run of `children = "contained"` asks for its PID namespace in the same `unshare`, so
+    /// the trial does too.
     fn verify(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
         let private = policy.ip == IpAccess::Private;
         let hidden = policy.view == FileView::Policy;
@@ -70,7 +72,7 @@ impl Backend for LinuxBackend {
         let namespaces = Namespaces {
             network: private,
             mount: hidden,
-            pid: false,
+            pid: plan::wants_pid_namespace(policy),
         };
         if (private || hidden)
             && namespace::support(&namespace::Purpose::of(policy)).is_ok()
@@ -84,6 +86,7 @@ impl Backend for LinuxBackend {
                     Requirement::EgressBrokered,
                 ),
                 (hidden, Requirement::PathsHidden),
+                (namespaces.pid, Requirement::ChildProcessesContained),
             ];
             for (_, requirement) in requirements.into_iter().filter(|(needed, _)| *needed) {
                 items.push(PlanItem::unavailable(requirement, reason.clone()));

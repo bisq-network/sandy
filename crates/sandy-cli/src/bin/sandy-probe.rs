@@ -5285,6 +5285,7 @@ mod view {
         "statfs",
         "link-count",
         "mount-source",
+        "mount-listed",
         "kill-signal",
         "pidfd-open",
         "proc-pids",
@@ -5362,6 +5363,18 @@ mod view {
                     .next_back()
                     .map(str::to_string)
                     .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such mount"))
+            }
+            // Whether PATH is a mount point in the mount table of process PID: `PID:PATH`.
+            "mount-listed" => {
+                let (pid, path) = target
+                    .split_once(':')
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "PID:PATH"))?;
+                let table = fs::read_to_string(format!("/proc/{pid}/mountinfo"))?;
+                table
+                    .lines()
+                    .any(|line| line.split(' ').nth(4) == Some(path))
+                    .then(String::new)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not listed"))
             }
             // Sends signal SIGNAL to process PID: `PID:SIGNAL`.
             "kill-signal" => {

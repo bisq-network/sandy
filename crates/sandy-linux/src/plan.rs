@@ -210,9 +210,13 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
 /// program that reads `/proc/<getpid()>` would read another process, and a `/proc` of the
 /// namespace (`subset=pid`) would hide the host's files the policy grants, such as `meminfo`.
 fn pid_namespace(policy: &ResolvedPolicy, host: &HostCapabilities) -> bool {
-    policy.children == ChildProcesses::Contained
-        && host.pid_namespace.is_ok()
-        && !sees_proc(policy, "/proc")
+    wants_pid_namespace(policy) && host.pid_namespace.is_ok()
+}
+
+/// Whether the program of `children = "contained"` runs in a PID namespace where the host gives
+/// one (`pid_namespace`), for the trial of `check`.
+pub(crate) fn wants_pid_namespace(policy: &ResolvedPolicy) -> bool {
+    policy.children == ChildProcesses::Contained && !sees_proc(policy, "/proc")
 }
 
 /// Whether a policy path holds `path` or lies below it.
@@ -410,7 +414,8 @@ fn view_shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
         shortfalls.push(format!(
             "{hides}: with /proc granted, /proc/self/mountinfo lists every mount of the view with \
              the host's device and file system and their mount options, for example the name of \
-             an encrypted volume (docs/linux.md, \"File system view\")"
+             an encrypted volume, and the mount table of a process outside the sandbox lists the \
+             host's mounts with their paths (docs/linux.md, \"File system view\")"
         ));
     }
     shortfalls
@@ -581,12 +586,14 @@ fn plan_item(
         },
         Requirement::Win32kDenied => enforced(NO_WIN32K.to_string()),
         Requirement::IpNetworkPrivate => match (&host.user_namespaces, &host.seccomp) {
-            (Err(Missing::NeedsSetup(reason)), _) => PlanItem::needs_setup(requirement, reason),
             (Err(Missing::Unavailable(reason)), _) | (_, Err(reason)) => unavailable(reason),
+            (Err(Missing::NeedsSetup(reason)), _) => PlanItem::needs_setup(requirement, reason),
             (Ok(()), Ok(())) => enforced(PRIVATE_NETWORK.to_string()),
         },
         // The broker serves a listener in the sandbox's network namespace, so it needs what the
         // private network needs, and what the relay needs to confine itself and watch the program.
+        // What setup cannot fix comes first, so that the item needs setup only when setup is all
+        // that is missing.
         Requirement::EgressBrokered => {
             match (
                 &host.user_namespaces,
@@ -594,13 +601,13 @@ fn plan_item(
                 &host.seccomp,
                 &host.pidfd,
             ) {
-                (Err(Missing::NeedsSetup(reason)), ..) => {
-                    PlanItem::needs_setup(requirement, reason)
-                }
                 (Err(Missing::Unavailable(reason)), ..)
                 | (_, Err(reason), _, _)
                 | (_, _, Err(reason), _)
                 | (_, _, _, Err(reason)) => unavailable(reason),
+                (Err(Missing::NeedsSetup(reason)), ..) => {
+                    PlanItem::needs_setup(requirement, reason)
+                }
                 _ => enforced(broker_mechanism(abi)),
             }
         }
@@ -1365,6 +1372,14 @@ mod tests {
         no_seccomp.seccomp = Err("no seccomp".to_string());
         let plan = plan_for(&policy, &no_seccomp);
         assert!(unavailable(&plan).contains(&Requirement::IpNetworkPrivate));
+        no_seccomp.user_namespaces = Err(Missing::NeedsSetup("restricted".to_string()));
+        let plan = plan_for(&policy, &no_seccomp);
+        assert_eq!(
+            status(&plan, Requirement::IpNetworkPrivate),
+            &Status::Unavailable {
+                reason: "no seccomp".to_string()
+            }
+        );
     }
 
     /// The egress broker serves a listener in the sandbox's network namespace, so it is
@@ -1429,6 +1444,19 @@ mod tests {
         ] {
             let plan = plan_for(&policy, &broken);
             assert!(unavailable(&plan).contains(&Requirement::EgressBrokered));
+            // What setup cannot fix wins over what it fixes, so check never exits with 2 here.
+            let restricted = HostCapabilities {
+                user_namespaces: Err(Missing::NeedsSetup("restricted".to_string())),
+                ..broken
+            };
+            let plan = plan_for(&policy, &restricted);
+            assert!(
+                matches!(
+                    status(&plan, Requirement::EgressBrokered),
+                    Status::Unavailable { .. }
+                ),
+                "{plan:?}"
+            );
         }
         policy.egress = None;
         assert_eq!(
