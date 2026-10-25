@@ -83,11 +83,13 @@ cargo build --release --target x86_64-unknown-linux-musl -p sandy-cli --bin sand
 ```
 
 Release archives for each platform are built by the `release` workflow (see
-[Building and testing](#building-and-testing)). Sizes:
+[Building and testing](#building-and-testing)). Sizes, measured for 1.x except the first row,
+which is 2.1.0 (the namespaces, the view and the egress broker made the Linux binary larger; the
+other rows will grow too, and the release workflow gives their current size):
 
 | Target | Binary | Archive |
 |---|---|---|
-| `x86_64-unknown-linux-musl` (static PIE) | 909 KiB | 434 KiB |
+| `x86_64-unknown-linux-musl` (static PIE) | 1.5 MiB | 700 KiB |
 | `aarch64-unknown-linux-musl` (static, not position-independent) | 772 KiB | 401 KiB |
 | `aarch64-apple-darwin` | 654 KiB | 318 KiB |
 | `x86_64-apple-darwin` | 713 KiB | 350 KiB |

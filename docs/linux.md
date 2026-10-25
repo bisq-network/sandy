@@ -403,9 +403,9 @@ the relay's Landlock rules allow TCP connect only to its targets, and the broker
 port the check allows.
 
 1. Before the `unshare`, sandy opens a `NETLINK_ROUTE` socket and checks that the kernel answers
-   a route lookup and an address dump over it, so a kernel that cannot answer refuses the run
-   instead of every connection later. It opens a pidfd for its own process ID (with
-   `contained`: the supervising sandy's) and a socket pair for the listener.
+   a route lookup and an address, a link and a route dump over it, so a kernel that cannot
+   answer refuses the run instead of every connection later. It opens a pidfd for its own process ID
+   (with `contained`: the supervising sandy's) and a socket pair for the listener.
 2. It forks the broker twice, as it forks the relay: in a session of its own, with every signal
    except the fault signals blocked and `/dev/null` as its standard descriptors. The broker stays
    in the host's network namespace.
@@ -434,9 +434,17 @@ port the check allows.
    program and of the guard's pipe meanwhile, and keeps its watchdog armed.
 5. It serves the listener with `sandy_relay::broker::serve`, which asks the kernel for every
    connection whether the destination is this host (`RTM_GETROUTE` for the destination, and
-   `RTM_GETADDR` for the addresses and subnets of every interface), and connects from the host's
-   namespace. A thread polls the pidfd and the guard's pipe, keeps the watchdog armed, and asks
-   the serve loop to stop when either ends.
+   `RTM_GETADDR` for the addresses and subnets of every interface) and which networks the host
+   reaches without a router (the subnets, and an `RTM_GETROUTE` dump of every table for the
+   unicast routes without a gateway other than the default route, over links that an
+   `RTM_GETLINK` dump shows neither point-to-point nor NOARP), and connects from the host's
+   namespace. The route dump holds every table, also one that no rule uses for the broker's
+   connections, such as a VRF's, so it can only add networks to the local network. A route that
+   names only a nexthop object, which is all the kernel sends when
+   `net.ipv4.nexthop_compat_mode` is 0, does not say whether it has a gateway and is left out,
+   so the network of an on-link route of that form is not the local network. A thread polls
+   the pidfd and the guard's pipe, keeps the watchdog armed, and asks the serve loop to stop
+   when either ends.
 
 Its lifetime follows rule 5 of "Forwarded ports":
 
@@ -473,14 +481,24 @@ What the program gets, measured on Fedora 44:
   destination, or a resolver of its own behind a forwarded port.
 - Only TCP leaves; ICMP and UDP stay inside.
 - The broker reaches what the host's routes reach, as sandy's user, VPN tunnels and the bridges
-  of containers and virtual machines included. Their subnets are subnets of the host's
-  interfaces, so `public` refuses their hosts and `public-and-local` allows them (measured: the
-  SSH ports of the VMs of a libvirt network), while their bridge addresses, which are this host,
-  stay refused.
+  of containers and virtual machines included. Their subnets, and every network that a route
+  without a gateway sends into a bridge or another link with neighbours of its own, are the
+  local network, so `public` refuses their hosts and `public-and-local` allows them (measured:
+  the SSH ports of the VMs of a libvirt network), while their bridge addresses, which are this
+  host, stay refused. A tunnel (wg, tun, ppp, gre) is point-to-point or NOARP: what a route sends
+  into it goes to the other end, which takes it on as a router does, so only the subnet of the
+  tunnel's own address is the local network. A full tunnel therefore leaves the internet
+  public, whether it takes all traffic through a default route without a gateway
+  (`default dev wg0`) or through narrower routes such as `0.0.0.0/1`, `128.0.0.0/1` and
+  `2000::/4`; the private ranges behind it stay refused by the static check
+  (`on_link_routes_are_the_local_network_without_an_address`, in a network namespace of its
+  own). A dummy link is NOARP too, until `ip link set ... arp on`.
 - The start takes about 1.8 ms more than without the broker: 6.2 to 6.4 ms against 4.3 to 4.7 ms,
   as the median of 100 runs of `sandy run --ip private -- /usr/bin/true` with the release build
-  (kernel 7.2, a busy 24 CPU host). Each connection costs a route lookup and an address dump over
-  netlink, two threads with 256 KiB stacks and two descriptors.
+  (kernel 7.2, a busy 24 CPU host). Each connection costs a route lookup, an address dump, a
+  link dump without statistics and a route dump over netlink (about 1, 4, 8 and 5 µs on that
+  host with 8 links, and 76 ms for the dump of a million routes in a network namespace), two
+  threads with 256 KiB stacks and two descriptors.
 
 ### Detection
 

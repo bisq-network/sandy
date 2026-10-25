@@ -501,8 +501,8 @@ mod tests {
     /// depending on the rest of the profile (docs/macos.md, "The egress broker"), so this applies
     /// the real profile, in a child process of its own, and connects to listeners at 127.0.0.1,
     /// at ::1 and at this Mac's address on the local network: each is refused. The control is the
-    /// same profile without the deny, which reaches each. The child also reads this Mac's addresses,
-    /// which the destination check needs under the profile.
+    /// same profile without the deny, which reaches each. The child also reads this Mac's addresses
+    /// and routing table, which the destination check needs under the profile.
     #[test]
     fn the_broker_profile_keeps_this_mac_out_of_reach() {
         if let Ok(trial) = std::env::var(BROKER_TRIAL) {
@@ -544,6 +544,7 @@ mod tests {
                 );
             }
             assert!(stdout.contains("trial addresses read"), "{mode}: {stdout}");
+            assert!(stdout.contains("trial routes read"), "{mode}: {stdout}");
         }
     }
 
@@ -570,6 +571,9 @@ mod tests {
         }
         if interfaces::addresses().is_ok_and(|all| !all.is_empty()) {
             println!("trial addresses read");
+        }
+        if interfaces::routing_table().is_ok_and(|table| !table.is_empty()) {
+            println!("trial routes read");
         }
     }
 

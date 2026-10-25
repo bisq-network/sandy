@@ -85,7 +85,7 @@ compiler fail, and sandy fails closed.
 | `EnvironmentControlled` | `posix_spawn` (with `children = "contained"`: `execve`) receives exactly `command.env`. The backend adds no variable. |
 | `IpNetworkDenied` | Profile: no `network-*` rule for IP, and the NECP calls are denied. The name resolver is unreachable unless `unix_sockets = "all"`. |
 | `IpNetworkPrivate` | Profile: TCP only, `network-outbound` only to `(remote tcp "localhost:P")` for each forwarded port and the egress port, and `network-bind` and `network-inbound` only on `(local tcp "localhost:E")` for each exposed port; the NECP calls are denied; `/etc/hosts` is readable, the name resolver unreachable unless `unix_sockets = "all"`. The relay and the broker bind their ports without listening at the wildcard addresses and at every current address of the Mac. Unavailable with a forwarded or egress port and `signals = "any"`. See [The private network](#the-private-network). |
-| `EgressBrokered` | A broker process outside the program's sandbox, with its own profile, that checks every destination (`sandy_core::destination`, with the Mac's addresses from `getifaddrs`). See [The egress broker](#the-egress-broker). |
+| `EgressBrokered` | A broker process outside the program's sandbox, with its own profile, that checks every destination (`sandy_core::destination`, with the Mac's addresses from `getifaddrs` and its routes from the routing sysctl). See [The egress broker](#the-egress-broker). |
 | `PathsHidden` | Profile: the rule of step 3 of [The generated profile](#the-generated-profile), which every profile has. Unavailable with `unix_sockets = "all"`. See [The file system view](#the-file-system-view). |
 | `InboundIpDenied` | Profile: `network-outbound` and `network-bind` for IP sockets, `network-inbound` only for UDP sockets, so `listen` and `accept` fail for TCP (see [Networking](#networking)). |
 | `UnixSocketsDenied` | Profile: no `network-bind` or `network-outbound` for Unix sockets. With `ip = "client"` or `ip = "all"`, the resolver socket is the one exception. |
@@ -849,24 +849,45 @@ connects only to the destinations that `sandy_core::destination` allows for the 
    - `(allow network-outbound (remote tcp "*:*"))`, followed by
      `(deny network-outbound (remote ip "localhost:*"))`, so the kernel too keeps it from every
      address of the Mac;
-   - `(allow sysctl-read (sysctl-name-prefix "net.route"))`, for `getifaddrs`;
+   - `(allow sysctl-read (sysctl-name-prefix "net.route"))`, for `getifaddrs` and the routing
+     table;
    - `FIONBIO` and `FIOASYNC`, and the closing denials of every profile: no files, no Mach
      services, no processes.
-4. Under that profile it checks that it can read the Mac's addresses and starts serving, and only
-   then reports that it is ready. sandy refuses to start the program without that report.
+4. Under that profile it checks that it can read the Mac's addresses and routing table and
+   starts serving, and only then reports that it is ready. sandy refuses to start the program
+   without that report.
 5. It serves `sandy_relay::broker::serve` until the program ends, then closes its listener and
    its holder sockets at once and gives the connections a second, like the relay.
 
-The host's part of the check (`HostNetwork`, `macos::interfaces`) reads `getifaddrs` again for
-every connection: an address is the Mac's own when an interface has it, also one that is down,
-or when it is the broadcast address of an interface's IPv4 subnet, and the subnets are those of
-the interfaces' addresses, for a point-to-point link that of its peer. macOS delivers nothing
-else to itself: it has no local route without an address, so 127.0.0.2 gets no answer (see the
-table above). `getifaddrs` reads the routing sysctl (`CTL_NET`, `PF_ROUTE`, `NET_RT_IFLIST2`);
-inside a profile only `(sysctl-name-prefix "net.route")` allows it, neither the exact name
-`net.route` nor a longer prefix such as `net.route.` or `net.route.0.0.6` (measured on macOS
-27.0.1). The prefix covers the routing sysctl, so the broker could also read the routing table;
-the only named sysctl under it is `net.route.verbose`.
+The host's part of the check (`HostNetwork`, `macos::interfaces`) reads `getifaddrs` and the
+routing table again for every connection. An address is the Mac's own when an interface has it,
+also one that is down, or when it is the broadcast address of an interface's IPv4 subnet. macOS
+delivers nothing else to itself: it has no local route without an address, so 127.0.0.2 gets no
+answer (see the table above). The local network is the subnet of every interface address, for
+a point-to-point link that of its peer, and every network that a route reaches without a router:
+a route that is up, other than the default route, whose gateway is none or a link-layer address,
+that is neither a route of the Mac itself (local, broadcast, multicast) nor one that reaches
+nothing (reject, blackhole), and whose interface is not point-to-point (`IFF_POINTOPOINT` in
+`getifaddrs`, such as `utun`, `gif`, `stf` and `ppp`). That covers the on-link prefix of router
+advertisements beside an address of another prefix, such as a DHCPv6 address, and a route into
+a link where the Mac has no address of its prefix. What a route sends into a tunnel goes to its
+other end, which takes it on as a router does, so a VPN that splits the default route into
+`0/1` and `128.0/1` on its `utun` leaves the internet public; the subnet of the tunnel's own
+address still counts (`routes_into_a_tunnel_name_no_network`). On the test Mac that leaves out
+the `fe80::/64` routes of its eight `utun` interfaces.
+
+`getifaddrs` reads the routing sysctl (`CTL_NET`, `PF_ROUTE`, `NET_RT_IFLIST2`); inside a
+profile only `(sysctl-name-prefix "net.route")` allows it, neither the exact name `net.route`
+nor a longer prefix such as `net.route.` or `net.route.0.0.6` (measured on macOS 27.0.1). The
+routing table is the same sysctl's `NET_RT_DUMP`, which the same rule allows
+(`the_broker_profile_keeps_this_mac_out_of_reach` reads it under the broker's profile). The
+only named sysctl under that prefix is `net.route.verbose`. Measured on macOS 27.0.1, reading
+and parsing the 13 KB routing table took about 64 µs, `getifaddrs` 39 µs, and the whole answer
+about the local network, which reads `getifaddrs` twice, 137 µs.
+`the_routing_table_holds_the_subnet_of_the_way_out` reads this Mac's table;
+`routes_to_a_link_name_their_network`, `routes_into_a_tunnel_name_no_network` and
+`other_routes_name_no_network` check the parser with routes this Mac does not have, because
+adding one needs root.
 
 The profile compiler drops a deny that follows a broad allow in some profile shapes: measured
 on macOS 27.0.1, `(allow network-outbound (remote ip "*:*"))` followed by

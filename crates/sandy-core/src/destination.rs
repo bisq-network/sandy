@@ -30,8 +30,8 @@ enum Kind {
     Never,
     /// The local network, which `reach = "public-and-local"` allows.
     Local,
-    /// Not globally reachable. With `public-and-local` a subnet of the host's interfaces in such
-    /// a block is the local network too.
+    /// Not globally reachable. With `public-and-local` a network that the host reaches without a
+    /// router in such a block is the local network too (`HostNetwork::subnets`).
     Special,
 }
 
@@ -226,8 +226,8 @@ pub enum Refusal {
     Block(&'static str),
     /// An address of this host (`HostNetwork::is_host`).
     Host,
-    /// An address on a subnet of the host's interfaces, which is the local network that
-    /// `reach = "public"` excludes.
+    /// An address on a network that the host reaches without a router
+    /// (`HostNetwork::subnets`), which is the local network that `reach = "public"` excludes.
     HostSubnet,
     /// The host could not tell whether the address is its own, so it counts as its own.
     HostUnknown,
@@ -241,7 +241,7 @@ impl fmt::Display for Refusal {
             Refusal::Host => write!(f, "an address of this host"),
             Refusal::HostSubnet => write!(
                 f,
-                "on a subnet of this host's interfaces, which is the local network"
+                "on a network this host reaches without a router, which is the local network"
             ),
             Refusal::HostUnknown => {
                 write!(f, "this host could not tell whether the address is its own")
@@ -250,7 +250,7 @@ impl fmt::Display for Refusal {
     }
 }
 
-/// A subnet of one of the host's interfaces: an address and the length of its prefix.
+/// A network that the host reaches without a router: an address and the length of its prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Subnet {
     address: IpAddr,
@@ -294,10 +294,20 @@ pub trait HostNetwork {
     ///   `ip route add local ...`).
     fn is_host(&self, ip: IpAddr) -> io::Result<bool>;
 
-    /// The subnets of the host's interfaces: for each interface address, the subnet the host
-    /// reaches without a router (the address and its prefix length, and for a point-to-point
-    /// link the peer's address and prefix). They are the local network, which
-    /// `reach = "public"` refuses and `"public-and-local"` allows.
+    /// Every network the host reaches without a router, which is the local network that
+    /// `reach = "public"` refuses and `"public-and-local"` allows:
+    /// - for each interface address, its subnet (the address and its prefix length, and for a
+    ///   point-to-point link the peer's address and prefix);
+    /// - the network of every unicast route whose next hop is no gateway (on-link), also where
+    ///   no interface address has its prefix, such as the on-link /64 of router advertisements
+    ///   beside a DHCPv6 /128. Except the default route, which would make every address local,
+    ///   and a route into a point-to-point or tunnel link (Linux: `IFF_POINTOPOINT` or
+    ///   `IFF_NOARP`; macOS: `IFF_POINTOPOINT`; Windows: a tunnel or PPP interface type, or a
+    ///   point-to-point access type): what it sends goes to the other end, which takes it on as
+    ///   a router does, so a full tunnel that splits the default route into `0.0.0.0/1` and
+    ///   `128.0.0.0/1` does not make every address local. The subnets of such a link's own
+    ///   addresses still count, by the first point. The routes of the host itself may be among
+    ///   them; `is_host` answers those first.
     fn subnets(&self) -> io::Result<Vec<Subnet>>;
 }
 

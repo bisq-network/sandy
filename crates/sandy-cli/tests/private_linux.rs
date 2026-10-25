@@ -218,7 +218,10 @@ fn an_exposed_port_reaches_the_program_and_its_own_port_stays_inside() {
     let mut modes = launch_modes();
     modes.push(args(&["--explain"]));
     for mode in modes {
-        let inner = free_port();
+        // The test holds the program's port on the host's loopback, bound but not listening, so
+        // no other test can listen there while this one checks that a direct connection finds
+        // nothing. Without a namespace of its own the program could not bind it at all.
+        let (inner, _held) = held_port();
         let outer = free_port();
         let mut sandbox_args = private();
         sandbox_args.extend(mode.iter().cloned());
@@ -249,6 +252,42 @@ fn an_exposed_port_reaches_the_program_and_its_own_port_stays_inside() {
             "{mode:?}: the program's own port took a connection"
         );
     }
+}
+
+/// A free port of 127.0.0.1, bound by a TCP socket that never listens, so that a connection to
+/// it on the host's loopback is refused and no other process can take the port meanwhile.
+fn held_port() -> (u16, std::os::fd::OwnedFd) {
+    use std::os::fd::FromRawFd;
+    // SAFETY: socket has no memory safety requirements; the result is checked.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+    // SAFETY: fd is a new socket that nothing else owns.
+    let socket = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    let address = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from(std::net::Ipv4Addr::LOCALHOST).to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    let length = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SAFETY: address is a valid sockaddr_in of `length` bytes.
+    let bound = unsafe { libc::bind(fd, (&raw const address).cast::<libc::sockaddr>(), length) };
+    assert_eq!(bound, 0, "{}", std::io::Error::last_os_error());
+    // SAFETY: an all-zero sockaddr_in is a valid value.
+    let mut name: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut name_length = length;
+    // SAFETY: name has room for a sockaddr_in, and name_length says so.
+    let read = unsafe {
+        libc::getsockname(
+            fd,
+            (&raw mut name).cast::<libc::sockaddr>(),
+            &mut name_length,
+        )
+    };
+    assert_eq!(read, 0, "{}", std::io::Error::last_os_error());
+    (u16::from_be(name.sin_port), socket)
 }
 
 /// The children and grandchildren of process `parent` that lead a session of their own, from

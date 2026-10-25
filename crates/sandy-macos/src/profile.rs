@@ -145,7 +145,8 @@ pub fn broker_profile(port: u16) -> Profile {
     writer.line("(allow network-outbound (remote tcp \"*:*\"))");
     writer.line(BROKER_LOCALHOST_DENY);
     writer.comment(
-        "getifaddrs reads the routing sysctl; no shorter name than this prefix matches it.",
+        "getifaddrs and the routing table read the routing sysctl; no shorter name than this\n\
+         prefix matches it.",
     );
     writer.line("(allow sysctl-read (sysctl-name-prefix \"net.route\"))");
     writer.comment("Non-blocking mode for the sockets (connect with a timeout).");

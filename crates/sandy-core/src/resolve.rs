@@ -342,9 +342,11 @@ impl ResolvedPolicy {
                 "egress: the broker refuses an address of this host with reply 2 and answers \
                  other addresses with the result of its connect, so by trying addresses the \
                  program can tell which belong to this host and, with reach = \"public\", which \
-                 belong to its subnets; a NAT64 prefix of an operator, other than the well-known \
-                 ones, looks like any public address, so the broker cannot recognise it, and \
-                 neither a public address that a router maps back to this host \
+                 belong to its local network; a NAT64 prefix of an operator, other than the \
+                 well-known ones, looks like any public address, so the broker cannot recognise \
+                 it, nor a public address that a router maps back to this host; a firewall rule \
+                 of this host that redirects outgoing connections takes the broker's \
+                 connections to the local service it names, which the broker cannot see \
                  (docs/DESIGN.md, \"Egress broker\")"
                     .to_string(),
             );

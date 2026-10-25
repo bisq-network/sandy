@@ -6,7 +6,19 @@
 //! address, the broadcast address of every subnet, and local routes that no interface shows
 //! (`ip route add local ...`). It also compares the address with every interface address and
 //! subnet broadcast address (RTM_GETADDR), which does not depend on the routing rules that the
-//! lookup follows. `subnets` comes from the same list of addresses.
+//! lookup follows.
+//!
+//! `subnets` is every network this host reaches without a router: the prefix of every interface
+//! address from the same list, and every unicast route of every table whose next hops name no
+//! gateway (an RTM_GETROUTE dump), except the default route and routes into a link that is
+//! point-to-point or NOARP (an RTM_GETLINK dump). A route reaches its network directly also where
+//! no address of the host has its prefix: a DHCPv6 address is a /128 beside the on-link /64 that
+//! router advertisements add, and `ip route add 203.0.113.0/24 dev eth1` needs no address at all.
+//! A tunnel (wg, tun, ppp, gre) has no neighbours of its own: what a route sends into it goes to
+//! the other end, which takes it on as a router does, so a full tunnel that splits the default
+//! route into `0.0.0.0/1` and `128.0.0.0/1` does not make every address local. The dump holds
+//! every table, also one that no rule uses for the broker's connections, so it can name more
+//! networks than the broker reaches directly.
 //!
 //! The socket is opened before the broker confines itself, so the broker needs no rule beyond
 //! `sendto` and `recvfrom` for it, as for the relay's peer check (`peer`); Landlock does not
@@ -35,7 +47,16 @@ const HEADER: usize = size_of::<libc::nlmsghdr>();
 const ROUTE_MESSAGE: usize = 12;
 /// `struct ifaddrmsg`: family, prefix length, flags, scope, interface index.
 const ADDRESS_MESSAGE: usize = 8;
+/// `struct ifinfomsg`: family, padding, device type, interface index, flags, change mask.
+const LINK_MESSAGE: usize = 16;
+/// `struct rtnexthop` in RTA_MULTIPATH: its length, flags, hops, interface index.
+const NEXT_HOP: usize = 8;
 const ATTRIBUTE_HEADER: usize = 4;
+/// A gateway of another family than the route's (`linux/rtnetlink.h`), which the libc crate
+/// names for glibc only.
+const RTA_VIA: u16 = 18;
+/// What a link dump leaves out (`linux/if_link.h`), which the libc crate names for Android only.
+const IFLA_EXT_MASK: u16 = 29;
 
 const ERROR: u16 = libc::NLMSG_ERROR as u16;
 const DONE: u16 = libc::NLMSG_DONE as u16;
@@ -64,7 +85,7 @@ struct InterfaceAddress {
 }
 
 impl Routes {
-    /// Opens the socket and checks that the kernel answers both lookups. sandy calls this before
+    /// Opens the socket and checks that the kernel answers every lookup. sandy calls this before
     /// it starts the broker, so a kernel that cannot answer refuses the run instead of every
     /// connection later.
     pub(crate) fn open() -> Result<Routes, SandboxError> {
@@ -115,7 +136,7 @@ impl Routes {
         let answers = routes
             .route_type(loopback)
             .map(|kind| kind == Some(libc::RTN_LOCAL))
-            .and_then(|local| routes.addresses().map(|_| local));
+            .and_then(|local| routes.subnets().map(|_| local));
         match answers {
             Ok(true) => Ok(routes),
             Ok(false) => Err(SandboxError::new(
@@ -189,6 +210,56 @@ impl Routes {
         Ok(addresses)
     }
 
+    /// Every network that a route of any table reaches without a router (`on_link_route`) over
+    /// links with neighbours of their own (`local_links`). A link that the first dump did not
+    /// list, because it appeared in between, does not count either.
+    fn on_link_routes(&self) -> io::Result<Vec<Subnet>> {
+        let local = self.local_links()?;
+        // AF_UNSPEC asks for every family, and a dump that names no table for every table.
+        let payload = [0u8; ROUTE_MESSAGE];
+        let mut subnets = Vec::new();
+        self.ask(
+            libc::RTM_GETROUTE,
+            libc::NLM_F_DUMP as u16,
+            &payload,
+            |message_type, message| {
+                if message_type != libc::RTM_NEWROUTE {
+                    return Err(invalid("an answer that is not a route"));
+                }
+                let route = on_link_route(message)?
+                    .filter(|route| route.links.iter().all(|link| local.contains(link)));
+                subnets.extend(route.map(|route| route.subnet));
+                Ok(())
+            },
+        )?;
+        Ok(subnets)
+    }
+
+    /// The interfaces whose link has neighbours of its own: neither point-to-point nor NOARP.
+    fn local_links(&self) -> io::Result<Vec<u32>> {
+        // Without the statistics the dump takes about a tenth of the time.
+        let mut payload = vec![0u8; LINK_MESSAGE];
+        let skip = libc::RTEXT_FILTER_SKIP_STATS as u32;
+        push_attribute(&mut payload, IFLA_EXT_MASK, &skip.to_ne_bytes());
+        let mut links = Vec::new();
+        self.ask(
+            libc::RTM_GETLINK,
+            libc::NLM_F_DUMP as u16,
+            &payload,
+            |message_type, message| {
+                if message_type != libc::RTM_NEWLINK {
+                    return Err(invalid("an answer that is not a link"));
+                }
+                let (index, flags) = link(message)?;
+                if flags & (libc::IFF_POINTOPOINT | libc::IFF_NOARP) as u32 == 0 {
+                    links.push(index);
+                }
+                Ok(())
+            },
+        )?;
+        Ok(links)
+    }
+
     /// Sends one request and calls `each` with the type and payload of every message of its
     /// answer, until the answer is complete.
     fn ask(
@@ -255,11 +326,13 @@ impl HostNetwork for Routes {
     }
 
     fn subnets(&self) -> io::Result<Vec<Subnet>> {
-        Ok(self
+        let mut subnets: Vec<Subnet> = self
             .addresses()?
             .iter()
             .map(|address| address.subnet)
-            .collect())
+            .collect();
+        subnets.extend(self.on_link_routes()?);
+        Ok(subnets)
     }
 }
 
@@ -388,17 +461,9 @@ fn interface_address(message: &[u8]) -> io::Result<Option<InterfaceAddress>> {
         _ => return Ok(None),
     };
     let (mut address, mut local, mut broadcast) = (None, None, None);
-    let mut rest = &message[ADDRESS_MESSAGE..];
-    while !rest.is_empty() {
-        let header = rest
-            .get(..ATTRIBUTE_HEADER)
-            .ok_or_else(|| invalid("a truncated attribute"))?;
-        let length = usize::from(u16_at(header, 0));
-        if length < ATTRIBUTE_HEADER || length > rest.len() {
-            return Err(invalid("an attribute whose length does not fit"));
-        }
-        let value = &rest[ATTRIBUTE_HEADER..length];
-        let slot = match u16_at(header, 2) {
+    for attribute in attributes(&message[ADDRESS_MESSAGE..]) {
+        let (kind, value) = attribute?;
+        let slot = match kind {
             libc::IFA_ADDRESS => Some(&mut address),
             libc::IFA_LOCAL => Some(&mut local),
             libc::IFA_BROADCAST => Some(&mut broadcast),
@@ -410,7 +475,6 @@ fn interface_address(message: &[u8]) -> io::Result<Option<InterfaceAddress>> {
             }
             *slot = Some(ip_from(value));
         }
-        rest = &rest[align(length).min(rest.len())..];
     }
     let address = address.ok_or_else(|| invalid("an interface address without an address"))?;
     let subnet =
@@ -420,6 +484,110 @@ fn interface_address(message: &[u8]) -> io::Result<Option<InterfaceAddress>> {
         broadcast,
         subnet,
     }))
+}
+
+/// The network of an RTM_NEWROUTE message when the route reaches it without a router, with the
+/// interfaces it goes out of: a unicast route other than the default route whose next hops name
+/// no gateway. `None` for every other
+/// route, and for families other than IPv4 and IPv6. The other types are the host itself
+/// (local, broadcast, anycast, multicast), which `is_host` answers, or reach nothing. A route
+/// that names only a nexthop object (RTA_NH_ID, which is all the kernel sends when
+/// `net.ipv4.nexthop_compat_mode` is 0) does not say whether it has a gateway, and is left out.
+fn on_link_route(message: &[u8]) -> io::Result<Option<OnLinkRoute>> {
+    let head = message
+        .get(..ROUTE_MESSAGE)
+        .ok_or_else(|| invalid("a truncated route"))?;
+    let (family, prefix, route_type) = (i32::from(head[0]), head[1], head[7]);
+    let size = match family {
+        libc::AF_INET => 4,
+        libc::AF_INET6 => 16,
+        _ => return Ok(None),
+    };
+    let (mut destination, mut links, mut gateway) = (None, Vec::new(), false);
+    for attribute in attributes(&message[ROUTE_MESSAGE..]) {
+        let (kind, value) = attribute?;
+        match kind {
+            libc::RTA_DST if value.len() != size => {
+                return Err(invalid("a destination of the wrong length"));
+            }
+            libc::RTA_DST => destination = Some(ip_from(value)),
+            libc::RTA_OIF => {
+                let index = <[u8; 4]>::try_from(value)
+                    .map_err(|_| invalid("an interface index of the wrong length"))?;
+                links.push(u32::from_ne_bytes(index));
+            }
+            libc::RTA_GATEWAY | RTA_VIA => gateway = true,
+            libc::RTA_MULTIPATH => gateway |= next_hops(value, &mut links)?,
+            _ => {}
+        }
+    }
+    if route_type != libc::RTN_UNICAST || prefix == 0 || links.is_empty() || gateway {
+        return Ok(None);
+    }
+    let destination = destination.ok_or_else(|| invalid("a route without a destination"))?;
+    let subnet = Subnet::new(destination, prefix)
+        .ok_or_else(|| invalid("a prefix longer than its address"))?;
+    Ok(Some(OnLinkRoute { subnet, links }))
+}
+
+/// A route without a gateway: its network and the interfaces of its next hops.
+#[derive(Debug, PartialEq)]
+struct OnLinkRoute {
+    subnet: Subnet,
+    links: Vec<u32>,
+}
+
+/// Adds the interface of every next hop of an RTA_MULTIPATH attribute to `links`, and says
+/// whether one of them has a gateway. Each next hop is a `struct rtnexthop` followed by its own
+/// attributes, within the length it names.
+fn next_hops(mut rest: &[u8], links: &mut Vec<u32>) -> io::Result<bool> {
+    let mut gateway = false;
+    while !rest.is_empty() {
+        let header = rest
+            .get(..NEXT_HOP)
+            .ok_or_else(|| invalid("a truncated next hop"))?;
+        let length = usize::from(u16_at(header, 0));
+        if length < NEXT_HOP || length > rest.len() {
+            return Err(invalid("a next hop whose length does not fit"));
+        }
+        links.push(u32_at(header, 4));
+        for attribute in attributes(&rest[NEXT_HOP..length]) {
+            let (kind, _) = attribute?;
+            gateway |= matches!(kind, libc::RTA_GATEWAY | RTA_VIA);
+        }
+        rest = &rest[align(length).min(rest.len())..];
+    }
+    Ok(gateway)
+}
+
+/// The interface index and the flags (`IFF_*`) of an RTM_NEWLINK message.
+fn link(message: &[u8]) -> io::Result<(u32, u32)> {
+    let head = message
+        .get(..LINK_MESSAGE)
+        .ok_or_else(|| invalid("a truncated link"))?;
+    Ok((u32_at(head, 4), u32_at(head, 8)))
+}
+
+/// The attributes in `bytes` as type and value, up to the first one whose length does not fit,
+/// which is an error.
+fn attributes(bytes: &[u8]) -> impl Iterator<Item = io::Result<(u16, &[u8])>> {
+    let mut rest = bytes;
+    std::iter::from_fn(move || {
+        let current = rest;
+        if current.is_empty() {
+            return None;
+        }
+        let length = current
+            .get(..ATTRIBUTE_HEADER)
+            .map(|header| usize::from(u16_at(header, 0)))
+            .filter(|length| (ATTRIBUTE_HEADER..=current.len()).contains(length));
+        let Some(length) = length else {
+            rest = &[];
+            return Some(Err(invalid("an attribute whose length does not fit")));
+        };
+        rest = &current[align(length).min(current.len())..];
+        Some(Ok((u16_at(current, 2), &current[ATTRIBUTE_HEADER..length])))
+    })
 }
 
 /// The address in `bytes`, which are 4 or 16 long.
@@ -739,5 +907,370 @@ mod tests {
                 "{message:?}"
             );
         }
+    }
+
+    fn route_message(
+        family: u8,
+        prefix: u8,
+        route_type: u8,
+        attributes: &[(u16, &[u8])],
+    ) -> Vec<u8> {
+        // Family, the lengths of destination and source, tos, table, protocol, scope, type,
+        // flags.
+        let table = libc::RT_TABLE_MAIN;
+        let mut payload = vec![family, prefix, 0, 0, table, 0, 0, route_type, 0, 0, 0, 0];
+        for (kind, value) in attributes {
+            push_attribute(&mut payload, *kind, value);
+        }
+        payload
+    }
+
+    /// A `struct rtnexthop` of interface `index` with `attributes`, as RTA_MULTIPATH holds it.
+    fn next_hop(index: i32, attributes: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut hop = vec![0u8; NEXT_HOP];
+        hop[4..8].copy_from_slice(&index.to_ne_bytes());
+        for (kind, value) in attributes {
+            push_attribute(&mut hop, *kind, value);
+        }
+        let length = u16::try_from(hop.len()).unwrap();
+        hop[0..2].copy_from_slice(&length.to_ne_bytes());
+        hop
+    }
+
+    const INET: u8 = libc::AF_INET as u8;
+    const INET6: u8 = libc::AF_INET6 as u8;
+    const INTERFACE: [u8; 4] = 2u32.to_ne_bytes();
+
+    #[test]
+    fn a_route_without_a_gateway_names_its_network() {
+        // The /64 that router advertisements add beside a DHCPv6 /128 address.
+        let prefix = "2a01:4f8:5::".parse::<Ipv6Addr>().unwrap().octets();
+        let lan = route_message(
+            INET6,
+            64,
+            libc::RTN_UNICAST,
+            &[(libc::RTA_DST, &prefix), (libc::RTA_OIF, &INTERFACE)],
+        );
+        let lan = on_link_route(&lan).unwrap().unwrap();
+        assert_eq!(lan.links, [2]);
+        assert!(lan.subnet.contains("2a01:4f8:5::99".parse().unwrap()));
+        assert!(!lan.subnet.contains("2a01:4f8:6::99".parse().unwrap()));
+        // A network that no address of the host is on, and one that an ECMP route reaches over
+        // two links, neither through a gateway.
+        let direct = route_message(
+            INET,
+            24,
+            libc::RTN_UNICAST,
+            &[
+                (libc::RTA_DST, &[203, 0, 113, 0]),
+                (libc::RTA_OIF, &INTERFACE),
+            ],
+        );
+        let direct = on_link_route(&direct).unwrap().unwrap();
+        assert!(direct.subnet.contains("203.0.113.7".parse().unwrap()));
+        assert!(!direct.subnet.contains("203.0.114.7".parse().unwrap()));
+        let hops = [next_hop(2, &[]), next_hop(5, &[])].concat();
+        let both = route_message(
+            INET,
+            24,
+            libc::RTN_UNICAST,
+            &[
+                (libc::RTA_DST, &[198, 51, 100, 0]),
+                (libc::RTA_MULTIPATH, &hops),
+            ],
+        );
+        let both = on_link_route(&both).unwrap().unwrap();
+        assert_eq!(both.links, [2, 5]);
+        assert!(both.subnet.contains("198.51.100.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_link_names_its_index_and_flags() {
+        let flags = (libc::IFF_UP | libc::IFF_POINTOPOINT | libc::IFF_NOARP) as u32;
+        let mut message = vec![0u8, 0];
+        message.extend(65534u16.to_ne_bytes());
+        message.extend(7i32.to_ne_bytes());
+        message.extend(flags.to_ne_bytes());
+        message.extend(u32::MAX.to_ne_bytes());
+        push_attribute(&mut message, libc::IFLA_IFNAME, b"wg0\0");
+        assert_eq!(link(&message).unwrap(), (7, flags));
+        assert_eq!(
+            link(&message[..15]).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn other_routes_name_no_network() {
+        let destination: &[u8] = &[203, 0, 113, 0];
+        let gateway: &[u8] = &[192, 0, 2, 1];
+        // `struct rtvia`: the family of the gateway, then its address.
+        let via = [
+            &(libc::AF_INET6 as u16).to_ne_bytes()[..],
+            &"fe80::1".parse::<Ipv6Addr>().unwrap().octets(),
+        ]
+        .concat();
+        let hops = [
+            next_hop(2, &[]),
+            next_hop(2, &[(libc::RTA_GATEWAY, gateway)]),
+        ]
+        .concat();
+        let unicast = |attributes: &[(u16, &[u8])]| {
+            let mut all = vec![(libc::RTA_DST, destination)];
+            all.extend_from_slice(attributes);
+            route_message(INET, 24, libc::RTN_UNICAST, &all)
+        };
+        let mut routes = vec![
+            unicast(&[(libc::RTA_OIF, &INTERFACE), (libc::RTA_GATEWAY, gateway)]),
+            unicast(&[(libc::RTA_OIF, &INTERFACE), (RTA_VIA, &via)]),
+            unicast(&[(libc::RTA_MULTIPATH, &hops)]),
+            // A nexthop object alone (RTA_NH_ID) does not say whether it has a gateway.
+            unicast(&[(30, &7u32.to_ne_bytes())]),
+            // The default route, also one into a tunnel without a gateway.
+            route_message(INET, 0, libc::RTN_UNICAST, &[(libc::RTA_OIF, &INTERFACE)]),
+            route_message(INET6, 0, libc::RTN_UNICAST, &[(libc::RTA_OIF, &INTERFACE)]),
+        ];
+        // The host itself, and routes that reach nothing.
+        for route_type in [
+            libc::RTN_LOCAL,
+            libc::RTN_BROADCAST,
+            libc::RTN_ANYCAST,
+            libc::RTN_MULTICAST,
+            libc::RTN_BLACKHOLE,
+            libc::RTN_UNREACHABLE,
+            libc::RTN_PROHIBIT,
+            libc::RTN_THROW,
+        ] {
+            routes.push(route_message(
+                INET,
+                24,
+                route_type,
+                &[(libc::RTA_DST, destination), (libc::RTA_OIF, &INTERFACE)],
+            ));
+        }
+        // Families other than IPv4 and IPv6: multicast routing (RTNL_FAMILY_IPMR) and MPLS.
+        for family in [128, libc::AF_MPLS as u8] {
+            routes.push(route_message(
+                family,
+                20,
+                libc::RTN_UNICAST,
+                &[(libc::RTA_DST, &[0, 1, 0x41]), (libc::RTA_OIF, &INTERFACE)],
+            ));
+        }
+        for route in routes {
+            assert_eq!(on_link_route(&route).unwrap(), None, "{route:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_routes_fail() {
+        let route = |prefix, attributes: &[(u16, &[u8])]| {
+            route_message(INET, prefix, libc::RTN_UNICAST, attributes)
+        };
+        let oif = (libc::RTA_OIF, &INTERFACE[..]);
+        let wrong_length = route(24, &[(libc::RTA_DST, &[1, 2, 3]), oif]);
+        let short_interface = route(24, &[(libc::RTA_DST, &[1, 2, 3, 0]), (libc::RTA_OIF, &[2])]);
+        let long_prefix = route(33, &[(libc::RTA_DST, &[1, 2, 3, 4]), oif]);
+        let no_destination = route(24, &[oif]);
+        let mut bad_attribute = route(24, &[(libc::RTA_DST, &[1, 2, 3, 0]), oif]);
+        bad_attribute[12..14].copy_from_slice(&64u16.to_ne_bytes());
+        let mut short_hop = next_hop(2, &[]);
+        short_hop[0..2].copy_from_slice(&4u16.to_ne_bytes());
+        let mut long_hop = next_hop(2, &[]);
+        long_hop[0..2].copy_from_slice(&16u16.to_ne_bytes());
+        let hops = |hops: &[u8]| {
+            route(
+                24,
+                &[(libc::RTA_DST, &[1, 2, 3, 0]), (libc::RTA_MULTIPATH, hops)],
+            )
+        };
+        let mut bad_hop_attribute = next_hop(2, &[(libc::RTA_GATEWAY, &[1, 2, 3, 1])]);
+        bad_hop_attribute[8..10].copy_from_slice(&64u16.to_ne_bytes());
+        for message in [
+            &wrong_length[..],
+            &short_interface,
+            &short_interface,
+            &long_prefix,
+            &no_destination,
+            &bad_attribute,
+            &hops(&short_hop),
+            &hops(&long_hop),
+            &hops(&[8, 0, 0]),
+            &hops(&bad_hop_attribute),
+            &[INET, 24, 0],
+        ] {
+            assert_eq!(
+                on_link_route(message).unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "{message:?}"
+            );
+        }
+    }
+
+    /// The on-link routes of this host as /proc lists them, independently of netlink: IPv4 of
+    /// the main table, IPv6 of every table. Without the default routes, the routes through a
+    /// gateway and those that are not unicast. Each with whether its link has neighbours of its
+    /// own, from the flags in /sys.
+    fn proc_on_link_routes() -> Vec<(Subnet, bool)> {
+        let local_link = |name: &str| {
+            let flags = std::fs::read_to_string(format!("/sys/class/net/{name}/flags"));
+            flags.is_ok_and(|flags| {
+                let flags = u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16);
+                flags.unwrap() & (libc::IFF_POINTOPOINT | libc::IFF_NOARP) as u32 == 0
+            })
+        };
+        let mut routes = Vec::new();
+        let ipv4 = std::fs::read_to_string("/proc/net/route").unwrap();
+        for line in ipv4.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let number = |at: usize| u32::from_str_radix(fields[at], 16).unwrap();
+            // The kernel prints the addresses in network byte order as a number of this host.
+            let (destination, flags) = (Ipv4Addr::from(number(1).to_ne_bytes()), number(3));
+            let prefix = Ipv4Addr::from(number(7).to_ne_bytes())
+                .to_bits()
+                .leading_ones();
+            // A device named `*` is none: a blackhole or unreachable route.
+            let through = flags & (libc::RTF_GATEWAY | libc::RTF_REJECT) as u32 != 0;
+            if fields[0] != "*" && !through && prefix > 0 {
+                let subnet = Subnet::new(destination.into(), prefix as u8).unwrap();
+                routes.push((subnet, local_link(fields[0])));
+            }
+        }
+        // RTF_LOCAL and RTF_ANYCAST of `linux/ipv6_route.h`; a multicast route has no flag of
+        // its own, but a multicast destination.
+        let (local, anycast) = (0x8000_0000u32, 0x0010_0000u32);
+        // Absent when IPv6 is off.
+        let ipv6 = std::fs::read_to_string("/proc/net/ipv6_route").unwrap_or_default();
+        for line in ipv6.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let destination = Ipv6Addr::from(u128::from_str_radix(fields[0], 16).unwrap());
+            let prefix = u8::from_str_radix(fields[1], 16).unwrap();
+            let flags = u32::from_str_radix(fields[8], 16).unwrap();
+            let not_unicast = (libc::RTF_GATEWAY | libc::RTF_REJECT) as u32 | local | anycast;
+            if flags & not_unicast == 0 && prefix > 0 && !destination.is_multicast() {
+                let subnet = Subnet::new(destination.into(), prefix).unwrap();
+                routes.push((subnet, local_link(fields[9])));
+            }
+        }
+        routes
+    }
+
+    /// The subnets hold every on-link route over a link with neighbours of its own, and none
+    /// that only a point-to-point or NOARP link has.
+    #[test]
+    fn the_subnets_hold_the_on_link_routes_that_proc_lists() {
+        let routes = Routes::open().unwrap();
+        let subnets = routes.subnets().unwrap();
+        let listed = proc_on_link_routes();
+        assert!(listed.iter().any(|(_, local)| *local), "{listed:?}");
+        for (route, _) in &listed {
+            let on_a_local_link = listed.iter().any(|(other, local)| other == route && *local);
+            let held = subnets.contains(route);
+            assert_eq!(held, on_a_local_link, "{route:?} in {subnets:?}");
+        }
+    }
+
+    /// Holds the name of a test that runs again as root of a user and network namespace of its
+    /// own, where it adds routes.
+    const IN_NAMESPACE: &str = "SANDY_TEST_ROUTES_NAMESPACE";
+
+    /// A network that a route reaches without a gateway over a broadcast link is the local
+    /// network also when no address of the host has its prefix: an IPv6 address that is a /128
+    /// beside its on-link /64, an IPv4 address with a longer prefix than its route, a network
+    /// without an address of the host, and one in another table. A network behind a gateway is
+    /// not, nor is what only the default route reaches, also when the default route has no
+    /// gateway, nor what a route sends into a tunnel or a link without ARP, also when it covers
+    /// half of IPv4 or all of 2000::/4 as a full tunnel's routes do. The tunnel's own address
+    /// prefix still counts (docs/linux.md, "Egress broker").
+    #[test]
+    fn on_link_routes_are_the_local_network_without_an_address() {
+        if std::env::var_os(IN_NAMESPACE).is_some() {
+            return on_link_routes_in_this_namespace();
+        }
+        let setup = [
+            "ip link set lo up",
+            // A broadcast link with ARP, as an Ethernet or Wi-Fi link is: a dummy link is NOARP
+            // until `arp on`.
+            "ip link add sandy0 type dummy",
+            "ip link set sandy0 arp on up",
+            "ip -6 address add 2a01:4f8:5::10/128 dev sandy0 nodad",
+            "ip -6 route add 2a01:4f8:5::/64 dev sandy0",
+            "ip -6 route add 2a01:4f8:7::/64 via 2a01:4f8:5::1",
+            "ip -6 route add default dev sandy0",
+            "ip address add 198.51.100.10/32 dev sandy0",
+            "ip route add 198.51.100.0/24 dev sandy0",
+            "ip route add 203.0.113.0/24 dev sandy0",
+            "ip route add 198.18.0.0/15 dev sandy0 table 100",
+            "ip route add 192.0.2.0/24 via 198.51.100.1",
+            "ip route add default via 198.51.100.1",
+            // A tunnel, and a link without ARP.
+            "ip tuntap add mode tun name sandy1",
+            "ip link set sandy1 up",
+            "ip address add 192.88.99.2/24 dev sandy1",
+            "ip route add 0.0.0.0/1 dev sandy1",
+            "ip -6 route add 2000::/4 dev sandy1",
+            "ip link add sandy2 type dummy",
+            "ip link set sandy2 up",
+            "ip route add 192.0.0.0/24 dev sandy2",
+        ]
+        .join(" && ");
+        let name = std::thread::current().name().unwrap().to_string();
+        let script =
+            format!("{setup} || exit 97\nexec \"$0\" {name} --exact --nocapture --test-threads=1");
+        let output = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--net", "sh", "-c", &script])
+            .arg(std::env::current_exe().unwrap())
+            .env(IN_NAMESPACE, "1")
+            .output();
+        let Ok(output) = output else {
+            eprintln!("skipped: unshare is not installed");
+            return;
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stdout.contains("running 1 test") {
+            eprintln!(
+                "skipped: no user and network namespace with dummy and tun links: {}, {stderr}",
+                output.status
+            );
+            return;
+        }
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}{stderr}"
+        );
+    }
+
+    fn on_link_routes_in_this_namespace() {
+        use sandy_core::EgressReach::{Public, PublicAndLocal};
+        use sandy_core::destination::{Refusal, check};
+        use std::net::SocketAddr;
+        let routes = Routes::open().unwrap();
+        let at = |ip: &str| SocketAddr::new(ip.parse().unwrap(), 443);
+        let lan = at("2a01:4f8:5::99");
+        assert_eq!(check(lan, Public, &routes), Err(Refusal::HostSubnet));
+        assert_eq!(check(lan, PublicAndLocal, &routes), Ok(lan));
+        let own = at("2a01:4f8:5::10");
+        assert_eq!(check(own, PublicAndLocal, &routes), Err(Refusal::Host));
+        // Blocks that are not globally reachable are the local network where such a route
+        // reaches them.
+        for ip in ["198.51.100.99", "203.0.113.5", "198.18.7.7"] {
+            assert_eq!(check(at(ip), PublicAndLocal, &routes), Ok(at(ip)), "{ip}");
+        }
+        // Behind a gateway, and behind a link without ARP, they are not.
+        for ip in ["192.0.2.5", "192.0.0.7"] {
+            let refused = check(at(ip), PublicAndLocal, &routes);
+            assert!(
+                matches!(refused, Err(Refusal::Block(_))),
+                "{ip}: {refused:?}"
+            );
+        }
+        // Behind a gateway, the default route or a tunnel, public addresses stay public.
+        for ip in ["2a01:4f8:7::5", "2606:4700::1111", "1.1.1.1"] {
+            assert_eq!(check(at(ip), Public, &routes), Ok(at(ip)), "{ip}");
+        }
+        // The subnet of the tunnel's own address is the local network as before.
+        let tunnel = at("192.88.99.7");
+        assert_eq!(check(tunnel, PublicAndLocal, &routes), Ok(tunnel));
     }
 }

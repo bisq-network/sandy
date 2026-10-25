@@ -456,11 +456,14 @@ Rules:
    because its length is unknown). It checks the destination outside the sandbox, connects
    from there, and from then on copies bytes like the relay. Only TCP leaves this way.
 6. Destinations (`sandy_core::destination`): `reach = "public"`, the default, allows only
-   globally reachable unicast addresses, from the IANA special-purpose registries.
-   `"public-and-local"` also allows the private, shared and unique local ranges and the subnets
-   of the host's interfaces. Never allowed, whatever `reach` says: an address of the host itself
-   (what the kernel calls a local, broadcast or multicast route), loopback, `0.0.0.0`,
-   link-local and multicast. An IPv4-mapped IPv6 address is judged as the IPv4 address it maps.
+   globally reachable unicast addresses, from the IANA special-purpose registries, outside the
+   local network. `"public-and-local"` also allows the private, shared and unique local ranges
+   and the local network: every network the host reaches without a router, which is the subnet
+   of every interface address and the network of every other route without a gateway, except
+   the default route and routes into a point-to-point or tunnel link. Never allowed, whatever
+   `reach` says: an address of the host itself (what the kernel calls a local, broadcast or
+   multicast route), loopback, `0.0.0.0`, link-local and multicast. An IPv4-mapped IPv6 address
+   is judged as the IPv4 address it maps.
    After the connect the broker also closes a connection whose local address is loopback or
    equal to its peer, which is what a connection to the host itself looks like. A refused
    destination gets reply 2. The success reply names `0.0.0.0:0`, so a connection does not tell
@@ -497,19 +500,35 @@ everywhere; a backend adds only its answer about its own addresses (`HostNetwork
    whatever `reach` says: whether a translator or a tunnel takes them to the embedded address
    depends on the network. Port 0 is refused.
 3. The host's part: whether an address is the host's own (an interface address, a subnet
-   broadcast address, or a local, broadcast, anycast or multicast route), and which subnets its
-   interfaces are on, asked for every connection. An address on such a subnet is the local
+   broadcast address, or a local, broadcast, anycast or multicast route), and which networks the
+   host reaches without a router, asked for every connection. Those are the subnet of every
+   interface address, for a point-to-point link that of its peer, and the network of every
+   unicast route whose next hop is no gateway, except the default route and routes into a
+   point-to-point or tunnel link. A route counts also where no address of the host has its
+   prefix: a DHCPv6 address is a /128 beside the on-link /64 of router advertisements, and a
+   route can send a network into a link without any address. A route into a tunnel does not:
+   what it sends goes to the other end, which takes it on as a router does. So a full tunnel
+   that splits the default route into `0.0.0.0/1` and `128.0.0.0/1` leaves the internet public,
+   while the subnet of the tunnel's own address stays the local network and the private ranges
+   behind it stay refused by the static check. Linux takes a link with `IFF_POINTOPOINT` or
+   `IFF_NOARP` for a tunnel, macOS one with `IFF_POINTOPOINT`, Windows an interface of a tunnel
+   or PPP type or of a point-to-point access type. An address on such a network is the local
    network. `public` refuses it also when it is globally reachable, because on IPv6 a local
-   network often has a global prefix. `public-and-local` allows it also in a block that is not
-   globally reachable, but a subnet never opens what rule 6 never allows, such as loopback or
-   link-local. When the host cannot tell, the broker refuses with reply 1. Linux asks the
-   kernel's routing tables (`RTM_GETROUTE` and `RTM_GETADDR`) over a `NETLINK_ROUTE` socket that
-   it opens before the broker confines itself. macOS reads `getifaddrs` for every connection,
-   which its broker profile allows through the routing sysctl; it has no local route without an
-   interface address.
+   network often has a global prefix.
+   `public-and-local` allows it also in a block that is not globally reachable, but a subnet
+   never opens what rule 6 never allows, such as loopback or link-local. When the host cannot
+   tell, the broker refuses with reply 1. Linux asks the kernel's routing tables
+   (`RTM_GETROUTE`, also as a dump of every table, `RTM_GETADDR` and `RTM_GETLINK`) over a
+   `NETLINK_ROUTE` socket that it opens before the broker confines itself. macOS reads
+   `getifaddrs` and the routing table for every connection, which its broker profile allows
+   through the routing sysctl; it has no local route without an interface address. Windows asks
+   `GetAdaptersAddresses`, `GetBestRoute2` and `GetIpForwardTable2`.
 4. The broker connects to the address it checked, an IPv4-mapped one as IPv4, within 10
    seconds. A refused, unreachable or timed-out connect gets reply 5, 3 or 4, any other failure
-   reply 1.
+   reply 1. It judges only the address: a router that maps a public address back to this host,
+   or a firewall rule of this host that redirects outgoing connections to a local service, takes
+   the connection where the check did not look, and the check after the connect sees the
+   address the program named as the peer (the exceptions table, row "All").
 5. It serves at most `sandy_relay::broker::MAX_CONNECTIONS` (1000) connections at the same time,
    more than a relayed port, because a program that talks to many peers needs them. Each takes
    two threads with small stacks and two descriptors; macOS allows a process 2048 threads.
@@ -589,7 +608,7 @@ exceptions:
 
 | Platform | When | What stays open |
 |---|---|---|
-| All | `egress` | the broker refuses an address of this host with reply 2 and answers others with the result of its connect, so the program can tell this host's addresses, and with `reach = "public"` its subnets, by trying them (`sandy_relay` `every_forbidden_form_is_refused_with_reply_2` and `a_closed_port_gets_reply_5`); a NAT64 prefix of an operator other than the well-known ones cannot be recognised; a public address that a router maps back to this host (a port forward with hairpin NAT) reaches the services of this host that the forward exposes, because the broker sees only the public address |
+| All | `egress` | the broker refuses an address of this host with reply 2 and answers others with the result of its connect, so the program can tell this host's addresses, and with `reach = "public"` its local network, by trying them (`sandy_relay` `every_forbidden_form_is_refused_with_reply_2` and `a_closed_port_gets_reply_5`); a NAT64 prefix of an operator other than the well-known ones cannot be recognised; a public address that a router maps back to this host (a port forward with hairpin NAT) reaches the services of this host that the forward exposes, because the broker sees only the public address; a firewall rule of this host that redirects outgoing connections (a REDIRECT or TPROXY rule on Linux, a pf `rdr` rule on macOS, a WFP connect redirect on Windows) takes the broker's connections to the local service it names, which the check after the connect cannot see, because the connection's peer address stays the destination the program named (measured on Linux with an nftables redirect in a network namespace of its own: the broker answered reply 0 for `1.1.1.1:443` and the service on `127.0.0.1:8443` took the connection; not verified on macOS and Windows) |
 | Linux | `signals = "isolated"` without `children = "contained"` | a read from the terminal in the background stops the group sandy was started in, with the processes outside the sandbox in it |
 | Linux | `ip = "client"` | a UDP socket that is not connected receives datagrams from every sender, at the port the kernel chose for it, and before Landlock ABI 10 at any port the program binds |
 | Linux | `forward` with `ip = "client"` or `ip = "all"` | another local user can deliver a write to the forwarded service, through a connection it closed before the relay asked who owns it, and that no longer carries its user (from the close on Linux 6.8, after the timewait record on newer kernels) |
@@ -910,8 +929,8 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   processes cannot use loopback among themselves.
 - The egress broker is a helper process of its own, forked twice like the relay and watched like
   it, with its own profile: accept on its port, TCP out with every address of the Mac denied
-  after that allow, the routing sysctl for `getifaddrs`, no files, no Mach services. Its
-  `HostNetwork` answer comes from `getifaddrs` at every connection.
+  after that allow, the routing sysctl for `getifaddrs` and the routing table, no files, no Mach
+  services. Its `HostNetwork` answer comes from both at every connection.
 - `filesystem.view = "policy"` is the `ENOENT` rule that every profile has; it is unavailable
   with `unix_sockets = "all"`, which allows the existence check for every path.
 - `ip = "client"`: `network-outbound` and `network-bind` for IP sockets, `network-inbound` for UDP

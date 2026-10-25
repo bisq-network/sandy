@@ -498,9 +498,10 @@ fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
             "a broker process on the program's 127.0.0.1 egress port that is not a child of the \
              target (forked twice, so launchd adopts it) and checks every destination \
              (sandy_core::destination, with the addresses and subnets of this Mac's interfaces \
-             from getifaddrs); confined by its own profile: accept on its port, TCP out, no \
-             connection to an address of this Mac (localhost denied), the routing sysctl, no \
-             files, no Mach services; it ends when the target ends (kqueue NOTE_EXIT)"
+             from getifaddrs and its on-link routes from the routing sysctl); confined by its \
+             own profile: accept on its port, TCP out, no connection to an address of this Mac \
+             (localhost denied), the routing sysctl, no files, no Mach services; it ends when \
+             the target ends (kqueue NOTE_EXIT)"
         }
         Requirement::Win32kDenied => {
             return Mechanism::Exec(

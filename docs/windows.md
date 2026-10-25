@@ -664,6 +664,24 @@ sandy runs the broker as `sandy __broker` in an AppContainer of its own, alongsi
 What the broker connects to is decided by `sandy_core::destination`, the same on every platform,
 with the host's own addresses and subnets answered by `GetAdaptersAddresses` and `GetBestRoute2`;
 a lookup that fails for another reason than a missing route refuses the destination with reply 1.
+The local network is the on-link prefix of every interface address and every route of
+`GetIpForwardTable2` whose next hop is the unspecified address (on-link), except the default
+route and the routes into a tunnel: an interface whose type is a tunnel or PPP
+(`IF_TYPE_TUNNEL`, `IF_TYPE_PPP`), or whose access type `GetIfTable2` reports as
+`NET_IF_ACCESS_POINT_TO_POINT`. A route into a link without an address of that prefix counts
+too (`on_link_routes_name_their_network` with crafted routes, and
+`the_routing_table_reaches_the_gateway_on_link` with this machine's). What a route sends into a
+tunnel goes to its other end, which takes it on as a router does, so a VPN that splits the
+default route into `0.0.0.0/1` and `128.0.0.0/1` on such an interface leaves the internet
+public; the prefix of the tunnel's own address still counts
+(`routes_into_a_tunnel_name_no_network` and `a_point_to_point_access_type_is_a_tunnel`, with
+crafted input: the test VM has no tunnel interface). `IF_TYPE_PROP_VIRTUAL` is no sign of a
+tunnel, because virtual switches and other virtual adapters with real neighbours declare it too.
+Whether the Wintun adapter of WireGuard and similar VPNs reports a tunnel type or a
+point-to-point access type is not verified here; if it reports neither, its routes still count
+as a link with neighbours of its own. Measured on a Windows 11 VM with 16 routes, the
+routing table takes about 20 µs, the adapter list 300 µs, and the whole answer about the local
+network 340 µs.
 It refuses a domain name (reply 8), so it resolves nothing for the program. On Windows there is a
 second line of defense: the broker's own AppContainer has no loopback exemption (the plan checks
 it), so loopback isolation drops any connection to this machine at the kernel level even if the
@@ -1231,9 +1249,9 @@ about a path is worse than none, so the backend answers nothing and sandy refuse
 
 Host: Windows 11 build 26200 (VM), binaries built for `x86_64-pc-windows-gnu`. The tests run in
 an elevated SSH session and without administrator rights. Latest elevated run, every test
-passing: `sandy_core` 85, `sandy_relay` 41, `sandy_windows` 87, `sandy` 17, `escape` 27,
-`escape_windows` 80, `expose` 5, `forward` 3, `children` 5, `parent` 5, `check` 11, `runner` 3,
-`review_windows` 11. The
+passing: `sandy_core` 88, `sandy_relay` 43, `sandy_windows` 101, `sandy` 20, `escape` 27,
+`escape_windows` 88, `expose` 5, `forward` 3, `children` 5, `parent` 5, `check` 11, `runner` 3,
+`review_windows` 12, `setup` 3. The
 COM check of `review_windows` is skipped there: the SSH session is session 0, where `ole32.dll`
 does not load in an AppContainer (limitation 13), so a denial would not be the COM boundary.
 Earlier non-administrator runs used a scheduled task with `/RL LIMITED` (medium integrity,

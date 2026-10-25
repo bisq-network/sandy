@@ -158,7 +158,7 @@ pub enum EgressReach {
     #[default]
     Public,
     /// Public addresses and the local network: the private, shared and unique local ranges and
-    /// the subnets of the host's interfaces.
+    /// every network the host reaches without a router (`destination::HostNetwork::subnets`).
     PublicAndLocal,
 }
 

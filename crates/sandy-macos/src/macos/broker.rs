@@ -123,13 +123,14 @@ fn watch_and_confine(
         register(&queue, ended.as_raw_fd() as usize, libc::EVFILT_READ, 0)?;
     }
     seatbelt.apply(profile).map_err(io::Error::other)?;
-    // Without its addresses the broker would refuse every destination with reply 1; better to
-    // refuse the run.
+    // Without its addresses and routes the broker would refuse every destination with reply 1;
+    // better to refuse the run.
     let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
     if !Interfaces.is_host(loopback)? {
         return Err(io::Error::other(
             "the egress broker does not find 127.0.0.1 among this Mac's addresses",
         ));
     }
+    Interfaces.subnets()?;
     Ok(queue)
 }
