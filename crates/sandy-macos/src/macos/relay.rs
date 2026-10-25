@@ -25,16 +25,16 @@ const DRAIN: Duration = Duration::from_secs(1);
 const DRAIN_POLL: Duration = Duration::from_millis(10);
 const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(50);
 
-/// Starts the relay for `pairs` as a helper process (see `helper`). Returns once the relay is
-/// confined, watches this process and serves; any failure before that is an error, and then no
-/// relay serves. With `children = "contained"`, `ended` is the read end of a pipe whose write end
-/// only the guard holds: its end means that the program's group has ended, also while the
-/// supervising sandy is stopped.
+/// Starts the relay for `pairs` as a helper process (see `helper`). Returns its process ID once
+/// the relay is confined, watches this process and serves; any failure before that is an error,
+/// and then no relay serves. With `children = "contained"`, `ended` is the read end of a pipe
+/// whose write end only the guard holds: its end means that the program's group has ended, also
+/// while the supervising sandy is stopped.
 pub fn start(
     pairs: &[RelayPair],
     seatbelt: &Seatbelt,
     ended: Option<File>,
-) -> Result<(), SandboxError> {
+) -> Result<libc::pid_t, SandboxError> {
     let mut listeners = Vec::with_capacity(pairs.len());
     for pair in pairs {
         let listener = TcpListener::bind(pair.listen).map_err(|error| {

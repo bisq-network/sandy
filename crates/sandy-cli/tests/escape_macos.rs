@@ -1458,6 +1458,68 @@ fn refuses_a_writable_path_over_the_home_directory() {
     );
 }
 
+/// Checks each `(location, beside)` pair of paths below the fixture's home directory, with that
+/// directory as HOME: a writable path that is the location is refused, and the path beside it,
+/// the control, is accepted.
+fn assert_refused_beside_an_accepted_path(fixture: &Fixture, cases: &[(&str, &str)]) {
+    for (location, beside) in cases {
+        let check = |name: &str| {
+            check_with_environment(
+                &fixture.arg("home"),
+                "/usr/bin",
+                &fixture.arg(&format!("home/{name}")),
+            )
+        };
+        let refused = check(location);
+        let report = String::from_utf8_lossy(&refused.stdout);
+        assert_eq!(
+            refused.status.code(),
+            Some(EXIT_NOT_ENFORCEABLE),
+            "{location}: {report}"
+        );
+        assert!(report.contains("runs outside the sandbox"), "{report}");
+
+        let allowed = check(beside);
+        assert_eq!(
+            allowed.status.code(),
+            Some(0),
+            "{beside}: {}",
+            String::from_utf8_lossy(&allowed.stdout)
+        );
+    }
+}
+
+/// The startup files of bash and fish and the git configuration run code outside the sandbox at
+/// the next shell or git command, on macOS as on Linux (README rule 8): Terminal.app starts login
+/// shells, which read `.bash_login`. sandy refuses a writable path that reaches one, also
+/// `~/.config`, which holds the fish and git configuration; the path beside each stays writable.
+#[test]
+fn refuses_a_writable_path_over_a_shell_or_git_startup_file() {
+    let fixture = home_fixture("trusted-tools");
+    let files = [
+        (".bash_login", ".bash_history"),
+        (".bash_logout", ".bash_history"),
+        (".bash_aliases", ".bash_history"),
+        (".gitconfig", ".gitignore"),
+    ];
+    let directories = [
+        (".config", ".cache"),
+        (".config/fish", ".config/other"),
+        (".config/git", ".config/other"),
+        (".bashrc.d", "data"),
+    ];
+    for (location, beside) in files {
+        fs::write(fixture.path(&format!("home/{location}")), b"").unwrap();
+        fs::write(fixture.path(&format!("home/{beside}")), b"").unwrap();
+    }
+    for (location, beside) in directories {
+        fs::create_dir_all(fixture.path(&format!("home/{location}"))).unwrap();
+        fs::create_dir_all(fixture.path(&format!("home/{beside}"))).unwrap();
+    }
+    assert_refused_beside_an_accepted_path(&fixture, &files);
+    assert_refused_beside_an_accepted_path(&fixture, &directories);
+}
+
 /// A directory on PATH inside a writable path lets the program leave a command there that the
 /// user runs outside the sandbox by name. Such a policy is ordinary work, so sandy enforces it
 /// and warns, naming the directory (README rule 8). The same writable path without that PATH
@@ -1485,6 +1547,53 @@ fn warns_about_a_writable_path_that_holds_a_directory_on_path() {
         String::from_utf8_lossy(&quiet.stdout)
     );
     assert!(!warnings.contains(&fixture.arg("rw/bin")), "{warnings}");
+}
+
+/// A service or a desktop application starts sandy with a minimal PATH, while the user's shell
+/// looks for commands in `~/.local/bin`, `~/bin` and cargo's `bin` directory. sandy warns about a
+/// writable path that holds one of them although its own PATH lacks it, and the advice keeps the
+/// directory out of the writable paths. The path beside each says nothing.
+#[test]
+fn warns_about_a_usual_bin_directory_that_is_not_on_sandys_path() {
+    let fixture = home_fixture("trusted-usual-path");
+    let cases = [
+        (".local/bin", ".local/opt"),
+        ("bin", "data"),
+        (".cargo/bin", ".cargo/registry"),
+    ];
+    for (directory, beside) in cases {
+        fs::create_dir_all(fixture.path(&format!("home/{directory}"))).unwrap();
+        fs::create_dir_all(fixture.path(&format!("home/{beside}"))).unwrap();
+    }
+    let check = |name: &str| {
+        check_with_environment(
+            &fixture.arg("home"),
+            "/usr/bin",
+            &fixture.arg(&format!("home/{name}")),
+        )
+    };
+    for (directory, beside) in cases {
+        let bin = fixture.arg(&format!("home/{directory}"));
+        let warned = check(directory);
+        let warnings = String::from_utf8_lossy(&warned.stderr);
+        assert_eq!(
+            warned.status.code(),
+            Some(0),
+            "{directory}: {}{warnings}",
+            String::from_utf8_lossy(&warned.stdout)
+        );
+        let names_it = |line: &str| {
+            line.starts_with("warning: ")
+                && line.contains(&bin)
+                && line.contains("make only the subdirectories the program needs writable")
+        };
+        assert!(warnings.lines().any(names_it), "{warnings}");
+
+        let quiet = check(beside);
+        let warnings = String::from_utf8_lossy(&quiet.stderr);
+        assert_eq!(quiet.status.code(), Some(0), "{beside}: {warnings}");
+        assert!(!warnings.contains(&bin), "{warnings}");
+    }
 }
 
 /// A writable path that holds a directory on PATH and a location that is refused stays refused:

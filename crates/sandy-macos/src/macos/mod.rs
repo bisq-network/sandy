@@ -77,8 +77,10 @@ impl Backend for MacosBackend {
         exec::reset_exception_ports()?;
         let contained = policy.children == ChildProcesses::Contained;
         let pairs = relay_pairs(policy);
-        // With `contained`, the relay also ends when the guard has ended the program's group.
+        // With `contained`, the relay also ends when the guard has ended the program's group,
+        // and the guard watches the relay in turn (see `contain::run`).
         let mut group_ended = None;
+        let mut relay = None;
         if !pairs.is_empty() {
             let ended = if contained {
                 let (read, write) = helper::pipe("the pipe of the group's end")?;
@@ -87,7 +89,7 @@ impl Backend for MacosBackend {
             } else {
                 None
             };
-            relay::start(&pairs, &seatbelt, ended)?;
+            relay = Some(relay::start(&pairs, &seatbelt, ended)?);
         }
         if policy.end_with_parent {
             let parent = command.parent.unwrap_or_else(|| ParentProcess {
@@ -115,6 +117,7 @@ impl Backend for MacosBackend {
                     Err(error) => error,
                 },
                 group_ended,
+                relay,
                 status,
             );
         }
@@ -130,10 +133,12 @@ impl Backend for MacosBackend {
 /// step changes the sandbox state of the process.
 fn detect(policy: &ResolvedPolicy) -> HostCapabilities {
     let interpreter = policy.interpreter_problem(SHEBANG_LEVELS, &executable_paths(policy));
+    let trusted_locations = crate::trust::locations();
     match Seatbelt::load() {
         Ok(seatbelt) => HostCapabilities {
             seatbelt: Ok(()),
             interpreter,
+            trusted_locations,
             profile: seatbelt
                 .compile(&generate(policy))
                 .and_then(|()| {
@@ -162,6 +167,7 @@ fn detect(policy: &ResolvedPolicy) -> HostCapabilities {
             already_sandboxed: false,
             rosetta: rosetta(policy),
             interpreter,
+            trusted_locations,
         },
     }
 }
@@ -190,6 +196,7 @@ fn applies_in_a_trial(policy: &ResolvedPolicy) -> Result<(), String> {
             Err(message) => ready.fail(&message),
         }
     })
+    .map(drop)
     .map_err(|error| error.to_string())
 }
 

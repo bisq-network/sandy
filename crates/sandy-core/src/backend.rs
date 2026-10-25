@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use crate::plan::PlanItem;
 use crate::resolve::ResolvedPolicy;
+use crate::streams::CreatableSocket;
 
 /// The program to start inside the sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,13 +141,22 @@ pub trait Backend {
     ) -> Result<i32, SandboxError>;
 
     /// What makes the program behave differently inside the sandbox than outside on this host,
-    /// beyond the requirements, for example a configuration file the policy does not cover.
+    /// beyond the requirements, for example a configuration file the policy does not cover, and
+    /// what a requirement the policy asks for leaves open on this platform although `plan`
+    /// reports it as enforced (DESIGN.md, "Requirements and the enforcement plan").
     /// `check` prints these as warnings next to the ones of the policy; they change neither what
     /// sandy enforces nor the exit status, so a backend reports a fact here instead of refusing
     /// when the program may well not be affected. Like `verify`, it may read host state and must
     /// leave the host as it found it.
     fn notes(&self, _policy: &ResolvedPolicy) -> Vec<String> {
         Vec::new()
+    }
+
+    /// What `ip = "all"` lets the program create on this platform besides AF_INET and AF_INET6
+    /// sockets. `run` accepts such a socket on a standard stream like an IP socket, because the
+    /// program could create one itself, and refuses every other family (see `streams`).
+    fn ip_also_allows(&self) -> &'static [CreatableSocket] {
+        &[]
     }
 
     /// Whether this backend can report what the sandbox denied while the program runs

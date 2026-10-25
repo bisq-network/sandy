@@ -122,7 +122,7 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
                 keep_process_group: policy.children == ChildProcesses::Contained,
                 isolate_signals: policy.signals == SignalScope::Isolated,
             },
-            relay: RelayConfig::new(&policy.expose, &policy.forward, abi),
+            relay: RelayConfig::new(&policy.expose, &policy.forward, policy.signals, abi),
             contain: policy.children == ChildProcesses::Contained,
             end_with_parent: policy.end_with_parent,
             identities,
@@ -134,11 +134,12 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
 
 /// What makes the program behave differently inside the sandbox than outside, beyond the
 /// requirements: a directory on sandy's PATH inside a writable path, an OpenSSL include the
-/// policy does not cover, and a cgroup limit the program cannot see. `sandy check` prints these
-/// as warnings; they change nothing sandy enforces, and a program that uses neither TLS nor the
-/// limits runs as it is.
+/// policy does not cover, and a cgroup limit the program cannot see. Before them come the
+/// `shortfalls` of the policy. `sandy check` prints these as warnings; they change nothing sandy
+/// enforces, and a program that uses neither TLS nor the limits runs as it is.
 pub fn notes(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
-    let mut notes = policy.path_directory_notes(&host.path_locations);
+    let mut notes = shortfalls(policy);
+    notes.extend(policy.path_directory_notes(&host.path_locations));
     let Some(rules) = landlock_for(policy, host).map(|landlock| landlock.rules) else {
         // Without Landlock the policy is refused anyway, and there are no rules to compare with.
         return notes;
@@ -170,6 +171,36 @@ pub fn notes(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
         notes.extend(cgroup::note(cgroup::limits()));
     }
     notes
+}
+
+/// What the policy asks for and Linux gives only in part, although the plan reports it as
+/// enforced (DESIGN.md, "Requirements and the enforcement plan"), each with the section of
+/// docs/linux.md that explains it.
+fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
+    let mut shortfalls = Vec::new();
+    if policy.signals == SignalScope::Isolated && policy.children != ChildProcesses::Contained {
+        shortfalls.push(
+            "signals = \"isolated\" is enforced only in part on Linux: when the program reads \
+             from the terminal while its process group is in the background, the kernel stops \
+             the whole group, and without children = \"contained\" that is the group sandy was \
+             started in, so the processes outside the sandbox in it stop as well, for example \
+             the shell that ran sandy from a script; children = \"contained\" gives the program \
+             a group of its own (docs/linux.md, \"Signals and the terminal\")"
+                .to_string(),
+        );
+    }
+    if !policy.forward.is_empty() {
+        shortfalls.push(
+            "a forwarded port keeps other users out only in part on Linux: the relay refuses a \
+             connection that the kernel names as another user's, but the kernel names no owner \
+             once the client has closed its socket, and the relay serves such a connection, so \
+             another local user can deliver a write to the forwarded service, though it cannot \
+             read the answer; forward only to services that are safe against such a write or \
+             authenticate their clients (docs/linux.md, \"Exposed and forwarded ports\")"
+                .to_string(),
+        );
+    }
+    shortfalls
 }
 
 /// The Landlock rules this policy gets on this host, for the callers that need the rules alone:
@@ -392,7 +423,21 @@ fn system_conflict(policy: &ResolvedPolicy, system: &[SystemPath]) -> Option<Str
 /// carve one file out of a writable tree, so the only way to keep what the policy promises is to
 /// refuse it. Unlike the system set this applies with `system = "none"` as well: the locations
 /// belong to the user, not to the set.
-fn trust_conflict(policy: &ResolvedPolicy, trusted: &[ProtectedPath]) -> Option<String> {
+///
+/// When no source names the home directory, sandy cannot tell whether a writable path reaches
+/// the locations below it, so a policy with a writable path is refused, as without the mount
+/// table. A policy without one reaches no location.
+fn trust_conflict(
+    policy: &ResolvedPolicy,
+    trusted: &Result<Vec<ProtectedPath>, String>,
+) -> Option<String> {
+    let trusted = match trusted {
+        Ok(trusted) => trusted,
+        Err(reason) => {
+            let writable = |rule: &PathRule| rule.access == PathAccess::ReadWrite;
+            return policy.paths.iter().any(writable).then(|| reason.clone());
+        }
+    };
     let identity = match PathIdentity::read() {
         Ok(identity) => identity,
         Err(error) => return Some(error.to_string()),
@@ -615,7 +660,7 @@ mod tests {
             pidfd: Ok(()),
             system_locations: [existing.clone(), vec![missing]].concat(),
             system_paths: existing,
-            trusted_locations: vec![sandy_core::ProtectedPath::entry("/home/someone")],
+            trusted_locations: Ok(vec![sandy_core::ProtectedPath::entry("/home/someone")]),
             path_locations: vec![sandy_core::ProtectedPath::entry("/data/bin")],
         }
     }
@@ -803,6 +848,12 @@ mod tests {
             ]
         );
         assert_eq!(relay.abi, ABI::V9);
+        // Signals are isolated, so the program cannot stop the relay, and it has no watchdog.
+        assert!(!relay.watchdog);
+        let mut any_signals = policy.clone();
+        any_signals.signals = SignalScope::Any;
+        let plan = plan_for(&any_signals, &host(Some(9)));
+        assert!(plan.sandbox.unwrap().relay.unwrap().watchdog);
 
         let mut no_pidfd = host(Some(9));
         no_pidfd.pidfd = Err("old kernel".to_string());
@@ -1079,6 +1130,27 @@ mod tests {
         assert!(refused("/home", SystemAccess::Minimal));
         assert!(refused("/home", SystemAccess::None));
         assert!(!refused("/home/someone/data", SystemAccess::Minimal));
+    }
+
+    /// When no source names the home directory, sandy cannot check the locations below it, so a
+    /// policy with a writable path is refused with the reason, and one without stays
+    /// enforceable.
+    #[test]
+    fn an_unknown_home_directory_refuses_a_writable_path() {
+        let mut host = host(Some(9));
+        host.trusted_locations = Err("cannot find the home directory of this user".into());
+        let plan = plan_for(&policy(), &host);
+        assert_eq!(unavailable(&plan), vec![Requirement::FilesystemConfined]);
+        match status(&plan, Requirement::FilesystemConfined) {
+            Status::Unavailable { reason } => assert!(reason.contains("home directory")),
+            other => panic!("{other:?}"),
+        }
+
+        let mut policy = policy();
+        policy
+            .paths
+            .retain(|rule| rule.access != PathAccess::ReadWrite);
+        assert_eq!(unavailable(&plan_for(&policy, &host)), vec![]);
     }
 
     /// A writable path that holds a directory on PATH is enforced and warned about (rule 12),

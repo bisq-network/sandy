@@ -415,8 +415,10 @@ mod unix {
             !still,
             "the relay outlived the program while sandy was stopped"
         );
-        // A relay that ended with the program is the normal end of a run, also when sandy sees
-        // it gone before it sees the program's end.
+        // The relay ended after the program, when the guard had ended the group, so the guard
+        // did not report it, and the run ends with the program's status. A relay and a program
+        // that ended in the same look of the guard are
+        // `review_relays::a_relay_that_ends_with_the_program_is_the_normal_end_of_a_run` (Linux).
         assert!(status.success(), "{status:?}");
     }
 

@@ -406,11 +406,13 @@ impl ResolvedPolicy {
             })
     }
 
-    /// Warnings for the writable paths that reach a directory on sandy's `PATH`. The escape is
-    /// the one of the other trusted locations, but a writable path that holds such a directory
-    /// is often what the caller means, a package cache whose `bin` directory is on `PATH` for
-    /// example, so rule 12 warns here instead of refusing. `check` prints the warnings; they
-    /// change nothing sandy enforces.
+    /// Warnings for the writable paths that reach a directory on `PATH`: sandy's own, or one the
+    /// usual shell setups put on the user's (the backends say which). The escape is the one of
+    /// the other trusted locations, but a writable path that holds such a directory is often
+    /// what the caller means, a package cache whose `bin` directory is on `PATH` for example, so
+    /// rule 12 warns here instead of refusing. `check` prints the warnings; they change nothing
+    /// sandy enforces. The advice names what removes the risk: a `PATH` without the directory
+    /// only silences the warning, because the user's shell still looks there.
     ///
     /// The backends pass the directories, as they do for `writable_conflict`, so a warning and a
     /// refusal never disagree about what reaches what. A host whose comparison cannot be read
@@ -422,11 +424,13 @@ impl ResolvedPolicy {
         self.writable_conflicts(directories, &identity)
             .map(|(rule, directory)| {
                 format!(
-                    "the writable path {} overlaps {}, a directory on sandy's PATH, so a file \
-                     the program leaves there runs outside the sandbox when the user next types \
-                     its name; grant the subdirectories the program needs instead, or start \
-                     sandy with a PATH that does not reach into the writable path",
+                    "the writable path {} overlaps {}, a directory on sandy's PATH or on the \
+                     usual PATH of a user's shell, so a file the program leaves there runs \
+                     outside the sandbox when the user next types its name; make only the \
+                     subdirectories the program needs writable, so that {} stays outside every \
+                     writable path (taking it off sandy's PATH leaves the risk)",
                     rule.path.display(),
+                    directory.path.display(),
                     directory.path.display()
                 )
             })
@@ -452,8 +456,8 @@ fn reaches(location: &ProtectedPath, writable: &Path, identity: &PathIdentity) -
 /// not reach, so one policy is refused for the same reason whichever check sees it first.
 ///
 /// What it sees per platform is in `is_within`. On Windows it compares the spelling only, so a
-/// second name of a directory, a junction for example, passes it (see "Links and identity" in
-/// docs/windows.md).
+/// second name of a directory that canonicalizing keeps, a path through a share of the local
+/// disk for example, passes it (see "Links and identity" in docs/windows.md).
 #[derive(Debug)]
 pub struct PathIdentity {
     mounts: Mounts,
@@ -2139,6 +2143,10 @@ mod tests {
         assert_eq!(warned.len(), 2, "{warned:?}");
         for (note, directory) in warned.iter().zip(["bin", "sbin"]) {
             assert!(note.contains("types its name"), "{note}");
+            // The advice keeps the directory out of the writable paths; another PATH for sandy
+            // would only silence the warning.
+            assert!(note.contains("make only the subdirectories"), "{note}");
+            assert!(!note.contains("start sandy with"), "{note}");
             assert!(
                 note.contains(&tools.join(directory).display().to_string()),
                 "{note}"

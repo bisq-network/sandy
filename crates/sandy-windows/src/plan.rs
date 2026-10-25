@@ -131,6 +131,37 @@ pub fn job_unavailable(policy: &ResolvedPolicy, reason: &str) -> Vec<PlanItem> {
         .collect()
 }
 
+/// What the policy asks for and this backend gives only in part, although the plan reports it
+/// as enforced (DESIGN.md, "Requirements and the enforcement plan"), each with the section of
+/// docs/windows.md that explains it. `sandy check` prints these as warnings.
+pub fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
+    let mut shortfalls = Vec::new();
+    if policy
+        .paths
+        .iter()
+        .any(|rule| rule.access == PathAccess::ReadWrite)
+    {
+        shortfalls.push(
+            "rules 3, 4, 6 and 12 compare paths only by their spelling on Windows, not by file \
+             identity: a file of an executable path, the program, sandy or the policy file that \
+             has a second name (a hard link) in a writable path passes them, and so does a \
+             policy path, sandy or the policy file reached through a junction or symbolic link \
+             inside a writable path (docs/windows.md, \"Links and identity\")"
+                .to_string(),
+        );
+    }
+    if policy.paths.iter().any(|rule| rule.is_dir) {
+        shortfalls.push(
+            "a grant on Windows follows the file, not the path: a file moved out of a granted \
+             directory on the same volume keeps the access it inherited there, so the program \
+             can still open it at its new place by its full path for as long as the directory \
+             is in the policy (docs/windows.md, \"Links and identity\")"
+                .to_string(),
+        );
+    }
+    shortfalls
+}
+
 /// Requirements that the AppContainer enforces.
 fn contained(
     requirement: Requirement,
@@ -154,9 +185,13 @@ fn contained(
     if let (Requirement::IpNetworkDenied, Some(reason)) = (requirement, bypass) {
         return unavailable(reason);
     }
+    let network = network_path_problem(policy);
     match requirement {
         Requirement::FilesystemConfined if policy.system == SystemAccess::None => {
             unavailable(SYSTEM_NONE.into())
+        }
+        Requirement::FilesystemConfined if network.is_some() => {
+            unavailable(network.unwrap_or_default())
         }
         Requirement::FilesystemConfined => {
             match (&host.capability_sids, &host.writable_paths, &host.grants) {
@@ -279,6 +314,35 @@ fn relay_program<'a>(
         )),
         None => Ok(sandy),
     }
+}
+
+/// Why a policy path that names a network share is refused. The program cannot open a share in
+/// its AppContainer with the capabilities sandy grants (docs/windows.md, "Links and identity"),
+/// but the entry sandy adds through the share lands on the folder behind it, which the program
+/// then opens by its local path, past the checks that compared the share's spelling.
+fn network_path_problem(policy: &ResolvedPolicy) -> Option<String> {
+    let rule = policy
+        .paths
+        .iter()
+        .find(|rule| is_network_path(&rule.path))?;
+    Some(format!(
+        "policy path {} is a network or share path, which sandy does not support: the program \
+         cannot open it, and the access sandy grants would land on the folder behind the share; \
+         name the local path instead",
+        rule.path.display()
+    ))
+}
+
+/// Whether `path` reaches its file through a network share: `\\server\share`, or
+/// `\\?\UNC\server\share`, which `canonicalize` returns for a share and for a mapped network
+/// drive. The other forms that start with two backslashes, `\\?\` and `\\.\`, are local.
+fn is_network_path(path: &Path) -> bool {
+    let text = path.as_os_str().to_string_lossy();
+    let verbatim = text
+        .get(..8)
+        .is_some_and(|start| start.eq_ignore_ascii_case(r"\\?\UNC\"));
+    let plain = text.starts_with(r"\\") && !text.starts_with(r"\\?\") && !text.starts_with(r"\\.\");
+    verbatim || plain
 }
 
 /// The read-write path of `policy` that contains `path`. The relays get read and execute access
@@ -470,6 +534,46 @@ mod tests {
                 Requirement::InheritedHandlesClosed | Requirement::EnvironmentControlled
             );
             assert_eq!(item.is_enforced(), !contained, "{item:?}");
+        }
+    }
+
+    #[test]
+    fn network_paths_are_refused_at_every_access_level() {
+        for path in [
+            r"\\?\UNC\localhost\C$\data",
+            r"\\?\unc\server\share",
+            r"\\server\share\data",
+        ] {
+            for access in [
+                PathAccess::Read,
+                PathAccess::ReadExec,
+                PathAccess::ReadWrite,
+            ] {
+                let mut policy = policy();
+                policy.paths.push(PathRule {
+                    path: PathBuf::from(path),
+                    access,
+                    is_dir: true,
+                });
+                let reason = unavailable(status(&policy, &host(), Requirement::FilesystemConfined));
+                assert!(reason.contains("network or share path"), "{path}: {reason}");
+                assert!(reason.contains(path), "{path}: {reason}");
+            }
+        }
+        // Control: local paths, also in the verbatim and the device form.
+        for path in [
+            r"C:\data",
+            r"\\?\C:\data",
+            r"\\?\Volume{0}\data",
+            r"\\.\C:\data",
+        ] {
+            let mut policy = policy();
+            policy.paths.push(PathRule {
+                path: PathBuf::from(path),
+                access: PathAccess::ReadWrite,
+                is_dir: true,
+            });
+            assert!(plan(&policy, &host()).is_enforceable(), "{path}");
         }
     }
 

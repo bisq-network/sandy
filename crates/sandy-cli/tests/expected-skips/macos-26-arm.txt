@@ -13,3 +13,6 @@ review_macos by_id_lookups_do_not_reach_files_outside_the_policy by-id-call-sear
 # macOS has no AF_UNIX seqpacket socket, so only the stream pair of that test can be passed on a
 # standard stream here.
 escape a_connected_unix_socket_on_standard_input_still_runs unix-socket-pair
+# Only root can create a raw IP socket, so the test cannot hand sandy one; the unit test
+# raw_ip_sockets_are_refused_under_every_policy checks the decision instead.
+escape a_raw_ip_socket_on_standard_input_is_refused raw-socket

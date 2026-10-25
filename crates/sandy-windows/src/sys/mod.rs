@@ -59,9 +59,12 @@ impl Backend for WindowsBackend {
     }
 
     /// What makes the program behave differently inside the sandbox than outside, beyond the
-    /// requirements: a directory on sandy's PATH inside a writable path (rule 12).
+    /// requirements: a directory on sandy's PATH inside a writable path (rule 12). Before it come
+    /// the shortfalls of the policy (`plan::shortfalls`).
     fn notes(&self, policy: &ResolvedPolicy) -> Vec<String> {
-        policy.path_directory_notes(&path_locations())
+        let mut notes = crate::plan::shortfalls(policy);
+        notes.extend(policy.path_directory_notes(&path_locations()));
+        notes
     }
 
     fn run(
@@ -421,11 +424,12 @@ fn held_sids(policy: &ResolvedPolicy, container: &Sid) -> Result<Vec<Sid>, Sandb
 
 /// Locations of this user that programs outside the sandbox read or execute later: the folders
 /// Windows runs programs from at logon, the PowerShell profile folders, the app execution
-/// aliases, the SSH configuration and sandy's own state. A writable path that reaches one of them
-/// lets the program leave a file there that runs outside the sandbox at the next logon, and a
-/// file the program creates keeps the user's own rights on it, including the right to execute it
-/// (see "Trusted user locations" in docs/windows.md). Such a path is refused; the directories on
-/// sandy's PATH only warn (`path_locations`).
+/// aliases, the SSH configuration, cargo's configuration (shared with the Unix backends,
+/// `sandy_core::trust::cargo_configs`) and sandy's own state. A writable path that reaches one of
+/// them lets the program leave a file there that runs outside the sandbox at the next logon or
+/// the next build, and a file the program creates keeps the user's own rights on it, including
+/// the right to execute it (see "Trusted user locations" in docs/windows.md). Such a path is
+/// refused; the directories on sandy's PATH only warn (`path_locations`).
 ///
 /// The list is a heuristic and can never be complete: no list knows which files the programs of
 /// this user trust. The user profile is protected only against a writable path that contains it,
@@ -455,7 +459,9 @@ fn trusted_locations() -> Result<Vec<ProtectedPath>, SandboxError> {
         // The state that decides which policy may join a running AppContainer.
         ProtectedPath::tree(state_directory()?),
     ];
-    for profile in user_profiles()? {
+    let profiles = user_profiles()?;
+    locations.extend(sandy_core::trust::cargo_configs(&profiles));
+    for profile in profiles {
         locations.push(ProtectedPath::tree(profile.join(".ssh")));
         // After the folders in it, so that a writable profile is reported with the folder that
         // makes it dangerous.
@@ -495,8 +501,9 @@ fn user_profiles() -> Result<Vec<std::path::PathBuf>, SandboxError> {
 ///
 /// Paths are compared as rules 3 and 4 compare them (`PathIdentity`). On Windows that is the
 /// spelling only: the file identity hook of the resolver is still a stub there, so a second name
-/// of a directory, a junction for example, passes these checks (see "Links and identity" in
-/// docs/windows.md).
+/// of a directory that canonicalizing keeps, a path through a share of the local disk for
+/// example, passes these checks; the plan refuses share paths for that reason
+/// (`plan::network_path_problem`, and "Links and identity" in docs/windows.md).
 fn check_writable_paths(policy: &ResolvedPolicy) -> Result<(), String> {
     let identity = sandy_core::PathIdentity::read().map_err(|error| error.to_string())?;
     let system = system_directories().map_err(|error| error.to_string())?;

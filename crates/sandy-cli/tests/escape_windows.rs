@@ -2151,6 +2151,205 @@ fn refuses_a_writable_path_over_the_startup_folder() {
     assert!(report.contains("runs outside the sandbox"), "{report}");
 }
 
+/// A junction or a directory symbolic link this test made with `mklink`. Dropping it removes the
+/// link itself, never what it leads to.
+struct DirectoryLink(PathBuf);
+
+impl DirectoryLink {
+    /// `kind` is `/J` for a junction or `/D` for a symbolic link. `None` when `mklink` fails, as
+    /// `/D` does without the privilege to create symbolic links.
+    fn new(kind: &str, link: &Path, target: &Path) -> Option<DirectoryLink> {
+        let status = Command::new("cmd")
+            .args(["/c", "mklink", kind])
+            .arg(plain_path(link))
+            .arg(plain_path(target))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()?;
+        status.success().then(|| DirectoryLink(link.to_path_buf()))
+    }
+
+    fn arg(&self) -> &str {
+        self.0.to_str().unwrap()
+    }
+}
+
+impl Drop for DirectoryLink {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.0);
+    }
+}
+
+/// A writable path spelled through a link is a second name of the folder the link leads to. The
+/// resolver canonicalizes every policy path, and `canonicalize` follows junctions and symbolic
+/// links, so rules 6 and 12 see the folder itself and refuse it as they refuse its own name.
+/// The control is that name. `check` only reads state, so this is safe on the real folders.
+/// Returns `false` when `mklink` could not make the link.
+fn links_are_refused_like_their_targets(kind: &str) -> bool {
+    let startup =
+        user_profile().join("AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup");
+    let system =
+        PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot is set")).join("Temp");
+    // One fixture per kind: the tests of both kinds run at the same time in one process.
+    let fixture = Fixture::new(&format!("link-protected-{}", &kind[1..]));
+    for (name, target, reason) in [
+        ("startup", &startup, "runs outside the sandbox"),
+        ("system", &system, "system directory"),
+    ] {
+        let refused = check_with_path("C:\\Windows\\system32", target.to_str().unwrap());
+        let report = String::from_utf8_lossy(&refused.stdout);
+        assert_eq!(
+            refused.status.code(),
+            Some(EXIT_NOT_ENFORCEABLE),
+            "{report}"
+        );
+        assert!(report.contains(reason), "{report}");
+
+        let Some(link) = DirectoryLink::new(kind, &fixture.path(name), target) else {
+            return false;
+        };
+        let output = check_with_path("C:\\Windows\\system32", link.arg());
+        let report = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            output.status.code(),
+            Some(EXIT_NOT_ENFORCEABLE),
+            "{} passed: {report}",
+            link.arg()
+        );
+        assert!(report.contains(reason), "{report}");
+    }
+    true
+}
+
+#[test]
+fn a_writable_path_through_a_junction_is_refused_like_its_target() {
+    let startup =
+        user_profile().join("AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup");
+    if !startup.exists() {
+        return skip(
+            "startup-folder",
+            "this account has no Startup folder below its profile",
+        );
+    }
+    assert!(
+        links_are_refused_like_their_targets("/J"),
+        "mklink /J failed"
+    );
+}
+
+#[test]
+fn a_writable_path_through_a_directory_symbolic_link_is_refused_like_its_target() {
+    let startup =
+        user_profile().join("AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup");
+    if !startup.exists() {
+        return skip(
+            "startup-folder",
+            "this account has no Startup folder below its profile",
+        );
+    }
+    if !links_are_refused_like_their_targets("/D") {
+        skip(
+            "symbolic-links",
+            "mklink /D failed: this session may not create symbolic links",
+        );
+    }
+}
+
+/// A drive letter this test mapped to a share. Dropping it removes the mapping.
+struct MappedDrive(String);
+
+impl MappedDrive {
+    /// Maps the first free letter from Z down to `share`, or `None` when `net use` fails.
+    fn new(share: &str) -> Option<MappedDrive> {
+        let letter = ('M'..='Z')
+            .rev()
+            .map(|letter| format!("{letter}:"))
+            .find(|drive| !Path::new(&format!("{drive}\\")).exists())?;
+        let status = Command::new("net")
+            .args(["use", &letter, share])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()?;
+        status.success().then_some(MappedDrive(letter))
+    }
+}
+
+impl Drop for MappedDrive {
+    fn drop(&mut self) {
+        let _ = Command::new("net")
+            .args(["use", &self.0, "/delete", "/y"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// A policy path through a network share is refused at every access level, also when a mapped
+/// drive hides the share. The program could not open the share in its AppContainer, but the
+/// entry sandy adds through it lands on the folder behind it, which the program then opens by
+/// its local path; and the checks of rules 6 and 12 compared the share's spelling, so
+/// `\\localhost\C$\Windows\Temp` passed rule 6 (docs/windows.md, "Links and identity"). The
+/// control is the local path of the same folder. The administrative shares need an
+/// administrator.
+#[test]
+fn network_and_share_paths_are_refused() {
+    let fixture = Fixture::new("share-paths");
+    let local = plain_path(&fixture.path("rw"));
+    let check = |policy: &[&str]| {
+        let mut check = vec!["check".to_string()];
+        check.extend(platform_args());
+        check.extend(args(policy));
+        sandy(&check)
+    };
+    let output = check(&["--read-write", &local]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+    let share_of = |path: &str| format!(r"\\localhost\{}${}", &path[..1], &path[2..]);
+    let share = share_of(&local);
+    if !Path::new(&share).exists() {
+        return skip(
+            "administrative-share",
+            "the administrative share of the system drive is not reachable",
+        );
+    }
+    let system = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot is set"));
+    let system_share = share_of(system.join("Temp").to_str().unwrap());
+    let mapped = MappedDrive::new(&format!(r"\\localhost\{}$", &local[..1]))
+        .expect("net use maps the administrative share");
+    let through_drive = format!("{}{}", mapped.0, &local[2..]);
+    for policy in [
+        ["--read-write", share.as_str()],
+        ["--read", share.as_str()],
+        ["--read-exec", share.as_str()],
+        ["--read-write", system_share.as_str()],
+        ["--read-write", through_drive.as_str()],
+    ] {
+        let output = check(&policy);
+        let report = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            output.status.code(),
+            Some(EXIT_NOT_ENFORCEABLE),
+            "{policy:?}: {report}"
+        );
+        assert!(
+            report.contains("network or share path"),
+            "{policy:?}: {report}"
+        );
+    }
+
+    let target = format!(r"{local}\file");
+    let output = sandy(run_program(
+        &args(&["--read", &share]),
+        &probe_path(),
+        &["read", &target],
+    ));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    assert!(stderr.contains("network or share path"), "{stderr}");
+}
+
 /// sandy keeps the state of its runs below `%LOCALAPPDATA%\sandy`. A program that could write
 /// there could rewrite the policy of its own AppContainer so that a run with another policy joins
 /// it, or hold a lock that makes every later run wait. A writable path that reaches the folder is

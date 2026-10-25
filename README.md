@@ -16,7 +16,7 @@ sandy run \
   -- /srv/app/bin/server --port 8080
 ```
 
-Version 1.3.2. Policies use format `version = 1`.
+Version 2.0.0. Policies use format `version = 1`.
 
 ## Contents
 
@@ -98,7 +98,7 @@ Release archives for each platform are built by the `release` workflow (see
 names the workflow, the commit and the run that built it:
 
 ```sh
-gh attestation verify sandy-1.3.2-x86_64-unknown-linux-musl.tar.gz --repo <owner>/sandy
+gh attestation verify sandy-2.0.0-x86_64-unknown-linux-musl.tar.gz --repo <owner>/sandy
 ```
 
 `SHA256SUMS` in the release lists the sum of every archive. It says that the archives belong
@@ -311,16 +311,20 @@ sandy setup --remove [OPTIONS]               take back what setup and the runs o
 after the first argument that is not an option) belongs to the program.
 
 `sandy check` prints one line per requirement: `enforced` with the mechanism, or `UNAVAILABLE`
-with the reason. Pass the program if the policy should include it.
+with the reason. Pass the program if the policy should include it. A requirement that this
+platform gives only in part is printed as `enforced` too, because `run` starts the program with
+it, and a warning names what stays open.
 
-Three kinds of finding get a `warning:` line on standard error: a setting that gives up part of
-the isolation (`unix_sockets = "all"`, `signals = "any"`, `path_metadata = "allow"`), an option
-that replaced a stricter value of the policy file, and a fact about this host that makes the
-program behave differently inside the sandbox (a directory of your `PATH` inside a writable
-path, on Linux an OpenSSL include the policy does not cover or a cgroup limit the program
-cannot see). Warnings change neither the exit status nor the one line per requirement on
-standard output, so a caller that reads it is not affected. `sandy run` prints no warnings: its
-standard error belongs to the program.
+Four kinds of finding get a `warning:` line on standard error: a setting that gives up part of the
+isolation (`unix_sockets = "all"`, `signals = "any"`, `path_metadata = "allow"`), an option that
+replaced a stricter value of the policy file, a guarantee of the policy that this platform gives
+only in part (for example `signals = "isolated"` on macOS, which leaves SIGIO open; the list is in
+[docs/DESIGN.md](docs/DESIGN.md), "Requirements and the enforcement plan"), and a fact about this
+host that makes the program behave differently inside the sandbox (a directory of your `PATH` or a
+usual `bin` directory inside a writable path, on Linux an OpenSSL include the policy does not cover
+or a cgroup limit the program cannot see). Warnings change neither the exit status nor the one line
+per requirement on standard output, so a caller that reads it is not affected. `sandy run` prints
+no warnings: its standard error belongs to the program.
 
 `sandy setup` does the one-time host preparation that needs administrator rights. Today this
 matters only on Windows (see [Windows](#windows)); on Linux and macOS it does nothing.
@@ -475,7 +479,9 @@ are errors, so a misspelled key never becomes a silent default.
 ### Rules
 
 1. **Absolute, existing paths.** sandy resolves symbolic links before it builds the sandbox. A
-   rule applies to the path and everything below it.
+   rule applies to the path and everything below it. On Windows a path must be local: sandy
+   refuses a network or share path (`\\server\share`, `\\localhost\C$`, a mapped network
+   drive) and asks for the local path instead.
 2. **Never writable and executable.** No path may be both writable and executable, also not
    through nesting (a `read_write` directory inside a `read_exec` directory, or the reverse).
    The rule compares files, not names: a hard link that gives an executable file a second name
@@ -505,17 +511,27 @@ are errors, so a misspelled key never becomes a silent default.
 8. **No writable path over a trusted user location.** A writable path gives the program your
    write rights there, and a file it leaves behind runs with your rights, outside the sandbox.
    sandy refuses a writable path that reaches a location whose content another program reads or
-   runs later: your home directory, the shell startup files (`~/.bashrc`, `~/.profile`),
-   autostart entries and user services, `~/.ssh`; on macOS also `~/Library/LaunchAgents`, on
-   Windows the Startup folders, the PowerShell profile folders, `WindowsApps` and sandy's own
-   state folder. Each platform documents its list. A directory below your home directory stays writable.
+   runs later: your home directory, the startup files of bash, zsh and fish (`~/.bashrc`,
+   `~/.profile`, `~/.config/fish`), the git configuration, cargo's configuration
+   (`~/.cargo/config.toml`), `~/.ssh`; on Linux also autostart entries, user services and the
+   KDE Plasma login scripts, on macOS also `~/Library/LaunchAgents`, on Windows the Startup
+   folders, the PowerShell profile folders, `WindowsApps` and sandy's own state folder. Each
+   platform documents its list. A directory below your home directory stays writable, but not
+   one that holds such a location: `--read-write ~/.cargo` is refused, and a program that
+   downloads crates needs `~/.cargo/registry` and `~/.cargo/git` instead. When sandy cannot find
+   your home directory (`HOME` unset and no entry in the password database), it cannot check
+   this rule and refuses a policy with a writable path; start it with `HOME` set.
 
    A directory on your `PATH` gets a warning instead, naming it, because a writable path that
-   holds one is often what you mean: `--read-write ~/.cargo` with `~/.cargo/bin` on `PATH`, or
-   `--read-write /usr/local`. The escape is real, a file the program leaves there runs when you
-   next type its name, so make only the subdirectories the program needs writable, or start
-   sandy with a `PATH` that does not reach into the writable path. A directory below a directory
-   on `PATH` is on no `PATH` and says nothing.
+   holds one is often what you mean: `--read-write ~/tools` with `~/tools/bin` on `PATH`, or
+   `--read-write /usr/local`. On Linux and macOS sandy also warns about the directories the
+   usual shell setups put on `PATH` (`~/.local/bin`, `~/bin`, `~/.cargo/bin`, `/usr/local/bin`,
+   `/usr/local/sbin`, and Homebrew's on macOS) when its own `PATH` lacks them, because a service
+   or a desktop application starts sandy with a shorter `PATH` than your shell has. The escape is
+   real, a file the program leaves there runs when you next type its name. Only a policy that
+   keeps the directory out of every writable path removes it: make only the subdirectories the
+   program needs writable. Starting sandy with another `PATH` can silence the warning, but leaves
+   the risk. A directory below a directory on `PATH` is on no `PATH` and says nothing.
 
    sandy cannot know which of your files other programs trust, so the list is a heuristic and
    can never be complete. Keep the writable paths of a policy as narrow as the program needs,
@@ -536,12 +552,18 @@ are errors, so a misspelled key never becomes a silent default.
   for programs you would also run without a sandbox.
 - A socket on standard input, output or error keeps the access it was created with: it exists
   before the sandbox, and no sandbox can take rights from what is already open. sandy therefore
-  refuses to start the program, with status 125 and the stream named, when a standard stream
-  carries an IP socket under `ip = "none"`, or an unconnected, datagram or listening Unix socket
-  under `unix_sockets = "none"`. A connected Unix stream or seqpacket socket is accepted: that is
-  how a parent passes a pipe. A service that is handed its connection on standard input
-  (inetd-style, systemd `Accept=yes`) needs `ip = "all"`. `sandy check` cannot report this,
-  because its own streams are not the streams of the later `run`.
+  accepts such a socket only when the policy lets the program create one like it, and else
+  refuses to start the program, with status 125 and the stream and the socket named. It refuses
+  an IP socket under `ip = "none"`, an unconnected, datagram or listening Unix socket under
+  `unix_sockets = "none"`, and under every policy a raw IP socket, which only a privileged
+  process can create, and a socket of any other family, for example a netlink socket that lists
+  the sockets of the host. An ICMP datagram socket counts as an IP socket, because an
+  unprivileged program can create one where the system allows it. On Linux `ip = "all"` also
+  accepts a route netlink socket, which the program may create. A connected Unix stream or seqpacket
+  socket is accepted: that is how a parent passes a pipe. A service that is handed its
+  connection on standard input (inetd-style, systemd `Accept=yes`) needs `ip = "all"`.
+  `sandy check` cannot report this, because its own streams are not the streams of the later
+  `run`.
 - `expose` entries: `listen` must be a loopback address, must differ from the program's own
   address, and may appear only once. They need `ip = "all"` in this version. At most 256
   connections per port are relayed at the same time. A connection that is still open when the
@@ -550,14 +572,20 @@ are errors, so a misspelled key never becomes a silent default.
   two seconds later and its ports are released; on macOS nothing bounds it, so only
   `signals = "isolated"` keeps the bound there. A relay that is continued before that can serve
   one more connection, made after the program ended, on whatever now holds the address it
-  forwards to; `process.children = "contained"` closes that on Linux (docs/linux.md).
+  forwards to. `signals = "isolated"`, which `process.children = "contained"` requires, closes
+  that: the program cannot stop its relay then, and the Linux relay has no timer, so a busy host
+  does not kill it either (docs/linux.md).
 - `forward` entries: on Linux the relay closes a connection whose other end the kernel names as
   another local user's, so it never reaches the service. A socket its process has closed has no
   owner for the kernel to name, and such a connection is served, because it is the program's
-  own in any ordinary run. Another local user can therefore still get a write through by
-  closing first and retrying until it hits that window, but never read the answer
+  own in any ordinary run. Another local user can therefore still deliver a blind write, usually
+  on the first attempt, by writing and closing at once, but never read the answer
   (docs/linux.md). On macOS every connection is served. Forward only to services that
   authenticate their clients.
+- A dead relay frees the program's forward port, and any local user can then bind it and
+  receive what the program sends there. With `children = "contained"` on Linux and macOS, sandy
+  therefore ends the program when its relay dies, and exits with status 125. Without it nothing
+  watches the relay.
 - A port another process already holds makes `sandy run` refuse with status 125. `sandy check`
   binds the same listeners for a moment and reports `UNAVAILABLE` for such a port, so it gives
   the same answer. Between the two the port can change hands, so `run` is the final word.
@@ -659,6 +687,11 @@ because it sets the metadata through the descriptor it wrote.
   `openat2`, which sandy denies because seccomp cannot read that call's flags and therefore
   cannot reject the open mode that gets past Landlock, and tar does not fall back. Creating and
   listing archives work, and so does `bsdtar` ([docs/linux.md](docs/linux.md)).
+- **Name resolution across network changes.** A Landlock rule binds a file, so a file the
+  system replaces by rename is lost to a program that is already running. With `--ip all`,
+  sandy grants systemd-resolved's directory, so name resolution keeps working when the network
+  changes. Where `/etc/resolv.conf` is a plain file or leads elsewhere, a long-running program
+  needs a restart after the system replaces it ([docs/linux.md](docs/linux.md)).
 - **Tested** on Fedora 44 (kernel 7.2), Ubuntu 22.04 (6.8), Ubuntu 25.10 (6.17) and the GitHub
   Ubuntu 22.04, 24.04 and 24.04-arm runners. The code paths of older Landlock ABIs are tested on
   a newer kernel with the test harness `sandy-abi-cap`, which lowers the ABI sandy reads (see
@@ -730,8 +763,8 @@ Recommendations:
    status.
 2. **Treat exit status 125 as "not started".** sandy prints the reason on standard error. Two
    exceptions: a program can exit with 125 itself, and with `children = "contained"` or
-   `--explain` sandy can fail while it supervises a running program (its message is
-   `sandy: run failed: ...`). Pass `--status-fd` when you need to tell these apart, or need the
+   `--explain` sandy can fail while it supervises a running program, for example when the relay
+   of its ports died (its message is `sandy: run failed: ...`). Pass `--status-fd` when you need to tell these apart, or need the
    program's process ID (see [The status record](#the-status-record)).
 3. **Keep sandy, the policy and the program's binaries out of every writable path.** Use separate
    directories for binaries (`read_exec`) and data (`read_write`). A program that can rewrite its

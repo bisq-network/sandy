@@ -9,8 +9,8 @@
 //! `recvfrom`, which it already allows; Landlock does not mediate netlink. An answer about
 //! another connection and every failure mean that the connection is refused, and a kernel that
 //! cannot answer at all is found by a self test before the relay starts. The kernel answers a
-//! lookup in the call that sends it, so the relay's watchdog bounds the wait for an answer that
-//! never comes.
+//! lookup in the call that sends it, so the relay reads the answer without waiting, and a
+//! missing answer refuses the connection instead of holding up the relay.
 //!
 //! One peer the kernel cannot name: one that closed its socket. The owner it reports comes from
 //! the socket's file (`sock_i_uid`), and closing the socket takes that file away, so from the
@@ -19,15 +19,16 @@
 //! The user in such an answer cannot be used: kernels up to 6.8 report user 0 from the close,
 //! and 6.17 and later keep the user until they replace the socket with a timewait record a few
 //! milliseconds afterwards. Reading the user therefore refused nearly every connection of a
-//! program that connects and exits on 6.8, and between none and two thirds of them on the
+//! program that connects and exits on 6.8, and between none and nine tenths of them on the
 //! newer kernels, depending on what the program does and how busy the host is (docs/linux.md,
 //! "Exposed and forwarded ports").
 //!
 //! The relay serves a connection no owner can be found for. It is the program's own in every
 //! ordinary run: the kernel completes a handshake by itself, so a program that connects and
 //! exits is always ahead of the relay's accept, and refusing these answers is refusing what a
-//! forwarded port exists to carry. What it costs is that another local user can land a write by
-//! connecting, writing, closing and retrying until one attempt hits the window.
+//! forwarded port exists to carry. What it costs is that another local user can deliver a blind
+//! write, usually on the first attempt: a peer that connects, writes and closes at once is
+//! usually closed before the relay asks.
 //!
 //! The one thing that keeps the straightforward attack closed is that only a peer which can no
 //! longer read is ever unnamed. Losing the file is what loses the owner, and it also gives up
@@ -161,7 +162,7 @@ impl PeerCheck {
                 self.fd(),
                 answer.as_mut_ptr().cast(),
                 answer.len(),
-                0,
+                libc::MSG_DONTWAIT,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             )

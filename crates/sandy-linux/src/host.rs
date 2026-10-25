@@ -36,9 +36,11 @@ pub struct HostCapabilities {
     pub system_paths: Vec<SystemPath>,
     /// Where every candidate of the minimal system set is or would be, also missing ones.
     pub system_locations: Vec<SystemPath>,
-    /// The locations of this user that programs outside the sandbox read or execute later.
-    pub trusted_locations: Vec<ProtectedPath>,
-    /// The directories on sandy's PATH, which only warn (rule 12).
+    /// The locations of this user that programs outside the sandbox read or execute later, or
+    /// why sandy cannot name them: no source names the home directory.
+    pub trusted_locations: Result<Vec<ProtectedPath>, String>,
+    /// The directories on sandy's PATH and the usual ones of the user's PATH, which only warn
+    /// (rule 12).
     pub path_locations: Vec<ProtectedPath>,
 }
 

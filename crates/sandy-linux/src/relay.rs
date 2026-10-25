@@ -23,7 +23,8 @@
 //!    process can block. A stopped relay sees neither the end of the program nor its own
 //!    listeners, so the kernel keeps completing handshakes for them. The relay therefore has a
 //!    watchdog: a timer that kills it when its poll loop has not run for `WATCHDOG` (see
-//!    `Watchdog`).
+//!    `Watchdog`). With `signals = "isolated"` the program cannot signal the relay, and the relay
+//!    has no timer: there it could only kill a healthy relay that the host was slow to schedule.
 //!
 
 use std::fs::File;
@@ -36,7 +37,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use landlock::{ABI, Scope};
-use sandy_core::{ExposedPort, ForwardedPort, SandboxError};
+use sandy_core::{ExposedPort, ForwardedPort, SandboxError, SignalScope};
 
 use crate::filter;
 use crate::helper::{self, Ready};
@@ -58,12 +59,20 @@ pub struct RelayConfig {
     /// program alone, so only there does the relay refuse connections from other users; an
     /// exposed port is meant for other processes, which may belong to another user.
     pub forwarded: usize,
+    /// Whether the relay arms its watchdog: only with `signals = "any"`, where the program can
+    /// stop it (see `Watchdog`).
+    pub watchdog: bool,
     pub abi: ABI,
 }
 
 impl RelayConfig {
     /// The relay for these ports, or `None` when there is nothing to relay.
-    pub fn new(expose: &[ExposedPort], forward: &[ForwardedPort], abi: ABI) -> Option<Self> {
+    pub fn new(
+        expose: &[ExposedPort],
+        forward: &[ForwardedPort],
+        signals: SignalScope,
+        abi: ABI,
+    ) -> Option<Self> {
         let exposed = expose.iter().map(|expose| RelayPair {
             listen: expose.listen,
             target: expose.target(),
@@ -76,6 +85,7 @@ impl RelayConfig {
         (!pairs.is_empty()).then_some(RelayConfig {
             pairs,
             forwarded: forward.len(),
+            watchdog: signals == SignalScope::Any,
             abi,
         })
     }
@@ -141,7 +151,7 @@ fn relay_main(
             SandboxError::io("cannot raise the relay's descriptor limit", error)
         })?;
         // Created before the filter is installed, so only re-arming it has to pass the filter.
-        let watchdog = Watchdog::create()?;
+        let watchdog = config.watchdog.then(Watchdog::create).transpose()?;
         confine(&keep, config)?;
         // Every connection gets its own threads. Starting one now shows that the filter allows
         // it, so a missing system call fails the start instead of the first connection.
@@ -159,7 +169,7 @@ fn relay_main(
                 .set_nonblocking(true)
                 .map_err(|error| SandboxError::io("cannot prepare a listener", error))?;
         }
-        Ok::<Watchdog, SandboxError>(watchdog)
+        Ok::<Option<Watchdog>, SandboxError>(watchdog)
     }));
     match started {
         Ok(Ok(watchdog)) => {
@@ -169,7 +179,7 @@ fn relay_main(
                 peers.as_ref(),
                 &program,
                 ended.as_ref(),
-                &watchdog,
+                watchdog.as_ref(),
             );
         }
         Ok(Err(error)) => ready.fail(&error.to_string()),
@@ -187,7 +197,8 @@ const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(50);
 /// every `WATCHDOG_TICK`, so this is the bound a stopped relay dies within, and at the same time
 /// the margin a relay that the host is slow to schedule has before it is killed by mistake.
 const WATCHDOG: Duration = Duration::from_secs(2);
-/// How long the poll loop waits for work before it wakes to re-arm the watchdog.
+/// How long the poll loop waits for work before it wakes to re-arm the watchdog. Without a
+/// watchdog it waits until there is work.
 const WATCHDOG_TICK: Duration = Duration::from_millis(250);
 
 /// A timer that kills the relay when its poll loop stops running. SIGSTOP and SIGKILL cannot be
@@ -195,6 +206,11 @@ const WATCHDOG_TICK: Duration = Duration::from_millis(250);
 /// stopped relay keeps its ports bound and relays whatever its backlog collected once someone
 /// continues it, which would put it beyond the one second bound of rule 5. The timer asks the
 /// kernel for SIGKILL, which arrives also while the process is stopped.
+///
+/// With `signals = "isolated"` the relay has none. The Landlock signal scope keeps the program
+/// from signalling it, and its own session keeps terminal and group signals away, so nothing the
+/// program does can stop it. The timer would only kill a relay the host did not schedule for
+/// `WATCHDOG`, which with `children = "contained"` ends the program too.
 struct Watchdog(libc::c_int);
 
 impl Watchdog {
@@ -263,7 +279,7 @@ fn serve_until_exit(
     peers: Option<&PeerCheck>,
     program: &OwnedFd,
     ended: Option<&File>,
-    watchdog: &Watchdog,
+    watchdog: Option<&Watchdog>,
 ) {
     // One count per listener: clients of one port cannot take the connections of another.
     let active: Vec<Arc<AtomicUsize>> = listeners
@@ -291,9 +307,14 @@ fn serve_until_exit(
             revents: 0,
         })
         .collect();
-    let tick = WATCHDOG_TICK.as_millis() as libc::c_int;
+    let tick = match watchdog {
+        Some(_) => WATCHDOG_TICK.as_millis() as libc::c_int,
+        None => -1,
+    };
     loop {
-        watchdog.rearm();
+        if let Some(watchdog) = watchdog {
+            watchdog.rearm();
+        }
         // SAFETY: `polls` holds `len` valid pollfd entries.
         let ready = unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, tick) };
         if ready < 0 {
@@ -351,7 +372,8 @@ fn serve_until_exit(
 /// end of the program is not always in the same poll result as the readiness of a listener.
 /// A relay continued while its program has already ended can therefore take its backlog before
 /// it can tell that either happened, which has been seen on this host. What bounds that window
-/// is the watchdog ending a relay that was stopped for `WATCHDOG`, not this check.
+/// is the watchdog ending a relay that was stopped for `WATCHDOG`, not this check. Without a
+/// watchdog the program cannot stop the relay in the first place.
 fn was_stopped() -> bool {
     // SAFETY: sigset_t is plain data, and the two calls initialize and change it.
     let cont = unsafe {
@@ -480,6 +502,7 @@ mod tests {
                 target: target.local_addr().unwrap(),
             }],
             forwarded: 0,
+            watchdog: true,
             abi: ABI::from(version),
         };
         let other = other.local_addr().unwrap();

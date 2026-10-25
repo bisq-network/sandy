@@ -10,7 +10,9 @@ everything else is denied. sandy supports Linux, macOS and Windows.
   user files outside its policy, gain privileges, or leave the sandbox through another process.
 - One policy model and one command line on all supported platforms.
 - Fail closed. If the host cannot enforce any restriction the policy requests, sandy does not
-  start the program. There is no best-effort mode.
+  start the program. There is no best-effort mode. The few requirements a platform gives only in
+  part are written down and named by `sandy check` (see "Requirements and the enforcement
+  plan").
 - Unprivileged use. `sandy run` needs no root or administrator rights. One-time host preparation
   that needs admin rights is allowed (`sandy setup`, for example the Windows loopback exemption).
 
@@ -67,10 +69,10 @@ Command line options extend the policy file (`sandy --help`): path options add p
 other option replaces the file's value, also with a weaker one. The caller is trusted, so sandy
 obeys, but `sandy check` names every option that replaced a stricter value of the file in a
 `warning:` line on standard error, together with the settings of the policy that give up part of
-the isolation (`ResolvedPolicy::warnings`) and what the backend found on this host that makes
-the program behave differently inside the sandbox (`Backend::notes`). Warnings do not change
-what sandy enforces or its exit status; `sandy run` prints none, because its standard error
-belongs to the program.
+the isolation (`ResolvedPolicy::warnings`) and what the backend found on this host that makes the
+program behave differently inside the sandbox or that its platform gives only in part
+(`Backend::notes`). Warnings do not change what sandy enforces or its exit status; `sandy run`
+prints none, because its standard error belongs to the program.
 
 sandy's own executable and the policy file get the checks of rules 3 and 4: sandy refuses to
 start when a writable path contains one of them, reaches one through a link or an alias, or
@@ -81,7 +83,9 @@ can be a link inside a writable path.
 Rules:
 
 1. Paths must be absolute and must exist. sandy resolves symbolic links before it builds the
-   sandbox, so all backends see the same object.
+   sandbox, so all backends see the same object. On Windows a path that resolves to a network
+   share is refused: the program cannot open it in its AppContainer, and the grant would land
+   on the folder behind the share (docs/windows.md, "Network and share paths").
 2. A rule applies to the path and everything beneath it.
 3. No path may be both writable and executable, also not through nesting. sandy rejects such a
    policy. The program could otherwise drop an executable that a process outside the sandbox
@@ -165,44 +169,62 @@ Rules:
    sandy also refuses when it sees that the process it would watch has already ended, and on
    macOS when that process is launchd, which has no end to wait for.
 12. No writable policy path may reach a location of this user whose content other programs read
-   or execute later: the home directory (which it may not contain), the shell startup files,
-   autostart entries and user services, `~/.ssh`, and per platform `~/Library/LaunchAgents`, the
-   Startup folders, the PowerShell profile folders, `WindowsApps` and, on Windows, sandy's own
-   state folder, which decides which policy may join a running AppContainer. A file the program
-   leaves in one of the others runs outside the sandbox with the user's rights at the next login
-   or the next shell, which would make the whole policy pointless. The backend checks this, because only it
-   knows the locations of its platform, and it compares paths as rules 3 and 4 do. A path below
-   the home directory stays writable: only the locations themselves and the trees of those that
-   hold code are protected.
+   or execute later: the home directory (which it may not contain), the startup files of the
+   shells, the SSH, GnuPG, git and cargo configuration, and per platform autostart entries and
+   user services, `~/Library/LaunchAgents`, the Startup folders, the PowerShell profile folders,
+   `WindowsApps` and, on Windows, sandy's own state folder, which decides which policy may join a
+   running AppContainer. Linux and macOS share one list for what every Unix has
+   (`sandy_core::trust`), so one policy is refused on both for the same files. A file the program
+   leaves in one of the others runs outside the sandbox with the user's rights at the next login,
+   the next shell or the next run of the tool, which would make the whole policy pointless. The
+   backend checks this, because only it knows the locations of its platform, and it compares
+   paths as rules 3 and 4 do. A path below the home directory stays writable: only the locations
+   themselves and the trees of those that hold code are protected.
 
-   A directory on sandy's `PATH` is **warned about, not refused**. The escape is the same, a
-   file the program leaves there runs when the user next types its name, but a writable path
-   that holds one is often what the caller means (a package cache whose `bin` directory is on
-   `PATH`, or `/usr/local`), so refusing it would turn away ordinary work. The warning names the
-   directory, and the answers are to grant the subdirectories the program needs or to start
-   sandy with a `PATH` that does not reach into the writable path.
+   A directory on `PATH` is **warned about, not refused**. The escape is the same, a file the
+   program leaves there runs when the user next types its name, but a writable path that holds
+   one is often what the caller means (a package cache whose `bin` directory is on `PATH`, or
+   `/usr/local`), so refusing it would turn away ordinary work. The directories are those on
+   sandy's own `PATH` and, on Linux and macOS, the ones the usual shell setups put on the user's
+   `PATH` (`sandy_core::trust::path_locations`), whether or not sandy's own holds them: a service
+   or a desktop application starts sandy with a minimal `PATH`, while the escape works through
+   the user's shell. The warning names the directory and the one answer that removes the risk:
+   grant only the subdirectories the program needs, so that the directory stays outside every
+   writable path. Starting sandy with another `PATH` would only silence the warning.
 
    The set is a heuristic. No list knows which files the programs of a user trust, and the set
    covers the usual shell and desktop setups only. It also does not depend on the policy:
    `system = "none"` changes nothing about it. The home directory comes from the password
    database or the known-folder API and from the environment, because a program that starts
-   sandy with a minimal environment sets neither; when no source names one, only the locations
-   that do not depend on it are checked.
+   sandy with a minimal environment sets neither. When no source names one, sandy cannot check
+   this rule, so it refuses a policy with a writable path, as it refuses when it cannot read the
+   mount table, and the message says to set `HOME`. On Windows a known folder that cannot be
+   found makes the filesystem requirement unavailable for every policy.
 
 13. The standard streams stay the caller's choice, except for the sockets among them. sandy
    passes descriptors 0, 1 and 2 on as it received them and closes every other one, because a
    program reads its input and writes its output through them. Nothing inside the sandbox can
    take rights away from what is already open, so a socket on a standard stream keeps the access
    it was created with, whatever the policy says about networking. `run` therefore looks at the
-   three streams before it applies the sandbox and refuses with status 125, naming the stream
-   and the socket, when one carries a socket the policy denies: an IP socket or one of another
-   family with `ip = "none"`, and an unconnected, datagram or listening Unix socket with
-   `unix_sockets = "none"`. A connected Unix stream or seqpacket socket is accepted, because it
-   talks only to the peer it already has, which is how a parent passes a pipe (libuv, journald,
-   `ssh` without a terminal); what that peer is stays the caller's choice, as with a file. A
-   service that is handed its connection on standard input, inetd-style or with systemd
-   `Accept=yes`, needs `ip = "all"`. `check` cannot report this: the streams it is given are not
-   the streams of the later `run`.
+   three streams before it applies the sandbox and accepts a socket only when the policy lets
+   the program create one like it. Otherwise it refuses with status 125, naming the stream and
+   the socket: an IP socket with `ip = "none"`, an unconnected, datagram or listening Unix
+   socket with `unix_sockets = "none"`, and under every policy a raw IP socket and a socket of
+   any other family, because no setting lets the program create one. A raw IP socket needs
+   privileges: CAP_NET_RAW on Linux, which sandy refuses to start with, root on macOS and
+   administrator rights on Windows; sandy refuses an inherited one also where the caller has
+   them, so that a policy means the same everywhere. An ICMP datagram socket follows `ip`,
+   because an unprivileged program can create one where the kernel allows it (on Linux within
+   `net.ipv4.ping_group_range`). What `ip = "all"` allows besides AF_INET and
+   AF_INET6 comes from the backend (`Backend::ip_also_allows`): on Linux a route netlink socket,
+   from the same list that the socket family filter is built from; on macOS and Windows
+   nothing. The message for another family names it and says to pass a pipe, a file or a
+   connected Unix stream socket instead; naming a setting would not help. A connected Unix
+   stream or seqpacket socket is accepted, because it talks only to the peer it already has,
+   which is how a parent passes a pipe (libuv, journald, `ssh` without a terminal); what that
+   peer is stays the caller's choice, as with a file. A service that is handed its connection
+   on standard input, inetd-style or with systemd `Accept=yes`, needs `ip = "all"`. `check`
+   cannot report this: the streams it is given are not the streams of the later `run`.
 
 ## Links and file identity
 
@@ -303,7 +325,9 @@ Rules:
    terminates the relay's job object from outside the sandbox. On macOS there is no such timer,
    so a stopped relay holds its ports until someone continues or kills it, and only
    `signals = "isolated"`, which keeps the program from signalling the relay at all, holds the
-   bound there (docs/macos.md).
+   bound there (docs/macos.md). With `signals = "isolated"` the Linux relay has no watchdog
+   either: the program cannot stop it, and the timer would only kill a healthy relay that a busy
+   host did not run for two seconds, which with `contained` ends the program too.
 
    A relay that is continued inside that bound can relay a connection that was made after the
    program ended. The poll loop looks for a stop and refuses the backlog it collected while
@@ -314,8 +338,16 @@ Rules:
    violation of the relay's lifetime, not an escape: an exposed port can answer once more after
    the operator believes the run ended, served by whatever now holds the inner address, and
    nothing gains access the relay did not already have. With `process.children = "contained"`
-   on Linux the window does not exist, because sandy stays as the supervisor and ends the
-   program's group as soon as the relay is gone.
+   the window does not exist, because `contained` requires `signals = "isolated"`.
+
+   A dead relay ends a contained program. With `process.children = "contained"` on Linux and
+   macOS, the guard of the program's group ends the group as soon as the relay is gone, whatever
+   ended it and also while sandy is stopped, and sandy exits with status 125. A dead forward relay frees the program's
+   forward port, and any local user can then bind it and receive what the program sends there
+   for `to`: its requests, credentials and data. A relay that ends together with the program,
+   or after it, is the normal end of a run. Without `contained` nothing watches the relay,
+   because sandy has become the program, so a relay that something outside the sandbox kills
+   leaves the program running with its forward port free for others to bind.
 6. Who may connect: an exposed port is meant for other processes, including those of other
    users, and the program's own listener is reachable directly on Linux and macOS anyway, so
    the relay serves every connection there. A forwarded port is for the program alone, and the
@@ -328,13 +360,14 @@ Rules:
    reports comes from the socket's file, so a socket its process has closed has none, which the
    answer shows by carrying no inode. The relay serves such a connection. It has to: the kernel
    completes a handshake by itself, so a program that connects and exits is always ahead of the
-   relay's accept, and refusing those answers dropped most of its connections on kernel 6.8 and
-   up to a fifth of them elsewhere, which is the opposite of what a forwarded port is for. What
-   it leaves open is that another local user can get a write through, by connecting, writing,
-   closing and retrying until it lands in the same window. It cannot read the answer, because
-   losing the file is what loses the owner and also gives up the reply, so the service cannot
-   be used interactively or read from; and a peer that only half closes keeps its file and its
-   owner, so that is not a way around the check either (docs/linux.md).
+   relay's accept, and refusing those answers dropped more than half of such a program's
+   connections on every kernel measured, which is the opposite of what a forwarded port is for. What
+   it leaves open is that another local user can deliver a blind write, usually on the first
+   attempt, because a peer that connects, writes and closes at once is usually closed before the
+   relay asks. It cannot read the answer, because losing the file is what loses the owner and
+   also gives up the reply, so the service cannot be used interactively or read from; and a peer
+   that only half closes keeps its file and its owner, so that is not a way around the check
+   either (docs/linux.md).
 7. The relay passes the end of a stream on as it came: a normal end as a half close, and a reset,
    or data the relay cannot deliver, as a reset of the other side. After one direction of a
    connection has ended, the other ends when it stays idle for `sandy_relay::HALF_CLOSED_IDLE`
@@ -368,6 +401,30 @@ to a socket through its file and therefore allows the sockets in the `read_write
 the program's private AppContainer folder (docs/windows.md).
 (On Linux with `ip = "all"` a socket pair can still take a free abstract name; see
 `docs/linux.md`.)
+
+There is one exception to "never less". Some requirements mean less on one platform than their
+description says, because the platform has no mechanism that closes a route, or because sandy
+does not use one there yet. sandy does not refuse them: the plan reports the requirement as
+enforced, the platform document describes the route, and `sandy check` prints a `warning:` line
+for it (`Backend::notes`) that names the route and the section that explains it. The warning
+appears only when the policy asks for what it concerns. A new exception needs the description,
+the warning and a row in the table below. The requirement line keeps the word `enforced`,
+because `run` starts the program with it, and the line a caller reads does not change. The
+exceptions:
+
+| Platform | When | What stays open |
+|---|---|---|
+| Linux | `signals = "isolated"` without `children = "contained"` | a read from the terminal in the background stops the group sandy was started in, with the processes outside the sandbox in it |
+| Linux | `forward` | another local user can deliver a write to the forwarded service, through a connection it closed before the relay asked who owns it |
+| macOS | `signals = "isolated"` | SIGIO, and SIGURG with `ip = "all"`, through the owner ioctls of sockets and pipes; without `children = "contained"` also joining another job of the terminal session and stopping it |
+| macOS | `forward` | every local user reaches the forwarded service |
+| macOS | `expose` or `forward` with `signals = "any"` | a stopped relay has no time limit |
+| Windows | a `read_write` path | rules 3, 4, 6 and 12 compare paths by their spelling only |
+| Windows | a directory in the policy | a file moved out of a granted directory keeps its grant |
+
+`children = "contained"` on macOS gets a warning as well, although it gives its full
+guarantee: it denies `posix_spawn`, which many runtimes start processes with, and that cost is
+easy to miss.
 
 The backend reports each requirement as enforced (naming the mechanism) or unavailable (naming the
 reason). `EnforcementPlan::new` treats a requirement without a report as unavailable, so a backend
@@ -502,7 +559,9 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   program writes its own process ID into that pipe, after it has joined the group, so the guard
   learns it without sandy running again after the fork and never before a kill of the group would
   reach the program. sandy also kills the group when the program exits and waits until the group
-  is gone.
+  is gone. With exposed or forwarded ports the guard also watches the relay with a pidfd; when
+  the relay ends first, it tells sandy before the kill, and sandy exits with status 125 (rule 5
+  of "Forwarded ports").
 - `process.end_with_parent`: a watcher process, forked twice like the relay, polls pidfds for
   sandy's parent and for the program (with `contained`: the supervising sandy). When the parent
   ends, it sends SIGTERM and SIGCONT and, 5 seconds later, SIGKILL. Like the relay, it runs in a
@@ -520,7 +579,8 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
 - Exposed and forwarded ports: one relay, forked twice from the single-threaded sandy before it
   confines itself, so it is not a child of the program. It watches the program with a pidfd and
   ends at most one second after it (rule 5 of "Forwarded ports"), or two seconds when the program
-  stopped it, which a timer the relay re-arms takes care of. It confines itself with
+  stopped it, which a timer the relay re-arms takes care of. The timer exists only under
+  `signals = "any"`; under `"isolated"` the program cannot stop the relay. It confines itself with
   no_new_privs, Landlock without file access (TCP connect only to the relay targets from ABI 4)
   and a seccomp filter limited to TCP, copying, threads and that timer. A forwarded port refuses
   a connection the kernel names as another user's (rule 6 of "Forwarded ports").
@@ -569,10 +629,12 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   `syscall-unix` rules (the flags `POSIX_SPAWN_SETSID` and `POSIX_SPAWN_SETPGROUP` change the
   group inside `posix_spawn`, which no rule can inspect), and the signal rule keeps the program
   from signaling sandy, the guard or the anchor, which run outside the sandbox. The guard watches
-  the program and a pipe from sandy with kqueue and, when either ends, sends SIGKILL to the group
-  until no live process is left: on macOS a process being forked can miss one signal for its
-  group. sandy does the same after the program exits. The guard reaps the anchor, which keeps the
-  group's ID reserved, only after sandy is done or gone.
+  the program, a pipe from sandy and, with exposed or forwarded ports, the relay with kqueue and,
+  when one ends, sends SIGKILL to the group until no live process is left: on macOS a process
+  being forked can miss one signal for its group. sandy does the same after the program exits.
+  When the relay ended first, the guard tells sandy before the kill, and sandy exits with status
+  125 (rule 5 of "Forwarded ports"). The guard reaps the anchor, which keeps the group's ID
+  reserved, only after sandy is done or gone.
 - `process.end_with_parent`: a watcher process, forked twice like the relay, registers
   `NOTE_EXIT` for sandy's parent and for the program (with `contained`: the supervising sandy)
   and then applies its own profile (no files, no network, no Mach services, signals allowed).
@@ -609,8 +671,9 @@ Details, limitations and sources: `docs/windows.md`.
   (`sandy setup --remove` does) and serializes its DACL changes with a lock file of the user, so
   concurrent runs do not conflict.
   Read and read-write never contain `FILE_EXECUTE`; read levels contain no right that changes
-  metadata. sandy refuses to propagate a grant through junctions or symbolic links. The system
-  set is what Windows grants ALL APPLICATION PACKAGES; `system = "none"` is unavailable.
+  metadata. sandy refuses to propagate a grant through junctions or symbolic links, and refuses
+  a policy path on a network share. The system set is what Windows grants ALL APPLICATION
+  PACKAGES; `system = "none"` is unavailable.
 - Network capabilities `internetClientServer` and `privateNetworkClientServer` only with
   `ip = "all"`. Connections from the program to loopback listeners outside need the loopback
   exemption, which `sandy setup` installs (administrator rights); connections from outside to

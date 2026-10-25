@@ -142,6 +142,12 @@ One relay process serves all pairs. sandy starts it before it confines itself:
    small machine that is not a remote risk: 16 busy loops on two CPUs, with no signal sent, were
    enough to kill a healthy relay within a minute.
 
+   With `signals = "isolated"` the relay has no timer. The Landlock signal scope keeps the
+   program from signalling it, and its own session keeps terminal and process group signals
+   away, so the program cannot stop it, and a timer would only kill a relay that the host was
+   slow to schedule. A relay that something outside the sandbox stops therefore keeps its ports
+   until it is continued, and then serves on.
+
    The poll loop also looks for a stop: the helper blocks SIGCONT like every other signal, so
    the kernel continues the process and leaves SIGCONT pending, and the loop takes it from the
    pending set on every turn. When the turn that finds the program ended also finds that the
@@ -159,13 +165,23 @@ One relay process serves all pairs. sandy starts it before it confines itself:
    the operator believes the run is over. It is a violation of the relay's lifetime, not a way
    out of the sandbox: nothing gains access the relay did not already have, and anything the
    program started is still inside the sandbox and is ended with its group. With
-   `process.children = "contained"` the window does not exist, because sandy stays as the
-   supervisor, holds a pidfd for the relay, and ends the program's group as soon as the relay is
-   gone, so there is no program left for a continued relay to be serving on behalf of. The
-   caller sees that as exit 125 with the reason on standard error, and as a status record of
-   `pid` followed by `failed` rather than `exited` or `signaled`. A relay that the watchdog
-   killed is gone as well, so on a host too busy to run the relay for two seconds a contained
-   program with exposed or forwarded ports ends with that status too.
+   `process.children = "contained"` the window does not exist: `contained` requires
+   `signals = "isolated"`, so the program cannot stop its relay.
+
+7. With `contained` the guard of the program's group (see "Contained child processes") holds a
+   pidfd for the relay and ends the group as soon as the relay is gone, whatever ended it, also
+   while sandy is stopped. A dead forward relay frees the program's forward port, and any local
+   user can then bind it and receive what the program sends there for `to`: its requests,
+   credentials and data. The guard tells sandy over a pipe of its own before it kills the group,
+   and the caller sees the end as exit 125 with the reason on standard error, and as a status
+   record of `pid` followed by `failed` rather than `exited` or `signaled`. The guard reports
+   the relay only when, in the same look, the program and sandy have not ended, so a relay that
+   ended together with the program is the normal end of a run and not a failure. In a normal
+   run the relay cannot end first: it ends when sandy ends or when the guard has ended the
+   group, and both come after the guard has seen the program end. The relay has no watchdog
+   there, so a host that is slow to run the relay does not end a contained program. Without
+   `contained` nothing watches the relay: when something outside the sandbox kills it, the
+   program keeps running and its forward port is free for others to bind.
 
 The listeners and the pidfd are close-on-exec, and sandy closes its copies before it confines
 itself, so the program never holds them. The relay has `/dev/null` as its standard descriptors,
@@ -175,7 +191,8 @@ readiness therefore leaves no message; a failure before that is reported over th
 
 The relay runs in its own Landlock domain, a sibling of the program's domain, so neither can
 ptrace the other. With `signals = "any"` the program can kill or stop the relay; a kill ends the
-relayed connections at once, and a stop ends the relay within two seconds (step 6 above). Any
+relayed connections at once, and a stop ends the relay within two seconds (step 6 above). With
+`signals = "isolated"` it can do neither. Any
 local process can connect to the relay's listeners, like to any loopback port. Through an exposed
 port it reaches the program, which is what an exposed port is for: the program's own listener is
 reachable directly anyway, so the relay checks nobody there.
@@ -187,7 +204,9 @@ end of every connection it accepts on a forwarded port, and closes the connectio
 answer names another user. It asks over a `NETLINK_SOCK_DIAG` socket that sandy opens before the
 relay confines itself, with an exact lookup of the connection's four addresses
 (`SOCK_DIAG_BY_FAMILY`), and it compares the answer with what it asked, so a lookup that matched
-a listening socket instead is refused like any other failure. A dual-stack IPv6 socket that
+a listening socket instead is refused like any other failure. The kernel answers in the call
+that sends the lookup, so the relay reads the answer without waiting, and a missing answer
+refuses the connection instead of holding up the relay. A dual-stack IPv6 socket that
 reached an IPv4 port, which is how Java connects by default, is answered in IPv6 form with
 IPv4-mapped addresses; the comparison reads them as the IPv4 addresses they map, because they
 name the same connection. Every failure closes the connection, and sandy checks the lookup on a
@@ -221,17 +240,19 @@ there this is the difference between a forwarded port that mostly works and one 
 does not. Dropping the program's own connection is the one thing a forwarded port must not do,
 and version 1.3.2 had no check at all, so refusing them was a reliability regression against it.
 
-What this leaves open: another local user can get a write through to the service, by connecting,
-writing, closing and retrying until one attempt lands in the window. It cannot read what comes
-back. Losing the file is what loses the owner, and it also gives up the answer, so the service
-cannot be used interactively, read from, or probed for a reply. A peer that only shuts down its
-sending side keeps its socket and its file, so it keeps its owner and is refused like any
-other: half closing is not a way around the check, and because a half closed peer and a closed
-one are both in FIN_WAIT2, the check must read the inode and never the state. The only way to
-close the residual rather than narrow it is a listener other local users cannot reach at all,
-which on Linux means a network namespace, as the AppContainer gives on Windows. Forward only to
-services that are safe against an unauthenticated local write, or that authenticate their
-clients themselves.
+What this leaves open: another local user can deliver a blind write to the service, usually on the
+first attempt. A peer that connects, writes and closes at once is usually closed before the relay
+asks, as most connections of a program that connects and exits were in the measurement above. It
+cannot read what comes back. Losing the file is what loses the owner, and it also gives up the
+answer, so the service cannot be used interactively, read from, or probed for a reply. A peer that
+only shuts down its sending side keeps its socket and its file, so it keeps its owner and is
+refused like any other: half closing is not a way around the check, and because a half closed peer
+and a closed one are both in FIN_WAIT2, the check must read the inode and never the state. The only
+way to close the residual rather than narrow it is a listener other local users cannot reach at
+all, which on Linux means a network namespace, as the AppContainer gives on Windows. Forward only
+to services that are safe against an unauthenticated local write, or that authenticate their
+clients themselves. `sandy check` prints this as a warning for every policy with a forwarded
+port.
 
 Two further limits are inherent: the owner is the user that created the socket, so a process of
 sandy's own user that acts for someone else still passes, and a descriptor passed between
@@ -251,11 +272,13 @@ when the program ends. sandy does not replace itself with the program:
 2. sandy forks the guard. The guard creates a process group of its own and closes every
    descriptor except the read end of a pipe. sandy holds the write end; the forked program in
    step 3 has a copy until `execve` closes it, so the pipe ends only once sandy is gone and the
-   program has started or ended.
+   program has started or ended. With exposed or forwarded ports the guard also keeps a pidfd
+   for the relay, the write end of the relay's pipe, and the write end of a pipe back to sandy
+   (step 7 of "Exposed and forwarded ports").
 3. sandy forks the program. Once the program has reported its process ID (step 4), the guard
-   opens a pidfd for it and polls that and the pipe. When the program ends, or when the pipe ends
-   because sandy died (also by `SIGKILL`), the guard checks that it leads its group and kills the
-   group with `SIGKILL`. The group therefore ends with the program even while sandy is stopped.
+   opens a pidfd for it and polls that and the pipe, and the relay's pidfd if there is a relay.
+   When the program ends, when the pipe ends because sandy died (also by `SIGKILL`), or when the
+   relay ends, the guard checks that it leads its group and kills the group with `SIGKILL`. The group therefore ends with the program even while sandy is stopped.
 4. The forked program joins the guard's group and then writes its own process ID into the guard's
    pipe, in that order. The guard therefore learns the ID even if sandy never runs again after
    the fork, for example because it was stopped or killed in that moment, and it never learns it
@@ -514,13 +537,19 @@ write:
 | `fchmod`, `fchown`, `fsetxattr`, `futimens` | change the file |
 | `fstat`, `statx`, `fgetxattr`, `flistxattr` | read its metadata and its extended attributes |
 | `ioctl` on a regular file (`FIONREAD`, `FS_IOC_GETFLAGS`) | works |
+| `FIDEDUPERANGE` on btrfs, with the descriptor as the destination and a file of the program as the source | compares a 4 KiB block of the file with the program's guess: status 0 and the block deduplicated when the guess is right, status 1 when it is wrong; the contents stay the same |
+| `FIDEDUPERANGE` with the descriptor as the source | `EINVAL` |
 | `ioctl` on a device | `EACCES` from ABI 5; reaches the driver on ABI 1 to 4 |
 | `read`, `write`, `flock` | `EBADF` |
 | `ftruncate` | `EINVAL` |
 | `mmap`, `execveat` and `linkat` with `AT_EMPTY_PATH`, reopening through `/proc/self/fd` | `EACCES` |
 
-The descriptor does not reach the contents of the file, but it carries the metadata calls past
-Landlock in both directions, which is also a way around `path_metadata = "deny"`.
+The descriptor cannot read the file, but it still reaches its contents. On a file system that
+deduplicates (btrfs here), the program writes a guess of one 4 KiB block to a file of its own on
+the same file system and asks the kernel to deduplicate it with that block of the file. The
+status says whether the guess was right. That confirms a guessed block, and it finds a block
+with few unknown bytes by trying every value. The descriptor also carries the metadata calls
+past Landlock in both directions, which is also a way around `path_metadata = "deny"`.
 `LANDLOCK_ACCESS_FS_IOCTL_DEV` (ABI 5) covers only the device ioctls. Landlock has no hook for
 the metadata calls on a descriptor at any ABI, ABI 10 included, so no ABI makes access mode 3
 harmless.
@@ -547,7 +576,9 @@ fifth only with `--explain` (see "Diagnostic mode"):
 2. **Denylist.** Rules with argument checks return `EPERM`.
 3. **Extended attribute reads.** With `path_metadata = "deny"`, the reads that take a path
    return `ENOTSUP`.
-4. **Socket families.** `socket` with a family the policy denies returns `EAFNOSUPPORT`.
+4. **Socket families.** `socket` with a family the policy denies returns `EAFNOSUPPORT`. `run`
+   accepts an inherited socket on a standard stream only when this filter would let the program
+   create one like it (see "Refusals").
 
 The kernel applies the stricter result of all of them, and among equal results the one of the
 filter installed last, which is why the family filter comes after the denylist. Programs mostly
@@ -715,7 +746,9 @@ stop its own process group. In the exec model that is the group sandy was starte
 processes outside the sandbox that share it stop as well: the shell that ran sandy without job
 control, for example in a script, and the other commands of its pipeline. They are the job the
 user started, which stops as it would without a sandbox; no other job is reached.
-`a_terminal_read_stops_the_group_sandy_was_started_in` records this.
+`a_terminal_read_stops_the_group_sandy_was_started_in` records this. `sandy check` prints it as
+a warning for every policy with `signals = "isolated"` and without `children = "contained"`,
+which gives the program a process group of its own.
 
 ### Other processes
 
@@ -896,7 +929,7 @@ audit log is the better source and it costs the run nothing.
 | `/dev/null` | read, write | always | Programs redirect output to it. Writes are discarded. No ioctl right. |
 | `/dev/zero`, `/dev/random`, `/dev/urandom` | read | always | Zero and random sources for programs that do not use `getrandom`. |
 | `/sys/devices/system/cpu/online`, `/sys/devices/system/cpu/possible` | read | always | The number of CPUs for glibc, Go and Java. |
-| `/etc/hosts`, `/etc/resolv.conf`, `/etc/nsswitch.conf`, `/etc/host.conf`, `/etc/gai.conf`, `/etc/services`, `/etc/protocols` | read | `ip = "all"` | Name resolution. |
+| `/etc/hosts`, `/etc/resolv.conf`, `/etc/nsswitch.conf`, `/etc/host.conf`, `/etc/gai.conf`, `/etc/services`, `/etc/protocols` | read | `ip = "all"` | Name resolution. When `/etc/resolv.conf` leads into `/run/systemd/resolve`, sandy grants that directory instead of the file (see "Replaced resolver files"). |
 | `/etc/ssl/certs`, `/usr/share/ca-certificates`, `/etc/pki/tls/certs`, `/etc/pki/ca-trust/extracted`, `/etc/ca-certificates/extracted`, `/var/lib/ca-certificates` | read | `ip = "all"` | CA certificates for TLS on Debian, Ubuntu, Fedora, RHEL, Arch and openSUSE. |
 | the loader of the program itself | read, execute | always | The file the program names in its ELF `PT_INTERP` header, with symbolic links resolved, when no other rule covers it. The entries above name the loaders of the FHS layout; this covers a host with another libc, another name, or a layout outside the FHS (NixOS, Guix). |
 
@@ -911,7 +944,8 @@ rule covers.
 
 Left out on purpose:
 
-- `/proc` (see below), `/tmp`, `/dev/shm`, `/run`, `/var`, `/home`.
+- `/proc` (see below), `/tmp`, `/dev/shm`, `/run` (apart from systemd-resolved's directory),
+  `/var`, `/home`.
 - `/dev/tty` and `/dev/pts`: a program whose standard streams are redirected could otherwise open
   the terminal of the user.
 - `/etc/passwd` and `/etc/group`: not needed to start, and they list the accounts of the host.
@@ -923,6 +957,46 @@ Left out on purpose:
 
 Distributions outside the FHS layout (for example NixOS) need the store paths of the program's
 libraries in the policy; only its loader is covered.
+
+### Replaced resolver files
+
+A Landlock rule binds the file that existed when sandy started. When the system later writes a
+new file and renames it over the old one, a running program cannot read the new file. For the
+resolver configuration this ends name resolution: glibc and musl treat an unreadable
+`/etc/resolv.conf` like a missing one and ask the default name server, 127.0.0.1, where nothing
+answers on a host whose resolver listens elsewhere. Measured on Ubuntu 22.04 with
+systemd-resolved, replacing `stub-resolv.conf` by rename in a private mount namespace while a
+program resolved names: musl failed with `EAI_AGAIN` after its 5 second timeout, glibc (Python
+3.10) failed at once, and neither recovered after the file was replaced once more.
+
+systemd-resolved, which `/etc/resolv.conf` leads to on Fedora, Ubuntu and other current
+distributions, writes `stub-resolv.conf` and `resolv.conf` in `/run/systemd/resolve` this way. On
+the Fedora 44 test host, `resolv.conf` had been replaced after a change of the network, while
+`stub-resolv.conf`, whose content had not changed, was still the file from boot. The stub file
+lists the search domains, so it is replaced when they change, for example when a VPN or another
+network brings its own. When `/etc/resolv.conf` leads into this directory, sandy therefore grants
+the directory, read-only, instead of the file. The test is
+`a_resolver_file_replaced_by_rename_stays_readable`. Besides the two resolver files the directory
+holds:
+
+- The resolver's Unix sockets, `io.systemd.Resolve` and `io.systemd.Resolve.Monitor`. A read
+  right does not connect to a socket. With `unix_sockets = "none"` the filter denies `AF_UNIX`
+  sockets, and from ABI 9 Landlock also denies connecting to a socket file; with `"all"` every
+  socket of the user is reachable anyway, these two included.
+- `netif`, the settings of each network link, which only the resolver's own user and root may
+  open (mode 0700). sandy refuses to run as root.
+
+Every other layout keeps the rule on the file, so there a program that runs across such a
+replacement loses name resolution until it restarts:
+
+- A plain file `/etc/resolv.conf`. Its directory is `/etc`.
+- `/run/NetworkManager/resolv.conf`. The directory also holds NetworkManager's state for each
+  device, readable by every user, with DHCP client identifiers derived from hardware addresses.
+- `/run/resolvconf/resolv.conf` (resolvconf) and `/run/netconfig/resolv.conf` (SUSE netconfig).
+  No test host has them, so what else these directories hold has not been checked.
+- `/etc/hosts`, `/etc/nsswitch.conf` and the other files of the row. They lie in `/etc`, or in
+  `/etc/authselect` on Fedora, which also holds the PAM configuration, and they change when an
+  administrator edits them rather than with the network.
 
 ### What the set does not cover
 
@@ -980,36 +1054,55 @@ Java, Node.js) still start.
 Rule 12 of [DESIGN.md](DESIGN.md): a writable policy path may not reach a location of this user
 that other programs read or execute later. Landlock rules are allow-only and apply to a whole
 tree, so a writable home directory cannot leave out the shell startup file in it; refusing the
-policy is the only way to keep what it promises. The locations that are refused are in
-`trust::locations`:
+policy is the only way to keep what it promises. The locations every Unix has are in
+`sandy_core::trust`, the same list as on macOS; those of Linux alone are in `trust::locations`:
 
 | Location | Protected | Why |
 |---|---|---|
 | the home directory | itself | holds the files below; a writable path below it stays allowed |
 | `.bashrc`, `.bash_profile`, `.bash_login`, `.bash_logout`, `.profile`, `.zshenv`, `.zprofile`, `.zshrc`, `.zlogin`, `.zlogout` | the file | every shell of this user reads them at its start |
-| `.pam_environment`, `.xprofile`, `.xinitrc`, `.xsession` | the file | read when a session starts |
+| `.bash_aliases` | the file | Debian's `.bashrc` sources it |
+| `.bashrc.d` | the tree | Fedora's `.bashrc` sources every file in it |
+| `<config>/fish` | the tree | the startup files of the fish shell |
+| `.gitconfig`, `<config>/git` | the file, the tree | `core.fsmonitor`, `core.sshCommand`, `core.pager` and `!` aliases run commands at the next git command |
+| `.cargo/config.toml`, `.cargo/config`, and both in `CARGO_HOME` | the file | `build.rustc`, `build.rustc-wrapper` and target runners name programs that the next cargo command runs |
 | `.ssh` | the tree | `ProxyCommand` and `LocalCommand` in the configuration run programs, and `authorized_keys` admits logins |
 | `.gnupg` | the tree | `pinentry-program` and `photo-viewer` name programs that gpg runs |
-| `<config>/autostart` | the tree | desktop entries that run at the next login |
-| `<config>/systemd`, `<data>/systemd` | the tree | systemd user units, which the program can enable with a link of its own |
-| `<config>/environment.d` | the tree | variables for every program of the session |
-| `<config>/fish` | the tree | the startup files of the fish shell |
-| `<data>/applications` | the tree | desktop entries that say which program opens a file |
+| `.pam_environment`, `.xprofile`, `.xinitrc`, `.xsession`, `.xsessionrc` | the file | read when a session starts (Linux) |
+| `<config>/autostart` | the tree | desktop entries that run at the next login (Linux) |
+| `<config>/systemd`, `<data>/systemd` | the tree | systemd user units, which the program can enable with a link of its own (Linux) |
+| `<config>/environment.d` | the tree | variables for every program of the session (Linux) |
+| `<config>/plasma-workspace/env`, `<config>/plasma-workspace/shutdown` | the tree | KDE Plasma sources the scripts in `env` at login and runs those in `shutdown` at logout (Linux) |
+| `<config>/autostart-scripts` | the tree | KDE Plasma runs the scripts in it at login (Linux) |
+| `<data>/applications` | the tree | desktop entries that say which program opens a file (Linux) |
 
 `<config>` is `XDG_CONFIG_HOME` and `~/.config`, `<data>` is `XDG_DATA_HOME` and
 `~/.local/share`; both spellings count, because the variables are not set for every program that
-starts sandy. The home directory comes from the password database (`getpwuid_r`) and from
-`HOME`, for the same reason; when neither names one, none of these locations is checked. A
+starts sandy, and the same holds for `CARGO_HOME` and `~/.cargo`. So `--read-write ~/.cargo` is
+refused; a program that downloads crates needs `~/.cargo/registry` and `~/.cargo/git`. A
 location that does not exist counts, because the program could create it, and each counts where
 it lies and where its symbolic links lead.
 
-Every absolute directory on sandy's `PATH` (`trust::path_locations`) is such a location too,
-and rule 12 warns about it instead of refusing it, because a writable path that holds one is
-ordinary work: `--read-write ~/.cargo` with `~/.cargo/bin` on `PATH`, or `--read-write
-/usr/local`. `sandy check` exits 0 and prints a `warning:` line on standard error that names
-the writable path and the directory (`plan::notes`). A directory below one of them is on no
-`PATH` and says nothing, and a writable path that reaches a refused location as well stays
-refused.
+The home directory comes from the password database (`getpwuid_r`) and from `HOME`, for the
+same reason. When neither names one, sandy cannot tell whether a writable path reaches these
+locations, so it refuses a policy with a writable path, as it does when it cannot read the mount
+table; a policy without one is not affected. This happens with the static release build, which
+reads only `/etc/passwd`, for a user that only SSSD, LDAP or systemd-homed knows, started
+without `HOME`. The message says to start sandy with `HOME` set to the home directory.
+
+Every absolute directory on sandy's `PATH` is such a location too, and so are the directories
+the usual shell setups put on the user's `PATH`, whether or not sandy's own `PATH` holds them:
+`~/.local/bin`, `~/bin`, `bin` in `CARGO_HOME` and in `~/.cargo`, `/usr/local/bin` and
+`/usr/local/sbin` (`trust::path_locations`). A service or a desktop application that
+starts sandy passes a shorter `PATH` than the user's shell has, and the escape works through the
+shell's. Rule 12 warns about these directories instead of refusing them, because a writable path
+that holds one is ordinary work: `--read-write ~/tools` with `~/tools/bin` on `PATH`, or
+`--read-write /usr/local`. `sandy check` exits 0 and prints a `warning:` line on standard error
+that names the writable path and the directory (`plan::notes`). What removes the risk is a
+policy that keeps the directory out of every writable path, by granting only the subdirectories
+the program needs; starting sandy with another `PATH` silences the warning for a directory that
+is not one of the usual ones, and leaves the risk. A directory below one of them is on no `PATH`
+and says nothing, and a writable path that reaches a refused location as well stays refused.
 
 The list is a heuristic and can never be complete: no list knows which files the programs of
 this user trust. It also does not see a hard link that already gives one of these files a second
@@ -1076,6 +1169,9 @@ path rules is refused before that, with exit code 125 and the paths it compared.
 - A writable policy path that overlaps a trusted user location, whatever the system access:
   FilesystemConfined is unavailable. The locations are in "Trusted user locations" above; a
   directory on `PATH` warns there instead.
+- A writable policy path while neither `HOME` nor the password database names the home
+  directory: FilesystemConfined is unavailable, because sandy cannot check the locations below
+  it. Setting `HOME` fixes it.
 - `children = "contained"` while sandy itself runs in a sandbox that denies `setpgid`:
   ChildProcessesContained is unavailable. The program runs in a process group of its own, and
   sandy's own filter denies `setpgid` inside `contained`, so one contained sandbox cannot hold
@@ -1100,17 +1196,31 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   ForwardedPortsRelayed is unavailable. `sandy check` binds the same addresses for a moment and
   releases them again, so it reports what `run` refuses. The answer can be stale one moment
   later; `run` binds for real and stays the authoritative answer.
-- A standard stream that carries a socket the policy denies: `sandy run` refuses with exit code
-  125 and names the stream and the socket. Such a socket was created before the sandbox, so
-  neither Landlock nor the filter takes its access away: an unconnected UDP socket on standard
-  input delivered a datagram to a listener outside under `ip = "none"`, and a listening TCP
-  socket on standard input took a connection from outside with `unix_sockets = "all"`, which
-  leaves `accept` allowed (both measured on Linux 7.2). Refused are an IP socket or one of
-  another family with `ip = "none"`, and an unconnected, datagram or listening Unix socket with
-  `unix_sockets = "none"`; a connected Unix stream or seqpacket socket is accepted, because it
-  reaches only the peer it already has. `sandy check` cannot report this: the streams it is
-  given are not the streams of the later `run`. The test is
-  `a_socket_on_standard_input_gives_no_network_access`.
+- A standard stream that carries a socket the policy denies: `sandy run` refuses with exit code 125
+  and names the stream and the socket. Such a socket was created before the sandbox, so neither
+  Landlock nor the filter takes its access away: an unconnected UDP socket on standard input
+  delivered a datagram to a listener outside under `ip = "none"`, a listening TCP socket on
+  standard input took a connection from outside with `unix_sockets = "all"`, which leaves `accept`
+  allowed, and a `NETLINK_SOCK_DIAG` socket on standard input listed the TCP sockets of the host
+  under `ip = "all"`, although the program's own `socket` for one fails with `EAFNOSUPPORT` (all
+  measured on Linux 7.2). sandy accepts a socket only when the program could create one like it:
+  the socket family filter allows its family and protocol, and creating it needs no capability,
+  because sandy never starts the program with one. sandy reads the family, the type and the
+  protocol with `SO_DOMAIN`, `SO_TYPE` and `SO_PROTOCOL`. Refused are an IP socket or a route
+  netlink socket with `ip = "none"`, an unconnected, datagram or listening Unix socket with
+  `unix_sockets = "none"`, and under every policy a raw IP socket (`SOCK_RAW`, which needs
+  `CAP_NET_RAW`) and a socket of every other family, a netlink socket of another protocol included.
+  The kernel turns an `AF_INET` socket of the obsolete type `SOCK_PACKET` into an `AF_PACKET`
+  socket, which is refused as another family. An ICMP datagram socket follows `ip` like any IP
+  datagram socket, because the kernel lets an unprivileged program create one within
+  `net.ipv4.ping_group_range`. A connected Unix stream or seqpacket socket is accepted, because it
+  reaches only the peer it already has. `sandy check` cannot report this: the streams it is given
+  are not the streams of the later `run`. The tests are
+  `a_socket_on_standard_input_gives_no_network_access`,
+  `a_socket_of_another_family_on_standard_input_is_refused` (sock_diag netlink, AF_VSOCK and
+  AF_ALG), `route_netlink_on_standard_input_follows_ip` and
+  `a_raw_ip_socket_on_standard_input_is_refused`, which creates the raw socket in a user and
+  network namespace of its own, where it holds `CAP_NET_RAW`, and executes sandy from there.
 
 ## Known limitations
 
@@ -1189,8 +1299,10 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   session bus. Through the systemd user manager on that bus, the program can start commands
   outside the sandbox. Use it only for programs that are trusted with this.
 - **Replaced files.** Landlock rules bind to the inode that existed when sandy started. A file
-  that is later replaced by rename (for example `/etc/resolv.conf` after a network change)
-  becomes unreadable for a running program.
+  that is later replaced by rename becomes unreadable for a running program. For the resolver
+  files of systemd-resolved sandy grants their directory instead; a plain `/etc/resolv.conf`,
+  the other layouts and `/etc/hosts` stay single files, so a long-running program needs a
+  restart after the system replaces one (see "Replaced resolver files").
 - **Hard links made outside.** The link check runs at the start. A process outside the sandbox
   can link a file into a writable path while the program runs, and the program can then change
   that file. The program cannot do it itself: it gets no `refer` right out of its writable paths

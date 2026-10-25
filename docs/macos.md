@@ -104,14 +104,24 @@ too. Chromium starts all its child processes on macOS with the same two calls
 
 Descriptors 0, 1 and 2 keep what they were opened with, because the target reads its input and
 writes its output through them. Before it applies the profile, `run` therefore looks at the three
-streams and refuses with exit code 125, naming the stream and the socket, when one carries a
-socket the policy denies: an IP socket or one of another family with `ip = "none"`, and an
-unconnected, datagram or listening Unix socket with `unix_sockets = "none"`. A connected Unix
-stream socket is accepted, because it reaches only the peer it already has; macOS has no
-AF_UNIX seqpacket socket. macOS also has no `SO_ACCEPTCONN` (`getsockopt` answers ENOPROTOOPT for
-every socket), so the message names a listening socket by what the kernel does tell about it: it
-has no peer. `sandy check` cannot report any of this, because the streams it is given are not the
-streams of the later `run`.
+streams and accepts a socket only when the policy lets the program create one like it. Otherwise it
+refuses with exit code 125, naming the stream and the socket: an IP socket with `ip = "none"`, an
+unconnected, datagram or listening Unix socket with `unix_sockets = "none"`, and a socket of any
+other family under every policy, because the profile allows `system-socket` for AF_UNIX only and
+Seatbelt checks the creation of every family but AF_INET and AF_INET6 (see "Networking"). With
+`ip = "none"` the program can create an IP socket but cannot bind, connect or send with it, so an
+inherited one, which may be connected already, counts as denied. A raw IP socket is refused under
+every policy: only root can create one, and sandy refuses an inherited one also when it runs as
+root, so that a policy means the same on every platform. An ICMP datagram socket, which an ordinary
+user can create (measured), follows `ip`. sandy reads the type with `SO_TYPE` and the family from
+`proc_pidfdinfo` (`PROC_PIDFDSOCKETINFO`), because macOS has no `SO_DOMAIN` and `getsockname` fails
+for some families: `EINVAL` for AF_ROUTE and `EOPNOTSUPP` for AF_SYSTEM (measured on macOS 26.5),
+and both can be created without privileges. A connected Unix stream socket is accepted, because it
+reaches only the peer it already has; macOS has no AF_UNIX seqpacket socket. macOS also has no
+`SO_ACCEPTCONN` (`getsockopt` answers ENOPROTOOPT for every socket), so the message names a
+listening socket by what the kernel does tell about it: it has no peer. `sandy check` cannot report
+any of this, because the streams it is given are not the streams of the later `run`. The test is
+`a_socket_of_another_family_on_standard_input_is_refused` (AF_ROUTE and AF_SYSTEM).
 
 ### Inherited Mach port rights
 
@@ -322,29 +332,47 @@ their arguments and environment.
 ## Trusted user locations
 
 Rule 12 of [DESIGN.md](DESIGN.md): a writable policy path may not reach a location of this user
-that other programs read or execute later. The locations that are refused are in
-`trust::locations`:
+that other programs read or execute later. The locations every Unix has are in
+`sandy_core::trust`, the same list as on Linux; those of macOS alone are in `trust::locations`:
 
 | Location | Protected | Why |
 |---|---|---|
 | the home directory | itself | holds the locations below; a writable path below it stays allowed |
-| `Library/LaunchAgents` | the tree | launchd starts the agents of this user at the next login |
-| `.zshenv`, `.zprofile`, `.zshrc`, `.zlogin`, `.zlogout`, `.bashrc`, `.bash_profile`, `.profile` | the file | zsh is the login shell of macOS, and bash is installed |
+| `Library/LaunchAgents` | the tree | launchd starts the agents of this user at the next login (macOS) |
+| `.zshenv`, `.zprofile`, `.zshrc`, `.zlogin`, `.zlogout`, `.bashrc`, `.bash_profile`, `.bash_login`, `.bash_logout`, `.profile` | the file | zsh is the login shell of macOS, bash is installed, and Terminal.app starts login shells |
+| `.bash_aliases`, `.bashrc.d` | the file, the tree | the usual `.bashrc` files of Debian and Fedora source them |
+| `<config>/fish` | the tree | the startup files of the fish shell |
+| `.gitconfig`, `<config>/git` | the file, the tree | `core.fsmonitor`, `core.sshCommand`, `core.pager` and `!` aliases run commands at the next git command |
+| `.cargo/config.toml`, `.cargo/config`, and both in `CARGO_HOME` | the file | `build.rustc`, `build.rustc-wrapper` and target runners name programs that the next cargo command runs |
 | `.ssh` | the tree | `ProxyCommand` and `LocalCommand` in the configuration run programs, and `authorized_keys` admits logins |
-| `.gnupg` | the tree | `pinentry-program` names a program that gpg runs |
+| `.gnupg` | the tree | `pinentry-program` and `photo-viewer` name programs that gpg runs |
+
+`<config>` is `XDG_CONFIG_HOME` and `~/.config`, so `--read-write ~/.config` is refused, as on
+Linux. cargo's files count in `CARGO_HOME` and in `~/.cargo`, so `--read-write ~/.cargo` is
+refused; a program that downloads crates needs `~/.cargo/registry` and `~/.cargo/git`. A
+location that does not exist counts, because the program could create it, and each counts where
+it lies and where its symbolic links lead.
 
 The home directory comes from the password database (`getpwuid_r`) and from `HOME`, because a
-program that starts sandy with a minimal environment sets no `HOME`; when neither names one,
-none of these locations is checked. A location that does not exist counts, because the
-program could create it, and each counts where it lies and where its symbolic links lead.
+program that starts sandy with a minimal environment sets no `HOME`. When neither names one,
+sandy cannot tell whether a writable path reaches these locations, so it refuses a policy with a
+writable path (FilesystemConfined is unavailable) and says to start sandy with `HOME` set to the
+home directory; a policy without a writable path is not affected.
 
-Every absolute directory on sandy's `PATH` (`trust::path_locations`) is such a location too,
-and rule 12 warns about it instead of refusing it, because a writable path that holds one is
-ordinary work: `--read-write ~/.cargo` with `~/.cargo/bin` on `PATH`, or `--read-write
-/usr/local`. `sandy check` exits 0 and prints a `warning:` line on standard error that names
-the writable path and the directory (`plan::notes`). A directory below one of them is on no
-`PATH` and says nothing, and a writable path that reaches a refused location as well stays
-refused.
+Every absolute directory on sandy's `PATH` is such a location too, and so are the directories the
+usual shell setups put on the user's `PATH`, whether or not sandy's own `PATH` holds them:
+`~/.local/bin`, `~/bin`, `bin` in `CARGO_HOME` and in `~/.cargo`, `/usr/local/bin` and
+`/usr/local/sbin`, and on macOS Homebrew's `/opt/homebrew/bin` and `/opt/homebrew/sbin`, which
+belong to the user who installed it (`trust::path_locations`). A service or a desktop application
+that starts sandy passes a shorter `PATH` than the user's shell has, and the escape works through
+the shell's. Rule 12 warns about these directories instead of refusing them, because a writable path
+that holds one is ordinary work: `--read-write ~/tools` with `~/tools/bin` on `PATH`, or
+`--read-write /usr/local`. `sandy check` exits 0 and prints a `warning:` line on standard error that
+names the writable path and the directory (`plan::notes`). What removes the risk is a policy that
+keeps the directory out of every writable path, by granting only the subdirectories the program
+needs; starting sandy with another `PATH` silences the warning for a directory that is not one of
+the usual ones, and leaves the risk. A directory below one of them is on no `PATH` and says nothing,
+and a writable path that reaches a refused location as well stays refused.
 
 The profile could deny these paths inside a writable path instead of refusing the policy,
 because a later deny rule overrides an earlier allow. sandy refuses, so that one policy means
@@ -437,7 +465,8 @@ The relay is a process of its own, outside the program's sandbox and confined by
    `FIONBIO` and `FIOASYNC` ioctls, and the same closing denials as the program's profile. It
    needs no file at all, because it keeps running the code sandy already loaded and executes
    nothing.
-6. Only then does it report over the readiness pipe that it is ready, or why it did not start.
+6. Only then does it report over the readiness pipe that it is ready, with its process ID, or
+   why it did not start.
    sandy waits for the report (10 seconds at most) and refuses to start the program without a
    ready report. sandy closes its own copies of the listeners before the exec, and
    `POSIX_SPAWN_CLOEXEC_DEFAULT` would close them anyway.
@@ -463,14 +492,16 @@ program alone, and the relay reaches `to` as sandy's user, so a connection of an
 pass an owner rule of a packet filter or a peer credential check in that service. On Linux the
 relay asks the kernel who owns the other end and refuses the rest; macOS has no equivalent of
 `SO_PEERCRED` for TCP and no checked way to read the owner of another socket, so it serves every
-local user. Forward only to services that authenticate their clients.
+local user. Forward only to services that authenticate their clients. `sandy check` prints this
+as a warning for every policy with a forwarded port.
 
 With the default `signals = "any"` the program can also stop the relay with `SIGSTOP`, which no
 process can block. A stopped relay keeps its listen ports bound until someone continues or kills
 it, so it can outlive the program by more than the one second of rule 5, without any bound at
 all. macOS has no timer that kills a process that is not running (the Linux relay uses one), so
 only `signals = "isolated"`, which keeps the program from signalling the relay at all, holds
-that bound here.
+that bound here. `sandy check` warns about it for every policy with exposed or forwarded ports
+and `signals = "any"`.
 
 A continued relay serves what its listeners collected while it was stopped. The kqueue reports
 a listener once when it becomes ready, and the relay then accepts its whole backlog, so when
@@ -483,8 +514,9 @@ stop the same can happen to a connection that arrives in the moment between the 
 and the relay's accept. What it costs is a violation of the relay's lifetime, not an escape: a
 forwarded port serves one more connection after the operator believes the run ended, and an
 exposed port can answer once more, served by whatever now holds the program's address.
-`process.children = "contained"` does not close it here as it does on Linux, where sandy ends
-the program's group when the relay is gone.
+With `process.children = "contained"` the program cannot stop its relay, because `contained`
+requires `signals = "isolated"`, and sandy ends the program when the relay is gone (see
+[Contained child processes](#contained-child-processes)).
 
 ## Signals the profile does not cover
 
@@ -530,6 +562,9 @@ without that check, because the kernel sends those signals itself:
   allowed only with 0 as its second argument, so a program may lead a group of its own but not
   join one.
 
+`sandy check` prints both routes as warnings for a policy with `signals = "isolated"`: SIGIO
+always, SIGURG with `ip = "all"`, and the job control route without `children = "contained"`.
+
 ## Contained child processes
 
 `process.children = "contained"` ends every process the target starts when the target ends, also
@@ -550,13 +585,15 @@ when sandy itself is killed. sandy then stays the target's parent instead of rep
 2. It forks the guard. The guard starts a process group of its own (it is in neither sandy's job
    nor the target's group) and forks the anchor, which starts the target's process group and only
    waits to be killed. The guard keeps two pipes to and from sandy and, with exposed or
-   forwarded ports, the write end of the relay's pipe; the anchor keeps no descriptor.
+   forwarded ports, the write end of the relay's pipe and the relay's process ID; the anchor
+   keeps no descriptor.
 3. sandy learns the group's ID (the anchor's process ID) from the guard and forks the target into
    that group. Once the target has reported its process ID (step 4), the guard registers the
-   target's `NOTE_EXIT` and the pipe from sandy in a kqueue. When either reports, that is when
-   the target ends or sandy is done or gone (also killed by SIGKILL), the guard kills the group
-   until no live process is left in it, closes the relay's pipe, waits until sandy is done or
-   gone, reaps the anchor and ends.
+   target's `NOTE_EXIT` and the pipe from sandy in a kqueue, and with exposed or forwarded ports
+   also the relay's `NOTE_EXIT`. When one reports, that is when the target ends, sandy is done or
+   gone (also killed by SIGKILL), or the relay ends, the guard kills the group until no live
+   process is left in it, closes the relay's pipe, waits until sandy is done or gone, reaps the
+   anchor and ends.
 4. The forked target joins the group and then writes its own process ID into the pipe to the
    guard, in that order. The guard therefore learns the ID even if sandy never runs again after
    the fork, for example because it was stopped or killed in that moment, and it never learns it
@@ -571,6 +608,17 @@ when sandy itself is killed. sandy then stays the target's parent instead of rep
 6. When the target exits, sandy kills the group until no live process is left in it, closes its
    pipe to the guard, reaps the guard and the target, and exits with the target's exit status, or
    128 plus the signal number.
+7. When the relay ends while the target runs, the guard tells sandy so over its pipe before it
+   kills the group. sandy then exits with status 125 and the reason on standard error, and
+   `--status-fd` records `failed` instead of `exited` or `signaled`. A dead forward relay frees
+   the target's forward port, and any local user can then bind it and receive what the target
+   sends there for `to`: its requests, credentials and data. Ending the target closes that, as on
+   Linux. When the relay's end is the only event, the guard looks at the target and the pipe
+   from sandy once more without waiting, so a relay that ended together with the target is the
+   normal end of a run and not a failure. In a normal run the relay cannot end first: it ends
+   when sandy ends or when the guard closes the relay's pipe, and both happen only after the
+   guard has seen the target end. A relay that has already ended when the guard registers it
+   counts as ended.
 
 The caller sees sandy's process ID and that exit status, not the target's ID and not how it
 really ended. `--status-fd` reports both without changing any exit status: sandy writes `pid N`
@@ -598,6 +646,7 @@ Programs that start processes with `posix_spawn` therefore get `EPERM`: Rust's
 `std::process::Command` (it falls back to `fork` only when `pre_exec` is set), Java's
 `ProcessBuilder`, Node.js (libuv) and `system()` and `popen()` of libSystem. Programs that use
 `fork` and `exec`, such as shells, work. The target's own start uses `execve` for the same reason.
+`sandy check` warns about this for every policy with `children = "contained"`.
 
 Other ways to find the target's processes again were tested and rejected: macOS has no child
 subreaper, so a process whose parent ends is adopted by launchd; `sandbox_check` on another
@@ -620,7 +669,10 @@ guard and the anchor are forks of one process and all carry sandy's command line
 the group.
 
 The relay of exposed and forwarded ports watches sandy's process ID, which is the supervising
-sandy here, so it ends after the group (rule 5 of "Forwarded ports" in `DESIGN.md`).
+sandy here, so it ends after the group (rule 5 of "Forwarded ports" in `DESIGN.md`). The guard
+watches the relay in turn (step 7). Without `contained` nothing watches the relay: when something
+outside the sandbox kills it, the target keeps running and its forward port is free for others
+to bind.
 
 ## Ending with the parent
 

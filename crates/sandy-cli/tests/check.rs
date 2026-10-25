@@ -65,6 +65,8 @@ fn check_warns_about_settings_that_give_up_isolation() {
     }
 
     // Control: a policy that keeps the isolation, and a home directory outside the writable path.
+    // It still gets the warnings of what this platform gives only in part (the tests below), so
+    // the control looks for the warnings above.
     let output = check_with_home(
         &fixture.path("ro"),
         &[
@@ -75,7 +77,14 @@ fn check_warns_about_settings_that_give_up_isolation() {
         ],
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!stderr.contains(WARNING), "{stderr}");
+    for named in [
+        "unix_sockets",
+        "signals = \"any\"",
+        "path_metadata",
+        "holds the home directory",
+    ] {
+        assert!(!warns(&stderr, named), "{stderr}");
+    }
 }
 
 /// A writable path that holds the home directory lets the program change shell startup files
@@ -110,6 +119,59 @@ fn check_refuses_a_writable_path_that_holds_the_home_directory() {
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );
+}
+
+/// cargo's configuration names programs that the next cargo command runs outside the sandbox
+/// (`build.rustc-wrapper`), so a writable path that reaches it is refused, in `.cargo` of the
+/// home directory and in `CARGO_HOME` (README rule 8). The registry beside it stays writable.
+#[test]
+fn check_refuses_a_writable_path_over_the_cargo_configuration() {
+    let fixture = Fixture::new("check-cargo");
+    for directory in ["home/.cargo/registry", "cargo/registry"] {
+        fs::create_dir_all(fixture.path(directory)).unwrap();
+    }
+    for file in [
+        "home/.cargo/config.toml",
+        "home/.cargo/config",
+        "cargo/config.toml",
+    ] {
+        fs::write(fixture.path(file), b"").unwrap();
+    }
+    let check = |writable: &str| {
+        let mut all = vec!["check".to_string()];
+        all.extend(platform_args());
+        all.extend(["--read-write".to_string(), fixture.arg(writable)]);
+        Command::new(sandy_path())
+            .args(&all)
+            .env(HOME, fixture.path("home"))
+            .env("CARGO_HOME", fixture.path("cargo"))
+            .output()
+            .unwrap()
+    };
+    let cases = [
+        ("home/.cargo", "home/.cargo/registry"),
+        ("home/.cargo/config.toml", "home/.cargo/registry"),
+        ("home/.cargo/config", "home/.cargo/registry"),
+        ("cargo", "cargo/registry"),
+        ("cargo/config.toml", "cargo/registry"),
+    ];
+    for (location, beside) in cases {
+        let refused = check(location);
+        let stdout = String::from_utf8_lossy(&refused.stdout);
+        assert_eq!(
+            refused.status.code(),
+            Some(NOT_ENFORCEABLE),
+            "{location}: {stdout}"
+        );
+        assert!(stdout.contains("runs outside the sandbox"), "{stdout}");
+
+        let allowed = check(beside);
+        assert!(
+            allowed.status.success(),
+            "{beside}: {}",
+            String::from_utf8_lossy(&allowed.stdout)
+        );
+    }
 }
 
 /// A command line option replaces the value of the policy file, also with a weaker one. The
@@ -158,6 +220,187 @@ fn check_warns_when_an_option_weakens_the_policy_file() {
     // An option that keeps or raises the restriction says nothing.
     let stderr = with(&["--children", "none", "--unix-sockets", "none"]);
     assert!(!stderr.contains("replaces"), "{stderr}");
+}
+
+/// Runs `sandy check` with `args` and returns its standard error.
+fn check_warnings(args: &[&str]) -> String {
+    let mut all = vec!["check".to_string()];
+    all.extend(platform_args());
+    all.extend(args.iter().map(|arg| arg.to_string()));
+    String::from_utf8_lossy(&sandy(&all).stderr).into_owned()
+}
+
+/// Whether a warning line of `stderr` names `text`.
+fn warns(stderr: &str, text: &str) -> bool {
+    stderr
+        .lines()
+        .any(|line| line.starts_with(WARNING) && line.contains(text))
+}
+
+/// A loopback address with a port that nothing listens on, for the relays that check binds.
+#[cfg(unix)]
+fn free_address() -> String {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .to_string()
+}
+
+/// `--forward` options for a free program port. `to` is held by a listener of its own, so the
+/// two ports differ; the relay connects to it only when the program does.
+#[cfg(unix)]
+fn forward_args(to: &TcpListener) -> [String; 4] {
+    let port = free_address().rsplit_once(':').unwrap().1.to_string();
+    [
+        "--ip".to_string(),
+        "all".to_string(),
+        "--forward".to_string(),
+        format!("{port}={}", to.local_addr().unwrap()),
+    ]
+}
+
+/// In the exec model the program runs in the process group sandy was started in, and the kernel
+/// stops that whole group when the program reads the terminal from the background
+/// (docs/linux.md, "Signals and the terminal"). check says so for isolated signals, and not
+/// where the program has a group of its own or may signal every process anyway.
+#[cfg(target_os = "linux")]
+#[test]
+fn check_warns_that_a_terminal_read_stops_the_group_sandy_was_started_in() {
+    let gap = "the group sandy was started in";
+    let stderr = check_warnings(&["--signals", "isolated"]);
+    assert!(warns(&stderr, gap), "{stderr}");
+
+    let stderr = check_warnings(&["--signals", "isolated", "--children", "contained"]);
+    assert!(!warns(&stderr, gap), "{stderr}");
+    let stderr = check_warnings(&["--signals", "any"]);
+    assert!(!warns(&stderr, gap), "{stderr}");
+}
+
+/// The relay of a forwarded port serves a connection whose owner the kernel no longer knows,
+/// which lets another user deliver a write (docs/linux.md, "Exposed and forwarded ports").
+#[cfg(target_os = "linux")]
+#[test]
+fn check_warns_that_a_forwarded_port_takes_a_write_of_another_user() {
+    let gap = "another local user can deliver a write";
+    let to = TcpListener::bind("127.0.0.1:0").unwrap();
+    let forward = forward_args(&to);
+    let stderr = check_warnings(&forward.each_ref().map(String::as_str));
+    assert!(warns(&stderr, gap), "{stderr}");
+
+    // Control: an exposed port is meant for other users.
+    let expose = format!("{}=8080", free_address());
+    let stderr = check_warnings(&["--ip", "all", "--expose", &expose]);
+    assert!(!warns(&stderr, gap), "{stderr}");
+}
+
+/// The kernel sends SIGIO, and SIGURG for urgent TCP data, to the owner of a socket or a pipe
+/// without the check that isolated signals are (docs/macos.md, "Signals the profile does not
+/// cover"). SIGURG needs TCP, so check names it only with IP networking.
+#[cfg(target_os = "macos")]
+#[test]
+fn check_warns_that_isolated_signals_leave_sigio_open() {
+    let stderr = check_warnings(&["--signals", "isolated"]);
+    assert!(warns(&stderr, "send SIGIO to a process"), "{stderr}");
+    let stderr = check_warnings(&["--signals", "isolated", "--ip", "all"]);
+    assert!(warns(&stderr, "send SIGIO and SIGURG"), "{stderr}");
+
+    let stderr = check_warnings(&["--signals", "any", "--ip", "all"]);
+    assert!(!warns(&stderr, "SIGIO"), "{stderr}");
+}
+
+/// A program with isolated signals can join another job of its terminal session and have the
+/// kernel stop it; `children = "contained"` denies the move (docs/macos.md, "Signals the
+/// profile does not cover").
+#[cfg(target_os = "macos")]
+#[test]
+fn check_warns_that_isolated_signals_leave_job_control_open() {
+    let gap = "another job of its terminal session";
+    let stderr = check_warnings(&["--signals", "isolated"]);
+    assert!(warns(&stderr, gap), "{stderr}");
+
+    let stderr = check_warnings(&["--signals", "isolated", "--children", "contained"]);
+    assert!(!warns(&stderr, gap), "{stderr}");
+    let stderr = check_warnings(&["--signals", "any"]);
+    assert!(!warns(&stderr, gap), "{stderr}");
+}
+
+/// `children = "contained"` denies `posix_spawn`, which many runtimes start processes with
+/// (docs/macos.md, "Contained child processes").
+#[cfg(target_os = "macos")]
+#[test]
+fn check_warns_that_contained_children_cannot_use_posix_spawn() {
+    let gap = "denies posix_spawn";
+    let stderr = check_warnings(&["--signals", "isolated", "--children", "contained"]);
+    assert!(warns(&stderr, gap), "{stderr}");
+
+    let stderr = check_warnings(&["--signals", "isolated", "--children", "none"]);
+    assert!(!warns(&stderr, gap), "{stderr}");
+}
+
+/// macOS cannot tell the relay who is at the other end of a connection, so a forwarded port
+/// serves every local user (docs/macos.md, "Who may connect, and who may stop the relay").
+#[cfg(target_os = "macos")]
+#[test]
+fn check_warns_that_a_forwarded_port_serves_every_user() {
+    let gap = "serves every local user";
+    let to = TcpListener::bind("127.0.0.1:0").unwrap();
+    let forward = forward_args(&to);
+    let stderr = check_warnings(&forward.each_ref().map(String::as_str));
+    assert!(warns(&stderr, gap), "{stderr}");
+
+    // Control: an exposed port is meant for other users.
+    let expose = format!("{}=8080", free_address());
+    let stderr = check_warnings(&["--ip", "all", "--expose", &expose]);
+    assert!(!warns(&stderr, gap), "{stderr}");
+}
+
+/// With `signals = "any"` the program can stop its relay, and nothing on macOS ends a stopped
+/// relay (docs/macos.md, "Who may connect, and who may stop the relay").
+#[cfg(target_os = "macos")]
+#[test]
+fn check_warns_that_a_stopped_relay_has_no_time_limit() {
+    let gap = "outlive the program without limit";
+    let expose = format!("{}=8080", free_address());
+    let stderr = check_warnings(&["--ip", "all", "--expose", &expose]);
+    assert!(warns(&stderr, gap), "{stderr}");
+    let to = TcpListener::bind("127.0.0.1:0").unwrap();
+    let forward = forward_args(&to);
+    let stderr = check_warnings(&forward.each_ref().map(String::as_str));
+    assert!(warns(&stderr, gap), "{stderr}");
+
+    let stderr = check_warnings(&["--ip", "all", "--expose", &expose, "--signals", "isolated"]);
+    assert!(!warns(&stderr, gap), "{stderr}");
+    let stderr = check_warnings(&["--ip", "all"]);
+    assert!(!warns(&stderr, gap), "{stderr}");
+}
+
+/// Windows compares the paths of rules 3, 4, 6 and 12 by their spelling only, which matters
+/// once the policy has a writable path (docs/windows.md, "Links and identity").
+#[cfg(windows)]
+#[test]
+fn check_warns_that_paths_are_compared_by_spelling() {
+    let fixture = Fixture::new("check-spelling");
+    let gap = "compare paths only by their spelling";
+    let stderr = check_warnings(&["--read-write", &fixture.arg("rw")]);
+    assert!(warns(&stderr, gap), "{stderr}");
+
+    let stderr = check_warnings(&["--read", &fixture.arg("ro")]);
+    assert!(!warns(&stderr, gap), "{stderr}");
+}
+
+/// A file moved out of a granted directory keeps the grant it inherited there
+/// (docs/windows.md, "Links and identity"). A grant of a single file has no such children.
+#[cfg(windows)]
+#[test]
+fn check_warns_that_a_grant_follows_a_moved_file() {
+    let fixture = Fixture::new("check-moved");
+    let gap = "follows the file, not the path";
+    let stderr = check_warnings(&["--read", &fixture.arg("ro")]);
+    assert!(warns(&stderr, gap), "{stderr}");
+
+    let stderr = check_warnings(&["--read", &fixture.arg("ro/file")]);
+    assert!(!warns(&stderr, gap), "{stderr}");
 }
 
 /// `run` binds the listeners of exposed and forwarded ports outside the sandbox, so a port that

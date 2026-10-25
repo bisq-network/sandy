@@ -19,6 +19,7 @@ mod system;
 mod trust;
 mod watch;
 
+use sandy_core::streams::CreatableSocket;
 use sandy_core::{Backend, PlanItem, ResolvedPolicy, SandboxError, StatusReport, TargetCommand};
 
 use host::HostCapabilities;
@@ -37,6 +38,10 @@ impl Backend for LinuxBackend {
 
     fn notes(&self, policy: &ResolvedPolicy) -> Vec<String> {
         plan::notes(policy, &HostCapabilities::detect_for(policy))
+    }
+
+    fn ip_also_allows(&self) -> &'static [CreatableSocket] {
+        filter::IP_ALSO_ALLOWS
     }
 
     fn can_explain(&self) -> bool {

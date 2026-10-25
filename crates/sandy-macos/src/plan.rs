@@ -1,11 +1,11 @@
-//! The enforcement plan for a host with known capabilities. Pure except for the trusted user
-//! locations it reads from the host (`trust`), so it runs and is tested on every platform.
+//! The enforcement plan for a host with known capabilities. Pure, so it runs and is tested on
+//! every platform.
 
 use std::path::Path;
 
 use sandy_core::{
     ChildProcesses, NetworkAccess, PathAccess, PathIdentity, PlanItem, ProtectedPath, Requirement,
-    ResolvedPolicy, SystemAccess,
+    ResolvedPolicy, SignalScope, SystemAccess,
 };
 
 use crate::system::{self, SystemAccess as Grant};
@@ -28,6 +28,9 @@ pub struct HostCapabilities {
     /// Why the kernel could not execute the program, if it could not: it is a script whose
     /// interpreter no `read_exec` path covers (`executable_paths`).
     pub interpreter: Option<String>,
+    /// The locations of this user that programs outside the sandbox read or execute later
+    /// (`trust::locations`), or why sandy cannot name them: no source names the home directory.
+    pub trusted_locations: Result<Vec<ProtectedPath>, String>,
 }
 
 /// How many `#!` lines sandy follows when it checks whether the program can be executed. XNU
@@ -68,7 +71,7 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<PlanIte
         (Ok(()), false, None, Ok(())) => Ok(()),
     };
     let conflict = system_conflict(policy)
-        .or_else(|| trust_conflict(policy, &trust::locations()))
+        .or_else(|| trust_conflict(policy, &host.trusted_locations))
         .or_else(|| host.interpreter.clone());
     policy
         .requirements()
@@ -136,7 +139,21 @@ fn system_conflict(policy: &ResolvedPolicy) -> Option<String> {
 /// The locations of this user that programs outside the sandbox read or execute later (see
 /// `trust`). They are no policy paths, so rules 3 and 4 do not cover them. Unlike the system set
 /// this applies with `system = "none"` as well: the locations belong to the user, not to the set.
-fn trust_conflict(policy: &ResolvedPolicy, trusted: &[ProtectedPath]) -> Option<String> {
+///
+/// When no source names the home directory, sandy cannot tell whether a writable path reaches
+/// the locations below it, so a policy with a writable path is refused. A policy without one
+/// reaches no location.
+fn trust_conflict(
+    policy: &ResolvedPolicy,
+    trusted: &Result<Vec<ProtectedPath>, String>,
+) -> Option<String> {
+    let trusted = match trusted {
+        Ok(trusted) => trusted,
+        Err(reason) => {
+            let writable = |rule: &sandy_core::PathRule| rule.access == PathAccess::ReadWrite;
+            return policy.paths.iter().any(writable).then(|| reason.clone());
+        }
+    };
     let identity = match PathIdentity::read() {
         Ok(identity) => identity,
         Err(error) => return Some(error.to_string()),
@@ -151,10 +168,80 @@ fn trust_conflict(policy: &ResolvedPolicy, trusted: &[ProtectedPath]) -> Option<
 }
 
 /// What makes the program behave differently inside the sandbox than outside, beyond the
-/// requirements: a directory on sandy's PATH inside a writable path (rule 12). `sandy check`
-/// prints these as warnings; they change nothing sandy enforces.
+/// requirements: a directory on sandy's PATH inside a writable path (rule 12). Before it come
+/// the `shortfalls` of the policy. `sandy check` prints these as warnings; they change nothing
+/// sandy enforces.
 pub fn notes(policy: &ResolvedPolicy) -> Vec<String> {
-    policy.path_directory_notes(&trust::path_locations())
+    let mut notes = shortfalls(policy);
+    notes.extend(policy.path_directory_notes(&trust::path_locations()));
+    notes
+}
+
+/// What the policy asks for and macOS gives only in part, although the plan reports it as
+/// enforced (DESIGN.md, "Requirements and the enforcement plan"), each with the section of
+/// docs/macos.md that explains it.
+fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
+    let mut shortfalls = Vec::new();
+    let contained = policy.children == ChildProcesses::Contained;
+    if policy.signals == SignalScope::Isolated {
+        // SIGURG needs urgent data on a TCP socket, which only IP networking gives.
+        let signals = if policy.ip == NetworkAccess::All {
+            "SIGIO and SIGURG"
+        } else {
+            "SIGIO"
+        };
+        shortfalls.push(format!(
+            "signals = \"isolated\" is enforced only in part on macOS: the program can still \
+             have the kernel send {signals} to a process outside the sandbox, by making that \
+             process the owner of a socket or a pipe with an ioctl (FIOSETOWN, SIOCSPGRP, \
+             TIOCSPGRP) that no profile rule reaches; a process that does not handle the signal \
+             discards it (docs/macos.md, \"Signals the profile does not cover\")"
+        ));
+        if !contained {
+            shortfalls.push(
+                "signals = \"isolated\" is enforced only in part on macOS: the program can join \
+                 the process group of another job of its terminal session (setpgid, or \
+                 posix_spawn with POSIX_SPAWN_SETPGROUP) and have the kernel stop that job by \
+                 reading from the terminal; children = \"contained\" closes this (docs/macos.md, \
+                 \"Signals the profile does not cover\")"
+                    .to_string(),
+            );
+        }
+    }
+    if contained {
+        shortfalls.push(
+            "children = \"contained\" denies posix_spawn on macOS, because its flags can move a \
+             new process out of the program's process group where no profile rule sees them: \
+             programs that start processes with it get EPERM, among them Rust's \
+             std::process::Command without pre_exec, Java's ProcessBuilder, Node.js and other \
+             libuv programs, and system() and popen(); fork and exec keep working \
+             (docs/macos.md, \"Contained child processes\")"
+                .to_string(),
+        );
+    }
+    if !policy.forward.is_empty() {
+        shortfalls.push(
+            "a forwarded port serves every local user on macOS: macOS cannot tell the relay \
+             which user holds the other end of a TCP connection, so another user can reach the \
+             forwarded service through the relay, as sandy's user; forward only to services \
+             that authenticate their clients (docs/macos.md, \"Who may connect, and who may \
+             stop the relay\")"
+                .to_string(),
+        );
+    }
+    let relayed = !policy.expose.is_empty() || !policy.forward.is_empty();
+    if relayed && policy.signals == SignalScope::Any {
+        shortfalls.push(
+            "the relay of exposed and forwarded ports can outlive the program without limit on \
+             macOS with signals = \"any\": the program can stop the relay with SIGSTOP, and \
+             macOS has no timer that ends a stopped process, so the relay keeps its ports until \
+             something continues or kills it, and once continued it can relay a connection made \
+             after the program ended; signals = \"isolated\" keeps the program from stopping \
+             it (docs/macos.md, \"Who may connect, and who may stop the relay\")"
+                .to_string(),
+        );
+    }
+    shortfalls
 }
 
 /// Reports every requirement that the Seatbelt profile enforces as unavailable with `reason`. For
@@ -324,6 +411,7 @@ mod tests {
             already_sandboxed: false,
             rosetta: None,
             interpreter: None,
+            trusted_locations: Ok(Vec::new()),
         }
     }
 
@@ -398,7 +486,7 @@ mod tests {
                 access: PathAccess::ReadWrite,
                 is_dir: true,
             });
-            trust_conflict(&policy, &trusted)
+            trust_conflict(&policy, &Ok(trusted.clone()))
         };
         // Holds the startup file, holds the home directory, lies inside a protected tree.
         assert!(conflict("/Users/someone").is_some());
@@ -406,6 +494,31 @@ mod tests {
         assert!(conflict("/Users/someone/Library/LaunchAgents/sub").is_some());
         // A directory below the home directory stays writable.
         assert!(conflict("/Users/someone/data").is_none());
+    }
+
+    /// When no source names the home directory, sandy cannot check the locations below it, so a
+    /// policy with a writable path is refused with the reason, and one without stays
+    /// enforceable.
+    #[test]
+    fn an_unknown_home_directory_refuses_a_writable_path() {
+        let host = HostCapabilities {
+            trusted_locations: Err("cannot find the home directory of this user".into()),
+            ..capable()
+        };
+        let plan_of = |policy: &ResolvedPolicy| {
+            EnforcementPlan::new(&policy.requirements(), plan_for(policy, &host))
+        };
+        let mut policy = strictest();
+        assert!(plan_of(&policy).is_enforceable());
+
+        policy.paths.push(sandy_core::PathRule {
+            path: "/Users/someone/data".into(),
+            access: PathAccess::ReadWrite,
+            is_dir: true,
+        });
+        let plan = plan_of(&policy);
+        assert!(!plan.is_enforceable(), "{plan}");
+        assert!(plan.to_string().contains("home directory"), "{plan}");
     }
 
     /// `system = "none"` leaves out what dyld needs, so no program starts with it. A policy that
@@ -472,6 +585,7 @@ mod tests {
             already_sandboxed: false,
             rosetta: None,
             interpreter: None,
+            trusted_locations: Ok(Vec::new()),
         };
         let items = plan_for(&policy, &host);
         let plan = EnforcementPlan::new(&policy.requirements(), items.clone());
@@ -497,6 +611,7 @@ mod tests {
             already_sandboxed: false,
             rosetta: None,
             interpreter: None,
+            trusted_locations: Ok(Vec::new()),
         };
         let items = plan_for(&policy, &host);
         let filesystem = items

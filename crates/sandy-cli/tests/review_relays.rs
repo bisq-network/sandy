@@ -18,13 +18,14 @@
 
 mod common;
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use common::unix::live_members;
 use common::*;
 
 fn free_port() -> u16 {
@@ -337,54 +338,178 @@ fn a_stopped_relay_ends_with_the_program() {
     );
 }
 
-/// With `children = "contained"` sandy stays as the supervisor, so it can watch the relay in
-/// turn and end the program's group when the relay is gone. Without that, the program keeps
-/// running with its ports served by nothing, and a relay that was only frozen can serve a
-/// connection made after the program ended (`relay::was_stopped`). Killing the relay is the
-/// mechanism, not a race: the scenario it protects against cannot be tested without one.
-///
-/// Linux only: sandy watches the relay in the Linux `contain` supervisor.
+/// The watchdog exists only for `signals = "any"`. With `signals = "isolated"` the program
+/// cannot stop its relay, so a timer could only kill a healthy relay that the host did not run
+/// for two seconds, and with `children = "contained"` that ends the program with status 125. The
+/// test stands in for such a host: it stops the relay from outside the sandbox for longer than
+/// the watchdog's period and continues it. The relay must still serve and the program must keep
+/// running. Control: the same stop under `signals = "any"` still ends the relay.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_dead_relay_ends_a_contained_program() {
+fn only_signals_any_arms_the_relay_watchdog() {
     if common::linux::landlock_abi() < 6 {
         return skip("landlock-abi-6", "signal isolation needs Landlock ABI 6");
     }
-    let (service_port, stop_service) = holding_service();
+    let service = TcpListener::bind("127.0.0.1:0").unwrap();
+    service.set_nonblocking(true).unwrap();
+    let to = service.local_addr().unwrap();
+    let forward = |inner: u16, more: &[&str]| -> Vec<String> {
+        ["--ip", "all"]
+            .iter()
+            .chain(more)
+            .map(|arg| arg.to_string())
+            .chain(["--forward".to_string(), format!("{inner}={to}")])
+            .collect()
+    };
+
     let inner = free_port();
-    let sandbox_args = [
-        "--ip",
-        "all",
-        "--children",
-        "contained",
-        "--signals",
-        "isolated",
-        "--forward",
-    ]
-    .map(String::from)
-    .into_iter()
-    .chain([format!("{inner}=127.0.0.1:{service_port}")])
-    .collect::<Vec<String>>();
+    let isolated = forward(inner, &["--children", "contained", "--signals", "isolated"]);
+    // The program runs until the test sends it a line, then exits with its own status.
     let mut program = Command::new(sandy_path())
-        .args(run_args(&sandbox_args, &[("sleep", "600000")]))
+        .args(run_args(&isolated, &[("read-line", "-"), ("exit", "7")]))
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let relay = relay_of(inner, &mut program);
+    assert!(
+        relayed(inner, &service),
+        "the forward port did not serve before the stop"
+    );
+    freeze(relay, WATCHDOG_PERIOD * 3 / 2);
+    assert!(
+        is_running(relay),
+        "the relay did not survive a stop under isolated signals"
+    );
+    assert!(
+        program.try_wait().unwrap().is_none(),
+        "the contained program ended while its relay was stopped"
+    );
+    assert!(
+        relayed(inner, &service),
+        "the forward port did not serve after the relay was continued"
+    );
+    writeln!(program.stdin.take().unwrap(), "end").unwrap();
+    let output = program.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "the program did not end on its own: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let inner = free_port();
+    let mut program = Command::new(sandy_path())
+        .args(run_args(&forward(inner, &[]), &[("sleep", "600000")]))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let relay = relay_of(inner, &mut program);
+    assert!(
+        relayed(inner, &service),
+        "the forward port did not serve before the stop"
+    );
+    freeze(relay, WATCHDOG_PERIOD * 3 / 2);
+    let gone = ends_soon(relay, Duration::from_secs(5));
+    let _ = program.kill();
+    let _ = program.wait();
+    if !gone {
+        kill_process(relay);
+    }
+    assert!(
+        gone,
+        "the watchdog did not end a stopped relay under signals = \"any\""
+    );
+}
+
+/// The Linux relay's `WATCHDOG`.
+#[cfg(target_os = "linux")]
+const WATCHDOG_PERIOD: Duration = Duration::from_secs(2);
+
+/// Stops process `pid` for `period` and continues it.
+#[cfg(target_os = "linux")]
+fn freeze(pid: u32, period: Duration) {
+    // SAFETY: kill takes a process ID and a signal.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) };
+    thread::sleep(period);
+    // SAFETY: as above.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) };
+}
+
+/// Whether a connection to the forward port on 127.0.0.1:`port` reaches `service`, which must be
+/// non-blocking.
+#[cfg(target_os = "linux")]
+fn relayed(port: u16, service: &TcpListener) -> bool {
+    let address = format!("127.0.0.1:{port}").parse().unwrap();
+    let Ok(_client) = TcpStream::connect_timeout(&address, HALF_SECOND) else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if service.accept().is_ok() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+/// With `children = "contained"` sandy stays as the supervisor, and its guard watches the relay
+/// in turn and ends the program's group when the relay is gone. Without that, the program keeps
+/// running with its ports served by nothing, and any local user can bind the freed forward port
+/// and receive what the program sends there. sandy reports the end as its own failure, status
+/// 125. Control: a run whose program ends on its own while the relay lives exits with the
+/// program's status.
+#[test]
+fn a_dead_relay_ends_a_contained_program() {
+    #[cfg(target_os = "linux")]
+    if common::linux::landlock_abi() < 6 {
+        return skip("landlock-abi-6", "signal isolation needs Landlock ABI 6");
+    }
+    let (service_port, stop_service) = holding_service();
+    let inner = free_port();
+    let sandbox_args = contained_forward(inner, service_port);
     let address = format!("127.0.0.1:{inner}").parse().unwrap();
-    // Control: the port serves while the program and its relay run, and sandy keeps the program
-    // through several of its looks at a relay that lives, so the end below is the kill's doing.
+    // The program runs until the test sends it a line, then exits with its own status.
+    let start = || {
+        Command::new(sandy_path())
+            .args(run_args(
+                &sandbox_args,
+                &[("read-line", "-"), ("exit", "7")],
+            ))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+
+    // Control: the port serves while the program and its relay run, sandy keeps the program
+    // while the relay lives, and the program's own end is the end of the run.
+    let mut program = start();
+    relay_of(inner, &mut program);
     assert!(
         TcpStream::connect_timeout(&address, HALF_SECOND).is_ok(),
-        "the forward port did not serve before the relay was killed"
+        "the forward port did not serve while the relay ran"
     );
     thread::sleep(Duration::from_secs(1));
     assert!(
         program.try_wait().unwrap().is_none(),
         "sandy ended the program while its relay was alive"
     );
+    writeln!(program.stdin.take().unwrap(), "end").unwrap();
+    let output = program.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "the program's own end was not the end of the run: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
+    let mut program = start();
+    let relay = relay_of(inner, &mut program);
     kill_process(relay);
     let deadline = Instant::now() + Duration::from_secs(20);
     while program.try_wait().unwrap().is_none() {
@@ -397,9 +522,10 @@ fn a_dead_relay_ends_a_contained_program() {
     let output = program.wait_with_output().unwrap();
     let _ = stop_service.send(());
     let reason = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "sandy reported success although its relay was gone: {output:?}"
+    assert_eq!(
+        output.status.code(),
+        Some(EXIT_FAILURE),
+        "sandy did not fail although its relay was gone: {output:?}"
     );
     assert!(
         reason.contains("relay"),
@@ -412,9 +538,187 @@ fn a_dead_relay_ends_a_contained_program() {
     );
 }
 
-/// The relay of the sandbox that `program` runs: the one process that listens on
-/// 127.0.0.1:`port`. Waits until it is there, and fails if the program ends first.
+/// The guard ends the group when the relay ends, so the freed forward port does not wait for
+/// sandy: while sandy is stopped, a dead relay still ends the program at once, and sandy reports
+/// the failure when it continues. Control: stopping sandy alone ends nothing.
+#[test]
+fn a_dead_relay_ends_a_contained_program_while_sandy_is_stopped() {
+    #[cfg(target_os = "linux")]
+    if common::linux::landlock_abi() < 6 {
+        return skip("landlock-abi-6", "signal isolation needs Landlock ABI 6");
+    }
+    let (service_port, stop_service) = holding_service();
+    let inner = free_port();
+    let (mut sandy, program) = start_contained(inner, service_port);
+    let group = group_of(program);
+    let relay = relay_of(inner, &mut sandy);
+    send(sandy.id(), libc::SIGSTOP);
+    thread::sleep(HALF_SECOND);
+    let alive = !live_members(group).is_empty();
+    kill_process(relay);
+    let ended = within(END_TIMEOUT, || live_members(group).is_empty());
+    send(sandy.id(), libc::SIGCONT);
+    let output = sandy.wait_with_output().unwrap();
+    let _ = stop_service.send(());
+    assert!(alive, "control: stopping sandy ended the program");
+    assert!(
+        ended,
+        "the program outlived its relay while sandy was stopped"
+    );
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+}
+
+/// When the guard wakes, it reports that the relay ended first only when the program has not
+/// ended too. A relay that ended in the same look as the program is the normal end of a run, not
+/// a failure. Stopping the guard makes that look certain: the program exits and the relay is
+/// killed while the guard is stopped, and the test waits for both ends as the guard learns them,
+/// so the guard finds both when its poll starts again after the stop. sandy is stopped as well,
+/// so that it cannot end the run before the guard has decided.
+///
+/// Linux only. On macOS a stopped process still finishes the kevent call that an event woke and
+/// stops only on its way back to user space (seen on macOS 26.5), so the guard takes the
+/// program's end alone, and no stop from outside can give it both ends in one look.
 #[cfg(target_os = "linux")]
+#[test]
+fn a_relay_that_ends_with_the_program_is_the_normal_end_of_a_run() {
+    if common::linux::landlock_abi() < 6 {
+        return skip("landlock-abi-6", "signal isolation needs Landlock ABI 6");
+    }
+    let (service_port, stop_service) = holding_service();
+    let inner = free_port();
+    let (mut sandy, program) = start_contained(inner, service_port);
+    // The guard leads the program's group.
+    let group = group_of(program);
+    let guard = group as u32;
+    let relay = relay_of(inner, &mut sandy);
+    let (program_end, relay_end) = (pidfd(program), pidfd(relay));
+    send(sandy.id(), libc::SIGSTOP);
+    send(guard, libc::SIGSTOP);
+    let both_stopped = within(END_TIMEOUT, || stopped(sandy.id()) && stopped(guard));
+    writeln!(sandy.stdin.take().unwrap(), "end").unwrap();
+    let program_exited = ends_within(&program_end, END_TIMEOUT);
+    kill_process(relay);
+    let relay_exited = ends_within(&relay_end, END_TIMEOUT);
+    send(guard, libc::SIGCONT);
+    let group_ended = within(END_TIMEOUT, || live_members(group).is_empty());
+    send(sandy.id(), libc::SIGCONT);
+    let output = sandy.wait_with_output().unwrap();
+    let _ = stop_service.send(());
+    assert!(both_stopped, "sandy and the guard did not stop");
+    assert!(program_exited, "the program did not exit");
+    assert!(relay_exited, "the relay did not end");
+    assert!(group_ended, "the guard did not end the group");
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "a relay that ended with the program failed the run: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Options for a contained program with a forward port from `inner` to 127.0.0.1:`service`.
+fn contained_forward(inner: u16, service: u16) -> Vec<String> {
+    [
+        "--ip",
+        "all",
+        "--children",
+        "contained",
+        "--signals",
+        "isolated",
+        "--forward",
+    ]
+    .map(String::from)
+    .into_iter()
+    .chain([format!("{inner}=127.0.0.1:{service}")])
+    .collect()
+}
+
+/// Starts a contained program with a forward port from `inner` to 127.0.0.1:`service`. The
+/// program reports its process ID, which this returns with sandy, and runs until the test sends
+/// it a line; then it exits with status 7.
+fn start_contained(inner: u16, service: u16) -> (std::process::Child, u32) {
+    let actions = [("pid", "-"), ("read-line", "-"), ("exit", "7")];
+    let mut sandy = Command::new(sandy_path())
+        .args(run_args(&contained_forward(inner, service), &actions))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(sandy.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    let program = parse_line(line.trim_end())
+        .detail
+        .parse()
+        .unwrap_or_else(|_| panic!("the program did not report its process ID: {line}"));
+    // The program must not end on a closed pipe when it reports its next action.
+    thread::spawn(move || std::io::copy(&mut stdout, &mut std::io::sink()));
+    (sandy, program)
+}
+
+fn send(pid: u32, signal: libc::c_int) {
+    // SAFETY: kill takes a process ID and a signal.
+    unsafe { libc::kill(pid as libc::pid_t, signal) };
+}
+
+/// Whether `condition` holds within `timeout`.
+fn within(timeout: Duration, condition: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !condition() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    true
+}
+
+/// The process group of process `pid`.
+fn group_of(pid: u32) -> libc::pid_t {
+    // SAFETY: getpgid takes a process ID.
+    let group = unsafe { libc::getpgid(pid as libc::pid_t) };
+    assert!(group > 0, "process {pid} has no group");
+    group
+}
+
+/// Whether process `pid` is stopped.
+#[cfg(target_os = "linux")]
+fn stopped(pid: u32) -> bool {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    // The state follows the name in parentheses.
+    stat.rfind(')')
+        .and_then(|end| stat.get(end + 2..end + 3))
+        .is_some_and(|state| matches!(state, "T" | "t"))
+}
+
+/// A pidfd for process `pid`. It tells of the end of the process as it tells the guard.
+#[cfg(target_os = "linux")]
+fn pidfd(pid: u32) -> std::os::fd::OwnedFd {
+    use std::os::fd::FromRawFd;
+    // SAFETY: pidfd_open takes a process ID and flags.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    assert!(fd >= 0, "cannot open a pidfd for process {pid}");
+    // SAFETY: the descriptor is new and owned by nothing else.
+    unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as std::os::fd::RawFd) }
+}
+
+/// Whether the process of `pidfd` ends within `timeout`.
+#[cfg(target_os = "linux")]
+fn ends_within(pidfd: &std::os::fd::OwnedFd, timeout: Duration) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut poll = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd.
+    unsafe { libc::poll(&mut poll, 1, timeout.as_millis() as libc::c_int) > 0 }
+}
+
+/// The relay of the sandbox that `program` runs: the one process that listens on
+/// 127.0.0.1:`port`. Waits until it is there, and fails if the program ends first. sandy binds
+/// the listener before it starts the relay, so until then sandy itself is that process.
 fn relay_of(port: u16, program: &mut std::process::Child) -> u32 {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -422,7 +726,7 @@ fn relay_of(port: u16, program: &mut std::process::Child) -> u32 {
             program.try_wait().unwrap().is_none(),
             "the program ended before the relay was ready"
         );
-        if let Some(relay) = listening_process(port) {
+        if let Some(relay) = listening_process(port).filter(|&pid| pid != program.id()) {
             return relay;
         }
         assert!(Instant::now() < deadline, "no relay listened on {port}");
@@ -454,6 +758,28 @@ fn listening_process(port: u16) -> Option<u32> {
             });
             holds.then_some(pid)
         })
+        .collect();
+    match holders[..] {
+        [relay] => Some(relay),
+        _ => None,
+    }
+}
+
+/// The single process that listens on 127.0.0.1:`port`, found with lsof.
+#[cfg(target_os = "macos")]
+fn listening_process(port: u16) -> Option<u32> {
+    let output = Command::new("/usr/sbin/lsof")
+        .args([
+            "-nP",
+            &format!("-iTCP@127.0.0.1:{port}"),
+            "-sTCP:LISTEN",
+            "-t",
+        ])
+        .output()
+        .ok()?;
+    let holders: Vec<u32> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
         .collect();
     match holders[..] {
         [relay] => Some(relay),

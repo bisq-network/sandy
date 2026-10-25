@@ -627,6 +627,260 @@ fn a_connected_ipv6_socket_on_standard_input_runs_with_ip_all() {
     drop(client);
 }
 
+/// A socket of a family that no policy lets the program create, such as a netlink socket for
+/// sock_diag, through which the program could list every socket of the host. The program cannot
+/// create one itself, also with `ip = "all"`, but one on a standard stream keeps working inside,
+/// so sandy refuses it under every policy and names the family.
+#[test]
+fn a_socket_of_another_family_on_standard_input_is_refused() {
+    let ip = ["--ip".to_string(), "all".to_string()];
+    let run = |args: &[String], stdin| run_with_stdin(&run_args(args, &[("pid", "-")]), stdin);
+
+    // Controls: with a pipe or a connected IP socket on standard input the same run starts.
+    let output = run(&ip, Stdio::piped());
+    assert!(output.status.success(), "{output:?}");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let output = run(&ip, stdin_from(client));
+    assert!(output.status.success(), "{output:?}");
+
+    for other in OTHER_FAMILIES {
+        let name = other.name;
+        if let Err(error) = other.socket() {
+            skip(
+                &format!("socket-family-{name}"),
+                &format!("{name}: not creatable outside the sandbox ({error})"),
+            );
+            continue;
+        }
+        if let Some(action) = CREATE_SOCKET_ACTION {
+            probe_inside(&ip, &[(action, name)])[0].assert_blocked();
+        }
+        for args in [&ip[..], &[]] {
+            let refused = run(args, other.socket().unwrap());
+            assert_refused(&refused, &format!("{};", other.named));
+            let stderr = String::from_utf8_lossy(&refused.stderr);
+            assert!(
+                stderr.contains("no policy lets the program create one like it"),
+                "{stderr}"
+            );
+        }
+    }
+}
+
+/// A socket family besides Unix and IP that this platform can create without privileges.
+struct OtherFamily {
+    /// The target of `CREATE_SOCKET_ACTION`, and the name of the skip.
+    name: &'static str,
+    family: i32,
+    kind: i32,
+    protocol: i32,
+    /// How sandy's message names the socket.
+    named: &'static str,
+}
+
+/// The probe action that creates one of `OTHER_FAMILIES` inside the sandbox.
+#[cfg(target_os = "linux")]
+const CREATE_SOCKET_ACTION: Option<&str> = Some("socket");
+#[cfg(target_os = "macos")]
+const CREATE_SOCKET_ACTION: Option<&str> = Some("socket-family");
+#[cfg(windows)]
+const CREATE_SOCKET_ACTION: Option<&str> = None;
+
+#[cfg(target_os = "linux")]
+const OTHER_FAMILIES: &[OtherFamily] = &[
+    // Only route netlink is allowed with `ip = "all"`; the family is the same.
+    OtherFamily {
+        name: "netlink-sock-diag",
+        family: libc::AF_NETLINK,
+        kind: libc::SOCK_RAW,
+        protocol: 4,
+        named: "socket of family 16 (AF_NETLINK), protocol 4",
+    },
+    OtherFamily {
+        name: "vsock",
+        family: 40,
+        kind: libc::SOCK_STREAM,
+        protocol: 0,
+        named: "stream socket of family 40 (AF_VSOCK)",
+    },
+    // It has neither a name nor a peer to ask for.
+    OtherFamily {
+        name: "alg",
+        family: libc::AF_ALG,
+        kind: libc::SOCK_SEQPACKET,
+        protocol: 0,
+        named: "seqpacket socket of family 38 (AF_ALG)",
+    },
+];
+
+#[cfg(target_os = "macos")]
+const OTHER_FAMILIES: &[OtherFamily] = &[
+    OtherFamily {
+        name: "route",
+        family: libc::PF_ROUTE,
+        kind: libc::SOCK_RAW,
+        protocol: 0,
+        named: "socket of family 17 (AF_ROUTE)",
+    },
+    OtherFamily {
+        name: "system",
+        family: libc::PF_SYSTEM,
+        kind: libc::SOCK_DGRAM,
+        protocol: libc::SYSPROTO_CONTROL,
+        named: "datagram socket of family 32 (AF_SYSTEM), protocol 2",
+    },
+];
+
+#[cfg(windows)]
+const OTHER_FAMILIES: &[OtherFamily] = &[OtherFamily {
+    name: "bluetooth",
+    family: 32,
+    kind: 1,
+    protocol: 3,
+    named: "stream socket of family 32 (AF_BTH), protocol 3",
+}];
+
+impl OtherFamily {
+    fn socket(&self) -> std::io::Result<Stdio> {
+        new_socket(self.family, self.kind, self.protocol)
+    }
+}
+
+/// A raw IP socket needs privileges that sandy does not give the program, so one on a standard
+/// stream is refused under every policy. An ICMP datagram socket, which an unprivileged program
+/// can create where the kernel allows it, follows `ip` like any other IP datagram socket.
+#[test]
+fn a_raw_ip_socket_on_standard_input_is_refused() {
+    let ip = ["--ip".to_string(), "all".to_string()];
+    let actions = [("pid", "-")];
+
+    match icmp_datagram_socket() {
+        Ok(socket) => {
+            let output = run_with_stdin(&run_args(&ip, &actions), socket);
+            assert!(output.status.success(), "{output:?}");
+            assert_refused(
+                &run_with_stdin(&run_args(&[], &actions), icmp_datagram_socket().unwrap()),
+                "standard input carries an unconnected IP datagram socket;",
+            );
+        }
+        Err(error) => skip(
+            "icmp-datagram-socket",
+            &format!("this host creates no ICMP datagram socket for this user: {error}"),
+        ),
+    }
+
+    for args in [&ip[..], &[]] {
+        let refused = match run_with_raw_socket(&run_args(args, &actions)) {
+            Ok(refused) => refused,
+            Err(error) => {
+                return skip(
+                    "raw-socket",
+                    &format!("this test cannot create a raw IP socket: {error}"),
+                );
+            }
+        };
+        assert_refused(
+            &refused,
+            "standard input carries an unconnected IP raw socket;",
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains("no policy lets the program create one like it"),
+            "{stderr}"
+        );
+    }
+}
+
+#[cfg(unix)]
+fn icmp_datagram_socket() -> std::io::Result<Stdio> {
+    new_socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_ICMP)
+}
+
+#[cfg(windows)]
+fn icmp_datagram_socket() -> std::io::Result<Stdio> {
+    new_socket(2, 2, 1)
+}
+
+/// Runs sandy with `args` and a raw ICMP socket as its standard input. Creating one needs
+/// CAP_NET_RAW, which the test has in a user and network namespace of its own: the child creates
+/// the socket there before it executes sandy, and executing drops the capability again.
+#[cfg(target_os = "linux")]
+fn run_with_raw_socket(args: &[String]) -> std::io::Result<Output> {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = Command::new(sandy_path());
+    command.args(args);
+    // SAFETY: the closure runs in the forked child and makes only system calls.
+    unsafe {
+        command.pre_exec(|| {
+            let raw = libc::SOCK_RAW | libc::SOCK_CLOEXEC;
+            if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let fd = libc::socket(libc::AF_INET, raw, libc::IPPROTO_ICMP);
+            if fd < 0 || libc::dup2(fd, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.output()
+}
+
+/// Runs sandy with `args` and a raw ICMP socket as its standard input, which only root (macOS) or
+/// an administrator (Windows) can create.
+#[cfg(not(target_os = "linux"))]
+fn run_with_raw_socket(args: &[String]) -> std::io::Result<Output> {
+    #[cfg(unix)]
+    let raw = (libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP);
+    #[cfg(windows)]
+    let raw = (2, 3, 1);
+    Ok(run_with_stdin(args, new_socket(raw.0, raw.1, raw.2)?))
+}
+
+/// A new socket as a child's standard input.
+#[cfg(unix)]
+fn new_socket(family: i32, kind: i32, protocol: i32) -> std::io::Result<Stdio> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    // SAFETY: socket takes no pointers.
+    let fd = unsafe { libc::socket(family, kind, protocol) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor is new and nothing else in this process owns it.
+    Ok(stdin_from(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+#[cfg(windows)]
+fn new_socket(family: i32, kind: i32, protocol: i32) -> std::io::Result<Stdio> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::{FromRawSocket, OwnedSocket};
+
+    use windows_sys::Win32::Networking::WinSock::{
+        INVALID_SOCKET, WSADATA, WSAGetLastError, WSAStartup, socket,
+    };
+
+    // Winsock answers only after it has started in this process. It is never stopped, which
+    // would end the sockets of the other tests.
+    let mut data = MaybeUninit::<WSADATA>::zeroed();
+    // SAFETY: the structure is the one WSAStartup fills.
+    unsafe { WSAStartup(0x0202, data.as_mut_ptr()) };
+    // SAFETY: socket takes no pointers.
+    let handle = unsafe { socket(family, kind, protocol) };
+    if handle == INVALID_SOCKET {
+        // SAFETY: WSAGetLastError has no preconditions.
+        return Err(std::io::Error::from_raw_os_error(unsafe {
+            WSAGetLastError()
+        }));
+    }
+    // SAFETY: the socket is new and nothing else in this process owns it.
+    Ok(stdin_from(unsafe {
+        OwnedSocket::from_raw_socket(handle as u64)
+    }))
+}
+
 /// The one socket that gives no more than a pipe: a connected Unix stream or seqpacket socket,
 /// which is how libuv, journald and `ssh` without a terminal pass a standard stream. Refusing it
 /// would break those callers, so sandy starts the program. A datagram pair can be pointed

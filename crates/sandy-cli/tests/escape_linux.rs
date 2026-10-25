@@ -135,6 +135,43 @@ fn only_route_netlink_is_available_with_ip() {
     lines[1].assert_blocked();
 }
 
+/// Route netlink is what `ip = "all"` lets the program create besides IP sockets, so one on a
+/// standard stream follows `ip` like an IP socket. Netlink sockets of other protocols are refused
+/// under every policy (`a_socket_of_another_family_on_standard_input_is_refused`).
+#[test]
+fn route_netlink_on_standard_input_follows_ip() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let run = |sandbox_args: &[&str]| {
+        // SAFETY: socket takes no pointers.
+        let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE) };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: the descriptor is new and nothing else in this process owns it.
+        let route = unsafe { OwnedFd::from_raw_fd(fd) };
+        Command::new(sandy_path())
+            .args(run_args(&args(sandbox_args), &[("pid", "-")]))
+            .stdin(Stdio::from(route))
+            .output()
+            .unwrap()
+    };
+    let output = run(&["--ip", "all"]);
+    assert!(output.status.success(), "{output:?}");
+    parse(&output)[0].assert_ok();
+
+    let output = run(&[]);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("standard input carries a connected route netlink raw socket;"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("ip = \"none\" cannot hold for it"),
+        "{stderr}"
+    );
+}
+
 /// A denied family fails with `EAFNOSUPPORT`, as on a kernel that does not have it, so that a
 /// program which probes for a family falls back instead of treating the failure as fatal.
 #[test]
@@ -996,7 +1033,8 @@ fn forward_relay_reaches_only_its_target() {
 /// no owner left for the kernel to report, and the relay serves it rather than drop what is in
 /// every ordinary run the program's own connection. Stopping the relay makes the late accept
 /// certain; a program that connects and exits reaches it by itself most of the time, on some
-/// kernels always. This is also the window another local user can retry into (docs/linux.md).
+/// kernels always. It is also how another local user delivers a blind write, usually on the first
+/// attempt (docs/linux.md).
 #[test]
 fn forward_relay_serves_a_peer_that_closed_before_it_accepted() {
     let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1359,6 +1397,44 @@ fn a_writable_path_over_the_system_set_is_refused() {
     );
 }
 
+/// systemd-resolved replaces the resolver configuration by renaming a new file over it when the
+/// network changes, so with `ip = "all"` sandy grants its directory instead of the file. Another
+/// file of that directory stands in for the new one: it is readable with `ip = "all"` and not
+/// without. The unit test `a_resolver_file_replaced_by_rename_stays_readable` does the rename.
+#[test]
+fn the_resolver_directory_is_granted_with_ip() {
+    let target = fs::canonicalize("/etc/resolv.conf").ok();
+    let directory = target
+        .as_deref()
+        .and_then(Path::parent)
+        .filter(|directory| *directory == Path::new("/run/systemd/resolve"));
+    let Some(directory) = directory else {
+        skip(
+            "resolver-directory",
+            &format!("/etc/resolv.conf leads to {target:?}, not into systemd-resolved's directory"),
+        );
+        return;
+    };
+    let other = fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            Some(path.as_path()) != target.as_deref()
+                && path.is_file()
+                && fs::File::open(path).is_ok()
+        });
+    let Some(other) = other else {
+        skip(
+            "resolver-directory",
+            &format!("{} holds no other readable file", directory.display()),
+        );
+        return;
+    };
+    let other = other.to_str().unwrap();
+    controlled(&args(&["--ip", "all"]), &[("read", other)])[0].assert_ok();
+    probe_inside(&[], &[("read", other)])[0].assert_blocked();
+}
+
 /// `check` with the environment the trusted locations are read from: a home directory and a PATH
 /// of the test's own, so the result does not depend on the account that runs the suite.
 fn check_with_environment(home: &str, path: &str, writable: &str) -> Output {
@@ -1397,6 +1473,75 @@ fn refuses_a_writable_path_over_the_home_directory() {
     );
 }
 
+/// Checks each `(location, beside)` pair of paths below the fixture's home directory, with that
+/// directory as HOME: a writable path that is the location is refused, and the path beside it,
+/// the control, is accepted.
+fn assert_refused_beside_an_accepted_path(fixture: &Fixture, cases: &[(&str, &str)]) {
+    for (location, beside) in cases {
+        let check = |name: &str| {
+            check_with_environment(
+                &fixture.arg("home"),
+                "/usr/bin",
+                &fixture.arg(&format!("home/{name}")),
+            )
+        };
+        let refused = check(location);
+        let stdout = String::from_utf8_lossy(&refused.stdout);
+        assert_eq!(
+            refused.status.code(),
+            Some(EXIT_NOT_ENFORCEABLE),
+            "{location}: {stdout}"
+        );
+        assert!(stdout.contains("runs outside the sandbox"), "{stdout}");
+
+        let allowed = check(beside);
+        assert_eq!(
+            allowed.status.code(),
+            Some(0),
+            "{beside}: {}",
+            String::from_utf8_lossy(&allowed.stdout)
+        );
+    }
+}
+
+/// The bash files Debian and Fedora source, the X session script of Debian, the KDE Plasma
+/// login and logout scripts and the git configuration run code outside the sandbox at the next
+/// login, shell or git command (README rule 8). sandy refuses a writable path that reaches one;
+/// the path beside each stays writable.
+#[test]
+fn refuses_a_writable_path_over_a_shell_desktop_or_git_startup_file() {
+    let fixture = Fixture::new("trusted-tools");
+    let files = [
+        (".gitconfig", ".gitignore"),
+        (".bash_aliases", ".bash_history"),
+        (".xsessionrc", ".xsession-errors"),
+    ];
+    let directories = [
+        (".config/git", ".config/other"),
+        (".bashrc.d", "data"),
+        (
+            ".config/plasma-workspace/env",
+            ".config/plasma-workspace/other",
+        ),
+        (
+            ".config/plasma-workspace/shutdown",
+            ".config/plasma-workspace/other",
+        ),
+        (".config/autostart-scripts", ".config/other"),
+    ];
+    fs::create_dir_all(fixture.path("home")).unwrap();
+    for (location, beside) in files {
+        fs::write(fixture.path(&format!("home/{location}")), b"").unwrap();
+        fs::write(fixture.path(&format!("home/{beside}")), b"").unwrap();
+    }
+    for (location, beside) in directories {
+        fs::create_dir_all(fixture.path(&format!("home/{location}"))).unwrap();
+        fs::create_dir_all(fixture.path(&format!("home/{beside}"))).unwrap();
+    }
+    assert_refused_beside_an_accepted_path(&fixture, &files);
+    assert_refused_beside_an_accepted_path(&fixture, &directories);
+}
+
 /// A directory on PATH inside a writable path lets the program leave a command there that the
 /// user runs outside the sandbox by name. Such a policy is ordinary work, so sandy enforces it
 /// and warns, naming the directory (README rule 8). The same writable path without that PATH
@@ -1426,6 +1571,53 @@ fn warns_about_a_writable_path_that_holds_a_directory_on_path() {
     assert!(!stderr.contains(&fixture.arg("rw/bin")), "{stderr}");
 }
 
+/// A service or a desktop application starts sandy with a minimal PATH, while the user's shell
+/// looks for commands in `~/.local/bin`, `~/bin` and cargo's `bin` directory. sandy warns about a
+/// writable path that holds one of them although its own PATH lacks it, and the advice keeps the
+/// directory out of the writable paths. The path beside each says nothing.
+#[test]
+fn warns_about_a_usual_bin_directory_that_is_not_on_sandys_path() {
+    let fixture = Fixture::new("trusted-usual-path");
+    let cases = [
+        (".local/bin", ".local/opt"),
+        ("bin", "data"),
+        (".cargo/bin", ".cargo/registry"),
+    ];
+    for (directory, beside) in cases {
+        fs::create_dir_all(fixture.path(&format!("home/{directory}"))).unwrap();
+        fs::create_dir_all(fixture.path(&format!("home/{beside}"))).unwrap();
+    }
+    let check = |name: &str| {
+        check_with_environment(
+            &fixture.arg("home"),
+            "/usr/bin",
+            &fixture.arg(&format!("home/{name}")),
+        )
+    };
+    for (directory, beside) in cases {
+        let bin = fixture.arg(&format!("home/{directory}"));
+        let warned = check(directory);
+        let stderr = String::from_utf8_lossy(&warned.stderr);
+        assert_eq!(
+            warned.status.code(),
+            Some(0),
+            "{directory}: {}{stderr}",
+            String::from_utf8_lossy(&warned.stdout)
+        );
+        let names_it = |line: &str| {
+            line.starts_with("warning: ")
+                && line.contains(&bin)
+                && line.contains("make only the subdirectories the program needs writable")
+        };
+        assert!(stderr.lines().any(names_it), "{stderr}");
+
+        let quiet = check(beside);
+        let stderr = String::from_utf8_lossy(&quiet.stderr);
+        assert_eq!(quiet.status.code(), Some(0), "{beside}: {stderr}");
+        assert!(!stderr.contains(&bin), "{stderr}");
+    }
+}
+
 /// A writable path that holds a directory on PATH and a location that is refused stays refused:
 /// the warning never replaces the refusal.
 #[test]
@@ -1449,6 +1641,108 @@ fn refuses_a_writable_path_that_holds_a_directory_on_path_and_a_startup_file() {
     let names_it =
         |line: &str| line.starts_with("warning: ") && line.contains(&fixture.arg("home/bin"));
     assert!(stderr.lines().any(names_it), "{stderr}");
+}
+
+/// A user ID that the password database does not know, so that a user namespace can run sandy as
+/// a user without a home directory.
+fn unknown_user_id() -> Option<libc::uid_t> {
+    (4242..4342).find(|&uid| {
+        // SAFETY: an all-zero passwd is a valid value of the type; the call below fills it.
+        let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut buffer = vec![0 as libc::c_char; 64 * 1024];
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: entry and found are valid out pointers, and the call writes at most
+        // buffer.len() bytes through the buffer pointer.
+        let error = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut entry,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut found,
+            )
+        };
+        error == 0 && found.is_null()
+    })
+}
+
+/// When neither HOME nor the password database names the home directory, sandy cannot tell
+/// whether a writable path reaches the shell startup files below it, so it refuses a policy with
+/// a writable path and says to set HOME (README rule 8). Without a writable path, or with HOME
+/// set, the same user passes.
+///
+/// A user namespace runs sandy as a user ID that the password database does not know, which is
+/// what a static build sees for a user that only a directory service knows.
+#[test]
+fn refuses_a_writable_path_when_no_source_names_the_home_directory() {
+    let fixture = Fixture::new("trusted-no-home");
+    let Some(uid) = unknown_user_id() else {
+        return skip(
+            "unknown-user",
+            "the password database knows every candidate ID",
+        );
+    };
+    // SAFETY: getuid has no preconditions.
+    let map = format!("{uid} {} 1", unsafe { libc::getuid() });
+    let check = |access: &str, home: Option<&str>| {
+        let mut command = Command::new(sandy_path());
+        command.args(["check", access, &fixture.arg("rw")]);
+        match home {
+            Some(home) => command.env("HOME", home),
+            None => command.env_remove("HOME"),
+        };
+        let map = map.clone();
+        // SAFETY: unshare, open, write and close are async-signal-safe, and the map was
+        // formatted before the fork.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::unshare(libc::CLONE_NEWUSER) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let fd = libc::open(c"/proc/self/uid_map".as_ptr(), libc::O_WRONLY);
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let written = libc::write(fd, map.as_ptr().cast(), map.len());
+                libc::close(fd);
+                if written != map.len() as isize {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.output()
+    };
+
+    let refused = match check("--read-write", None) {
+        Ok(output) => output,
+        Err(error) => {
+            return skip(
+                "unshare",
+                &format!("no unprivileged user namespace: {error}"),
+            );
+        }
+    };
+    let stdout = String::from_utf8_lossy(&refused.stdout);
+    assert_eq!(
+        refused.status.code(),
+        Some(EXIT_NOT_ENFORCEABLE),
+        "{stdout}"
+    );
+    assert!(stdout.contains("start sandy with HOME set"), "{stdout}");
+
+    for (access, home) in [
+        ("--read", None),
+        ("--read-write", Some(fixture.arg("home"))),
+    ] {
+        let allowed = check(access, home.as_deref()).unwrap();
+        assert_eq!(
+            allowed.status.code(),
+            Some(0),
+            "{access} {home:?}: {}",
+            String::from_utf8_lossy(&allowed.stdout)
+        );
+    }
 }
 
 /// A bind mount of a subdirectory of a writable path shares no ancestor with that path, so

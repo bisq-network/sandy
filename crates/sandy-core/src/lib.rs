@@ -10,6 +10,7 @@ mod plan;
 mod policy;
 mod resolve;
 pub mod streams;
+pub mod trust;
 pub mod verify;
 
 pub use backend::{Backend, ParentProcess, SandboxError, StatusReport, TargetCommand};

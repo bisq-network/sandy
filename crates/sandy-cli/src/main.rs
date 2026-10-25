@@ -8,7 +8,7 @@ mod stdio;
 use std::process::ExitCode;
 
 use args::{Command, Invocation, Mode};
-use sandy_core::streams::StandardStream;
+use sandy_core::streams::{CreatableSocket, StandardStream};
 use sandy_core::{
     Backend, EnforcementPlan, ParentProcess, Policy, ResolvedPolicy, StatusReport, TargetCommand,
     target_environment,
@@ -304,7 +304,7 @@ fn sandbox(
             if !plan.is_enforceable() {
                 return Err(refusal(&plan));
             }
-            refuse_sockets_on_standard_streams(&resolved)?;
+            refuse_sockets_on_standard_streams(&resolved, backend.ip_also_allows())?;
             let program = resolved
                 .program
                 .clone()
@@ -380,12 +380,16 @@ fn refuse_writable_trusted_files(
 /// The program inherits standard input, output and error as they are, and a socket among them
 /// keeps the access it was created with (see `sandy_core::streams`). Only `run` can check this:
 /// the streams of a `check` are not the streams the later `run` gets.
-fn refuse_sockets_on_standard_streams(resolved: &ResolvedPolicy) -> Result<(), String> {
+fn refuse_sockets_on_standard_streams(
+    resolved: &ResolvedPolicy,
+    ip_also_allows: &[CreatableSocket],
+) -> Result<(), String> {
     for stream in StandardStream::ALL {
         let Some(socket) = stdio::socket_on(stream)? else {
             continue;
         };
-        if let Some(reason) = sandy_core::streams::refusal(resolved, stream, socket) {
+        if let Some(reason) = sandy_core::streams::refusal(resolved, stream, socket, ip_also_allows)
+        {
             return Err(reason);
         }
     }

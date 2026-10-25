@@ -122,6 +122,15 @@ const CANDIDATES: &[(&str, SystemUse, Needed)] = &[
     ),
 ];
 
+/// Where systemd-resolved writes the resolver configuration that /etc/resolv.conf leads to. It
+/// replaces those files by renaming a new file over the old one when the network changes, and a
+/// Landlock rule binds the file that existed when sandy started, so a rule on the file would
+/// leave a running program without name resolution. A candidate that leads into this directory
+/// is granted as the directory. Besides the two resolver files, it holds only the resolver's
+/// sockets, which a read right does not connect to, and `netif`, which only the resolver's own
+/// user and root may open.
+const RESOLVED_DIRECTORY: &str = "/run/systemd/resolve";
+
 /// The OpenSSL configuration files of the candidate list, whose `.include` directives decide
 /// which crypto settings the program sees (`openssl::missing_includes`).
 pub fn openssl_configs() -> Vec<PathBuf> {
@@ -144,7 +153,7 @@ fn candidates() -> impl Iterator<Item = (&'static str, SystemUse, Needed)> {
 pub fn detect() -> Vec<SystemPath> {
     let mut found: Vec<SystemPath> = candidates()
         .filter_map(|(path, usage, needed)| {
-            let path = Path::new(path).canonicalize().ok()?;
+            let path = rule_path(Path::new(path).canonicalize().ok()?, RESOLVED_DIRECTORY);
             let is_dir = path.metadata().ok()?.is_dir();
             Some(SystemPath {
                 path,
@@ -169,6 +178,7 @@ pub fn locations() -> Vec<SystemPath> {
     candidates()
         .flat_map(|(path, usage, needed)| {
             let (location, links) = resolve_existing_part(Path::new(path));
+            let location = rule_path(location, RESOLVED_DIRECTORY);
             let is_dir = location.metadata().is_ok_and(|metadata| metadata.is_dir());
             let links = links.into_iter().map(move |link| SystemPath {
                 path: link,
@@ -185,6 +195,15 @@ pub fn locations() -> Vec<SystemPath> {
             .chain(links)
         })
         .collect()
+}
+
+/// What sandy grants for the candidate at the canonical `path`: the directory `replaced` when the
+/// candidate lies directly in it, otherwise the path itself.
+fn rule_path(path: PathBuf, replaced: &str) -> PathBuf {
+    match path.parent() {
+        Some(parent) if parent == Path::new(replaced) => parent.to_path_buf(),
+        _ => path,
+    }
 }
 
 /// Where `path` is or would be, like `canonicalize`, except that the part from the first missing
@@ -297,6 +316,94 @@ mod tests {
         assert_eq!(location, dir.join("etc"));
         assert!(links.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Only the files directly in systemd-resolved's directory are granted as the directory. The
+    /// other places /etc/resolv.conf can lead to stay single files: /etc and NetworkManager's
+    /// directory hold more than resolver configuration, and no test host has resolvconf.
+    #[test]
+    fn a_file_of_systemd_resolved_is_granted_as_its_directory() {
+        for (file, granted) in [
+            (
+                "/run/systemd/resolve/stub-resolv.conf",
+                "/run/systemd/resolve",
+            ),
+            ("/run/systemd/resolve/resolv.conf", "/run/systemd/resolve"),
+            (
+                "/run/systemd/resolve/netif/2",
+                "/run/systemd/resolve/netif/2",
+            ),
+            ("/run/systemd/resolve", "/run/systemd/resolve"),
+            (
+                "/run/NetworkManager/resolv.conf",
+                "/run/NetworkManager/resolv.conf",
+            ),
+            ("/run/resolvconf/resolv.conf", "/run/resolvconf/resolv.conf"),
+            ("/etc/resolv.conf", "/etc/resolv.conf"),
+        ] {
+            assert_eq!(
+                rule_path(PathBuf::from(file), RESOLVED_DIRECTORY),
+                Path::new(granted),
+                "{file}"
+            );
+        }
+    }
+
+    /// The system replaces the resolver file by renaming a new one over it when the network
+    /// changes. A program that started before must still read the new file. The domain applies
+    /// to the reading thread only, because Landlock restricts the thread that asks for it.
+    #[test]
+    fn a_resolver_file_replaced_by_rename_stays_readable() {
+        use crate::host::HostCapabilities;
+        use landlock::{
+            ABI, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
+        };
+        use std::sync::mpsc;
+
+        let Ok(version) = HostCapabilities::detect().landlock else {
+            eprintln!("skipped: no Landlock");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("sandy-system-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("resolve")).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let resolver = dir.join("resolve");
+        std::fs::write(resolver.join("stub-resolv.conf"), "nameserver 127.0.0.53\n").unwrap();
+        std::os::unix::fs::symlink("resolve/stub-resolv.conf", dir.join("resolv.conf")).unwrap();
+
+        let link = dir.join("resolv.conf");
+        let rule = rule_path(link.canonicalize().unwrap(), resolver.to_str().unwrap());
+        let abi = ABI::from(version);
+        let ruleset = Ruleset::default()
+            .handle_access(AccessFs::from_all(abi))
+            .unwrap()
+            .create()
+            .unwrap()
+            .add_rule(PathBeneath::new(
+                PathFd::new(&rule).unwrap(),
+                AccessFs::ReadFile,
+            ))
+            .unwrap();
+        let (started, has_started) = mpsc::channel();
+        let (replaced, is_replaced) = mpsc::channel::<()>();
+        let reader = std::thread::spawn(move || {
+            ruleset.restrict_self().unwrap();
+            started.send(std::fs::read(&link).is_ok()).unwrap();
+            is_replaced.recv().unwrap();
+            std::fs::read_to_string(&link).map_err(|error| error.to_string())
+        });
+        assert!(has_started.recv().unwrap(), "the first read failed");
+        let new = resolver.join(".stub-resolv.conf.new");
+        std::fs::write(&new, "nameserver 127.0.0.53\nsearch example.test\n").unwrap();
+        std::fs::rename(&new, resolver.join("stub-resolv.conf")).unwrap();
+        replaced.send(()).unwrap();
+        let after = reader.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            after.as_deref(),
+            Ok("nameserver 127.0.0.53\nsearch example.test\n")
+        );
     }
 
     /// The directories that the OpenSSL configuration of Ubuntu 25.10 includes are read

@@ -10,7 +10,7 @@
 //!    terminal or process group signal reaches it. It points 0, 1 and 2 at `/dev/null` and closes
 //!    every other descriptor except the ones it keeps and the readiness pipe.
 //! 3. The helper confines itself with its own profile and reports over the pipe that it is ready,
-//!    or why it is not. sandy continues only after a ready report.
+//!    with its process ID, or why it is not. sandy continues only after a ready report.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use sandy_core::SandboxError;
 
-const READY: &[u8] = b"ready";
+const READY: &str = "ready";
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Signals that report a fault of the process itself. They stay unblocked, so a fault ends it.
@@ -39,9 +39,12 @@ const FAULTS: [libc::c_int; 7] = [
 pub struct Ready(File);
 
 impl Ready {
-    /// Reports that the helper is confined and serving. Ends the helper if sandy is gone.
+    /// Reports that the helper is confined and serving, with its process ID. Ends the helper if
+    /// sandy is gone.
     pub fn report(mut self) {
-        if self.0.write_all(READY).is_err() {
+        // SAFETY: getpid has no requirements.
+        let pid = unsafe { libc::getpid() };
+        if write!(self.0, "{READY}{pid}").is_err() {
             // SAFETY: ends the helper without running sandy's cleanup.
             unsafe { libc::_exit(1) };
         }
@@ -55,11 +58,15 @@ impl Ready {
     }
 }
 
-/// Starts `main` in a helper process named `name` (for example "the relay") and returns once it
-/// reported that it is ready. The helper keeps the descriptors in `keep`. `main` runs in the
-/// helper and must call `Ready::report` after it has confined itself; the helper ends when `main`
-/// returns. What `main` owns is dropped in sandy.
-pub fn start(name: &str, keep: &[RawFd], main: impl FnOnce(Ready)) -> Result<(), SandboxError> {
+/// Starts `main` in a helper process named `name` (for example "the relay") and returns its
+/// process ID once it reported that it is ready. The helper keeps the descriptors in `keep`.
+/// `main` runs in the helper and must call `Ready::report` after it has confined itself; the
+/// helper ends when `main` returns. What `main` owns is dropped in sandy.
+pub fn start(
+    name: &str,
+    keep: &[RawFd],
+    main: impl FnOnce(Ready),
+) -> Result<libc::pid_t, SandboxError> {
     let null = File::options()
         .read(true)
         .write(true)
@@ -116,11 +123,13 @@ pub fn start(name: &str, keep: &[RawFd], main: impl FnOnce(Ready)) -> Result<(),
         Some(report) if report.is_empty() => Err(SandboxError::new(format!(
             "{name} ended before it was ready"
         ))),
-        Some(report) if report == READY => Ok(()),
-        Some(report) => Err(SandboxError::new(format!(
-            "{name} did not start: {}",
-            String::from_utf8_lossy(&report)
-        ))),
+        Some(report) => {
+            let report = String::from_utf8_lossy(&report);
+            report
+                .strip_prefix(READY)
+                .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+                .ok_or_else(|| SandboxError::new(format!("{name} did not start: {report}")))
+        }
     }
 }
 

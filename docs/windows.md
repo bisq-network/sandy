@@ -266,11 +266,17 @@ reach the resolver through a backend hook that is not written yet. The stubs are
   and stay there after the run.
 - `sandy` is checked under the path `current_exe` reports. There is no second name to compare
   it with yet.
-- The backend's own checks, the system directories of rule 6 and the trusted user locations of
-  rule 12, go through the same comparison (`PathIdentity`), so they see the same and no more: a
-  writable path spelled through a junction that leads into `C:\Windows` or into the Startup
-  folder passes them. Both spellings of a location are compared, the one the backend names and
-  the one with its links resolved, which catches a location that itself leads through a link.
+- The backend's own checks, the system directories of rule 6 and the trusted user locations of rule
+  12, go through the same comparison (`PathIdentity`), so they see the same and no more. A writable
+  path spelled through a junction or a directory symbolic link is refused all the same: the
+  resolver canonicalizes every policy path, `canonicalize` follows both, and the checks see the
+  folder the link leads to (`a_writable_path_through_a_junction_is_refused_like_its_target` and
+  `a_writable_path_through_a_directory_symbolic_link_is_refused_like_its_target`, into the Startup
+  folder and into `C:\Windows\Temp`). A path through a network share is a second name that
+  canonicalizing keeps, and it got past these checks: `\\localhost\C$\Windows\Temp` as a writable
+  path passed rule 6. sandy now refuses such paths (see "Network and share paths" below). Both
+  spellings of a location are compared, the one the backend names and the one with its links
+  resolved, which catches a location that itself leads through a link.
 - A grant is an entry on the object, so it travels with the object. A file renamed out of a
   granted directory, on the same volume, keeps the entry it inherited from that directory: a
   rename does not touch the security descriptor, and Windows recomputes inherited entries only
@@ -281,6 +287,27 @@ reach the resolver through a backend hook that is not written yet. The stubs are
   denied at once. `escape_windows::a_file_moved_out_of_a_granted_directory_keeps_its_grant`
   records this. Closing it would mean a new capability per run and a fresh propagation over
   every policy path on every run.
+
+`sandy check` prints a warning for the comparison by spelling when the policy has a writable
+path, and for the grant that travels with a file when the policy grants a directory.
+
+### Network and share paths
+
+sandy refuses a policy path that resolves to a network share, at every access level:
+`\\server\share\...`, an administrative share such as `\\localhost\C$\...`, and a mapped
+network drive, which `canonicalize` turns into the path of its share (`\\?\UNC\...`).
+`FilesystemConfined` is then unavailable, and the message asks for the local path instead.
+
+Such a grant never worked for the program. Measured on Windows 11, a program in its AppContainer
+got "Network access is denied" (`ERROR_NETWORK_ACCESS_DENIED`, 65) when it read a file or listed
+the directory through `\\localhost\C$\...` and through a share made with `net share`, with
+`ip = "none"` and with `ip = "all"`, which grants `internetClientServer` and
+`privateNetworkClientServer`. What the grant did instead was harmful: the entry sandy added
+through the share landed on the folder behind it, so the program read the file by its local
+path; and the checks of rules 6 and 12 compare spellings, so rule 6 did not see `C:\Windows`
+behind `\\localhost\C$\Windows\Temp`. A share on another machine was not tested; the refusal
+covers it the same way. `network_and_share_paths_are_refused` checks the refusal, with the local
+path of the same folder as the control.
 
 ### Trusted user locations
 
@@ -304,6 +331,7 @@ The locations that are refused are in `sys::trusted_locations`:
 | `Documents\WindowsPowerShell`, `Documents\PowerShell` | the tree | the profile scripts of PowerShell 5 and PowerShell 7 |
 | `%LOCALAPPDATA%\Microsoft\WindowsApps` | the tree | the app execution aliases, which the default `PATH` holds |
 | `<profile>\.ssh` | the tree | `ProxyCommand` and `LocalCommand` in the configuration run programs |
+| `<profile>\.cargo\config.toml`, `<profile>\.cargo\config`, and both in `CARGO_HOME` | the file | `build.rustc`, `build.rustc-wrapper` and target runners name programs that the next cargo command runs; the list is shared with Linux and macOS (`sandy_core::trust::cargo_configs`) |
 | `%LOCALAPPDATA%\sandy` | the tree | sandy's own state: the policy of each running AppContainer, the lock files and the forwarded-port sockets |
 
 The profile folder comes from the known folder and from `USERPROFILE`, because a service that
@@ -713,16 +741,22 @@ messages that reach processes outside the sandbox.
   network access through that socket, also with `ip = "none"`: AppContainer network isolation
   applies to sockets the AppContainer creates, not to sockets created outside it (verified on
   Windows 11 with a listening socket). This holds on every platform for inherited sockets, so
-  `run` looks at the three standard handles before it duplicates them and refuses with exit code
-  125, naming the handle and the socket, when one carries a socket the policy denies: an IP
-  socket or one of another family with `ip = "none"`, and an unconnected, datagram or listening
-  AF_UNIX socket with `unix_sockets = "none"`. A connected AF_UNIX stream socket is accepted,
-  because it reaches only the peer it already has. Winsock tells a socket from a file, a pipe and
-  a console: `GetFileType` reports `FILE_TYPE_PIPE` for a socket and a named pipe alike, while
-  `getsockopt` with `SO_PROTOCOL_INFOW` answers only for a socket and names its family and type.
+  `run` looks at the three standard handles before it duplicates them and accepts a socket only
+  when the policy lets the program create one like it. Otherwise it refuses with exit code 125,
+  naming the handle and the socket: an IP socket with `ip = "none"`, an unconnected, datagram or
+  listening AF_UNIX socket with `unix_sockets = "none"`, and under every policy a raw IP socket
+  and a socket of any other family. Only an administrator can create a raw socket; sandy refuses
+  an inherited one also when it runs as one, so that a policy means the same on every platform.
+  The capabilities of `ip = "all"` cover IP networking only, and sandy grants no device capability
+  such as `bluetooth`. Windows 11 creates an AF_BTH socket also in a virtual machine without a
+  Bluetooth radio (measured), and before this rule sandy started the program with one on a standard
+  handle under `ip = "all"`. A connected AF_UNIX stream socket is accepted, because it reaches only
+  the peer it already has. Winsock tells a socket from a file, a pipe and a console: `GetFileType`
+  reports `FILE_TYPE_PIPE` for a socket and a named pipe alike, while `getsockopt` with
+  `SO_PROTOCOL_INFOW` answers only for a socket and names its family, type and protocol.
   `SO_ACCEPTCONN` exists only for sockets that can listen, so a datagram socket is named by what
-  Windows does tell about it: it has no peer. `sandy check` cannot report any of this, because
-  the handles it is given are not the handles of the later `run`.
+  Windows does tell about it: it has no peer. `sandy check` cannot report any of this, because the
+  handles it is given are not the handles of the later `run`.
 - **Environment.** sandy builds the block from the policy, sorted by name, case-insensitive,
   "without regard to locale" [Environment]. It sets two variables, which replace policy values:
   - `SystemRoot`, from `GetSystemWindowsDirectoryW`. System DLLs need it; without it, for
@@ -852,6 +886,8 @@ about a path is worse than none, so the backend answers nothing and sandy refuse
     `%LOCALAPPDATA%\sandy\forward` stays behind until the next run with a forwarded port
     removes it. Its sockets have no listener while it is there, so nobody can connect through
     them. A directory that sandy 1.3.2 left behind stays (see "Removing the changes").
+15. A policy path on a network share, also through a mapped drive, is refused; name the local
+    path (see "Network and share paths").
 
 ## Verified on Windows 11
 
@@ -875,6 +911,12 @@ Facts these runs established:
 - A UDP socket and a listening TCP socket passed as the standard input of `sandy run` are
   refused with exit code 125 before the program starts, and the outside control shows both
   working without the sandbox (`a_socket_on_standard_input_gives_no_network_access`).
+- An AF_BTH (Bluetooth RFCOMM) socket passed as the standard input of `sandy run` is refused
+  with `ip = "all"` and with `ip = "none"`, while a pipe and a connected TCP socket with
+  `ip = "all"` start the program (`a_socket_of_another_family_on_standard_input_is_refused`).
+- A raw ICMP socket, which the elevated test session can create, passed as the standard input of
+  `sandy run` is refused with `ip = "all"` and with `ip = "none"`; before this rule sandy
+  started the program with it under `ip = "all"` (`a_raw_ip_socket_on_standard_input_is_refused`).
 - `NetworkIsolationGetAppContainerConfig` works without administrator rights.
 - Listening on loopback succeeds without capabilities; incoming connections time out, also with
   the exemption. Outbound connections to the internet fail with `WSAEACCES` (10013).

@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 
+use sandy_core::streams::CreatableSocket;
 use seccompiler::{
     BackendError, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
     SeccompFilter, SeccompRule, TargetArch, sock_filter,
@@ -23,7 +24,7 @@ use seccompiler::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FilterConfig {
-    /// Allow AF_INET, AF_INET6 and route netlink sockets.
+    /// Allow AF_INET, AF_INET6 and the sockets of `IP_ALSO_ALLOWS`.
     pub allow_ip: bool,
     /// Allow AF_UNIX sockets and socket pairs of every type.
     pub allow_unix: bool,
@@ -302,7 +303,14 @@ const PROCESS_SELECTOR_CALLS: &[(i64, u64)] = &[
 ];
 const IOPRIO_WHO_PROCESS: u64 = 1;
 
-const NETLINK_ROUTE: u64 = 0;
+/// What `ip = "all"` allows besides AF_INET and AF_INET6, one protocol per family. Route netlink
+/// lets the C library list interfaces and addresses. Other netlink protocols expose, for example,
+/// every socket of the host (sock_diag).
+pub const IP_ALSO_ALLOWS: &[CreatableSocket] = &[CreatableSocket {
+    name: "route netlink",
+    family: libc::AF_NETLINK,
+    protocol: libc::NETLINK_ROUTE,
+}];
 const SOCK_TYPE_MASK: u64 = 0xf;
 
 /// F_SETDELEG of Linux 7, which the libc crate does not have yet.
@@ -589,7 +597,8 @@ fn socket_rules(config: &FilterConfig) -> Result<Vec<SeccompRule>, BackendError>
         allowed.push(libc::AF_UNIX);
     }
     if config.allow_ip {
-        allowed.extend([libc::AF_INET, libc::AF_INET6, libc::AF_NETLINK]);
+        allowed.extend([libc::AF_INET, libc::AF_INET6]);
+        allowed.extend(IP_ALSO_ALLOWS.iter().map(|socket| socket.family));
     }
     if allowed.is_empty() {
         return Ok(Vec::new());
@@ -600,12 +609,12 @@ fn socket_rules(config: &FilterConfig) -> Result<Vec<SeccompRule>, BackendError>
         .collect::<Result<_, _>>()?;
     let mut rules = vec![rule(other_family)?];
     if config.allow_ip {
-        // Route netlink lets the C library list interfaces and addresses. Other netlink
-        // protocols expose, for example, every socket of the host (sock_diag).
-        rules.push(rule(vec![
-            low(0, SeccompCmpOp::Eq, libc::AF_NETLINK as u64)?,
-            low(2, SeccompCmpOp::Ne, NETLINK_ROUTE)?,
-        ])?);
+        for socket in IP_ALSO_ALLOWS {
+            rules.push(rule(vec![
+                low(0, SeccompCmpOp::Eq, socket.family as u64)?,
+                low(2, SeccompCmpOp::Ne, socket.protocol as u64)?,
+            ])?);
+        }
     }
     Ok(rules)
 }
@@ -726,8 +735,9 @@ const RELAY_CALLS: &[i64] = &[
     libc::SYS_nanosleep,
     libc::SYS_clock_nanosleep,
     libc::SYS_clock_gettime,
-    // The relay re-arms its watchdog timer on every turn of the poll loop. The timer itself is
-    // created before the filter is installed, so timer_create is not allowed here.
+    // With signals = "any" the relay re-arms its watchdog timer on every turn of the poll loop.
+    // The timer itself is created before the filter is installed, so timer_create is not allowed
+    // here.
     libc::SYS_timer_settime,
     libc::SYS_getrandom,
     libc::SYS_restart_syscall,

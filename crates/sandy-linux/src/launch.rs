@@ -44,7 +44,7 @@ pub fn launch(
         ));
     }
     // With `contained`, the relay also ends when the guard has ended the program's group, and
-    // sandy stays to watch the relay in turn (see `contain::run`).
+    // the guard watches the relay in turn (see `contain::run`).
     let mut group_ended = None;
     let mut relay_alive = None;
     if let Some(relay) = &sandbox.relay {
