@@ -818,6 +818,15 @@ metadata through the descriptor they wrote.
   the relay access to `sandy.exe` if your user cannot.
 - **Inbound loopback.** Windows blocks every connection from outside into an AppContainer, also
   on 127.0.0.1. Use `expose` for programs that accept connections.
+- **Private network.** `ip = "private"` runs the program in its AppContainer without network
+  capabilities and without the loopback exemption: its processes and the relays of `expose` and
+  `forward` talk over loopback, and nothing else on this machine or the network reaches the
+  program or is reached by it. Names do not resolve, and a datagram the program sends out is
+  dropped although the send reports success. `sandy setup` removes the exemption for it, as for
+  `ip = "none"`.
+- **No hidden paths.** `view = "policy"` is refused: Windows cannot hide paths from an
+  AppContainer without administrator rights, so the program can tell an existing path outside
+  the policy from a missing one.
 - **File grants.** sandy grants access by adding entries to the access control lists of the
   policy paths. These entries stay; they grant nothing to programs outside this AppContainer.
   `docs/windows.md` explains how to remove them and the profile.

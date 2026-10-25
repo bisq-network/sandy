@@ -316,8 +316,8 @@ outside. Linux and macOS relay the same way, so a policy means the same on every
 Rules:
 
 1. `listen` must be a loopback address and must differ from the program's own address.
-2. The program needs `ip = "all"` to listen. `ip = "client"` denies listening, so sandy refuses
-   `expose` with it and says to use `ip = "all"`.
+2. The program needs `ip = "all"` or `ip = "private"` to listen. `ip = "client"` denies
+   listening, so sandy refuses `expose` with it and says to use `ip = "all"`.
 3. The relay ends with the program. On Windows the job object ends it; on Linux and macOS the
    relay watches the program's process.
 4. The relay is confined as tightly as the platform allows: on Windows it runs in the program's
@@ -342,7 +342,7 @@ confined relay process as `expose`, so a policy means the same on every platform
 Rules:
 
 1. `to` must be a loopback address; the program's address (`port`) must differ from it.
-2. The program needs `ip = "client"` or `ip = "all"` to connect.
+2. The program needs `ip = "private"`, `ip = "client"` or `ip = "all"` to connect.
 3. No address may be used by two relays (`expose` or `forward`), and `to` must not lead back into
    the sandbox (an exposed address).
 4. The relay ends with the program and is confined like the `expose` relay.
@@ -831,9 +831,9 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
 
 Details, limitations and sources: `docs/windows.md`.
 
-- Requires Windows 10 1809 (build 17763) or later; `IpNetworkDenied` and `InboundIpDenied` also
-  require the fix for CVE-2021-41338. `sandy.exe` starts on older builds and the plan names the
-  reason.
+- Requires Windows 10 1809 (build 17763) or later; `IpNetworkDenied`, `IpNetworkPrivate` and
+  `InboundIpDenied` also require the fix for CVE-2021-41338. `sandy.exe` starts on older builds
+  and the plan names the reason.
 
 - AppContainer named by `windows.appcontainer_name`; sandy creates its profile on first use.
   While a program runs, a second run under the same name with a different policy is refused,
@@ -857,7 +857,15 @@ Details, limitations and sources: `docs/windows.md`.
   connections out into one. Connections from the program to loopback listeners outside need the
   loopback exemption, which `sandy setup` installs for `ip = "client"` and `ip = "all"`
   (administrator rights); connections from outside to the program are always blocked. An exempt
-  AppContainer reaches loopback without capabilities, so `ip = "none"` refuses it.
+  AppContainer reaches loopback without capabilities, so `ip = "none"` and `ip = "private"`
+  refuse it, and `sandy setup` removes the exemption for them.
+- `ip = "private"`: the AppContainer of `ip = "none"`, without capabilities and exemption. Its
+  processes and the relays reach each other over loopback; loopback isolation and the missing
+  capability cut off the rest of the machine and the network, a datagram out is dropped at the
+  connect layer, and the DNS Client service resolves no name for it.
+- `filesystem.view = "policy"` is unavailable: Windows hides no path from an AppContainer
+  without administrator rights, and the sandbox answers `ERROR_ACCESS_DENIED` for an existing
+  path outside the policy.
 - `UnixSocketsDenied` through the file ACL: AF_UNIX connect needs write access to the socket
   file, which the program has only in read-write paths and its profile folder.
 - The AppContainer profile folder (`...\Packages\<name>\AC`, which holds `TEMP`) is private,

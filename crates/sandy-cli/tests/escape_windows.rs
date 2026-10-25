@@ -3070,3 +3070,413 @@ fn win32k_lockdown_stops_programs_that_load_user32() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
 }
+
+// `ip = "private"`: the program's AppContainer without network capabilities and without the
+// loopback exemption (docs/windows.md, "Private network").
+
+/// `--ip private` for this test's AppContainer, which has no loopback exemption.
+fn private_args(fixture: &Fixture) -> Vec<String> {
+    let mut sandbox_args = fixture.access_args();
+    sandbox_args.extend(args(&["--ip", "private"]));
+    sandbox_args
+}
+
+/// This machine's IPv4 address on the route to other hosts, if it has one. Connecting a UDP
+/// socket sends nothing; it picks the route and the source address.
+fn lan_address() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?;
+    let address = socket.local_addr().ok()?.ip();
+    (!address.is_unspecified() && !address.is_loopback()).then_some(address)
+}
+
+/// The IPv4 gateway of the route to other hosts, if there is one. On the test VM that is the host
+/// of its virtual network, which runs a DNS server on TCP and UDP port 53.
+fn gateway() -> Option<std::net::Ipv4Addr> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{GetBestRoute, MIB_IPFORWARDROW};
+    // SAFETY: the structure is plain data; zero is a valid value for every field.
+    let mut route: MIB_IPFORWARDROW = unsafe { std::mem::zeroed() };
+    // SAFETY: route is writable; the addresses are in network byte order.
+    let error = unsafe { GetBestRoute(u32::from_ne_bytes([192, 0, 2, 1]), 0, &mut route) };
+    let hop = std::net::Ipv4Addr::from(route.dwForwardNextHop.to_ne_bytes());
+    (error == 0 && !hop.is_unspecified()).then_some(hop)
+}
+
+/// The program and its own processes talk over loopback, IPv4 and IPv6: the reason for
+/// `ip = "private"`.
+#[test]
+fn ip_private_connects_on_its_own_loopback() {
+    let fixture = Fixture::new("private-self");
+    let lines = controlled(
+        &private_args(&fixture),
+        &[("tcp-self", "127.0.0.1:0"), ("tcp-self", "[::1]:0")],
+    );
+    lines[0].assert_ok();
+    lines[1].assert_ok();
+}
+
+/// Nothing on this machine outside the AppContainer: a listener on 127.0.0.1, on ::1 and on the
+/// machine's own address on the network, and a socket on 127.0.0.1 and ::1 that waits for a
+/// datagram. Each works outside the sandbox.
+#[test]
+fn ip_private_reaches_nothing_on_this_machine_outside_the_appcontainer() {
+    let fixture = Fixture::new("private-local");
+    let private = private_args(&fixture);
+    let v4 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let v6 = TcpListener::bind("[::1]:0").unwrap();
+    let mut targets = vec![
+        v4.local_addr().unwrap().to_string(),
+        v6.local_addr().unwrap().to_string(),
+    ];
+    let lan = lan_address().map(|address| TcpListener::bind((address, 0)).unwrap());
+    match &lan {
+        Some(listener) => targets.push(listener.local_addr().unwrap().to_string()),
+        None => skip(
+            "network-address",
+            "this machine has no route to other hosts",
+        ),
+    }
+    let actions: Vec<(&str, &str)> = targets
+        .iter()
+        .map(|target| ("tcp-connect", target.as_str()))
+        .collect();
+    for line in controlled(&private, &actions) {
+        line.assert_blocked();
+    }
+
+    for bind in ["127.0.0.1:0", "[::1]:0"] {
+        assert!(datagram_arrives(None, bind), "control on {bind}");
+        assert!(
+            !datagram_arrives(Some(&private), bind),
+            "a datagram reached {bind}"
+        );
+    }
+}
+
+/// Whether a datagram that the probe sends to a socket of this process on `bind` arrives, with
+/// the probe outside the sandbox when `sandbox_args` is `None`.
+fn datagram_arrives(sandbox_args: Option<&[String]>, bind: &str) -> bool {
+    let socket = std::net::UdpSocket::bind(bind).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let target = socket.local_addr().unwrap().to_string();
+    let output = probe_command(sandbox_args, &[("udp-send", &target)])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let mut buffer = [0; 16];
+    socket.recv_from(&mut buffer).is_ok()
+}
+
+/// Nothing on the network: the gateway, on the test VM the host of its virtual network, by TCP to
+/// the DNS server it runs, by a DNS query over UDP and by ICMP echo. Each action that works
+/// outside the sandbox is denied inside, and the connection with `ip = "all"` shows that the
+/// denial comes from the missing network capability.
+#[test]
+fn ip_private_reaches_no_host_of_the_network() {
+    let Some(gateway) = gateway() else {
+        skip(
+            "network-gateway",
+            "this machine has no route to other hosts",
+        );
+        return;
+    };
+    let fixture = Fixture::new("private-network");
+    let name = std::env::var("COMPUTERNAME").expect("COMPUTERNAME is set");
+    let tcp = format!("{gateway}:53");
+    let query = format!("{gateway}:53\u{1f}{name}");
+    let icmp = gateway.to_string();
+    let actions = [
+        ("tcp-connect", tcp.as_str()),
+        ("dns-query", query.as_str()),
+        ("icmp-echo", icmp.as_str()),
+    ];
+    let outside = probe_outside(&actions);
+    let inside = probe_inside(&private_args(&fixture), &actions);
+    for (control, line) in outside.iter().zip(&inside) {
+        if control.result == "ok" {
+            line.assert_blocked();
+        } else {
+            skip(
+                "network-gateway",
+                &format!(
+                    "{} {} fails outside the sandbox: {}",
+                    control.action, control.target, control.detail
+                ),
+            );
+        }
+    }
+    if outside[0].result == "ok" {
+        let mut all = fixture.access_args();
+        all.extend(args(&["--ip", "all"]));
+        probe_inside(&all, &actions[..1])[0].assert_ok();
+    }
+}
+
+/// The WFP events of the last datagrams to `port`, from `netsh wfp show netevents`, which needs
+/// administrator rights. `None` when they cannot be read.
+fn network_events(port: u16) -> Option<String> {
+    let file =
+        std::env::temp_dir().join(format!("sandy-netevents-{port}-{}.xml", std::process::id()));
+    let shown = Command::new("netsh")
+        .args(["wfp", "show", "netevents"])
+        .arg(format!("remoteport={port}"))
+        .arg(format!("file={}", file.display()))
+        .output()
+        .ok()?;
+    let events = fs::read_to_string(&file).ok();
+    let _ = fs::remove_file(&file);
+    events.filter(|_| shown.status.success())
+}
+
+/// A datagram the program sends to another host is dropped before it leaves the machine, although
+/// `sendto` reports success: Windows Firewall logs the drop at the connect layer, outbound, for
+/// the program's AppContainer (docs/windows.md, "Private network"). The same datagram from
+/// outside the sandbox leaves without a drop. Reading the firewall's events needs administrator
+/// rights.
+#[test]
+fn ip_private_datagrams_to_the_network_are_dropped_before_they_leave() {
+    let Some(gateway) = gateway() else {
+        skip(
+            "network-gateway",
+            "this machine has no route to other hosts",
+        );
+        return;
+    };
+    let fixture = Fixture::new("private-datagram");
+    let (outside_port, inside_port) = (free_port(), free_port());
+    let to = |port: u16| format!("{gateway}:{port}");
+    probe_outside(&[("udp-send", &to(outside_port))])[0].assert_ok();
+    // sendto does not report the drop.
+    probe_inside(&private_args(&fixture), &[("udp-send", &to(inside_port))])[0].assert_ok();
+
+    let sid = appcontainer_sid(&appcontainer_name());
+    // One event per header; other tests run at the same time and may log events of their own.
+    let drops = |events: &str, port: u16| -> Vec<String> {
+        events
+            .split("<header>")
+            .filter(|event| {
+                event.contains("CLASSIFY_DROP")
+                    && event.contains("MS_FWP_DIRECTION_OUT")
+                    && event.contains(&format!("<remoteAddrV4>{gateway}<"))
+                    && event.contains(&format!("<remotePort>{port}<"))
+            })
+            .map(str::to_string)
+            .collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let dropped = loop {
+        let Some(events) = network_events(inside_port) else {
+            skip(
+                "wfp-events",
+                "netsh cannot read the firewall's events without administrator rights",
+            );
+            return;
+        };
+        let dropped = drops(&events, inside_port);
+        if !dropped.is_empty() || Instant::now() > deadline {
+            break dropped;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    assert!(
+        dropped.iter().any(|event| event.contains(&sid)
+            && (event.contains("FWPM_LAYER_ALE_AUTH_CONNECT_V4")
+                || event.contains("<layerId>48<"))),
+        "no drop at the connect layer for {sid}: {dropped:?}"
+    );
+    let control = network_events(outside_port).unwrap_or_default();
+    let control = drops(&control, outside_port);
+    assert!(
+        control.is_empty(),
+        "the datagram from outside was dropped too: {control:?}"
+    );
+}
+
+/// A name that only a DNS server knows does not resolve, while `localhost` still does, so the
+/// resolver works and refuses only what needs the network. `SANDY_TEST_NETWORK_NAME` names the
+/// host to resolve, `example.com` by default; the check is skipped where that name does not
+/// resolve outside the sandbox.
+#[test]
+fn ip_private_resolves_no_network_name() {
+    let name = std::env::var("SANDY_TEST_NETWORK_NAME").unwrap_or("example.com".to_string());
+    let control = probe_outside(&[("resolve", &name)]);
+    if control[0].result != "ok" {
+        skip(
+            "network-name",
+            &format!(
+                "{name} does not resolve outside the sandbox: {}",
+                control[0].detail
+            ),
+        );
+        return;
+    }
+    let fixture = Fixture::new("private-names");
+    let lines = probe_inside(
+        &private_args(&fixture),
+        &[("resolve", "localhost"), ("resolve", &name)],
+    );
+    lines[0].assert_ok();
+    lines[1].assert_blocked();
+    let mut client = fixture.access_args();
+    client.extend(args(&["--ip", "client"]));
+    probe_inside(&client, &[("resolve", &name)])[0].assert_ok();
+}
+
+/// Starts the probe's `tcp-accept` on `listen`, outside the sandbox when `sandbox_args` is
+/// `None`, and connects to each of `connect` from this process while it waits. Returns whether a
+/// connection was made and the probe's report.
+fn accepts_from_this_machine(
+    sandbox_args: Option<&[String]>,
+    listen: std::net::SocketAddr,
+    connect: &[std::net::SocketAddr],
+) -> (bool, ProbeLine) {
+    let target = listen.to_string();
+    let mut child = probe_command(sandbox_args, &[("tcp-accept", target.as_str())])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut connected = false;
+    while !connected && Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        connected = connect
+            .iter()
+            .any(|address| TcpStream::connect_timeout(address, Duration::from_millis(300)).is_ok());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let output = child.wait_with_output().unwrap();
+    let mut lines = parse(&output);
+    assert_eq!(lines.len(), 1, "{output:?}");
+    (connected, lines.remove(0))
+}
+
+/// No process outside the AppContainer connects to a port the program listens on, at any
+/// address of this machine, and no datagram from outside reaches it. The program listens on
+/// every address, so only isolation keeps the connections out.
+#[test]
+fn ip_private_takes_no_connections_or_datagrams_from_outside() {
+    let fixture = Fixture::new("private-in");
+    let private = private_args(&fixture);
+    let port = free_port();
+    let mut v4: Vec<std::net::SocketAddr> = vec![(std::net::Ipv4Addr::LOCALHOST, port).into()];
+    match lan_address() {
+        Some(address) => v4.push((address, port).into()),
+        None => skip(
+            "network-address",
+            "this machine has no route to other hosts",
+        ),
+    }
+    let v6 = [(std::net::Ipv6Addr::LOCALHOST, port).into()];
+    let any_v4 = (std::net::Ipv4Addr::UNSPECIFIED, port).into();
+    let any_v6 = (std::net::Ipv6Addr::UNSPECIFIED, port).into();
+    for (listen, connect) in [(any_v4, &v4[..]), (any_v6, &v6[..])] {
+        let (connected, line) = accepts_from_this_machine(None, listen, connect);
+        assert!(connected, "control on {listen}: {line:?}");
+        line.assert_ok();
+        let (connected, line) = accepts_from_this_machine(Some(&private), listen, connect);
+        assert!(!connected, "connected to the program on {listen}: {line:?}");
+        line.assert_blocked();
+    }
+
+    inbound_udp(None).assert_ok();
+    inbound_udp(Some(&private)).assert_blocked();
+}
+
+/// `expose` reaches a program with `ip = "private"`: the relay runs in the program's
+/// AppContainer, also without network capabilities.
+#[test]
+fn an_exposed_port_reaches_a_program_with_ip_private() {
+    let fixture = Fixture::new("private-expose");
+    let (inner, outer) = (free_port(), free_port());
+    let mut sandbox_args = private_args(&fixture);
+    sandbox_args.extend(args(&["--expose", &format!("127.0.0.1:{outer}={inner}")]));
+    let mut run = Command::new(sandy_path())
+        .args(run_args(
+            &sandbox_args,
+            &[("tcp-accept", &format!("127.0.0.1:{inner}"))],
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let address = format!("127.0.0.1:{outer}").parse().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while run.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the program never accepted");
+        let _ = TcpStream::connect_timeout(&address, Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let output = run.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    parse(&output)[0].assert_ok();
+}
+
+/// `forward` works with `ip = "private"`: the program reaches the service outside through its
+/// relay, and the same listener directly not.
+#[test]
+fn a_forwarded_port_works_with_ip_private() {
+    let fixture = Fixture::new("private-forward");
+    let (service, received) = one_shot_service();
+    let inner = free_port();
+    let mut sandbox_args = private_args(&fixture);
+    sandbox_args.extend(args(&[
+        "--forward",
+        &format!("{inner}=127.0.0.1:{service}"),
+    ]));
+    let lines = probe_inside(
+        &sandbox_args,
+        &[
+            ("tcp-connect", &format!("127.0.0.1:{service}")),
+            ("tcp-send", &format!("127.0.0.1:{inner}")),
+        ],
+    );
+    lines[0].assert_blocked();
+    lines[1].assert_ok();
+    assert_eq!(received.join().unwrap().as_deref(), Some(TCP_SEND_PAYLOAD));
+}
+
+/// An exempt AppContainer reaches 127.0.0.1 outside also without capabilities, so `check`
+/// refuses `ip = "private"` there, and `sandy setup` with the policy takes the exemption away.
+/// Needs administrator rights, like `prepare_loopback_exemption`.
+#[test]
+fn setup_takes_the_loopback_exemption_from_a_private_network() {
+    prepare_loopback_exemption();
+    let name = appcontainer_loopback_name();
+    let check = || sandy(["check", "--appcontainer", &name, "--ip", "private"]);
+    let output = check();
+    assert_eq!(
+        output.status.code(),
+        Some(EXIT_NOT_ENFORCEABLE),
+        "{output:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("exempt"), "{stdout}");
+
+    let setup = sandy(["setup", "--appcontainer", &name, "--ip", "private"]);
+    assert!(setup.status.success(), "{setup:?}");
+    let output = check();
+    assert!(output.status.success(), "{output:?}");
+}
+
+/// Windows cannot hide paths from an AppContainer, so `view = "policy"` is refused and the
+/// reason says why.
+#[test]
+fn the_policy_view_is_refused() {
+    let output = sandy([
+        "check",
+        "--appcontainer",
+        &appcontainer_name(),
+        "--view",
+        "policy",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(EXIT_NOT_ENFORCEABLE),
+        "{output:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("administrator rights"), "{stdout}");
+    assert!(stdout.contains("What the program can see"), "{stdout}");
+}

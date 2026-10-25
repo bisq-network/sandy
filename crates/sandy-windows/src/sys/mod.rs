@@ -15,8 +15,8 @@ use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::AsRawSocket;
 
 use sandy_core::{
-    Backend, ChildProcesses, IpAccess, PlanItem, ProtectedPath, Requirement, ResolvedPolicy,
-    SandboxError, Status, StatusReport, TargetCommand, Win32k, path_directories,
+    Backend, ChildProcesses, PlanItem, ProtectedPath, Requirement, ResolvedPolicy, SandboxError,
+    Status, StatusReport, TargetCommand, Win32k, path_directories,
 };
 use windows_sys::Win32::Security::{
     WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
@@ -35,7 +35,9 @@ use windows_sys::Win32::UI::Shell::{
 use crate::cmdline::{command_line, is_batch_file, without_verbatim_prefix};
 use crate::envblock::{LOCAL_APP_DATA, SYSTEM_ROOT, environment_block};
 use crate::name::validate_appcontainer_name;
-use crate::plan::{HostCapabilities, NetworkCapability, network_capabilities, plan_for};
+use crate::plan::{
+    HostCapabilities, NetworkCapability, loopback_exemption, network_capabilities, plan_for,
+};
 use util::{Sid, wide, wide_nul};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -218,7 +220,8 @@ impl Backend for WindowsBackend {
     }
 
     /// Makes the loopback exemption of the policy's AppContainer match the policy: present with
-    /// `ip = "client"` and `ip = "all"`, absent with `ip = "none"`. With exposed or forwarded ports, also lets the relays run
+    /// `ip = "client"` and `ip = "all"`, absent with `ip = "none"` and `ip = "private"`
+    /// (`plan::loopback_exemption`). With exposed or forwarded ports, also lets the relays run
     /// sandy's executable, which a user without the right to change its permissions cannot do at
     /// run time. Needs administrator rights when it changes something.
     fn setup(&self, policy: &ResolvedPolicy) -> Result<(), SandboxError> {
@@ -227,7 +230,7 @@ impl Backend for WindowsBackend {
         })?;
         validate_appcontainer_name(name).map_err(SandboxError::new)?;
         let container = appcontainer::sid(name)?;
-        network::set_loopback_exempt(&container, policy.ip != IpAccess::None)?;
+        network::set_loopback_exempt(&container, loopback_exemption(policy.ip))?;
         if !policy.expose.is_empty() || !policy.forward.is_empty() {
             // The relay rule is read and execute, so no writable-path check reads `held`.
             acl::grant(name, &relay::relay_rule().map_err(SandboxError::new)?, &[])?;

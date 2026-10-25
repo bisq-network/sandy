@@ -77,6 +77,9 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
             Ok(String::new())
         }
         "tcp-connect-read" => tcp_connect_read(target),
+        // Listens on ADDRESS and connects to that listener from the same process, as the parts of
+        // one program talk over loopback, and passes one byte through.
+        "tcp-self" => tcp_self(target),
         "tcp-listen" => {
             let listener = TcpListener::bind(socket_address(target)?)?;
             Ok(listener.local_addr()?.to_string())
@@ -181,6 +184,7 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
         "session-id" => windows_actions::session_id(),
         "wts-processes" => windows_actions::wts_processes(),
         "enum-windows" => windows_actions::enum_windows(),
+        "icmp-echo" => windows_actions::icmp_echo(target),
         "junction" => windows_actions::junction(target),
         "symbolic-link" => windows_actions::symbolic_link(target),
         // Connects to the AF_UNIX socket whose path the file `target` holds; the test writes the
@@ -565,6 +569,18 @@ fn fd_read(target: &str) -> io::Result<String> {
 #[cfg(not(unix))]
 fn fd_read(_target: &str) -> io::Result<String> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported"))
+}
+
+fn tcp_self(target: &str) -> io::Result<String> {
+    let listener = TcpListener::bind(socket_address(target)?)?;
+    let address = listener.local_addr()?;
+    let mut client = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)?;
+    let (mut server, _) = listener.accept()?;
+    client.write_all(b"x")?;
+    server.set_read_timeout(Some(CONNECT_TIMEOUT))?;
+    let mut byte = [0];
+    server.read_exact(&mut byte)?;
+    Ok(format!("through {address}"))
 }
 
 fn socket_address(target: &str) -> io::Result<SocketAddr> {
@@ -3002,6 +3018,57 @@ mod windows_actions {
         }
         Ok(String::new())
     }
+
+    /// Sends one ICMP echo request to the IPv4 address `target` through the ICMP functions of
+    /// the IP helper library, which need no socket of the caller, and waits up to three seconds
+    /// for the reply.
+    pub fn icmp_echo(target: &str) -> io::Result<String> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            ICMP_ECHO_REPLY, IP_SUCCESS, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho,
+        };
+
+        let address: std::net::Ipv4Addr = target
+            .parse()
+            .map_err(|_| invalid("invalid IPv4 address"))?;
+        // SAFETY: IcmpCreateFile has no preconditions.
+        let handle = unsafe { IcmpCreateFile() };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let request = *b"sandy-probe";
+        // One reply, its data and room for an ICMP error message, as the documentation asks.
+        let mut reply = vec![0u8; std::mem::size_of::<ICMP_ECHO_REPLY>() + request.len() + 8 + 64];
+        // SAFETY: handle is open; the request and reply buffers are valid for their lengths;
+        // the address is in network byte order, as IPAddr is.
+        let count = unsafe {
+            IcmpSendEcho(
+                handle,
+                u32::from_ne_bytes(address.octets()),
+                request.as_ptr().cast(),
+                request.len() as u16,
+                ptr::null(),
+                reply.as_mut_ptr().cast(),
+                reply.len() as u32,
+                3000,
+            )
+        };
+        let error = io::Error::last_os_error();
+        // SAFETY: handle is open and closed exactly once.
+        unsafe { IcmpCloseHandle(handle) };
+        if count == 0 {
+            return Err(error);
+        }
+        // SAFETY: the call wrote at least one ICMP_ECHO_REPLY to the start of the buffer.
+        let echo = unsafe { reply.as_ptr().cast::<ICMP_ECHO_REPLY>().read_unaligned() };
+        if echo.Status != IP_SUCCESS {
+            return Err(io::Error::other(format!("status {}", echo.Status)));
+        }
+        Ok(format!(
+            "reply from {}",
+            std::net::Ipv4Addr::from(echo.Address.to_ne_bytes())
+        ))
+    }
 }
 
 #[cfg(not(windows))]
@@ -3089,6 +3156,10 @@ mod windows_actions {
     }
 
     pub fn enum_windows() -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn icmp_echo(_target: &str) -> io::Result<String> {
         unsupported()
     }
 }

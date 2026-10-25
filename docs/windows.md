@@ -22,6 +22,9 @@ isolation.
 | `InheritedHandlesClosed` | `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` with the three standard handles | never |
 | `EnvironmentControlled` | Environment block built from the policy, plus `SystemRoot` and `LOCALAPPDATA` | never |
 | `IpNetworkDenied` | No network capabilities, no loopback exemption | AppContainer exempt from loopback isolation; firewall service not running |
+| `IpNetworkPrivate` | No network capabilities, no loopback exemption; the program's processes and the relays reach each other over loopback (see "Private network") | AppContainer exempt from loopback isolation; firewall service not running; no fix for CVE-2021-41338 |
+| `EgressBrokered` | Not enforced yet | always |
+| `PathsHidden` | None: Windows cannot hide paths from an AppContainer without administrator rights (see "What the program can see") | always |
 | `InboundIpDenied` | The `internetClient` capability only; loopback isolation | firewall service not running; no fix for CVE-2021-41338 |
 | `UnixSocketsDenied` | No write access to socket files outside read-write paths | no AppContainer |
 | `SignalsIsolated` | Own console; AppContainer access checks; job UI restrictions | no AppContainer |
@@ -398,9 +401,20 @@ The sandbox refuses access, it does not hide what exists. Paths outside the poli
 | A name that does not exist next to it | `ERROR_FILE_NOT_FOUND`, `ERROR_PATH_NOT_FOUND` |
 
 So the program can tell whether a path exists, and from the names it guesses it learns what the
-user has. Hiding paths would need a separate view of the file system, which `DESIGN.md` names a
-non-goal. The file case is recorded in
+user has. The file case is recorded in
 `review_windows::an_existing_path_outside_the_policy_is_told_apart_from_a_missing_one`.
+
+Hiding those paths needs a view of the file system that differs per process, and Windows gives
+none without administrator rights. A bind link (`bindflt.sys`) maps a backing path onto a
+virtual one; creating it needs administrator rights, it applies to the whole machine or to a
+silo, and it carries the permissions of the backing path over instead of hiding it [Bind Link].
+A silo, the job object behind Windows containers, needs undocumented kernel interfaces and
+administrator rights, and amounts to a container [Silo]. A Less Privileged AppContainer does not
+help either: it drops the ALL APPLICATION PACKAGES grant but keeps ALL RESTRICTED APPLICATION
+PACKAGES, which the system directories also grant, and in a measurement on build 26200 it
+answered for the system files and the user's files as a normal AppContainer does. The plan
+therefore reports `PathsHidden` as unavailable, and `run` refuses `filesystem.view = "policy"`
+(`the_policy_view_is_refused`).
 
 Processes are different: the AppContainer gives the program a narrower view than the file system
 does. The program cannot open the user's processes (see "Other processes"), and it cannot list
@@ -478,12 +492,13 @@ lock file, so the directories it left behind stay too; they hold no listener and
 
 ## Network
 
-With `ip = "none"` the program gets no network capabilities. With `ip = "all"` it gets
-`internetClientServer` (which includes `internetClient`) and `privateNetworkClientServer`
-[Capabilities]. With `ip = "client"` it gets `internetClient` alone. Windows Firewall enforces
-these rules through the Windows Filtering Platform. The plan reports `IpNetworkDenied` and
-`InboundIpDenied` as unavailable when the firewall service (`MpsSvc`) does not run: whether
-isolation holds without it is not documented, and Microsoft does not support stopping it.
+With `ip = "none"` and `ip = "private"` the program gets no network capabilities. With
+`ip = "all"` it gets `internetClientServer` (which includes `internetClient`) and
+`privateNetworkClientServer` [Capabilities]. With `ip = "client"` it gets `internetClient` alone.
+Windows Firewall enforces these rules through the Windows Filtering Platform. The plan reports
+`IpNetworkDenied`, `IpNetworkPrivate` and `InboundIpDenied` as unavailable when the firewall
+service (`MpsSvc`) does not run: whether isolation holds without it is not documented, and
+Microsoft does not support stopping it.
 
 Turning the firewall profiles off is a different matter, and an ordinary one: a third-party
 firewall registered with Security Center, or a group policy, turns the Defender Firewall
@@ -545,8 +560,61 @@ accept layer, so a blocked connection times out instead of failing at once [Proj
 
 The exemption is bound to the AppContainer SID and does not need any network capability: an
 exempt AppContainer can reach `127.0.0.1` with no capabilities at all [Project Zero 2021]. The
-plan therefore refuses `ip = "none"` for an exempt AppContainer. Use separate AppContainer names
-for policies with and without IP networking.
+plan therefore refuses `ip = "none"` and `ip = "private"` for an exempt AppContainer. Use
+separate AppContainer names for policies with and without IP networking.
+
+### Private network
+
+`ip = "private"` runs the program in the AppContainer of `ip = "none"`: no network capability
+and no loopback exemption. Processes in one AppContainer reach each other over loopback, so the
+program may bind, listen and connect on `127.0.0.1` and `::1` among its own processes, and the
+relays of `expose` and `forward`, which run in the same AppContainer, reach it there
+(`ip_private_connects_on_its_own_loopback`, `an_exposed_port_reaches_a_program_with_ip_private`,
+`a_forwarded_port_works_with_ip_private`). Everything else is cut off by the two filters that
+also hold `ip = "none"`: loopback isolation between the AppContainer and the rest of this
+machine, and the missing capability for every other host. On Windows the two values differ only
+in what the policy allows around them: `private` takes `expose` and `forward`, and later
+`egress`.
+
+Measured on Windows 11 build 26200, each case also from outside the sandbox as the control:
+
+| From the program | Outside the sandbox | `ip = "private"` |
+|---|---|---|
+| TCP to a listener outside on `127.0.0.1`, on `::1` and on this machine's address on the network | connects | times out: loopback isolation drops the connection |
+| A datagram to a socket outside on `127.0.0.1` and `::1` | arrives | does not arrive |
+| TCP to the gateway, on the test VM the host of its virtual network, port 53 of the DNS server it runs | connects | `WSAEACCES` (10013) at once |
+| A DNS query over UDP to that server | answered | no answer: `sendto` reports success, but Windows Firewall drops the datagram before it leaves the machine (below) |
+| ICMP echo to the gateway through `IcmpSendEcho` | answered | `ERROR_ACCESS_DENIED` (5), also with `ip = "all"` |
+| `getaddrinfo` of a name only a DNS server knows | resolves | `WSAHOST_NOT_FOUND` (11001); `localhost` and this machine's own name still resolve |
+| A connection or datagram from another process of this machine to a port the program listens on at every address | arrives | does not arrive, at `127.0.0.1`, `::1` and this machine's address on the network |
+
+The tests are `ip_private_reaches_nothing_on_this_machine_outside_the_appcontainer`,
+`ip_private_reaches_no_host_of_the_network`, `ip_private_resolves_no_network_name` and
+`ip_private_takes_no_connections_or_datagrams_from_outside`. Where a control cannot work on a
+host (no route to other hosts, no service on the gateway's port 53, a resolver that does not
+know the test name), the test records a skip instead of judging.
+
+Datagrams: a `sendto` from the program to another host succeeds, so the program cannot tell from
+the call that nothing went out. Windows Firewall logs the drop: an outbound classify drop at
+`FWPM_LAYER_ALE_AUTH_CONNECT_V4` by the filter "UWP Default Outbound Block Rule" of the MPSSVC
+app isolation sublayer, for the program's package SID. The connect layer decides before the
+datagram is sent, and the same datagram from outside the sandbox leaves without such an event
+(`ip_private_datagrams_to_the_network_are_dropped_before_they_leave`, which reads the events
+with `netsh wfp show netevents` and therefore needs administrator rights).
+
+Names: the program resolves through the DNS Client service, which serves AppContainers that
+hold a network capability [Project Zero 2021], and the program holds none. `localhost` and this
+machine's own name are answered without the service. They tell the program this machine's
+addresses, which reaches nothing: it cannot connect to them. With `ip = "client"` the same name
+resolves in the sandbox, which shows that the capability is what decides.
+
+Other hosts connecting in were not measured with a second host. The program holds no
+capability, which is less than the `internetClient` of `ip = "client"`, whose inbound case did
+not arrive (see "Client networking").
+
+Like `ip = "none"`, `ip = "private"` needs the firewall service, the fix for CVE-2021-41338 and
+an AppContainer without the loopback exemption. `sandy setup` with the policy removes an
+exemption the AppContainer has (`setup_takes_the_loopback_exemption_from_a_private_network`).
 
 ### Local servers in the sandbox
 
@@ -580,8 +648,8 @@ sandy enforces one policy per AppContainer at a time
 - While a program runs, sandy holds a shared byte range lock on a file named after the SID below
   `%LOCALAPPDATA%\sandy\runs`, which stores a fingerprint of the resolved policy: the path rules
   (including the program's own read and execute rule), the system set, `ip`, `unix_sockets`, the
-  exposed and forwarded ports, `signals`, `children`, `end_with_parent`, `path_metadata` and
-  `win32k`.
+  exposed and forwarded ports, `signals`, `children`, `end_with_parent`, `path_metadata`,
+  `win32k`, `view` and the egress broker.
   Arguments, working directory and environment are not part of it. A second byte of the same
   file serializes the check.
 - A second run in the same AppContainer with the same fingerprint may run at the same time. A run
@@ -701,13 +769,13 @@ the program's end (`relay_stops_listening_as_soon_as_the_program_ends`).
 ### The setup step
 
 `sandy setup` makes the loopback exemption of the policy's AppContainer match the policy: present
-with `ip = "client"` and `ip = "all"`, absent with `ip = "none"`. With `--expose`, it also grants
-the relays read and execute on `sandy.exe` (see "Exposed ports"). Run it once per machine as
-administrator:
+with `ip = "client"` and `ip = "all"`, absent with `ip = "none"` and `ip = "private"`. With
+`--expose`, it also grants the relays read and execute on `sandy.exe` (see "Exposed ports"). Run
+it once per machine as administrator:
 
 ```text
 sandy setup --appcontainer example.app --ip all     # add the exemption (also --ip client)
-sandy setup --appcontainer example.app              # remove it (ip = "none")
+sandy setup --appcontainer example.app              # remove it (ip = "none", also --ip private)
 ```
 
 The exemption list is machine-wide. `NetworkIsolationSetAppContainerConfig` replaces the whole
@@ -1059,13 +1127,15 @@ about a path is worse than none, so the backend answers nothing and sandy refuse
     processes can neither lock the file nor read or write it (measured on Windows 11:
     `ERROR_LOCK_VIOLATION`). The lock gives the program no access of its own. The test is
     `a_lock_on_a_readable_file_holds_off_other_processes`.
+18. `filesystem.view = "policy"` is unavailable: Windows cannot hide paths from an AppContainer
+    without administrator rights (see "What the program can see").
 
 ## Verified on Windows 11
 
 Host: Windows 11 build 26200 (VM), binaries built for `x86_64-pc-windows-gnu`. The tests run in
 an elevated SSH session and without administrator rights. Latest elevated run, every test
-passing: `sandy_core` 65, `sandy_relay` 12, `sandy_windows` 77, `sandy` 14, `escape` 27,
-`escape_windows` 63, `expose` 5, `forward` 3, `children` 5, `parent` 5, `check` 11, `runner` 3,
+passing: `sandy_core` 72, `sandy_relay` 12, `sandy_windows` 83, `sandy` 16, `escape` 27,
+`escape_windows` 73, `expose` 5, `forward` 3, `children` 5, `parent` 5, `check` 11, `runner` 3,
 `review_windows` 11. The
 COM check of `review_windows` is skipped there: the SSH session is session 0, where `ole32.dll`
 does not load in an AppContainer (limitation 13), so a denial would not be the COM boundary.
@@ -1117,6 +1187,14 @@ Facts these runs established:
   `PROCESS_VM_READ` and `PROCESS_TERMINATE`, but not `sandy.exe` outside it.
 - A relay without network capabilities reaches the program over loopback. Without the loopback
   exemption it cannot reach a listener outside; with the exemption it can, like the program.
+- With `ip = "private"` the program connects to its own listeners on `127.0.0.1` and `::1`, an
+  exposed port reaches it and it reaches a forwarded service, while a listener outside on either
+  loopback address or on this machine's network address times out, TCP to the gateway fails
+  with `WSAEACCES`, a datagram to a socket outside does not arrive, ICMP echo fails with
+  `ERROR_ACCESS_DENIED`, a name only a DNS server knows does not resolve, and connections and
+  datagrams from outside do not reach the program. Each works outside the sandbox. Windows
+  Firewall logs a datagram to the gateway as dropped outbound at `ALE_AUTH_CONNECT_V4` by "UWP
+  Default Outbound Block Rule", for the program's package SID, although `sendto` succeeded.
 - A user without the right to change the DACL of `sandy.exe` gets `ExposedPortsRelayed` as
   unavailable; after `sandy setup` with the policy, run as administrator, the plan enforces it.
 - A program in an AppContainer without the loopback exemption reaches a loopback service outside
@@ -1193,6 +1271,7 @@ Facts these runs established:
 - [AF_UNIX] AF_UNIX comes to Windows: https://devblogs.microsoft.com/commandline/af_unix-comes-to-windows/
 - [AppContainer isolation] https://learn.microsoft.com/en-us/windows/win32/secauthz/appcontainer-isolation
 - [BatBadBut] Rust security advisory CVE-2024-24576: https://blog.rust-lang.org/2024/04/09/cve-2024-24576.html
+- [Bind Link] Bind Link API: https://learn.microsoft.com/en-us/windows/win32/api/bindlink/
 - [Capabilities] App capability declarations: https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/app-capability-declarations
 - [Chromium design] Sandbox design: https://chromium.googlesource.com/chromium/src/+/main/docs/design/sandbox.md
 - [Chromium install] configure_app_container_sandbox.cc: https://chromium.googlesource.com/chromium/src/+/main/chrome/installer/setup/configure_app_container_sandbox.cc
@@ -1219,6 +1298,7 @@ Facts these runs established:
 - [PostgreSQL] Abstract Unix sockets on Windows: https://www.postgresql.org/message-id/E1pNSBf-001AfT-Af%40gemulon.postgresql.org
 - [Project Zero 2021] Understanding network access in Windows AppContainers: https://projectzero.google/2021/08/understanding-network-access-windows-app.html
 - [SetNamedSecurityInfoW] https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-setnamedsecurityinfow
+- [Silo] Silo and server silo internals: https://www.geoffchappell.com/studies/windows/km/ntoskrnl/inc/ntos/ps/esilo.htm
 - [STIG] Windows 10 default permissions of Program Files: https://www.stigviewer.com/stigs/microsoft_windows_10/2025-02-25/finding/V-220717
 - [Synacktiv] Escaping AppJailLauncher: https://www.synacktiv.com/sites/default/files/2021-10/AppJailLauncher.pdf
 - [Terminal] Console host sources (`src/server`): https://github.com/microsoft/terminal

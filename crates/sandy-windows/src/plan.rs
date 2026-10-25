@@ -44,6 +44,12 @@ const SYSTEM_NONE: &str = "Windows grants every AppContainer read and execute ac
      group, and a Less Privileged AppContainer keeps it through ALL RESTRICTED APPLICATION \
      PACKAGES; sandy cannot remove these grants, so system = \"none\" cannot be enforced";
 
+const PATHS_HIDDEN: &str = "Windows cannot hide paths from an AppContainer without \
+     administrator rights: the AppContainer denies a path outside the policy with \
+     ERROR_ACCESS_DENIED instead of answering that it does not exist, and the mechanisms that \
+     change what a process sees of the file system (bind links, silos) need administrator rights \
+     and act on the whole machine or a container (docs/windows.md, \"What the program can see\")";
+
 /// Reports every requirement of `policy` as enforced or unavailable on `host`.
 pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<PlanItem> {
     let container = appcontainer(policy, host);
@@ -61,6 +67,7 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<PlanIte
                 "Unicode environment block built from the policy, plus SystemRoot and \
                  LOCALAPPDATA",
             ),
+            (Requirement::PathsHidden, _) => PlanItem::unavailable(requirement, PATHS_HIDDEN),
             (_, Err(reason)) => PlanItem::unavailable(requirement, reason.clone()),
             (_, Ok(name)) => contained(requirement, policy, host, name),
         })
@@ -186,8 +193,10 @@ fn contained(
         .ok()
         .copied()
         .and_then(firewall_bypass);
-    if let (Requirement::IpNetworkDenied | Requirement::InboundIpDenied, Some(reason)) =
-        (requirement, bypass)
+    if let (
+        Requirement::IpNetworkDenied | Requirement::IpNetworkPrivate | Requirement::InboundIpDenied,
+        Some(reason),
+    ) = (requirement, bypass)
     {
         return unavailable(reason);
     }
@@ -285,6 +294,27 @@ fn contained(
                  exemption"
             )),
         },
+        Requirement::IpNetworkPrivate => match (&host.firewall, &host.loopback_exempt) {
+            (Err(reason), _) => unavailable(format!(
+                "AppContainer network isolation depends on the Windows Firewall service: {reason}"
+            )),
+            (_, Err(reason)) => unavailable(format!(
+                "cannot read the loopback exemptions of AppContainers: {reason}"
+            )),
+            (_, Ok(true)) => unavailable(format!(
+                "AppContainer {name:?} is exempt from loopback isolation and could reach \
+                 127.0.0.1 outside the sandbox without network capabilities; run `sandy setup \
+                 --appcontainer {name} --ip private` as administrator to remove the exemption, \
+                 or use another name for this policy"
+            )),
+            (Ok(()), Ok(false)) => enforced(format!(
+                "AppContainer {name:?} without network capabilities and without loopback \
+                 exemption: its processes and the relays in it reach each other over loopback; \
+                 Windows Firewall denies connections and datagrams to other hosts, loopback \
+                 isolation drops the traffic between the AppContainer and the rest of this \
+                 machine, and the DNS Client service resolves no name for it"
+            )),
+        },
         Requirement::InboundIpDenied => match &host.firewall {
             Err(reason) => unavailable(format!(
                 "AppContainer network isolation depends on the Windows Firewall service: {reason}"
@@ -306,10 +336,12 @@ fn contained(
              it; job UI restrictions and low integrity block window messages"
         )),
         Requirement::Win32kDenied => enforced(WIN32K_LOCKDOWN.to_string()),
-        Requirement::IpNetworkPrivate | Requirement::EgressBrokered | Requirement::PathsHidden => {
+        Requirement::EgressBrokered => {
             unavailable("the Windows backend does not enforce this yet".into())
         }
-        Requirement::InheritedHandlesClosed | Requirement::EnvironmentControlled => {
+        Requirement::InheritedHandlesClosed
+        | Requirement::EnvironmentControlled
+        | Requirement::PathsHidden => {
             unreachable!("reported in plan_for")
         }
     }
@@ -381,6 +413,17 @@ fn writable_parent<'a>(policy: &'a ResolvedPolicy, path: &Path) -> Option<&'a Pa
         .iter()
         .find(|rule| rule.access == PathAccess::ReadWrite && path.starts_with(&rule.path))
         .map(|rule| rule.path.as_path())
+}
+
+/// Whether `sandy setup` gives the policy's AppContainer the loopback exemption. Only the values
+/// that let the program connect to other hosts get it: an exempt AppContainer reaches 127.0.0.1
+/// outside the sandbox without any network capability, which `ip = "none"` and
+/// `ip = "private"` deny.
+pub fn loopback_exemption(ip: IpAccess) -> bool {
+    match ip {
+        IpAccess::None | IpAccess::Private => false,
+        IpAccess::Client | IpAccess::All => true,
+    }
 }
 
 /// The network capabilities the target gets. `internetClientServer` includes `internetClient`.
@@ -959,6 +1002,102 @@ mod tests {
         let mut all = policy();
         all.ip = IpAccess::All;
         assert!(super::notes(&all).is_empty());
+    }
+
+    fn private(mut policy: ResolvedPolicy) -> ResolvedPolicy {
+        policy.ip = IpAccess::Private;
+        policy
+    }
+
+    /// `ip = "private"` is the AppContainer of `ip = "none"`: no network capability and no
+    /// loopback exemption, so its processes reach each other over loopback and nothing else.
+    #[test]
+    fn private_network_is_an_appcontainer_without_capabilities() {
+        let policy = private(policy());
+        assert!(plan(&policy, &host()).is_enforceable());
+        match status(&policy, &host(), Requirement::IpNetworkPrivate) {
+            Status::Enforced { mechanism } => {
+                assert!(
+                    mechanism.contains("without network capabilities"),
+                    "{mechanism}"
+                );
+                assert!(mechanism.contains("loopback isolation"), "{mechanism}");
+            }
+            Status::Unavailable { reason } | Status::NeedsSetup { reason } => {
+                panic!("unavailable: {reason}")
+            }
+        }
+        assert!(network_capabilities(IpAccess::Private).is_empty());
+        let relayed = private(forwarding(exposing(self::policy())));
+        assert!(plan(&relayed, &host()).is_enforceable());
+    }
+
+    #[test]
+    fn private_network_needs_the_firewall_no_exemption_and_the_fix() {
+        let policy = private(policy());
+        let exempt = HostCapabilities {
+            loopback_exempt: Ok(true),
+            ..host()
+        };
+        let reason = unavailable(status(&policy, &exempt, Requirement::IpNetworkPrivate));
+        assert!(reason.contains("exempt"), "{reason}");
+        assert!(reason.contains("--ip private"), "{reason}");
+        let stopped = HostCapabilities {
+            firewall: Err("MpsSvc stopped".into()),
+            ..host()
+        };
+        let reason = unavailable(status(&policy, &stopped, Requirement::IpNetworkPrivate));
+        assert!(reason.contains("Windows Firewall"), "{reason}");
+        let unreadable = HostCapabilities {
+            loopback_exempt: Err("access denied".into()),
+            ..host()
+        };
+        assert!(!plan(&policy, &unreadable).is_enforceable());
+        let unpatched = HostCapabilities {
+            windows: Ok(WindowsVersion {
+                build: 19043,
+                revision: Some(1287),
+            }),
+            ..host()
+        };
+        let reason = unavailable(status(&policy, &unpatched, Requirement::IpNetworkPrivate));
+        assert!(reason.contains("CVE-2021-41338"), "{reason}");
+    }
+
+    /// `sandy setup` gives the exemption to the values that connect to other hosts, and takes it
+    /// from the two that must not reach 127.0.0.1 outside the sandbox.
+    #[test]
+    fn setup_exempts_only_the_values_that_connect_out() {
+        assert!(!loopback_exemption(IpAccess::None));
+        assert!(!loopback_exemption(IpAccess::Private));
+        assert!(loopback_exemption(IpAccess::Client));
+        assert!(loopback_exemption(IpAccess::All));
+    }
+
+    /// Windows has nothing that hides paths from an AppContainer without administrator rights,
+    /// so the view is refused, also when the policy is otherwise not enforceable here.
+    #[test]
+    fn the_policy_view_is_unavailable() {
+        let mut policy = policy();
+        policy.view = sandy_core::FileView::Policy;
+        assert!(!plan(&policy, &host()).is_enforceable());
+        let reason = unavailable(status(&policy, &host(), Requirement::PathsHidden));
+        assert!(reason.contains("administrator rights"), "{reason}");
+        assert!(reason.contains("What the program can see"), "{reason}");
+        policy.windows.appcontainer_name = None;
+        let reason = unavailable(status(&policy, &host(), Requirement::PathsHidden));
+        assert!(reason.contains("administrator rights"), "{reason}");
+    }
+
+    #[test]
+    fn egress_is_not_enforced_yet() {
+        let mut policy = private(policy());
+        policy.egress = Some(sandy_core::Egress {
+            port: 1080,
+            reach: sandy_core::EgressReach::Public,
+        });
+        let reason = unavailable(status(&policy, &host(), Requirement::EgressBrokered));
+        assert!(reason.contains("does not enforce"), "{reason}");
     }
 
     #[test]
