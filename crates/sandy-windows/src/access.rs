@@ -193,6 +193,64 @@ pub fn map_generic(mask: u32) -> u32 {
     mapped
 }
 
+/// `S-1-5-18`, NT AUTHORITY\SYSTEM.
+pub const LOCAL_SYSTEM: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+/// `S-1-5-32-544`, BUILTIN\Administrators.
+pub const ADMINISTRATORS: &[u8] = &[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0];
+/// `S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464`, NT
+/// SERVICE\TrustedInstaller, which owns the files of Windows itself.
+pub const TRUSTED_INSTALLER: &[u8] = &[
+    1, 6, 0, 0, 0, 0, 0, 5, 80, 0, 0, 0, 181, 137, 251, 56, 25, 132, 194, 203, 92, 108, 35, 109,
+    87, 0, 119, 110, 192, 2, 100, 135,
+];
+/// `S-1-3-4`, OWNER RIGHTS: an entry for whoever owns the object.
+pub const OWNER_RIGHTS: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 3, 4, 0, 0, 0];
+
+/// The identities that only administrators control.
+const ADMINISTRATIVE: [&[u8]; 3] = [LOCAL_SYSTEM, ADMINISTRATORS, TRUSTED_INSTALLER];
+
+/// The rights on a program file that change what runs when it starts: its data and extended
+/// attributes, deleting it, and its DACL and owner.
+pub const CHANGES_FILE: u32 =
+    FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | DELETE | WRITE_DAC | WRITE_OWNER;
+/// The rights on a directory that replace an entry in it or the directory itself.
+pub const REPLACES_ENTRY: u32 = FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER;
+/// `REPLACES_ENTRY` and adding an entry, on the directory that holds a program: Windows looks
+/// for the program's libraries there first.
+pub const ADDS_LIBRARY: u32 = REPLACES_ENTRY | FILE_WRITE_DATA | FILE_APPEND_DATA;
+
+/// Who other than administrators can use `rights` on an object owned by `owner` with the DACL
+/// `aces`, as an SID in string form, `None` when no one can. The owner counts as holding every
+/// right, since it may rewrite the DACL. An allow entry counts whether or not it has a
+/// condition, and deny entries are ignored, so the answer errs towards "someone can".
+pub fn changeable_by_others(owner: &[u8], aces: &[Ace<'_>], rights: u32) -> Option<String> {
+    if !ADMINISTRATIVE.contains(&owner) {
+        return Some(sid_string(owner));
+    }
+    aces.iter()
+        .filter(|ace| ace.kind != AceKind::Deny && ace.flags & INHERIT_ONLY_ACE == 0)
+        .filter(|ace| map_generic(ace.mask) & rights != 0)
+        // OWNER RIGHTS names the owner, which is administrative here.
+        .find(|ace| !ADMINISTRATIVE.contains(&ace.sid) && ace.sid != OWNER_RIGHTS)
+        .map(|ace| sid_string(ace.sid))
+}
+
+/// A binary SID in the `S-1-...` form.
+pub fn sid_string(sid: &[u8]) -> String {
+    if sid.len() < 8 {
+        return "a malformed SID".to_string();
+    }
+    let authority = sid[2..8]
+        .iter()
+        .fold(0u64, |value, &byte| value << 8 | u64::from(byte));
+    let mut text = format!("S-{}-{authority}", sid[0]);
+    let (subauthorities, _) = sid[8..].as_chunks::<4>();
+    for subauthority in subauthorities.iter().take(usize::from(sid[1])) {
+        text.push_str(&format!("-{}", u32::from_le_bytes(*subauthority)));
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,5 +551,108 @@ mod tests {
             FILE_EXECUTE,
             true
         ));
+    }
+
+    const USERS: &[u8] = &[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 33, 2, 0, 0];
+    const AUTHENTICATED_USERS: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 5, 11, 0, 0, 0];
+    /// `S-1-5-21-1-2-3-1001`, a user.
+    const USER: &[u8] = &[
+        1, 5, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 233, 3, 0, 0,
+    ];
+
+    #[test]
+    fn sids_read_as_strings() {
+        assert_eq!(sid_string(ADMINISTRATORS), "S-1-5-32-544");
+        assert_eq!(
+            sid_string(TRUSTED_INSTALLER),
+            "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+        );
+        assert_eq!(sid_string(USER), "S-1-5-21-1-2-3-1001");
+        assert_eq!(sid_string(OWNER_RIGHTS), "S-1-3-4");
+    }
+
+    /// A file below Program Files: owned by an administrative identity, which alone may write;
+    /// everyone else may read and execute.
+    #[test]
+    fn an_installed_program_only_administrators_can_change() {
+        let aces = [
+            allow(INHERITED_ACE, FILE_ALL_ACCESS, ADMINISTRATORS),
+            allow(INHERITED_ACE, FILE_ALL_ACCESS, LOCAL_SYSTEM),
+            allow(INHERITED_ACE, FILE_ALL_ACCESS, TRUSTED_INSTALLER),
+            allow(INHERITED_ACE, RX, USERS),
+            allow(INHERITED_ACE, RX, ALL_APPLICATION_PACKAGES),
+            allow(0, FILE_ALL_ACCESS, OWNER_RIGHTS),
+            // A deny entry takes nothing away from the answer, and grants nothing.
+            deny(0, FILE_ALL_ACCESS, USER),
+        ];
+        for owner in [TRUSTED_INSTALLER, ADMINISTRATORS, LOCAL_SYSTEM] {
+            assert_eq!(changeable_by_others(owner, &aces, CHANGES_FILE), None);
+        }
+        // An administrator's own account is not enough: its processes without elevation hold
+        // its SID too.
+        assert_eq!(
+            changeable_by_others(USER, &aces, CHANGES_FILE).as_deref(),
+            Some("S-1-5-21-1-2-3-1001")
+        );
+    }
+
+    #[test]
+    fn any_right_that_changes_the_file_is_enough() {
+        for mask in [
+            FILE_WRITE_DATA,
+            FILE_APPEND_DATA,
+            FILE_WRITE_EA,
+            DELETE,
+            WRITE_DAC,
+            WRITE_OWNER,
+            GENERIC_WRITE,
+            GENERIC_ALL,
+        ] {
+            for ace in [allow(0, mask, USER), conditional(0, mask, USER)] {
+                assert_eq!(
+                    changeable_by_others(ADMINISTRATORS, &[ace], CHANGES_FILE).as_deref(),
+                    Some("S-1-5-21-1-2-3-1001"),
+                    "{mask:#x}"
+                );
+            }
+        }
+        // Attributes and timestamps leave the program as it is.
+        let attributes = [allow(0, FILE_WRITE_ATTRIBUTES | RX, USER)];
+        assert_eq!(
+            changeable_by_others(ADMINISTRATORS, &attributes, CHANGES_FILE),
+            None
+        );
+    }
+
+    /// The root of a system drive lets every user create folders in it, and gives a creator's
+    /// folders to the creator through an entry that applies only to what it inherits to. That
+    /// replaces nothing above sandy, but it would add a library next to a program in that
+    /// directory.
+    #[test]
+    fn a_directory_above_may_take_new_entries_the_one_holding_sandy_may_not() {
+        let root = [
+            allow(
+                OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+                FILE_ALL_ACCESS,
+                ADMINISTRATORS,
+            ),
+            allow(OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE, RX, USERS),
+            allow(
+                OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | INHERIT_ONLY_ACE,
+                GENERIC_ALL,
+                AUTHENTICATED_USERS,
+            ),
+            allow(0, FILE_APPEND_DATA, AUTHENTICATED_USERS),
+        ];
+        assert_eq!(
+            changeable_by_others(TRUSTED_INSTALLER, &root, REPLACES_ENTRY),
+            None
+        );
+        assert_eq!(
+            changeable_by_others(TRUSTED_INSTALLER, &root, ADDS_LIBRARY).as_deref(),
+            Some("S-1-5-11")
+        );
+        let deletes = [allow(0, FILE_DELETE_CHILD, USERS)];
+        assert!(changeable_by_others(ADMINISTRATORS, &deletes, REPLACES_ENTRY).is_some());
     }
 }

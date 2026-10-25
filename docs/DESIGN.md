@@ -13,8 +13,16 @@ everything else is denied. sandy supports Linux, macOS and Windows.
   start the program. There is no best-effort mode. The few requirements a platform gives only in
   part are written down and named by `sandy check` (see "Requirements and the enforcement
   plan").
-- Unprivileged use. `sandy run` needs no root or administrator rights. One-time host preparation
-  that needs admin rights is allowed (`sandy setup`, for example the Windows loopback exemption).
+- Unprivileged use. `sandy run` needs no root or administrator rights.
+- One-time host preparation. What needs admin rights once is allowed, as `sandy setup`: the
+  Windows loopback exemption, and on Linux under Ubuntu's AppArmor restriction of user
+  namespaces an AppArmor profile that lets sandy use them. Setup never grants a right to a file
+  that someone without admin rights can change: on Linux it prepares only a sandy whose file and
+  directories up to `/` only root can change, or a root-owned copy of a portable sandy that
+  `--install-copy` installs and that the portable sandy hands over to. `--elevate` asks for the
+  rights (pkexec on Linux, UAC on Windows) and never runs a file with them that someone else
+  can change. Setup ends with 0 when it is done or has nothing to do, 3 when it did nothing, and
+  125 when it failed (see "Exit status").
 
 ## Non-goals
 
@@ -707,6 +715,17 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   `kernel.apparmor_restrict_unprivileged_userns` with sandy's AppArmor label: under the Ubuntu
   restriction an unconfined sandy gets no rights in its user namespace, and the requirement needs
   setup (an AppArmor profile). `check` also tries the steps in a forked child.
+- `sandy setup` under that restriction: as root it writes and loads
+  `/etc/apparmor.d/sandy-setup.PATH`, an unconfined profile with only `userns,` for the path of
+  the running sandy, marked as sandy's on its first line. It refuses a path that is not
+  root-only from `/` down (owner root, no write for group or others, no symbolic link, no
+  `nosuid` mount). `--install-copy` installs the running image as
+  `/usr/local/libexec/sandy/VERSION/sandy` and prepares that path; a portable sandy whose copy
+  has its bytes and a loaded profile execs the copy for `run` and `check` before it opens
+  anything, and passes its own names in `SANDY_STARTED_AS`, which every sandy checks like its own
+  and removes from its environment. `--elevate` uses pkexec: of sandy's own root-only file, or of
+  a fixed shell script that copies `/proc/PID/exe` of its waiting parent, checks the bytes and
+  the parent, and runs the copy's setup. Details in [linux.md](linux.md), "Setup on Ubuntu".
 - Landlock (ABI 1 or newer, read from the kernel at run time) handles every file system right of
   the ABI. Writable paths never get execute, symbolic link, named pipe or device rights. Each
   rule path is opened without following links and must still be the file sandy planned with. ABI 6
@@ -972,6 +991,8 @@ Details, limitations and sources: `docs/windows.md`.
 | 125 | sandy failed or refused (invalid policy, unenforceable policy, a socket on a standard stream the policy denies, a pseudo-terminal master on one with `signals = "isolated"`, setup failure); where sandy stays the parent also a failure while it supervises the program |
 | 0 / 1 | `sandy check`: enforceable / not enforceable |
 | 2 | `sandy check`: not enforceable on this host until `sandy setup`, run once with administrator rights, prepares it; nothing else is missing |
+| 0 | `sandy setup` and `sandy setup --remove`: done, or nothing to do |
+| 3 | `sandy setup` and `sandy setup --remove`: not done, and nothing changed: the rights were not given (on Linux, run without root and without `--elevate`; with `--elevate`, a dismissed prompt, no authentication agent, not authorized), or setup is not allowed for this binary |
 
 The caller sees sandy's process ID where sandy stays the parent, and 125 means both "sandy
 refused" and "the program exited with 125". These are additions, not changes: `--status-fd`
@@ -986,6 +1007,12 @@ cannot do it" without parsing text: it can ask the user for administrator rights
 (`Status::NeedsSetup`), and when several reports cover one requirement, one that setup cannot fix
 wins, so status 2 never promises more than setup gives. `run` still refuses such a policy with
 status 125.
+
+Status 3 of `setup` lets the same program tell "setup did nothing" from "setup failed" (125,
+where part of it may be done): after a 2 from `check` it runs `sandy setup --elevate`, adding
+`--install-copy` on Linux for a sandy outside a root-only path, checks again on 0, and on 3 runs
+its fallback policy, which does without what setup prepares. Every refusal of setup says what
+to do instead.
 
 ## Testing
 

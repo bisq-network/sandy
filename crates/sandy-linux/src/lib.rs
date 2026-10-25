@@ -5,6 +5,7 @@
 
 mod cgroup;
 mod contain;
+mod elevate;
 mod explain;
 mod factory;
 mod filter;
@@ -17,24 +18,30 @@ mod namespace;
 mod openssl;
 mod peer;
 mod plan;
+mod relaunch;
 mod relay;
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "the Linux egress broker, a later task, uses it")
 )]
 mod routes;
+mod setup;
 mod system;
 mod trust;
 mod watch;
 
+use std::ffi::OsString;
+
 use sandy_core::streams::CreatableSocket;
 use sandy_core::{
-    Backend, IpAccess, PlanItem, Requirement, ResolvedPolicy, SandboxError, StatusReport,
-    TargetCommand,
+    Backend, IpAccess, PlanItem, Requirement, ResolvedPolicy, SandboxError, SetupOptions,
+    SetupOutcome, StatusReport, TargetCommand,
 };
 
 use host::HostCapabilities;
 use namespace::Namespaces;
+
+pub use relaunch::hand_over_target;
 
 #[derive(Debug, Default)]
 pub struct LinuxBackend;
@@ -113,5 +120,33 @@ impl Backend for LinuxBackend {
             .sandbox
             .ok_or_else(|| SandboxError::new("this host cannot enforce the policy"))?;
         launch::launch(&sandbox, command, status)
+    }
+
+    /// Under Ubuntu's AppArmor restriction, the profile that gives sandy user namespaces; the
+    /// policy plays no part (`setup`).
+    fn setup(
+        &self,
+        _policy: &ResolvedPolicy,
+        options: SetupOptions,
+    ) -> Result<SetupOutcome, SandboxError> {
+        setup::setup(options)
+    }
+
+    fn remove(
+        &self,
+        _policy: &ResolvedPolicy,
+        options: SetupOptions,
+    ) -> Result<SetupOutcome, SandboxError> {
+        setup::remove(options)
+    }
+
+    fn elevate(
+        &self,
+        _policy: &ResolvedPolicy,
+        remove: bool,
+        options: SetupOptions,
+        args: &[OsString],
+    ) -> Result<SetupOutcome, SandboxError> {
+        elevate::elevate(remove, options, args)
     }
 }

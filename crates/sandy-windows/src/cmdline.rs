@@ -62,6 +62,26 @@ pub fn command_line(program: &[u16], args: &[Vec<u16>]) -> Result<Vec<u16>, Comm
     Ok(line)
 }
 
+/// Builds the NUL-terminated parameters for `ShellExecuteExW`, which takes the program apart
+/// from its arguments: the arguments quoted as `command_line` quotes them.
+pub fn parameters(args: &[Vec<u16>]) -> Result<Vec<u16>, CommandLineError> {
+    if args.iter().any(|arg| arg.contains(&NUL)) {
+        return Err(CommandLineError::ContainsNul);
+    }
+    let mut line = Vec::new();
+    for (index, arg) in args.iter().enumerate() {
+        if index > 0 {
+            line.push(SPACE);
+        }
+        push_quoted(&mut line, arg);
+    }
+    line.push(NUL);
+    if line.len() > MAX_COMMAND_LINE {
+        return Err(CommandLineError::TooLong);
+    }
+    Ok(line)
+}
+
 /// Appends `arg` so that `CommandLineToArgvW` and the Microsoft C runtime read it back unchanged.
 /// Backslashes are literal unless they precede a quote; then each one must be doubled.
 fn push_quoted(line: &mut Vec<u16>, arg: &[u16]) {
@@ -153,6 +173,27 @@ mod tests {
 
     fn simplified(path: &str) -> String {
         String::from_utf16(without_verbatim_prefix(&wide(path))).unwrap()
+    }
+
+    /// The parameters are the command line without its program.
+    #[test]
+    fn parameters_quote_like_the_command_line() {
+        let args: Vec<Vec<u16>> = ["setup", "--policy", r"C:\Program Files\x\p.toml", ""]
+            .iter()
+            .map(|arg| wide(arg))
+            .collect();
+        let line = command_line(&wide(r"C:\sandy.exe"), &args).unwrap();
+        let quoted = parameters(&args).unwrap();
+        assert_eq!(
+            String::from_utf16(&quoted).unwrap(),
+            "setup --policy \"C:\\Program Files\\x\\p.toml\" \"\"\0"
+        );
+        assert_eq!(line[r#""C:\sandy.exe" "#.len()..], quoted[..]);
+        assert_eq!(parameters(&[]).unwrap(), [NUL]);
+        assert_eq!(
+            parameters(&[vec![b'a' as u16, NUL]]),
+            Err(CommandLineError::ContainsNul)
+        );
     }
 
     #[test]

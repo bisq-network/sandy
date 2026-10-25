@@ -16,8 +16,9 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION, GetAce,
-    GetAclInformation, GetSecurityDescriptorControl, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    GetAclInformation, GetLengthSid, GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+    UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
@@ -33,9 +34,10 @@ use super::host;
 use super::lockfile::{LOCKS, SERIALIZE, UserLock};
 use super::util::{LocalBox, Sid, last_error, wide_nul, win32_error};
 use crate::access::{
-    ALL_APPLICATION_PACKAGES, ALL_RESTRICTED_APPLICATION_PACKAGES, Ace, AceKind,
-    CONTAINER_INHERIT_ACE, FILE_EXECUTE, INHERITED_ACE, OBJECT_INHERIT_ACE, PROFILE_DENIED,
-    access_mask, ace_flags, grants, has_explicit_ace, map_generic, may_grant,
+    ADDS_LIBRARY, ALL_APPLICATION_PACKAGES, ALL_RESTRICTED_APPLICATION_PACKAGES, Ace, AceKind,
+    CHANGES_FILE, CONTAINER_INHERIT_ACE, FILE_EXECUTE, INHERITED_ACE, OBJECT_INHERIT_ACE,
+    PROFILE_DENIED, REPLACES_ENTRY, access_mask, ace_flags, changeable_by_others, grants,
+    has_explicit_ace, map_generic, may_grant,
 };
 use crate::name::{FileIdentity, grant_capability_name};
 
@@ -394,6 +396,72 @@ fn capability_sid(name: &str) -> Result<Sid, SandboxError> {
         drop(LocalBox(array.cast()));
     }
     sid
+}
+
+/// Whether only administrators can change the program at `path`: no one else owns it or holds a
+/// right there that changes it (`CHANGES_FILE`), or owns or holds a right on the directory that
+/// holds it that adds or replaces an entry (`ADDS_LIBRARY`: Windows looks for a program's
+/// libraries next to it first), or on a directory above that replaces an entry
+/// (`REPLACES_ENTRY`). `Err` says who else can.
+pub fn administrators_only(path: &Path) -> Result<(), String> {
+    let mut rights = CHANGES_FILE;
+    for entry in path.ancestors() {
+        if let Some(who) = changeable_by(entry, rights)? {
+            return Err(format!("{who} can change {}", entry.display()));
+        }
+        rights = if rights == CHANGES_FILE {
+            ADDS_LIBRARY
+        } else {
+            REPLACES_ENTRY
+        };
+    }
+    Ok(())
+}
+
+/// Who other than administrators holds `rights` on `path` or owns it, `None` when no one does.
+fn changeable_by(path: &Path, rights: u32) -> Result<Option<String>, String> {
+    let wide = wide_nul(path.as_os_str());
+    let (mut owner, mut acl): (PSID, *mut ACL) = (ptr::null_mut(), ptr::null_mut());
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: wide is NUL-terminated; the out pointers are valid or null for the parts not
+    // requested.
+    let error = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            ptr::null_mut(),
+            &mut acl,
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if error != 0 {
+        return Err(format!(
+            "cannot read the permissions of {}: {}",
+            path.display(),
+            std::io::Error::from_raw_os_error(error as i32)
+        ));
+    }
+    let _descriptor = LocalBox(descriptor);
+    if owner.is_null() {
+        return Ok(Some("whoever takes ownership".to_string()));
+    }
+    if acl.is_null() {
+        return Ok(Some("everyone (it has no access control list)".to_string()));
+    }
+    // SAFETY: owner points to a valid SID inside the descriptor, which is still allocated.
+    let owner = unsafe {
+        std::slice::from_raw_parts(owner.cast::<u8>(), GetLengthSid(owner) as usize).to_vec()
+    };
+    let parsed = parse_acl(acl).map_err(|error| error.to_string())?;
+    if parsed.has_unknown_types {
+        return Ok(Some(
+            "an entry of a kind sandy does not read, which may name anyone,".to_string(),
+        ));
+    }
+    Ok(changeable_by_others(&owner, &parsed.entries(), rights))
 }
 
 /// Checks the tree below a directory that is about to receive an inheritable ACE. Called only

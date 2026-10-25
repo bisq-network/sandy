@@ -1,5 +1,6 @@
 mod acl;
 mod appcontainer;
+mod elevate;
 mod forward;
 mod host;
 mod lockfile;
@@ -16,16 +17,13 @@ use std::os::windows::io::AsRawSocket;
 
 use sandy_core::{
     Backend, ChildProcesses, PlanItem, ProtectedPath, Requirement, ResolvedPolicy, SandboxError,
-    Status, StatusReport, TargetCommand, Win32k, path_directories,
+    SetupOptions, SetupOutcome, Status, StatusReport, TargetCommand, Win32k, path_directories,
 };
 use windows_sys::Win32::Security::{
     WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
     WinCapabilityPrivateNetworkClientServerSid,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
-use windows_sys::Win32::System::LibraryLoader::{
-    GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
-};
 use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 use windows_sys::Win32::UI::Shell::{
     FOLDERID_CommonStartup, FOLDERID_Documents, FOLDERID_LocalAppData, FOLDERID_Profile,
@@ -224,18 +222,28 @@ impl Backend for WindowsBackend {
     /// (`plan::loopback_exemption`). With exposed or forwarded ports, also lets the relays run
     /// sandy's executable, which a user without the right to change its permissions cannot do at
     /// run time. Needs administrator rights when it changes something.
-    fn setup(&self, policy: &ResolvedPolicy) -> Result<(), SandboxError> {
+    fn setup(
+        &self,
+        policy: &ResolvedPolicy,
+        _options: SetupOptions,
+    ) -> Result<SetupOutcome, SandboxError> {
         let name = policy.windows.appcontainer_name.as_deref().ok_or_else(|| {
             SandboxError::new("the policy names no AppContainer; pass --appcontainer NAME")
         })?;
         validate_appcontainer_name(name).map_err(SandboxError::new)?;
         let container = appcontainer::sid(name)?;
-        network::set_loopback_exempt(&container, loopback_exemption(policy.ip))?;
+        let exempt = loopback_exemption(policy.ip);
+        network::set_loopback_exempt(&container, exempt)?;
+        let mut done = format!(
+            "the AppContainer {name} is {} the loopback exemption",
+            if exempt { "in" } else { "not in" }
+        );
         if !policy.expose.is_empty() || !policy.forward.is_empty() {
             // The relay rule is read and execute, so no writable-path check reads `held`.
             acl::grant(name, &relay::relay_rule().map_err(SandboxError::new)?, &[])?;
+            done.push_str(", and its relays may run sandy.exe");
         }
-        Ok(())
+        Ok(SetupOutcome::Done(done))
     }
 
     /// Takes back what `setup` and the runs of this policy left behind: the loopback exemption,
@@ -245,7 +253,11 @@ impl Backend for WindowsBackend {
     ///
     /// Entries on objects that have left the policy stay, because nothing says where they are.
     /// Needs administrator rights only where it changes the loopback exemption.
-    fn remove(&self, policy: &ResolvedPolicy) -> Result<(), SandboxError> {
+    fn remove(
+        &self,
+        policy: &ResolvedPolicy,
+        _options: SetupOptions,
+    ) -> Result<SetupOutcome, SandboxError> {
         let name = policy.windows.appcontainer_name.as_deref().ok_or_else(|| {
             SandboxError::new("the policy names no AppContainer; pass --appcontainer NAME")
         })?;
@@ -260,7 +272,29 @@ impl Backend for WindowsBackend {
         if let Ok(rule) = relay::relay_rule() {
             acl::revoke(name, &rule)?;
         }
-        appcontainer::delete_profile(name)
+        appcontainer::delete_profile(name)?;
+        Ok(SetupOutcome::Done(format!(
+            "removed what sandy left for the AppContainer {name}"
+        )))
+    }
+
+    /// With administrator rights already, setup runs here; otherwise sandy runs again after the
+    /// UAC prompt (`elevate`).
+    fn elevate(
+        &self,
+        policy: &ResolvedPolicy,
+        remove: bool,
+        options: SetupOptions,
+        args: &[OsString],
+    ) -> Result<SetupOutcome, SandboxError> {
+        if elevate::is_elevated()? {
+            return if remove {
+                self.remove(policy, options)
+            } else {
+                self.setup(policy, options)
+            };
+        }
+        elevate::run_elevated(args)
     }
 }
 
@@ -614,27 +648,10 @@ type ShGetKnownFolderPath = unsafe extern "system" fn(
     *mut windows_sys::core::PWSTR,
 ) -> windows_sys::core::HRESULT;
 
-/// `SHGetKnownFolderPath`, loaded at run time. shell32.dll loads user32.dll, and user32.dll
-/// fails to initialize in an AppContainer when the window station does not admit AppContainers,
-/// for example in an SSH session (`STATUS_DLL_INIT_FAILED`). `sandy.exe` also runs the relays
-/// in the AppContainer, so it must not import shell32.dll at load time.
+/// `SHGetKnownFolderPath`, loaded at run time (`util::system_function`): shell32.dll must not be
+/// imported at load time.
 fn sh_get_known_folder_path() -> Result<ShGetKnownFolderPath, SandboxError> {
-    let module = wide_nul("shell32.dll".as_ref());
-    // SAFETY: the name is NUL-terminated and the search is limited to System32. sandy never
-    // frees the module, so the function stays valid.
-    let handle = unsafe {
-        LoadLibraryExW(
-            module.as_ptr(),
-            std::ptr::null_mut(),
-            LOAD_LIBRARY_SEARCH_SYSTEM32,
-        )
-    };
-    if handle.is_null() {
-        return Err(util::last_error("cannot load shell32.dll"));
-    }
-    // SAFETY: the module handle is valid and the export name is NUL-terminated.
-    let address = unsafe { GetProcAddress(handle, c"SHGetKnownFolderPath".as_ptr().cast()) }
-        .ok_or_else(|| util::last_error("cannot find SHGetKnownFolderPath"))?;
+    let address = util::system_function("shell32.dll", c"SHGetKnownFolderPath")?;
     // SAFETY: the export has the documented signature of SHGetKnownFolderPath.
     Ok(unsafe {
         std::mem::transmute::<unsafe extern "system" fn() -> isize, ShGetKnownFolderPath>(address)

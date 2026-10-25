@@ -12,7 +12,8 @@ pub const USAGE: &str = "\
 Usage:
   sandy run [OPTIONS] [--] PROGRAM [ARGS...]   run PROGRAM inside the sandbox
   sandy check [OPTIONS] [[--] PROGRAM]         show how this host enforces the policy
-  sandy setup [OPTIONS]                        prepare the host (needs admin rights on Windows)
+  sandy setup [OPTIONS]                        prepare the host (needs admin rights on Windows,
+                                               and on Linux under Ubuntu's AppArmor restriction)
   sandy setup --remove [OPTIONS]               take back what setup and the runs of the policy
                                                left on the host
 
@@ -70,9 +71,18 @@ Options (they extend the policy file):
   -h, --help                 show this help
   -V, --version              show the version
 
+Setup options:
+  --install-copy             on Linux, install a root-owned copy of this sandy in
+                             /usr/local/libexec/sandy/VERSION and prepare the host for it; for
+                             a sandy whose own file is not root-owned
+  --elevate                  ask for the administrator rights setup needs (pkexec on Linux,
+                             UAC on Windows); --policy must then be an absolute path
+
 Exit status: the program's status; 125 when sandy fails or refuses; for check, 0 when the policy
 is enforceable, 1 when it is not, and 2 when only `sandy setup`, run once with administrator
-rights, is missing.
+rights, is missing; for setup, 0 when it is done or nothing is to do, 3 when it is not done and
+nothing changed (the rights were not given, or setup is not allowed for this binary), and 125
+when it failed.
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +280,10 @@ pub struct Invocation {
     pub explain: bool,
     /// `--explain-path`: the paths `check` answers for.
     pub explain_paths: Vec<PathBuf>,
+    /// `--install-copy` of setup.
+    pub install_copy: bool,
+    /// `--elevate` of setup.
+    pub elevate: bool,
     pub program: Option<PathBuf>,
     pub args: Vec<OsString>,
 }
@@ -319,6 +333,8 @@ where
         status_fd: None,
         explain: false,
         explain_paths: Vec::new(),
+        install_copy: false,
+        elevate: false,
         program: None,
         args: Vec::new(),
     };
@@ -394,6 +410,15 @@ where
             }
             Long("end-with-parent") => overrides.end_with_parent = true,
             Long("remove") if invocation.mode == Mode::Setup => invocation.mode = Mode::Remove,
+            Long("install-copy") => invocation.install_copy = true,
+            Long(ELEVATE_OPTION) => {
+                // Given once, so that `--elevate` among the arguments is this flag and nothing
+                // else (see `without_elevate`).
+                if invocation.elevate {
+                    return Err("--elevate given twice".into());
+                }
+                invocation.elevate = true
+            }
             Long("linux-path-metadata") => {
                 overrides.path_metadata = Some(match parser.value()?.string()?.as_str() {
                     "deny" => PathMetadata::Deny,
@@ -473,7 +498,39 @@ where
     if !invocation.explain_paths.is_empty() && invocation.mode != Mode::Check {
         return Err("--explain-path belongs to check".into());
     }
+    let setup = matches!(invocation.mode, Mode::Setup | Mode::Remove);
+    if invocation.install_copy && !setup {
+        return Err("--install-copy belongs to setup".into());
+    }
+    if invocation.elevate && !setup {
+        return Err("--elevate belongs to setup".into());
+    }
+    // The elevated sandy may start in another directory: pkexec starts it in root's home.
+    if invocation.elevate
+        && invocation
+            .policy_file
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+    {
+        return Err("with --elevate, --policy needs an absolute path".into());
+    }
     Ok(Command::Sandbox(Box::new(invocation)))
+}
+
+const ELEVATE_OPTION: &str = "elevate";
+
+/// The arguments sandy was given, without `--elevate`: what the elevated sandy runs with. The
+/// caller has parsed them, so `--elevate` occurs once and as the flag: an option value of that
+/// spelling would make `parse` find the flag a second time, or no option at all.
+pub fn without_elevate(args: &[OsString]) -> Result<Vec<OsString>, String> {
+    let flag = format!("--{ELEVATE_OPTION}");
+    let kept: Vec<OsString> = args.iter().filter(|arg| **arg != *flag).cloned().collect();
+    if args.len() - kept.len() != 1 {
+        return Err(format!(
+            "{flag} must appear exactly once, and not as the value of another option"
+        ));
+    }
+    Ok(kept)
 }
 
 fn network_access(
@@ -786,6 +843,64 @@ mod tests {
     #[test]
     fn run_needs_a_program() {
         assert!(parse_strs(&["run", "--ip", "all"]).is_err());
+    }
+
+    #[test]
+    fn setup_takes_install_copy_and_elevate() {
+        let setup = invocation(&["setup", "--install-copy", "--elevate"]);
+        assert_eq!(setup.mode, Mode::Setup);
+        assert!(setup.install_copy && setup.elevate);
+        let remove = invocation(&["setup", "--elevate", "--install-copy", "--remove"]);
+        assert_eq!(remove.mode, Mode::Remove);
+        assert!(remove.install_copy && remove.elevate);
+        let plain = invocation(&["setup"]);
+        assert!(!plain.install_copy && !plain.elevate);
+        for (args, error) in [
+            (
+                &["check", "--install-copy"][..],
+                "--install-copy belongs to setup",
+            ),
+            (
+                &["run", "--elevate", "/bin/true"][..],
+                "--elevate belongs to setup",
+            ),
+            (
+                &["setup", "--elevate", "--elevate"][..],
+                "--elevate given twice",
+            ),
+            (
+                &["setup", "--elevate", "--policy", "policy.toml"][..],
+                "absolute path",
+            ),
+        ] {
+            let message = parse_strs(args).unwrap_err();
+            assert!(message.contains(error), "{args:?}: {message}");
+        }
+        let absolute = if cfg!(windows) {
+            r"C:\policy.toml"
+        } else {
+            "/etc/policy.toml"
+        };
+        assert!(parse_strs(&["setup", "--elevate", "--policy", absolute]).is_ok());
+    }
+
+    /// The elevated sandy runs with the same arguments, less the flag. A value spelled like the
+    /// flag would make the count differ from what `parse` saw, so it is refused instead of
+    /// dropped.
+    #[test]
+    fn the_elevated_arguments_drop_only_the_flag() {
+        let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            without_elevate(&args(&["setup", "--elevate", "--policy", "/p.toml"])).unwrap(),
+            args(&["setup", "--policy", "/p.toml"])
+        );
+        let value_too = args(&["setup", "--appcontainer", "--elevate", "--elevate"]);
+        assert!(matches!(
+            parse(value_too.clone()),
+            Ok(Command::Sandbox(invocation)) if invocation.elevate
+        ));
+        assert!(without_elevate(&value_too).is_err());
+        assert!(without_elevate(&args(&["setup"])).is_err());
     }
 
     #[test]

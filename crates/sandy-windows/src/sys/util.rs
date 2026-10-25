@@ -1,4 +1,4 @@
-use std::ffi::OsStr;
+use std::ffi::{CStr, OsStr};
 use std::fmt;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
@@ -8,6 +8,9 @@ use sandy_core::SandboxError;
 use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
 use windows_sys::Win32::Security::{
     CreateWellKnownSid, GetLengthSid, IsValidSid, PSID, WELL_KNOWN_SID_TYPE,
+};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
 
 pub fn wide(text: &OsStr) -> Vec<u16> {
@@ -40,6 +43,37 @@ pub fn hresult_to_io(hresult: i32) -> io::Error {
     } else {
         io::Error::other(format!("HRESULT {code:#010x}"))
     }
+}
+
+/// The export `name` of the System32 library `module`, loaded at run time. shell32.dll and
+/// ole32.dll load user32.dll, and user32.dll fails to initialize in an AppContainer when the
+/// window station does not admit AppContainers, for example in an SSH session
+/// (`STATUS_DLL_INIT_FAILED`). `sandy.exe` also runs the relays in the AppContainer, so it must
+/// not import such a library at load time. sandy never frees the module, so the function stays
+/// valid.
+pub fn system_function(
+    module: &str,
+    name: &CStr,
+) -> Result<unsafe extern "system" fn() -> isize, SandboxError> {
+    let wide_module = wide_nul(module.as_ref());
+    // SAFETY: the name is NUL-terminated and the search is limited to System32.
+    let handle = unsafe {
+        LoadLibraryExW(
+            wide_module.as_ptr(),
+            ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    };
+    if handle.is_null() {
+        return Err(last_error(format!("cannot load {module}")));
+    }
+    // SAFETY: the module handle is valid and the export name is NUL-terminated.
+    unsafe { GetProcAddress(handle, name.as_ptr().cast()) }.ok_or_else(|| {
+        last_error(format!(
+            "cannot find {} in {module}",
+            name.to_string_lossy()
+        ))
+    })
 }
 
 /// Memory that a Windows API allocated with `LocalAlloc`.

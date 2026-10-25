@@ -726,6 +726,29 @@ fn an_exempt_appcontainer_cannot_deny_ip() {
     assert!(stdout.contains("exempt"), "{stdout}");
 }
 
+/// `setup --elevate` in a session that has administrator rights already, as the test VM's SSH
+/// session and the CI runners have, runs setup in this process: no UAC prompt, the outcome on
+/// standard output, and the exemption in place; `setup --remove --elevate` takes it back.
+#[test]
+fn elevate_with_administrator_rights_runs_setup_directly() {
+    let name = "sandy.elevate-test";
+    let setup = sandy(["setup", "--elevate", "--appcontainer", name, "--ip", "all"]);
+    let stdout = String::from_utf8_lossy(&setup.stdout);
+    assert!(setup.status.success(), "{setup:?}");
+    assert!(stdout.contains("is in the loopback exemption"), "{stdout}");
+    let check = || sandy(["check", "--appcontainer", name]).status.code();
+    assert_eq!(check(), Some(EXIT_NOT_ENFORCEABLE));
+
+    let removed = sandy(["setup", "--remove", "--elevate", "--appcontainer", name]);
+    assert!(removed.status.success(), "{removed:?}");
+    assert!(
+        String::from_utf8_lossy(&removed.stdout).contains("removed what sandy left"),
+        "{removed:?}"
+    );
+    assert_eq!(check(), Some(0));
+    delete_profile(name);
+}
+
 /// The program has its own console. Ctrl+Break sent to every process on the console must not
 /// reach sandy, whose handler would end the job with STATUS_CONTROL_C_EXIT. sandy runs in a new
 /// console, so a failure cannot reach this test or Cargo.

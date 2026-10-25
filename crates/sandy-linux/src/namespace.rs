@@ -207,8 +207,9 @@ pub type Support = Result<(), Missing>;
 
 const MAX_USER_NAMESPACES: &str = "/proc/sys/user/max_user_namespaces";
 const UNPRIVILEGED_USERNS_CLONE: &str = "/proc/sys/kernel/unprivileged_userns_clone";
-const APPARMOR_RESTRICTION: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
-const APPARMOR_LABEL: &str = "/proc/self/attr/apparmor/current";
+pub(crate) const APPARMOR_RESTRICTION: &str =
+    "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
+pub(crate) const APPARMOR_LABEL: &str = "/proc/self/attr/apparmor/current";
 
 /// What `plan` reads, and none of it is a trial: the two sysctls that disable user namespaces
 /// (`kernel.unprivileged_userns_clone` exists on Debian and Ubuntu kernels only), Ubuntu's

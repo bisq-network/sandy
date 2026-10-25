@@ -5,13 +5,15 @@ mod args;
 mod status;
 mod stdio;
 
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use args::{Command, Invocation, Mode};
 use sandy_core::streams::{CreatableSocket, StandardStream};
 use sandy_core::{
-    Backend, EnforcementPlan, ParentProcess, Policy, ResolvedPolicy, StatusReport, TargetCommand,
-    target_environment,
+    Backend, EnforcementPlan, ParentProcess, Policy, ResolvedPolicy, SetupOptions, SetupOutcome,
+    StatusReport, TargetCommand, target_environment,
 };
 
 const EXIT_FAILURE: u8 = 125;
@@ -19,6 +21,14 @@ const EXIT_NOT_ENFORCEABLE: u8 = 1;
 /// `check`: not enforceable, and `sandy setup` with administrator rights would make it so. A
 /// caller can then ask for those rights and run setup, which it cannot tell from status 1.
 const EXIT_NEEDS_SETUP: u8 = 2;
+/// `setup`: not done, and nothing changed. A caller then runs without what setup prepares,
+/// which it cannot tell from status 125, where something may be half done.
+const EXIT_SETUP_NOT_DONE: u8 = 3;
+
+/// The names a sandy was started under before it handed over to the copy that setup installs
+/// (`hand_over`), separated like `PATH`. Every sandy checks them like its own names and removes
+/// the variable from its environment, so it can only add checks, and the program never sees it.
+const STARTED_AS_VARIABLE: &str = "SANDY_STARTED_AS";
 
 /// Marks the advice `check` writes to standard error. `run` prints none: its standard error
 /// belongs to the program.
@@ -28,7 +38,9 @@ fn main() -> ExitCode {
     // First, so that the window in which sandy's parent can end unseen stays as short as possible
     // (`process.end_with_parent`).
     let parent_at_start = parent_process_id();
-    let command = match args::parse(std::env::args_os().skip(1)) {
+    let started_as = take_started_as();
+    let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let command = match args::parse(arguments.clone()) {
         Ok(command) => command,
         Err(message) => {
             eprintln!("sandy: {message}\n\n{}", args::USAGE);
@@ -46,15 +58,118 @@ fn main() -> ExitCode {
         }
         Command::Relay { listener, target } => relay(listener, target),
         Command::Forward { listen, socket } => forward(listen, &socket),
-        Command::Sandbox(invocation) => match execute(*invocation, parent_at_start) {
-            Ok(code) => code,
-            Err(message) => {
-                eprintln!("sandy: {message}");
-                ExitCode::from(EXIT_FAILURE)
+        Command::Sandbox(invocation) => {
+            if matches!(invocation.mode, Mode::Run | Mode::Check) {
+                hand_over(&started_as);
             }
-        },
+            let context = Context {
+                parent_at_start,
+                started_as,
+                arguments,
+            };
+            match execute(*invocation, &context) {
+                Ok(code) => code,
+                Err(message) => {
+                    eprintln!("sandy: {message}");
+                    ExitCode::from(EXIT_FAILURE)
+                }
+            }
+        }
     }
 }
+
+/// What `main` learns before the invocation runs.
+struct Context {
+    parent_at_start: Option<u32>,
+    /// The names of `STARTED_AS_VARIABLE`.
+    started_as: Vec<PathBuf>,
+    /// sandy's arguments, without the program name.
+    arguments: Vec<OsString>,
+}
+
+/// Reads and removes `STARTED_AS_VARIABLE`, before any thread starts.
+fn take_started_as() -> Vec<PathBuf> {
+    let Some(value) = std::env::var_os(STARTED_AS_VARIABLE) else {
+        return Vec::new();
+    };
+    // SAFETY: sandy has one thread here, so nothing reads the environment at the same time.
+    unsafe { std::env::remove_var(STARTED_AS_VARIABLE) };
+    std::env::split_paths(&value)
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect()
+}
+
+/// On a Linux host where only a root-owned copy of sandy gets user namespaces (`sandy setup
+/// --install-copy`), replaces this process with that copy, with the same arguments, environment
+/// and descriptors, before sandy opens anything. The copy checks the names this sandy was
+/// started under as its own (`STARTED_AS_VARIABLE`), because the next start runs this file
+/// again. Returns when there is no such copy, or when the names cannot be passed intact; this
+/// sandy then runs on as itself.
+#[cfg(target_os = "linux")]
+fn hand_over(started_as: &[PathBuf]) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let Some(copy) = sandy_linux::hand_over_target() else {
+        return;
+    };
+    let mut names = started_as.to_vec();
+    if let Ok(path) = std::env::current_exe() {
+        names.push(path);
+    }
+    names.extend(
+        executed_paths()
+            .into_iter()
+            .filter_map(|path| std::path::absolute(path).ok()),
+    );
+    // A name that holds the separator would arrive as two other names, and its own check would
+    // be lost.
+    let Ok(joined) = std::env::join_paths(&names) else {
+        return;
+    };
+    let c_string = |bytes: Vec<u8>| CString::new(bytes).ok();
+    let Some(program) = c_string(copy.into_os_string().into_vec()) else {
+        return;
+    };
+    let arguments: Option<Vec<CString>> = std::env::args_os()
+        .map(|arg| c_string(arg.into_vec()))
+        .collect();
+    let mut variable = OsString::from(STARTED_AS_VARIABLE);
+    variable.push("=");
+    variable.push(&joined);
+    let environment: Option<Vec<CString>> = std::env::vars_os()
+        .map(|(name, value)| {
+            let mut entry = name;
+            entry.push("=");
+            entry.push(value);
+            entry
+        })
+        .chain(std::iter::once(variable))
+        .map(|entry| c_string(entry.as_bytes().to_vec()))
+        .collect();
+    let (Some(arguments), Some(environment)) = (arguments, environment) else {
+        return;
+    };
+    let pointers = |strings: &[CString]| {
+        strings
+            .iter()
+            .map(|string| string.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect::<Vec<_>>()
+    };
+    // SAFETY: program is NUL-terminated, and both arrays hold NUL-terminated strings that
+    // outlive the call and end with a null pointer. execve returns only when it fails.
+    unsafe {
+        libc::execve(
+            program.as_ptr(),
+            pointers(&arguments).as_ptr(),
+            pointers(&environment).as_ptr(),
+        )
+    };
+}
+
+#[cfg(not(target_os = "linux"))]
+fn hand_over(_started_as: &[PathBuf]) {}
 
 fn relay(listener: u64, target: std::net::SocketAddr) -> ExitCode {
     // SAFETY: a backend starts this command only with a listening socket it passed to this
@@ -204,12 +319,12 @@ fn parent_for(
 
 /// Opens the status channel before anything else, so that every refusal of `run` is reported on
 /// it, and marks a failure on the way out.
-fn execute(invocation: Invocation, parent_at_start: Option<u32>) -> Result<ExitCode, String> {
+fn execute(invocation: Invocation, context: &Context) -> Result<ExitCode, String> {
     let status = match invocation.mode {
         Mode::Run => status::open(invocation.status_fd)?,
         _ => StatusReport::none(),
     };
-    let result = sandbox(invocation, parent_at_start, &status);
+    let result = sandbox(invocation, context, &status);
     if result.is_err() {
         status.failed();
     }
@@ -218,7 +333,7 @@ fn execute(invocation: Invocation, parent_at_start: Option<u32>) -> Result<ExitC
 
 fn sandbox(
     invocation: Invocation,
-    parent_at_start: Option<u32>,
+    context: &Context,
     status: &StatusReport,
 ) -> Result<ExitCode, String> {
     let mut policy = match &invocation.policy_file {
@@ -238,10 +353,14 @@ fn sandbox(
     let parent = parent_for(
         invocation.parent_pid,
         invocation.parent_start,
-        parent_at_start,
+        context.parent_at_start,
         resolved.end_with_parent,
     )?;
-    refuse_writable_trusted_files(&resolved, invocation.policy_file.as_deref())?;
+    refuse_writable_trusted_files(
+        &resolved,
+        invocation.policy_file.as_deref(),
+        &context.started_as,
+    )?;
     let backend = platform_backend();
     if invocation.explain && !backend.can_explain() {
         return Err(format!(
@@ -293,17 +412,35 @@ fn sandbox(
                 Ok(ExitCode::from(EXIT_NOT_ENFORCEABLE))
             }
         }
-        Mode::Setup => {
-            backend
-                .setup(&resolved)
-                .map_err(|error| format!("setup failed: {error}"))?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Mode::Remove => {
-            backend
-                .remove(&resolved)
-                .map_err(|error| format!("setup --remove failed: {error}"))?;
-            Ok(ExitCode::SUCCESS)
+        Mode::Setup | Mode::Remove => {
+            let remove = invocation.mode == Mode::Remove;
+            let options = SetupOptions {
+                install_copy: invocation.install_copy,
+            };
+            let outcome = if invocation.elevate {
+                let arguments = args::without_elevate(&context.arguments)?;
+                backend.elevate(&resolved, remove, options, &arguments)
+            } else if remove {
+                backend.remove(&resolved, options)
+            } else {
+                backend.setup(&resolved, options)
+            };
+            let command = if remove { "setup --remove" } else { "setup" };
+            // An empty message comes from an elevated sandy that has already written its own.
+            match outcome.map_err(|error| format!("{command} failed: {error}"))? {
+                SetupOutcome::Done(message) => {
+                    if !message.is_empty() {
+                        println!("sandy {command}: {message}");
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                SetupOutcome::Refused(message) => {
+                    if !message.is_empty() {
+                        eprintln!("sandy: {command} not done: {message}");
+                    }
+                    Ok(ExitCode::from(EXIT_SETUP_NOT_DONE))
+                }
+            }
         }
         Mode::Run => {
             if !plan.is_enforceable() {
@@ -355,6 +492,7 @@ fn home_directory() -> Option<std::path::PathBuf> {
 fn refuse_writable_trusted_files(
     resolved: &ResolvedPolicy,
     policy_file: Option<&std::path::Path>,
+    started_as: &[PathBuf],
 ) -> Result<(), String> {
     let sandy_path = std::env::current_exe()
         .map_err(|error| format!("cannot find the path of sandy: {error}"))?;
@@ -367,8 +505,12 @@ fn refuse_writable_trusted_files(
     let mut trusted = vec![absolute(&sandy_path)?];
     // The name sandy was started under leads to the same file, but a second name can lie in a
     // writable path. One that no longer exists cannot be used for the next start, so it is left
-    // out instead of refused.
-    for path in executed_paths() {
+    // out instead of refused. After a hand-over, the names of the sandy that handed over count
+    // too: the next start runs that file again.
+    for path in executed_paths()
+        .into_iter()
+        .chain(started_as.iter().cloned())
+    {
         let Ok(path) = absolute(&path) else { continue };
         if path.exists() && !trusted.contains(&path) {
             trusted.push(path);

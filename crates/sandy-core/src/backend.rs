@@ -176,16 +176,67 @@ pub trait Backend {
 
     /// One-time host preparation that needs elevated rights, for example on Windows. Must be
     /// idempotent.
-    fn setup(&self, _policy: &ResolvedPolicy) -> Result<(), SandboxError> {
-        Ok(())
+    fn setup(
+        &self,
+        _policy: &ResolvedPolicy,
+        _options: SetupOptions,
+    ) -> Result<SetupOutcome, SandboxError> {
+        Ok(SetupOutcome::Done(
+            "nothing to do: this platform needs no setup".to_string(),
+        ))
     }
 
     /// Takes back what `setup` and the runs of this policy left on the host. Must be
     /// idempotent, and must touch only what sandy itself created for this policy. A backend
     /// that leaves nothing behind does nothing here.
-    fn remove(&self, _policy: &ResolvedPolicy) -> Result<(), SandboxError> {
-        Ok(())
+    fn remove(
+        &self,
+        _policy: &ResolvedPolicy,
+        _options: SetupOptions,
+    ) -> Result<SetupOutcome, SandboxError> {
+        Ok(SetupOutcome::Done(
+            "nothing to remove: this platform needs no setup".to_string(),
+        ))
     }
+
+    /// `setup --elevate` and `setup --remove --elevate`: `setup` or `remove` with the rights
+    /// they need, asked for from the user. `args` are sandy's own arguments without
+    /// `--elevate`, for a backend that runs sandy again with those rights. The rights must never
+    /// run a file that someone without them can change. A process that already holds them, and
+    /// a backend that needs none, runs the step directly.
+    fn elevate(
+        &self,
+        policy: &ResolvedPolicy,
+        remove: bool,
+        options: SetupOptions,
+        _args: &[OsString],
+    ) -> Result<SetupOutcome, SandboxError> {
+        if remove {
+            self.remove(policy, options)
+        } else {
+            self.setup(policy, options)
+        }
+    }
+}
+
+/// What `sandy setup` and `sandy setup --remove` are asked for besides the policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SetupOptions {
+    /// `--install-copy` (Linux): prepare the host for a root-owned copy of sandy that setup
+    /// installs, instead of for the file that runs.
+    pub install_copy: bool,
+}
+
+/// How `setup` and `setup --remove` end when they do not fail. A failure is an error, exit
+/// status 125.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetupOutcome {
+    /// Done, or nothing to do; the message says which. Exit status 0.
+    Done(String),
+    /// Not done, and nothing changed: the user did not give the rights, or setup may not
+    /// prepare this host for this binary. The message says why and what to do instead. Exit
+    /// status 3.
+    Refused(String),
 }
 
 #[derive(Debug)]

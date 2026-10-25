@@ -405,8 +405,10 @@ host's namespace, where it listens for exposed ports and connects to forward tar
    user namespaces (kernel.apparmor_restrict_unprivileged_userns = 1) applies to sandy, which runs
    unconfined: the user namespace it creates gives it no rights, so it cannot set up the private
    network; an AppArmor profile that allows sandy user namespaces lifts the restriction for sandy
-   alone". An administrator can also set the sysctl to 0, which lifts it for every program. Any
-   other label is a profile, and whether that allows user namespaces only a trial shows.
+   alone". `sandy setup` installs that profile for a sandy that only root can change, or for a
+   root-owned copy of one that is not (see "Setup on Ubuntu"). An administrator can also set the
+   sysctl to 0, which lifts it for every program. Any other label is a profile, and whether that
+   allows user namespaces only a trial shows.
 
 When nothing of this rules the namespaces out, `check` also tries them (`Backend::verify`): a
 forked child runs steps 1 to 3 and 5 and reports the first that fails. The namespaces end with
@@ -457,6 +459,247 @@ answer: a step that fails refuses the run with the step's error.
   so sandy refuses every IP socket there (see "Refusals").
 - The namespace hides nothing of the file system: `/proc` and `/sys`, when granted, describe the
   host, apart from `/proc/net`, which shows the network namespace of the process that reads it.
+
+## Setup on Ubuntu
+
+On Ubuntu 23.10 and newer, `kernel.apparmor_restrict_unprivileged_userns = 1` gives an unconfined
+process no capabilities in a user namespace it creates, so `ip = "private"` cannot work there
+(see "Detection" above). An AppArmor profile with the `userns,` rule lifts the restriction for
+the file it attaches to. Only root can load a profile, and a profile attaches to a path: whatever
+file is at that path gets the right. `sandy setup` therefore writes a profile only for a path that
+only root can change.
+
+### What setup does
+
+`sandy setup`, run as root:
+
+1. Where the restriction does not apply, it does nothing and says so, with exit status 0: the
+   sysctl is absent or 0, or AppArmor is not enabled (`/sys/module/apparmor/parameters/enabled`
+   is not `Y`). That covers Ubuntu 22.04 and the distributions without the sysctl (measured on
+   Ubuntu 22.04 and Fedora 44).
+2. It checks that only root can change the file the kernel runs as sandy (`/proc/self/exe`; see
+   "The root-only check" below). If not, it refuses with exit status 3 and names
+   `--install-copy` and installing from a package.
+3. It writes `/etc/apparmor.d/sandy-setup.PATH`, with the path's `/` as `.`. For
+   `/usr/bin/sandy`:
+
+   ```text
+   # Written by sandy setup for /usr/bin/sandy. `sandy setup --remove` deletes it.
+   abi <abi/4.0>,
+
+   profile sandy-setup.usr.bin.sandy /usr/bin/sandy flags=(unconfined) {
+     userns,
+   }
+   ```
+
+   The first line is sandy's marker. sandy writes the file under a temporary name that starts
+   with a dot, which the AppArmor parser skips when it loads the directory at boot, and renames it
+   into place. An identical file stays as it is, a file with the same marker is replaced, and a
+   file without it is left alone: setup then refuses with status 3.
+4. It loads the profile with `apparmor_parser --replace` and checks that the kernel lists an
+   unconfined profile of that name. The profile loads again at every boot, with the others.
+
+The profile allows `userns` and nothing more: `flags=(unconfined)` leaves every other right as an
+unconfined process has it, and the profile's name becomes the label that the restriction looks
+at. An attachment is a pattern in AppArmor, so a path with characters that mean more there (`*`,
+`?`, `[`, `{`, `@`, a space and others) gets no profile: only letters, digits, `.`, `_`, `+`,
+`-` and `/` are allowed.
+
+### The root-only check
+
+A path passes when its file and every directory above it, up to `/`, belong to root, none is
+writable by its group or by others, none is a symbolic link, and none lies on a file system
+mounted `nosuid`. sandy reads each component with `lstat`, from `/` down, so a component that
+passed can only be changed by root. The sticky bit does not count: `/tmp` (mode 1777) is refused.
+`nosuid` is how a file system arrives that a user controls, such as a removable disk that udisks
+mounts or a FUSE mount; the system does not trust its files with rights either.
+
+ACLs: sandy reads the mode only. POSIX ACLs need no separate read: when a file or directory has
+one, the group bits of its mode are the ACL's mask, and the mask bounds every entry of a named
+user or group, so a mask without write leaves only the owner, root, able to write. Measured on
+Ubuntu 25.10: an entry that gives a user write turns the mode into 775, and setup refuses; with
+the mask set to `r-x` that user's write fails with "Permission denied", the mode reads 755, and
+setup goes ahead. ACLs of other kinds, such as NFSv4 ACLs on a network file system, are not
+read.
+
+### A portable sandy: `--install-copy`
+
+A sandy unpacked into a user's directory fails the check, as it should: anything that user runs
+could replace it. `sandy setup --install-copy`, run as root, copies the running image of sandy,
+read from `/proc/self/exe` and never from the path the caller named, to
+`/usr/local/libexec/sandy/VERSION/sandy`, owned by root with mode 0755, through a temporary file
+in that directory that it renames into place. An identical copy stays. The directories it
+creates get owner root and mode 0755, whatever the umask, a default ACL or a set-group-ID bit
+of the parent say. It checks the directory's existing part before it creates anything, and
+refuses with status 3 when that fails, for example where `/usr/local` is writable by the group
+`staff`. Then it prepares the copy's path as above. It copies nothing else, and the portable file
+gets no profile.
+
+### The hand-over
+
+A portable sandy started for `run` or `check` replaces itself with the copy of its version
+(`execve`, with the same arguments, environment and descriptors) when all of this holds, read in
+this order:
+
+1. it does not run as root, the restriction is on, and its label is `unconfined`;
+2. its own file is not the copy;
+3. the copy exists, and only root can change it;
+4. a profile with the copy's name is loaded and unconfined: every user may read the names and
+   modes of the loaded profiles in `/sys/kernel/security/apparmor/policy/profiles`, though not
+   their attachments, which read `<unknown>` even for root;
+5. the copy has the same bytes as the image this sandy runs.
+
+It does so before it opens anything else: before the policy file, the status descriptor and the
+standard streams. Otherwise it runs on as itself, and `check` reports that the host needs setup.
+The copy runs under its profile, so its label is not `unconfined` and it never hands over again;
+condition 2 stops a loop even where the label would allow one.
+
+**The portable file is still checked.** sandy refuses a policy with a writable path over its own
+file or over a name it was started under (DESIGN.md, rules 3 and 4), because the next start runs
+that file. After the hand-over the copy's own names are the copy's, so the portable sandy passes
+its names in the variable `SANDY_STARTED_AS`: its file (`/proc/self/exe`), the name `execve` was
+given (`AT_EXECFN`), and the names it received there itself, separated by `:`. Every sandy reads
+the variable at its start, removes it from its environment, and checks each name in it that
+exists like its own. The variable can only add checks: a caller that sets it makes sandy check
+more files. A name that holds a `:` cannot pass intact, and then sandy does not hand over. The
+program never sees the variable, also when the policy passes it on
+(`started_as_never_reaches_the_program`).
+
+**Costs.** On a host with the restriction, every `run` and `check` of a portable sandy reads two
+small files. With a copy installed it also checks the copy's path, lists the loaded profiles and
+compares the copy with its own image, which is as large as sandy. Measured on Ubuntu 25.10 (two
+virtual CPUs, the 1.4 MB release build, means of 100 runs of `run -- /usr/bin/true`): a start of
+the portable sandy that hands over takes 0.3 to 0.7 ms more than a start of the copy itself.
+Where the restriction does not apply, the first read ends it.
+
+**The program's label.** The profile is unconfined, and a program that sandy starts keeps
+sandy's label when no other profile attaches to it (the kernel's `domain.c`, "unconfined exec no
+attachment"), so the program runs under a label that allows user namespaces. sandy's seccomp
+filter still denies it every namespace call. Measured on Ubuntu 25.10: a program that the copy
+runs reads `sandy-setup.usr.local.libexec.sandy.2.1.0.sandy (unconfined)` as its label, and
+`unshare -U` and `unshare -n` fail there with "Operation not permitted".
+
+### Removing
+
+`sandy setup --remove`, run as root, takes back only what setup wrote: the profile of the file
+that runs, and only a file that starts with sandy's marker for that path, after it unloaded the
+profile with `apparmor_parser --remove` and checked that the kernel no longer has it. It goes by
+the path, so it also finds the profile after a package replaced the file. With `--install-copy`
+it also removes the copy's profile, the copy, temporary files that setup left in the copy's
+directory, that directory, and `/usr/local/libexec/sandy` when it is empty then. It is
+idempotent: with nothing to remove it says so and exits 0, also without root.
+
+### Asking for root's rights: `--elevate`
+
+`sandy setup --elevate`, run by a user, asks for root's rights with `pkexec`, whose authentication
+agent asks for an administrator's password once. Root never runs a file that someone other than
+root can change:
+
+- Where the restriction does not apply, or with `--remove` where nothing is to remove, it asks
+  for nothing and exits 0. As root it runs setup directly.
+- When only root can change sandy's own file, `pkexec` runs that file with the same arguments,
+  less `--elevate`. pkexec starts the program in root's home directory, so with `--elevate` a
+  `--policy` path must be absolute.
+- A portable sandy with `--install-copy`: root must not run the portable file. `pkexec` runs
+  `/bin/sh -c SCRIPT sandy-setup PID VERSION`. SCRIPT is fixed text in sandy that names every
+  tool by its absolute path (`/usr/bin/mkdir`, `cat`, `cmp`, `chmod`, `mv` and `rm`), and the
+  process ID and the version arrive as positional parameters, never as script text. The
+  script:
+  1. refuses a process ID that is not its parent, and a version with other characters than
+     letters, digits, `.`, `+` and `-` or with a leading `.`, before it writes anything. pkexec
+     runs the shell in its own process, so its parent is the sandy that asked, which waits for
+     it;
+  2. creates the copy's directory, copies `/proc/PID/exe`, the image of that sandy and never the
+     file at its path, to a temporary file there and renames it into place; an identical copy
+     stays;
+  3. checks with `cmp` that the copy has the same bytes as that image, and that the sandy that
+     asked is still its parent, so that the process ID named that sandy during both reads;
+     otherwise it deletes a copy it wrote and fails;
+  4. only then runs the copy's `setup --install-copy`, which checks the copy's path, finds the
+     copy identical to its own image, and writes and loads the profile.
+
+  With `--remove`, pkexec runs the installed copy's `setup --remove --install-copy`, once sandy
+  has checked that only root can change the copy.
+- Otherwise it refuses with status 3, before pkexec runs.
+
+pkexec exits with 126 when the user dismissed the dialog and with 127 when it gave no rights
+(not authorized, or no authentication agent, as in an SSH session); both end with status 3, and
+the message shows the `sudo` command to run instead. So does a missing `pkexec`. The elevated
+sandy writes its own messages, and its statuses 0, 3 and 125 pass through; the script's own
+failures exit with 125.
+
+Measured on Ubuntu 25.10 (pkexec 126): over SSH pkexec finds no agent and exits with 127
+(`elevate_without_an_authentication_agent_is_not_done`). With a temporary polkit rule that let the
+test user run pkexec without a password, each of the three routes took one pkexec call and
+installed and loaded the profile, and the removals left nothing behind. A process ID that was
+not the shell's parent and the version `../../etc` were refused before anything was written.
+
+Why one shell script: polkit's `org.freedesktop.policykit.exec` action asks for the password at
+every call, so two calls (copy, then setup) would ask twice, and pkexec of the portable file
+would have root run a file its user can change. The script runs only system tools, takes the
+image from the waiting process instead of a path, and binds the process ID to its parent, so a
+sandy that ends and a process that takes its ID over cannot hand root another image. pkexec
+writes the whole command, script included, to the system log (measured in `/var/log/auth.log`).
+
+### Exit status
+
+| Status | `sandy setup` and `sandy setup --remove` |
+|---|---|
+| 0 | done, or nothing to do |
+| 3 | not done, and nothing changed: not root and no `--elevate`, the rights were not given, or setup is not allowed for this binary |
+| 125 | failed, for example when the AppArmor parser rejected the profile |
+
+A program that starts sandy can decide by status alone. When `check` exits with 2, it runs
+`sandy setup --elevate`, with `--install-copy` for a sandy it ships in a user's directory. On 0
+it checks again; on 3 it runs its fallback policy, without `ip = "private"`.
+
+### Packaging
+
+A package installs sandy at a path that only root can change, so its maintainer scripts can run
+setup for it. They do not fail the installation when setup fails: `ip = "private"` then needs
+setup later, and `sandy check` says so.
+
+A Debian package, `debian/postinst` and `debian/prerm`:
+
+```sh
+#!/bin/sh
+set -e
+if [ "$1" = configure ]; then
+    /usr/bin/sandy setup || echo "sandy setup failed; ip = \"private\" needs it on this host" >&2
+fi
+#DEBHELPER#
+exit 0
+```
+
+```sh
+#!/bin/sh
+set -e
+case "$1" in
+remove | deconfigure)
+    /usr/bin/sandy setup --remove || true
+    ;;
+esac
+#DEBHELPER#
+exit 0
+```
+
+An upgrade keeps the path, so `prerm upgrade` leaves the profile, and the new `postinst` runs
+setup again.
+
+An RPM package, in the spec file (`$1` is 0 when the package is erased, 1 when it is
+upgraded):
+
+```spec
+%post
+/usr/bin/sandy setup || :
+
+%preun
+if [ "$1" -eq 0 ]; then
+    /usr/bin/sandy setup --remove || :
+fi
+```
+
+On a host without the restriction both scripts do nothing.
 
 ## Contained child processes
 
@@ -1580,7 +1823,7 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   `kernel.unprivileged_userns_clone` 0), or where a trial of the namespaces fails, for example
   inside another sandbox: IpNetworkPrivate is unavailable. Under Ubuntu's AppArmor restriction of
   unprivileged user namespaces it needs setup, and `sandy check` exits with status 2 (see
-  "Private network").
+  "Private network" and "Setup on Ubuntu").
 - A listening address of a relay that another process holds: ExposedPortsRelayed or
   ForwardedPortsRelayed is unavailable. `sandy check` binds the same addresses for a moment and
   releases them again, so it reports what `run` refuses. The answer can be stale one moment
@@ -1750,7 +1993,10 @@ higher, a socket family) call `common::skip`, which records the skip; the README
 from the kernel: below ABI 6, the signal test expects sandy to refuse `signals = "isolated"`.
 The unit tests in `crates/sandy-linux` cover the planning function with invented host
 capabilities, and the filter decisions with a small BPF interpreter that applies every
-installed filter with the kernel's precedence.
+installed filter with the kernel's precedence. `setup_linux.rs` covers `sandy setup`; its tests
+that change the host take root with `sudo -n`, skip where sudo asks for a password
+(`passwordless-sudo`) or the restriction does not apply, run one at a time, and remove what they
+installed without sandy's help, so a failed test leaves nothing behind either.
 
 ### A lower ABI on this kernel
 

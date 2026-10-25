@@ -784,6 +784,29 @@ list, so sandy reads it first and writes it back with one entry added or removed
 can lose one change. `CheckNetIsolation LoopbackExempt -d -n=example.app` also removes the
 exemption.
 
+`sandy setup --elevate` (and `setup --remove --elevate`) asks for administrator rights instead
+of needing them. A process that has them already, as an elevated prompt or the test VM's SSH
+session does, runs setup directly (`elevate_with_administrator_rights_runs_setup_directly`).
+Otherwise sandy runs itself again with the same arguments, less `--elevate`, through the `runas`
+verb of `ShellExecuteExW`, which shows the UAC prompt, in the current directory, and waits for
+its exit status. Administrator rights must not run a file that someone else can change, so sandy
+asks only when no one but SYSTEM, Administrators and TrustedInstaller owns `sandy.exe` or holds a
+right on it that changes it (write data, append, write extended attributes, delete, change the
+DACL or the owner), owns or holds a right on its directory that adds or replaces an entry there
+(Windows looks for a program's libraries in its directory first), or owns or holds a right on a
+directory above that replaces an entry (delete a child, delete, change the DACL or the owner).
+Allow entries count with or without a condition, deny entries are ignored, and an entry of a
+kind sandy does not read refuses, so the check errs towards refusing. The account of an
+administrator does not count as administrators: its processes without elevation hold its SID
+too. Below `C:\Program Files` the check passes; in a user's profile it fails, and sandy refuses
+with status 3. A dismissed UAC prompt also ends with status 3. The elevated sandy has a console
+of its own, which closes when it ends, so its messages do not reach the caller and only its
+exit status does; to read them, run the same command from an elevated prompt.
+`ShellExecuteExW` and `CoInitializeEx` are loaded at run time, like `SHGetKnownFolderPath`:
+shell32.dll and ole32.dll load user32.dll, which fails to initialize in an AppContainer in an
+SSH session, and `sandy.exe` also runs the relays there. Only the elevated route was tested: the
+test VM's SSH session is elevated, and a UAC prompt needs a desktop.
+
 ## Unix sockets
 
 Windows has AF_UNIX sockets. Connecting needs write permission on the socket file, which is a

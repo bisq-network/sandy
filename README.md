@@ -307,7 +307,8 @@ All three exit with status 125, and the program does not start.
 ```text
 sandy run [OPTIONS] [--] PROGRAM [ARGS...]   run PROGRAM inside the sandbox
 sandy check [OPTIONS] [[--] PROGRAM]         show how this host enforces the policy
-sandy setup [OPTIONS]                        prepare the host (needs admin rights on Windows)
+sandy setup [OPTIONS]                        prepare the host (needs admin rights on Windows,
+                                             and on Linux under Ubuntu's AppArmor restriction)
 sandy setup --remove [OPTIONS]               take back what setup and the runs of the policy
                                              left on the host
 ```
@@ -331,14 +332,44 @@ or a cgroup limit the program cannot see). Warnings change neither the exit stat
 per requirement on standard output, so a caller that reads it is not affected. `sandy run` prints
 no warnings: its standard error belongs to the program.
 
-`sandy setup` does the one-time host preparation that needs administrator rights. Today this
-matters only on Windows (see [Windows](#windows)); on Linux and macOS it does nothing.
+`sandy setup` does the one-time host preparation that needs administrator rights:
+
+- **Windows**: the loopback exemption of the policy's AppContainer, and with relays a grant on
+  `sandy.exe` (see [Windows](#windows)).
+- **Linux**, on Ubuntu 23.10 and newer, where AppArmor restricts the user namespaces of
+  unconfined programs: an AppArmor profile that lets sandy use them, which `ip = "private"` needs.
+  A profile gives that right to whatever file is at its path, so setup, run as root, prepares
+  only a sandy whose file and directories up to `/` only root can change, as a package installs
+  it. It refuses any other sandy with status 3. `sandy setup --install-copy` installs a
+  root-owned copy of the running sandy as `/usr/local/libexec/sandy/VERSION/sandy` and prepares
+  that copy instead; a sandy of that version elsewhere then hands its `run` and `check` over to
+  the copy, which still checks the first sandy's file against the policy: the variable
+  `SANDY_STARTED_AS` carries its names, and sandy removes it before the program starts. Elsewhere
+  on Linux setup has nothing to do. See
+  [docs/linux.md](docs/linux.md), "Setup on Ubuntu", also for packaging scripts.
+- **macOS**: nothing to do.
+
+`sandy setup --elevate` asks for those rights instead of needing them: through `pkexec` on Linux,
+whose authentication agent asks for an administrator's password, and through the UAC prompt on
+Windows. It never runs a file with the rights that someone without them can change: on Linux it
+runs sandy's own file only when only root can change it, and otherwise, with `--install-copy`,
+only system tools and the root-owned copy, which it makes from the image of the running sandy;
+on Windows it asks only when only administrators can change `sandy.exe` and its directories.
+Otherwise it refuses with status 3. Where nothing is to do, it asks for nothing. With
+`--elevate`, `--policy` needs an absolute path.
 
 `sandy setup --remove`, with the same policy, takes that preparation back, together with what
 the runs of the policy left on the host: on Windows the loopback exemption, the access control
-entries of the policy paths and the AppContainer profile. The entry on the program file goes only
-when the removal names the program as a `read_exec` path (see docs/windows.md). It is
-idempotent, and on Linux and macOS it does nothing because those backends leave nothing behind.
+entries of the policy paths and the AppContainer profile; on Linux the profile of the running
+sandy, and with `--install-copy` also the copy and its profile. It removes only what sandy
+wrote. The entry on the program file goes only when the removal names the program as a
+`read_exec` path (see docs/windows.md). It is idempotent, takes `--elevate` too, and on macOS
+it does nothing.
+
+| Setup option | Meaning |
+|---|---|
+| `--install-copy` | On Linux, install a root-owned copy of the running sandy as `/usr/local/libexec/sandy/VERSION/sandy` and prepare the host for it, for a sandy whose own file is not root-owned. |
+| `--elevate` | Ask for the administrator rights setup needs: `pkexec` on Linux, UAC on Windows. |
 
 ### Options
 
@@ -422,10 +453,14 @@ it.
 | 125 | sandy failed or refused: invalid policy, a requirement this host cannot enforce, a socket on a standard stream that the policy denies, a pseudo-terminal master on one with `signals = "isolated"`, a setup error; with `children = "contained"` or `--explain` also a failure while sandy supervises the program |
 | 0 / 1 | `sandy check`: the policy is enforceable / not enforceable |
 | 2 | `sandy check`: not enforceable until `sandy setup`, run once with administrator rights, prepares this host, and nothing else is missing |
+| 0 | `sandy setup`, with or without `--remove`: done, or nothing to do |
+| 3 | `sandy setup`, with or without `--remove`: not done, and nothing changed: the rights were not given (on Linux, no root and no `--elevate`; with `--elevate`, a dismissed prompt, no authentication agent, not authorized), or setup is not allowed for this binary |
 
-A program that starts sandy can act on status 2 without reading text: ask the user for
-administrator rights, run `sandy setup` with the same policy (for example through `pkexec` or
-`sudo` on Linux), and run `check` again.
+A program that starts sandy can act on these without reading text. On status 2 from `check`, it
+runs `sandy setup --elevate` with the same policy, adding `--install-copy` on Linux when it
+ships sandy outside a root-only path. On 0 it runs `check` again; on 3 it runs its fallback
+policy, one that needs no setup (on Linux, without `ip = "private"`); 125 means setup failed. A
+refusal also names the command that does it without `--elevate`, such as `sudo`.
 
 On Windows the program's 32-bit exit code is passed through unchanged.
 
@@ -756,7 +791,10 @@ metadata through the descriptor they wrote.
 - **`ip = "private"`** runs the program in a user and network namespace of its own, so it needs
   unprivileged user namespaces. Ubuntu 23.10 and newer restrict them for programs without an
   AppArmor profile; there `sandy check` exits with status 2 until `sandy setup` installs one for
-  sandy. Inside, files of other users and of root show the owner 65534, and `ping` does not work.
+  sandy. That works for a sandy that only root can change, such as a packaged one; for a
+  portable sandy, `sandy setup --install-copy` (or `--elevate --install-copy`) installs a
+  root-owned copy that the portable sandy hands over to ([docs/linux.md](docs/linux.md), "Setup
+  on Ubuntu"). Inside, files of other users and of root show the owner 65534, and `ping` does not work.
   Other users cannot reach the program's ports, but your own processes can enter the namespace,
   for example with `nsenter`, and `sandy check` warns about that
   ([docs/linux.md](docs/linux.md), "Private network").
@@ -824,7 +862,10 @@ metadata through the descriptor they wrote.
 
   It adds the loopback exemption when the policy has `ip = "client"` or `ip = "all"` (removes it
   otherwise), so the program can connect to services on 127.0.0.1, and with `expose` it grants
-  the relay access to `sandy.exe` if your user cannot.
+  the relay access to `sandy.exe` if your user cannot. `--elevate` asks for the rights with the
+  UAC prompt, when only administrators can change `sandy.exe` and its directories, for example
+  below `C:\Program Files`; the elevated sandy's messages go to its own console, so only its exit
+  status comes back.
 - **Inbound loopback.** Windows blocks every connection from outside into an AppContainer, also
   on 127.0.0.1. Use `expose` for programs that accept connections.
 - **Private network.** `ip = "private"` runs the program in its AppContainer without network
@@ -874,8 +915,11 @@ Recommendations:
 4. **Treat everything the program writes as untrusted input**, including files in its data
    directory and everything it sends over exposed ports.
 5. **Do not pass secrets in arguments or the environment** unless the program needs them.
-6. **On Windows**, choose a stable AppContainer name per policy, and run `sandy setup` with
-   administrator rights during installation.
+6. **Run `sandy setup` during installation**, with administrator rights: on Windows, with a
+   stable AppContainer name per policy; on Linux, for `ip = "private"` under Ubuntu's AppArmor
+   restriction, as in the packaging scripts of [docs/linux.md](docs/linux.md). A program without
+   an installer runs `sandy setup --elevate` when `check` exits with 2 (see
+   [Exit status](#exit-status)).
 7. **Give the program pipes, files or a terminal on its standard streams.** sandy passes
    descriptors 0, 1 and 2 on as it got them, so a socket among them would keep its access; sandy
    refuses to start the program then. The connected Unix stream socket that most runtimes pass
