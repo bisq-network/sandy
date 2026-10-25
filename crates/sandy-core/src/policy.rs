@@ -87,7 +87,7 @@ pub enum SystemAccess {
 pub struct NetworkPolicy {
     /// IPv4 and IPv6 networking, including loopback.
     #[serde(default)]
-    pub ip: NetworkAccess,
+    pub ip: IpAccess,
     /// Connecting to Unix domain sockets (pathname and abstract). With `all`, the target can
     /// reach every Unix socket the user can reach, independent of the filesystem rules.
     #[serde(default)]
@@ -157,6 +157,30 @@ pub enum NetworkAccess {
     #[default]
     None,
     All,
+}
+
+/// What the target may do over IPv4 and IPv6, loopback included.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IpAccess {
+    #[default]
+    None,
+    /// Connections and datagrams the target starts, name resolution included, but no listening
+    /// socket and no accepted connection. What a datagram socket receives differs per platform
+    /// (DESIGN.md, "Requirements and the enforcement plan").
+    Client,
+    All,
+}
+
+impl IpAccess {
+    /// The value as the policy writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            IpAccess::None => "none",
+            IpAccess::Client => "client",
+            IpAccess::All => "all",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -428,7 +452,7 @@ mod tests {
     fn empty_policy_denies_everything_optional() {
         let policy = Policy::from_toml("version = 1").unwrap();
         assert_eq!(policy, Policy::default());
-        assert_eq!(policy.network.ip, NetworkAccess::None);
+        assert_eq!(policy.network.ip, IpAccess::None);
         assert_eq!(policy.network.unix_sockets, NetworkAccess::None);
         assert_eq!(policy.filesystem.system, SystemAccess::Minimal);
         assert_eq!(policy.linux.path_metadata, PathMetadata::Deny);
@@ -465,7 +489,7 @@ mod tests {
         .unwrap();
         assert_eq!(policy.filesystem.system, SystemAccess::None);
         assert_eq!(policy.filesystem.read_write, vec![PathBuf::from("/c")]);
-        assert_eq!(policy.network.ip, NetworkAccess::All);
+        assert_eq!(policy.network.ip, IpAccess::All);
         assert_eq!(
             policy.network.expose,
             vec![ExposedPort {
@@ -493,6 +517,15 @@ mod tests {
         assert_eq!(policy.environment.set["HOME"], "/c");
         assert_eq!(policy.linux.path_metadata, PathMetadata::Allow);
         assert_eq!(policy.windows.appcontainer_name.as_deref(), Some("example"));
+    }
+
+    #[test]
+    fn ip_takes_client_and_unix_sockets_does_not() {
+        let policy = Policy::from_toml("version = 1\n[network]\nip = \"client\"").unwrap();
+        assert_eq!(policy.network.ip, IpAccess::Client);
+        let error =
+            Policy::from_toml("version = 1\n[network]\nunix_sockets = \"client\"").unwrap_err();
+        assert!(matches!(error, PolicyError::Parse(_)), "{error}");
     }
 
     #[test]

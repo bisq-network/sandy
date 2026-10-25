@@ -19,6 +19,11 @@ pub enum Requirement {
     EnvironmentControlled,
     /// IPv4 and IPv6 networking is denied, including loopback.
     IpNetworkDenied,
+    /// The target can connect out over IPv4 and IPv6, loopback included, but cannot listen for
+    /// TCP connections or accept one, so no other process can connect to it. A datagram socket
+    /// that is not connected still receives from every sender on Linux and macOS (DESIGN.md,
+    /// the exceptions table).
+    InboundIpDenied,
     /// The target cannot connect to Unix domain sockets outside the paths it may write, so it
     /// cannot reach local services (session bus, service managers, resolvers). This is a lower
     /// bound: Linux and macOS deny Unix sockets completely; Windows, where access to a socket
@@ -59,6 +64,7 @@ impl Requirement {
             }
             Requirement::EnvironmentControlled => "environment limited to policy",
             Requirement::IpNetworkDenied => "IP networking denied",
+            Requirement::InboundIpDenied => "no inbound IP connections",
             Requirement::UnixSocketsDenied => "Unix sockets outside writable paths denied",
             Requirement::SignalsIsolated => "signals limited to the sandbox",
             Requirement::MetadataConfined => "metadata of files outside policy paths protected",

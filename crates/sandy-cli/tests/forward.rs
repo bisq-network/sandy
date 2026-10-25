@@ -40,27 +40,30 @@ fn outside_service() -> (String, JoinHandle<bool>) {
     (address, accepted)
 }
 
+/// The program connects to the relay, which `ip = "client"` allows as well as `ip = "all"`.
 #[test]
 fn forwarded_port_reaches_the_outside_service() {
     let fixture = Fixture::new("forward");
-    let (service, accepted) = outside_service();
-    let inner = free_port();
-    let mut args = fixture.access_args();
-    args.extend([
-        "--ip".to_string(),
-        "all".to_string(),
-        "--forward".to_string(),
-        format!("{inner}={service}"),
-    ]);
-    // The program connects and exits without sending anything. The kernel keeps no owner for
-    // the socket it closed, and the relay serves the connection anyway (rule 6 of "Forwarded
-    // ports").
-    let lines = probe_inside(&args, &[("tcp-connect", &format!("127.0.0.1:{inner}"))]);
-    lines[0].assert_ok();
-    assert!(
-        accepted.join().unwrap(),
-        "the outside service saw no connection"
-    );
+    for ip in ["all", "client"] {
+        let (service, accepted) = outside_service();
+        let inner = free_port();
+        let mut args = fixture.access_args();
+        args.extend([
+            "--ip".to_string(),
+            ip.to_string(),
+            "--forward".to_string(),
+            format!("{inner}={service}"),
+        ]);
+        // The program connects and exits without sending anything. The kernel keeps no owner
+        // for the socket it closed, and the relay serves the connection anyway (rule 6 of
+        // "Forwarded ports").
+        let lines = probe_inside(&args, &[("tcp-connect", &format!("127.0.0.1:{inner}"))]);
+        lines[0].assert_ok();
+        assert!(
+            accepted.join().unwrap(),
+            "the outside service saw no connection with ip = {ip:?}"
+        );
+    }
 }
 
 #[test]
@@ -77,7 +80,7 @@ fn forward_without_ip_is_refused() {
     assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
     assert!(output.stdout.is_empty(), "{output:?}");
     let reason = String::from_utf8_lossy(&output.stderr);
-    assert!(reason.contains("ip = \"all\""), "{reason}");
+    assert!(reason.contains("ip = \"client\" or \"all\""), "{reason}");
 }
 
 /// A program that writes more than the target reads in time, and exits. When the one second of

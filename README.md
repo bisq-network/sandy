@@ -48,7 +48,7 @@ program sees the normal file system, but it can open only what the policy allows
 
 | Platform | Mechanism |
 |---|---|
-| Linux | Landlock (file access, TCP ports, scopes), up to four seccomp-bpf filters, `no_new_privs`, closing inherited descriptors, then `execve` |
+| Linux | Landlock (file access, TCP and UDP ports, scopes), up to four seccomp-bpf filters, `no_new_privs`, closing inherited descriptors, then `execve` |
 | macOS | A Seatbelt profile generated from the policy, applied with `sandbox_init_with_parameters`, then `execve` |
 | Windows | An AppContainer with one capability per policy path, a job object with UI restrictions, and a list of inherited handles |
 
@@ -176,19 +176,23 @@ sandy run \
 
 ### A network client
 
-`--ip all` allows IPv4 and IPv6. On Linux it also adds the files for name resolution and the CA
-certificates to the system set.
+`--ip client` lets the program connect out over IPv4 and IPv6 and resolve names, but not listen
+for or accept connections, so a compromised client cannot open a port for others. On Linux it
+also adds the files for name resolution and the CA certificates to the system set.
 
 ```console
 $ sandy run -- /usr/bin/curl -sS -o /dev/null -w '%{http_code}\n' https://example.org
 curl: (6) Could not resolve host: example.org
 000
-$ sandy run --ip all -- /usr/bin/curl -sS -o /dev/null -w '%{http_code}\n' https://example.org
+$ sandy run --ip client -- /usr/bin/curl -sS -o /dev/null -w '%{http_code}\n' https://example.org
 200
 ```
 
-IP networking is all or nothing: with `--ip all` the program can connect to any address. sandy
-does not filter destinations.
+With `--ip client` or `--ip all` the program can connect to any address; sandy does not filter
+destinations. `--ip all` also lets it listen. On Linux and macOS a UDP socket that is not
+connected still receives datagrams from every sender under `--ip client`, and on Windows the
+program reaches no host of a network that Windows counts as a private network (see
+[Network](#network)).
 
 ### A local server that others connect to
 
@@ -344,7 +348,7 @@ idempotent, and on Linux and macOS it does nothing because those backends leave 
 | `--read-exec PATH` | Allow reading and executing below `PATH`. | |
 | `--read-write PATH` | Allow reading, creating, changing and deleting below `PATH`. Never executing. | |
 | `--system minimal\|none` | Add the minimal set of system paths programs need to start. | `minimal` |
-| `--ip all\|none` | IPv4 and IPv6 networking, including loopback. | `none` |
+| `--ip all\|client\|none` | IPv4 and IPv6 networking, including loopback. `client` connects out but cannot listen or accept. | `none` |
 | `--unix-sockets all\|none` | Unix domain sockets. Read the warning below before using `all`. | `none` |
 | `--signals any\|isolated` | Whether the program may signal processes outside its sandbox. | `any` |
 | `--end-with-parent` | End the program when the process that started sandy ends. Needs `--signals isolated`. See [Processes](#processes). | off |
@@ -355,7 +359,7 @@ idempotent, and on Linux and macOS it does nothing because those backends leave 
 | `--explain-path PATH` | Say what the policy allows for `PATH` and which rule decides it. `check` only, Linux only. | |
 | `--children allowed\|none\|contained` | Whether the program may start other processes, and whether they may outlive it. See [Processes](#processes). | `allowed` |
 | `--expose ADDRESS=PORT` | Relay connections on the loopback `ADDRESS` to the program's loopback `PORT`. Needs `--ip all`. | |
-| `--forward PORT=ADDRESS` | Relay the program's connections to its loopback `PORT` to the loopback `ADDRESS` outside the sandbox. Needs `--ip all`. | |
+| `--forward PORT=ADDRESS` | Relay the program's connections to its loopback `PORT` to the loopback `ADDRESS` outside the sandbox. Needs `--ip client` or `--ip all`. | |
 | `--linux-path-metadata deny\|allow` | On Linux, whether `chmod`, `chown`, `utimensat` and `setxattr` by path are allowed. | `deny` |
 | `--pass-env NAME` | Copy the variable `NAME` into the program's environment, if it is set. | |
 | `--set-env NAME=VALUE` | Set a variable in the program's environment. Overrides `--pass-env`. | |
@@ -451,7 +455,7 @@ read_exec = ["/path"]           # read, list, execute
 read_write = ["/path"]          # read, list, create, change, delete; never execute
 
 [network]
-ip = "none"                     # "none" | "all"
+ip = "none"                     # "none" | "client" | "all"
 unix_sockets = "none"           # "none" | "all"
 expose = [{ listen = "127.0.0.1:18080", port = 8080 }]
 forward = [{ port = 18081, to = "127.0.0.1:8081" }]
@@ -472,9 +476,9 @@ path_metadata = "deny"          # "deny" | "allow"
 appcontainer_name = "example.app"
 ```
 
-The block names every key; it is not a policy that runs as written, because `expose` and
-`forward` need `ip = "all"` and one path cannot be both `read_exec` and `read_write`. Unknown keys
-are errors, so a misspelled key never becomes a silent default.
+The block names every key; it is not a policy that runs as written, because `expose` needs
+`ip = "all"`, `forward` needs `ip = "client"` or `"all"`, and one path cannot be both `read_exec`
+and `read_write`. Unknown keys are errors, so a misspelled key never becomes a silent default.
 
 ### Rules
 
@@ -538,7 +542,21 @@ are errors, so a misspelled key never becomes a silent default.
 
 ### Network
 
-- `ip = "none"` denies IPv4 and IPv6, including loopback. `ip = "all"` allows every destination.
+- `ip = "none"` denies IPv4 and IPv6, including loopback. `ip = "all"` allows every destination
+  and listening.
+- `ip = "client"` lets the program connect and send to every destination, loopback included,
+  resolve names and receive the answers, but not listen for or accept a connection. On Linux
+  `listen` and `accept` fail with `EPERM` for every socket, Unix sockets too (`check` warns when
+  `unix_sockets = "all"`), and from kernel 6.7 (Landlock ABI 4) a TCP socket binds only to a port
+  the kernel chooses, from Landlock ABI 10 a UDP socket too. On macOS `listen` fails. On Windows
+  the program may listen, but no connection or datagram of another process or host that it did
+  not ask for reaches it. What stays open, and `sandy check` names with a warning: on Linux and
+  macOS a UDP socket that is not connected receives datagrams from every sender, not only from
+  the addresses it sent to, at the port the kernel chose for it, and on macOS and Linux before
+  Landlock ABI 10 at any port the program binds it to. On Windows `client` reaches no host of a
+  network that Windows counts as private or domain network, such as a printer on the local
+  network, because Windows has no capability for connections out into such a network alone;
+  names still resolve there, and `ip = "all"` reaches those hosts.
 - `unix_sockets = "none"` guarantees that the program cannot connect to Unix sockets outside the
   paths it may write. Linux and macOS deny connections to every Unix socket; Windows checks
   socket access through the socket file, so it allows the sockets in the `read_write` paths and
@@ -557,13 +575,17 @@ are errors, so a misspelled key never becomes a silent default.
   can create, an IP socket of a protocol other than TCP, UDP, ICMP and MPTCP (SCTP, for example),
   and a socket of any other family, for example a netlink socket that lists the sockets of the
   host. An ICMP datagram socket counts as an IP socket, because an unprivileged program can create
-  one where the system allows it. On Linux `ip = "all"` also accepts a route netlink socket, which
-  the program may create. A connected Unix stream or seqpacket socket is accepted: that is how a
-  parent passes a pipe. A service that is handed its connection on standard input (inetd-style,
-  systemd `Accept=yes`) needs `ip = "all"`. `sandy check` cannot report this, because its own
+  one where the system allows it. On Linux `ip = "all"` and `ip = "client"` also accept a route
+  netlink socket, which the program may create. A connected Unix stream or seqpacket socket is
+  accepted: that is how a parent passes a pipe. Under `ip = "client"` only a connected TCP socket
+  is accepted: a listening socket would let the program take connections, and a datagram socket,
+  also a connected one, datagrams from every sender. A service that is handed its connection on
+  standard input (inetd-style, systemd `Accept=yes`) needs `ip = "client"`, one that is handed a
+  listening socket `ip = "all"`. `sandy check` cannot report this, because its own
   streams are not the streams of the later `run`.
 - `expose` entries: `listen` must be a loopback address, must differ from the program's own
-  address, and may appear only once. They need `ip = "all"` in this version. At most 256
+  address, and may appear only once. They need `ip = "all"`: the program listens for the relay's
+  connections, which `ip = "client"` denies, so sandy refuses `expose` with it. At most 256
   connections per port are relayed at the same time. A connection that is still open when the
   relay ends, one second after the program, is reset, so a cut stream never looks complete.
   With `signals = "any"` the program may stop its own relay. On Linux a stopped relay is killed
@@ -693,10 +715,10 @@ wrote.
   cannot reject the open mode that gets past Landlock, and tar does not fall back. Creating and
   listing archives work, and so does `bsdtar` ([docs/linux.md](docs/linux.md)).
 - **Name resolution across network changes.** A Landlock rule binds a file, so a file the
-  system replaces by rename is lost to a program that is already running. With `--ip all`,
-  sandy grants systemd-resolved's directory, so name resolution keeps working when the network
-  changes. Where `/etc/resolv.conf` is a plain file or leads elsewhere, a long-running program
-  needs a restart after the system replaces it ([docs/linux.md](docs/linux.md)).
+  system replaces by rename is lost to a program that is already running. With `--ip all` or
+  `--ip client`, sandy grants systemd-resolved's directory, so name resolution keeps working when
+  the network changes. Where `/etc/resolv.conf` is a plain file or leads elsewhere, a long-running
+  program needs a restart after the system replaces it ([docs/linux.md](docs/linux.md)).
 - **Tested** on Fedora 44 (kernel 7.2), Ubuntu 22.04 (6.8), Ubuntu 25.10 (6.17) and the GitHub
   Ubuntu 22.04, 24.04 and 24.04-arm runners. The code paths of older Landlock ABIs are tested on
   a newer kernel with the test harness `sandy-abi-cap`, which lowers the ABI sandy reads (see
@@ -741,9 +763,9 @@ wrote.
   sandy setup --policy C:\ProgramData\example\policy.toml
   ```
 
-  It adds the loopback exemption when the policy has `ip = "all"` (removes it otherwise), so the
-  program can connect to services on 127.0.0.1, and with `expose` it grants the relay access to
-  `sandy.exe` if your user cannot.
+  It adds the loopback exemption when the policy has `ip = "client"` or `ip = "all"` (removes it
+  otherwise), so the program can connect to services on 127.0.0.1, and with `expose` it grants
+  the relay access to `sandy.exe` if your user cannot.
 - **Inbound loopback.** Windows blocks every connection from outside into an AppContainer, also
   on 127.0.0.1. Use `expose` for programs that accept connections.
 - **File grants.** sandy grants access by adding entries to the access control lists of the
@@ -808,7 +830,7 @@ sandy protects:
 sandy does not protect:
 
 - secrets the program itself holds, and the data in its `read_write` paths,
-- network traffic the program may send with `ip = "all"`,
+- network traffic the program may send with `ip = "client"` or `ip = "all"`,
 - the availability of the machine (CPU, memory, disk use),
 - against bugs in the operating system kernel.
 

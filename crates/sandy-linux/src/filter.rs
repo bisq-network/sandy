@@ -29,6 +29,9 @@ pub struct FilterConfig {
     pub allow_ip: bool,
     /// Allow AF_UNIX sockets and socket pairs of every type.
     pub allow_unix: bool,
+    /// Deny listening and accepting (`ip = "client"`), for every socket: the filter sees only
+    /// the descriptor, not the family of its socket.
+    pub deny_inbound: bool,
     /// Deny the ways to truncate a file without write access. Landlock checks truncation only
     /// since ABI 3.
     pub restrict_truncate: bool,
@@ -545,6 +548,12 @@ fn denylist(
             libc::SYS_accept,
             libc::SYS_accept4,
         ] {
+            rules.add(call, Vec::new());
+        }
+    } else if config.deny_inbound {
+        // Landlock does not check the port that listen gives an unbound TCP socket (measured on
+        // Linux 7.2), so only this keeps the program from listening.
+        for call in [libc::SYS_listen, libc::SYS_accept, libc::SYS_accept4] {
             rules.add(call, Vec::new());
         }
     }
@@ -1212,6 +1221,7 @@ mod tests {
         FilterConfig {
             allow_ip: false,
             allow_unix: false,
+            deny_inbound: false,
             restrict_truncate: false,
             deny_path_metadata: true,
             deny_children: true,
@@ -1224,6 +1234,7 @@ mod tests {
         FilterConfig {
             allow_ip: true,
             allow_unix: true,
+            deny_inbound: false,
             restrict_truncate: false,
             deny_path_metadata: false,
             deny_children: false,
@@ -1548,6 +1559,29 @@ mod tests {
         ] {
             assert_eq!(call(&strict(), nr, [0; 6]), RET_EPERM, "{nr}");
             assert_eq!(call(&open(), nr, [0; 6]), RET_ALLOW, "{nr}");
+        }
+    }
+
+    /// `ip = "client"`: sockets connect and bind, but none listens or accepts, also not a Unix
+    /// socket with `unix_sockets = "all"`. The socket families are those of `ip = "all"`.
+    #[test]
+    fn client_sockets_neither_listen_nor_accept() {
+        for unix in [false, true] {
+            let client = FilterConfig {
+                allow_unix: unix,
+                deny_inbound: true,
+                ..open()
+            };
+            for nr in [libc::SYS_listen, libc::SYS_accept, libc::SYS_accept4] {
+                assert_eq!(call(&client, nr, [0; 6]), RET_EPERM, "{nr}");
+            }
+            for nr in [libc::SYS_bind, libc::SYS_connect, libc::SYS_sendto] {
+                assert_eq!(call(&client, nr, [0; 6]), RET_ALLOW, "{nr}");
+            }
+            for family in [libc::AF_INET, libc::AF_INET6] {
+                let args = socket(family, libc::SOCK_STREAM, 0);
+                assert_eq!(call(&client, libc::SYS_socket, args), RET_ALLOW);
+            }
         }
     }
 

@@ -99,6 +99,34 @@ fn expose_without_ip_is_refused() {
     assert!(reason.contains("ip = \"all\""), "{reason}");
 }
 
+/// The program has to listen for the relay's connections, which `ip = "client"` denies, so sandy
+/// refuses the policy and says what to use instead.
+#[test]
+fn expose_with_ip_client_is_refused() {
+    let fixture = Fixture::new("expose-client");
+    let mut sandbox_args = fixture.access_args();
+    let (inner, outer) = free_ports();
+    sandbox_args.extend([
+        "--ip".to_string(),
+        "client".to_string(),
+        "--expose".to_string(),
+        format!("127.0.0.1:{outer}={inner}"),
+    ]);
+    let output = sandy(run_args(&sandbox_args, &[("env", "PATH")]));
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let reason = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        reason.contains("ip = \"client\" denies listening; use ip = \"all\""),
+        "{reason}"
+    );
+    let mut check = vec!["check".to_string()];
+    check.extend(platform_args());
+    check.extend(sandbox_args);
+    let output = sandy(&check);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+}
+
 /// The relay holds many connections at once: each one needs two descriptors in the relay, more
 /// than the soft limit of 256 that macOS gives a process, which the relay raises.
 #[test]

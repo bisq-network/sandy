@@ -12,7 +12,7 @@
 //! `terminal_master_refusal`). `check` cannot do this: it does not see the streams of a later
 //! `run`.
 
-use crate::policy::{NetworkAccess, SignalScope};
+use crate::policy::{IpAccess, NetworkAccess, SignalScope};
 use crate::resolve::ResolvedPolicy;
 
 /// One of the three streams every program starts with.
@@ -161,7 +161,11 @@ pub struct CreatableSocket {
 
 /// Why the policy cannot hold for the socket on `stream`, or `None` when it can. A socket is
 /// accepted only when the policy lets the program create one like it; `ip_also_allows` names
-/// what `ip = "all"` allows on this platform besides IP sockets.
+/// what `ip = "all"` and `ip = "client"` allow on this platform besides IP sockets. With
+/// `ip = "client"` that is a connected IP stream socket, which talks only to its peer, like one
+/// the program connects itself. A listening socket would let it take connections, and a datagram
+/// socket datagrams from others, also a connected one: a connect to AF_UNSPEC turns it back into
+/// a socket that receives from every sender, at the port its creator chose.
 pub fn refusal(
     policy: &ResolvedPolicy,
     stream: StandardStream,
@@ -169,15 +173,21 @@ pub fn refusal(
     ip_also_allows: &[CreatableSocket],
 ) -> Option<String> {
     let description = socket.description(ip_also_allows);
-    let (access, setting, hint) = match socket.family {
-        Family::Unix => (
-            policy.unix_sockets,
-            "unix_sockets",
-            Some(
-                "only a connected Unix stream or seqpacket socket, which is how a parent passes \
-                 a pipe, needs neither",
-            ),
-        ),
+    let connection = socket.kind == Kind::Stream && socket.connected && !socket.listening;
+    const INETD: &str = "a service that is handed its connection on standard input, inetd-style \
+        or with systemd Accept=yes, needs that";
+    let (setting, advice) = match socket.family {
+        Family::Unix => {
+            if policy.unix_sockets == NetworkAccess::All || socket.is_a_pipe() {
+                return None;
+            }
+            (
+                "unix_sockets = \"none\" cannot hold for it",
+                "allow what the socket gives with unix_sockets = \"all\": only a connected Unix \
+                 stream or seqpacket socket, which is how a parent passes a pipe, needs neither"
+                    .to_string(),
+            )
+        }
         // An ICMP datagram socket (IPPROTO_ICMP or IPPROTO_ICMPV6) follows `ip` like any other
         // IP datagram socket: an unprivileged program can create one where the kernel allows
         // it, on Linux within net.ipv4.ping_group_range.
@@ -185,17 +195,32 @@ pub fn refusal(
             if matches!(socket.kind, Kind::Stream | Kind::Seqpacket | Kind::Datagram)
                 && IP_PROTOCOLS.contains(&socket.protocol) =>
         {
-            (
-                policy.ip,
-                "ip",
-                Some(
-                    "a service that is handed its connection on standard input, inetd-style or \
-                     with systemd Accept=yes, needs that",
+            match policy.ip {
+                IpAccess::All => return None,
+                IpAccess::Client if connection => return None,
+                IpAccess::Client => (
+                    "ip = \"client\" cannot hold for it: the program could take connections or \
+                     datagrams from others through it",
+                    "allow what the socket gives with ip = \"all\"".to_string(),
                 ),
-            )
+                IpAccess::None if connection => (
+                    "ip = \"none\" cannot hold for it",
+                    format!("allow what the socket gives with ip = \"client\": {INETD}"),
+                ),
+                IpAccess::None => (
+                    "ip = \"none\" cannot hold for it",
+                    format!("allow what the socket gives with ip = \"all\": {INETD}"),
+                ),
+            }
         }
         Family::Other { .. } if socket.creatable_with_ip(ip_also_allows).is_some() => {
-            (policy.ip, "ip", None)
+            if policy.ip != IpAccess::None {
+                return None;
+            }
+            (
+                "ip = \"none\" cannot hold for it",
+                "allow what the socket gives with ip = \"client\"".to_string(),
+            )
         }
         // A raw IP socket needs privileges: CAP_NET_RAW on Linux, which sandy refuses to start
         // with, root on macOS and administrator rights on Windows. It is refused also where the
@@ -209,18 +234,10 @@ pub fn refusal(
             ));
         }
     };
-    if access != NetworkAccess::None || socket.is_a_pipe() {
-        return None;
-    }
-    let mut message = format!(
+    Some(format!(
         "{stream} carries {description}; a socket that is open before the sandbox starts keeps \
-         working inside it, so {setting} = \"none\" cannot hold for it. Redirect the stream, or \
-         allow what the socket gives with {setting} = \"all\""
-    );
-    if let Some(hint) = hint {
-        message += &format!(": {hint}");
-    }
-    Some(message)
+         working inside it, so {setting}. Redirect the stream, or {advice}"
+    ))
 }
 
 /// Why the policy cannot hold for the master side of a pseudo-terminal on `stream`, or `None`
@@ -252,7 +269,7 @@ mod tests {
         protocol: 0,
     };
 
-    fn policy(ip: NetworkAccess, unix_sockets: NetworkAccess) -> ResolvedPolicy {
+    fn policy(ip: IpAccess, unix_sockets: NetworkAccess) -> ResolvedPolicy {
         let mut policy = Policy::default();
         policy.network.ip = ip;
         policy.network.unix_sockets = unix_sockets;
@@ -260,10 +277,10 @@ mod tests {
     }
 
     fn every_policy() -> Vec<ResolvedPolicy> {
-        let settings = [NetworkAccess::None, NetworkAccess::All];
-        settings
+        let unix = [NetworkAccess::None, NetworkAccess::All];
+        [IpAccess::None, IpAccess::Client, IpAccess::All]
             .iter()
-            .flat_map(|&ip| settings.iter().map(move |&unix| policy(ip, unix)))
+            .flat_map(|&ip| unix.iter().map(move |&unix| policy(ip, unix)))
             .collect()
     }
 
@@ -289,7 +306,7 @@ mod tests {
 
     #[test]
     fn a_connected_unix_stream_is_a_pipe_and_stays_allowed() {
-        let denied = policy(NetworkAccess::None, NetworkAccess::None);
+        let denied = policy(IpAccess::None, NetworkAccess::None);
         for kind in [Kind::Stream, Kind::Seqpacket] {
             let pipe = socket(Family::Unix, kind, true, false);
             for stream in StandardStream::ALL {
@@ -300,8 +317,8 @@ mod tests {
 
     #[test]
     fn other_unix_sockets_need_unix_sockets_all() {
-        let denied = policy(NetworkAccess::None, NetworkAccess::None);
-        let allowed = policy(NetworkAccess::None, NetworkAccess::All);
+        let denied = policy(IpAccess::None, NetworkAccess::None);
+        let allowed = policy(IpAccess::None, NetworkAccess::All);
         let cases = [
             socket(Family::Unix, Kind::Stream, false, false),
             socket(Family::Unix, Kind::Stream, false, true),
@@ -318,8 +335,8 @@ mod tests {
 
     #[test]
     fn ip_sockets_need_ip_all() {
-        let denied = policy(NetworkAccess::None, NetworkAccess::All);
-        let allowed = policy(NetworkAccess::All, NetworkAccess::None);
+        let denied = policy(IpAccess::None, NetworkAccess::All);
+        let allowed = policy(IpAccess::All, NetworkAccess::None);
         // ICMP datagram sockets of IPv4 and IPv6, which an unprivileged program can create.
         let icmp = |protocol| Socket {
             protocol,
@@ -342,12 +359,59 @@ mod tests {
         }
     }
 
+    /// With `ip = "client"` the program can make a connection itself, so a connected stream
+    /// socket is accepted; a listening or a datagram socket would let it take connections or
+    /// datagrams from others.
+    #[test]
+    fn ip_client_accepts_only_connected_ip_stream_sockets() {
+        let client = policy(IpAccess::Client, NetworkAccess::None);
+        let connected = socket(Family::Ip, Kind::Stream, true, false);
+        assert_eq!(
+            refusal(&client, StandardStream::Input, connected, &[]),
+            None
+        );
+        let icmp = Socket {
+            protocol: 1,
+            ..socket(Family::Ip, Kind::Datagram, false, false)
+        };
+        for case in [
+            socket(Family::Ip, Kind::Stream, false, true),
+            socket(Family::Ip, Kind::Stream, false, false),
+            socket(Family::Ip, Kind::Datagram, false, false),
+            socket(Family::Ip, Kind::Datagram, true, false),
+            icmp,
+        ] {
+            let message = refusal(&client, StandardStream::Input, case, &[]).expect("refused");
+            assert!(
+                message.contains(
+                    "so ip = \"client\" cannot hold for it: the program could take connections \
+                     or datagrams from others through it. Redirect the stream, or allow what the \
+                     socket gives with ip = \"all\""
+                ),
+                "{message}"
+            );
+        }
+        // Without ip, a connected stream socket needs only client, and a datagram socket all.
+        let denied = policy(IpAccess::None, NetworkAccess::None);
+        let message = refusal(&denied, StandardStream::Input, connected, &[]).expect("refused");
+        assert!(
+            message.contains("allow what the socket gives with ip = \"client\""),
+            "{message}"
+        );
+        let datagram = socket(Family::Ip, Kind::Datagram, true, false);
+        let message = refusal(&denied, StandardStream::Input, datagram, &[]).expect("refused");
+        assert!(
+            message.contains("allow what the socket gives with ip = \"all\""),
+            "{message}"
+        );
+    }
+
     /// A socket of another IP protocol, such as SCTP, needs kernel code that the Linux filter
     /// keeps from the program, so `ip = "all"` does not let it create one, and an inherited one is
     /// refused under every policy. The usual protocols stay accepted.
     #[test]
     fn ip_sockets_of_other_protocols_are_refused_under_every_policy() {
-        let allowed = policy(NetworkAccess::All, NetworkAccess::None);
+        let allowed = policy(IpAccess::All, NetworkAccess::None);
         let with = |kind, protocol| Socket {
             protocol,
             ..socket(Family::Ip, kind, true, false)
@@ -436,24 +500,29 @@ mod tests {
         }
     }
 
-    /// What `ip = "all"` lets the program create besides IP sockets follows `ip` like an IP
-    /// socket, with no hint about inetd-style services.
+    /// What `ip = "all"` and `ip = "client"` let the program create besides IP sockets follows
+    /// `ip` like an IP socket, with no hint about inetd-style services.
     #[test]
     fn a_socket_that_ip_allows_follows_ip() {
         let route = other(16, Some("AF_NETLINK"), Kind::Raw, 0);
         let allows = [ROUTE_NETLINK];
-        let allowed = policy(NetworkAccess::All, NetworkAccess::None);
+        let allowed = policy(IpAccess::All, NetworkAccess::None);
         assert_eq!(
             refusal(&allowed, StandardStream::Input, route, &allows),
             None
         );
-        let denied = policy(NetworkAccess::None, NetworkAccess::All);
+        let client = policy(IpAccess::Client, NetworkAccess::None);
+        assert_eq!(
+            refusal(&client, StandardStream::Input, route, &allows),
+            None
+        );
+        let denied = policy(IpAccess::None, NetworkAccess::All);
         let message = refusal(&denied, StandardStream::Input, route, &allows).expect("refused");
         assert_eq!(
             message,
             "standard input carries a connected route netlink raw socket; a socket that is open \
              before the sandbox starts keeps working inside it, so ip = \"none\" cannot hold for \
-             it. Redirect the stream, or allow what the socket gives with ip = \"all\""
+             it. Redirect the stream, or allow what the socket gives with ip = \"client\""
         );
         // Without the entry, which is the case on every platform but Linux, it is a family like
         // any other.
@@ -463,7 +532,7 @@ mod tests {
 
     #[test]
     fn the_message_names_the_socket() {
-        let denied = policy(NetworkAccess::None, NetworkAccess::None);
+        let denied = policy(IpAccess::None, NetworkAccess::None);
         let listening = socket(Family::Ip, Kind::Stream, false, true);
         let message = refusal(&denied, StandardStream::Output, listening, &[]).unwrap();
         assert!(

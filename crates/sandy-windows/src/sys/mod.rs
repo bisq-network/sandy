@@ -15,11 +15,11 @@ use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::AsRawSocket;
 
 use sandy_core::{
-    Backend, ChildProcesses, NetworkAccess, PlanItem, ProtectedPath, ResolvedPolicy, SandboxError,
+    Backend, ChildProcesses, IpAccess, PlanItem, ProtectedPath, ResolvedPolicy, SandboxError,
     Status, StatusReport, TargetCommand, path_directories,
 };
 use windows_sys::Win32::Security::{
-    WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientServerSid,
+    WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
     WinCapabilityPrivateNetworkClientServerSid,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
@@ -59,10 +59,12 @@ impl Backend for WindowsBackend {
     }
 
     /// What makes the program behave differently inside the sandbox than outside, beyond the
-    /// requirements: a directory on sandy's PATH inside a writable path (rule 12). Before it come
-    /// the shortfalls of the policy (`plan::shortfalls`).
+    /// requirements: the networks `ip = "client"` cannot reach (`plan::notes`) and a directory on
+    /// sandy's PATH inside a writable path (rule 12). Before them come the shortfalls of the
+    /// policy (`plan::shortfalls`).
     fn notes(&self, policy: &ResolvedPolicy) -> Vec<String> {
         let mut notes = crate::plan::shortfalls(policy);
+        notes.extend(crate::plan::notes(policy));
         notes.extend(policy.path_directory_notes(&path_locations()));
         notes
     }
@@ -210,7 +212,7 @@ impl Backend for WindowsBackend {
     }
 
     /// Makes the loopback exemption of the policy's AppContainer match the policy: present with
-    /// `ip = "all"`, absent otherwise. With exposed or forwarded ports, also lets the relays run
+    /// `ip = "client"` and `ip = "all"`, absent with `ip = "none"`. With exposed or forwarded ports, also lets the relays run
     /// sandy's executable, which a user without the right to change its permissions cannot do at
     /// run time. Needs administrator rights when it changes something.
     fn setup(&self, policy: &ResolvedPolicy) -> Result<(), SandboxError> {
@@ -219,7 +221,7 @@ impl Backend for WindowsBackend {
         })?;
         validate_appcontainer_name(name).map_err(SandboxError::new)?;
         let container = appcontainer::sid(name)?;
-        network::set_loopback_exempt(&container, policy.ip == NetworkAccess::All)?;
+        network::set_loopback_exempt(&container, policy.ip != IpAccess::None)?;
         if !policy.expose.is_empty() || !policy.forward.is_empty() {
             // The relay rule is read and execute, so no writable-path check reads `held`.
             acl::grant(name, &relay::relay_rule().map_err(SandboxError::new)?, &[])?;
@@ -632,6 +634,7 @@ fn sh_get_known_folder_path() -> Result<ShGetKnownFolderPath, SandboxError> {
 
 fn network_capability_sid(capability: NetworkCapability) -> Result<Sid, SandboxError> {
     let kind: WELL_KNOWN_SID_TYPE = match capability {
+        NetworkCapability::InternetClient => WinCapabilityInternetClientSid,
         NetworkCapability::InternetClientServer => WinCapabilityInternetClientServerSid,
         NetworkCapability::PrivateNetworkClientServer => WinCapabilityPrivateNetworkClientServerSid,
     };

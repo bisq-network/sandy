@@ -89,7 +89,11 @@ fn fingerprint(policy: &ResolvedPolicy) -> Vec<u8> {
             sandy_core::SystemAccess::Minimal => 0,
             sandy_core::SystemAccess::None => 1,
         },
-        net(policy.ip),
+        match policy.ip {
+            sandy_core::IpAccess::None => 0,
+            sandy_core::IpAccess::All => 1,
+            sandy_core::IpAccess::Client => 2,
+        },
         net(policy.unix_sockets),
         match policy.signals {
             sandy_core::SignalScope::Any => 0,
@@ -170,5 +174,18 @@ mod tests {
         let mut ends = policy();
         ends.end_with_parent = true;
         assert_ne!(fingerprint(&policy()), fingerprint(&ends));
+    }
+
+    #[test]
+    fn every_ip_value_has_its_own_fingerprint() {
+        let with = |ip| {
+            let mut policy = policy();
+            policy.ip = ip;
+            fingerprint(&policy)
+        };
+        let none = with(sandy_core::IpAccess::None);
+        let client = with(sandy_core::IpAccess::Client);
+        let all = with(sandy_core::IpAccess::All);
+        assert!(none != client && client != all && none != all);
     }
 }

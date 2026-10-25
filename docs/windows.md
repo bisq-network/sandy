@@ -22,6 +22,7 @@ isolation.
 | `InheritedHandlesClosed` | `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` with the three standard handles | never |
 | `EnvironmentControlled` | Environment block built from the policy, plus `SystemRoot` and `LOCALAPPDATA` | never |
 | `IpNetworkDenied` | No network capabilities, no loopback exemption | AppContainer exempt from loopback isolation; firewall service not running |
+| `InboundIpDenied` | The `internetClient` capability only; loopback isolation | firewall service not running; no fix for CVE-2021-41338 |
 | `UnixSocketsDenied` | No write access to socket files outside read-write paths | no AppContainer |
 | `SignalsIsolated` | Own console; AppContainer access checks; job UI restrictions | no AppContainer |
 | `ExposedPortsRelayed` | Listening socket created outside the AppContainer; `sandy __relay` in the program's AppContainer and a job of its own | no AppContainer; outer job with UI restrictions; sandy cannot grant read and execute on `sandy.exe`; `sandy.exe` lies in a read-write path |
@@ -433,10 +434,10 @@ lock file, so the directories it left behind stay too; they hold no listener and
 
 With `ip = "none"` the program gets no network capabilities. With `ip = "all"` it gets
 `internetClientServer` (which includes `internetClient`) and `privateNetworkClientServer`
-[Capabilities]. Windows Firewall enforces these rules through the Windows Filtering Platform. The
-plan reports `IpNetworkDenied` as unavailable when the firewall service (`MpsSvc`) does not run:
-whether isolation holds without it is not documented, and Microsoft does not support stopping
-it.
+[Capabilities]. With `ip = "client"` it gets `internetClient` alone. Windows Firewall enforces
+these rules through the Windows Filtering Platform. The plan reports `IpNetworkDenied` and
+`InboundIpDenied` as unavailable when the firewall service (`MpsSvc`) does not run: whether
+isolation holds without it is not documented, and Microsoft does not support stopping it.
 
 Turning the firewall profiles off is a different matter, and an ordinary one: a third-party
 firewall registered with Security Center, or a group policy, turns the Defender Firewall
@@ -447,6 +448,32 @@ connection from outside the sandbox succeeded as the positive control; the profi
 restored to the state they had. The filters that carry the AppContainer rules sit in the
 Windows Service Hardening sublayer, which the profiles do not switch. `sandy check` therefore
 reads the service and not the profiles.
+
+### Client networking
+
+`internetClient` allows connections out to the internet and none in. Windows has no capability
+for connections out into home and work networks alone: `privateNetworkClientServer` also lets the
+hosts of such a network connect in. So under `ip = "client"` the program reaches no host of a
+network that Windows counts as a private or domain network: one whose profile type is Private,
+as Windows sets it for a home network, or a domain network. Names still resolve there, because
+`getaddrinfo` asks the DNS Client service, which runs outside the AppContainer. `sandy check`
+says so in a warning, and `ip = "all"` reaches those hosts.
+
+Measured on Windows 11 build 26200, from the VM to the host of its virtual network, with the
+firewall profiles off, because with them on Windows drops every connection from another host to a
+program without a firewall rule, outside the sandbox too. The profiles and the profile type of
+the network were restored afterwards.
+
+| | profile type Private | profile type Public |
+|---|---|---|
+| `ip = "all"` | everything works, also a connection and datagrams from the host to ports of the program | the same |
+| `ip = "client"`, out | `connect` to the host fails at once with `WSAEACCES` (10013); a DNS query of the program to the host's DNS server gets no answer; `getaddrinfo` of a name only that server knows works | `connect` to the host and a DNS query of the program to it work |
+| `ip = "client"`, in | a connection to a port the program listens on, and a datagram to a port it bound, do not arrive | the same; a datagram from the host also does not arrive at the port the program had just sent a DNS query from, because it comes from another port of the host |
+
+Outside the sandbox every inbound case arrived. Processes of the same machine are loopback
+traffic, which loopback isolation drops in every setting (see "Loopback"); that is what
+`ip_client_takes_no_connections` and `ip_client_datagrams_from_others` check, because the test
+suite has no second host.
 
 A child process could once bypass the isolation through firewall rules that matched only an
 executable path [Project Zero 2021]. Microsoft later published an update for it as
@@ -626,12 +653,13 @@ the program's end (`relay_stops_listening_as_soon_as_the_program_ends`).
 
 ### The setup step
 
-`sandy setup` makes the loopback exemption of the policy's AppContainer match the policy. With
-`--expose`, it also grants the relays read and execute on `sandy.exe` (see "Exposed ports"). Run
-it once per machine as administrator:
+`sandy setup` makes the loopback exemption of the policy's AppContainer match the policy: present
+with `ip = "client"` and `ip = "all"`, absent with `ip = "none"`. With `--expose`, it also grants
+the relays read and execute on `sandy.exe` (see "Exposed ports"). Run it once per machine as
+administrator:
 
 ```text
-sandy setup --appcontainer example.app --ip all     # add the exemption
+sandy setup --appcontainer example.app --ip all     # add the exemption (also --ip client)
 sandy setup --appcontainer example.app              # remove it (ip = "none")
 ```
 
@@ -768,10 +796,13 @@ pseudoconsole through such a pipe is not measured.
   Windows 11 with a listening socket). This holds on every platform for inherited sockets, so
   `run` looks at the three standard handles before it duplicates them and accepts a socket only
   when the policy lets the program create one like it. Otherwise it refuses with exit code 125,
-  naming the handle and the socket: an IP socket with `ip = "none"`, an unconnected, datagram or
-  listening AF_UNIX socket with `unix_sockets = "none"`, and under every policy a raw IP socket
-  and a socket of any other family. Only an administrator can create a raw socket; sandy refuses
-  an inherited one also when it runs as one, so that a policy means the same on every platform.
+  naming the handle and the socket: an IP socket with `ip = "none"`, a listening or datagram IP
+  socket with `ip = "client"` (a socket created outside keeps the rights of its creator in the
+  firewall, so a disconnected datagram socket would receive from every host), an unconnected,
+  datagram or listening AF_UNIX socket with `unix_sockets = "none"`, and under every policy a raw
+  IP socket and a socket of any other family. Only an administrator can create a raw socket;
+  sandy refuses an inherited one also when it runs as one, so that a policy means the same on
+  every platform.
   The capabilities of `ip = "all"` cover IP networking only, and sandy grants no device capability
   such as `bluetooth`. Windows 11 creates an AF_BTH socket also in a virtual machine without a
   Bluetooth radio (measured), and before this rule sandy started the program with one on a standard
@@ -810,10 +841,11 @@ pseudoconsole through such a pipe is not measured.
   later. Earlier builds do not export `DeriveCapabilitySidsFromName`, and none of them receives
   security updates any more. sandy resolves that function at run time, so `sandy check` still
   starts on older builds and reports why it cannot enforce the policy.
-- **Network isolation:** `IpNetworkDenied` also needs the fix for CVE-2021-41338, a bypass of the
-  AppContainer firewall rules. The plan refuses builds without it: 17763 before .2237, 18362
-  (never fixed), 18363 before .1854, 19041 to 19043 before .1288, 20348 before .288 and 22000
-  before .258 [CVE-2021-41338]. The table lives in `crates/sandy-windows/src/version.rs`.
+- **Network isolation:** `IpNetworkDenied` and `InboundIpDenied` also need the fix for
+  CVE-2021-41338, a bypass of the AppContainer firewall rules. The plan refuses builds without
+  it: 17763 before .2237, 18362 (never fixed), 18363 before .1854, 19041 to 19043 before .1288,
+  20348 before .288 and 22000 before .258 [CVE-2021-41338]. The table lives in
+  `crates/sandy-windows/src/version.rs`.
 - **Expected to work, not tested:** Windows 10 1809 (LTSC 2019), 21H2 (LTSC 2021) and 22H2.
 - **Tested:** Windows 11 build 26200 (VM, all tests), Windows Server 2022 and Windows Server
   2025 (GitHub Actions; all tests except the four that need AppContainer child processes, see
@@ -913,6 +945,8 @@ about a path is worse than none, so the backend answers nothing and sandy refuse
     them. A directory that sandy 1.3.2 left behind stays (see "Removing the changes").
 15. A policy path on a network share, also through a mapped drive, is refused; name the local
     path (see "Network and share paths").
+16. With `ip = "client"` the program reaches no host of a private or domain network (see
+    "Client networking").
 
 ## Verified on Windows 11
 
@@ -945,6 +979,12 @@ Facts these runs established:
 - `NetworkIsolationGetAppContainerConfig` works without administrator rights.
 - Listening on loopback succeeds without capabilities; incoming connections time out, also with
   the exemption. Outbound connections to the internet fail with `WSAEACCES` (10013).
+- With `ip = "client"` the program connects to a loopback listener outside through the
+  exemption and gets the answer of a DNS server on loopback; a connection to its listener and
+  datagrams to its sockets from processes outside the AppContainer do not arrive, also a
+  datagram from a third party after the program sent to another peer (`ip_client_connects_out`,
+  `ip_client_takes_no_connections`, `ip_client_datagrams_from_others`). The measurements with a
+  second host are in "Network".
 - A working directory outside the policy does not prevent the start; the program cannot list it.
 - `DeleteAppContainerProfile` from the PowerShell snippet above removes a profile and its
   folder.

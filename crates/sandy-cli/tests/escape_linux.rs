@@ -2206,3 +2206,104 @@ fn refuses_a_loader_in_an_alias_of_a_writable_path() {
     assert_eq!(codes[1], 0, "the control run was refused: {codes:?}");
     assert_eq!(codes[0], EXIT_NOT_ENFORCEABLE, "{codes:?}");
 }
+
+/// Runs the probe in the sandbox under `sandy-abi-cap`, so that sandy sees Landlock ABI `abi`.
+fn probe_capped(
+    cap: &str,
+    abi: &str,
+    sandbox_args: &[String],
+    actions: &[(&str, &str)],
+) -> Vec<ProbeLine> {
+    let output = Command::new(cap)
+        .arg(abi)
+        .arg(sandy_path())
+        .args(run_args(sandbox_args, actions))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "sandy run under the ABI cap failed: {output:?}"
+    );
+    let lines = parse(&output);
+    assert_eq!(lines.len(), actions.len(), "probe output: {lines:?}");
+    lines
+}
+
+/// `ip = "client"` lets a socket bind only to a port the kernel chooses where Landlock can say
+/// so: TCP from ABI 4, UDP from ABI 10. Landlock refuses with `EACCES`. Below ABI 10 a UDP socket
+/// binds any port and receives there from every sender, the route the exceptions table names;
+/// below ABI 4 a TCP socket binds any port too, but the filter keeps it from listening.
+#[test]
+fn client_binds_follow_the_landlock_abi() {
+    if landlock_abi() < 10 {
+        return skip("landlock-abi-10", "UDP bind rules need Landlock ABI 10");
+    }
+    let Some(cap) = abi_cap_path() else {
+        return skip("abi-cap", "sandy-abi-cap is not next to the other binaries");
+    };
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .to_string();
+    let actions = [
+        ("tcp-bind", tcp.as_str()),
+        ("tcp-bind", "127.0.0.1:0"),
+        ("udp-send", "127.0.0.1:9"),
+    ];
+    let client = args(&["--ip", "client"]);
+    let refused = |line: &ProbeLine| {
+        assert_eq!(line.result, "denied", "{line:?}");
+        assert!(line.detail.contains("os error 13)"), "not EACCES: {line:?}");
+    };
+    // A UDP socket on a port the program chose, with sandy seeing `abi`; datagrams from this
+    // process arrive while it waits, unless the bind is refused.
+    let inbound = |abi: &str| {
+        let address = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let target = address.to_string();
+        let mut command = Command::new(&cap);
+        command
+            .arg(abi)
+            .arg(sandy_path())
+            .args(run_args(&client, &[("udp-receive", target.as_str())]));
+        sends_while_running(command, address)
+    };
+
+    let all = controlled(&args(&["--ip", "all"]), &actions[..2]);
+    all[0].assert_ok();
+    let lines = probe_inside(&client, &actions);
+    refused(&lines[0]);
+    lines[1].assert_ok();
+    lines[2].assert_ok();
+    refused(&inbound("10"));
+
+    let lines = probe_capped(&cap, "9", &client, &actions);
+    refused(&lines[0]);
+    lines[1].assert_ok();
+    inbound("9").assert_ok();
+
+    let lines = probe_capped(&cap, "3", &client, &actions[..2]);
+    lines[0].assert_ok();
+    lines[1].assert_ok();
+}
+
+/// seccomp sees the descriptor of `listen`, not the family of its socket, so with
+/// `ip = "client"` a Unix socket cannot listen either, also with `unix_sockets = "all"`.
+#[test]
+fn client_denies_listening_on_unix_sockets_too() {
+    let fixture = Fixture::new("linux-client-unix");
+    let socket = fixture.arg("rw/socket");
+    let actions = [("unix-listen", socket.as_str())];
+    let mut all = fixture.access_args();
+    all.extend(args(&["--ip", "all", "--unix-sockets", "all"]));
+    probe_inside(&all, &actions)[0].assert_ok();
+    let _ = fs::remove_file(&socket);
+    let mut client = fixture.access_args();
+    client.extend(args(&["--ip", "client", "--unix-sockets", "all"]));
+    let line = &probe_inside(&client, &actions)[0];
+    assert_eq!(line.result, "denied", "{line:?}");
+    assert!(line.detail.contains("os error 1)"), "not EPERM: {line:?}");
+}

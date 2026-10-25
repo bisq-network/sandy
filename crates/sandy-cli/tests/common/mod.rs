@@ -6,7 +6,7 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -274,13 +274,13 @@ pub fn platform_args() -> Vec<String> {
     }
 }
 
-/// On Windows, a run with `--ip all` uses this test's AppContainer with the loopback exemption,
-/// unless the test names an AppContainer itself. These options go after the sandbox options,
-/// because the last --appcontainer wins.
+/// On Windows, a run with `--ip all` or `--ip client` uses this test's AppContainer with the
+/// loopback exemption, unless the test names an AppContainer itself. These options go after the
+/// sandbox options, because the last --appcontainer wins.
 fn loopback_args(sandbox_args: &[String]) -> Vec<String> {
     let allows_ip = sandbox_args
         .windows(2)
-        .any(|pair| pair[0] == "--ip" && pair[1] == "all");
+        .any(|pair| pair[0] == "--ip" && (pair[1] == "all" || pair[1] == "client"));
     let names_container = sandbox_args.iter().any(|arg| arg == "--appcontainer");
     if cfg!(windows) && allows_ip && !names_container {
         prepare_loopback_exemption();
@@ -480,20 +480,7 @@ pub fn inbound_tcp(sandbox_args: Option<&[String]>) -> (bool, ProbeLine) {
         .local_addr()
         .unwrap();
     let target = address.to_string();
-    let actions = [("tcp-accept", target.as_str())];
-    let mut command = match sandbox_args {
-        None => {
-            let mut command = Command::new(probe_path());
-            command.args(probe_args(&actions));
-            command
-        }
-        Some(sandbox_args) => {
-            let mut command = Command::new(sandy_path());
-            command.args(run_args(sandbox_args, &actions));
-            command
-        }
-    };
-    let mut child = command
+    let mut child = probe_command(sandbox_args, &[("tcp-accept", target.as_str())])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -503,6 +490,85 @@ pub fn inbound_tcp(sandbox_args: Option<&[String]>) -> (bool, ProbeLine) {
     let mut lines = parse(&output);
     assert_eq!(lines.len(), 1, "{output:?}");
     (connected, lines.remove(0))
+}
+
+/// The probe with `actions`, outside the sandbox when `sandbox_args` is `None`.
+pub fn probe_command(sandbox_args: Option<&[String]>, actions: &[(&str, &str)]) -> Command {
+    match sandbox_args {
+        None => {
+            let mut command = Command::new(probe_path());
+            command.args(probe_args(actions));
+            command
+        }
+        Some(sandbox_args) => {
+            let mut command = Command::new(sandy_path());
+            command.args(run_args(sandbox_args, actions));
+            command
+        }
+    }
+}
+
+/// Starts the probe's `udp-receive` on a free loopback port, outside the sandbox when
+/// `sandbox_args` is `None`, and sends datagrams to it from this process while it waits. Returns
+/// the probe's report.
+pub fn inbound_udp(sandbox_args: Option<&[String]>) -> ProbeLine {
+    let address = UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let target = address.to_string();
+    sends_while_running(
+        probe_command(sandbox_args, &[("udp-receive", target.as_str())]),
+        address,
+    )
+}
+
+/// Runs `command`, a probe with one action that waits for a datagram on `address`, and sends
+/// datagrams there from this process until it ends, for at most 12 seconds.
+pub fn sends_while_running(mut command: Command, address: SocketAddr) -> ProbeLine {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        // A send fails while nothing is bound yet on some platforms; the next one counts.
+        let _ = sender.send_to(b"inbound", address);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().unwrap();
+    let mut lines = parse(&output);
+    assert_eq!(lines.len(), 1, "{output:?}");
+    lines.remove(0)
+}
+
+/// Runs the probe's `udp-reply` against a socket of this process, outside the sandbox when
+/// `sandbox_args` is `None`, and answers the datagram the probe sends from that socket or, with
+/// `third_party`, from another one, which the probe never sent to. Returns the probe's report and
+/// the address the answer came from.
+pub fn udp_answer(sandbox_args: Option<&[String]>, third_party: bool) -> (ProbeLine, SocketAddr) {
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let other = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let answering = if third_party { &other } else { &peer };
+    let from = answering.local_addr().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(12)))
+        .unwrap();
+    let target = peer.local_addr().unwrap().to_string();
+    let child = probe_command(sandbox_args, &[("udp-reply", target.as_str())])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut buffer = [0; 16];
+    if let Ok((_, program)) = peer.recv_from(&mut buffer) {
+        answering.send_to(b"answer", program).unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    let mut lines = parse(&output);
+    assert_eq!(lines.len(), 1, "{output:?}");
+    (lines.remove(0), from)
 }
 
 /// Connects to `address` from this process while `child` runs, for at most 8 seconds.

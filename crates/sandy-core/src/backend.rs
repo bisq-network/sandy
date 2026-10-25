@@ -152,9 +152,10 @@ pub trait Backend {
         Vec::new()
     }
 
-    /// What `ip = "all"` lets the program create on this platform besides AF_INET and AF_INET6
-    /// sockets. `run` accepts such a socket on a standard stream like an IP socket, because the
-    /// program could create one itself, and refuses every other family (see `streams`).
+    /// What `ip = "all"` and `ip = "client"` let the program create on this platform besides
+    /// AF_INET and AF_INET6 sockets. `run` accepts such a socket on a standard stream like an IP
+    /// socket, because the program could create one itself, and refuses every other family (see
+    /// `streams`).
     fn ip_also_allows(&self) -> &'static [CreatableSocket] {
         &[]
     }

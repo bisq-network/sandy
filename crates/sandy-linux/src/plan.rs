@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 use landlock::{ABI, Access, AccessFs, AccessNet, BitFlags, Scope, make_bitflags};
 use sandy_core::{
-    ChildProcesses, NetworkAccess, PathAccess, PathIdentity, PathMetadata, PathRule, PlanItem,
-    ProtectedPath, Requirement, ResolvedPolicy, SignalScope, SystemAccess,
+    ChildProcesses, IpAccess, NetworkAccess, PathAccess, PathIdentity, PathMetadata, PathRule,
+    PlanItem, ProtectedPath, Requirement, ResolvedPolicy, SignalScope, SystemAccess,
 };
 
 use crate::cgroup;
@@ -33,6 +33,9 @@ pub struct LinuxPlan {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sandbox {
     pub landlock: LandlockConfig,
+    /// `ip = "client"`: the Landlock network rights that a socket may use only on port 0, so
+    /// that it binds only to a port the kernel chooses (`client_binds`). Zero for no ruleset.
+    pub client_binds: u64,
     pub filter: FilterConfig,
     /// The relay for exposed ports, when the policy has any.
     pub relay: Option<RelayConfig>,
@@ -48,6 +51,11 @@ pub struct Sandbox {
 
 /// The device and inode number of a file.
 pub type FileIdentity = (u64, u64);
+
+/// `LANDLOCK_ACCESS_NET_BIND_TCP` and `LANDLOCK_ACCESS_NET_BIND_UDP` of linux/landlock.h, from
+/// ABI 4 and ABI 10. The landlock crate does not know the UDP right yet.
+pub const BIND_TCP: u64 = 1 << 0;
+pub const BIND_UDP: u64 = 1 << 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LandlockConfig {
@@ -113,9 +121,14 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
     let sandbox = match (abi, landlock) {
         (Ok(abi), Some(landlock)) if enforceable => Some(Sandbox {
             landlock,
+            client_binds: match policy.ip {
+                IpAccess::Client => port_zero_binds(host),
+                IpAccess::None | IpAccess::All => 0,
+            },
             filter: FilterConfig {
-                allow_ip: policy.ip == NetworkAccess::All,
+                allow_ip: policy.ip != IpAccess::None,
                 allow_unix: policy.unix_sockets == NetworkAccess::All,
+                deny_inbound: policy.ip == IpAccess::Client,
                 restrict_truncate: abi < ABI::V3,
                 deny_path_metadata: policy.path_metadata == PathMetadata::Deny,
                 deny_children: policy.children == ChildProcesses::None,
@@ -132,13 +145,39 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
     LinuxPlan { items, sandbox }
 }
 
+/// The bind rights of `Sandbox::client_binds` on this host: TCP from Landlock ABI 4, UDP from
+/// ABI 10. With them a socket binds only to port 0, which the kernel turns into a free port of
+/// its choice, so a client that names its local address keeps working while no socket takes a
+/// port that others know. The seccomp filter denies listening, so this does not decide whether
+/// the program can take connections; it narrows where datagrams reach it.
+fn port_zero_binds(host: &HostCapabilities) -> u64 {
+    let version = *host.landlock.as_ref().unwrap_or(&0);
+    let mut rights = 0;
+    if version >= 4 {
+        rights |= BIND_TCP;
+    }
+    if version >= 10 {
+        rights |= BIND_UDP;
+    }
+    rights
+}
+
 /// What makes the program behave differently inside the sandbox than outside, beyond the
 /// requirements: a directory on sandy's PATH inside a writable path, an OpenSSL include the
 /// policy does not cover, and a cgroup limit the program cannot see. Before them come the
 /// `shortfalls` of the policy. `sandy check` prints these as warnings; they change nothing sandy
 /// enforces, and a program that uses neither TLS nor the limits runs as it is.
 pub fn notes(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
-    let mut notes = shortfalls(policy);
+    let mut notes = shortfalls(policy, host);
+    if policy.ip == IpAccess::Client && policy.unix_sockets == NetworkAccess::All {
+        notes.push(
+            "with ip = \"client\" the program cannot listen on a Unix socket either on Linux: \
+             seccomp denies listen and accept for every socket, because it cannot tell a Unix \
+             socket from an IP socket; a program that serves on a Unix socket needs ip = \"all\" \
+             there (docs/linux.md, \"Client networking\")"
+                .to_string(),
+        );
+    }
     notes.extend(policy.path_directory_notes(&host.path_locations));
     let Some(rules) = landlock_for(policy, host).map(|landlock| landlock.rules) else {
         // Without Landlock the policy is refused anyway, and there are no rules to compare with.
@@ -176,8 +215,25 @@ pub fn notes(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
 /// What the policy asks for and Linux gives only in part, although the plan reports it as
 /// enforced (DESIGN.md, "Requirements and the enforcement plan"), each with the section of
 /// docs/linux.md that explains it.
-fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
+fn shortfalls(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
     let mut shortfalls = Vec::new();
+    if policy.ip == IpAccess::Client {
+        let any_port = "at any port the program binds it to, because only Landlock ABI 10 \
+            limits UDP binds";
+        let ports = match &host.landlock {
+            _ if port_zero_binds(host) & BIND_UDP != 0 => {
+                "at the port the kernel chose for it".to_string()
+            }
+            Ok(version) => format!("{any_port} and this kernel has ABI {version}"),
+            Err(_) => any_port.to_string(),
+        };
+        shortfalls.push(format!(
+            "ip = \"client\" keeps datagrams out only in part on Linux: a UDP socket that is not \
+             connected receives datagrams from every sender, not only from the addresses it sent \
+             to, {ports}; no seccomp or Landlock rule tells a reply from any other datagram \
+             (docs/linux.md, \"Client networking\")"
+        ));
+    }
     if policy.signals == SignalScope::Isolated && policy.children != ChildProcesses::Contained {
         shortfalls.push(
             "signals = \"isolated\" is enforced only in part on Linux: when the program reads \
@@ -277,6 +333,25 @@ fn plan_item(
         Requirement::EnvironmentControlled => {
             enforced("execve with only the policy environment".to_string())
         }
+        Requirement::InboundIpDenied => match &host.seccomp {
+            Err(reason) => unavailable(reason),
+            Ok(()) => {
+                let mut mechanism =
+                    "seccomp denies listen, accept and accept4 for every socket".to_string();
+                let binds = port_zero_binds(host);
+                if binds & BIND_UDP != 0 {
+                    mechanism.push_str(
+                        "; Landlock ABI 10 lets TCP and UDP sockets bind only to a port the \
+                         kernel chooses",
+                    );
+                } else if binds & BIND_TCP != 0 {
+                    mechanism.push_str(
+                        "; Landlock ABI 4 lets TCP sockets bind only to a port the kernel chooses",
+                    );
+                }
+                enforced(mechanism)
+            }
+        },
         Requirement::IpNetworkDenied => match &host.seccomp {
             Err(reason) => unavailable(reason),
             Ok(()) => {
@@ -536,7 +611,7 @@ fn landlock_config(
         // `unix_sockets = "all"` allows every socket, independent of the filesystem rules.
         handled_fs.remove(AccessFs::ResolveUnix);
     }
-    let handled_net = if policy.ip == NetworkAccess::None && abi >= ABI::V4 {
+    let handled_net = if policy.ip == IpAccess::None && abi >= ABI::V4 {
         AccessNet::BindTcp | AccessNet::ConnectTcp
     } else {
         BitFlags::empty()
@@ -569,10 +644,10 @@ fn landlock_config(
         })
         .collect();
     if policy.system == SystemAccess::Minimal {
-        let ip_all = policy.ip == NetworkAccess::All;
+        let ip = policy.ip != IpAccess::None;
         let needed = system
             .iter()
-            .filter(|entry| entry.needed == Needed::Always || ip_all);
+            .filter(|entry| entry.needed == Needed::Always || ip);
         rules.extend(needed.map(|entry| PathRights {
             path: entry.path.clone(),
             is_dir: entry.is_dir,
@@ -684,7 +759,7 @@ mod tests {
             ],
             program: Some(PathBuf::from("/opt/app/bin/app")),
             system: SystemAccess::Minimal,
-            ip: NetworkAccess::None,
+            ip: IpAccess::None,
             unix_sockets: NetworkAccess::None,
             expose: Vec::new(),
             forward: Vec::new(),
@@ -823,7 +898,7 @@ mod tests {
     #[test]
     fn relayed_ports_need_pidfd_landlock_and_seccomp() {
         let mut policy = policy();
-        policy.ip = NetworkAccess::All;
+        policy.ip = IpAccess::All;
         policy.expose = vec![ExposedPort {
             listen: "127.0.0.1:18080".parse().unwrap(),
             port: 8080,
@@ -1050,11 +1125,98 @@ mod tests {
         let plan = plan_for(&policy, &host(Some(3)));
         assert!(plan.sandbox.unwrap().landlock.handled_net.is_empty());
 
-        policy.ip = NetworkAccess::All;
+        policy.ip = IpAccess::All;
         let plan = plan_for(&policy, &host(Some(9)));
         let sandbox = plan.sandbox.unwrap();
         assert!(sandbox.landlock.handled_net.is_empty());
         assert!(sandbox.filter.allow_ip);
+    }
+
+    /// `ip = "client"` lets the program create IP sockets and denies listening with seccomp on
+    /// every kernel; Landlock adds what each ABI can: binds only to port 0, for TCP from ABI 4
+    /// and for UDP from ABI 10. The TCP rights of `ip = "none"` stay off, so it can connect.
+    #[test]
+    fn client_denies_listening_and_limits_binds_per_abi() {
+        let mut policy = policy();
+        policy.ip = IpAccess::Client;
+        policy.signals = SignalScope::Any;
+        for (abi, binds) in [
+            (3, 0),
+            (4, BIND_TCP),
+            (9, BIND_TCP),
+            (10, BIND_TCP | BIND_UDP),
+        ] {
+            let plan = plan_for(&policy, &host(Some(abi)));
+            let Status::Enforced { mechanism } = status(&plan, Requirement::InboundIpDenied) else {
+                panic!("ABI {abi}: {plan:?}");
+            };
+            assert!(
+                mechanism.starts_with("seccomp denies listen"),
+                "{mechanism}"
+            );
+            assert_eq!(
+                mechanism.contains("Landlock ABI 10"),
+                abi >= 10,
+                "{mechanism}"
+            );
+            assert!(
+                !plan
+                    .items
+                    .iter()
+                    .any(|item| item.requirement == Requirement::IpNetworkDenied)
+            );
+            let sandbox = plan.sandbox.unwrap();
+            assert_eq!(sandbox.client_binds, binds, "ABI {abi}");
+            assert!(sandbox.landlock.handled_net.is_empty(), "ABI {abi}");
+            assert!(sandbox.filter.allow_ip && sandbox.filter.deny_inbound);
+        }
+        let mut no_seccomp = host(Some(10));
+        no_seccomp.seccomp = Err("no seccomp".to_string());
+        let plan = plan_for(&policy, &no_seccomp);
+        assert!(unavailable(&plan).contains(&Requirement::InboundIpDenied));
+
+        // The other values neither deny listening nor add the bind rules.
+        for ip in [IpAccess::None, IpAccess::All] {
+            policy.ip = ip;
+            let sandbox = plan_for(&policy, &host(Some(10))).sandbox.unwrap();
+            assert_eq!(sandbox.client_binds, 0);
+            assert!(!sandbox.filter.deny_inbound);
+        }
+    }
+
+    /// The UDP route that stays open is named in a warning, with the ports this kernel leaves
+    /// to the program, and so is the listen denial that also hits Unix sockets.
+    #[test]
+    fn client_notes_name_what_stays_open() {
+        let mut policy = policy();
+        policy.ip = IpAccess::Client;
+        let udp = |abi| {
+            notes(&policy, &host(Some(abi)))
+                .into_iter()
+                .find(|note| note.starts_with("ip = \"client\" keeps datagrams out only in part"))
+                .unwrap_or_else(|| panic!("ABI {abi}: no UDP note"))
+        };
+        assert!(
+            udp(10).contains("at the port the kernel chose for it"),
+            "{}",
+            udp(10)
+        );
+        assert!(udp(9).contains("this kernel has ABI 9"), "{}", udp(9));
+        let unix = |policy: &ResolvedPolicy| {
+            notes(policy, &host(Some(10)))
+                .iter()
+                .any(|note| note.contains("cannot listen on a Unix socket either"))
+        };
+        assert!(!unix(&policy));
+        policy.unix_sockets = NetworkAccess::All;
+        assert!(unix(&policy));
+        policy.ip = IpAccess::All;
+        assert!(!unix(&policy));
+        assert!(
+            !notes(&policy, &host(Some(10)))
+                .iter()
+                .any(|note| note.contains("keeps datagrams out"))
+        );
     }
 
     #[test]
@@ -1072,10 +1234,12 @@ mod tests {
         let landlock = plan.sandbox.unwrap().landlock;
         assert!(!landlock.rules.iter().any(|r| r.path.starts_with("/etc")));
 
-        let mut with_ip = policy();
-        with_ip.ip = NetworkAccess::All;
-        let plan = plan_for(&with_ip, &host(Some(9)));
-        assert_eq!(rights(&plan, "/etc/hosts"), AccessFs::ReadFile);
+        for ip in [IpAccess::Client, IpAccess::All] {
+            let mut with_ip = policy();
+            with_ip.ip = ip;
+            let plan = plan_for(&with_ip, &host(Some(9)));
+            assert_eq!(rights(&plan, "/etc/hosts"), AccessFs::ReadFile, "{ip:?}");
+        }
 
         let mut no_system = policy();
         no_system.system = SystemAccess::None;

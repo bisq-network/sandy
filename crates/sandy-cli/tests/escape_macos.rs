@@ -236,8 +236,9 @@ fn launchctl_cannot_submit_jobs() {
     assert!(!escaped, "the sandboxed probe submitted a job: {inside:?}");
 }
 
-/// The resolver socket follows `ip`: name resolution is part of IP networking. With
-/// `unix_sockets = "all"` it is reachable like every other Unix socket, on every platform.
+/// The resolver socket follows `ip`: name resolution is part of IP networking, also of
+/// `ip = "client"`. With `unix_sockets = "all"` it is reachable like every other Unix socket, on
+/// every platform.
 #[test]
 fn name_resolver_follows_ip() {
     let fixture = home_fixture("resolver");
@@ -249,10 +250,12 @@ fn name_resolver_follows_ip() {
     denied[0].assert_blocked();
     denied[1].assert_blocked();
 
-    let ip = with(home_args(&fixture), &["--ip", "all"]);
-    let lines = probe_inside(&ip, &actions);
-    lines[0].assert_ok();
-    lines[1].assert_ok();
+    for value in ["all", "client"] {
+        let ip = with(home_args(&fixture), &["--ip", value]);
+        let lines = probe_inside(&ip, &actions);
+        lines[0].assert_ok();
+        lines[1].assert_ok();
+    }
 
     let unix_sockets = with(home_args(&fixture), &["--unix-sockets", "all"]);
     let lines = probe_inside(&unix_sockets, &actions);

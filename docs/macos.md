@@ -84,7 +84,8 @@ compiler fail, and sandy fails closed.
 | `InheritedHandlesClosed` | `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`; descriptors 0, 1 and 2 are named with `posix_spawn_file_actions_addinherit_np`. The kernel closes every other descriptor during the exec. With `children = "contained"` the forked target, a single thread, marks every descriptor above 2 close-on-exec (`PROC_PIDLISTFDS`) right before `execve`. |
 | `EnvironmentControlled` | `posix_spawn` (with `children = "contained"`: `execve`) receives exactly `command.env`. The backend adds no variable. |
 | `IpNetworkDenied` | Profile: no `network-*` rule for IP. The name resolver is unreachable unless `unix_sockets = "all"`. |
-| `UnixSocketsDenied` | Profile: no `network-bind` or `network-outbound` for Unix sockets. With `ip = "all"`, the resolver socket is the one exception. |
+| `InboundIpDenied` | Profile: `network-outbound` and `network-bind` for IP sockets, `network-inbound` only for UDP sockets, so `listen` and `accept` fail for TCP (see [Networking](#networking)). |
+| `UnixSocketsDenied` | Profile: no `network-bind` or `network-outbound` for Unix sockets. With `ip = "client"` or `ip = "all"`, the resolver socket is the one exception. |
 | `SignalsIsolated` | Profile: `(allow signal (target self) (target same-sandbox))` instead of `(allow signal)`, and `(deny system-fcntl (fcntl-command 6))`, which closes `F_SETOWN`, one of the ways to have the kernel send SIGIO to any process. The other ways, through ioctls on sockets and pipes, and the kernel's job control signals stay outside it (see [Signals the profile does not cover](#signals-the-profile-does-not-cover)). |
 | `ChildProcessesDenied` | Profile: no `(allow process-fork)`, and an explicit `(deny process-fork)` at the end. Seatbelt checks `fork`, `vfork` and `posix_spawn` without `POSIX_SPAWN_SETEXEC` as `process-fork`; all three fail with `EPERM` (CI run 39857337279 logged `deny(1) process-fork` for each). Threads are no operation, and `execve` of an allowed program, which replaces the image without creating a process, stays covered by `process-exec*`. sandy's own final `posix_spawn` with `POSIX_SPAWN_SETEXEC` is not a `process-fork`, and the relay is forked before the profile applies, so both still work. |
 | `EndsWithParent` | A watcher process outside the sandbox with its own profile; see [Ending with the parent](#ending-with-the-parent). |
@@ -435,6 +436,25 @@ gets them ignored unless the binary carries the `allow-dyld-environment-variable
 - `ip = "all"`: `(allow network-outbound (remote ip))` and `(allow network-bind network-inbound
   (local ip))`. `ip` covers IPv4 and IPv6 (SBPL has `ip4` and `ip6` for one family), including
   loopback. Apple's `appsandbox-common.sb` uses the same bare `(remote ip)`.
+- `ip = "client"`: `(allow network-outbound (remote ip))`, `(allow network-bind (local ip))` and
+  `(allow network-inbound (local udp))`. Measured on macOS 27.0.1, in a profile that allowed
+  everything but networking and in `sandy run`: Seatbelt checks `listen`, also on an unbound
+  socket, and `accept` as `network-inbound`, so with it denied for TCP both fail with `EPERM`,
+  while `connect` and a connected UDP socket need only `network-outbound`. It checks as
+  `network-inbound` too every datagram that a socket which is not connected receives: without
+  the UDP rule `recvfrom` failed with `EPERM` after a `sendto`, and the answer of the peer was
+  lost. Clients that receive that way (QUIC, DNS and NTP clients, Rust's
+  `UdpSocket::bind("0.0.0.0:0")` with `send_to`) need it, so the profile allows it for UDP. Allowing
+  `network-inbound` also allows `network-bind`. `network-bind` itself covers only `bind`: a
+  connect or a first send that picks a port needs no rule. A filter on port 0 does not exist:
+  `(local ip "*:0")` does not compile ("invalid port in network address"), so the profile cannot
+  limit binds to a port the kernel chooses, as Linux does.
+
+  What stays open, an exception of DESIGN.md: a UDP socket that is not connected receives
+  datagrams from every sender, not only from the addresses it sent to, at any port the program
+  binds it to. Seatbelt cannot tell a reply from any other datagram. `sandy check` warns about it,
+  and `ip_client_datagrams_from_others` records it: a datagram from a third party reached the
+  socket that had sent to another peer, and one reached a port the program had bound itself.
 - `unix_sockets = "all"`: `(allow network-outbound (remote unix-socket))` and `(allow network-bind
   network-inbound (local unix-socket))`. This allows every Unix socket the user can reach,
   independent of the filesystem rules, as on every platform.
@@ -456,11 +476,11 @@ gets them ignored unless the binary carries the `allow-dyld-environment-variable
 the Mach service `com.apple.dnssd.service`, which Network.framework uses; the profile does not
 allow it, so only `getaddrinfo` and the dns_sd API work.
 
-- `ip = "all"`: the profile allows connecting to exactly this socket, reading `/private/etc/hosts`,
-  and passing through the `/var` link. Name resolution is part of IP networking, so it does not
-  require `unix_sockets = "all"`. Through the resolver the target can only do what IP networking
-  already allows (queries, service registration on the local network, port mappings on the
-  router). The plan names this exception for `UnixSocketsDenied`.
+- `ip = "all"` and `ip = "client"`: the profile allows connecting to exactly this socket, reading
+  `/private/etc/hosts`, and passing through the `/var` link. Name resolution is part of IP
+  networking, so it does not require `unix_sockets = "all"`. Through the resolver the target can
+  only do what IP networking already allows (queries, service registration on the local network,
+  port mappings on the router). The plan names this exception for `UnixSocketsDenied`.
 - `ip = "none"` and `unix_sockets = "none"`: the resolver is unreachable.
 - `ip = "none"` and `unix_sockets = "all"`: the resolver is reachable like every other Unix
   socket. The target cannot open IP sockets, but it can make mDNSResponder send DNS queries,
@@ -578,9 +598,10 @@ without that check, because the kernel sends those signals itself:
   process of another user (uid 501) that handled it, through each owner ioctl, by process id and
   by negative process group; `F_SETOWN` stayed denied. SIGURG was measured within one user only,
   and a target owned by root was not tested. The same owner
-  gets SIGURG when urgent data arrives on a TCP socket, which with `ip = "all"` the program can
-  send itself over loopback; measured the same way. Not even the `ioctl` system call as a whole
-  can be denied: a `syscall-unix` rule for its number has no effect, while the same rule stops
+  gets SIGURG when urgent data arrives on a TCP socket, which with `ip = "all"` or
+  `ip = "client"` the program can send itself over loopback; measured the same way. Not even the
+  `ioctl` system call as a whole can be denied: a `syscall-unix` rule for its number has no
+  effect, while the same rule stops
   `fsgetpath` (measured on macOS 26.5 and 27.0.1). The program cannot choose the signal, and the
   default action of SIGIO and SIGURG is to discard it, so only a process that handles them
   notices; a negative owner names a process group, so one ioctl reaches every such process of a
@@ -606,7 +627,8 @@ without that check, because the kernel sends those signals itself:
   join one.
 
 `sandy check` prints both routes as warnings for a policy with `signals = "isolated"`: SIGIO
-always, SIGURG with `ip = "all"`, and the job control route without `children = "contained"`.
+always, SIGURG with `ip = "client"` or `ip = "all"`, and the job control route without
+`children = "contained"`.
 The interrupt characters typed into a pseudo-terminal master are one more such route; `run`
 refuses a master on a standard stream instead (see [Inherited descriptors](#inherited-descriptors)).
 

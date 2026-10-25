@@ -260,6 +260,33 @@ fn forward_args(to: &TcpListener) -> [String; 4] {
     ]
 }
 
+/// `ip = "client"` is a requirement of its own. On Linux and macOS a UDP socket that is not
+/// connected still receives from every sender, which check names (DESIGN.md, the exceptions
+/// table); Windows drops such datagrams, so it says nothing there. The controls: no warning with
+/// `ip = "all"`, which promises no such thing.
+#[test]
+fn check_reports_client_networking_and_warns_about_datagrams() {
+    let mut args = vec!["check".to_string()];
+    args.extend(platform_args());
+    args.extend(["--ip".to_string(), "client".to_string()]);
+    let output = sandy(&args);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("enforced     no inbound IP connections: ")),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("IP networking denied"), "{stdout}");
+
+    let gap = "ip = \"client\" keeps datagrams out only in part";
+    let stderr = check_warnings(&["--ip", "client"]);
+    assert_eq!(warns(&stderr, gap), !cfg!(windows), "{stderr}");
+    let stderr = check_warnings(&["--ip", "all"]);
+    assert!(!warns(&stderr, gap), "{stderr}");
+}
+
 /// In the exec model the program runs in the process group sandy was started in, and the kernel
 /// stops that whole group when the program reads the terminal from the background
 /// (docs/linux.md, "Signals and the terminal"). check says so for isolated signals, and not

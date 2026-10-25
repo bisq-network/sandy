@@ -69,6 +69,7 @@ pub fn launch(
         watch::start(parent, sandbox.landlock.abi)?;
     }
     let ruleset = prepare_ruleset(&sandbox.landlock, &sandbox.identities)?;
+    let binds = prepare_client_binds(sandbox.client_binds)?;
     // The filter is built again in the forked child, whose process ID it needs, but a policy it
     // cannot express fails here, before anything starts.
     build_filters(&sandbox.filter)?;
@@ -85,7 +86,7 @@ pub fn launch(
             SandboxError::io(format!("cannot change to {}", cwd.display()), error)
         })?;
     }
-    let start = || match confine(ruleset, &sandbox.filter, observer.as_ref()) {
+    let start = || match confine(ruleset, binds, &sandbox.filter, observer.as_ref()) {
         Ok(()) => exec.execute(),
         Err(error) => error,
     };
@@ -113,6 +114,7 @@ fn build_filters(config: &FilterConfig) -> Result<Filters, SandboxError> {
 /// sandy's answer.
 fn confine(
     ruleset: RulesetCreated,
+    binds: Option<OwnedFd>,
     filter: &FilterConfig,
     observer: Option<&Observer>,
 ) -> Result<(), SandboxError> {
@@ -124,6 +126,7 @@ fn confine(
     set_no_new_privs()?;
     ensure_single_thread()?;
     restrict(ruleset)?;
+    restrict_client_binds(binds)?;
     filter::install(&filters).map_err(|error| {
         SandboxError::new(format!("cannot install the seccomp filter: {error}"))
     })?;
@@ -164,6 +167,94 @@ fn prepare_ruleset(
             .map_err(landlock_error)?;
     }
     Ok(ruleset)
+}
+
+/// The ruleset of `Sandbox::client_binds`: it handles `rights` and grants them on port 0 only,
+/// so that a socket binds only to a port the kernel chooses. sandy makes it with the system calls
+/// themselves, because the landlock crate does not know the UDP right of ABI 10, and applies it
+/// as a second Landlock layer right after the first.
+fn prepare_client_binds(rights: u64) -> Result<Option<OwnedFd>, SandboxError> {
+    /// `struct landlock_ruleset_attr` up to `handled_access_net`, which every kernel with
+    /// network rights knows.
+    #[repr(C)]
+    struct RulesetAttr {
+        handled_access_fs: u64,
+        handled_access_net: u64,
+    }
+    /// `struct landlock_net_port_attr`.
+    #[repr(C)]
+    struct NetPortAttr {
+        allowed_access: u64,
+        port: u64,
+    }
+    const LANDLOCK_RULE_NET_PORT: libc::c_int = 2;
+    if rights == 0 {
+        return Ok(None);
+    }
+    let failed = |what: &str| {
+        SandboxError::io(
+            format!("Landlock: cannot {what} the bind rules of ip = \"client\""),
+            io::Error::last_os_error(),
+        )
+    };
+    let attr = RulesetAttr {
+        handled_access_fs: 0,
+        handled_access_net: rights,
+    };
+    // SAFETY: attr is a ruleset attribute of the size passed, and the kernel only reads it.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            &attr as *const RulesetAttr,
+            std::mem::size_of::<RulesetAttr>(),
+            0u32,
+        )
+    };
+    if fd < 0 {
+        return Err(failed("create"));
+    }
+    // SAFETY: the kernel just created the descriptor, close-on-exec, and nothing else owns it.
+    let ruleset = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
+    let port = NetPortAttr {
+        allowed_access: rights,
+        port: 0,
+    };
+    // SAFETY: the ruleset is open and `port` is a rule of type LANDLOCK_RULE_NET_PORT, which the
+    // kernel only reads.
+    let added = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_add_rule,
+            std::os::fd::AsRawFd::as_raw_fd(&ruleset),
+            LANDLOCK_RULE_NET_PORT,
+            &port as *const NetPortAttr,
+            0u32,
+        )
+    };
+    if added != 0 {
+        return Err(failed("add"));
+    }
+    Ok(Some(ruleset))
+}
+
+fn restrict_client_binds(ruleset: Option<OwnedFd>) -> Result<(), SandboxError> {
+    let Some(ruleset) = ruleset else {
+        return Ok(());
+    };
+    // SAFETY: the ruleset is open, and no_new_privs is set, which the call needs.
+    let restricted = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_restrict_self,
+            std::os::fd::AsRawFd::as_raw_fd(&ruleset),
+            0u32,
+        )
+    };
+    if restricted != 0 {
+        return Err(SandboxError::io(
+            "Landlock: cannot apply the bind rules of ip = \"client\"",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
 }
 
 /// Opens the canonical rule path `path` one component at a time without following a symbolic

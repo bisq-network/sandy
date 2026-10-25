@@ -77,6 +77,7 @@ can write, so the rule then reaches nothing that this process could not reach al
 | InheritedHandlesClosed | Close-on-exec on every descriptor above 2. |
 | EnvironmentControlled | `execve` with exactly the policy environment. The backend adds no variables. |
 | IpNetworkDenied | The socket family allowlist has no `AF_INET`, `AF_INET6` or `AF_NETLINK`; io_uring is denied. From ABI 4, Landlock also denies TCP bind and connect. |
+| InboundIpDenied | The denylist denies `listen`, `accept` and `accept4` for every socket. A second Landlock ruleset lets sockets bind only port 0: TCP from ABI 4, UDP from ABI 10 (see "Client networking"). |
 | UnixSocketsDenied | The allowlist has no `AF_UNIX`, and socket pairs are limited to stream and seqpacket. From ABI 6, Landlock scopes abstract sockets; from ABI 9 it denies connections to pathname sockets. |
 | SignalsIsolated | Landlock signal scope (ABI 6) and the denylist, which denies `setpgid` into a process group that exists and the terminal ioctls `TIOCSPGRP`, `TIOCSWINSZ` and `TIOCSIG` (see "Signals and the terminal"). Unavailable on older ABIs. |
 | MetadataConfined | The denylist denies the metadata calls that take a path, and `fchown`, `fsetxattr` and `fremovexattr` on a descriptor (see "Metadata"). |
@@ -84,6 +85,39 @@ can write, so the rule then reaches nothing that this process could not reach al
 | ChildProcessesContained | sandy stays the parent and ends the program's process group; the denylist denies `setsid` and `setpgid` (see "Contained child processes"). |
 | EndsWithParent | A watcher process outside the sandbox ends the program when sandy's parent ends (see "Ending with the parent"). |
 | ExposedPortsRelayed, ForwardedPortsRelayed | One relay process outside the program's sandbox, confined by its own Landlock domain and seccomp filters (see "Exposed and forwarded ports"). |
+
+## Client networking
+
+`ip = "client"` gives the program the sockets and the system set of `ip = "all"`, so it connects,
+sends, resolves names and receives the answers, but it cannot take connections:
+
+- The denylist denies `listen`, `accept` and `accept4` with `EPERM`, so no socket of the program
+  takes a TCP connection, and `run` refuses a listening socket on a standard stream (see
+  "Refusals"). The filter sees the descriptor of the call, not the family of its socket, so a Unix
+  socket cannot listen either, also with `unix_sockets = "all"`; a program that serves on a Unix
+  socket needs `ip = "all"` on Linux, and `check` warns about that combination.
+- Landlock cannot deny listening. `listen` on an unbound TCP socket gives it a port without the
+  check of `LANDLOCK_ACCESS_NET_BIND_TCP`: a ruleset that handles the right without a rule refused
+  every `bind`, but not that `listen` (measured on Linux 7.2, ABI 10).
+- A second Landlock ruleset handles the bind rights and grants them for port 0 only, which the
+  kernel turns into a free port of its choice: `LANDLOCK_ACCESS_NET_BIND_TCP` from ABI 4 and
+  `LANDLOCK_ACCESS_NET_BIND_UDP` from ABI 10. A client that binds before it sends, as musl's
+  resolver and Rust's `UdpSocket::bind("0.0.0.0:0")` do, keeps working, and so does the port a
+  socket takes when it first connects or sends, which the UDP right covers too (measured); a bind
+  to a chosen port fails with `EACCES`. sandy builds this ruleset with the system calls
+  themselves, because the `landlock` crate does not know the UDP right, and applies it right
+  after the first one. Older kernels let a socket bind any port. For TCP that gives nothing
+  inbound, because the socket cannot listen.
+- What stays open, an exception of DESIGN.md: a UDP socket that is not connected receives
+  datagrams from every sender, not only from the addresses it sent to, at the port the kernel
+  chose for it, and before ABI 10 also at any port the program binds it to. No rule tells a reply
+  from any other datagram: seccomp cannot read the address of a call, and Landlock checks binds
+  and sends, not what arrives. An ICMP datagram socket likewise receives every echo reply for its
+  identifier. `sandy check` prints a warning with what this kernel leaves open, and
+  `ip_client_datagrams_from_others` and `client_binds_follow_the_landlock_abi` record it.
+
+Measured on Fedora 44 under `ip = "client"`: curl over HTTP, `getent hosts`, Python's `urllib`
+and `dig` against systemd-resolved all work as with `ip = "all"`.
 
 ## Exposed and forwarded ports
 
@@ -479,11 +513,11 @@ sandy reads the ABI from the kernel each time (`landlock_create_ruleset` with th
 It never infers the ABI from the kernel version, because distributions backport Landlock. It uses
 the lower of the kernel ABI and ABI 9, the newest ABI that the `landlock` crate (0.4.7) knows. The
 crate runs with `CompatLevel::HardRequirement`, so a right that the kernel does not support is an
-error, not a silent omission. ABI 10 adds only UDP rights, which sandy does not need: the seccomp
-filter denies IP sockets, so a program inside cannot create one, and a UDP socket created before
-the sandbox is refused on a standard stream and closed on every other descriptor. The crate's
-`AccessNet` knows only the two TCP rights, so handling the UDP rights would need a newer crate or
-a ruleset built with raw system calls.
+error, not a silent omission. ABI 10 adds UDP rights. sandy uses the bind right for
+`ip = "client"`, in a second ruleset built with raw system calls, because the crate's `AccessNet`
+knows only the two TCP rights (see "Client networking"). `ip = "none"` needs no UDP right: the
+seccomp filter denies IP sockets, so a program inside cannot create one, and a UDP socket created
+before the sandbox is refused on a standard stream and closed on every other descriptor.
 
 | ABI | Linux | What changes in sandy |
 |---|---|---|
@@ -491,12 +525,13 @@ a ruleset built with raw system calls.
 | 1 | 5.13 | Renaming or linking a file into another directory fails with `EXDEV`, also inside writable paths. |
 | 1, 2 | | Landlock cannot restrict truncation. The denylist denies `truncate` for every path, also inside a writable one, because the call carries no access mode the filter could look at, and `open`/`openat` with `O_TRUNC` on a read-only open. A program that empties a file in a writable path needs `O_TRUNC` with write access, or `ftruncate`; both stay allowed. |
 | 3 | 6.2 | Truncation is a Landlock right. |
-| 4 | 6.7 | TCP bind and connect are denied when IP is denied (a second layer). |
+| 4 | 6.7 | TCP bind and connect are denied when IP is denied (a second layer). With `ip = "client"` a TCP socket binds only port 0. |
 | 1 to 4 | | Device ioctls are not checked by Landlock; the program can only open the devices of the policy and the system set. |
 | 5 | 6.10 | `LANDLOCK_ACCESS_FS_IOCTL_DEV` is handled. |
 | 1 to 5 | | `signals = "isolated"` is refused. |
 | 6 | 6.12 | Signal and abstract socket scopes. |
 | 9 | 7.1 | `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` is handled when `unix_sockets = "none"`. |
+| 10 | 7.2 | With `ip = "client"` a UDP socket binds only port 0. |
 
 ### Rights per access level
 
@@ -642,7 +677,8 @@ The rules return `EPERM`, except where the table says otherwise.
 
 | System calls | Rule | Reason |
 |---|---|---|
-| `socket` (`EAFNOSUPPORT`) | family not in the allowlist; with `ip = "all"` an IP protocol other than 0, ICMP, TCP, UDP, ICMPv6 and MPTCP | `AF_UNIX` only with `unix_sockets = "all"`. `AF_INET`, `AF_INET6` and `AF_NETLINK` with protocol `NETLINK_ROUTE` only with `ip = "all"`. A denylist would miss families that reach TCP, for example `AF_SMC`. Within `AF_INET` and `AF_INET6` the kernel loads the module of a protocol when a program asks for a socket of it, for any user: SCTP, L2TP over IP, and since Linux 6.14 SMC through `IPPROTO_SMC`, which reaches the same code as `AF_SMC`. On Fedora 44 the modules `sctp`, `l2tp_ip`, `l2tp_ip6` and `smc` are installed and not blocked (checked with `modinfo` and `modprobe -c`). That is kernel code no common program needs: the measured programs used 0, TCP (Python, curl, Java, Node, Go), MPTCP (Go), ICMP and ICMPv6 (ping), and ran the same with the rule. `ip_sockets_of_unusual_protocols_are_denied` checks it with protocol 253, which has no module. Route netlink lets the C library list interfaces (`getifaddrs`, `getaddrinfo`); other netlink protocols expose, for example, every socket of the host (`sock_diag`). `AF_VSOCK`, `AF_ALG`, `AF_PACKET` and the rest are always denied. |
+| `socket` (`EAFNOSUPPORT`) | family not in the allowlist; with `ip = "all"` or `ip = "client"` an IP protocol other than 0, ICMP, TCP, UDP, ICMPv6 and MPTCP | `AF_UNIX` only with `unix_sockets = "all"`. `AF_INET`, `AF_INET6` and `AF_NETLINK` with protocol `NETLINK_ROUTE` only with `ip = "all"` or `ip = "client"`. A denylist would miss families that reach TCP, for example `AF_SMC`. Within `AF_INET` and `AF_INET6` the kernel loads the module of a protocol when a program asks for a socket of it, for any user: SCTP, L2TP over IP, and since Linux 6.14 SMC through `IPPROTO_SMC`, which reaches the same code as `AF_SMC`. On Fedora 44 the modules `sctp`, `l2tp_ip`, `l2tp_ip6` and `smc` are installed and not blocked (checked with `modinfo` and `modprobe -c`). That is kernel code no common program needs: the measured programs used 0, TCP (Python, curl, Java, Node, Go), MPTCP (Go), ICMP and ICMPv6 (ping), and ran the same with the rule. `ip_sockets_of_unusual_protocols_are_denied` checks it with protocol 253, which has no module. Route netlink lets the C library list interfaces (`getifaddrs`, `getaddrinfo`); other netlink protocols expose, for example, every socket of the host (`sock_diag`). `AF_VSOCK`, `AF_ALG`, `AF_PACKET` and the rest are always denied. |
+| `listen`, `accept`, `accept4` | with `ip = "client"`: always | No socket of the program takes a connection. The filter cannot tell an IP socket from a Unix one by its descriptor, so this holds for Unix sockets too (see "Client networking"). |
 | `socketpair` | other family than `AF_UNIX`; datagram or raw type when `unix_sockets = "none"` | A datagram socket can send to any address, also from a pair. `AF_UNIX` treats `SOCK_RAW` as `SOCK_DGRAM`. Stream and seqpacket pairs stay allowed. |
 | `ioctl` | `TIOCSTI`, `TIOCLINUX`, `TIOCSETD`, `TIOCEXCL`, the console ioctls that change a virtual console, and the file system ioctls that change a file; with `signals = "isolated"` also `TIOCSPGRP`, `TIOCSWINSZ` and `TIOCSIG` | `TIOCSTI` and `TIOCLINUX` can inject input into the terminal of the user. `TIOCSETD` changes its line discipline, and the kernel loads the module of a discipline on demand when `dev.tty.ldisc_autoload` is 1, which is kernel attack surface. `TIOCEXCL` keeps every process outside from opening the terminal again. The console ioctls change the key map and the fonts of every console of the host (see "Device ioctls and the terminal"). For the file system ioctls see "Metadata", for the three others "Signals and the terminal". |
 | `fcntl` | `F_SETLEASE` with anything but `F_UNLCK`, `F_SETDELEG` | A lease or a delegation needs only a read descriptor of a file or directory the user owns, and Landlock does not cover `fcntl`. While the program holds one, a process outside that opens the file for writing, or creates, renames or removes an entry in the directory, waits until `/proc/sys/fs/lease-break-time` passes (45 seconds by default; measured: 48 seconds). Giving one up stays allowed. |
@@ -1021,8 +1057,8 @@ audit log is the better source and it costs the run nothing.
 | `/dev/null` | read, write | always | Programs redirect output to it. Writes are discarded. No ioctl right. |
 | `/dev/zero`, `/dev/random`, `/dev/urandom` | read | always | Zero and random sources for programs that do not use `getrandom`. |
 | `/sys/devices/system/cpu/online`, `/sys/devices/system/cpu/possible` | read | always | The number of CPUs for glibc, Go and Java. |
-| `/etc/hosts`, `/etc/resolv.conf`, `/etc/nsswitch.conf`, `/etc/host.conf`, `/etc/gai.conf`, `/etc/services`, `/etc/protocols` | read | `ip = "all"` | Name resolution. When `/etc/resolv.conf` leads into `/run/systemd/resolve`, sandy grants that directory instead of the file (see "Replaced resolver files"). |
-| `/etc/ssl/certs`, `/usr/share/ca-certificates`, `/etc/pki/tls/certs`, `/etc/pki/ca-trust/extracted`, `/etc/ca-certificates/extracted`, `/var/lib/ca-certificates` | read | `ip = "all"` | CA certificates for TLS on Debian, Ubuntu, Fedora, RHEL, Arch and openSUSE. |
+| `/etc/hosts`, `/etc/resolv.conf`, `/etc/nsswitch.conf`, `/etc/host.conf`, `/etc/gai.conf`, `/etc/services`, `/etc/protocols` | read | `ip = "client"` or `"all"` | Name resolution. When `/etc/resolv.conf` leads into `/run/systemd/resolve`, sandy grants that directory instead of the file (see "Replaced resolver files"). |
+| `/etc/ssl/certs`, `/usr/share/ca-certificates`, `/etc/pki/tls/certs`, `/etc/pki/ca-trust/extracted`, `/etc/ca-certificates/extracted`, `/var/lib/ca-certificates` | read | `ip = "client"` or `"all"` | CA certificates for TLS on Debian, Ubuntu, Fedora, RHEL, Arch and openSUSE. |
 | the loader of the program itself | read, execute | always | The file the program names in its ELF `PT_INTERP` header, with symbolic links resolved, when no other rule covers it. The entries above name the loaders of the FHS layout; this covers a host with another libc, another name, or a layout outside the FHS (NixOS, Guix). |
 
 The loader of the program is read from the program file, which is untrusted input, so sandy
@@ -1299,7 +1335,8 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   the socket family filter allows its family and protocol, and creating it needs no capability,
   because sandy never starts the program with one. sandy reads the family, the type and the
   protocol with `SO_DOMAIN`, `SO_TYPE` and `SO_PROTOCOL`. Refused are an IP socket or a route
-  netlink socket with `ip = "none"`, an unconnected, datagram or listening Unix socket with
+  netlink socket with `ip = "none"`, a listening or datagram IP socket with `ip = "client"` (a
+  connected TCP socket is accepted), an unconnected, datagram or listening Unix socket with
   `unix_sockets = "none"`, and under every policy a raw IP socket (`SOCK_RAW`, which needs
   `CAP_NET_RAW`), an IP socket of a protocol the filter denies (see "Denylist"), and a socket of
   every other family, a netlink socket of another protocol included. The kernel turns an `AF_INET`
@@ -1338,17 +1375,17 @@ path rules is refused before that, with exit code 125 and the paths it compared.
     when its listing may be seen.
   The reads of extended attributes by path, `fanotify_init` and `name_to_handle_at` are denied
   (see "Metadata" and "Denylist").
-- **Abstract socket names with `ip = "all"`.** The program can bind one end of a socket pair to
-  a free abstract name, because the filter cannot tell a socket's family from its descriptor and
-  the Landlock scope checks connect and send, not bind. A service outside that binds the same
-  name later then fails to start. With `unix_sockets = "none"` that is all it can do: the pair
-  is a stream or seqpacket pair, which is connected already and cannot listen, so a client that
-  reaches the name gets a refused connection. With `unix_sockets = "all"` the program can take
-  the name of a service and serve it: a datagram pair end that binds the name and then
-  disconnects with `connect(AF_UNSPEC)` receives what clients send to it (measured on Linux
-  7.2), and an ordinary AF_UNIX socket can listen. With `ip = "none"` and
-  `unix_sockets = "none"` the filter denies `bind`, `listen`, `connect` and `accept`, which no
-  socket pair needs.
+- **Abstract socket names with `ip = "all"` or `ip = "client"`.** The program can bind one end
+  of a socket pair to a free abstract name, because the filter cannot tell a socket's family
+  from its descriptor and the Landlock scope checks connect and send, not bind. A service outside
+  that binds the same name later then fails to start. With `unix_sockets = "none"` that is all it
+  can do: the pair is a stream or seqpacket pair, which is connected already and cannot listen,
+  so a client that reaches the name gets a refused connection. With `unix_sockets = "all"` the
+  program can take the name of a service and serve it: a datagram pair end that binds the name
+  and then disconnects with `connect(AF_UNSPEC)` receives what clients send to it (measured on
+  Linux 7.2), and an ordinary AF_UNIX socket can listen, except under `ip = "client"`. With
+  `ip = "none"` and `unix_sockets = "none"` the filter denies `bind`, `listen`, `connect` and
+  `accept`, which no socket pair needs.
 - **System information.** `uname`, `sysinfo` and `statfs` stay allowed. They show the kernel
   version, load and memory, and file system statistics. The mount and namespace listing calls,
   the security module calls (`lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr`) and
@@ -1382,8 +1419,8 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   program starts itself or through its children. Both need `unix_sockets = "none"`, because
   through a Unix socket the program could ask a service of the user, for example the systemd user
   manager over D-Bus, to start a process outside the sandbox. A service that starts processes on
-  requests over TCP is still reachable with `ip = "all"` or through a `forward` target; such
-  processes are not the program's and are not covered.
+  requests over TCP is still reachable with `ip = "client"`, `ip = "all"` or through a `forward`
+  target; such processes are not the program's and are not covered.
 - **Standard streams.** sandy passes descriptors 0, 1 and 2 on as it got them, so whatever they
   carry keeps working inside the sandbox: a file outside the policy can be read and written, a
   directory stays listable, and its mode and times can change (see "Metadata through open

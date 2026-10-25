@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use sandy_core::{
-    ChildProcesses, NetworkAccess, PathAccess, ResolvedPolicy, SignalScope, SystemAccess,
+    ChildProcesses, IpAccess, NetworkAccess, PathAccess, ResolvedPolicy, SignalScope, SystemAccess,
 };
 
 use crate::system::{self, SystemAccess as Grant};
@@ -325,13 +325,30 @@ fn network_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
          they can be created in any case; binding and connecting them follow the rules below.",
     );
     writer.line("(allow system-socket (socket-domain AF_UNIX))");
-    if policy.ip == NetworkAccess::All {
-        writer.comment(
-            "IP networking, and name resolution: getaddrinfo asks mDNSResponder through its\n\
-             Unix socket.",
-        );
-        writer.line("(allow network-outbound (remote ip))");
-        writer.line("(allow network-bind network-inbound (local ip))");
+    match policy.ip {
+        IpAccess::None => {}
+        IpAccess::Client => {
+            writer.comment(
+                "IP networking out, and name resolution: getaddrinfo asks mDNSResponder through\n\
+                 its Unix socket. network-inbound covers listen and accept, and every datagram\n\
+                 that a socket which is not connected receives, so it is allowed for UDP only:\n\
+                 a TCP socket cannot listen. Seatbelt cannot tell port 0 from a chosen port, so\n\
+                 binding stays allowed.",
+            );
+            writer.line("(allow network-outbound (remote ip))");
+            writer.line("(allow network-bind (local ip))");
+            writer.line("(allow network-inbound (local udp))");
+        }
+        IpAccess::All => {
+            writer.comment(
+                "IP networking, and name resolution: getaddrinfo asks mDNSResponder through its\n\
+                 Unix socket.",
+            );
+            writer.line("(allow network-outbound (remote ip))");
+            writer.line("(allow network-bind network-inbound (local ip))");
+        }
+    }
+    if policy.ip != IpAccess::None {
         let resolver = writer.grant("DNS", Path::new(system::DNS_RESOLVER_SOCKET));
         writer.rule("allow", &["network-outbound"], &[literal(resolver)]);
         let hosts = writer.grant("DNS", Path::new(system::HOSTS_FILE));
@@ -480,7 +497,7 @@ mod tests {
             paths,
             program: None,
             system: SystemAccess::Minimal,
-            ip: NetworkAccess::None,
+            ip: IpAccess::None,
             unix_sockets: NetworkAccess::None,
             expose: Vec::new(),
             forward: Vec::new(),
@@ -649,7 +666,7 @@ mod tests {
     #[test]
     fn text_contains_no_path_and_every_parameter_is_used_once() {
         let mut policy = typical("/srv");
-        policy.ip = NetworkAccess::All;
+        policy.ip = IpAccess::All;
         policy.unix_sockets = NetworkAccess::All;
         let profile = generate(&policy);
         assert!(!profile.text.contains('/'), "{}", profile.text);
@@ -812,17 +829,43 @@ mod tests {
         };
         use NetworkAccess::{All, None};
         // IP, Unix sockets, resolver allowed, resolver denied.
-        assert_eq!(rules(None, None), [false, false, false, false]);
-        assert_eq!(rules(All, None), [true, false, true, false]);
+        assert_eq!(rules(IpAccess::None, None), [false, false, false, false]);
+        assert_eq!(rules(IpAccess::All, None), [true, false, true, false]);
+        assert_eq!(rules(IpAccess::Client, None), [true, false, true, false]);
         // All Unix sockets include the resolver, as on every platform.
-        assert_eq!(rules(None, All), [false, true, false, false]);
-        assert_eq!(rules(All, All), [true, true, true, false]);
+        assert_eq!(rules(IpAccess::None, All), [false, true, false, false]);
+        assert_eq!(rules(IpAccess::All, All), [true, true, true, false]);
+    }
+
+    /// `ip = "client"` allows network-inbound for UDP only, so that a TCP socket cannot listen or
+    /// accept; `ip = "all"` allows it for every IP socket.
+    #[test]
+    fn client_allows_inbound_only_for_udp() {
+        let inbound = |ip| {
+            let mut policy = typical("/srv");
+            policy.ip = ip;
+            generate(&policy)
+                .text
+                .lines()
+                .filter(|line| line.starts_with("(allow") && line.contains("network-inbound"))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            inbound(IpAccess::Client),
+            vec!["(allow network-inbound (local udp))"]
+        );
+        assert_eq!(
+            inbound(IpAccess::All),
+            vec!["(allow network-bind network-inbound (local ip))"]
+        );
+        assert!(inbound(IpAccess::None).is_empty());
     }
 
     #[test]
     fn by_id_syscalls_are_denied_after_every_allow() {
         let mut policy = typical("/srv");
-        policy.ip = NetworkAccess::All;
+        policy.ip = IpAccess::All;
         policy.unix_sockets = NetworkAccess::All;
         let text = generate(&policy).text;
         let deny = text.find("(deny syscall-unix").unwrap();
@@ -1025,7 +1068,7 @@ mod tests {
     #[test]
     fn generates_no_mach_lookup_allowance() {
         let mut policy = typical("/srv");
-        policy.ip = NetworkAccess::All;
+        policy.ip = IpAccess::All;
         policy.unix_sockets = NetworkAccess::All;
         let text = generate(&policy).text;
         assert!(!text.contains("(allow mach"));

@@ -4,8 +4,8 @@
 use std::path::Path;
 
 use sandy_core::{
-    ChildProcesses, NetworkAccess, PathAccess, PathIdentity, PlanItem, ProtectedPath, Requirement,
-    ResolvedPolicy, SignalScope, SystemAccess,
+    ChildProcesses, IpAccess, NetworkAccess, PathAccess, PathIdentity, PlanItem, ProtectedPath,
+    Requirement, ResolvedPolicy, SignalScope, SystemAccess,
 };
 
 use crate::system::{self, SystemAccess as Grant};
@@ -185,7 +185,7 @@ fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
     let contained = policy.children == ChildProcesses::Contained;
     if policy.signals == SignalScope::Isolated {
         // SIGURG needs urgent data on a TCP socket, which only IP networking gives.
-        let signals = if policy.ip == NetworkAccess::All {
+        let signals = if policy.ip != IpAccess::None {
             "SIGIO and SIGURG"
         } else {
             "SIGIO"
@@ -209,6 +209,17 @@ fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
                     .to_string(),
             );
         }
+    }
+    if policy.ip == IpAccess::Client {
+        shortfalls.push(
+            "ip = \"client\" keeps datagrams out only in part on macOS: a UDP socket that is not \
+             connected receives datagrams from every sender, not only from the addresses it sent \
+             to, at any port the program binds it to; Seatbelt checks each such datagram as \
+             network-inbound and cannot tell a reply from any other, and programs that receive on \
+             a socket that is not connected (QUIC, DNS and NTP clients) need it, so the profile \
+             allows it for UDP (docs/macos.md, \"Networking\")"
+                .to_string(),
+        );
     }
     if contained {
         shortfalls.push(
@@ -322,10 +333,14 @@ fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
                  (mDNSResponder) is unreachable"
             }
         }
+        Requirement::InboundIpDenied => {
+            "network-outbound and network-bind for IP sockets, network-inbound only for UDP \
+             sockets, so no TCP socket can listen or accept"
+        }
         Requirement::UnixSocketsDenied => {
-            if policy.ip == NetworkAccess::All {
+            if policy.ip != IpAccess::None {
                 "no Unix socket network-bind or network-outbound, except the socket of the name \
-                 resolver (mDNSResponder), which is part of ip = \"all\""
+                 resolver (mDNSResponder), which is part of IP networking"
             } else {
                 "no Unix socket network-bind or network-outbound"
             }
@@ -376,11 +391,7 @@ mod tests {
         WindowsPolicy,
     };
 
-    fn policy(
-        ip: NetworkAccess,
-        unix_sockets: NetworkAccess,
-        signals: SignalScope,
-    ) -> ResolvedPolicy {
+    fn policy(ip: IpAccess, unix_sockets: NetworkAccess, signals: SignalScope) -> ResolvedPolicy {
         ResolvedPolicy {
             paths: Vec::new(),
             program: None,
@@ -399,11 +410,7 @@ mod tests {
     }
 
     fn strictest() -> ResolvedPolicy {
-        policy(
-            NetworkAccess::None,
-            NetworkAccess::None,
-            SignalScope::Isolated,
-        )
+        policy(IpAccess::None, NetworkAccess::None, SignalScope::Isolated)
     }
 
     fn capable() -> HostCapabilities {
@@ -640,12 +647,43 @@ mod tests {
                 .find(|item| item.requirement == Requirement::UnixSocketsDenied)
                 .map(|item| item.status)
         };
-        let with_ip = policy(NetworkAccess::All, NetworkAccess::None, SignalScope::Any);
-        let without_ip = policy(NetworkAccess::None, NetworkAccess::None, SignalScope::Any);
+        let with_ip = policy(IpAccess::All, NetworkAccess::None, SignalScope::Any);
+        let without_ip = policy(IpAccess::None, NetworkAccess::None, SignalScope::Any);
         let with = format!("{:?}", mechanism_of(&with_ip));
         let without = format!("{:?}", mechanism_of(&without_ip));
         assert!(with.contains("mDNSResponder"), "{with}");
         assert!(!without.contains("mDNSResponder"), "{without}");
+    }
+
+    /// `ip = "client"` is the profile's, and the UDP route it leaves open is named, as is
+    /// SIGURG, which urgent data on its TCP connections can raise.
+    #[test]
+    fn client_is_enforced_by_the_profile_and_names_what_stays_open() {
+        let client = policy(IpAccess::Client, NetworkAccess::None, SignalScope::Isolated);
+        let item = plan_for(&client, &capable())
+            .into_iter()
+            .find(|item| item.requirement == Requirement::InboundIpDenied)
+            .expect("reported");
+        let Status::Enforced { mechanism } = item.status else {
+            panic!("{item:?}");
+        };
+        assert!(
+            mechanism.contains("network-inbound only for UDP"),
+            "{mechanism}"
+        );
+        let udp = |policy: &ResolvedPolicy| {
+            notes(policy)
+                .iter()
+                .any(|note| note.starts_with("ip = \"client\" keeps datagrams out only in part"))
+        };
+        assert!(udp(&client));
+        assert!(
+            notes(&client)
+                .iter()
+                .any(|note| note.contains("SIGIO and SIGURG"))
+        );
+        let all = policy(IpAccess::All, NetworkAccess::None, SignalScope::Isolated);
+        assert!(!udp(&all));
     }
 
     #[test]

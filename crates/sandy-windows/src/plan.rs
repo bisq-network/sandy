@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use sandy_core::{NetworkAccess, PathAccess, PlanItem, Requirement, ResolvedPolicy, SystemAccess};
+use sandy_core::{IpAccess, PathAccess, PlanItem, Requirement, ResolvedPolicy, SystemAccess};
 
 use crate::name::validate_appcontainer_name;
 use crate::version::{WindowsVersion, below_minimum, firewall_bypass};
@@ -148,6 +148,24 @@ pub fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
     shortfalls
 }
 
+/// What makes the program behave differently inside the sandbox than outside with this policy,
+/// beyond what it denies by design. `sandy check` prints these as warnings.
+pub fn notes(policy: &ResolvedPolicy) -> Vec<String> {
+    let mut notes = Vec::new();
+    if policy.ip == IpAccess::Client {
+        notes.push(
+            "ip = \"client\" reaches no host of a network that Windows counts as private or \
+             domain network, such as a printer or a server on the local network: Windows has no \
+             capability for connections out into such a network alone, and \
+             privateNetworkClientServer lets its hosts connect in too; names still resolve, \
+             through the DNS Client service, and ip = \"all\" reaches those hosts \
+             (docs/windows.md, \"Client networking\")"
+                .to_string(),
+        );
+    }
+    notes
+}
+
 /// Requirements that the AppContainer enforces.
 fn contained(
     requirement: Requirement,
@@ -168,7 +186,9 @@ fn contained(
         .ok()
         .copied()
         .and_then(firewall_bypass);
-    if let (Requirement::IpNetworkDenied, Some(reason)) = (requirement, bypass) {
+    if let (Requirement::IpNetworkDenied | Requirement::InboundIpDenied, Some(reason)) =
+        (requirement, bypass)
+    {
         return unavailable(reason);
     }
     let network = network_path_problem(policy);
@@ -257,12 +277,23 @@ fn contained(
             (_, Ok(true)) => unavailable(format!(
                 "AppContainer {name:?} is exempt from loopback isolation and could reach \
                  127.0.0.1 without network capabilities; run `sandy setup --appcontainer \
-                 {name}` without --ip all as administrator to remove the exemption, or use \
-                 another name for policies without IP networking"
+                 {name}` without --ip as administrator to remove the exemption, or use another \
+                 name for policies without IP networking"
             )),
             (Ok(()), Ok(false)) => enforced(format!(
                 "AppContainer {name:?} without network capabilities and without loopback \
                  exemption"
+            )),
+        },
+        Requirement::InboundIpDenied => match &host.firewall {
+            Err(reason) => unavailable(format!(
+                "AppContainer network isolation depends on the Windows Firewall service: {reason}"
+            )),
+            Ok(()) => enforced(format!(
+                "AppContainer {name:?} with the internetClient capability only: Windows Firewall \
+                 drops the connections and datagrams of other hosts that the program did not \
+                 start, also with its profiles off, and loopback isolation all that processes of \
+                 this machine outside the AppContainer send"
             )),
         },
         Requirement::UnixSocketsDenied => enforced(format!(
@@ -342,12 +373,14 @@ fn writable_parent<'a>(policy: &'a ResolvedPolicy, path: &Path) -> Option<&'a Pa
         .map(|rule| rule.path.as_path())
 }
 
-/// The network capabilities the target gets. The policy allows IP networking completely or not
-/// at all. `internetClientServer` includes `internetClient`.
-pub fn network_capabilities(ip: NetworkAccess) -> &'static [NetworkCapability] {
+/// The network capabilities the target gets. `internetClientServer` includes `internetClient`.
+/// Windows has no capability for outbound connections into home and work networks alone, so
+/// `ip = "client"` reaches the internet only (docs/windows.md, "Client networking").
+pub fn network_capabilities(ip: IpAccess) -> &'static [NetworkCapability] {
     match ip {
-        NetworkAccess::None => &[],
-        NetworkAccess::All => &[
+        IpAccess::None => &[],
+        IpAccess::Client => &[NetworkCapability::InternetClient],
+        IpAccess::All => &[
             NetworkCapability::InternetClientServer,
             NetworkCapability::PrivateNetworkClientServer,
         ],
@@ -356,6 +389,8 @@ pub fn network_capabilities(ip: NetworkAccess) -> &'static [NetworkCapability] {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkCapability {
+    /// Outbound connections to the internet.
+    InternetClient,
     /// Inbound and outbound connections to the internet.
     InternetClientServer,
     /// Inbound and outbound connections to home and work networks.
@@ -392,7 +427,7 @@ mod tests {
     }
 
     fn forwarding(mut policy: ResolvedPolicy) -> ResolvedPolicy {
-        policy.ip = NetworkAccess::All;
+        policy.ip = IpAccess::All;
         policy.forward = vec![ForwardedPort {
             port: 18081,
             to: "127.0.0.1:8081".parse().unwrap(),
@@ -406,7 +441,7 @@ mod tests {
     }
 
     fn exposing(mut policy: ResolvedPolicy) -> ResolvedPolicy {
-        policy.ip = NetworkAccess::All;
+        policy.ip = IpAccess::All;
         policy.expose = vec![ExposedPort {
             listen: "127.0.0.1:18080".parse().unwrap(),
             port: 8080,
@@ -581,7 +616,7 @@ mod tests {
         assert!(reason.contains("exempt"), "{reason}");
 
         let mut allowed = policy();
-        allowed.ip = NetworkAccess::All;
+        allowed.ip = IpAccess::All;
         assert!(plan(&allowed, &host).is_enforceable());
     }
 
@@ -660,7 +695,7 @@ mod tests {
         assert!(reason.contains("CVE-2021-41338"), "{reason}");
 
         let mut allowed = policy();
-        allowed.ip = NetworkAccess::All;
+        allowed.ip = IpAccess::All;
         assert!(plan(&allowed, &unpatched).is_enforceable());
     }
 
@@ -867,8 +902,55 @@ mod tests {
     }
 
     #[test]
-    fn network_capabilities_are_all_or_nothing() {
-        assert!(network_capabilities(NetworkAccess::None).is_empty());
-        assert_eq!(network_capabilities(NetworkAccess::All).len(), 2);
+    fn client_notes_that_private_networks_are_out_of_reach() {
+        let mut client = policy();
+        client.ip = IpAccess::Client;
+        let notes = notes(&client);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("private or domain network"), "{notes:?}");
+        let mut all = policy();
+        all.ip = IpAccess::All;
+        assert!(super::notes(&all).is_empty());
+    }
+
+    #[test]
+    fn network_capabilities_follow_ip() {
+        assert!(network_capabilities(IpAccess::None).is_empty());
+        assert_eq!(
+            network_capabilities(IpAccess::Client),
+            &[NetworkCapability::InternetClient]
+        );
+        assert_eq!(network_capabilities(IpAccess::All).len(), 2);
+    }
+
+    /// `ip = "client"` relies on the firewall like `ip = "none"`, and on the fix of
+    /// CVE-2021-41338, but an exempt AppContainer is what it needs to reach loopback services.
+    #[test]
+    fn client_needs_the_firewall_and_may_be_exempt() {
+        let mut client = policy();
+        client.ip = IpAccess::Client;
+        let exempt = HostCapabilities {
+            loopback_exempt: Ok(true),
+            ..host()
+        };
+        assert!(matches!(
+            status(&client, &exempt, Requirement::InboundIpDenied),
+            Status::Enforced { .. }
+        ));
+        let stopped = HostCapabilities {
+            firewall: Err("MpsSvc stopped".into()),
+            ..host()
+        };
+        let reason = unavailable(status(&client, &stopped, Requirement::InboundIpDenied));
+        assert!(reason.contains("Windows Firewall"), "{reason}");
+        let unpatched = HostCapabilities {
+            windows: Ok(WindowsVersion {
+                build: 19043,
+                revision: Some(1287),
+            }),
+            ..host()
+        };
+        let reason = unavailable(status(&client, &unpatched, Requirement::InboundIpDenied));
+        assert!(reason.contains("CVE-2021-41338"), "{reason}");
     }
 }

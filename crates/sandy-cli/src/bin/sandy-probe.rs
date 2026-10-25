@@ -91,6 +91,30 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
             UdpSocket::bind(local)?.send_to(b"probe", address)?;
             Ok(String::new())
         }
+        // Binds ADDRESS and waits for one datagram, which the escape tests send from outside.
+        "udp-receive" => {
+            let socket = UdpSocket::bind(socket_address(target)?)?;
+            datagram_from(&socket)
+        }
+        // Sends a datagram to ADDRESS from a port the system chooses, as a client does, and waits
+        // for one datagram on that socket, from whichever sender.
+        "udp-reply" => {
+            let address = socket_address(target)?;
+            let local = if address.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            };
+            let socket = UdpSocket::bind(local)?;
+            socket.send_to(b"probe", address)?;
+            datagram_from(&socket)
+        }
+        // SERVER<U+001F>NAME: asks the DNS server SERVER for the A records of NAME over UDP, as a
+        // resolver library does, and names the response code and the number of answers.
+        "dns-query" => {
+            let (server, name) = pair(target)?;
+            dns_query(socket_address(server)?, name)
+        }
         "unix-connect" => unix_connect(target),
         "env" => std::env::var_os(target)
             .map(|value| value.to_string_lossy().into_owned())
@@ -632,11 +656,15 @@ mod linux {
         "openat2-read",
         "landlock-ioctl-only",
         "open-stdin",
+        "tcp-bind",
+        "unix-listen",
     ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
         match action {
             "socketpair-bind" => socketpair_bind(target),
+            "tcp-bind" => tcp_bind(target),
+            "unix-listen" => std::os::unix::net::UnixListener::bind(target).map(|_| String::new()),
             "listxattr-path" => listxattr_path(target),
             "getxattr-fd" => getxattr_fd(target),
             "inotify-name" => inotify_name(target),
@@ -728,6 +756,35 @@ mod linux {
     }
 
     const SETUID_MODE: u32 = 0o4755;
+
+    /// Binds a TCP socket to the IPv4 address `target` without listening, which Rust's standard
+    /// library cannot do.
+    fn tcp_bind(target: &str) -> io::Result<String> {
+        let address = std::net::SocketAddrV4::from_str(target)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let socket = check(
+            // SAFETY: socket takes no pointers.
+            unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) },
+        )?;
+        let name = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: address.port().to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from(*address.ip()).to_be(),
+            },
+            sin_zero: [0; 8],
+        };
+        // SAFETY: `name` is a sockaddr_in of the size passed.
+        let bound = check(unsafe {
+            libc::bind(
+                socket,
+                (&raw const name).cast(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        });
+        close(socket);
+        bound.map(|_| String::new())
+    }
 
     /// Binds one end of a stream socket pair to `target`: an abstract name when it starts with
     /// `@`, otherwise a pathname. socketpair stays allowed with `unix_sockets = "none"`, so this
@@ -1820,6 +1877,59 @@ fn tcp_connect_read(target: &str) -> io::Result<String> {
     let mut received = Vec::new();
     stream.read_to_end(&mut received)?;
     Ok(format!("{} bytes", received.len()))
+}
+
+/// One DNS query for the A records of `name`, sent from a port the system chooses to `server`.
+/// Only a response with the query's ID counts.
+fn dns_query(server: SocketAddr, name: &str) -> io::Result<String> {
+    let id = (std::process::id() as u16).to_be_bytes();
+    // Header: ID, recursion desired, one question.
+    let mut query = vec![id[0], id[1], 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label in name.split('.').filter(|label| !label.is_empty()) {
+        let length = u8::try_from(label.len())
+            .ok()
+            .filter(|&length| length < 64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "label too long"))?;
+        query.push(length);
+        query.extend(label.as_bytes());
+    }
+    // The root label, type A, class IN.
+    query.extend([0, 0, 1, 0, 1]);
+    let local = if server.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(local)?;
+    socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+    socket.send_to(&query, server)?;
+    let mut response = [0; 512];
+    loop {
+        let (length, _) = socket.recv_from(&mut response)?;
+        let is_response = response[2] & 0x80 != 0;
+        if length >= 12 && response[..2] == id && is_response {
+            let answers = u16::from_be_bytes([response[6], response[7]]);
+            return Ok(format!("rcode {}, {answers} answers", response[3] & 0x0f));
+        }
+    }
+}
+
+/// Waits up to 10 seconds for one datagram on `socket` and names its sender.
+fn datagram_from(socket: &UdpSocket) -> io::Result<String> {
+    socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut buffer = [0; 64];
+    match socket.recv_from(&mut buffer) {
+        Ok((_, sender)) => Ok(format!("from {sender}")),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            Err(io::Error::new(io::ErrorKind::TimedOut, "no datagram"))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Accepts one TCP connection on `target` within `ACCEPT_TIMEOUT`. The escape tests connect from

@@ -290,8 +290,8 @@ fn sysctl_flag(name: &CStr) -> bool {
 mod tests {
     use super::*;
     use sandy_core::{
-        EnvironmentPolicy, NetworkAccess, PathAccess, PathMetadata, PathRule, SignalScope,
-        SystemAccess, WindowsPolicy,
+        EnvironmentPolicy, IpAccess, NetworkAccess, PathAccess, PathMetadata, PathRule,
+        SignalScope, SystemAccess, WindowsPolicy,
     };
     use std::path::PathBuf;
 
@@ -311,7 +311,7 @@ mod tests {
             ],
             program: Some(PathBuf::from("/bin/ls")),
             system: SystemAccess::Minimal,
-            ip: NetworkAccess::None,
+            ip: IpAccess::None,
             unix_sockets: NetworkAccess::None,
             expose: Vec::new(),
             forward: Vec::new(),
@@ -324,7 +324,7 @@ mod tests {
         };
         let mut policies = Vec::new();
         for system in [SystemAccess::Minimal, SystemAccess::None] {
-            for ip in [NetworkAccess::None, NetworkAccess::All] {
+            for ip in [IpAccess::None, IpAccess::Client, IpAccess::All] {
                 for unix_sockets in [NetworkAccess::None, NetworkAccess::All] {
                     for signals in [SignalScope::Any, SignalScope::Isolated] {
                         policies.push(ResolvedPolicy {

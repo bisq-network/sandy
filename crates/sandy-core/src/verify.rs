@@ -35,11 +35,11 @@ pub fn relay_listeners(policy: &ResolvedPolicy) -> Vec<PlanItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{ExposedPort, ForwardedPort, NetworkAccess, Policy};
+    use crate::policy::{ExposedPort, ForwardedPort, IpAccess, Policy};
 
     fn policy(expose: Vec<ExposedPort>, forward: Vec<ForwardedPort>) -> ResolvedPolicy {
         let mut policy = Policy::default();
-        policy.network.ip = NetworkAccess::All;
+        policy.network.ip = IpAccess::All;
         policy.network.expose = expose;
         policy.network.forward = forward;
         ResolvedPolicy::resolve(&policy, None).unwrap()

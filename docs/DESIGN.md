@@ -18,7 +18,8 @@ everything else is denied. sandy supports Linux, macOS and Windows.
 
 ## Non-goals
 
-- Limiting where the program connects on the network. IP networking is all or nothing.
+- Limiting where the program connects on the network. `ip` decides between no IP networking,
+  connections the program makes (`client`) and all of it; it never filters destinations.
 - Protecting the program from the user, or protecting secrets the program itself holds.
 - Resource limits (memory, CPU, process count). They can come later.
 - Containers, images or a separate root file system.
@@ -44,7 +45,7 @@ read_exec = ["/opt/app/bin"]  # read, list, execute
 read_write = ["/var/lib/app"] # read, list, create, change, delete; never execute
 
 [network]
-ip = "none"                   # "none" | "all"; IPv4 and IPv6 including loopback
+ip = "none"                   # "none" | "client" | "all"; IPv4 and IPv6 including loopback
 unix_sockets = "none"         # "none" | "all"; "none" reaches no socket outside read_write
 expose = [{ listen = "127.0.0.1:18080", port = 8080 }]  # relay into the program's port 8080
 forward = [{ port = 18081, to = "127.0.0.1:8081" }]     # relay out to a local service
@@ -140,7 +141,8 @@ Rules:
    children. Both need `unix_sockets = "none"`: through a Unix socket the program could ask a
    service of the user (for example the systemd user manager over D-Bus) to start a process,
    which is not its child. A service that starts processes on requests over TCP stays reachable
-   with `ip = "all"` or through a `forward` target, and its processes are not covered.
+   with `ip = "client"`, `ip = "all"` or through a `forward` target, and its processes are not
+   covered.
    `contained` also needs `signals = "isolated"`: otherwise the program could kill sandy and the
    process that ends the group. sandy rejects the policy when either condition is missing.
 10. `linux.path_metadata = "deny"` (the default) requires that permissions, owner, timestamps and
@@ -212,14 +214,15 @@ Rules:
    three streams before it applies the sandbox and accepts a socket only when the policy lets
    the program create one like it. Otherwise it refuses with status 125, naming the stream and
    the socket: an IP socket with `ip = "none"`, an unconnected, datagram or listening Unix
-   socket with `unix_sockets = "none"`, and under every policy a raw IP socket, an IP socket of
-   a protocol outside the usual ones (`streams::IP_PROTOCOLS`: TCP, UDP, ICMP, MPTCP) and a
-   socket of any other family, because no setting lets the program create one. A raw IP socket
+   socket with `unix_sockets = "none"`, a listening or datagram IP socket with
+   `ip = "client"`, and under every policy a raw IP socket, an IP socket of a protocol outside
+   the usual ones (`streams::IP_PROTOCOLS`: TCP, UDP, ICMP, MPTCP) and a socket of any other
+   family, because no setting lets the program create one. A raw IP socket
    needs privileges: CAP_NET_RAW on Linux, which sandy refuses to start with, root on macOS and
    administrator rights on Windows; sandy refuses an inherited one also where the caller has
    them, so that a policy means the same everywhere. An ICMP datagram socket follows `ip`,
    because an unprivileged program can create one where the kernel allows it (on Linux within
-   `net.ipv4.ping_group_range`). What `ip = "all"` allows besides AF_INET and
+   `net.ipv4.ping_group_range`). What `ip = "all"` and `ip = "client"` allow besides AF_INET and
    AF_INET6 comes from the backend (`Backend::ip_also_allows`): on Linux a route netlink socket,
    from the same list that the socket family filter is built from; on macOS and Windows
    nothing. The message for another family names it and says to pass a pipe, a file or a
@@ -227,7 +230,11 @@ Rules:
    stream or seqpacket socket is accepted, because it talks only to the peer it already has,
    which is how a parent passes a pipe (libuv, journald, `ssh` without a terminal); what that
    peer is stays the caller's choice, as with a file. A service that is handed its connection
-   on standard input, inetd-style or with systemd `Accept=yes`, needs `ip = "all"`. With
+   on standard input, inetd-style or with systemd `Accept=yes`, needs `ip = "client"`: a
+   connected TCP socket talks only to its peer, like a connection the program makes. A datagram
+   socket needs `ip = "all"`, also a connected one, because the program could disconnect it
+   (connect to AF_UNSPEC) and then receive from every sender at the port its creator chose,
+   which on Windows passes the firewall with the creator's rights. With
    `signals = "isolated"` `run` also refuses the master side of a pseudo-terminal on a standard
    stream, naming the stream and saying to pass the slave side or a pipe instead
    (`streams::terminal_master_refusal`). Writing the interrupt, quit or suspend character into
@@ -294,7 +301,8 @@ outside. Linux and macOS relay the same way, so a policy means the same on every
 Rules:
 
 1. `listen` must be a loopback address and must differ from the program's own address.
-2. The program needs `ip = "all"` to listen in this version.
+2. The program needs `ip = "all"` to listen. `ip = "client"` denies listening, so sandy refuses
+   `expose` with it and says to use `ip = "all"`.
 3. The relay ends with the program. On Windows the job object ends it; on Linux and macOS the
    relay watches the program's process.
 4. The relay is confined as tightly as the platform allows: on Windows it runs in the program's
@@ -319,7 +327,7 @@ confined relay process as `expose`, so a policy means the same on every platform
 Rules:
 
 1. `to` must be a loopback address; the program's address (`port`) must differ from it.
-2. The program needs `ip = "all"` to connect in this version.
+2. The program needs `ip = "client"` or `ip = "all"` to connect.
 3. No address may be used by two relays (`expose` or `forward`), and `to` must not lead back into
    the sandbox (an exposed address).
 4. The relay ends with the program and is confined like the `expose` relay.
@@ -403,6 +411,7 @@ Rules:
 | `InheritedHandlesClosed` | always |
 | `EnvironmentControlled` | always |
 | `IpNetworkDenied` | `network.ip = "none"` |
+| `InboundIpDenied` | `network.ip = "client"` |
 | `UnixSocketsDenied` | `network.unix_sockets = "none"` |
 | `SignalsIsolated` | `process.signals = "isolated"` |
 | `MetadataConfined` | `linux.path_metadata = "deny"` (default) |
@@ -417,8 +426,8 @@ A requirement is a lower bound. A backend may deny more, but never less. For exa
 it may write; Linux and macOS deny connections to every Unix socket, while Windows checks access
 to a socket through its file and therefore allows the sockets in the `read_write` paths and in
 the program's private AppContainer folder (docs/windows.md).
-(On Linux with `ip = "all"` a socket pair can still take a free abstract name; see
-`docs/linux.md`.)
+(On Linux with `ip = "all"` or `ip = "client"` a socket pair can still take a free abstract name;
+see `docs/linux.md`.)
 
 There is one exception to "never less". Some requirements mean less on one platform than their
 description says, because the platform has no mechanism that closes a route, or because sandy
@@ -433,8 +442,10 @@ exceptions:
 | Platform | When | What stays open |
 |---|---|---|
 | Linux | `signals = "isolated"` without `children = "contained"` | a read from the terminal in the background stops the group sandy was started in, with the processes outside the sandbox in it |
+| Linux | `ip = "client"` | a UDP socket that is not connected receives datagrams from every sender, at the port the kernel chose for it, and before Landlock ABI 10 at any port the program binds |
 | Linux | `forward` | another local user can deliver a write to the forwarded service, through a connection it closed before the relay asked who owns it, and that no longer carries its user (from the close on Linux 6.8, after the timewait record on newer kernels) |
-| macOS | `signals = "isolated"` | SIGIO (to a process of any user), and SIGURG with `ip = "all"`, through the owner ioctls of sockets and pipes; without `children = "contained"` also joining another job of the terminal session and stopping it |
+| macOS | `signals = "isolated"` | SIGIO (to a process of any user), and SIGURG with `ip = "client"` or `ip = "all"`, through the owner ioctls of sockets and pipes; without `children = "contained"` also joining another job of the terminal session and stopping it |
+| macOS | `ip = "client"` | a UDP socket that is not connected receives datagrams from every sender, at any port the program binds |
 | macOS | `forward` | every local user reaches the forwarded service |
 | macOS | `expose` or `forward` with `signals = "any"` | a stopped relay has no time limit |
 | Windows | a directory in the policy | a file moved out of a granted directory keeps its grant |
@@ -554,20 +565,25 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   the ABI. Writable paths never get execute, symbolic link, named pipe or device rights. Each
   rule path is opened without following links and must still be the file sandy planned with. ABI 6
   scopes signals (required for `signals = "isolated"`) and abstract Unix sockets; ABI 9 denies
-  pathname Unix sockets when `unix_sockets = "none"`; ABI 4 denies TCP when `ip = "none"`.
+  pathname Unix sockets when `unix_sockets = "none"`; ABI 4 denies TCP when `ip = "none"`. With
+  `ip = "client"` a second ruleset, built with raw system calls because the `landlock` crate
+  does not know the UDP right, lets sockets bind only port 0, a port the kernel chooses: TCP from
+  ABI 4, UDP from ABI 10. It decides nothing about listening: `listen` on an unbound socket picks
+  a port without that check.
 - Seccomp allowlist: the reviewed system call table of Linux 7.2; every other number, x32 numbers,
   `clone3`, `openat2`, `fanotify_init` and `name_to_handle_at` fail with `ENOSYS`; other CPU
   architectures are killed.
   `openat2` stays out because its flags live in memory, so the rule against access mode 3 below
   cannot be applied to it. The cost is GNU tar, which does not fall back (docs/linux.md).
 - Seccomp socket family filter: `socket` with a family outside the policy (an allowlist), or
-  with `ip = "all"` an IP protocol outside `streams::IP_PROTOCOLS`, whose module the kernel would
-  load, fails with `EAFNOSUPPORT`, so that programs fall back as they would on a kernel without
-  the family.
+  with `ip = "all"` or `ip = "client"` an IP protocol outside `streams::IP_PROTOCOLS`, whose
+  module the kernel would load, fails with `EAFNOSUPPORT`, so that programs fall back as they
+  would on a kernel without the family.
 - Seccomp extended attribute filter: with `path_metadata = "deny"`, the reads that take a path,
   and `fsetxattr` and `fremovexattr` on a descriptor, fail with `ENOTSUP`, the error of a file
   system without extended attributes, so that programs skip them instead of failing.
-- Seccomp denylist (`EPERM`): datagram socket pairs when Unix sockets are denied, io_uring, ptrace
+- Seccomp denylist (`EPERM`): datagram socket pairs when Unix sockets are denied, with
+  `ip = "client"` `listen`, `accept` and `accept4` for every socket, io_uring, ptrace
   and `process_vm_*`, `MADV_MERGEABLE`, System V IPC, POSIX message queues, namespaces,
   `CLONE_PARENT`, mounts, `bpf`, `perf_event_open`, `userfaultfd`, keyrings, the security module
   calls, `PIDFD_GET_INFO`, `TIOCSTI`/`TIOCLINUX`/`TIOCSETD`/`TIOCEXCL`, the console ioctls that
@@ -637,8 +653,11 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
 - dyld needs the root directory itself (only the names in `/`) to find the shared cache, so the
   minimal system set contains it; with `system = "none"` no program can start on macOS, so the
   backend refuses that unless a policy path covers "/".
-- Name resolution is part of `ip = "all"`: the profile allows exactly the Unix socket of
-  mDNSResponder, so DNS does not need `unix_sockets = "all"`.
+- Name resolution is part of `ip = "all"` and `ip = "client"`: the profile allows exactly the
+  Unix socket of mDNSResponder, so DNS does not need `unix_sockets = "all"`.
+- `ip = "client"`: `network-outbound` and `network-bind` for IP sockets, `network-inbound` for UDP
+  only. Seatbelt checks `listen` and `accept` as `network-inbound`, so no TCP socket listens, and
+  also every datagram that a socket which is not connected receives, which UDP clients need.
 - Metadata (mode, owner, flags, times, extended attributes, ACLs) can change only on `read_write`
   paths, through paths and open descriptors alike. `linux.path_metadata = "allow"` only drops the
   requirement; the profile is the same.
@@ -687,8 +706,9 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
 
 Details, limitations and sources: `docs/windows.md`.
 
-- Requires Windows 10 1809 (build 17763) or later; `IpNetworkDenied` also requires the fix for
-  CVE-2021-41338. `sandy.exe` starts on older builds and the plan names the reason.
+- Requires Windows 10 1809 (build 17763) or later; `IpNetworkDenied` and `InboundIpDenied` also
+  require the fix for CVE-2021-41338. `sandy.exe` starts on older builds and the plan names the
+  reason.
 
 - AppContainer named by `windows.appcontainer_name`; sandy creates its profile on first use.
   While a program runs, a second run under the same name with a different policy is refused,
@@ -706,10 +726,13 @@ Details, limitations and sources: `docs/windows.md`.
   a policy path on a network share. The system set is what Windows grants ALL APPLICATION
   PACKAGES; `system = "none"` is unavailable.
 - Network capabilities `internetClientServer` and `privateNetworkClientServer` only with
-  `ip = "all"`. Connections from the program to loopback listeners outside need the loopback
-  exemption, which `sandy setup` installs (administrator rights); connections from outside to
-  the program are always blocked. An exempt AppContainer reaches loopback without capabilities,
-  so `ip = "none"` refuses it.
+  `ip = "all"`, `internetClient` alone with `ip = "client"`: Windows Firewall then drops what
+  other hosts send that the program did not start, and the program reaches no host of a network
+  that Windows counts as private or domain network, because no capability allows only
+  connections out into one. Connections from the program to loopback listeners outside need the
+  loopback exemption, which `sandy setup` installs for `ip = "client"` and `ip = "all"`
+  (administrator rights); connections from outside to the program are always blocked. An exempt
+  AppContainer reaches loopback without capabilities, so `ip = "none"` refuses it.
 - `UnixSocketsDenied` through the file ACL: AF_UNIX connect needs write access to the socket
   file, which the program has only in read-write paths and its profile folder.
 - The AppContainer profile folder (`...\Packages\<name>\AC`, which holds `TEMP`) is private,

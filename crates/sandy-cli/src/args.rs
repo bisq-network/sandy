@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use lexopt::prelude::*;
 use sandy_core::{
-    ChildProcesses, ExposedPort, ForwardedPort, NetworkAccess, PathMetadata, Policy, SignalScope,
-    SystemAccess,
+    ChildProcesses, ExposedPort, ForwardedPort, IpAccess, NetworkAccess, PathMetadata, Policy,
+    SignalScope, SystemAccess,
 };
 
 pub const USAGE: &str = "\
@@ -25,7 +25,8 @@ Options (they extend the policy file):
   --read-exec PATH           allow reading and executing PATH (repeatable)
   --read-write PATH          allow reading and writing PATH (repeatable)
   --system minimal|none      add the minimal system paths (default: minimal)
-  --ip all|none              IP networking (default: none)
+  --ip all|client|none       IP networking; client connects out but takes no connections
+                             (default: none)
   --unix-sockets all|none    Unix domain sockets (default: none)
   --signals any|isolated     who the program may signal (default: any)
   --children allowed|none|contained
@@ -50,7 +51,7 @@ Options (they extend the policy file):
                              needs --ip all)
   --forward PORT=ADDRESS     relay connections from the program to its loopback PORT to the
                              loopback ADDRESS outside, for example 18081=127.0.0.1:8081
-                             (repeatable; needs --ip all)
+                             (repeatable; needs --ip client or --ip all)
   --linux-path-metadata deny|allow
                              metadata changes by path on Linux (default: deny)
   --pass-env NAME            copy variable NAME into the program environment (repeatable)
@@ -79,7 +80,7 @@ pub struct Overrides {
     read_exec: Vec<PathBuf>,
     read_write: Vec<PathBuf>,
     system: Option<SystemAccess>,
-    ip: Option<NetworkAccess>,
+    ip: Option<IpAccess>,
     unix_sockets: Option<NetworkAccess>,
     signals: Option<SignalScope>,
     children: Option<ChildProcesses>,
@@ -120,8 +121,8 @@ impl Overrides {
             filesystem.system = system;
         }
         if let Some(ip) = self.ip {
-            if ip == NetworkAccess::All && policy.network.ip == NetworkAccess::None {
-                note("--ip", "all", "ip", "none");
+            if ip_strictness(ip) < ip_strictness(policy.network.ip) {
+                note("--ip", ip.name(), "ip", policy.network.ip.name());
             }
             policy.network.ip = ip;
         }
@@ -173,6 +174,14 @@ impl Overrides {
 }
 
 /// How strict a `children` value is, higher is stricter. Only the order matters.
+fn ip_strictness(ip: IpAccess) -> u8 {
+    match ip {
+        IpAccess::All => 0,
+        IpAccess::Client => 1,
+        IpAccess::None => 2,
+    }
+}
+
 fn strictness(children: ChildProcesses) -> u8 {
     match children {
         ChildProcesses::Allowed => 0,
@@ -293,7 +302,14 @@ where
                     other => return Err(format!("invalid --system value {other:?}").into()),
                 })
             }
-            Long("ip") => overrides.ip = Some(network_access(&mut parser, "--ip")?),
+            Long("ip") => {
+                overrides.ip = Some(match parser.value()?.string()?.as_str() {
+                    "all" => IpAccess::All,
+                    "client" => IpAccess::Client,
+                    "none" => IpAccess::None,
+                    other => return Err(format!("invalid --ip value {other:?}").into()),
+                })
+            }
             Long("unix-sockets") => {
                 overrides.unix_sockets = Some(network_access(&mut parser, "--unix-sockets")?)
             }
@@ -472,7 +488,7 @@ mod tests {
             vec![PathBuf::from("/z"), PathBuf::from("/a")]
         );
         assert_eq!(policy.filesystem.read_write, vec![PathBuf::from("/b")]);
-        assert_eq!(policy.network.ip, NetworkAccess::All);
+        assert_eq!(policy.network.ip, IpAccess::All);
         assert_eq!(policy.process.signals, SignalScope::Isolated);
         assert_eq!(policy.process.children, ChildProcesses::None);
         assert!(policy.process.end_with_parent);
@@ -493,6 +509,36 @@ mod tests {
                 port: 8080
             }]
         );
+    }
+
+    /// `--ip client` widens a file without IP networking and narrows one with `ip = "all"`.
+    #[test]
+    fn a_wider_ip_setting_over_the_file_is_named() {
+        let weakened = |file: IpAccess, option: &str| {
+            let mut policy = Policy::default();
+            policy.network.ip = file;
+            let notes = invocation(&["check", "--ip", option])
+                .overrides
+                .apply(&mut policy, true);
+            assert_eq!(policy.network.ip.name(), option);
+            notes
+        };
+        assert_eq!(
+            weakened(IpAccess::None, "client"),
+            vec![
+                "--ip client replaces ip = \"none\" from the policy file and allows more than the \
+                 file does"
+                    .to_string()
+            ]
+        );
+        assert_eq!(weakened(IpAccess::Client, "all").len(), 1);
+        assert_eq!(weakened(IpAccess::None, "all").len(), 1);
+        assert!(weakened(IpAccess::All, "client").is_empty());
+        assert!(weakened(IpAccess::Client, "none").is_empty());
+        assert!(matches!(
+            parse_strs(&["check", "--ip", "server"]),
+            Err(message) if message.contains("invalid --ip value \"server\"")
+        ));
     }
 
     /// `--system minimal` adds the system set to what the program may read, so it widens a file

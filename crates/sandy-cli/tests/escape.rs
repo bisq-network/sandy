@@ -184,6 +184,121 @@ fn ip_networking_works_when_allowed() {
     lines[0].assert_ok();
 }
 
+/// `ip = "client"`: the program connects out, resolves names through the system and asks a DNS
+/// server itself, and gets the answers to its datagrams. The control without IP networking shows
+/// that the connection needs the setting.
+#[test]
+fn ip_client_connects_out() {
+    let fixture = Fixture::new("ipclient-out");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let query = format!("{}\u{1f}example.test", dns_server());
+    let client = with_ip(&fixture, "client");
+    let lines = controlled(
+        &client,
+        &[
+            ("tcp-connect", &address),
+            ("resolve", "localhost"),
+            ("dns-query", &query),
+        ],
+    );
+    lines[0].assert_ok();
+    lines[1].assert_ok();
+    assert_eq!(lines[2].detail, "rcode 0, 0 answers", "{:?}", lines[2]);
+    probe_inside(&fixture.access_args(), &[("tcp-connect", &address)])[0].assert_blocked();
+
+    let (control, _) = udp_answer(None, false);
+    control.assert_ok();
+    let (line, peer) = udp_answer(Some(&client), false);
+    line.assert_ok();
+    assert_eq!(line.detail, format!("from {peer}"));
+}
+
+/// `ip = "client"`: no connection reaches a listener of the program. Linux and macOS refuse
+/// listen itself; Windows lets the program listen and drops what arrives. The controls: the
+/// connection arrives outside the sandbox, and with `ip = "all"` on Linux and macOS, while
+/// Windows drops every loopback connection into an AppContainer also then (docs/windows.md,
+/// "Loopback").
+#[test]
+fn ip_client_takes_no_connections() {
+    let fixture = Fixture::new("ipclient-in");
+    let client = with_ip(&fixture, "client");
+    let all = with_ip(&fixture, "all");
+    let listen = [("tcp-listen", "127.0.0.1:0")];
+    let lines = controlled(&client, &listen);
+    if cfg!(windows) {
+        lines[0].assert_ok();
+    } else {
+        lines[0].assert_blocked();
+    }
+    probe_inside(&all, &listen)[0].assert_ok();
+
+    let (connected, line) = inbound_tcp(None);
+    assert!(connected, "control: {line:?}");
+    let (connected, line) = inbound_tcp(Some(&client));
+    assert!(!connected, "connected to the program: {line:?}");
+    line.assert_blocked();
+    let (connected, line) = inbound_tcp(Some(&all));
+    assert_eq!(connected, !cfg!(windows), "ip = \"all\": {line:?}");
+}
+
+/// `ip = "client"` and datagrams the program did not ask for. This records the routes the
+/// exceptions table of DESIGN.md names, so a platform that closes one fails here: on Linux and
+/// macOS a UDP socket that is not connected receives from every sender, at the port the kernel
+/// chose for it, and at a port the program binds itself unless Landlock ABI 10 refuses that bind.
+/// Windows drops both over loopback, as it does with `ip = "all"`.
+#[test]
+fn ip_client_datagrams_from_others() {
+    let fixture = Fixture::new("ipclient-udp");
+    let client = with_ip(&fixture, "client");
+    let all = with_ip(&fixture, "all");
+
+    inbound_udp(None).assert_ok();
+    let bound = inbound_udp(Some(&client));
+    let gap = !cfg!(windows);
+    #[cfg(target_os = "linux")]
+    let gap = gap && common::linux::landlock_abi() < 10;
+    if gap {
+        bound.assert_ok();
+    } else {
+        bound.assert_blocked();
+    }
+    assert_eq!(inbound_udp(Some(&all)).result == "ok", !cfg!(windows));
+
+    let (control, third) = udp_answer(None, true);
+    assert_eq!(control.detail, format!("from {third}"));
+    let (line, third) = udp_answer(Some(&client), true);
+    if cfg!(windows) {
+        line.assert_blocked();
+    } else {
+        assert_eq!(line.detail, format!("from {third}"), "{line:?}");
+    }
+}
+
+/// A DNS server on loopback that answers every query with no records. Returns its address.
+fn dns_server() -> String {
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = server.local_addr().unwrap().to_string();
+    server
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    std::thread::spawn(move || {
+        let mut query = [0; 512];
+        while let Ok((length, client)) = server.recv_from(&mut query) {
+            // The query itself, marked as a response.
+            query[2] |= 0x80;
+            let _ = server.send_to(&query[..length], client);
+        }
+    });
+    address
+}
+
+fn with_ip(fixture: &Fixture, ip: &str) -> Vec<String> {
+    let mut args = fixture.access_args();
+    args.extend(["--ip".to_string(), ip.to_string()]);
+    args
+}
+
 #[cfg(unix)]
 #[test]
 fn unix_sockets_are_denied_by_default() {
@@ -600,6 +715,47 @@ fn a_socket_on_standard_input_gives_no_network_access() {
         &format!("standard input carries {state} IP stream socket"),
     );
     drop(waiting);
+}
+
+/// With `ip = "client"` a connected TCP socket on standard input is accepted: it talks only to
+/// its peer, like a connection the program makes itself. A listening socket and a datagram
+/// socket are refused, also a connected datagram socket, which the program could disconnect and
+/// then receive from every sender at the port its creator chose.
+#[test]
+fn ip_client_accepts_only_a_connection_on_standard_input() {
+    let client = ["--ip".to_string(), "client".to_string()];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let output = run_with_stdin(&run_args(&client, &[("pid", "-")]), stdin_from(stream));
+    assert!(output.status.success(), "{output:?}");
+    parse(&output)[0].assert_ok();
+
+    let waiting = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let refused = run_with_stdin(&run_args(&client, &[("pid", "-")]), stdin_from(listener));
+    let state = if cfg!(target_os = "macos") {
+        "an unconnected"
+    } else {
+        "a listening"
+    };
+    assert_refused(
+        &refused,
+        &format!("standard input carries {state} IP stream socket"),
+    );
+    drop(waiting);
+
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let connected = UdpSocket::bind("127.0.0.1:0").unwrap();
+    connected.connect(peer.local_addr().unwrap()).unwrap();
+    let refused = run_with_stdin(&run_args(&client, &[("pid", "-")]), stdin_from(connected));
+    assert_refused(
+        &refused,
+        "standard input carries a connected IP datagram socket",
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("ip = \"client\" cannot hold for it"),
+        "{stderr}"
+    );
 }
 
 /// A service that is handed its connection on standard input runs with `ip = "all"`. The peer is

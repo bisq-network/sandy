@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use crate::plan::Requirement;
 use crate::policy::{
-    ChildProcesses, EnvironmentPolicy, ExposedPort, ForwardedPort, NetworkAccess, PathMetadata,
-    Policy, PolicyError, ProcessPolicy, SignalScope, SystemAccess, WindowsPolicy,
+    ChildProcesses, EnvironmentPolicy, ExposedPort, ForwardedPort, IpAccess, NetworkAccess,
+    PathMetadata, Policy, PolicyError, ProcessPolicy, SignalScope, SystemAccess, WindowsPolicy,
 };
 
 #[cfg(windows)]
@@ -138,7 +138,7 @@ pub struct ResolvedPolicy {
     /// Canonical path of the target executable, when the policy was resolved for one.
     pub program: Option<PathBuf>,
     pub system: SystemAccess,
-    pub ip: NetworkAccess,
+    pub ip: IpAccess,
     pub unix_sockets: NetworkAccess,
     pub expose: Vec<ExposedPort>,
     pub forward: Vec<ForwardedPort>,
@@ -221,8 +221,10 @@ impl ResolvedPolicy {
             Requirement::InheritedHandlesClosed,
             Requirement::EnvironmentControlled,
         ];
-        if self.ip == NetworkAccess::None {
-            requirements.push(Requirement::IpNetworkDenied);
+        match self.ip {
+            IpAccess::None => requirements.push(Requirement::IpNetworkDenied),
+            IpAccess::Client => requirements.push(Requirement::InboundIpDenied),
+            IpAccess::All => {}
         }
         if self.unix_sockets == NetworkAccess::None {
             requirements.push(Requirement::UnixSocketsDenied);
@@ -1216,15 +1218,25 @@ fn for_each_linked_file(
 }
 
 /// Exposed ports listen on loopback only, so a relay never makes the target reachable from other
-/// machines. The target must be able to listen, which needs IP networking in this version.
-fn validate_expose(expose: &[ExposedPort], ip: NetworkAccess) -> Result<(), PolicyError> {
+/// machines. The target must be able to listen, which only `ip = "all"` allows.
+fn validate_expose(expose: &[ExposedPort], ip: IpAccess) -> Result<(), PolicyError> {
     let invalid = |expose: &ExposedPort, reason| PolicyError::InvalidExpose {
         expose: *expose,
         reason,
     };
     for entry in expose {
-        if ip != NetworkAccess::All {
-            return Err(invalid(entry, "the program needs ip = \"all\" to listen"));
+        match ip {
+            IpAccess::None => {
+                return Err(invalid(entry, "the program needs ip = \"all\" to listen"));
+            }
+            IpAccess::Client => {
+                return Err(invalid(
+                    entry,
+                    "the program must listen for the relay's connections, and ip = \"client\" \
+                     denies listening; use ip = \"all\"",
+                ));
+            }
+            IpAccess::All => {}
         }
         if !entry.listen.ip().is_loopback() {
             return Err(invalid(entry, "listen must be a loopback address"));
@@ -1243,15 +1255,18 @@ fn validate_expose(expose: &[ExposedPort], ip: NetworkAccess) -> Result<(), Poli
 }
 
 /// Forwarded ports reach loopback services only, so a relay never opens a way to other machines.
-/// The target connects over IP, which needs IP networking.
-fn validate_forward(forward: &[ForwardedPort], ip: NetworkAccess) -> Result<(), PolicyError> {
+/// The target connects over IP, which `ip = "client"` and `ip = "all"` allow.
+fn validate_forward(forward: &[ForwardedPort], ip: IpAccess) -> Result<(), PolicyError> {
     let invalid = |forward: &ForwardedPort, reason| PolicyError::InvalidForward {
         forward: *forward,
         reason,
     };
     for entry in forward {
-        if ip != NetworkAccess::All {
-            return Err(invalid(entry, "the program needs ip = \"all\" to connect"));
+        if ip == IpAccess::None {
+            return Err(invalid(
+                entry,
+                "the program needs ip = \"client\" or \"all\" to connect",
+            ));
         }
         if !entry.to.ip().is_loopback() {
             return Err(invalid(entry, "to must be a loopback address"));
@@ -1561,7 +1576,7 @@ mod tests {
         }
     }
 
-    fn with_expose(ip: NetworkAccess, entries: &[ExposedPort]) -> Policy {
+    fn with_expose(ip: IpAccess, entries: &[ExposedPort]) -> Policy {
         let mut policy = Policy::default();
         policy.network.ip = ip;
         policy.network.expose = entries.to_vec();
@@ -1571,7 +1586,7 @@ mod tests {
     #[test]
     fn accepts_loopback_expose_with_ip() {
         for listen in ["127.0.0.1:18080", "[::1]:18080"] {
-            let policy = with_expose(NetworkAccess::All, &[expose(listen, 8080)]);
+            let policy = with_expose(IpAccess::All, &[expose(listen, 8080)]);
             let resolved = ResolvedPolicy::resolve(&policy, None).unwrap();
             let requirements = resolved.requirements();
             assert!(requirements.contains(&Requirement::ExposedPortsRelayed));
@@ -1581,21 +1596,21 @@ mod tests {
     #[test]
     fn rejects_invalid_expose() {
         let cases = [
-            with_expose(NetworkAccess::None, &[expose("127.0.0.1:18080", 8080)]),
-            with_expose(NetworkAccess::All, &[expose("0.0.0.0:18080", 8080)]),
-            with_expose(NetworkAccess::All, &[expose("192.168.1.2:18080", 8080)]),
-            with_expose(NetworkAccess::All, &[expose("127.0.0.1:0", 8080)]),
-            with_expose(NetworkAccess::All, &[expose("127.0.0.1:18080", 0)]),
-            with_expose(NetworkAccess::All, &[expose("127.0.0.1:8080", 8080)]),
+            with_expose(IpAccess::None, &[expose("127.0.0.1:18080", 8080)]),
+            with_expose(IpAccess::All, &[expose("0.0.0.0:18080", 8080)]),
+            with_expose(IpAccess::All, &[expose("192.168.1.2:18080", 8080)]),
+            with_expose(IpAccess::All, &[expose("127.0.0.1:0", 8080)]),
+            with_expose(IpAccess::All, &[expose("127.0.0.1:18080", 0)]),
+            with_expose(IpAccess::All, &[expose("127.0.0.1:8080", 8080)]),
             with_expose(
-                NetworkAccess::All,
+                IpAccess::All,
                 &[
                     expose("127.0.0.1:18080", 8080),
                     expose("127.0.0.1:18080", 8081),
                 ],
             ),
             with_expose(
-                NetworkAccess::All,
+                IpAccess::All,
                 &[
                     expose("127.0.0.1:18080", 8080),
                     expose("127.0.0.1:8080", 8081),
@@ -1609,6 +1624,23 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    /// The program must listen for the relay's connections, which `ip = "client"` denies.
+    #[test]
+    fn expose_is_refused_with_client() {
+        let policy = with_expose(IpAccess::Client, &[expose("127.0.0.1:18080", 8080)]);
+        let error = ResolvedPolicy::resolve(&policy, None).unwrap_err();
+        assert!(
+            matches!(error, PolicyError::InvalidExpose { .. }),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("ip = \"client\" denies listening; use ip = \"all\""),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1628,7 +1660,7 @@ mod tests {
         }
     }
 
-    fn with_forward(ip: NetworkAccess, entries: &[ForwardedPort]) -> Policy {
+    fn with_forward(ip: IpAccess, entries: &[ForwardedPort]) -> Policy {
         let mut policy = Policy::default();
         policy.network.ip = ip;
         policy.network.forward = entries.to_vec();
@@ -1638,34 +1670,45 @@ mod tests {
     #[test]
     fn accepts_loopback_forward_with_ip() {
         for to in ["127.0.0.1:8080", "[::1]:8080"] {
-            let policy = with_forward(NetworkAccess::All, &[forward(18080, to)]);
+            let policy = with_forward(IpAccess::All, &[forward(18080, to)]);
             let resolved = ResolvedPolicy::resolve(&policy, None).unwrap();
             let requirements = resolved.requirements();
             assert!(requirements.contains(&Requirement::ForwardedPortsRelayed));
         }
     }
 
+    /// A forwarded port is a connection the program makes, which `ip = "client"` allows.
+    #[test]
+    fn forward_works_with_client() {
+        let policy = with_forward(IpAccess::Client, &[forward(18080, "127.0.0.1:8080")]);
+        let requirements = ResolvedPolicy::resolve(&policy, None)
+            .unwrap()
+            .requirements();
+        assert!(requirements.contains(&Requirement::ForwardedPortsRelayed));
+        assert!(requirements.contains(&Requirement::InboundIpDenied));
+    }
+
     #[test]
     fn rejects_invalid_forward() {
         let mut cases = vec![
-            with_forward(NetworkAccess::None, &[forward(18080, "127.0.0.1:8080")]),
-            with_forward(NetworkAccess::All, &[forward(18080, "192.168.1.2:8080")]),
-            with_forward(NetworkAccess::All, &[forward(18080, "0.0.0.0:8080")]),
-            with_forward(NetworkAccess::All, &[forward(0, "127.0.0.1:8080")]),
-            with_forward(NetworkAccess::All, &[forward(18080, "127.0.0.1:0")]),
-            with_forward(NetworkAccess::All, &[forward(8080, "127.0.0.1:8080")]),
+            with_forward(IpAccess::None, &[forward(18080, "127.0.0.1:8080")]),
+            with_forward(IpAccess::All, &[forward(18080, "192.168.1.2:8080")]),
+            with_forward(IpAccess::All, &[forward(18080, "0.0.0.0:8080")]),
+            with_forward(IpAccess::All, &[forward(0, "127.0.0.1:8080")]),
+            with_forward(IpAccess::All, &[forward(18080, "127.0.0.1:0")]),
+            with_forward(IpAccess::All, &[forward(8080, "127.0.0.1:8080")]),
             with_forward(
-                NetworkAccess::All,
+                IpAccess::All,
                 &[
                     forward(18080, "127.0.0.1:8080"),
                     forward(18080, "127.0.0.1:8081"),
                 ],
             ),
         ];
-        let mut clashing = with_forward(NetworkAccess::All, &[forward(18080, "127.0.0.1:8080")]);
+        let mut clashing = with_forward(IpAccess::All, &[forward(18080, "127.0.0.1:8080")]);
         clashing.network.expose = vec![expose("127.0.0.1:18080", 9000)];
         cases.push(clashing);
-        let mut looping = with_forward(NetworkAccess::All, &[forward(18081, "127.0.0.1:18080")]);
+        let mut looping = with_forward(IpAccess::All, &[forward(18081, "127.0.0.1:18080")]);
         looping.network.expose = vec![expose("127.0.0.1:18080", 9000)];
         cases.push(looping);
         for policy in cases {
@@ -1685,7 +1728,7 @@ mod tests {
     fn relay_conflicts_do_not_depend_on_the_order() {
         let both = |expose: Vec<ExposedPort>, forward: Vec<ForwardedPort>| {
             let mut policy = Policy::default();
-            policy.network.ip = NetworkAccess::All;
+            policy.network.ip = IpAccess::All;
             policy.network.expose = expose;
             policy.network.forward = forward;
             ResolvedPolicy::resolve(&policy, None)
@@ -1733,7 +1776,7 @@ mod tests {
         labeled.set_flowinfo(5);
         for address in [scoped, SocketAddr::V6(labeled)] {
             let policy = with_expose(
-                NetworkAccess::All,
+                IpAccess::All,
                 &[ExposedPort {
                     listen: address,
                     port: 28081,
@@ -1744,7 +1787,7 @@ mod tests {
                 Err(PolicyError::InvalidExpose { .. })
             ));
             let policy = with_forward(
-                NetworkAccess::All,
+                IpAccess::All,
                 &[ForwardedPort {
                     port: 28081,
                     to: address,
@@ -1854,13 +1897,14 @@ mod tests {
             .requirements();
         assert!(baseline.iter().all(|r| all_denied.contains(r)));
         assert!(all_denied.contains(&Requirement::IpNetworkDenied));
+        assert!(!all_denied.contains(&Requirement::InboundIpDenied));
         assert!(all_denied.contains(&Requirement::UnixSocketsDenied));
         assert!(!all_denied.contains(&Requirement::SignalsIsolated));
         assert!(!all_denied.contains(&Requirement::ChildProcessesDenied));
         assert!(!all_denied.contains(&Requirement::ChildProcessesContained));
         assert!(all_denied.contains(&Requirement::MetadataConfined));
 
-        policy.network.ip = NetworkAccess::All;
+        policy.network.ip = IpAccess::All;
         policy.network.unix_sockets = NetworkAccess::All;
         policy.process.signals = SignalScope::Isolated;
         policy.linux.path_metadata = PathMetadata::Allow;
@@ -1869,9 +1913,17 @@ mod tests {
             .requirements();
         assert!(baseline.iter().all(|r| allowed.contains(r)));
         assert!(!allowed.contains(&Requirement::IpNetworkDenied));
+        assert!(!allowed.contains(&Requirement::InboundIpDenied));
         assert!(!allowed.contains(&Requirement::UnixSocketsDenied));
         assert!(allowed.contains(&Requirement::SignalsIsolated));
         assert!(!allowed.contains(&Requirement::MetadataConfined));
+
+        policy.network.ip = IpAccess::Client;
+        let client = ResolvedPolicy::resolve(&policy, None)
+            .unwrap()
+            .requirements();
+        assert!(client.contains(&Requirement::InboundIpDenied));
+        assert!(!client.contains(&Requirement::IpNetworkDenied));
 
         // children = "none" needs unix_sockets = "none" (see rejects_children_none_with_unix_sockets).
         policy.network.unix_sockets = NetworkAccess::None;
