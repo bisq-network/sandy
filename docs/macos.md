@@ -85,7 +85,7 @@ compiler fail, and sandy fails closed.
 | `EnvironmentControlled` | `posix_spawn` (with `children = "contained"`: `execve`) receives exactly `command.env`. The backend adds no variable. |
 | `IpNetworkDenied` | Profile: no `network-*` rule for IP. The name resolver is unreachable unless `unix_sockets = "all"`. |
 | `UnixSocketsDenied` | Profile: no `network-bind` or `network-outbound` for Unix sockets. With `ip = "all"`, the resolver socket is the one exception. |
-| `SignalsIsolated` | Profile: `(allow signal (target self) (target same-sandbox))` instead of `(allow signal)`, and `(deny system-fcntl (fcntl-command 6))`, because `F_SETOWN` makes the kernel send SIGIO to any process. The kernel's job control signals stay outside it (see [Signals the profile does not cover](#signals-the-profile-does-not-cover)). |
+| `SignalsIsolated` | Profile: `(allow signal (target self) (target same-sandbox))` instead of `(allow signal)`, and `(deny system-fcntl (fcntl-command 6))`, which closes `F_SETOWN`, one of the ways to have the kernel send SIGIO to any process. The other ways, through ioctls on sockets and pipes, and the kernel's job control signals stay outside it (see [Signals the profile does not cover](#signals-the-profile-does-not-cover)). |
 | `ChildProcessesDenied` | Profile: no `(allow process-fork)`, and an explicit `(deny process-fork)` at the end. Seatbelt checks `fork`, `vfork` and `posix_spawn` without `POSIX_SPAWN_SETEXEC` as `process-fork`; all three fail with `EPERM` (CI run 39857337279 logged `deny(1) process-fork` for each). Threads are no operation, and `execve` of an allowed program, which replaces the image without creating a process, stays covered by `process-exec*`. sandy's own final `posix_spawn` with `POSIX_SPAWN_SETEXEC` is not a `process-fork`, and the relay is forked before the profile applies, so both still work. |
 | `EndsWithParent` | A watcher process outside the sandbox with its own profile; see [Ending with the parent](#ending-with-the-parent). |
 | `ChildProcessesContained` | sandy stays the target's parent; a guard process leads the target's process group; the profile denies `setpgid`, `setsid` and `posix_spawn`. See [Contained child processes](#contained-child-processes). |
@@ -121,16 +121,23 @@ the task already holds needs no lookup. The kernel copies the task's exception p
 creates a task and keeps them across `exec`, so a caller with a crash reporter (Crashpad,
 Sentry, a debugger) would hand the program a send right to its handler, which the program could
 use for forged exception messages. Before it applies the profile, sandy therefore sets the
-handler of every machine-independent exception (`EXC_MASK_ALL`) to `MACH_PORT_NULL`, as
-Chromium's launcher does. It happens before the relay and the watcher are forked, so they drop
-the ports too.
+handler of every machine-independent exception (`EXC_MASK_ALL`, as Chromium's launcher does)
+and of the crash port (`EXC_MASK_CRASH`) to `MACH_PORT_NULL`. The crash port is not part of
+`EXC_MASK_ALL`, and it is the one Crashpad's handler takes. It happens before the relay and the
+watcher are forked, so they drop the ports too.
 
-What stays: the crash port (`EXC_MASK_CRASH`), which launchd sets to the system crash reporter
-and which is not part of `EXC_MASK_ALL`, so crashes are still reported; and the host name port,
-which every process inherits (see "Information the target can still read"). A program that is
-started by a caller with its own crash reporter loses that reporter, which is the point.
-Measured on macOS 26.5: a task starts with a handler for `EXC_MASK_RESOURCE` even without a
-crash reporter, the handler survives `exec`, and after the reset the exec'd program finds none.
+A program that is started by a caller with its own crash reporter loses that reporter, which is
+the point. Measured on macOS 26.5: a task starts with a handler for `EXC_MASK_RESOURCE` even
+without a crash reporter, the handler survives `exec`, and after the reset the exec'd program
+finds none. Neither a login over SSH nor a launchd job has a handler for the crash port, so
+only a caller's own crash reporter puts one there. A caller that installs `EXC_MASK_CRASH`,
+`EXC_MASK_RESOURCE` and `EXC_MASK_GUARD`, as Crashpad does, and keeps the receive right in a
+process of its own handed the program a live send right for the crash port until it was reset
+too (`inherited_mach_exception_ports_are_reset`).
+
+What stays: the handler of `EXC_MASK_CORPSE_NOTIFY`, which every task has; and the host name
+port, which every process inherits (see "Information the target can still read"). A caller that
+replaces the corpse notification handler with its own passes that one on.
 
 ### SIGPIPE
 
@@ -292,8 +299,12 @@ Not in the set, on purpose:
 duplicates that descriptor instead of opening the file again. XNU's `dupfdopen` refuses a mode
 the original lacks, measured on macOS 26.5 and in the escape test
 `a_descriptor_path_grants_no_more_than_the_descriptor`: `open("/dev/fd/0", O_WRONLY)` on a
-read-only standard input gives `EACCES` inside the sandbox and outside it. A program that takes
-`/dev/stdin` as a file name therefore works, as it does on Linux.
+read-only standard input gives `EACCES` inside the sandbox and outside it, and so does
+`truncate("/dev/fd/0")`. `chmod`, `utimes`, `chflags` and `setattrlist` on `/dev/fd/N` do reach
+the file behind the descriptor, whatever mode it was opened with, but Seatbelt judges them by
+the path of that file and not by `/dev/fd`, so they follow the policy for that file
+(`a_descriptor_path_changes_no_metadata`). A program that takes `/dev/stdin` as a file name
+therefore works, as it does on Linux.
 
 The set is smaller than the sets of Chromium (`common.sb`) and the Codex CLI
 (`seatbelt_read_only_platform_defaults.sbpl`), which serve programs with Cocoa, preferences and
@@ -461,13 +472,17 @@ all. macOS has no timer that kills a process that is not running (the Linux rela
 only `signals = "isolated"`, which keeps the program from signalling the relay at all, holds
 that bound here.
 
-A continued relay here is meant not to relay what its listeners collected while it was stopped:
-the kqueue reports the end of the program before anything that became ready after it, and the
-relay returns on that event without accepting. That has not been measured on macOS, and the
-equivalent claim on Linux turned out to be false for two reasons that do not depend on signals
-(docs/linux.md, "Exposed and forwarded ports"), so treat it as untested rather than as a
-guarantee. What it would cost if it does not hold is a violation of the relay's lifetime, not
-an escape: an exposed port can answer once more after the operator believes the run ended.
+A continued relay serves what its listeners collected while it was stopped. The kqueue reports
+a listener once when it becomes ready, and the relay then accepts its whole backlog, so when
+the program's own connection made the listener ready before the program ended, a connection
+made after the end is accepted with it. Measured on macOS 26.5
+(`a_continued_relay_serves_a_connection_made_after_the_program_ended`): the program connects
+through a forwarded port while its relay is stopped and ends, a client connects after the end,
+and once the relay is continued the forwarded service receives both connections. Without a
+stop the same can happen to a connection that arrives in the moment between the program's end
+and the relay's accept. What it costs is a violation of the relay's lifetime, not an escape: a
+forwarded port serves one more connection after the operator believes the run ended, and an
+exposed port can answer once more, served by whatever now holds the program's address.
 `process.children = "contained"` does not close it here as it does on Linux, where sandy ends
 the program's group when the relay is gone.
 
@@ -479,13 +494,23 @@ the escape test `isolated_signals_do_not_cross_sandbox_instances` showed that a 
 with the same policy cannot signal the first. Two paths reach a process outside the sandbox
 without that check, because the kernel sends those signals itself:
 
-- `F_SETOWN` names the process that gets SIGIO when a socket or a pipe becomes ready, and XNU
-  sends it with no check behind it that `signal` covers. Measured on macOS 26.5: a program with
-  isolated signals delivered SIGIO to a process outside the sandbox. A profile cannot filter the
-  owner, so with `signals = "isolated"` the command itself is denied and the program gets no
-  SIGIO at all. The ioctl variants `FIOSETOWN` and `SIOCSPGRP` were outside the ioctl allowlist
-  already. With the default `signals = "any"` the program may signal every process anyway, so
-  the rule is only added for `isolated`.
+- SIGIO. `F_SETOWN` names the process that gets SIGIO when a socket or a pipe becomes ready,
+  and XNU sends it with no check behind it that `signal` covers. Measured on macOS 26.5: a
+  program with isolated signals delivered SIGIO to a process outside the sandbox. A profile
+  cannot filter the owner, so with `signals = "isolated"` the command itself is denied. That
+  closes one way of naming the owner, not all of them: the ioctls `FIOSETOWN` (sockets and
+  pipes), `SIOCSPGRP` (sockets) and `TIOCSPGRP` (pipes) set the same owner, and Seatbelt checks
+  `file-ioctl`, and with it the ioctl allowlist, only for files and devices. No operation of the
+  profile language reaches them; `socket-ioctl` compiles but stops none of them. Measured on
+  macOS 26.5, each of the four delivers SIGIO to a process outside the sandbox under
+  `signals = "isolated"` (`sigio_through_owner_ioctls_follows_no_signal_policy`). The same owner
+  gets SIGURG when urgent data arrives on a TCP socket, which with `ip = "all"` the program can
+  send itself over loopback; measured the same way. Not even the `ioctl` system call as a whole
+  can be denied: a `syscall-unix` rule for its number has no effect, while the same rule stops
+  `fsgetpath` (measured on macOS 26.5). The program cannot choose the signal, and the default
+  action of SIGIO and SIGURG is to discard it, so only a process that handles them notices. With
+  the default `signals = "any"` the program may signal every process anyway, so the `F_SETOWN`
+  rule is only added for `isolated`.
 - Job control. The kernel stops a whole process group when one of its processes reads a terminal
   in the background, and that send has no check behind it either. A program can join the process
   group of another job of the terminal session it was started in: `setpgid` cannot be filtered by
@@ -516,8 +541,12 @@ when sandy itself is killed. sandy then stays the target's parent instead of rep
    its caller set to be ignored, for example `SIGINT` and `SIGQUIT` after `&` in a script or
    `SIGHUP` under `nohup`. macOS discards a signal on arrival while its action is to ignore it,
    even when it is blocked, so without the handler sandy would never see these signals and could
-   not forward them. Then it blocks every signal except the fault signals and waits for them with
-   `sigwait`. The target gets the caller's actions back before it starts.
+   not forward them. Then it blocks every signal except the fault signals and SIGPIPE and waits
+   for them with `sigwait`. The target gets the caller's actions back before it starts. SIGPIPE
+   stays ignored, as sandy's Rust runtime set it: a write of sandy's own whose reader has gone,
+   the record of `--status-fd` for one, raises it, and caught it would be forwarded and end the
+   target with status 141. A SIGPIPE sent to sandy is therefore not passed on. The target starts
+   with the default action for SIGPIPE.
 2. It forks the guard. The guard starts a process group of its own (it is in neither sandy's job
    nor the target's group) and forks the anchor, which starts the target's process group and only
    waits to be killed. The guard keeps two pipes to and from sandy and, with exposed or
@@ -782,7 +811,8 @@ none, so the backend answers nothing and sandy refuses the option.
   target type commands into the shell that started sandy. Job control fails for the same reason:
   `TIOCSPGRP` is not allowed either, so a shell inside the sandbox cannot give the terminal to a
   job.
-- With `signals = "isolated"` the program gets no SIGIO, because `F_SETOWN` is denied (see
+- With `signals = "isolated"`, `fcntl(F_SETOWN)` fails, and the program can still have the
+  kernel send SIGIO to a process outside the sandbox through an ioctl on a socket or a pipe (see
   [Signals the profile does not cover](#signals-the-profile-does-not-cover)).
 - Standard input, output and error keep what they were opened with, so a file outside the policy
   on a standard stream can be read and written. A socket the policy denies is refused at the
@@ -813,6 +843,11 @@ none, so the backend answers nothing and sandy refuses the option.
 - A `read_write` path itself cannot be deleted or replaced, and a writable file cannot be replaced
   by renaming another file over it. Programs must write such a file in place.
 - `getcwd` fails when the working directory is outside the policy.
+- A policy path spelled through the data volume, such as `/System/Volumes/Data/private/tmp/x`
+  for `/private/tmp/x`, grants nothing. A firmlink is no symbolic link, so `canonicalize` keeps
+  that spelling, while Seatbelt matches the path through the firmlink: measured on macOS 26.5,
+  a program with that `read_write` path could write neither under it nor under `/private/tmp/x`.
+  Give the path without the prefix; the program may then use either spelling.
 - sandy cannot run inside another Seatbelt sandbox; `sandy check` reports this.
 - x86_64 code does not run in the sandbox on Apple silicon. Rosetta loads its runtime
   (`libRosettaRuntime`) into every translated process, and the profile does not allow it, so the
@@ -870,7 +905,8 @@ macOS only:
   groups of the terminal session. A check that this host cannot run reports a skip, and
   `tests/expected-skips/macos-26-arm.txt` lists the ones that are expected.
 
-To see what the sandbox denies on a Mac:
+To see what the sandbox denies on a Mac, from an administrator account (a standard user gets
+no log, see [Diagnostic mode](#diagnostic-mode)):
 
 ```sh
 log stream --style compact --predicate 'sender == "Sandbox"'

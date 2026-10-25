@@ -222,6 +222,41 @@ fn signals_reach_the_program_and_its_status_is_reported() {
     assert_eq!(sandy.wait().unwrap().code(), Some(143));
 }
 
+/// Writing the `--status-fd` record is best effort: a caller that closed its end of the
+/// channel gets no record, and the program runs as it would without the option. Such a write
+/// raises SIGPIPE, which must neither end sandy before it starts the program nor reach the
+/// program through the supervising sandy of `contained`, which passes signals on.
+#[test]
+fn a_status_channel_nobody_reads_changes_nothing() {
+    use std::os::fd::AsRawFd;
+
+    let fixture = Fixture::new("contained-status-unread");
+    for sandbox_args in [fixture.access_args(), contained(&fixture)] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let raw = writer.as_raw_fd();
+        let mut args = run_args(&sandbox_args, &[("sleep", "200"), ("exit", "7")]);
+        args.splice(1..1, ["--status-fd".to_string(), "3".to_string()]);
+        let mut command = Command::new(sandy_path());
+        command.args(args);
+        // SAFETY: dup2 is async-signal-safe and the closure calls nothing else.
+        unsafe {
+            command.pre_exec(move || match libc::dup2(raw, 3) {
+                3 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            });
+        }
+        let output = command.output().unwrap();
+        drop(writer);
+        assert_eq!(
+            output.status.code(),
+            Some(7),
+            "{sandbox_args:?}: {output:?}"
+        );
+        parse(&output)[0].assert_ok();
+    }
+}
+
 #[test]
 fn a_failed_start_is_reported() {
     let fixture = Fixture::new("contained-start");

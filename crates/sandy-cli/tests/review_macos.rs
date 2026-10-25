@@ -116,8 +116,10 @@ fn dangerous_socket_families_cannot_be_created() {
     let mut checked = 0;
     for ((family, out), inside) in families.iter().zip(&outside).zip(&inside) {
         if out.result != "ok" {
+            // One feature per family, so that the expected-skip list names each one: a
+            // family that stops working outside must not hide behind another that never did.
             skip(
-                "socket-family",
+                &format!("socket-family-{family}"),
                 &format!(
                     "{family}: not creatable outside the sandbox ({})",
                     out.detail
@@ -212,6 +214,32 @@ fn metadata_by_path_outside_writable_is_denied() {
     }
     for file in ["secret/file", "ro/file"] {
         assert!(fixture.path(file).exists(), "{file} disappeared");
+    }
+}
+
+/// The descriptor variants of the metadata calls take the check of the path variants
+/// (`MetadataConfined`: "by path and through open descriptors alike"): a descriptor opened for
+/// reading on a `read` path changes neither mode, owner, flags, times nor extended attributes.
+/// On Linux the same descriptor once could.
+#[test]
+fn metadata_through_a_read_only_descriptor_is_denied() {
+    let fixture = Fixture::new("macos-fd-metadata");
+    let file = fixture.arg("ro/file");
+    let targets: Vec<String> = ["fchmod", "fchown", "fchflags", "futimes", "fsetxattr"]
+        .iter()
+        .map(|call| format!("{file}{ARGUMENT_SEPARATOR}{call}"))
+        .collect();
+    let actions: Vec<(&str, &str)> = targets
+        .iter()
+        .map(|target| ("fd-metadata", target.as_str()))
+        .collect();
+
+    for line in probe_outside(&actions) {
+        line.assert_ok();
+    }
+    fixture.reset();
+    for line in probe_inside(&fixture.access_args(), &actions) {
+        line.assert_blocked();
     }
 }
 
@@ -356,8 +384,9 @@ fn by_id_lookups_do_not_reach_files_outside_the_policy() {
         }
         if out.result != "ok" {
             // The host refuses the call to every process, so the sandbox adds nothing here.
+            // One feature per call, for the same reason as the socket families above.
             skip(
-                "by-id-call",
+                &format!("by-id-call-{action}"),
                 &format!("{action} does not work outside the sandbox: {}", out.detail),
             );
             continue;
@@ -557,6 +586,46 @@ fn sigio_through_f_setown_follows_no_signal_policy() {
         "SIGIO reached a process outside the sandbox under signals = isolated: {:?}",
         inside[0]
     );
+}
+
+/// `F_SETOWN` is not the only way to name the owner that SIGIO goes to: the ioctls FIOSETOWN,
+/// SIOCSPGRP (sockets) and TIOCSPGRP (pipes) set the same owner. Seatbelt checks `file-ioctl`
+/// only for files and devices, so the ioctl allowlist does not reach sockets and pipes, and no
+/// operation of the profile language does (`socket-ioctl` compiles and stops none of them,
+/// measured on macOS 26.5). This records that the signal still arrives under
+/// `signals = "isolated"`, as docs/macos.md says.
+#[test]
+fn sigio_through_owner_ioctls_follows_no_signal_policy() {
+    let fixture = Fixture::new("macos-sigio-ioctl");
+    let isolated = with(fixture.access_args(), &["--signals", "isolated"]);
+    for route in [
+        "socket:fiosetown",
+        "socket:siocspgrp",
+        "pipe:fiosetown",
+        "pipe:tiocspgrp",
+    ] {
+        let mut victim = spawn_victim();
+        let target = format!("{}:{route}", victim.0.id());
+        probe_outside(&[("sigio-signal", &target)])[0].assert_ok();
+        assert_eq!(
+            exit_code_within(&mut victim, Duration::from_secs(2)),
+            Some(42),
+            "control: SIGIO through {route} does not deliver on this host"
+        );
+        drop(victim);
+
+        let mut victim = spawn_victim();
+        let target = format!("{}:{route}", victim.0.id());
+        let inside = probe_inside(&isolated, &[("sigio-signal", &target)]);
+        inside[0].assert_ok();
+        assert_eq!(
+            exit_code_within(&mut victim, Duration::from_secs(2)),
+            Some(42),
+            "SIGIO through {route} no longer reaches a process outside the sandbox; the \
+             documented limitation is stale: {:?}",
+            inside[0]
+        );
+    }
 }
 
 /// A victim outside the sandbox that waits for SIGIO (23) and exits with 42 when it arrives.

@@ -77,11 +77,13 @@ const DISCARDED_BY_DEFAULT: [libc::c_int; 5] = [
 /// NSIG of macOS (`sys/signal.h`): signal numbers are 1 to 31.
 const SIGNAL_COUNT: libc::c_int = 32;
 /// Signals sandy never catches: SIGKILL and SIGSTOP cannot be caught, SIGCONT is never discarded,
-/// and the fault signals keep their action, so that a fault ends sandy.
-const NOT_CAUGHT: [libc::c_int; 10] = [
+/// SIGPIPE stays ignored (`Signals::block`), and the fault signals keep their action, so that a
+/// fault ends sandy.
+const NOT_CAUGHT: [libc::c_int; 11] = [
     libc::SIGKILL,
     libc::SIGSTOP,
     libc::SIGCONT,
+    libc::SIGPIPE,
     libc::SIGSEGV,
     libc::SIGBUS,
     libc::SIGILL,
@@ -520,11 +522,25 @@ struct Signals {
 }
 
 impl Signals {
-    /// Blocks every signal except the faults. Blocked signals stay pending until sandy waits for
-    /// them; `CaughtSignals` keeps macOS from discarding the ones it would ignore.
+    /// Blocks every signal except the faults and SIGPIPE. Blocked signals stay pending until
+    /// sandy waits for them; `CaughtSignals` keeps macOS from discarding the ones it would
+    /// ignore. SIGPIPE stays ignored, as the Rust runtime set it: a write of sandy's own whose
+    /// reader has gone raises it, the status record's for one, and blocked it would wait here and
+    /// reach the program as a forwarded signal.
     fn block() -> Result<Signals, SandboxError> {
-        let (blocked, previous) =
-            block_signals().map_err(|error| SandboxError::io("cannot block signals", error))?;
+        let failed = |error| SandboxError::io("cannot block signals", error);
+        let (mut blocked, previous) = block_signals().map_err(failed)?;
+        // SAFETY: sigset_t is plain data; the calls initialize and change the two sets, and
+        // sigprocmask reads one of them.
+        unsafe {
+            let mut pipe: libc::sigset_t = mem::zeroed();
+            libc::sigemptyset(&mut pipe);
+            libc::sigaddset(&mut pipe, libc::SIGPIPE);
+            libc::sigdelset(&mut blocked, libc::SIGPIPE);
+            if libc::sigprocmask(libc::SIG_UNBLOCK, &pipe, ptr::null_mut()) != 0 {
+                return Err(failed(io::Error::last_os_error()));
+            }
+        }
         Ok(Signals { blocked, previous })
     }
 

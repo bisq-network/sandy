@@ -241,14 +241,23 @@ fn rosetta(policy: &ResolvedPolicy) -> Option<String> {
 }
 
 /// The beginning of `file`, as much as `binary::has_arm64_code` needs. A file that cannot be
-/// read is left to the exec, which reports its own error.
+/// read is left to the exec, which reports its own error. Only a regular file is read, the only
+/// kind the kernel executes, and the open does not wait: without O_NONBLOCK, opening a named
+/// pipe waits for a writer, and sandy would hang on a program path that names one.
 fn header_of(file: &std::path::Path) -> Option<Vec<u8>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(file)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
     let mut header = Vec::with_capacity(binary::HEADER_SIZE);
-    std::fs::File::open(file)
-        .and_then(|file| {
-            file.take(binary::HEADER_SIZE as u64)
-                .read_to_end(&mut header)
-        })
+    file.take(binary::HEADER_SIZE as u64)
+        .read_to_end(&mut header)
         .ok()?;
     Some(header)
 }
@@ -393,5 +402,28 @@ mod tests {
         let plan =
             sandy_core::EnforcementPlan::new(&policy.requirements(), MacosBackend.plan(&policy));
         assert!(plan.is_enforceable(), "{plan}");
+    }
+
+    /// A named pipe is no program. Reading its header must not wait for a writer that never
+    /// comes, or check and run hang instead of reporting.
+    #[test]
+    fn a_named_pipe_has_no_header_and_does_not_block() {
+        let dir = std::env::temp_dir().join(format!("sandy-macos-header-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Control: the header of a regular file.
+        let program = dir.join("program");
+        std::fs::write(&program, b"\xcf\xfa\xed\xfe").unwrap();
+        assert_eq!(header_of(&program), Some(b"\xcf\xfa\xed\xfe".to_vec()));
+
+        let pipe = dir.join("pipe");
+        let path = std::ffi::CString::new(pipe.to_str().unwrap()).unwrap();
+        // SAFETY: the path is NUL-terminated.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o700) }, 0);
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || send.send(header_of(&pipe)));
+        let result = receive.recv_timeout(std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(result, Ok(None));
     }
 }

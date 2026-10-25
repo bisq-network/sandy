@@ -216,8 +216,8 @@ own sandbox and no file access; on Windows it runs in the program's AppContainer
 This example also shows a typical first problem: Python's web server reads `/etc/mime.types`,
 which is not in the minimal system set. Without `--read /etc/mime.types`, each request fails with
 `PermissionError`. When a program fails inside the sandbox, look for "Permission denied" (Linux),
-the sandbox log (macOS: `log show --last 5m --predicate 'sender == "Sandbox"'`) or "Access is
-denied" (Windows), and add exactly the path it needs.
+the sandbox log (macOS, from an administrator account: `log show --last 5m --predicate
+'sender == "Sandbox"'`) or "Access is denied" (Windows), and add exactly the path it needs.
 
 ### A policy file
 
@@ -428,8 +428,8 @@ without changing any exit status. sandy writes short lines to the descriptor, in
 
 In the exec model (Linux and macOS without `contained` and without `--explain`) sandy becomes
 the program, so the record ends after `pid` and the caller's own wait status is the program's. sandy writes that
-line right before it replaces itself with the program, so a `failed` line after it means that
-the `execve` failed. sandy makes the descriptor close-on-exec, and on Windows it keeps the
+line right before it confines itself and replaces itself with the program, so a `failed` line
+after it means that applying the sandbox or the `execve` failed. sandy makes the descriptor close-on-exec, and on Windows it keeps the
 handle out of what the program inherits, so the program never has it. Writing is best effort: a
 caller that closed the read end gets no record, and the program keeps running. An empty record
 with status 125 means that sandy stopped before it took the descriptor, at a usage error for
@@ -574,7 +574,9 @@ are errors, so a misspelled key never becomes a silent default.
   filter the arguments of `setpgid`, so the program can still join
   another job's process group of its terminal session and have the kernel stop that job; taking
   the terminal and resizing it are denied there in every mode, and `children = "contained"`
-  closes the rest (see [docs/macos.md](docs/macos.md)).
+  closes the rest. A program on macOS can also still have the kernel send SIGIO to a process
+  outside the sandbox, through an ioctl on a socket or a pipe; a process that does not handle
+  SIGIO ignores it (see [docs/macos.md](docs/macos.md)).
 - `children` decides whether the program may start processes:
   - `allowed` (the default): yes. On Linux and macOS these processes can outlive the program; on
     Windows they end with it.

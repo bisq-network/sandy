@@ -224,8 +224,9 @@ fn process_rules(writer: &mut Writer, signals: SignalScope, children: ChildProce
             writer.comment(
                 "F_SETOWN makes the kernel send SIGIO to any process of this user when a socket\n\
                  or pipe becomes ready, and that send has no check behind it that `signal`\n\
-                 covers. A profile cannot filter the owner, so the command is denied: with\n\
-                 isolated signals a program gets no SIGIO at all.",
+                 covers. A profile cannot filter the owner, so the command is denied. The\n\
+                 ioctls FIOSETOWN, SIOCSPGRP and TIOCSPGRP set the same owner on sockets and\n\
+                 pipes, and no operation reaches them.",
             );
             writer.line(&format!(
                 "(deny system-fcntl (fcntl-command {}))",
@@ -531,8 +532,9 @@ mod tests {
 
 ; F_SETOWN makes the kernel send SIGIO to any process of this user when a socket
 ; or pipe becomes ready, and that send has no check behind it that `signal`
-; covers. A profile cannot filter the owner, so the command is denied: with
-; isolated signals a program gets no SIGIO at all.
+; covers. A profile cannot filter the owner, so the command is denied. The
+; ioctls FIOSETOWN, SIOCSPGRP and TIOCSPGRP set the same owner on sockets and
+; pipes, and no operation reaches them.
 (deny system-fcntl (fcntl-command 6))
 
 ; ioctls on open files and devices: only the two that fcntl(F_SETFL) issues and two that

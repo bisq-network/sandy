@@ -123,12 +123,11 @@ fn watch_and_confine(
 /// the watched process exited or the group's pipe ended. An error of kevent also ends the loop,
 /// so the relay never outlives a watch it lost.
 ///
-/// The order of the events decides what a connection that arrives around the end of the program
-/// gets: kqueue reports them in the order they became ready, so a connection the program made
-/// before it exited is still accepted, and one that arrived after the end is not, because the
-/// loop returns on the end event before it reaches that listener. The relay relies on that
-/// order, which also matters when the program stopped the relay with SIGSTOP and continued it
-/// afterwards (docs/macos.md).
+/// kqueue reports events in the order they became ready, so a connection the program made
+/// before it exited is still accepted. A listener is reported once for its whole backlog, and
+/// `accept_pending` takes all of it, so a connection that arrived after the end is accepted as
+/// well when its listener became ready before the end. After a SIGSTOP and SIGCONT that is
+/// everything the backlog collected while the relay was stopped (docs/macos.md).
 fn accept_until_exit(
     queue: &OwnedFd,
     listeners: &[(TcpListener, SocketAddr)],

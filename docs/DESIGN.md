@@ -389,7 +389,7 @@ a moment later.
   directly.
 - Linux and macOS with `process.children = "contained"`: sandy forks the program and stays its
   parent. sandy forwards every signal it receives to the program, except `SIGCHLD`, `SIGCONT`,
-  `SIGTTIN`, `SIGTTOU` and the fault signals, which it cannot wait for, on Linux `SIGPIPE`,
+  `SIGTTIN`, `SIGTTOU` and the fault signals, which it cannot wait for, `SIGPIPE`,
   which its own writes raise and which it ignores, and `SIGKILL` and `SIGSTOP`, which cannot be
   caught at all. It exits with the program's exit status, or 128 plus the signal number when a
   signal ended the program. With a terminal, sandy follows job
@@ -582,9 +582,9 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   program's end right before each signal. With `--parent-start` sandy checks the named
   process's recorded start time instead of `getppid`, before and after the registration. It
   refuses process 1: macOS has no child subreaper, so launchd is the parent of every orphan.
-- `sandy check` compiles the profile without applying it, so it reports operations or filters that
-  this macOS does not know, and then applies it in a helper process that ends right after,
-  because a profile that compiles can still be refused when it is applied.
+- `sandy check` compiles the profiles, so it reports operations or filters that this macOS does
+  not know, and applies the program's profile in a helper process that ends right after, so it
+  also reports a profile that compiles but is refused when applied.
 - Refused: sandy running through Rosetta, and on Apple silicon a program without arm64 code, or
   a script whose interpreter has none; Rosetta cannot load its runtime inside the sandbox.
 - `docs/macos.md` describes the profile, the system set with a reason per entry, and the known

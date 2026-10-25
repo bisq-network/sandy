@@ -33,9 +33,9 @@ unsafe extern "C" {
 }
 
 /// Every machine-independent exception, as `EXC_MASK_ALL` in <mach/exception_types.h> (0x1bfe on
-/// macOS 26.5). `EXC_MASK_CRASH`, which launchd sets to the system crash reporter, and
-/// `EXC_MASK_CORPSE_NOTIFY` are not part of it.
-const EXC_MASK_ALL: u32 = 0x1bfe;
+/// macOS 26.5), and `EXC_MASK_CRASH` (0x400), which is not part of it and which Crashpad's
+/// handler takes. `EXC_MASK_CORPSE_NOTIFY` stays.
+const EXC_MASK_HANDLED: u32 = 0x1bfe | 0x400;
 /// `EXCEPTION_DEFAULT` and `THREAD_STATE_NONE`: the behaviour and thread state flavour of a
 /// handler. They are required arguments; with MACH_PORT_NULL as the handler they have no effect.
 const EXCEPTION_DEFAULT: u32 = 1;
@@ -47,8 +47,9 @@ const THREAD_STATE_NONE: i32 = 0;
 /// task and keeps them across `exec`, and the profile's `mach-lookup` denial does not cover a
 /// right that the task already holds. A caller with a crash reporter (Crashpad, Sentry, a
 /// debugger) therefore hands the program a send right to its handler, which the program could
-/// use to send forged exception messages. The program loses nothing it should have: the system
-/// crash reporter hangs on the crash port, which is not in `EXC_MASK_ALL`.
+/// use to send forged exception messages. Measured on macOS 26.5, neither a login over SSH nor
+/// a launchd job has a task handler for `EXC_MASK_CRASH`, so only a caller's own crash reporter
+/// puts one there; the handler of `EXC_MASK_CORPSE_NOTIFY`, which every task has, stays.
 pub fn reset_exception_ports() -> Result<(), SandboxError> {
     // SAFETY: mach_task_self only reads the task port name that libSystem set up at start; the
     // libc binding is deprecated in favour of the mach2 crate, which sandy does not depend on.
@@ -58,7 +59,7 @@ pub fn reset_exception_ports() -> Result<(), SandboxError> {
     let result = unsafe {
         task_set_exception_ports(
             task,
-            EXC_MASK_ALL,
+            EXC_MASK_HANDLED,
             libc::MACH_PORT_NULL as libc::mach_port_t,
             EXCEPTION_DEFAULT,
             THREAD_STATE_NONE,

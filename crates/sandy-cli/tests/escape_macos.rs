@@ -926,6 +926,94 @@ fn forward_relay_delivers_data_sent_just_before_exit() {
     assert_eq!(received.join().unwrap(), TCP_SEND_PAYLOAD);
 }
 
+/// What a relay serves once it is continued after a stop. With the default `signals = "any"`
+/// the program can stop its relay, and nothing on macOS ends a stopped relay (docs/macos.md).
+/// While it is stopped, the kernel completes the handshakes for its listener: the program's own
+/// connection before it ends, and a client's after. The continued relay accepts the whole
+/// backlog of a listener that became ready before the end, so it serves both. This records
+/// that: the connection made after the end reaches the forwarded service.
+#[test]
+fn a_continued_relay_serves_a_connection_made_after_the_program_ended() {
+    use std::io::{Read, Write};
+    let fixture = home_fixture("relay-continued");
+    let service = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = service.local_addr().unwrap().port();
+    let (sender, received) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for mut stream in service.incoming().flatten() {
+            let mut data = Vec::new();
+            let _ = stream.read_to_end(&mut data);
+            let _ = sender.send(data);
+        }
+    });
+    let inner = free_port();
+    let address = format!("127.0.0.1:{inner}");
+    let args = with(
+        home_args(&fixture),
+        &[
+            "--ip",
+            "all",
+            "--forward",
+            &format!("{inner}=127.0.0.1:{target}"),
+        ],
+    );
+    // The program waits until the test has stopped the relay, then connects, sends and ends.
+    let program = Command::new(sandy_path())
+        .args(run_args(
+            &args,
+            &[("sleep", "3000"), ("tcp-send", address.as_str())],
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // sandy binds the listener before it starts the relay, so lsof can name sandy itself until
+    // sandy has become the program.
+    wait_for_program(program.id());
+    let relay = listener_pid(inner);
+    assert_ne!(
+        relay,
+        program.id() as libc::pid_t,
+        "the program holds the listener"
+    );
+    // SAFETY: kill takes a process ID and a signal.
+    unsafe { libc::kill(relay, libc::SIGSTOP) };
+    let output = program.wait_with_output().unwrap();
+    let lines = parse(&output);
+    assert_eq!(lines.len(), 2, "{output:?}");
+    lines[1].assert_ok();
+
+    let mut late = TcpStream::connect(&address).unwrap();
+    late.write_all(b"late").unwrap();
+    late.shutdown(std::net::Shutdown::Write).unwrap();
+    // SAFETY: as above.
+    unsafe { libc::kill(relay, libc::SIGCONT) };
+    let start = Instant::now();
+    // SAFETY: kill with signal 0 only checks that the process exists.
+    while unsafe { libc::kill(relay, 0) } == 0 {
+        assert!(start.elapsed() < WAIT, "the continued relay did not end");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut served = Vec::new();
+    while served.len() < 2 {
+        match received.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(data) => served.push(data),
+            Err(_) => break,
+        }
+    }
+    drop(late);
+    assert!(
+        served.iter().any(|data| data == TCP_SEND_PAYLOAD),
+        "the program's own connection was lost: {served:?}"
+    );
+    assert!(
+        served.iter().any(|data| data == b"late"),
+        "the continued relay no longer serves a connection made after the program ended; the \
+         documented limitation is stale: {served:?}"
+    );
+}
+
 /// `process.children = "none"`: fork, vfork and posix_spawn (without POSIX_SPAWN_SETEXEC) all
 /// fail, while threads still work. The control runs the same actions with children allowed.
 #[test]
@@ -1157,10 +1245,49 @@ fn a_descriptor_path_grants_no_more_than_the_descriptor() {
     assert_eq!(fs::read(fixture.path("rw/file")).unwrap(), b"content");
 }
 
+/// A descriptor path does reach the file behind the descriptor for metadata: outside the
+/// sandbox, chmod, utimes, chflags and setattrlist on `/dev/fd/0` change the file that a
+/// read-only standard input names. Seatbelt judges these calls by the path of that file, not by
+/// `/dev/fd` (measured on macOS 26.5: granting the tree `file-write*` changes nothing), so inside
+/// the sandbox they stay denied for a file the policy only lets the program read, and work for
+/// one in a writable path.
+#[test]
+fn a_descriptor_path_changes_no_metadata() {
+    use std::os::macos::fs::MetadataExt;
+    let fixture = Fixture::new("macos-devfd-metadata");
+    let actions = [
+        ("set-readonly", "/dev/fd/0"),
+        ("utimes-set", "/dev/fd/0"),
+        ("chflags-set", "/dev/fd/0"),
+        ("setattr", "/dev/fd/0"),
+    ];
+    let open = || fs::File::open(fixture.path("ro/file")).unwrap();
+
+    for line in probe_outside_with_stdin(&actions, open()) {
+        line.assert_ok();
+    }
+    fixture.reset();
+    let before = fs::metadata(fixture.path("ro/file")).unwrap();
+    for line in probe_inside_with_stdin(&fixture.access_args(), &actions, open()) {
+        line.assert_blocked();
+    }
+    let after = fs::metadata(fixture.path("ro/file")).unwrap();
+    assert_eq!(after.st_mode(), before.st_mode());
+    assert_eq!(after.st_mtime(), before.st_mtime());
+    assert_eq!(after.st_flags(), before.st_flags());
+
+    let writable = fs::File::open(fixture.path("rw/file")).unwrap();
+    for line in probe_inside_with_stdin(&fixture.access_args(), &actions, writable) {
+        line.assert_ok();
+    }
+}
+
 /// Mach port rights are not descriptors: an exception handler port of the caller's task passes
 /// through `posix_spawn` and `execve` into the program, which could then send a forged exception
 /// message to the caller's crash handler. sandy resets the task's exception ports before it
-/// applies the profile.
+/// applies the profile, the crash port that Crashpad's handler takes among them. The caller
+/// keeps the receive right in a process of its own, as a crash reporter does, so the control
+/// shows a live right and not a dead name.
 #[test]
 fn inherited_mach_exception_ports_are_reset() {
     let fixture = Fixture::new("macos-excports");
@@ -1259,6 +1386,37 @@ fn refuses_a_writable_firmlink_spelling_of_a_system_set_directory() {
     let report = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(EXIT_NOT_ENFORCEABLE), "{report}");
     assert!(report.contains("minimal system set"), "{report}");
+}
+
+/// Seatbelt matches a path through the firmlink, so a policy path spelled through the data
+/// volume grants nothing, under either spelling. This records the limitation in docs/macos.md;
+/// the control grants the same directory under its own name.
+#[test]
+fn a_policy_path_through_the_data_volume_grants_nothing() {
+    let fixture = Fixture::new("macos-data-volume");
+    let alias = format!("/System/Volumes/Data{}", fixture.arg("rw"));
+    if !Path::new(&alias).exists() {
+        return skip(
+            "data-volume-firmlink",
+            "this host has no /System/Volumes/Data spelling of the fixture",
+        );
+    }
+    let plain = fixture.path("rw/plain").to_str().unwrap().to_string();
+    let through = format!("{alias}/through");
+    let actions = [("write", plain.as_str()), ("write", through.as_str())];
+    for line in probe_inside(
+        &with(Vec::new(), &["--read-write", &fixture.arg("rw")]),
+        &actions,
+    ) {
+        line.assert_ok();
+    }
+    for line in probe_inside(&with(Vec::new(), &["--read-write", &alias]), &actions) {
+        assert_eq!(
+            line.result, "denied",
+            "a data volume spelling grants access now; the documented limitation is stale: \
+             {line:?}"
+        );
+    }
 }
 
 /// `check` with the environment the trusted locations are read from: a home directory and a PATH

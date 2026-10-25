@@ -205,7 +205,9 @@ pub const TIOCSTI: u64 = 0x8001_7472;
 /// `F_SETOWN` names the process or process group that the kernel sends SIGIO and SIGURG to when
 /// a socket or a pipe becomes ready. XNU sends those signals without the check behind
 /// `(allow signal ...)`, so with `signals = "isolated"` the command is denied. Number from
-/// `<sys/fcntl.h>`; the ioctl variants FIOSETOWN and SIOCSPGRP are not in `ALLOWED_IOCTLS`.
+/// `<sys/fcntl.h>`. The ioctls FIOSETOWN, SIOCSPGRP and TIOCSPGRP set the same owner, and
+/// `ALLOWED_IOCTLS` does not stop them: Seatbelt checks `file-ioctl` only for files and devices,
+/// not for sockets and pipes (docs/macos.md).
 pub const F_SETOWN: u32 = 6;
 
 /// The ioctls allowed on files and devices. fcntl(F_SETFL) issues FIONBIO and FIOASYNC;

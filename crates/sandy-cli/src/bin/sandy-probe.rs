@@ -2674,6 +2674,7 @@ mod macos {
         "metadata",
         "sigio-signal",
         "spawn-join",
+        "fd-metadata",
     ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
@@ -2691,6 +2692,7 @@ mod macos {
             "metadata" => metadata(target),
             "sigio-signal" => sigio_signal(target),
             "spawn-join" => spawn_join(target),
+            "fd-metadata" => fd_metadata(target),
             "rename" => {
                 let (from, to) = super::pair(target)?;
                 fs::rename(from, to).map(|()| String::new())
@@ -3019,6 +3021,46 @@ mod macos {
         }
     }
 
+    /// Changes metadata through a descriptor opened for reading: `PATH<U+001F>CALL` with CALL
+    /// one of `fchmod`, `fchown` (to the owner it has), `fchflags`, `futimes` and `fsetxattr`.
+    fn fd_metadata(target: &str) -> io::Result<String> {
+        use std::os::fd::AsRawFd;
+
+        let (path, call) = super::pair(target)?;
+        let file = fs::File::open(path)?;
+        let fd = file.as_raw_fd();
+        let times = [libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        }; 2];
+        let value = b"x";
+        // SAFETY: each call takes the open descriptor and, where it reads memory, a buffer of the
+        // length it is given.
+        let result = unsafe {
+            match call {
+                "fchmod" => libc::fchmod(fd, 0o600),
+                "fchown" => libc::fchown(fd, libc::getuid(), libc::getgid()),
+                "fchflags" => libc::fchflags(fd, libc::UF_HIDDEN),
+                "futimes" => libc::futimes(fd, times.as_ptr()),
+                "fsetxattr" => libc::fsetxattr(
+                    fd,
+                    c"user.sandy.review".as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                    0,
+                ),
+                _ => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown call"));
+                }
+            }
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(String::new())
+    }
+
     /// Writes an extended attribute by path (setxattr). file-write-xattr is part of file-write*.
     fn setxattr_set(target: &str) -> io::Result<String> {
         let path = cstr(target)?;
@@ -3132,13 +3174,16 @@ mod macos {
     }
 
     /// Every machine-independent exception, the value of `EXC_MASK_ALL` in
-    /// `<mach/exception_types.h>` (measured on macOS 26.5). `EXC_MASK_CRASH` (0x400) and
-    /// `EXC_MASK_CORPSE_NOTIFY` (0x2000) are not part of it.
-    const EXC_MASK_ALL: u32 = 0x1bfe;
+    /// `<mach/exception_types.h>` (measured on macOS 26.5), plus `EXC_MASK_CRASH` (0x400), which
+    /// is not part of it and which Crashpad's handler takes. `EXC_MASK_CORPSE_NOTIFY` (0x2000) is
+    /// left out.
+    const EXC_MASK_HANDLED: u32 = 0x1bfe | 0x400;
     const EXCEPTION_DEFAULT: u32 = 1;
     const THREAD_STATE_NONE: i32 = 0;
     const MACH_PORT_RIGHT_RECEIVE: u32 = 1;
     const MACH_MSG_TYPE_MAKE_SEND: u32 = 20;
+    /// The name of a send right whose receive right is gone.
+    const MACH_PORT_DEAD: libc::mach_port_t = !0;
     /// `EXC_TYPES_COUNT`: the most slots `task_get_exception_ports` can return.
     const EXCEPTION_SLOTS: usize = 14;
 
@@ -3180,9 +3225,10 @@ mod macos {
         unsafe { libc::mach_task_self() }
     }
 
-    /// How many Mach exception handler ports the task holds. A handler port is a send right, so
-    /// it needs no `mach-lookup`: a program that inherits one can send a message to the crash
-    /// handler of whoever started sandy.
+    /// How many live Mach exception handler ports the task holds. A handler port is a send
+    /// right, so it needs no `mach-lookup`: a program that inherits one can send a message to the
+    /// crash handler of whoever started sandy. A dead name, whose receiver is gone, reaches
+    /// nobody and does not count.
     fn exception_ports() -> io::Result<String> {
         let mut masks = [0u32; EXCEPTION_SLOTS];
         let mut handlers = [0 as libc::mach_port_t; EXCEPTION_SLOTS];
@@ -3194,7 +3240,7 @@ mod macos {
         let result = unsafe {
             task_get_exception_ports(
                 task_self(),
-                EXC_MASK_ALL,
+                EXC_MASK_HANDLED,
                 masks.as_mut_ptr(),
                 &mut count,
                 handlers.as_mut_ptr(),
@@ -3209,14 +3255,16 @@ mod macos {
         }
         let live = handlers[..count as usize]
             .iter()
-            .filter(|port| **port != 0)
+            .filter(|port| **port != 0 && **port != MACH_PORT_DEAD)
             .count();
         Ok(live.to_string())
     }
 
-    /// Installs a Mach exception handler port on this task, then replaces this process with the
-    /// program in `target` (program and arguments separated by U+001F), as a caller with a crash
-    /// reporter starts sandy. Mach port rights are not descriptors: they survive the exec.
+    /// Installs a Mach exception handler port on this task and starts the program in `target`
+    /// (program and arguments separated by U+001F) in a forked child, as a caller with a crash
+    /// reporter starts sandy. Mach port rights are not descriptors: the child gets a send right
+    /// to the handler and keeps it across the exec. The probe holds the receive right and waits
+    /// for the child, so the right stays live, and exits with the child's status.
     fn exception_port_exec(target: &str) -> io::Result<String> {
         let mut port: libc::mach_port_t = 0;
         let task = task_self();
@@ -3227,7 +3275,7 @@ mod macos {
                 0 => match mach_port_insert_right(task, port, port, MACH_MSG_TYPE_MAKE_SEND) {
                     0 => task_set_exception_ports(
                         task,
-                        EXC_MASK_ALL,
+                        EXC_MASK_HANDLED,
                         port,
                         EXCEPTION_DEFAULT,
                         THREAD_STATE_NONE,
@@ -3252,10 +3300,30 @@ mod macos {
             .map(|argument| argument.as_ptr())
             .chain(std::iter::once(ptr::null()))
             .collect();
-        // SAFETY: every pointer refers to a CString that lives until the call returns, and the
-        // array ends with a null pointer.
-        unsafe { libc::execv(program.as_ptr(), argv.as_ptr()) };
-        Err(io::Error::last_os_error())
+        // SAFETY: the probe has one thread, so the child may run any code; it leaves through
+        // execv or `_exit`.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            // SAFETY: every pointer refers to a CString that lives until execv returns, and the
+            // array ends with a null pointer.
+            unsafe {
+                libc::execv(program.as_ptr(), argv.as_ptr());
+                libc::_exit(127)
+            }
+        }
+        if child < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut status = 0;
+        // SAFETY: waits for the child forked above.
+        if unsafe { libc::waitpid(child, &mut status, 0) } != child {
+            return Err(io::Error::last_os_error());
+        }
+        std::process::exit(if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            1
+        })
     }
 
     /// A function of libSystem that the SDK headers do not declare.
@@ -3648,8 +3716,21 @@ mod macos {
     /// Asks the kernel to send SIGIO to another process: `F_SETOWN` names the owner of a
     /// socket pair end (or a pipe with `PID:pipe`), `O_ASYNC` turns on the signal, and the write
     /// makes the other end readable. The owner needs no relation to this process.
+    /// `PID:KIND:IOCTL` names the owner with the ioctl `fiosetown`, `siocspgrp` or `tiocspgrp`
+    /// instead of `F_SETOWN`.
     fn sigio_signal(target: &str) -> io::Result<String> {
-        let (pid, kind) = target.split_once(':').unwrap_or((target, "socket"));
+        let mut fields = target.splitn(3, ':');
+        let pid = fields.next().unwrap_or_default();
+        let kind = fields.next().unwrap_or("socket");
+        let request = match fields.next() {
+            None => None,
+            Some("fiosetown") => Some(libc::FIOSETOWN),
+            Some("siocspgrp") => Some(libc::SIOCSPGRP),
+            Some("tiocspgrp") => Some(libc::TIOCSPGRP),
+            Some(_) => {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid ioctl"));
+            }
+        };
         let pid: libc::pid_t = pid
             .parse()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"))?;
@@ -3666,9 +3747,14 @@ mod macos {
         }
         let (owned, other) = (ends[0], ends[1]);
         let result = (|| {
-            // SAFETY: F_SETOWN and F_SETFL take an integer argument, F_GETFL none.
+            // SAFETY: F_SETOWN and F_SETFL take an integer argument, F_GETFL none; the owner
+            // ioctls read one int.
             unsafe {
-                if libc::fcntl(owned, libc::F_SETOWN, pid) == -1 {
+                let named = match request {
+                    None => libc::fcntl(owned, libc::F_SETOWN, pid),
+                    Some(request) => libc::ioctl(owned, request, &pid),
+                };
+                if named == -1 {
                     return Err(io::Error::last_os_error());
                 }
                 let flags = libc::fcntl(owned, libc::F_GETFL);

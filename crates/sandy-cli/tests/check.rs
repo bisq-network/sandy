@@ -440,24 +440,27 @@ fn check_refuses_system_none_without_the_root_directory() {
 fn the_trial_profile_does_not_refuse_a_working_policy() {
     let fixture = Fixture::new("check-trial");
     let program = fixture.copy_probe("bin");
+    let mut policy = fixture.access_args();
+    policy.extend(
+        [
+            "--signals",
+            "isolated",
+            "--children",
+            "contained",
+            "--end-with-parent",
+        ]
+        .map(String::from),
+    );
     let mut args = vec!["check".to_string()];
-    args.extend(fixture.access_args());
-    args.extend([
-        "--signals".to_string(),
-        "isolated".to_string(),
-        "--children".to_string(),
-        "contained".to_string(),
-        "--end-with-parent".to_string(),
-        "--".to_string(),
-        program,
-    ]);
+    args.extend(policy.clone());
+    args.extend(["--".to_string(), program]);
     let output = sandy(&args);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
     assert!(!stdout.contains("UNAVAILABLE"), "{stdout}");
 
     // Control: the same policy runs, so the trial agreed with the run.
-    let lines = probe_inside(&fixture.access_args(), &[("read", &fixture.arg("ro/file"))]);
+    let lines = probe_inside(&policy, &[("read", &fixture.arg("ro/file"))]);
     lines[0].assert_ok();
 }
 
