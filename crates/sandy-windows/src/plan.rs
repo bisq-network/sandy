@@ -136,20 +136,6 @@ pub fn job_unavailable(policy: &ResolvedPolicy, reason: &str) -> Vec<PlanItem> {
 /// docs/windows.md that explains it. `sandy check` prints these as warnings.
 pub fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
     let mut shortfalls = Vec::new();
-    if policy
-        .paths
-        .iter()
-        .any(|rule| rule.access == PathAccess::ReadWrite)
-    {
-        shortfalls.push(
-            "rules 3, 4, 6 and 12 compare paths only by their spelling on Windows, not by file \
-             identity: a file of an executable path, the program, sandy or the policy file that \
-             has a second name (a hard link) in a writable path passes them, and so does a \
-             policy path, sandy or the policy file reached through a junction or symbolic link \
-             inside a writable path (docs/windows.md, \"Links and identity\")"
-                .to_string(),
-        );
-    }
     if policy.paths.iter().any(|rule| rule.is_dir) {
         shortfalls.push(
             "a grant on Windows follows the file, not the path: a file moved out of a granted \
@@ -317,9 +303,9 @@ fn relay_program<'a>(
 }
 
 /// Why a policy path that names a network share is refused. The program cannot open a share in
-/// its AppContainer with the capabilities sandy grants (docs/windows.md, "Links and identity"),
-/// but the entry sandy adds through the share lands on the folder behind it, which the program
-/// then opens by its local path, past the checks that compared the share's spelling.
+/// its AppContainer with the capabilities sandy grants (docs/windows.md, "Network and share
+/// paths"), but the entry sandy adds through the share lands on the folder behind it, which the
+/// program then opens by its local path.
 fn network_path_problem(policy: &ResolvedPolicy) -> Option<String> {
     let rule = policy
         .paths

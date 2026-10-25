@@ -485,14 +485,12 @@ are errors, so a misspelled key never becomes a silent default.
 2. **Never writable and executable.** No path may be both writable and executable, also not
    through nesting (a `read_write` directory inside a `read_exec` directory, or the reverse).
    The rule compares files, not names: a hard link that gives an executable file a second name
-   inside a `read_write` path is refused too. On Windows the comparison is by path only, so a
-   second name of a file and an alias of a directory are not seen; rules 3 and 4 compare the
-   same way (see [docs/windows.md](docs/windows.md)).
+   inside a `read_write` path is refused too.
 3. **Nothing inside a writable path.** No policy path may lie inside a `read_write` path, or be
-   reached through a symbolic link inside one. The program could replace it with a symbolic
-   link, and the next start would follow the link. sandy's own executable and the policy file
-   get the same check: a `read_write` path must not contain them, lead to them through a link or
-   an alias, or hold a second name of them.
+   reached through a symbolic link (on Windows also a junction) inside one. The program could
+   replace it with a symbolic link, and the next start would follow the link. sandy's own
+   executable and the policy file get the same check: a `read_write` path must not contain
+   them, lead to them through a link or an alias, or hold a second name of them.
 4. **The program file** gets read and execute access automatically. It must not lie inside a
    `read_write` path, and must have no second name in one.
 5. **The minimal system set** (`system = "minimal"`) adds, read-only, what programs need to start:

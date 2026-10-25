@@ -14,5 +14,9 @@ toml.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+# File identity and the names of a file, which the resolver compares (src/resolve/windows.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [lints]
 workspace = true

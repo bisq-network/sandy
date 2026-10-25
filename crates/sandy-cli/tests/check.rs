@@ -375,20 +375,6 @@ fn check_warns_that_a_stopped_relay_has_no_time_limit() {
     assert!(!warns(&stderr, gap), "{stderr}");
 }
 
-/// Windows compares the paths of rules 3, 4, 6 and 12 by their spelling only, which matters
-/// once the policy has a writable path (docs/windows.md, "Links and identity").
-#[cfg(windows)]
-#[test]
-fn check_warns_that_paths_are_compared_by_spelling() {
-    let fixture = Fixture::new("check-spelling");
-    let gap = "compare paths only by their spelling";
-    let stderr = check_warnings(&["--read-write", &fixture.arg("rw")]);
-    assert!(warns(&stderr, gap), "{stderr}");
-
-    let stderr = check_warnings(&["--read", &fixture.arg("ro")]);
-    assert!(!warns(&stderr, gap), "{stderr}");
-}
-
 /// A file moved out of a granted directory keeps the grant it inherited there
 /// (docs/windows.md, "Links and identity"). A grant of a single file has no such children.
 #[cfg(windows)]

@@ -407,7 +407,6 @@ fn refuses_a_sandy_executable_a_writable_path_reaches() {
 /// Rule 3 by identity: a file with one name in an executable path and one in a writable path is
 /// writable and executable, whichever name a call uses. The program could rewrite the code that
 /// the next run, or a process outside the sandbox, executes.
-#[cfg(unix)]
 #[test]
 fn a_hard_link_between_writable_and_executable_paths_is_refused() {
     let fixture = Fixture::new("link-wx");
@@ -432,7 +431,6 @@ fn a_hard_link_between_writable_and_executable_paths_is_refused() {
 
 /// The program file gets execute access of its own (rule 5), so a second name of it inside a
 /// writable path is refused as well.
-#[cfg(unix)]
 #[test]
 fn a_hard_link_of_the_program_into_a_writable_path_is_refused() {
     let fixture = Fixture::new("link-program");

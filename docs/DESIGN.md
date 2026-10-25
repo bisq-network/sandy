@@ -248,14 +248,16 @@ reason whichever check sees it first. A location of a backend counts twice: wher
 where its symbolic links lead, because whoever can write the one can repoint it and whoever can
 write the other changes what programs read.
 
-- **Two paths, one directory.** sandy compares the identity (device and inode) of a writable
-  path with the path it checks and with each of that path's parent directories, so an alias of
-  the writable path or of one of its parents counts as the same directory. On Linux it also
-  compares where both paths lie inside their file system, which is the mount root from
-  `/proc/self/mountinfo` plus the rest of the path. That sees a bind mount of a subdirectory of
-  a writable path, which shares no parent directory with it. sandy refuses the policy when it
-  cannot read the mount table, because it could not tell the two apart then; the Linux backend
-  needs `/proc` anyway. Windows compares paths only (see docs/windows.md).
+- **Two paths, one directory.** sandy compares the identity (device and inode; on Windows the
+  volume serial number and the file ID) of a writable path with the path it checks and with
+  each of that path's parent directories, so an alias of the writable path or of one of its
+  parents counts as the same directory. On Linux it also compares where both paths lie inside
+  their file system, which is the mount root from `/proc/self/mountinfo` plus the rest of the
+  path. That sees a bind mount of a subdirectory of a writable path, which shares no parent
+  directory with it. sandy refuses the policy when it cannot read the mount table, because it
+  could not tell the two apart then; the Linux backend needs `/proc` anyway. On Windows a
+  directory whose identity sandy cannot read counts as the same directory, so the check
+  refuses (see docs/windows.md).
 - **Two names, one file.** A hard link gives one file a second name. The kernels check the name
   a call uses, so a file that is executable under one name and writable under another is both.
   At the start sandy looks for a second name inside the writable paths of every file that must
@@ -263,7 +265,8 @@ write the other changes what programs read.
   executable and the policy file. It walks the writable trees first, because a file with more
   than one name is rare there, and the executable trees only when it found one. A directory
   the user may not list is skipped: the program runs as the same user and cannot list it
-  either. Windows does not compare the names of a file yet, as above.
+  either. On Windows a file lists its own names (`FindFirstFileNameW`), so sandy asks the
+  files themselves and walks the writable trees only for a `read_exec` directory.
 - **What stays open.** A hard link between a writable path and a file that no rule names, or
   that only a `read` rule names, is allowed: the program can change that file through the
   writable name. Refusing it would stop the package managers that fill a project from a shared
@@ -434,7 +437,6 @@ exceptions:
 | macOS | `signals = "isolated"` | SIGIO (to a process of any user), and SIGURG with `ip = "all"`, through the owner ioctls of sockets and pipes; without `children = "contained"` also joining another job of the terminal session and stopping it |
 | macOS | `forward` | every local user reaches the forwarded service |
 | macOS | `expose` or `forward` with `signals = "any"` | a stopped relay has no time limit |
-| Windows | a `read_write` path | rules 3, 4, 6 and 12 compare paths by their spelling only |
 | Windows | a directory in the policy | a file moved out of a granted directory keeps its grant |
 
 `children = "contained"` on macOS gets a warning as well, although it gives its full
@@ -837,7 +839,7 @@ until the certificates exist.
 
 | Crate | Role | May depend on |
 |---|---|---|
-| `sandy-core` | policy, validation, requirements, plan, backend trait | no other sandy crate; `libc` on Unix |
+| `sandy-core` | policy, validation, requirements, plan, backend trait | no other sandy crate; `libc` on Unix, `windows-sys` on Windows |
 | `sandy-linux`, `sandy-macos`, `sandy-windows` | one backend each; empty on other platforms | `sandy-core`, `sandy-relay` |
 | `sandy-relay` | byte relay behind `expose` and `forward` | no other sandy crate; `libc` or `windows-sys` |
 | `sandy-cli` | command line, backend selection, test probe | all of the above |

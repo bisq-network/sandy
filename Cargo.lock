@@ -106,6 +106,7 @@ dependencies = [
  "libc",
  "serde",
  "toml",
+ "windows-sys",
 ]
 
 [[package]]

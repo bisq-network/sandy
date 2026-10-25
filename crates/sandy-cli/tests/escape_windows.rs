@@ -249,14 +249,15 @@ fn a_file_moved_out_of_a_granted_directory_keeps_its_grant() {
     lines[1].assert_blocked();
 }
 
-/// The "Links and identity" exception (docs/windows.md) says sandy compares policy paths by
-/// their spelling, so a second name of a file inside a writable path is not seen. This records
-/// that the sandboxed program itself cannot make such a second name: it cannot hard-link a file
-/// of a read, read-exec or unreadable path into a writable path, cannot make a junction that
-/// points out of its writable paths, and cannot make a symbolic link at all (the AppContainer
-/// token holds no `SeCreateSymbolicLinkPrivilege`). The residual therefore needs a second name
-/// planted by a process other than the sandboxed one. Each denial has an outside control that
-/// succeeds for the file owner, so a denial inside is the sandbox and not an impossible action.
+/// sandy looks for second names and links inside writable paths when it starts ("Links and
+/// identity" in docs/windows.md), so it relies on the sandboxed program not making them while it
+/// runs. This records that it cannot: it cannot hard-link a file of a read, read-exec or
+/// unreadable path into a writable path, cannot make a junction that points out of its writable
+/// paths, and cannot make a symbolic link at all (the AppContainer token holds no
+/// `SeCreateSymbolicLinkPrivilege`). What the start-time check does not see therefore needs a
+/// second name planted by a process other than the sandboxed one while it runs. Each denial has
+/// an outside control that succeeds for the file owner, so a denial inside is the sandbox and not
+/// an impossible action.
 #[test]
 fn the_program_cannot_plant_a_link_reaching_outside_its_writable_paths() {
     let fixture = Fixture::new("plant-link");
@@ -2314,6 +2315,169 @@ fn a_writable_path_through_a_directory_symbolic_link_is_refused_like_its_target(
             "mklink /D failed: this session may not create symbolic links",
         );
     }
+}
+
+/// `sandy check` with the fixture's writable directory and `extra`.
+fn check_with_writable(fixture: &Fixture, extra: &[&str]) -> std::process::Output {
+    let mut all = vec!["check".to_string()];
+    all.extend(platform_args());
+    all.extend(["--read-write".to_string(), fixture.arg("rw")]);
+    all.extend(args(extra));
+    sandy(&all)
+}
+
+fn assert_refused(output: &std::process::Output, reason: &str) {
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(reason), "{stderr}");
+}
+
+/// Rule 4: a policy path resolved through a junction or a symbolic link inside a writable path
+/// would lead wherever the program points that entry at the next start, so sandy refuses it, as
+/// it refuses a symbolic link there on Linux and macOS. `check` refuses what `run` refuses and
+/// grants nothing, so the links may lead to the secret directory. The same links outside the
+/// writable path are the controls.
+#[test]
+fn refuses_a_policy_path_resolved_through_a_link_in_a_writable_path() {
+    let fixture = Fixture::new("link-through");
+    let probe = fixture.copy_probe("bin");
+    let probe_name = Path::new(&probe).file_name().unwrap().to_str().unwrap();
+    let inside = "inside writable path";
+    for kind in ["/J", "/D"] {
+        let link = |name: &str, target: &str| {
+            let name = format!("{name}-{}", &kind[1..]);
+            DirectoryLink::new(kind, &fixture.path(&name), &fixture.path(target))
+        };
+        let Some(outside) = link("secret-link", "secret") else {
+            assert_ne!(kind, "/J", "mklink /J failed");
+            skip(
+                "symbolic-links",
+                "mklink /D failed: this session may not create symbolic links",
+            );
+            continue;
+        };
+        let bin = link("bin-link", "bin").unwrap();
+        let read = format!("{}\\file", outside.arg());
+        let output = check_with_writable(&fixture, &["--read", &read]);
+        assert!(output.status.success(), "{output:?}");
+        let program = format!("{}\\{probe_name}", bin.arg());
+        let output = check_with_writable(&fixture, &["--", &program]);
+        assert!(output.status.success(), "{output:?}");
+
+        let secret = link("rw/secret-link", "secret").unwrap();
+        let bin = link("rw/bin-link", "bin").unwrap();
+        for extra in [
+            ["--read".to_string(), format!("{}\\file", secret.arg())],
+            ["--read-write".to_string(), secret.arg().to_string()],
+            ["--".to_string(), format!("{}\\{probe_name}", bin.arg())],
+        ] {
+            let output = check_with_writable(&fixture, &extra.each_ref().map(String::as_str));
+            assert_refused(&output, inside);
+        }
+        // A chain: a link outside the writable path that leads through one inside it.
+        let chain = link("chain", &format!("rw/secret-link-{}", &kind[1..])).unwrap();
+        let read = format!("{}\\file", chain.arg());
+        assert_refused(&check_with_writable(&fixture, &["--read", &read]), inside);
+    }
+
+    // A file symbolic link, and a relative one, which leads on from where it lies.
+    let made = |target: &str, link: &str| {
+        std::os::windows::fs::symlink_file(target, fixture.path(link)).is_ok()
+    };
+    if !made(&fixture.arg("ro/file"), "file-link") {
+        return skip(
+            "symbolic-links",
+            "a file symbolic link failed: this session may not create symbolic links",
+        );
+    }
+    assert!(made(&fixture.arg("ro/file"), "rw/file-link"));
+    assert!(made("..\\ro\\file", "rw/relative-link"));
+    let output = check_with_writable(&fixture, &["--read", &fixture.arg("file-link")]);
+    assert!(output.status.success(), "{output:?}");
+    for link in ["rw/file-link", "rw/relative-link"] {
+        let output = check_with_writable(&fixture, &["--read", &fixture.arg(link)]);
+        assert_refused(&output, inside);
+    }
+}
+
+/// The policy file gets the checks of rules 3 and 4: a writable path must not reach it through a
+/// junction and must hold no second name of it, as on Linux and macOS
+/// (`escape::refuses_a_policy_file_reached_through_a_link_in_a_writable_path`). The program
+/// would rewrite it there, and the next start would read what it wrote.
+#[test]
+fn refuses_a_policy_file_a_writable_path_reaches() {
+    let fixture = Fixture::new("policy-reach");
+    let policy = fixture.path("ro/policy.toml");
+    let text = format!(
+        "version = 1\n[filesystem]\nread_write = ['{}']\n",
+        fixture.arg("rw")
+    );
+    fs::write(&policy, text).unwrap();
+    let check = |file: &str| {
+        let mut all = vec!["check".to_string()];
+        all.extend(platform_args());
+        all.extend(["--policy".to_string(), file.to_string()]);
+        sandy(&all)
+    };
+
+    // Control: the policy file where it lies, outside the writable path.
+    let output = check(&fixture.arg("ro/policy.toml"));
+    assert!(output.status.success(), "{output:?}");
+
+    // Named through a junction inside the writable path.
+    let link = DirectoryLink::new("/J", &fixture.path("rw/j"), &fixture.path("ro"))
+        .expect("mklink /J failed");
+    let through = format!("{}\\policy.toml", link.arg());
+    assert_refused(&check(&through), "writable path");
+    drop(link);
+
+    // Named where it lies, with a second name inside the writable path.
+    fs::hard_link(&policy, fixture.path("rw/second.toml")).unwrap();
+    assert_refused(&check(&fixture.arg("ro/policy.toml")), "writable path");
+}
+
+/// The same for sandy's own executable, which the program would replace for the next start
+/// (`escape::refuses_a_sandy_executable_a_writable_path_reaches`). Windows reports the name sandy
+/// was started under as its executable, so a junction on the way counts.
+#[test]
+fn refuses_a_sandy_executable_a_writable_path_reaches() {
+    let fixture = Fixture::new("sandy-reach");
+    let copy = fixture.path("bin/sandy.exe");
+    copy_executable(sandy_path(), &copy);
+    let check = |program: &Path| {
+        let mut all = vec!["check".to_string()];
+        all.extend(platform_args());
+        all.extend(["--read-write".to_string(), fixture.arg("rw")]);
+        run_copied(program, &all)
+    };
+
+    // Control: sandy outside the writable path.
+    let output = check(&copy);
+    assert!(output.status.success(), "{output:?}");
+
+    // Started through a junction inside the writable path.
+    let link = DirectoryLink::new("/J", &fixture.path("rw/j"), &fixture.path("bin"))
+        .expect("mklink /J failed");
+    let through = PathBuf::from(plain_path(&Path::new(link.arg()).join("sandy.exe")));
+    assert_refused(&check(&through), "writable path");
+    drop(link);
+
+    // Started through a file symbolic link inside the writable path, where the session may
+    // create one.
+    let link = fixture.path("rw/sandy-link.exe");
+    if std::os::windows::fs::symlink_file(&copy, &link).is_ok() {
+        assert_refused(&check(&link), "writable path");
+        fs::remove_file(&link).unwrap();
+    } else {
+        skip(
+            "symbolic-links",
+            "a file symbolic link failed: this session may not create symbolic links",
+        );
+    }
+
+    // Started where it lies, with a second name inside the writable path.
+    fs::hard_link(&copy, fixture.path("rw/sandy.exe")).unwrap();
+    assert_refused(&check(&copy), "writable path");
 }
 
 /// A drive letter this test mapped to a share. Dropping it removes the mapping.

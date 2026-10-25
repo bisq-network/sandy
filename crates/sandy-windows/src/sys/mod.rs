@@ -499,11 +499,9 @@ fn user_profiles() -> Result<Vec<std::path::PathBuf>, SandboxError> {
 /// of the user's trusted locations, and nobody the program's token carries may execute files in
 /// one. Changes nothing.
 ///
-/// Paths are compared as rules 3 and 4 compare them (`PathIdentity`). On Windows that is the
-/// spelling only: the file identity hook of the resolver is still a stub there, so a second name
-/// of a directory that canonicalizing keeps, a path through a share of the local disk for
-/// example, passes these checks; the plan refuses share paths for that reason
-/// (`plan::network_path_problem`, and "Links and identity" in docs/windows.md).
+/// Paths are compared as rules 3 and 4 compare them (`PathIdentity`): by the identity of the
+/// directories on the way, so a junction or another spelling of a directory counts as that
+/// directory ("Links and identity" in docs/windows.md).
 fn check_writable_paths(policy: &ResolvedPolicy) -> Result<(), String> {
     let identity = sandy_core::PathIdentity::read().map_err(|error| error.to_string())?;
     let system = system_directories().map_err(|error| error.to_string())?;

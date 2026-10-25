@@ -436,9 +436,9 @@ fn executed_paths() -> Vec<std::path::PathBuf> {
     paths
 }
 
-/// TODO: on Windows the path of the running image comes from the process parameters, which
-/// `current_exe` reads, so there is no second name to check yet. A junction or a hard link that
-/// leads to sandy needs the identity work described in docs/windows.md.
+/// On Windows `current_exe` is the name sandy was started under, as the process parameters
+/// record it, so the resolver already sees a junction or symbolic link on the way through it,
+/// and it asks the file for its other names.
 #[cfg(not(unix))]
 fn executed_paths() -> Vec<std::path::PathBuf> {
     Vec::new()

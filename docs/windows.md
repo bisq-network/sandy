@@ -248,41 +248,53 @@ so only such paths and paths the user does not own can fail this way
 
 ### Links and identity
 
-The resolver compares files and not only paths where it can: one directory reachable under two
-paths counts as one, and a file with a second name inside a writable path counts as writable
-(see "Links and file identity" in [DESIGN.md](DESIGN.md)). On Windows it compares paths only.
-The identity of a file is `FILE_ID_INFO` and the other names of a file come from
-`FindFirstFileNameW`, both Windows API calls, which `sandy-core` must not make; they have to
-reach the resolver through a backend hook that is not written yet. The stubs are marked in
-`crates/sandy-core/src/resolve.rs`. Until they are filled in, on Windows:
+The resolver compares files and not only paths: one directory reachable under two paths counts
+as one, and a file with a second name inside a writable path counts as writable (see "Links and
+file identity" in [DESIGN.md](DESIGN.md)). On Windows the identity of a file is the serial
+number of its volume and its file ID (`FILE_ID_INFO`, or `BY_HANDLE_FILE_INFORMATION` on a file
+system without 128-bit file IDs), read with the object opened for its attributes only. An object
+whose identity sandy cannot read counts as the one it is compared with, so the check refuses
+instead of passing it. Junctions count as symbolic links, as `std::fs` counts them. On Windows:
 
-- A policy path or a trusted file reached through a junction or a symbolic link inside a
-  writable path is not refused by the resolver. For `run`, the walk before a new grant refuses a
-  junction below a granted directory (`check_tree_below`); `check`, and a grant that already
-  exists, do not.
-- A hard link between a `read_write` and a `read_exec` path, or one that leads to the program
-  file, sandy's own executable or the policy file, is not refused. This weighs more here than on
-  Linux and macOS: the rights live in the one security descriptor of the file, so the
-  inheritable ACE of the writable parent and the one of the executable parent both land on it,
-  and stay there after the run. The sandboxed program cannot make such a second name itself: an
-  AppContainer process is refused a hard link to a file it may not write, a junction that leaves
-  its writable paths, and a symbolic link of any kind (it holds no `SeCreateSymbolicLinkPrivilege`),
-  all measured on Windows 11 build 26200
-  (`the_program_cannot_plant_a_link_reaching_outside_its_writable_paths`). The second name has to
-  come from a process outside the sandbox or a run of an earlier sandy.
-- `sandy` is checked under the path `current_exe` reports. There is no second name to compare
-  it with yet.
-- The backend's own checks, the system directories of rule 6 and the trusted user locations of rule
-  12, go through the same comparison (`PathIdentity`), so they see the same and no more. A writable
-  path spelled through a junction or a directory symbolic link is refused all the same: the
-  resolver canonicalizes every policy path, `canonicalize` follows both, and the checks see the
-  folder the link leads to (`a_writable_path_through_a_junction_is_refused_like_its_target` and
-  `a_writable_path_through_a_directory_symbolic_link_is_refused_like_its_target`, into the Startup
-  folder and into `C:\Windows\Temp`). A path through a network share is a second name that
-  canonicalizing keeps, and it got past these checks: `\\localhost\C$\Windows\Temp` as a writable
-  path passed rule 6. sandy now refuses such paths (see "Network and share paths" below). Both
-  spellings of a location are compared, the one the backend names and the one with its links
-  resolved, which catches a location that itself leads through a link.
+- A policy path, sandy's executable or the policy file reached through a junction or a
+  symbolic link inside a writable path is refused, as a symbolic link there is on Linux and
+  macOS: the program could point the entry elsewhere before the next start. Windows resolves
+  `.` and `..` by their spelling before it looks a path up, also in the target of a relative
+  symbolic link (measured on Windows 11 build 26200: `link\..\x` is `x` beside the link), and
+  the resolver walks a path the same way
+  (`escape_windows::refuses_a_policy_path_resolved_through_a_link_in_a_writable_path`,
+  `refuses_a_policy_file_a_writable_path_reaches`,
+  `refuses_a_sandy_executable_a_writable_path_reaches`).
+- A hard link between a `read_write` and a `read_exec` path, or one that gives the program
+  file, sandy's own executable or the policy file a second name inside a writable path, is
+  refused (`escape::a_hard_link_between_writable_and_executable_paths_is_refused`,
+  `escape::a_hard_link_of_the_program_into_a_writable_path_is_refused`). This weighs more here
+  than on Linux and macOS: the rights live in the one security descriptor of the file, so the
+  inheritable ACE of the writable parent would land on the file and stay there after the run. A
+  file lists its own names (`FindFirstFileNameW`), so sandy asks the program file, the files
+  that `read_exec` paths name, its own executable and the policy file directly, and walks the
+  writable trees only for a `read_exec` directory. That keeps an ordinary run from walking every
+  writable tree: the programs in `System32` have a second name in the component store
+  (`WinSxS`), measured for `cmd.exe`.
+- The sandboxed program cannot make such a second name itself: an AppContainer process is
+  refused a hard link to a file it may not write, a junction that leaves its writable paths, and
+  a symbolic link of any kind (it holds no `SeCreateSymbolicLinkPrivilege`), all measured on
+  Windows 11 build 26200 (`the_program_cannot_plant_a_link_reaching_outside_its_writable_paths`).
+  The check runs at the start, so a second name that a process outside the sandbox makes while
+  the program runs is not seen, as on the other platforms.
+- `sandy` is checked under the name it was started under, which `current_exe` reports on
+  Windows, so a junction or symbolic link on the way counts.
+- The backend's own checks, the system directories of rule 6 and the trusted user locations of
+  rule 12, go through the same comparison (`PathIdentity`). Windows names these locations
+  without the verbatim prefix (`\\?\`) that canonical paths carry; the identity of the
+  directories on the way compares them all the same, and it also sees a location whose path
+  leads through a junction inside a writable path, which neither its own spelling nor the one
+  with its links resolved shows. A writable path spelled through a junction or a directory
+  symbolic link is refused like the folder it leads to
+  (`a_writable_path_through_a_junction_is_refused_like_its_target` and
+  `a_writable_path_through_a_directory_symbolic_link_is_refused_like_its_target`, into the
+  Startup folder and into `C:\Windows\Temp`). A path through a network share is refused for
+  reasons of its own (see "Network and share paths" below).
 - A grant is an entry on the object, so it travels with the object. A file renamed out of a
   granted directory, on the same volume, keeps the entry it inherited from that directory: a
   rename does not touch the security descriptor, and Windows recomputes inherited entries only
@@ -294,8 +306,8 @@ reach the resolver through a backend hook that is not written yet. The stubs are
   records this. Closing it would mean a new capability per run and a fresh propagation over
   every policy path on every run.
 
-`sandy check` prints a warning for the comparison by spelling when the policy has a writable
-path, and for the grant that travels with a file when the policy grants a directory.
+`sandy check` prints a warning for the grant that travels with a file when the policy grants a
+directory.
 
 ### Network and share paths
 
@@ -310,10 +322,12 @@ the directory through `\\localhost\C$\...` and through a share made with `net sh
 `ip = "none"` and with `ip = "all"`, which grants `internetClientServer` and
 `privateNetworkClientServer`. What the grant did instead was harmful: the entry sandy added
 through the share landed on the folder behind it, so the program read the file by its local
-path; and the checks of rules 6 and 12 compare spellings, so rule 6 did not see `C:\Windows`
-behind `\\localhost\C$\Windows\Temp`. A share on another machine was not tested; the refusal
-covers it the same way. `network_and_share_paths_are_refused` checks the refusal, with the local
-path of the same folder as the control.
+path; and the checks of rules 6 and 12 compared spellings then, so rule 6 did not see
+`C:\Windows` behind `\\localhost\C$\Windows\Temp`. They compare file identity now, and a share
+of the local disk reports the identity of the folder behind it (measured), but the refusal
+stays, because the program cannot use such a grant. A share on another machine was not tested;
+the refusal covers it the same way. `network_and_share_paths_are_refused` checks the refusal,
+with the local path of the same folder as the control.
 
 ### Trusted user locations
 
@@ -342,8 +356,8 @@ The locations that are refused are in `sys::trusted_locations`:
 
 The profile folder comes from the known folder and from `USERPROFILE`, because a service that
 starts sandy with a minimal environment sets no variable. A location that does not exist counts,
-because the program could create it. Paths are compared as everywhere else on Windows, by their
-spelling (see "Links and identity").
+because the program could create it. Paths are compared by file identity, as rules 3 and 4 compare
+them (see "Links and identity").
 
 Every absolute directory on sandy's `PATH` (`sys::path_locations`) is such a location too, and
 rule 12 warns about it instead of refusing it, because a writable path that holds one is
@@ -983,6 +997,11 @@ Facts these runs established:
   `SeCreateSymbolicLinkPrivilege`), while the file owner can do all three outside the sandbox
   (`the_program_cannot_plant_a_link_reaching_outside_its_writable_paths`). It can still hard-link
   or junction within its writable paths.
+- Windows resolves `..` in the target of a relative symbolic link by its spelling, and a
+  verbatim path with `..` after a junction does not resolve. `FindFirstFileNameW` gives
+  `C:\Windows\System32\cmd.exe` a second name in `WinSxS`. Through `\\localhost\C$`,
+  `FILE_ID_INFO` reports the volume serial number and file ID of the local folder, and
+  `FindFirstFileNameW` fails with `ERROR_NOT_SUPPORTED` (see "Links and identity").
 - The AppContainer token holds only `SeChangeNotifyPrivilege` and `SeIncreaseWorkingSetPrivilege`,
   with and without `children = "none"`, while the elevated session outside holds two dozen; it
   can enable no privilege beyond those two.
