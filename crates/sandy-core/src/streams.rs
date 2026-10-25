@@ -1,4 +1,4 @@
-//! The sockets a caller hands the program on its standard streams.
+//! The sockets and pseudo-terminal masters a caller hands the program on its standard streams.
 //!
 //! sandy passes descriptors 0, 1 and 2 on as it received them, because that is how a program
 //! reads its input and writes its output. No sandbox can take rights away from a socket that is
@@ -8,9 +8,11 @@
 //!
 //! `run` looks at the three streams before it applies the sandbox and accepts a socket only when
 //! the policy lets the program create one like it, so that the socket gives the program nothing
-//! the policy denies. `check` cannot do this: it does not see the streams of a later `run`.
+//! the policy denies. It refuses the master side of a pseudo-terminal with isolated signals (see
+//! `terminal_master_refusal`). `check` cannot do this: it does not see the streams of a later
+//! `run`.
 
-use crate::policy::NetworkAccess;
+use crate::policy::{NetworkAccess, SignalScope};
 use crate::resolve::ResolvedPolicy;
 
 /// One of the three streams every program starts with.
@@ -61,6 +63,14 @@ pub enum Kind {
     Raw,
     Other,
 }
+
+/// The protocols of AF_INET and AF_INET6 sockets that `ip = "all"` lets the program create: the
+/// default of a socket type (0), ICMP, TCP, UDP, ICMPv6, and MPTCP, which Go listens with. The
+/// Linux kernel loads the module of another protocol, such as SCTP, L2TP or SMC, when a program
+/// asks for a socket of it, and the Linux filter keeps the program from that kernel code. A
+/// socket of another protocol on a standard stream is refused on every platform, so that a policy
+/// means the same everywhere.
+pub const IP_PROTOCOLS: &[i32] = &[0, 1, 6, 17, 58, 262];
 
 /// A socket that a caller passed on a standard stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,7 +126,10 @@ impl Socket {
         };
         match self.family {
             Family::Unix => format!("{state} Unix{kind} socket"),
-            Family::Ip => format!("{state} IP{kind} socket"),
+            Family::Ip if IP_PROTOCOLS.contains(&self.protocol) => {
+                format!("{state} IP{kind} socket")
+            }
+            Family::Ip => format!("{state} IP{kind} socket of protocol {}", self.protocol),
             Family::Other { number, name } => {
                 if let Some(allowed) = self.creatable_with_ip(ip_also_allows) {
                     return format!("{state} {}{kind} socket", allowed.name);
@@ -168,20 +181,26 @@ pub fn refusal(
         // An ICMP datagram socket (IPPROTO_ICMP or IPPROTO_ICMPV6) follows `ip` like any other
         // IP datagram socket: an unprivileged program can create one where the kernel allows
         // it, on Linux within net.ipv4.ping_group_range.
-        Family::Ip if matches!(socket.kind, Kind::Stream | Kind::Seqpacket | Kind::Datagram) => (
-            policy.ip,
-            "ip",
-            Some(
-                "a service that is handed its connection on standard input, inetd-style or with \
-                 systemd Accept=yes, needs that",
-            ),
-        ),
+        Family::Ip
+            if matches!(socket.kind, Kind::Stream | Kind::Seqpacket | Kind::Datagram)
+                && IP_PROTOCOLS.contains(&socket.protocol) =>
+        {
+            (
+                policy.ip,
+                "ip",
+                Some(
+                    "a service that is handed its connection on standard input, inetd-style or \
+                     with systemd Accept=yes, needs that",
+                ),
+            )
+        }
         Family::Other { .. } if socket.creatable_with_ip(ip_also_allows).is_some() => {
             (policy.ip, "ip", None)
         }
         // A raw IP socket needs privileges: CAP_NET_RAW on Linux, which sandy refuses to start
         // with, root on macOS and administrator rights on Windows. It is refused also where the
-        // caller has them, so that a policy means the same on every platform.
+        // caller has them, so that a policy means the same on every platform. So is an IP socket
+        // of a protocol outside `IP_PROTOCOLS`.
         Family::Ip | Family::Other { .. } => {
             return Some(format!(
                 "{stream} carries {description}; a socket that is open before the sandbox starts \
@@ -202,6 +221,23 @@ pub fn refusal(
         message += &format!(": {hint}");
     }
     Some(message)
+}
+
+/// Why the policy cannot hold for the master side of a pseudo-terminal on `stream`, or `None`
+/// when it can. Writing the interrupt, quit or suspend character into a master makes the kernel
+/// send SIGINT, SIGQUIT or SIGTSTP to the foreground process group of the other side, without
+/// the check that `signals = "isolated"` adds to every other signal (measured on Linux and
+/// macOS). A write cannot be told from any other, so the master itself must stay out. The slave
+/// side, the terminal a program normally gets, signals nobody when the program writes to it.
+pub fn terminal_master_refusal(policy: &ResolvedPolicy, stream: StandardStream) -> Option<String> {
+    (policy.signals == SignalScope::Isolated).then(|| {
+        format!(
+            "{stream} carries the master side of a pseudo-terminal; writing the interrupt \
+             character into it signals the processes on the other side, also outside the \
+             sandbox, so signals = \"isolated\" cannot hold for it. Pass the slave side of the \
+             pseudo-terminal or a pipe instead"
+        )
+    })
 }
 
 #[cfg(test)]
@@ -303,6 +339,47 @@ mod tests {
             assert!(message.contains("ip = \"none\""), "{message}");
             assert!(message.contains("inetd-style"), "{message}");
             assert_eq!(refusal(&allowed, StandardStream::Error, case, &[]), None);
+        }
+    }
+
+    /// A socket of another IP protocol, such as SCTP, needs kernel code that the Linux filter
+    /// keeps from the program, so `ip = "all"` does not let it create one, and an inherited one is
+    /// refused under every policy. The usual protocols stay accepted.
+    #[test]
+    fn ip_sockets_of_other_protocols_are_refused_under_every_policy() {
+        let allowed = policy(NetworkAccess::All, NetworkAccess::None);
+        let with = |kind, protocol| Socket {
+            protocol,
+            ..socket(Family::Ip, kind, true, false)
+        };
+        for (kind, protocol) in [
+            (Kind::Stream, 6),
+            (Kind::Stream, 262),
+            (Kind::Datagram, 17),
+            (Kind::Datagram, 58),
+        ] {
+            let case = with(kind, protocol);
+            assert_eq!(refusal(&allowed, StandardStream::Input, case, &[]), None);
+        }
+        // SCTP, L2TP over IP and SMC.
+        for (kind, protocol) in [
+            (Kind::Seqpacket, 132),
+            (Kind::Stream, 132),
+            (Kind::Datagram, 115),
+            (Kind::Stream, 256),
+        ] {
+            for policy in every_policy() {
+                let case = with(kind, protocol);
+                let message = refusal(&policy, StandardStream::Input, case, &[]).expect("refused");
+                assert!(
+                    message.contains("no policy lets the program create one like it"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains(&format!("of protocol {protocol}")),
+                    "{message}"
+                );
+            }
         }
     }
 
@@ -418,5 +495,34 @@ mod tests {
             ),
             "{message}"
         );
+    }
+
+    /// With `signals = "any"` the program may signal every process of the user anyway, so a
+    /// master gives it nothing more.
+    #[test]
+    fn a_terminal_master_is_refused_only_with_isolated_signals() {
+        let mut isolated = Policy::default();
+        isolated.process.signals = SignalScope::Isolated;
+        let isolated = ResolvedPolicy::resolve(&isolated, None).unwrap();
+        let any = ResolvedPolicy::resolve(&Policy::default(), None).unwrap();
+        assert_eq!(any.signals, SignalScope::Any);
+        for stream in StandardStream::ALL {
+            let message = terminal_master_refusal(&isolated, stream).expect("refused");
+            assert!(
+                message.starts_with(&format!(
+                    "{stream} carries the master side of a pseudo-terminal;"
+                )),
+                "{message}"
+            );
+            assert!(
+                message.contains("signals = \"isolated\" cannot hold for it"),
+                "{message}"
+            );
+            assert!(
+                message.ends_with("Pass the slave side of the pseudo-terminal or a pipe instead"),
+                "{message}"
+            );
+            assert_eq!(terminal_master_refusal(&any, stream), None);
+        }
     }
 }

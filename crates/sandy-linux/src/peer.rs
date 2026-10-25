@@ -16,19 +16,24 @@
 //! the socket's file (`sock_i_uid`), and closing the socket takes that file away, so from the
 //! close onwards the lookup answers with no owner for a connection of any user. It says so in
 //! the inode of the answer, which is zero exactly then, and that is the field the relay reads.
-//! The user in such an answer cannot be used: kernels up to 6.8 report user 0 from the close,
-//! and 6.17 and later keep the user until they replace the socket with a timewait record a few
-//! milliseconds afterwards. Reading the user therefore refused nearly every connection of a
-//! program that connects and exits on 6.8, and between none and nine tenths of them on the
-//! newer kernels, depending on what the program does and how busy the host is (docs/linux.md,
-//! "Exposed and forwarded ports").
+//! The user in such an answer cannot name the owner on its own: kernels up to 6.8 report user 0
+//! from the close, and 6.17 and later keep the user until they replace the socket with a
+//! timewait record, which reports user 0, after about a millisecond, or about 40 milliseconds
+//! when the peer wrote before it closed (measured on 6.8, 6.17 and 7.2). Requiring sandy's user
+//! therefore refused nearly every connection of a program that connects and exits on 6.8, and
+//! between none and nine tenths of them on the newer kernels, depending on what the program does
+//! and how busy the host is (docs/linux.md, "Exposed and forwarded ports").
 //!
 //! The relay serves a connection no owner can be found for. It is the program's own in every
 //! ordinary run: the kernel completes a handshake by itself, so a program that connects and
 //! exits is always ahead of the relay's accept, and refusing these answers is refusing what a
-//! forwarded port exists to carry. What it costs is that another local user can deliver a blind
-//! write, usually on the first attempt: a peer that connects, writes and closes at once is
-//! usually closed before the relay asks.
+//! forwarded port exists to carry. A user the answer does name still counts, though: user 0 says
+//! nothing on any kernel and sandy's own user is the program's, but any other user is someone
+//! else's closed socket, which the relay refuses. What remains is that another local user can
+//! deliver a blind write when its socket no longer carries its user: on 6.8 always, usually on
+//! the first attempt, because a peer that connects, writes and closes at once is usually closed
+//! before the relay asks; on 6.17 and later only when the relay asks after the timewait record
+//! has replaced the socket.
 //!
 //! The one thing that keeps the straightforward attack closed is that only a peer which can no
 //! longer read is ever unnamed. Losing the file is what loses the owner, and it also gives up
@@ -125,17 +130,7 @@ impl PeerCheck {
         if message.connection() != Some((canonical(peer), canonical(local))) {
             return Owner::AnotherUser;
         }
-        // Only a peer that closed its socket is unnamed, and such a peer can no longer read.
-        // A half closed peer keeps its file, so it keeps its inode and its owner. Both reach
-        // FIN_WAIT2, so this must stay a test of the inode and never of `idiag_state`.
-        if message.inode == 0 {
-            return Owner::Nobody;
-        }
-        if message.uid == self.uid {
-            Owner::Us
-        } else {
-            Owner::AnotherUser
-        }
+        owner_of(message.uid, message.inode, self.uid)
     }
 
     /// Sends one lookup and reads its answer. `None` when the kernel reports an error, the
@@ -207,6 +202,20 @@ impl PeerCheck {
             ));
         }
         Ok(())
+    }
+}
+
+/// Who an answer with `uid` and `inode` names, for a relay that runs as `own`. Only a peer that
+/// closed its socket is unnamed, and such a peer can no longer read. A half closed peer keeps its
+/// file, so it keeps its inode and its owner. Both reach FIN_WAIT2, so this must stay a test of
+/// the inode and never of `idiag_state`. Without an inode, user 0 and sandy's user are served,
+/// and any other user is refused (see the module documentation).
+fn owner_of(uid: u32, inode: u32, own: u32) -> Owner {
+    match (inode, uid) {
+        (0, 0) => Owner::Nobody,
+        (0, uid) if uid == own => Owner::Nobody,
+        (_, uid) if uid == own => Owner::Us,
+        _ => Owner::AnotherUser,
     }
 }
 
@@ -386,26 +395,60 @@ mod tests {
         assert!(!as_another_user(&check).may_relay(peer, local));
     }
 
-    /// A peer that closed its socket has no file for the kernel to read an owner from, so no
-    /// lookup can attribute it to anybody and the relay serves it whoever asks. That is what
-    /// keeps the program's own connection, and what another local user can reach for (see the
-    /// module documentation). The kernel answers this way from the close onwards, before it
-    /// replaces the socket with a timewait record.
+    /// A peer that closed its socket has no file for the kernel to read an owner from, so the
+    /// answer carries no inode, and the relay serves it for its own user from the close onwards.
+    /// That keeps the program's own connection. For another user it is served only once the
+    /// answer no longer carries a user: on 6.8 from the close, on 6.17 and later once a timewait
+    /// record has replaced the socket. Until then the user it still carries refuses it. The
+    /// decision is taken from the answer itself, because the kernel replaces the socket at a
+    /// moment of its own.
     #[test]
     fn a_peer_that_closed_its_socket_has_no_owner() {
         let check = PeerCheck::open().unwrap();
+        let other = as_another_user(&check);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (accepted, peer) = listener.accept().unwrap();
         let local = accepted.local_addr().unwrap();
         drop(client);
+        let request = Request::new(peer, local).unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
-        while check.owner(peer, local) != Owner::Nobody {
-            assert!(Instant::now() < deadline, "the peer kept an owner");
+        loop {
+            let mut answer = [0u8; 4096];
+            let message = check
+                .ask(&request, &mut answer)
+                .expect("the kernel answered");
+            assert_eq!(message.inode, 0, "the closed peer kept its file");
+            assert!(check.may_relay(peer, local));
+            if message.uid == 0 {
+                break;
+            }
+            assert_eq!(message.uid, check.uid);
+            let seen_by_other = owner_of(message.uid, message.inode, other.uid);
+            assert_eq!(seen_by_other, Owner::AnotherUser);
+            assert!(
+                Instant::now() < deadline,
+                "the closed socket was never replaced"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(check.may_relay(peer, local));
-        assert!(as_another_user(&check).may_relay(peer, local));
+        // A record that carries no user stays so until it expires.
+        assert!(other.may_relay(peer, local));
+        drop(accepted);
+    }
+
+    /// The rule for an answer, apart from the kernel: an answer with an inode names its owner.
+    /// One without is a closed socket, served for user 0, which says nothing on any kernel, and
+    /// for the relay's own user, and refused for any other user the kernel still names.
+    #[test]
+    fn an_answer_is_judged_by_the_user_it_carries() {
+        const OWN: u32 = 1000;
+        assert_eq!(owner_of(OWN, 7, OWN), Owner::Us);
+        assert_eq!(owner_of(0, 7, OWN), Owner::AnotherUser);
+        assert_eq!(owner_of(OWN + 1, 7, OWN), Owner::AnotherUser);
+        assert_eq!(owner_of(0, 0, OWN), Owner::Nobody);
+        assert_eq!(owner_of(OWN, 0, OWN), Owner::Nobody);
+        assert_eq!(owner_of(OWN + 1, 0, OWN), Owner::AnotherUser);
     }
 
     /// A lookup the relay cannot trust refuses the connection: an answer about another socket

@@ -9,8 +9,8 @@
 # A diff here means a filter, the reviewed table or seccompiler's code generation changed.
 
 [strict denylist]
-instructions 875
-checksum 0xa2b6ad7373719cf0
+instructions 1094
+checksum 0x91cb6f3d698e0d2d
 0-28 allow
 29-31 EPERM
 32-41 allow
@@ -26,9 +26,7 @@ checksum 0xa2b6ad7373719cf0
 72-89 allow
 90 EPERM
 91 allow
-92 EPERM
-93 allow
-94 EPERM
+92-94 EPERM
 95-100 allow
 101 EPERM
 102 allow
@@ -37,18 +35,18 @@ checksum 0xa2b6ad7373719cf0
 109 EPERM
 110-111 allow
 112 EPERM
-113-131 allow
+113-115 allow
+116 EPERM
+117-131 allow
 132 EPERM
 133 allow
 134 EPERM
-135-153 allow
-154-155 EPERM
+135-152 allow
+153-155 EPERM
 156-160 allow
 161 EPERM
 162 allow
-163-169 EPERM
-170-171 allow
-172-173 EPERM
+163-173 EPERM
 174 allow
 175-176 EPERM
 177-178 allow
@@ -106,13 +104,15 @@ checksum 0xa2b6ad7373719cf0
 471-511 allow
 
 [strict path xattrs]
-instructions 40
-checksum 0x53df5a220c088d24
-0-190 allow
-191-192 ENOTSUP
+instructions 50
+checksum 0x950a04b60acd1229
+0-189 allow
+190-192 ENOTSUP
 193 allow
 194-195 ENOTSUP
-196-463 allow
+196-198 allow
+199 ENOTSUP
+200-463 allow
 464-465 ENOTSUP
 466-467 allow
 468 ENOTSUP
@@ -126,8 +126,8 @@ checksum 0xa6412eeb0cbdfb53
 42-511 allow
 
 [open denylist]
-instructions 741
-checksum 0x65c455e4b9b8d0be
+instructions 950
+checksum 0xbf7bace988b16cae
 0-28 allow
 29-31 EPERM
 32-52 allow
@@ -138,16 +138,16 @@ checksum 0x65c455e4b9b8d0be
 101 EPERM
 102 allow
 103 EPERM
-104-133 allow
+104-115 allow
+116 EPERM
+117-133 allow
 134 EPERM
-135-153 allow
-154-155 EPERM
+135-152 allow
+153-155 EPERM
 156-160 allow
 161 EPERM
 162 allow
-163-169 EPERM
-170-171 allow
-172-173 EPERM
+163-173 EPERM
 174 allow
 175-176 EPERM
 177-178 allow
@@ -189,8 +189,8 @@ checksum 0x65c455e4b9b8d0be
 471-511 allow
 
 [open socket families]
-instructions 25
-checksum 0xdc64dcd9e8e5c2fb
+instructions 59
+checksum 0x8890d920da03e633
 0-40 allow
 41 EAFNOSUPPORT
 42-511 allow
@@ -223,8 +223,8 @@ checksum 0xa831fe02797704c0
 272-511 EPERM
 
 [relay denylist]
-instructions 253
-checksum 0xff0e7adf26744424
+instructions 256
+checksum 0xf84f1a3d0c05c994
 0-1 allow
 2 EPERM
 3 allow
@@ -247,8 +247,8 @@ checksum 0xff0e7adf26744424
 46-47 EPERM
 48 allow
 49-53 EPERM
-54-56 allow
-57-59 EPERM
+54-55 allow
+56-59 EPERM
 60 allow
 61-71 EPERM
 72 allow
@@ -285,11 +285,13 @@ checksum 0xff0e7adf26744424
 436-511 EPERM
 
 [allowlist]
-instructions 1915
-checksum 0xf1350f598af417c6
+instructions 1910
+checksum 0x89ea3165654876fa
 0-299 allow
 300 ENOSYS
-301-336 allow
+301-302 allow
+303 ENOSYS
+304-336 allow
 337-423 ENOSYS
 424-434 allow
 435 ENOSYS
@@ -322,4 +324,51 @@ checksum 0x07af126b6c8c2782
 267-321 allow
 322 notify
 323-511 allow
+
+[explain watcher]
+instructions 205
+checksum 0xc658c54438a0064d
+0-2 kill process
+3-7 allow
+8 kill process
+9-12 allow
+13 kill process
+14-15 allow
+16-20 kill process
+21 allow
+22-23 kill process
+24-25 allow
+26-27 kill process
+28 allow
+29-59 kill process
+60 allow
+61-78 kill process
+79 allow
+80-88 kill process
+89 allow
+90-130 kill process
+131 allow
+132-201 kill process
+202 allow
+203-218 kill process
+219 allow
+220-227 kill process
+228 allow
+229-230 kill process
+231 allow
+232-261 kill process
+262 allow
+263-266 kill process
+267 allow
+268 kill process
+269 allow
+270 kill process
+271 allow
+272-309 kill process
+310 allow
+311-331 kill process
+332 allow
+333-438 kill process
+439 allow
+440-511 kill process
 

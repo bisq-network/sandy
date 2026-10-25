@@ -479,3 +479,43 @@ fn the_program_keeps_its_exit_status_when_the_caller_ignores_sigchld() {
     let output = command.output().unwrap();
     assert_eq!(output.status.code(), Some(7), "{output:?}");
 }
+
+/// The watcher thread confines itself with a seccomp filter of its own, because it parses bytes
+/// the program controls outside the sandbox, and sandy's main thread, which forwards signals and
+/// waits for the program, has none (docs/linux.md, "Diagnostic mode"). The kernel shows the mode
+/// of every thread in its status file: 2 for a filter.
+#[test]
+fn the_watcher_thread_confines_itself() {
+    let mut sandy = std::process::Command::new(sandy_path())
+        .args(run_args(&args(&["--explain"]), &[("sleep", "3000")]))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let modes = || -> Vec<String> {
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{}/task", sandy.id())) else {
+            return Vec::new();
+        };
+        tasks
+            .flatten()
+            .filter_map(|task| std::fs::read_to_string(task.path().join("status")).ok())
+            .filter_map(|status| {
+                let line = status.lines().find(|line| line.starts_with("Seccomp:"))?;
+                Some(line.trim_start_matches("Seccomp:").trim().to_string())
+            })
+            .collect()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut seen = modes();
+    while seen.iter().filter(|mode| *mode == "2").count() != 1
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        seen = modes();
+    }
+    kill_process(sandy.id());
+    let _ = sandy.wait();
+    assert_eq!(seen.len(), 2, "sandy and its watcher: {seen:?}");
+    assert!(seen.contains(&"0".to_string()), "{seen:?}");
+    assert!(seen.contains(&"2".to_string()), "{seen:?}");
+}

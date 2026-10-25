@@ -221,9 +221,10 @@ Microsoft does not document whether this propagation follows junctions and symbo
 program that could write below a directory in an earlier run could have planted a link to a
 directory of the user. Before sandy adds an inheritable ACE, it therefore walks the directory and
 refuses the run if it finds a junction or symbolic link (`is_symlink` covers every name-surrogate
-reparse point). Hard links cannot be found this way. Creating one is expected to need write
-access to the target, which the AppContainer lacks outside its paths, but that is not measured
-on a host yet.
+reparse point). Hard links cannot be found this way. Measured on Windows 11 build 26200: an
+AppContainer program cannot create a hard link to a file it may not write (`ERROR_ACCESS_DENIED`),
+so it cannot give a file outside its writable paths a second name itself; a hard link that
+already exists weighs on the resolver instead (see "Links and identity").
 
 Measured once on Windows 11 build 26200: the propagation follows neither. After
 `SetNamedSecurityInfoW` added an inheritable entry to a directory, a junction below it carried
@@ -263,7 +264,12 @@ reach the resolver through a backend hook that is not written yet. The stubs are
   file, sandy's own executable or the policy file, is not refused. This weighs more here than on
   Linux and macOS: the rights live in the one security descriptor of the file, so the
   inheritable ACE of the writable parent and the one of the executable parent both land on it,
-  and stay there after the run.
+  and stay there after the run. The sandboxed program cannot make such a second name itself: an
+  AppContainer process is refused a hard link to a file it may not write, a junction that leaves
+  its writable paths, and a symbolic link of any kind (it holds no `SeCreateSymbolicLinkPrivilege`),
+  all measured on Windows 11 build 26200
+  (`the_program_cannot_plant_a_link_reaching_outside_its_writable_paths`). The second name has to
+  come from a process outside the sandbox or a run of an earlier sandy.
 - `sandy` is checked under the path `current_exe` reports. There is no second name to compare
   it with yet.
 - The backend's own checks, the system directories of rule 6 and the trusted user locations of rule
@@ -731,6 +737,11 @@ pipe grants nothing to AppContainers [CreateNamedPipeW] [Implementing an AppCont
 `SignalsIsolated` on Windows means: no console control events, no process handles and no window
 messages that reach processes outside the sandbox.
 
+Windows has no pseudo-terminal device for `run` to refuse, as Linux and macOS do with
+`signals = "isolated"` (DESIGN.md rule 13): a pseudoconsole (ConPTY) reads its input from an
+ordinary pipe, which sandy cannot tell from any other; whether a program can type Ctrl+C into a
+pseudoconsole through such a pipe is not measured.
+
 ## Handles, environment and command line
 
 - **Handles.** `bInheritHandles` is TRUE, but `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` limits
@@ -967,6 +978,14 @@ Facts these runs established:
   privileges (`check_reports_a_path_whose_permissions_the_user_cannot_change`).
 - `SetNamedSecurityInfoW` did not carry an inheritable entry through a junction or a directory
   symbolic link into its target (see "How sandy changes a DACL").
+- An AppContainer program cannot create a hard link to a file outside its writable paths, a
+  junction that points out of them, or a symbolic link of any kind (the token holds no
+  `SeCreateSymbolicLinkPrivilege`), while the file owner can do all three outside the sandbox
+  (`the_program_cannot_plant_a_link_reaching_outside_its_writable_paths`). It can still hard-link
+  or junction within its writable paths.
+- The AppContainer token holds only `SeChangeNotifyPrivilege` and `SeIncreaseWorkingSetPrivilege`,
+  with and without `children = "none"`, while the elevated session outside holds two dozen; it
+  can enable no privilege beyond those two.
 - `setup --remove` leaves the entry of a run on the program file, and removes it when the
   removal names the program with `--read-exec`
   (`setup_remove_takes_back_the_program_entry_only_when_named`).

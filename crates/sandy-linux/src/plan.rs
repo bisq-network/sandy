@@ -192,11 +192,12 @@ fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
     if !policy.forward.is_empty() {
         shortfalls.push(
             "a forwarded port keeps other users out only in part on Linux: the relay refuses a \
-             connection that the kernel names as another user's, but the kernel names no owner \
-             once the client has closed its socket, and the relay serves such a connection, so \
-             another local user can deliver a write to the forwarded service, though it cannot \
-             read the answer; forward only to services that are safe against such a write or \
-             authenticate their clients (docs/linux.md, \"Exposed and forwarded ports\")"
+             connection that the kernel names as another user's, but once the client has closed \
+             its socket the kernel names no owner, at once on Linux 6.8 and after a moment on \
+             newer kernels, and the relay serves such a connection, so another local user can \
+             deliver a write to the forwarded service, though it cannot read the answer; \
+             forward only to services that are safe against such a write or authenticate their \
+             clients (docs/linux.md, \"Exposed and forwarded ports\")"
                 .to_string(),
         );
     }
@@ -356,7 +357,7 @@ fn plan_item(
             Err(reason) => unavailable(reason),
             Ok(()) if abi >= ABI::V6 => enforced(
                 "Landlock ABI 6 signal scope; seccomp denies setpgid into a process group that \
-                 exists and the terminal ioctls TIOCSPGRP and TIOCSWINSZ"
+                 exists and the terminal ioctls TIOCSPGRP, TIOCSWINSZ and TIOCSIG"
                     .to_string(),
             ),
             Ok(()) => unavailable(&format!(

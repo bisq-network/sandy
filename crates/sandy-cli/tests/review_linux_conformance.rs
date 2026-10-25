@@ -198,6 +198,7 @@ fn denylisted_calls_fail_with_eperm_on_the_kernel() {
         target
     };
     const READ_IMPLIES_EXEC: libc::c_long = 0x040_0000;
+    const FIDEDUPERANGE: libc::c_long = 0xc018_9436;
     const UFFD_USER_MODE_ONLY: libc::c_long = 1;
     const PTRACE_ATTACH: libc::c_long = 16;
     const IPC_STAT: libc::c_long = 2;
@@ -229,6 +230,24 @@ fn denylisted_calls_fail_with_eperm_on_the_kernel() {
             &[libc::CLOCK_REALTIME as libc::c_long, 0],
         ),
         call(libc::SYS_personality, &[READ_IMPLIES_EXEC]),
+        // On standard input, /dev/null here: outside, the kernel fails to read the request.
+        call(libc::SYS_ioctl, &[0, FIDEDUPERANGE, 0]),
+        // An empty range: the kernel checks the advice and changes nothing.
+        call(
+            libc::SYS_madvise,
+            &[0, 0, libc::MADV_MERGEABLE as libc::c_long],
+        ),
+        // CLONE_SIGHAND without CLONE_VM makes the kernel refuse before it creates a process.
+        call(
+            libc::SYS_clone,
+            &[
+                (libc::CLONE_PARENT | libc::CLONE_SIGHAND) as libc::c_long,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
     ];
     #[cfg(target_arch = "x86_64")]
     {
@@ -260,8 +279,9 @@ fn denylisted_calls_fail_with_eperm_on_the_kernel() {
 }
 
 /// docs/linux.md, "Metadata": with the default `path_metadata = "deny"` every metadata call by
-/// path fails, also in writable paths, while the calls on an open descriptor keep working; with
-/// `allow` the path calls work. `path_metadata_follows_the_policy` checks chmod only.
+/// path fails, also in writable paths, while the times change through an open descriptor; with
+/// `allow` the path calls work. `path_metadata_follows_the_policy` checks chmod only, and
+/// `a_read_only_descriptor_changes_only_the_mode_and_the_times` the other descriptor calls.
 #[test]
 fn every_metadata_call_by_path_follows_the_policy() {
     let fixture = Fixture::new("conformance-metadata");
@@ -271,7 +291,7 @@ fn every_metadata_call_by_path_follows_the_policy() {
         ("chown-path", file.as_str()),
         ("utime-path", file.as_str()),
     ];
-    let by_descriptor = [("setxattr-fd", file.as_str()), ("utime-fd", file.as_str())];
+    let by_descriptor = [("utime-fd", file.as_str())];
     let actions: Vec<(&str, &str)> = by_path.iter().chain(&by_descriptor).copied().collect();
     let outside = probe_outside(&actions);
     // tmpfs before Linux 6.6 has no user extended attributes.
@@ -501,6 +521,19 @@ fn fanotify_groups_cannot_be_created() {
     assert!(has_errno(&inside[0], libc::ENOSYS), "{inside:?}");
 }
 
+/// docs/linux.md, "Known limitations": `name_to_handle_at` gives the handle and the mount of any
+/// path, outside the policy as well, and fails with ENOSYS inside. Without a path the kernel
+/// fails the call outside with EFAULT, so the control changes nothing.
+#[test]
+fn file_handles_cannot_be_made() {
+    let call = format!("{}:-100:0:0:0:0", libc::SYS_name_to_handle_at);
+    let actions = [("raw-syscall", call.as_str())];
+    let outside = probe_outside(&actions);
+    assert!(has_errno(&outside[0], libc::EFAULT), "{outside:?}");
+    let inside = probe_inside(&[], &actions);
+    assert!(has_errno(&inside[0], libc::ENOSYS), "{inside:?}");
+}
+
 /// docs/linux.md, "Metadata": the extended attribute reads that take a path fail with `ENOTSUP`,
 /// also for a file the policy allows, because the call names a path and Landlock does not check
 /// it. The descriptor variants keep working, so a program reads the attributes of the files it
@@ -703,31 +736,48 @@ fn file_system_ioctls_cannot_change_readable_files() {
     assert!(is_eperm(&inside[0]), "{inside:?}");
 }
 
-/// Records a documented limitation (docs/linux.md, "Metadata through open files"): `fchmod`,
-/// `fsetxattr` and `futimens` work on a descriptor that a `read` path opened. seccomp sees only
-/// the descriptor number, not how the file was opened, and Landlock has no metadata right. If
-/// this test fails, sandy gained a way to tell the two apart and the limitation list should say
-/// so.
+/// docs/linux.md, "Metadata through open files": with `path_metadata = "deny"`, a descriptor of a
+/// file that a `read` path opened cannot change the owner or the extended attributes of the file
+/// (EPERM and ENOTSUP), and with `allow` it can. The mode and the times still change, which
+/// records a documented limitation: seccomp sees only the descriptor number, not how the file
+/// was opened, and cp, touch and Rust's `fs::copy` need `fchmod` and `futimens` on the files
+/// they write. If that part fails, sandy gained a way to tell the two apart.
 #[test]
-fn metadata_calls_on_a_read_only_descriptor_still_work() {
+fn a_read_only_descriptor_changes_only_the_mode_and_the_times() {
     let fixture = Fixture::new("conformance-fdmeta");
     let file = fixture.arg("ro/file");
+    // fchown on the file as standard input, with no new owner or group: the kernel still
+    // checks the call and updates the change time.
+    let chown = format!("{}:0:-1:-1", libc::SYS_fchown);
     let actions = [
         ("fchmod-ro", file.as_str()),
         ("utime-ro", file.as_str()),
+        ("raw-syscall", chown.as_str()),
         ("setxattr-fd", file.as_str()),
     ];
-    let outside = probe_outside(&actions);
-    let inside = probe_inside(&fixture.access_args(), &actions);
-    for (control, line) in outside.iter().zip(&inside) {
+    let on_the_file = |command: &mut Command| {
+        command.stdin(fs::File::open(&file).unwrap());
+    };
+    let outside = parse(&run_with(probe_path(), probe_args(&actions), &on_the_file));
+    let inside = probe_inside_with(&fixture.access_args(), &actions, &on_the_file);
+    let mut allow = fixture.access_args();
+    allow.extend(args(&["--linux-path-metadata", "allow"]));
+    let allowed = probe_inside_with(&allow, &actions, &on_the_file);
+    for (index, control) in outside.iter().enumerate() {
         if control.result != "ok" {
+            // tmpfs before Linux 6.6 has no user extended attributes.
             skip(
                 "metadata-calls",
                 &format!("{} fails outside: {}", control.action, control.detail),
             );
             continue;
         }
-        line.assert_ok();
+        allowed[index].assert_ok();
+        match index {
+            0 | 1 => inside[index].assert_ok(),
+            2 => assert!(is_eperm(&inside[index]), "{inside:?}"),
+            _ => assert!(has_errno(&inside[index], libc::ENOTSUP), "{inside:?}"),
+        }
     }
 }
 

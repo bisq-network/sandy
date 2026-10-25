@@ -5,8 +5,9 @@
 //!    including x32 numbers and system calls of newer kernels, fails with ENOSYS. Programs treat
 //!    that like an older kernel. A call of another CPU architecture kills the process.
 //! 2. The denylist checks arguments and denies single system calls with EPERM.
-//! 3. The extended attribute filter fails the reads that take a path with ENOTSUP. Programs
-//!    treat that like a file system without extended attributes and skip them.
+//! 3. The extended attribute filter fails the reads that take a path, and the changes through a
+//!    descriptor, with ENOTSUP. Programs treat that like a file system without extended
+//!    attributes and skip them.
 //! 4. The socket family filter fails `socket` with EAFNOSUPPORT for the families the policy
 //!    denies. Programs treat that like a kernel without the family and fall back; EPERM reads
 //!    like a temporary failure and often ends the program instead.
@@ -16,7 +17,7 @@
 
 use std::collections::BTreeMap;
 
-use sandy_core::streams::CreatableSocket;
+use sandy_core::streams::{CreatableSocket, IP_PROTOCOLS};
 use seccompiler::{
     BackendError, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
     SeccompFilter, SeccompRule, TargetArch, sock_filter,
@@ -76,6 +77,13 @@ mod arch {
     pub const CHMOD_CALLS: &[(i64, u8)] = &[(libc::SYS_chmod, 1)];
     /// Calls the relay and the watcher need that only x86_64 has (arm64 has only ppoll).
     pub const RELAY_CALLS: &[i64] = &[libc::SYS_poll];
+    /// Lookups by path that only x86_64 has besides their `*at` forms.
+    pub const PATH_LOOKUP_CALLS: &[i64] = &[
+        libc::SYS_readlink,
+        libc::SYS_stat,
+        libc::SYS_lstat,
+        libc::SYS_access,
+    ];
     /// System calls that create a process without arguments to check; arm64 has only clone.
     pub const FORK_CALLS: &[i64] = &[libc::SYS_fork, libc::SYS_vfork];
 }
@@ -95,6 +103,7 @@ mod arch {
     pub const OPEN_CALLS: &[(i64, u8)] = &[(libc::SYS_openat, 2)];
     pub const CHMOD_CALLS: &[(i64, u8)] = &[];
     pub const RELAY_CALLS: &[i64] = &[];
+    pub const PATH_LOOKUP_CALLS: &[i64] = &[];
     pub const FORK_CALLS: &[i64] = &[];
 }
 
@@ -108,6 +117,7 @@ mod arch {
     pub const OPEN_CALLS: &[(i64, u8)] = &[];
     pub const CHMOD_CALLS: &[(i64, u8)] = &[];
     pub const RELAY_CALLS: &[i64] = &[];
+    pub const PATH_LOOKUP_CALLS: &[i64] = &[];
     pub const FORK_CALLS: &[i64] = &[];
 }
 
@@ -213,13 +223,16 @@ const DENIED: &[i64] = &[
     libc::SYS_open_by_handle_at,
     libc::SYS_settimeofday,
     libc::SYS_clock_settime,
+    libc::SYS_vhangup,
+    libc::SYS_sethostname,
+    libc::SYS_setdomainname,
+    libc::SYS_setgroups,
 ];
 
-/// Landlock does not restrict metadata changes. The descriptor variants (fchmod, fchown,
-/// fsetxattr, fremovexattr, futimens) stay allowed: they reject O_PATH descriptors, so they only
-/// reach files that Landlock let the program open. fchmodat, fchmodat2 and fchownat accept
-/// O_PATH descriptors with AT_EMPTY_PATH, so they are denied completely. utimensat has its own
-/// rule.
+/// Landlock does not restrict metadata changes. fchmodat, fchmodat2 and fchownat accept O_PATH
+/// descriptors with AT_EMPTY_PATH, so they are denied completely. utimensat has its own rule. The
+/// descriptor variants reject O_PATH descriptors, so they only reach files that Landlock let the
+/// program open, but also one it may only read: see `DESCRIPTOR_METADATA`.
 const PATH_METADATA: &[i64] = &[
     libc::SYS_fchmodat,
     SYS_FCHMODAT2,
@@ -250,12 +263,32 @@ const PATH_XATTR_READS: &[i64] = &[
     SYS_FILE_GETATTR,
 ];
 
+/// Metadata changes through a descriptor that sandy denies with the path metadata: fchown sets
+/// the owner and group, fsetxattr and fremovexattr the ACLs, the security label and the user
+/// attributes. seccomp cannot tell a descriptor opened for writing from one opened for reading,
+/// so they would otherwise change a file of a `read` path or one the caller passed on a standard
+/// stream. The programs that call them on the files they write (sed -i, gzip, xz, patch, Java's
+/// Files.copy) carry on without them: fchown fails with EPERM as for any user who may not
+/// change an owner, and the attribute calls fail with ENOTSUP, as on a file system without
+/// extended attributes, because EPERM there makes sed and patch print a warning. fchmod and
+/// futimens stay allowed: cp, touch and Rust's fs::copy need them on the files they write.
+const DESCRIPTOR_METADATA: &[i64] = &[libc::SYS_fchown];
+const DESCRIPTOR_XATTR_CHANGES: &[i64] = &[libc::SYS_fsetxattr, libc::SYS_fremovexattr];
+
 /// Not in the allowlist, so they fail with ENOSYS. Programs fall back on ENOSYS: glibc uses
-/// clone instead of clone3, openat2 callers use openat, and a program that cannot create an
-/// fanotify group uses inotify. The arguments of clone3 and openat2 are in memory, where seccomp
-/// cannot check them; an unprivileged fanotify group needs no argument check, because it reports
-/// paths outside the policy whatever its flags are.
-const ENOSYS_CALLS: &[i64] = &[libc::SYS_clone3, libc::SYS_openat2, libc::SYS_fanotify_init];
+/// clone instead of clone3, openat2 callers use openat, a program that cannot create an fanotify
+/// group uses inotify, and one without file handles works with paths, as on a kernel built
+/// without them. The arguments of clone3 and openat2 are in memory, where seccomp cannot check
+/// them; an unprivileged fanotify group needs no argument check, because it reports paths outside
+/// the policy whatever its flags are, and name_to_handle_at gives the handle and the mount of any
+/// path the user can reach, also outside the policy, while open_by_handle_at, its only use, needs
+/// a capability.
+const ENOSYS_CALLS: &[i64] = &[
+    libc::SYS_clone3,
+    libc::SYS_openat2,
+    libc::SYS_fanotify_init,
+    libc::SYS_name_to_handle_at,
+];
 
 /// The namespace flags of clone. CLONE_NEWTIME shares its bit with the exit signal of clone, so
 /// only unshare checks it.
@@ -333,6 +366,10 @@ const F_SETDELEG: u64 = 1040;
 ///   changes directories without the Landlock checks for creating and removing entries.
 ///   BTRFS_IOC_SET_RECEIVED_SUBVOL and its 32-bit form, which 64-bit kernels also take, change
 ///   the identity by which `btrfs receive` finds the parent of an incremental stream.
+/// - FIDEDUPERANGE makes a file share blocks with another file of the same content. The kernel
+///   takes a destination the user owns also when it was opened read-only, so it changes how a
+///   file of a `read` path is stored, and its answer tells whether a guessed block equals a block
+///   of the destination, which is what made access mode 3 a content oracle.
 const FILE_SYSTEM_IOCTLS: &[u32] = &[
     0x4008_6602,
     0x4004_6602,
@@ -353,6 +390,42 @@ const FILE_SYSTEM_IOCTLS: &[u32] = &[
     0x4008_941a,
     0xc0c8_9425,
     0xc0c0_9425,
+    0xc018_9436,
+];
+
+/// PIDFD_GET_INFO, `_IOWR(0xFF, 11, struct pidfd_info)`, which tells the parent, the user and
+/// group IDs, the cgroup and the exit status of the process behind a pidfd, and pidfd_open takes
+/// any process of the host. Leaving out `/proc` otherwise hides these, as it hides the mounts
+/// that statmount shows. The structure grows with the kernel and its size is part of the number,
+/// so the rule ignores the size bits. Only libsystemd uses the call, for the peers of a bus; it
+/// does without when the call fails.
+const PIDFD_GET_INFO: u64 = 0xc000_ff0b;
+const PIDFD_GET_INFO_MASK: u64 = 0xc000_ffff;
+
+/// Console ioctls that change a Linux virtual console, its keyboard or which console the screen
+/// shows. The kernel allows them without privileges on the console that is the caller's
+/// controlling terminal, which a program has when the user started it from a text console. The
+/// key map, the strings of the function keys and the fonts belong to every console of the host,
+/// and a key mapped to a string types that string when the user presses the key later, at the
+/// shell, which is input injection like TIOCSTI. The calls that only read stay allowed: nano
+/// asks VT_GETSTATE whether it runs on a console. KDFONTOP and KDKBDREP also read, which only
+/// console tools do. The numbers are the same on x86_64 and arm64.
+const CONSOLE_IOCTLS: &[u32] = &[
+    // KIOCSOUND, KDMKTONE, KDSETLED, KDSKBLED: the speaker and the keyboard lights.
+    0x4b2f, 0x4b30, 0x4b32, 0x4b65,
+    // KDSETMODE, KDSKBMODE, KDSKBMETA, KDKBDREP: text or graphics, a raw or disabled keyboard,
+    // the repeat rate.
+    0x4b3a, 0x4b45, 0x4b63, 0x4b52,
+    // KDSKBENT, KDSKBSENT, KDSKBDIACR, KDSKBDIACRUC, KDSETKEYCODE, KDSIGACCEPT: the key map, the
+    // function key strings, the accent tables, the scan codes, and the signal of a key.
+    0x4b47, 0x4b49, 0x4b4b, 0x4bfb, 0x4b4d, 0x4b4e,
+    // PIO_FONT, PIO_FONTX, PIO_FONTRESET, KDFONTOP, PIO_CMAP, PIO_SCRNMAP, PIO_UNISCRNMAP,
+    // PIO_UNIMAP, PIO_UNIMAPCLR: fonts, colors and character maps.
+    0x4b61, 0x4b6c, 0x4b6d, 0x4b72, 0x4b71, 0x4b41, 0x4b6a, 0x4b67, 0x4b68,
+    // VT_SETMODE, VT_RELDISP, VT_ACTIVATE, VT_SETACTIVATE, VT_DISALLOCATE, VT_RESIZE, VT_RESIZEX,
+    // VT_LOCKSWITCH, VT_UNLOCKSWITCH: switching consoles, holding a switch back, and the size of
+    // every console.
+    0x5602, 0x5605, 0x5606, 0x560f, 0x5608, 0x5609, 0x560a, 0x560b, 0x560c,
 ];
 
 /// The compiled filters, in the order they are installed. The relay and the watcher have no
@@ -383,13 +456,15 @@ pub fn build(config: &FilterConfig, own_pid: u32) -> Result<Filters, BackendErro
     })
 }
 
-/// The third filter: the extended attribute reads that take a path fail with ENOTSUP, the error
-/// of a file system without extended attributes, so that `cp -a`, `rsync -X` and `tar --xattrs`
-/// skip them instead of reporting a failure. It follows `path_metadata`, which decides the same
-/// question for the calls that change metadata by path.
+/// The third filter: the extended attribute reads that take a path, and the changes through a
+/// descriptor, fail with ENOTSUP, the error of a file system without extended attributes, so
+/// that `cp -a`, `rsync -X`, `tar --xattrs` and `sed -i` skip them instead of reporting a
+/// failure. It follows `path_metadata`, which decides the same question for the calls that
+/// change metadata by path.
 fn xattr_filter(target: TargetArch) -> Result<BpfProgram, BackendError> {
     let rules = PATH_XATTR_READS
         .iter()
+        .chain(DESCRIPTOR_XATTR_CHANGES)
         .map(|&call| (call, Vec::new()))
         .collect();
     let filter = SeccompFilter::new(
@@ -453,6 +528,11 @@ fn denylist(
     }
     rules.add(libc::SYS_ioctl, ioctl_rules(config)?);
     rules.add(libc::SYS_fcntl, lease_rules()?);
+    // Where an administrator enabled KSM, the kernel shares mergeable pages of the program with
+    // identical pages of other processes, and the time a write to such a page takes tells the
+    // program whether another process holds the same content.
+    let mergeable = low(2, SeccompCmpOp::Eq, libc::MADV_MERGEABLE as u64)?;
+    rules.add(libc::SYS_madvise, vec![rule(vec![mergeable])?]);
     rules.add(libc::SYS_socketpair, socketpair_rules(config)?);
     if !config.allow_ip && !config.allow_unix {
         // The only sockets left are connected pairs, which need none of these. bind would let
@@ -469,6 +549,10 @@ fn denylist(
         }
     }
     let mut clone = namespace_rules(CLONE_NAMESPACES)?;
+    // CLONE_PARENT makes the new process a child of the program's parent, a process outside the
+    // sandbox, which then receives its SIGCHLD and has to reap it.
+    let parent = libc::CLONE_PARENT as u64;
+    clone.push(rule(vec![low(0, SeccompCmpOp::MaskedEq(parent), parent)?])?);
     if config.deny_children {
         // Only a thread (CLONE_THREAD) stays possible. The flags are the first argument of clone
         // on x86_64 and arm64. clone3 already fails with ENOSYS, so libc falls back to clone,
@@ -499,7 +583,11 @@ fn denylist(
         .collect::<Result<_, _>>()?;
     rules.add(libc::SYS_personality, vec![rule(personality)?]);
     if config.deny_path_metadata {
-        for &call in PATH_METADATA.iter().chain(arch::PATH_METADATA) {
+        for &call in PATH_METADATA
+            .iter()
+            .chain(arch::PATH_METADATA)
+            .chain(DESCRIPTOR_METADATA)
+        {
             rules.add(call, Vec::new());
         }
         // utimensat with a NULL path changes the descriptor itself (futimens).
@@ -554,25 +642,44 @@ impl Rules {
 
 /// TIOCSTI and TIOCLINUX can push input into the terminal of the user, where a shell outside the
 /// sandbox would run it. TIOCSETD changes the line discipline of the terminal, and the kernel
-/// loads the module of a discipline on demand (dev.tty.ldisc_autoload). The file system ioctls
-/// change files through descriptors that Landlock opened for reading. With isolated signals,
-/// TIOCSPGRP and TIOCSWINSZ are denied too: the first gives the terminal to another job of the
-/// session, which then stops at its next read, and the second makes the kernel send SIGWINCH to
-/// the foreground group.
+/// loads the module of a discipline on demand (dev.tty.ldisc_autoload). TIOCEXCL makes every
+/// later open of the terminal fail with EBUSY for processes without CAP_SYS_ADMIN, also after the
+/// program has ended, so that a pager or a password prompt outside cannot open /dev/tty. The
+/// console ioctls change a virtual console and its keyboard for the whole host. The file system
+/// ioctls change files through descriptors that Landlock opened for reading. With isolated
+/// signals, TIOCSPGRP, TIOCSWINSZ and TIOCSIG are denied too: the first gives the terminal to
+/// another job of the session, which then stops at its next read, the second makes the kernel
+/// send SIGWINCH to the foreground group, and the third, on the master side of a pseudo-terminal,
+/// sends SIGINT, SIGQUIT or SIGTSTP to the foreground group of the other side. Writing the
+/// interrupt, quit or suspend character into the master does the same and stays possible, because
+/// a write cannot be told from any other.
 fn ioctl_rules(config: &FilterConfig) -> Result<Vec<SeccompRule>, BackendError> {
     let mut commands = vec![
         libc::TIOCSTI as u32,
         libc::TIOCLINUX as u32,
         libc::TIOCSETD as u32,
+        libc::TIOCEXCL as u32,
     ];
+    commands.extend(CONSOLE_IOCTLS);
     commands.extend(FILE_SYSTEM_IOCTLS);
     if config.isolate_signals {
-        commands.extend([libc::TIOCSPGRP as u32, libc::TIOCSWINSZ as u32]);
+        commands.extend([
+            libc::TIOCSPGRP as u32,
+            libc::TIOCSWINSZ as u32,
+            libc::TIOCSIG as u32,
+        ]);
     }
-    commands
+    let mut rules: Vec<SeccompRule> = commands
         .into_iter()
         .map(|command| rule(vec![low(1, SeccompCmpOp::Eq, u64::from(command))?]))
-        .collect()
+        .collect::<Result<_, _>>()?;
+    let pidfd_info = low(
+        1,
+        SeccompCmpOp::MaskedEq(PIDFD_GET_INFO_MASK),
+        PIDFD_GET_INFO,
+    )?;
+    rules.push(rule(vec![pidfd_info])?);
+    Ok(rules)
 }
 
 /// A lease or a delegation needs only a read descriptor of a file the user owns, and Landlock
@@ -590,7 +697,9 @@ fn lease_rules() -> Result<Vec<SeccompRule>, BackendError> {
 }
 
 /// An allowlist of socket families. A denylist of AF_INET and AF_INET6 is not enough: other
-/// families, for example AF_SMC, fall back to TCP.
+/// families, for example AF_SMC, fall back to TCP. Within AF_INET and AF_INET6 an allowlist of
+/// protocols, because the kernel loads the module of a protocol such as SCTP, L2TP or SMC when a
+/// program asks for a socket of it (`IP_PROTOCOLS`).
 fn socket_rules(config: &FilterConfig) -> Result<Vec<SeccompRule>, BackendError> {
     let mut allowed = Vec::new();
     if config.allow_unix {
@@ -609,6 +718,13 @@ fn socket_rules(config: &FilterConfig) -> Result<Vec<SeccompRule>, BackendError>
         .collect::<Result<_, _>>()?;
     let mut rules = vec![rule(other_family)?];
     if config.allow_ip {
+        for family in [libc::AF_INET, libc::AF_INET6] {
+            let mut other_protocol = vec![low(0, SeccompCmpOp::Eq, family as u64)?];
+            for &protocol in IP_PROTOCOLS {
+                other_protocol.push(low(2, SeccompCmpOp::Ne, protocol as u64)?);
+            }
+            rules.push(rule(other_protocol)?);
+        }
         for socket in IP_ALSO_ALLOWS {
             rules.push(rule(vec![
                 low(0, SeccompCmpOp::Eq, socket.family as u64)?,
@@ -809,7 +925,8 @@ pub fn watcher(program: i32) -> Result<Filters, BackendError> {
 }
 
 /// Builds the filters of the relay: the shared allowlist and the relay's own list, which allows
-/// only `RELAY_CALLS`, TCP sockets, thread creation without namespaces, and FIONBIO.
+/// only `RELAY_CALLS`, TCP sockets, threads without namespaces, and FIONBIO. The relay serves
+/// each connection in a thread and never starts a process, so clone needs CLONE_THREAD.
 pub fn relay() -> Result<Filters, BackendError> {
     let target = arch::TARGET
         .ok_or_else(|| BackendError::InvalidTargetArch(std::env::consts::ARCH.to_string()))?;
@@ -835,7 +952,9 @@ pub fn relay() -> Result<Filters, BackendError> {
         .iter()
         .fold(0, |all, &flag| all | flag as u64);
     let no_namespace = low(0, SeccompCmpOp::MaskedEq(namespaces), 0)?;
-    rules.add(libc::SYS_clone, vec![rule(vec![no_namespace])?]);
+    let thread = libc::CLONE_THREAD as u64;
+    let a_thread = low(0, SeccompCmpOp::MaskedEq(thread), thread)?;
+    rules.add(libc::SYS_clone, vec![rule(vec![no_namespace, a_thread])?]);
     let fionbio = low(1, SeccompCmpOp::Eq, u64::from(libc::FIONBIO as u32))?;
     rules.add(libc::SYS_ioctl, vec![rule(vec![fionbio])?]);
     let filter = SeccompFilter::new(
@@ -850,6 +969,89 @@ pub fn relay() -> Result<Filters, BackendError> {
         path_xattrs: None,
         families: None,
     })
+}
+
+/// What the watcher thread of the diagnostic mode needs once it holds the notification
+/// descriptor: wait for a notification, read the path out of the calling process, resolve it
+/// with the stat, access and readlink family, and end. The memory calls cover the allocator and the
+/// futex the lock of standard error. `ioctl`, `write`, `writev`, `mmap` and `mprotect` have
+/// rules of their own.
+const EXPLAIN_WATCHER_CALLS: &[i64] = &[
+    libc::SYS_ppoll,
+    libc::SYS_process_vm_readv,
+    libc::SYS_readlinkat,
+    libc::SYS_newfstatat,
+    libc::SYS_statx,
+    libc::SYS_faccessat,
+    libc::SYS_faccessat2,
+    libc::SYS_fstat,
+    libc::SYS_getcwd,
+    libc::SYS_close,
+    libc::SYS_munmap,
+    libc::SYS_mremap,
+    libc::SYS_madvise,
+    libc::SYS_brk,
+    libc::SYS_futex,
+    libc::SYS_sched_yield,
+    libc::SYS_clock_gettime,
+    libc::SYS_rt_sigprocmask,
+    libc::SYS_rt_sigreturn,
+    libc::SYS_sigaltstack,
+    libc::SYS_restart_syscall,
+    libc::SYS_exit,
+    libc::SYS_exit_group,
+];
+
+/// The filter of the diagnostic mode's watcher thread, which parses bytes the program controls
+/// outside the sandbox. It is installed on that thread alone. ioctl is allowed only on
+/// `listener`, the notification descriptor, and only with `requests`, the notification
+/// interface; write only to standard error; mmap and mprotect only without PROT_EXEC, so the
+/// thread cannot make code of its own. Any other call ends sandy with SIGSYS: a watcher that
+/// went on after a denied call would report what it did not see, and the program keeps its
+/// sandbox, with its watched calls failing with ENOSYS from then on.
+pub fn explain_watcher(listener: i32, requests: &[u32]) -> Result<BpfProgram, BackendError> {
+    let target = arch::TARGET
+        .ok_or_else(|| BackendError::InvalidTargetArch(std::env::consts::ARCH.to_string()))?;
+    let mut rules = Rules::default();
+    for &call in EXPLAIN_WATCHER_CALLS
+        .iter()
+        .chain(arch::RELAY_CALLS)
+        .chain(arch::PATH_LOOKUP_CALLS)
+    {
+        rules.add(call, Vec::new());
+    }
+    let notify = requests
+        .iter()
+        .map(|&request| {
+            rule(vec![
+                low(0, SeccompCmpOp::Eq, listener as u64)?,
+                low(1, SeccompCmpOp::Eq, u64::from(request))?,
+            ])
+        })
+        .collect::<Result<_, _>>()?;
+    rules.add(libc::SYS_ioctl, notify);
+    let standard_error = libc::STDERR_FILENO as u64;
+    for call in [libc::SYS_write, libc::SYS_writev] {
+        rules.add(
+            call,
+            vec![rule(vec![low(0, SeccompCmpOp::Eq, standard_error)?])?],
+        );
+    }
+    // Rust's standard library asks whether a descriptor is still open before it closes it.
+    let descriptor_flags = low(1, SeccompCmpOp::Eq, libc::F_GETFD as u64)?;
+    rules.add(libc::SYS_fcntl, vec![rule(vec![descriptor_flags])?]);
+    let executable = libc::PROT_EXEC as u64;
+    for call in [libc::SYS_mmap, libc::SYS_mprotect] {
+        let no_code = low(2, SeccompCmpOp::MaskedEq(executable), 0)?;
+        rules.add(call, vec![rule(vec![no_code])?]);
+    }
+    let filter = SeccompFilter::new(
+        rules.0,
+        SeccompAction::KillProcess,
+        SeccompAction::Allow,
+        target,
+    )?;
+    filter.try_into()
 }
 
 /// The program of the diagnostic mode (`explain`): `calls` return SECCOMP_RET_USER_NOTIF, every
@@ -1189,6 +1391,9 @@ mod tests {
                 &observer(&crate::explain::watched_calls()),
                 &mut out,
             );
+            let requests = crate::explain::NOTIFICATION_REQUESTS;
+            let explain_watcher = explain_watcher(WATCHED_PROGRAM, &requests).unwrap();
+            render("explain watcher", &explain_watcher, &mut out);
             out
         }
 
@@ -1245,8 +1450,7 @@ mod tests {
             libc::SYS_close_range,
             libc::SYS_rseq,
             libc::SYS_fchmod,
-            libc::SYS_fchown,
-            libc::SYS_fsetxattr,
+            libc::SYS_fgetxattr,
         ] {
             assert_eq!(call(&strict(), nr, [0; 6]), RET_ALLOW, "system call {nr}");
         }
@@ -1281,6 +1485,34 @@ mod tests {
         const NETLINK_SOCK_DIAG: i32 = 4;
         let diag = socket(libc::AF_NETLINK, 2, NETLINK_SOCK_DIAG);
         assert_eq!(call(&open(), libc::SYS_socket, diag), RET_NO_FAMILY);
+        // The usual IP protocols, and not those whose module the kernel would load: SCTP, L2TP
+        // over IP, SMC and UDP-Lite. High bits change neither.
+        const HIGH: u64 = 0xffff_ffff_0000_0000;
+        for family in [libc::AF_INET, libc::AF_INET6] {
+            for (kind, protocol) in [(1, 0), (1, 6), (1, 262), (2, 17), (2, 1), (2, 58)] {
+                let mut args = socket(family, kind, protocol);
+                args[2] |= HIGH;
+                assert_eq!(
+                    call(&open(), libc::SYS_socket, args),
+                    RET_ALLOW,
+                    "{protocol}"
+                );
+            }
+            for (kind, protocol) in [(5, 132), (1, 132), (2, 115), (1, 256), (2, 136)] {
+                let mut args = socket(family, kind, protocol);
+                assert_eq!(
+                    call(&open(), libc::SYS_socket, args),
+                    RET_NO_FAMILY,
+                    "{protocol}"
+                );
+                args[2] |= HIGH;
+                assert_eq!(
+                    call(&open(), libc::SYS_socket, args),
+                    RET_NO_FAMILY,
+                    "{protocol}"
+                );
+            }
+        }
         let ip_only = FilterConfig {
             allow_unix: false,
             ..open()
@@ -1388,14 +1620,26 @@ mod tests {
 
     #[test]
     fn terminal_ioctls_are_denied_also_with_high_bits_set() {
-        let denied = [libc::TIOCSTI, libc::TIOCLINUX, libc::TIOCSETD];
+        let denied = [
+            libc::TIOCSTI,
+            libc::TIOCLINUX,
+            libc::TIOCSETD,
+            libc::TIOCEXCL,
+        ];
         for command in denied.map(|command| u64::from(command as u32)) {
             for high in [0, 0xffff_ffff_0000_0000] {
                 let args = args(&[0, high | command]);
                 assert_eq!(call(&open(), libc::SYS_ioctl, args), RET_EPERM);
             }
         }
-        for command in [libc::TIOCGWINSZ, libc::TIOCGETD].map(|c| u64::from(c as u32)) {
+        // Giving up exclusive mode, and asking for it, stay allowed.
+        let allowed = [
+            libc::TIOCGWINSZ,
+            libc::TIOCGETD,
+            libc::TIOCNXCL,
+            libc::TIOCGEXCL,
+        ];
+        for command in allowed.map(|c| u64::from(c as u32)) {
             let args = args(&[0, command]);
             assert_eq!(call(&strict(), libc::SYS_ioctl, args), RET_ALLOW);
         }
@@ -1404,8 +1648,8 @@ mod tests {
     #[test]
     fn file_system_ioctls_that_change_files_are_denied() {
         const HIGH: u64 = 0xffff_ffff_0000_0000;
-        // FS_IOC_SETFLAGS, FS_IOC_FSSETXATTR, FS_IOC_SETVERSION, ext4's own number for it, and
-        // both forms of BTRFS_IOC_SET_RECEIVED_SUBVOL.
+        // FS_IOC_SETFLAGS, FS_IOC_FSSETXATTR, FS_IOC_SETVERSION, ext4's own number for it, both
+        // forms of BTRFS_IOC_SET_RECEIVED_SUBVOL, and FIDEDUPERANGE.
         for command in [
             0x4008_6602,
             0x401c_5820,
@@ -1413,6 +1657,7 @@ mod tests {
             0x4008_6604,
             0xc0c8_9425,
             0xc0c0_9425,
+            0xc018_9436,
         ] {
             assert!(FILE_SYSTEM_IOCTLS.contains(&command), "{command:#x}");
         }
@@ -1426,9 +1671,87 @@ mod tests {
                 );
             }
         }
-        // The forms that only read stay allowed: FS_IOC_GETFLAGS and FS_IOC_FSGETXATTR.
-        for command in [0x8008_6601u32, 0x801c_581f] {
+        // The forms that only read stay allowed: FS_IOC_GETFLAGS and FS_IOC_FSGETXATTR. So does
+        // FICLONE, which `cp` uses and which needs a destination opened for writing.
+        for command in [0x8008_6601u32, 0x801c_581f, 0x4004_9409] {
             let args = args(&[3, u64::from(command)]);
+            assert_eq!(
+                call(&open(), libc::SYS_ioctl, args),
+                RET_ALLOW,
+                "{command:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_cannot_be_offered_for_merging() {
+        const HIGH: u64 = 0xffff_ffff_0000_0000;
+        let advice = |advice: i32| args(&[0x7fff_0000_0000, 4096, HIGH | advice as u64]);
+        for config in [strict(), open()] {
+            let merge = advice(libc::MADV_MERGEABLE);
+            assert_eq!(call(&config, libc::SYS_madvise, merge), RET_EPERM);
+            for other in [
+                libc::MADV_UNMERGEABLE,
+                libc::MADV_DONTNEED,
+                libc::MADV_HUGEPAGE,
+            ] {
+                let args = advice(other);
+                assert_eq!(call(&config, libc::SYS_madvise, args), RET_ALLOW, "{other}");
+            }
+        }
+    }
+
+    #[test]
+    fn process_details_through_a_pidfd_are_denied() {
+        // The sizes of Linux 6.13, of libsystemd, and of a larger structure, also with high bits.
+        for command in [
+            0xc040_ff0bu64,
+            0xc048_ff0b,
+            0xc050_ff0b,
+            0xffff_ffff_c040_ff0b,
+        ] {
+            for config in [strict(), open()] {
+                let args = args(&[3, command]);
+                assert_eq!(
+                    call(&config, libc::SYS_ioctl, args),
+                    RET_EPERM,
+                    "{command:#x}"
+                );
+            }
+        }
+        // PIDFD_GET_NET_NAMESPACE, which needs ptrace access that Landlock gives only inside the
+        // sandbox, and another call of the same number without the read-write direction.
+        for command in [0xff06u64, 0x8040_ff0b] {
+            let args = args(&[3, command]);
+            assert_eq!(
+                call(&open(), libc::SYS_ioctl, args),
+                RET_ALLOW,
+                "{command:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn console_ioctls_that_change_the_console_are_denied() {
+        const HIGH: u64 = 0xffff_ffff_0000_0000;
+        // KDSKBENT, KDSKBSENT, KDSKBMODE and VT_ACTIVATE.
+        for command in [0x4b47, 0x4b49, 0x4b45, 0x5606] {
+            assert!(CONSOLE_IOCTLS.contains(&command), "{command:#x}");
+        }
+        for &command in CONSOLE_IOCTLS {
+            let args = args(&[0, HIGH | u64::from(command)]);
+            for config in [strict(), open()] {
+                assert_eq!(
+                    call(&config, libc::SYS_ioctl, args),
+                    RET_EPERM,
+                    "{command:#x}"
+                );
+            }
+        }
+        // The forms that only read stay allowed: KDGKBTYPE, KDGKBMODE, KDGKBENT, KDGKBSENT,
+        // VT_GETMODE and VT_GETSTATE.
+        for command in [0x4b33u32, 0x4b44, 0x4b46, 0x4b48, 0x5601, 0x5603] {
+            let args = args(&[0, u64::from(command)]);
             assert_eq!(
                 call(&open(), libc::SYS_ioctl, args),
                 RET_ALLOW,
@@ -1526,6 +1849,15 @@ mod tests {
             let unshare = args(&[namespace as u64]);
             assert_eq!(call(&open(), libc::SYS_unshare, unshare), RET_EPERM);
         }
+        // A process whose parent would be the program's parent, also with high bits set.
+        let parent = libc::CLONE_PARENT as u64;
+        for flags in [
+            fork_flags | parent,
+            (1 << 32) | parent,
+            thread_flags | parent,
+        ] {
+            assert_eq!(call(&open(), libc::SYS_clone, args(&[flags])), RET_EPERM);
+        }
         let time = args(&[libc::CLONE_NEWTIME as u64]);
         assert_eq!(call(&open(), libc::SYS_unshare, time), RET_EPERM);
         let files = args(&[libc::CLONE_FILES as u64]);
@@ -1553,6 +1885,10 @@ mod tests {
                 SYS_LSM_GET_SELF_ATTR,
                 SYS_LSM_SET_SELF_ATTR,
                 SYS_LSM_LIST_MODULES,
+                libc::SYS_vhangup,
+                libc::SYS_sethostname,
+                libc::SYS_setdomainname,
+                libc::SYS_setgroups,
             ] {
                 assert_eq!(call(&config, nr, [0; 6]), RET_EPERM, "system call {nr}");
             }
@@ -1577,9 +1913,20 @@ mod tests {
             assert_eq!(call(&deny, nr, [0; 6]), RET_EPERM, "system call {nr}");
             assert_eq!(call(&allow, nr, [0; 6]), RET_ALLOW, "system call {nr}");
         }
-        for nr in [libc::SYS_fchmod, libc::SYS_fchown, libc::SYS_fsetxattr] {
-            assert_eq!(call(&deny, nr, [0; 6]), RET_ALLOW, "system call {nr}");
+        // Through a descriptor, the owner and the extended attributes follow the policy too;
+        // the attributes fail like on a file system without them. The mode stays allowed.
+        assert_eq!(call(&deny, libc::SYS_fchown, [0; 6]), RET_EPERM);
+        for nr in [libc::SYS_fsetxattr, libc::SYS_fremovexattr] {
+            assert_eq!(call(&deny, nr, [0; 6]), RET_NO_XATTRS, "system call {nr}");
         }
+        for nr in [
+            libc::SYS_fchown,
+            libc::SYS_fsetxattr,
+            libc::SYS_fremovexattr,
+        ] {
+            assert_eq!(call(&allow, nr, [0; 6]), RET_ALLOW, "system call {nr}");
+        }
+        assert_eq!(call(&deny, libc::SYS_fchmod, [0; 6]), RET_ALLOW);
         let path = args(&[3, 0x7fff_0000_1000]);
         assert_eq!(call(&deny, libc::SYS_utimensat, path), RET_EPERM);
         assert_eq!(call(&allow, libc::SYS_utimensat, path), RET_ALLOW);
@@ -1615,6 +1962,23 @@ mod tests {
             assert_eq!(call(&config, libc::SYS_fanotify_init, [0; 6]), RET_ENOSYS);
         }
         assert_eq!(call(&open(), libc::SYS_inotify_init1, [0; 6]), RET_ALLOW);
+    }
+
+    /// A file handle names a file of any path the user can reach, with its mount, and only
+    /// open_by_handle_at, which needs a capability, takes it. ENOSYS, as on a kernel without
+    /// file handles.
+    #[test]
+    fn file_handles_cannot_be_made() {
+        for config in [strict(), open()] {
+            assert_eq!(
+                call(&config, libc::SYS_name_to_handle_at, [0; 6]),
+                RET_ENOSYS
+            );
+            assert_eq!(
+                call(&config, libc::SYS_open_by_handle_at, [0; 6]),
+                RET_EPERM
+            );
+        }
     }
 
     #[test]
@@ -1745,6 +2109,74 @@ mod tests {
     }
 
     #[test]
+    fn the_explain_watcher_can_only_watch_and_report() {
+        const LISTENER: i32 = 5;
+        let requests = crate::explain::NOTIFICATION_REQUESTS;
+        let program = explain_watcher(LISTENER, &requests).unwrap();
+        let decide = |nr: i64, values: &[u64]| evaluate(&program, NATIVE, nr, args(values));
+        for nr in [
+            libc::SYS_ppoll,
+            libc::SYS_process_vm_readv,
+            libc::SYS_readlinkat,
+            libc::SYS_statx,
+            libc::SYS_faccessat2,
+            libc::SYS_futex,
+            libc::SYS_munmap,
+            libc::SYS_exit,
+        ] {
+            assert_eq!(decide(nr, &[]), RET_ALLOW, "system call {nr}");
+        }
+        // The notification interface on the notification descriptor, and nothing else on any.
+        let listener = LISTENER as u64;
+        for request in requests.map(u64::from) {
+            assert_eq!(decide(libc::SYS_ioctl, &[listener, request]), RET_ALLOW);
+            assert_eq!(decide(libc::SYS_ioctl, &[2, request]), RET_KILL_PROCESS);
+        }
+        let tiocsti = u64::from(libc::TIOCSTI as u32);
+        assert_eq!(
+            decide(libc::SYS_ioctl, &[listener, tiocsti]),
+            RET_KILL_PROCESS
+        );
+        // The report goes to standard error only.
+        assert_eq!(decide(libc::SYS_write, &[2]), RET_ALLOW);
+        for fd in [0, 1, 3] {
+            assert_eq!(decide(libc::SYS_write, &[fd]), RET_KILL_PROCESS, "fd {fd}");
+        }
+        // Memory, but no code of its own.
+        let read_write = (libc::PROT_READ | libc::PROT_WRITE) as u64;
+        let executable = (libc::PROT_READ | libc::PROT_EXEC) as u64;
+        for nr in [libc::SYS_mmap, libc::SYS_mprotect] {
+            assert_eq!(decide(nr, &[0, 4096, read_write]), RET_ALLOW, "{nr}");
+            assert_eq!(decide(nr, &[0, 4096, executable]), RET_KILL_PROCESS, "{nr}");
+        }
+        assert_eq!(
+            decide(libc::SYS_fcntl, &[3, libc::F_GETFD as u64]),
+            RET_ALLOW
+        );
+        assert_eq!(
+            decide(libc::SYS_fcntl, &[3, libc::F_SETFL as u64]),
+            RET_KILL_PROCESS
+        );
+        for nr in [
+            libc::SYS_openat,
+            libc::SYS_execve,
+            libc::SYS_socket,
+            libc::SYS_connect,
+            libc::SYS_kill,
+            libc::SYS_clone,
+            libc::SYS_ptrace,
+            libc::SYS_process_vm_writev,
+            libc::SYS_unlinkat,
+            libc::SYS_pidfd_send_signal,
+        ] {
+            assert_eq!(decide(nr, &[]), RET_KILL_PROCESS, "system call {nr}");
+        }
+        const AUDIT_ARCH_I386: u32 = 3 | 0x4000_0000;
+        let foreign = evaluate(&program, AUDIT_ARCH_I386, 3, [0; 6]);
+        assert_eq!(foreign, RET_KILL_PROCESS);
+    }
+
+    #[test]
     fn the_relay_can_only_relay() {
         let filters = relay().unwrap();
         let relay = |nr: i64, args: [u64; 6]| decide_with(&filters, NATIVE, nr, args);
@@ -1789,6 +2221,16 @@ mod tests {
         assert_eq!(relay(libc::SYS_socket, udp), RET_EPERM);
         let user = thread | libc::CLONE_NEWUSER as u64;
         assert_eq!(relay(libc::SYS_clone, args(&[user])), RET_EPERM);
+        // No process: neither fork's flags nor posix_spawn's, also with high bits set.
+        let fork = libc::SIGCHLD as u64;
+        let spawn = (libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD) as u64;
+        for flags in [fork, spawn, (1 << 32) | fork] {
+            assert_eq!(
+                relay(libc::SYS_clone, args(&[flags])),
+                RET_EPERM,
+                "{flags:#x}"
+            );
+        }
         let tiocsti = args(&[0, u64::from(libc::TIOCSTI as u32)]);
         assert_eq!(relay(libc::SYS_ioctl, tiocsti), RET_EPERM);
         // The shared allowlist still decides clone3, so threads fall back to clone.
@@ -1852,7 +2294,8 @@ mod tests {
             assert_eq!(call(&open(), libc::SYS_setpgid, existing_group), RET_ALLOW);
         }
         assert_eq!(call(&isolated(), libc::SYS_setsid, [0; 6]), RET_ALLOW);
-        for command in [libc::TIOCSPGRP, libc::TIOCSWINSZ].map(|c| u64::from(c as u32)) {
+        let terminal = [libc::TIOCSPGRP, libc::TIOCSWINSZ, libc::TIOCSIG];
+        for command in terminal.map(|c| u64::from(c as u32)) {
             for high in [0, HIGH] {
                 let args = args(&[0, high | command]);
                 for config in [isolated(), contained()] {

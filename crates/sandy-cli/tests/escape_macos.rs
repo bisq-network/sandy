@@ -1285,9 +1285,9 @@ fn a_descriptor_path_changes_no_metadata() {
 /// Mach port rights are not descriptors: an exception handler port of the caller's task passes
 /// through `posix_spawn` and `execve` into the program, which could then send a forged exception
 /// message to the caller's crash handler. sandy resets the task's exception ports before it
-/// applies the profile, the crash port that Crashpad's handler takes among them. The caller
-/// keeps the receive right in a process of its own, as a crash reporter does, so the control
-/// shows a live right and not a dead name.
+/// applies the profile, the crash port that Crashpad's handler takes and the corpse notification
+/// port among them. The caller keeps the receive right in a process of its own, as a crash
+/// reporter does, so the control shows a live right and not a dead name.
 #[test]
 fn inherited_mach_exception_ports_are_reset() {
     let fixture = Fixture::new("macos-excports");

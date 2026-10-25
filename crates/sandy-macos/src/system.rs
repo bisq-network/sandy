@@ -232,6 +232,14 @@ pub const BY_ID_SYSCALLS: &[(&str, u32)] = &[
 /// `bsd/kern/syscalls.master`.
 pub const MACHINE_ID_SYSCALLS: &[(&str, u32)] = &[("gethostuuid", 142)];
 
+/// System calls that list every mounted volume and the directory it is mounted on, with no path
+/// the profile could check: getfsstat and its 64-bit inode variant (the one libc calls). The
+/// list names the volumes of the machine, including attached disks under /Volumes, which is
+/// information about the system outside the sandbox that no documented guarantee needs and no
+/// common program reads at startup (measured on macOS 26.5). `statfs` and `fstatfs`, which take
+/// a path that the sandbox checks, are not denied. Numbers from XNU `bsd/kern/syscalls.master`.
+pub const VOLUME_LIST_SYSCALLS: &[(&str, u32)] = &[("getfsstat", 18), ("getfsstat64", 347)];
+
 /// System calls that move a process out of its process group, denied with
 /// `process.children = "contained"`. posix_spawn is denied as a whole: its POSIX_SPAWN_SETSID and
 /// POSIX_SPAWN_SETPGROUP flags change the group inside the kernel, where no profile rule sees

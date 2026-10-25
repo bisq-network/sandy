@@ -962,6 +962,88 @@ fn unix_pair(_kind: &str) -> Option<(fs::File, Stdio)> {
     None
 }
 
+/// Writing the interrupt character into the master side of a pseudo-terminal makes the kernel
+/// send SIGINT to the foreground group of the other side, with no check of who may signal whom.
+/// With `signals = "isolated"` sandy therefore refuses a master on a standard stream; with
+/// `signals = "any"` the program may signal every process of the user anyway. The slave side,
+/// which a program gets when it runs in a terminal, stays accepted.
+#[cfg(unix)]
+#[test]
+fn a_pseudo_terminal_master_on_a_standard_stream_needs_signals_any() {
+    use common::unix::{discard_output, open_pty};
+
+    #[cfg(target_os = "linux")]
+    if common::linux::landlock_abi() < 6 {
+        return skip("landlock-abi-6", "signal isolation needs Landlock ABI 6");
+    }
+    let Some(pty) = open_pty() else {
+        return skip("pty", "no pseudo-terminal available");
+    };
+    // On macOS the victim, which leads the terminal's session, can only exit once the terminal's
+    // output is read.
+    discard_output(&pty);
+    let isolated = ["--signals".to_string(), "isolated".to_string()];
+    let any = ["--signals".to_string(), "any".to_string()];
+    let interrupt = [("type-interrupt", "0")];
+    let master = || Stdio::from(pty.master.try_clone().unwrap());
+
+    let refused = run_with_stdin(&run_args(&isolated, &interrupt), master());
+    assert_refused(
+        &refused,
+        "standard input carries the master side of a pseudo-terminal;",
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("Pass the slave side of the pseudo-terminal or a pipe instead"),
+        "{stderr}"
+    );
+    let refused = Command::new(sandy_path())
+        .args(run_args(&isolated, &[("pid", "-")]))
+        .stdout(master())
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(EXIT_FAILURE), "{refused:?}");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("standard output carries the master side of a pseudo-terminal;"),
+        "{stderr}"
+    );
+
+    let slave = Stdio::from(pty.slave.try_clone().unwrap());
+    let lines = parse(&run_with_stdin(&run_args(&isolated, &interrupt), slave));
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    lines[0].assert_ok();
+
+    // The control: the same write from a program with `signals = "any"` reaches the process
+    // outside the sandbox.
+    let mut victim = await_interrupt(&pty);
+    let lines = parse(&run_with_stdin(&run_args(&any, &interrupt), master()));
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    lines[0].assert_ok();
+    assert_eq!(victim.wait().unwrap().code(), Some(42));
+}
+
+/// A probe outside the sandbox that leads the session of `pty`, so its group is the foreground
+/// group of the terminal, and exits with status 42 when SIGINT arrives within 5 seconds.
+#[cfg(unix)]
+fn await_interrupt(pty: &common::unix::Pty) -> std::process::Child {
+    use std::io::BufRead;
+
+    let mut command = Command::new(probe_path());
+    command
+        .args(probe_args(&[("await-signal", &libc::SIGINT.to_string())]))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    common::unix::with_terminal(pty)(&mut command);
+    let mut victim = command.spawn().unwrap();
+    let mut ready = String::new();
+    std::io::BufReader::new(victim.stderr.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert!(ready.starts_with("await-signal ready"), "{ready:?}");
+    victim
+}
+
 /// Runs sandy with `args` and `stdin` as its standard input.
 fn run_with_stdin(args: &[String], stdin: Stdio) -> Output {
     Command::new(sandy_path())
@@ -979,7 +1061,7 @@ fn assert_refused(output: &Output, reason: &str) {
     assert_eq!(
         output.status.code(),
         Some(EXIT_FAILURE),
-        "sandy did not refuse the socket; it printed {stdout:?} and {stderr:?}"
+        "sandy did not refuse the stream; it printed {stdout:?} and {stderr:?}"
     );
     assert!(stderr.contains(reason), "{stderr}");
     assert!(stdout.is_empty(), "the program must not run: {stdout}");

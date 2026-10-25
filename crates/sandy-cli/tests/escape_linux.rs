@@ -8,9 +8,9 @@ mod common;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::linux::net::SocketAddrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{SocketAddr, UnixListener};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -174,6 +174,43 @@ fn route_netlink_on_standard_input_follows_ip() {
 
 /// A denied family fails with `EAFNOSUPPORT`, as on a kernel that does not have it, so that a
 /// program which probes for a family falls back instead of treating the failure as fatal.
+/// With `ip = "all"`, AF_INET and AF_INET6 sockets get only the usual protocols, because the
+/// kernel loads the module of another one, such as SCTP, when a program asks for a socket of it
+/// (docs/linux.md, "Denylist"). Protocol 253 is set aside for experiments and has no module, so
+/// the control loads nothing: the kernel answers EPROTONOSUPPORT, the filter EAFNOSUPPORT. MPTCP,
+/// which Go listens with, keeps working.
+#[test]
+fn ip_sockets_of_unusual_protocols_are_denied() {
+    let ip = args(&["--ip", "all"]);
+    let socket = |family: i32, protocol: i32| {
+        format!(
+            "{}:{family}:{}:{protocol}",
+            libc::SYS_socket,
+            libc::SOCK_STREAM
+        )
+    };
+    let calls = [
+        socket(libc::AF_INET, 253),
+        socket(libc::AF_INET6, 253),
+        socket(libc::AF_INET, libc::IPPROTO_MPTCP),
+    ];
+    let actions: Vec<(&str, &str)> = calls.iter().map(|c| ("raw-syscall", c.as_str())).collect();
+    let outside = probe_outside(&actions);
+    let inside = probe_inside(&ip, &actions);
+    for index in 0..2 {
+        assert!(
+            outside[index].detail.contains("os error 93)"),
+            "{outside:?}"
+        );
+        assert!(inside[index].detail.contains("os error 97)"), "{inside:?}");
+    }
+    if outside[2].result == "ok" {
+        inside[2].assert_ok();
+    } else {
+        skip("mptcp", &format!("no MPTCP here: {}", outside[2].detail));
+    }
+}
+
 #[test]
 fn denied_socket_families_look_unsupported() {
     let unsupported = "os error 97";
@@ -274,6 +311,90 @@ fn terminal_input_injection_is_denied() {
     // The terminal was opened before the sandbox, so ordinary terminal ioctls still work.
     lines[0].assert_ok();
     assert_eq!(lines[1].result, "denied", "{lines:?}");
+}
+
+/// Exclusive mode makes every later open of a terminal fail with EBUSY for a process without
+/// CAP_SYS_ADMIN, also after the process that set it has ended, so a program that inherited the
+/// user's terminal could keep a pager or a password prompt outside from opening /dev/tty. The
+/// control shows the effect: once the probe outside has set it, this process cannot open the
+/// terminal.
+#[test]
+fn the_terminal_cannot_be_made_exclusive() {
+    let Some(pty) = open_pty() else {
+        return skip("pty", "no pseudo-terminal available");
+    };
+    let path = fs::read_link(format!("/proc/self/fd/{}", pty.slave.as_raw_fd())).unwrap();
+    let open_terminal = || {
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(&path)
+    };
+    let exclusive = format!("{}:0:{}:0", libc::SYS_ioctl, libc::TIOCEXCL);
+    let actions = [("raw-syscall", exclusive.as_str())];
+    let on_the_terminal = |command: &mut Command| {
+        command.stdin(Stdio::from(pty.slave.try_clone().unwrap()));
+    };
+
+    parse(&probe_outside_with(&actions, on_the_terminal))[0].assert_ok();
+    let error = open_terminal().unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::EBUSY), "{error}");
+    // SAFETY: TIOCNXCL takes no argument.
+    let cleared = unsafe { libc::ioctl(pty.slave.as_raw_fd(), libc::TIOCNXCL) };
+    assert_eq!(cleared, 0);
+
+    let lines = probe_inside_with(&[], &actions, on_the_terminal);
+    assert_eq!(lines[0].result, "denied", "{lines:?}");
+    open_terminal().unwrap();
+}
+
+/// PIDFD_GET_INFO tells the parent, the user and group IDs and the cgroup of any process the
+/// program opens a pidfd for, which leaving out `/proc` otherwise hides (docs/linux.md,
+/// "Denylist"). The probe gets a pidfd of this process as its standard input. Without a buffer
+/// the kernel fails the call once it reached the pidfd code, with EINVAL, or with ENOTTY before
+/// Linux 6.13; the filter answers EPERM before that.
+#[test]
+fn process_details_through_a_pidfd_are_denied() {
+    let info = format!("{}:0:{}:0", libc::SYS_ioctl, 0xc040_ff0b_u32);
+    let actions = [("raw-syscall", info.as_str())];
+    let on_a_pidfd = |command: &mut Command| {
+        // SAFETY: pidfd_open takes a process ID and flags and returns a new descriptor.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) };
+        assert!(fd >= 0, "pidfd_open: {}", std::io::Error::last_os_error());
+        // SAFETY: the descriptor was just created and nothing else owns it.
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+        command.stdin(Stdio::from(fd));
+    };
+    let control = parse(&probe_outside_with(&actions, on_a_pidfd));
+    assert_ne!(control[0].result, "denied", "{control:?}");
+    assert!(!control[0].detail.contains("os error 1)"), "{control:?}");
+    let lines = probe_inside_with(&[], &actions, on_a_pidfd);
+    assert_eq!(lines[0].result, "denied", "{lines:?}");
+    assert!(lines[0].detail.contains("os error 1)"), "{lines:?}");
+}
+
+/// The console ioctls that change a virtual console or its keyboard are denied on every
+/// descriptor (docs/linux.md, "Denylist"). No test host gives an unprivileged process a console,
+/// so this asks on standard input, which is `/dev/null` here: outside, the kernel answers ENOTTY;
+/// inside, the filter answers EPERM before the driver sees the call. A call that only reads still
+/// reaches the driver.
+#[test]
+fn console_ioctls_are_denied() {
+    let ioctl = |command: u32| format!("{}:0:{command}:0", libc::SYS_ioctl);
+    // KDSKBSENT, KDSKBENT, KDSKBMODE and VT_ACTIVATE change the console; KDGKBTYPE only reads.
+    let calls = [0x4b49, 0x4b47, 0x4b45, 0x5606, 0x4b33].map(ioctl);
+    let actions: Vec<(&str, &str)> = calls.iter().map(|c| ("raw-syscall", c.as_str())).collect();
+    let not_a_terminal = |line: &ProbeLine| line.detail.contains("os error 25)");
+    for line in probe_outside(&actions) {
+        assert!(not_a_terminal(&line), "{line:?}");
+    }
+    let mut lines = probe_inside(&[], &actions);
+    let read = lines.pop().unwrap();
+    assert!(not_a_terminal(&read), "{read:?}");
+    for line in lines {
+        assert_eq!(line.result, "denied", "{line:?}");
+        assert!(line.detail.contains("os error 1)"), "{line:?}");
+    }
 }
 
 /// A lease or a delegation needs only a read descriptor of a file or directory the user owns.
@@ -558,6 +679,119 @@ fn terminal_resize_cannot_signal_outside() {
     let lines = probe_inside_with(&args(&["--signals", "isolated"]), &resize, on_the_terminal);
     assert_eq!(lines[0].result, "denied", "{lines:?}");
     assert_ne!(victim.wait().unwrap().code(), Some(42));
+}
+
+/// `TIOCSIG` on the master side of a pseudo-terminal sends SIGINT, SIGQUIT or SIGTSTP to the
+/// foreground group of the other side, which the kernel does without the permission check that
+/// the Landlock signal scope hooks. With these signals sandy refuses a master on a standard
+/// stream (`a_pseudo_terminal_master_on_a_standard_stream_needs_signals_any`), so the program
+/// holds one only when it opens one itself, which a grant on `/dev/ptmx` allows. The filter denies
+/// `TIOCSIG` there too, in case a process outside takes the other side as its terminal.
+#[test]
+fn a_pseudo_terminal_master_cannot_signal_outside() {
+    if landlock_abi() < 6 {
+        return skip("landlock-abi-6", "signal isolation needs Landlock ABI 6");
+    }
+    let Some(pty) = open_pty() else {
+        return skip("pty", "no pseudo-terminal available");
+    };
+    let signal = format!("{}:0:{}:{}", libc::SYS_ioctl, libc::TIOCSIG, libc::SIGINT);
+    let actions = [("raw-syscall", signal.as_str())];
+    let on_the_master = |command: &mut Command| {
+        command.stdin(Stdio::from(pty.master.try_clone().unwrap()));
+    };
+    // The victim leads the session of the terminal, so its group is the foreground group.
+    let mut command = Command::new(probe_path());
+    command
+        .args(probe_args(&[("await-signal", &libc::SIGINT.to_string())]))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    with_terminal(&pty)(&mut command);
+    let mut victim = command.spawn().unwrap();
+    let mut ready = String::new();
+    BufReader::new(victim.stderr.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert!(ready.starts_with("await-signal ready"), "{ready:?}");
+    parse(&probe_outside_with(&actions, on_the_master))[0].assert_ok();
+    assert_eq!(victim.wait().unwrap().code(), Some(42));
+
+    // A new pseudo-terminal has no foreground group, so outside the call succeeds and signals
+    // nobody. The grant gives the device ioctl right, so EPERM comes from the filter.
+    let own = [
+        ("open-stdin", "/dev/ptmx"),
+        ("raw-syscall", signal.as_str()),
+    ];
+    for line in probe_outside(&own) {
+        line.assert_ok();
+    }
+    let isolated = args(&["--signals", "isolated", "--read-write", "/dev/ptmx"]);
+    let lines = probe_inside(&isolated, &own);
+    lines[0].assert_ok();
+    assert_eq!(lines[1].result, "denied", "{lines:?}");
+    assert!(lines[1].detail.contains("os error 1)"), "{lines:?}");
+}
+
+/// A master is a descriptor of a ptmx device whichever devpts instance it comes from, as in a
+/// container. The test mounts a devpts instance of its own in a user and a mount namespace and
+/// gives sandy that instance's `ptmx` as standard input.
+#[test]
+fn a_master_of_another_devpts_instance_is_refused() {
+    if landlock_abi() < 6 {
+        return skip("landlock-abi-6", "signal isolation needs Landlock ABI 6");
+    }
+    let fixture = Fixture::new("linux-devpts");
+    let directory = std::ffi::CString::new(fixture.arg("rw")).unwrap();
+    let ptmx = std::ffi::CString::new(fixture.arg("rw/ptmx")).unwrap();
+    let run = |signals: &str| {
+        let mut command = Command::new(sandy_path());
+        command.args(run_args(&args(&["--signals", signals]), &[("pid", "-")]));
+        let (directory, ptmx) = (directory.clone(), ptmx.clone());
+        // SAFETY: unshare, mount, open and dup2 are async-signal-safe, and the paths were
+        // allocated before the fork.
+        unsafe {
+            command.pre_exec(move || {
+                let options = c"newinstance,ptmxmode=0666";
+                if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0
+                    || libc::mount(
+                        c"devpts".as_ptr(),
+                        directory.as_ptr(),
+                        c"devpts".as_ptr(),
+                        0,
+                        options.as_ptr().cast(),
+                    ) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let master = libc::open(ptmx.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+                if master < 0 || libc::dup2(master, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.output()
+    };
+
+    let refused = match run("isolated") {
+        Ok(output) => output,
+        Err(error) => {
+            return skip(
+                "unshare",
+                &format!("no devpts instance in an unprivileged mount namespace: {error}"),
+            );
+        }
+    };
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(EXIT_FAILURE), "{stderr}");
+    assert!(
+        stderr.contains("standard input carries the master side of a pseudo-terminal;"),
+        "{stderr}"
+    );
+    // The control: sandy runs in such a namespace and accepts the master with `signals = "any"`.
+    let output = run("any").unwrap();
+    assert!(output.status.success(), "{output:?}");
+    parse(&output)[0].assert_ok();
 }
 
 /// Before Landlock ABI 3 the kernel cannot check truncation, so sandy's filter denies
@@ -1378,6 +1612,54 @@ fn common_programs_run_under_the_default_policy() {
 /// A writable path that overlaps the minimal system set would let the program change code or
 /// configuration that other programs trust, here /etc/ld.so.cache, /etc/ld.so.preload (also when
 /// it does not exist) and /etc/hosts. sandy refuses before the program starts.
+/// Records what `cp -a` does under each setting of `path_metadata` (docs/linux.md, "Metadata"):
+/// a file keeps its mode and times under "deny" too, because cp sets them through the
+/// descriptor it wrote, while a directory fails there, because cp sets the times of a directory
+/// by path. With "allow" both work.
+#[test]
+fn cp_a_copies_a_file_under_deny_and_a_directory_only_under_allow() {
+    let Ok(cp) = Path::new("/usr/bin/cp").canonicalize() else {
+        return skip("common-programs", "/usr/bin/cp is not installed");
+    };
+    let fixture = Fixture::new("linux-cp-a");
+    let source = fixture.path("rw/source");
+    fs::create_dir_all(source.join("inner")).unwrap();
+    fs::write(source.join("inner/file"), b"data").unwrap();
+    let file = fixture.path("rw/file");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+    // A time far from the copy's, so that a copy that does not keep it shows.
+    let past = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+    fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
+    let copy = |setting: &str, from: &Path, to: &str| {
+        let mut run = args(&["run", "--read-write", &fixture.arg("rw")]);
+        run.extend(args(&["--read-exec", cp.to_str().unwrap()]));
+        run.extend(args(&["--linux-path-metadata", setting, "--"]));
+        run.extend(args(&[cp.to_str().unwrap(), "-a"]));
+        run.extend([from.display().to_string(), fixture.arg(to)]);
+        sandy(&run)
+    };
+    for setting in ["deny", "allow"] {
+        let target = format!("rw/file-{setting}");
+        let output = copy(setting, &file, &target);
+        assert!(output.status.success(), "{setting}: {output:?}");
+        let (original, copied) = (
+            fs::metadata(&file).unwrap(),
+            fs::metadata(fixture.path(&target)).unwrap(),
+        );
+        assert_eq!(copied.mode() & 0o777, 0o640, "{setting}");
+        assert_eq!(copied.mtime(), original.mtime(), "{setting}");
+    }
+    let denied = copy("deny", &source, "rw/tree-deny");
+    assert!(!denied.status.success(), "{denied:?}");
+    let allowed = copy("allow", &source, "rw/tree-allow");
+    assert!(allowed.status.success(), "{allowed:?}");
+}
+
 #[test]
 fn a_writable_path_over_the_system_set_is_refused() {
     let output = sandy(run_args(

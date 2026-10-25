@@ -10,29 +10,14 @@ use sandy_core::streams::{Family, Kind, Socket, StandardStream};
 pub fn socket_on(stream: StandardStream) -> Result<Option<Socket>, String> {
     use std::io;
     use std::mem::{MaybeUninit, size_of};
-    use std::os::fd::RawFd;
 
-    let fd: RawFd = match stream {
-        StandardStream::Input => 0,
-        StandardStream::Output => 1,
-        StandardStream::Error => 2,
-    };
+    let fd = descriptor(stream);
     let failed = |call: &str, error: io::Error| format!("cannot read {stream}: {call}: {error}");
 
-    let mut status = MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: fstat only fills the structure.
-    if unsafe { libc::fstat(fd, status.as_mut_ptr()) } != 0 {
-        let error = io::Error::last_os_error();
-        // A stream the caller closed stays closed for the program, which can open nothing with
-        // the descriptor it leaves free: Landlock and the Seatbelt profile decide every open.
-        return match error.raw_os_error() {
-            Some(libc::EBADF) => Ok(None),
-            _ => Err(failed("fstat", error)),
-        };
-    }
-    // SAFETY: fstat filled the structure.
-    let mode = unsafe { status.assume_init() }.st_mode;
-    if mode & libc::S_IFMT != libc::S_IFSOCK {
+    let Some(status) = status(stream)? else {
+        return Ok(None);
+    };
+    if status.st_mode & libc::S_IFMT != libc::S_IFSOCK {
         return Ok(None);
     }
 
@@ -96,6 +81,76 @@ pub fn socket_on(stream: StandardStream) -> Result<Option<Socket>, String> {
         connected,
         listening,
     }))
+}
+
+/// Whether `stream` carries the master side of a pseudo-terminal. A closed stream does not. The
+/// device numbers are fixed (the kernel's `devices.txt`): every Unix98 master is open on a ptmx
+/// device, 5:2, whether `/dev/ptmx` or the `ptmx` of any devpts instance, and the legacy BSD
+/// masters (`CONFIG_LEGACY_PTYS`) have major 2. An ioctl that only a master answers would reach
+/// the driver of whatever device the caller passed.
+#[cfg(target_os = "linux")]
+pub fn terminal_master_on(stream: StandardStream) -> Result<bool, String> {
+    const PTMX: (libc::c_uint, libc::c_uint) = (5, 2);
+    const BSD_MASTER_MAJOR: libc::c_uint = 2;
+
+    let Some(status) = status(stream)? else {
+        return Ok(false);
+    };
+    if status.st_mode & libc::S_IFMT != libc::S_IFCHR {
+        return Ok(false);
+    }
+    let device = (libc::major(status.st_rdev), libc::minor(status.st_rdev));
+    Ok(device == PTMX || device.0 == BSD_MASTER_MAJOR)
+}
+
+/// Whether `stream` carries the master side of a pseudo-terminal. A closed stream does not. The
+/// kernel numbers its drivers as it starts them, so this compares with `/dev/ptmx`: every master
+/// is a clone of it and has its major number, and the slaves `/dev/ttys*` have another. The
+/// legacy BSD masters `/dev/pty*` cannot be opened by an ordinary user (EAGAIN, measured on
+/// macOS 26.5).
+#[cfg(target_os = "macos")]
+pub fn terminal_master_on(stream: StandardStream) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(status) = status(stream)? else {
+        return Ok(false);
+    };
+    if status.st_mode & libc::S_IFMT != libc::S_IFCHR {
+        return Ok(false);
+    }
+    let ptmx = std::fs::metadata("/dev/ptmx")
+        .map_err(|error| format!("cannot read {stream}: /dev/ptmx: {error}"))?;
+    Ok(libc::major(status.st_rdev) == libc::major(ptmx.rdev() as libc::dev_t))
+}
+
+/// The descriptor of `stream`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn descriptor(stream: StandardStream) -> std::os::fd::RawFd {
+    match stream {
+        StandardStream::Input => 0,
+        StandardStream::Output => 1,
+        StandardStream::Error => 2,
+    }
+}
+
+/// The status of the descriptor of `stream`, or `None` when the caller closed it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn status(stream: StandardStream) -> Result<Option<libc::stat>, String> {
+    use std::mem::MaybeUninit;
+
+    let mut status = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat only fills the structure.
+    if unsafe { libc::fstat(descriptor(stream), status.as_mut_ptr()) } != 0 {
+        let error = std::io::Error::last_os_error();
+        // A stream the caller closed stays closed for the program, which can open nothing with
+        // the descriptor it leaves free: Landlock and the Seatbelt profile decide every open.
+        return match error.raw_os_error() {
+            Some(libc::EBADF) => Ok(None),
+            _ => Err(format!("cannot read {stream}: fstat: {error}")),
+        };
+    }
+    // SAFETY: fstat filled the structure.
+    Ok(Some(unsafe { status.assume_init() }))
 }
 
 /// The names of the families a message is likely to name: those the platform docs list as
@@ -339,4 +394,11 @@ fn start_winsock() -> Result<(), String> {
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn socket_on(_stream: StandardStream) -> Result<Option<Socket>, String> {
     Ok(None)
+}
+
+/// Windows has no pseudo-terminal device, and the other platforms have no backend that runs a
+/// program.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn terminal_master_on(_stream: StandardStream) -> Result<bool, String> {
+    Ok(false)
 }

@@ -222,11 +222,11 @@ fn process_rules(writer: &mut Writer, signals: SignalScope, children: ChildProce
         SignalScope::Isolated => {
             writer.line("(allow signal (target self) (target same-sandbox))");
             writer.comment(
-                "F_SETOWN makes the kernel send SIGIO to any process of this user when a socket\n\
-                 or pipe becomes ready, and that send has no check behind it that `signal`\n\
-                 covers. A profile cannot filter the owner, so the command is denied. The\n\
-                 ioctls FIOSETOWN, SIOCSPGRP and TIOCSPGRP set the same owner on sockets and\n\
-                 pipes, and no operation reaches them.",
+                "F_SETOWN makes the kernel send SIGIO to any process, of this or another user,\n\
+                 when a socket or pipe becomes ready, and the kernel sends it with no owner\n\
+                 check that `signal` covers. A profile cannot filter the owner, so the command\n\
+                 is denied. The ioctls FIOSETOWN, SIOCSPGRP and TIOCSPGRP set the same owner on\n\
+                 sockets and pipes, and no operation reaches them.",
             );
             writer.line(&format!(
                 "(deny system-fcntl (fcntl-command {}))",
@@ -432,6 +432,17 @@ fn hardening_rules(writer: &mut Writer) {
         .collect();
     writer.rule("deny", &["syscall-unix"], &filters);
 
+    writer.comment(
+        "The list of every mounted volume reaches no file operation either, so the rules above\n\
+         cannot stop it: getfsstat, getfsstat64. It names the disks of the system, including\n\
+         any attached external disks.",
+    );
+    let filters: Vec<String> = system::VOLUME_LIST_SYSCALLS
+        .iter()
+        .map(|(_, number)| format!("(syscall-number {number})"))
+        .collect();
+    writer.rule("deny", &["syscall-unix"], &filters);
+
     writer.comment("TIOCSTI would type commands into the terminal of the caller.");
     writer.line(&format!(
         "(deny file-ioctl (ioctl-command {}))",
@@ -530,11 +541,11 @@ mod tests {
 (allow process-info* (target self))
 (allow signal (target self) (target same-sandbox))
 
-; F_SETOWN makes the kernel send SIGIO to any process of this user when a socket
-; or pipe becomes ready, and that send has no check behind it that `signal`
-; covers. A profile cannot filter the owner, so the command is denied. The
-; ioctls FIOSETOWN, SIOCSPGRP and TIOCSPGRP set the same owner on sockets and
-; pipes, and no operation reaches them.
+; F_SETOWN makes the kernel send SIGIO to any process, of this or another user,
+; when a socket or pipe becomes ready, and the kernel sends it with no owner
+; check that `signal` covers. A profile cannot filter the owner, so the command
+; is denied. The ioctls FIOSETOWN, SIOCSPGRP and TIOCSPGRP set the same owner on
+; sockets and pipes, and no operation reaches them.
 (deny system-fcntl (fcntl-command 6))
 
 ; ioctls on open files and devices: only the two that fcntl(F_SETFL) issues and two that
@@ -591,6 +602,13 @@ mod tests {
 ; The hardware UUID, which the denial of IOKit properties already hides: gethostuuid.
 (deny syscall-unix
   (syscall-number 142))
+
+; The list of every mounted volume reaches no file operation either, so the rules above
+; cannot stop it: getfsstat, getfsstat64. It names the disks of the system, including
+; any attached external disks.
+(deny syscall-unix
+  (syscall-number 18)
+  (syscall-number 347))
 
 ; TIOCSTI would type commands into the terminal of the caller.
 (deny file-ioctl (ioctl-command 2147578994))

@@ -455,13 +455,15 @@ mod tests {
     use std::fs::File;
     use std::net::TcpStream;
 
-    const OUTCOMES: [&str; 6] = [
+    const OUTCOMES: [&str; 8] = [
         "ok",
         "confine failed",
         "the target was unreachable",
         "another port was reachable",
         "a file could be opened",
         "a new socket could be bound",
+        "a process could be started",
+        "no thread could be started",
     ];
 
     /// What a compromised relay would try after `confine`. Returns an index into `OUTCOMES`.
@@ -481,6 +483,21 @@ mod tests {
         }
         if TcpListener::bind("127.0.0.1:0").is_ok() {
             return 5;
+        }
+        // clone with fork's flags; the other arguments are zero on x86_64 and arm64 alike.
+        // SAFETY: a child that clone creates leaves through `_exit` at once.
+        let child = unsafe { libc::syscall(libc::SYS_clone, libc::SIGCHLD, 0, 0, 0, 0) };
+        if child == 0 {
+            // SAFETY: ends the child without running anything of the parent's.
+            unsafe { libc::_exit(0) };
+        }
+        if child > 0 {
+            // SAFETY: reaps the child created above.
+            unsafe { libc::waitpid(child as libc::pid_t, std::ptr::null_mut(), 0) };
+            return 6;
+        }
+        if std::thread::spawn(|| ()).join().is_err() {
+            return 7;
         }
         0
     }

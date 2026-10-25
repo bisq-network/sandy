@@ -153,6 +153,8 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
         "grant-all-packages" => windows_actions::grant_all_packages(target),
         "open-process-right" => windows_actions::open_process_right(target),
         "open-thread-right" => windows_actions::open_thread_right(target),
+        "junction" => windows_actions::junction(target),
+        "symbolic-link" => windows_actions::symbolic_link(target),
         // Connects to the AF_UNIX socket whose path the file `target` holds; the test writes the
         // path there while the program runs.
         "afunix-connect-file" => {
@@ -629,6 +631,7 @@ mod linux {
         "current-exe",
         "openat2-read",
         "landlock-ioctl-only",
+        "open-stdin",
     ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
@@ -656,6 +659,20 @@ mod linux {
             "enable-verity" => enable_verity(target),
             "open" => fs::File::open(target).map(|_| String::new()),
             "open-ioctl-only" => open_ioctl_only(target),
+            // Opens `target` for reading and writing in place of standard input, so that the
+            // actions that take descriptor 0 act on it.
+            "open-stdin" => {
+                use std::os::fd::AsRawFd;
+                use std::os::unix::fs::OpenOptionsExt;
+
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_NOCTTY)
+                    .open(target)?;
+                // SAFETY: dup2 takes two descriptors; the file stays open until it returns.
+                check(unsafe { libc::dup2(file.as_raw_fd(), 0) }).map(|_| String::new())
+            }
             "openat2-read" => openat2_read(target),
             "landlock-ioctl-only" => landlock_ioctl_only(target),
             "fchmod-readonly" => fchmod_readonly(target),
@@ -2562,6 +2579,84 @@ mod windows_actions {
             _ => Err(io::Error::other(detail)),
         }
     }
+
+    /// Makes the new directory `LINK` a junction (mount point) to the existing directory
+    /// `TARGET`. Target: `TARGET U+001F LINK`, the order of `hardlink`. An AppContainer process
+    /// outside its writable paths is refused this, which is why the escape test can plant one
+    /// only outside the sandbox.
+    pub fn junction(target: &str) -> io::Result<String> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+        };
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+        /// `FSCTL_SET_REPARSE_POINT` and `IO_REPARSE_TAG_MOUNT_POINT`.
+        const SET_REPARSE_POINT: u32 = 0x0009_00A4;
+        const MOUNT_POINT: u32 = 0xA000_0003;
+
+        let (existing, link) = super::pair(target)?;
+        fs::create_dir(link)?;
+        let result = (|| {
+            let directory = fs::OpenOptions::new()
+                .access_mode(FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(link)?;
+            // An NT substitute name: `\??\C:\path`, so strip a `\\?\` verbatim prefix first.
+            let plain = existing.strip_prefix(r"\\?\").unwrap_or(existing);
+            let substitute: Vec<u16> = format!(r"\??\{plain}").encode_utf16().collect();
+            let print: Vec<u16> = plain.encode_utf16().collect();
+            let mut names = substitute.clone();
+            names.push(0);
+            names.extend(&print);
+            names.push(0);
+            let mut buffer: Vec<u8> = Vec::new();
+            buffer.extend(MOUNT_POINT.to_le_bytes());
+            buffer.extend((8 + 2 * names.len() as u16).to_le_bytes());
+            buffer.extend(0u16.to_le_bytes());
+            buffer.extend(0u16.to_le_bytes());
+            buffer.extend((2 * substitute.len() as u16).to_le_bytes());
+            buffer.extend((2 * substitute.len() as u16 + 2).to_le_bytes());
+            buffer.extend((2 * print.len() as u16).to_le_bytes());
+            for unit in names {
+                buffer.extend(unit.to_le_bytes());
+            }
+            let mut returned = 0u32;
+            // SAFETY: the handle is open; the buffer holds a mount point reparse buffer of the
+            // length passed; there is no output buffer.
+            let ok = unsafe {
+                DeviceIoControl(
+                    std::os::windows::io::AsRawHandle::as_raw_handle(&directory),
+                    SET_REPARSE_POINT,
+                    buffer.as_ptr().cast(),
+                    buffer.len() as u32,
+                    ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(String::new())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir(link);
+        }
+        result
+    }
+
+    /// A symbolic link `LINK` to `TARGET`, a directory link when `TARGET` is a directory.
+    /// Target: `TARGET U+001F LINK`. Creating one needs `SeCreateSymbolicLinkPrivilege`, which
+    /// the AppContainer token never holds, so this always fails inside the sandbox.
+    pub fn symbolic_link(target: &str) -> io::Result<String> {
+        let (existing, link) = super::pair(target)?;
+        if std::path::Path::new(existing).is_dir() {
+            std::os::windows::fs::symlink_dir(existing, link)?;
+        } else {
+            std::os::windows::fs::symlink_file(existing, link)?;
+        }
+        Ok(String::new())
+    }
 }
 
 #[cfg(not(windows))]
@@ -2625,6 +2720,14 @@ mod windows_actions {
     }
 
     pub fn open_thread_right(_target: &str) -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn junction(_target: &str) -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn symbolic_link(_target: &str) -> io::Result<String> {
         unsupported()
     }
 }
@@ -3175,9 +3278,9 @@ mod macos {
 
     /// Every machine-independent exception, the value of `EXC_MASK_ALL` in
     /// `<mach/exception_types.h>` (measured on macOS 26.5), plus `EXC_MASK_CRASH` (0x400), which
-    /// is not part of it and which Crashpad's handler takes. `EXC_MASK_CORPSE_NOTIFY` (0x2000) is
-    /// left out.
-    const EXC_MASK_HANDLED: u32 = 0x1bfe | 0x400;
+    /// is not part of it and which Crashpad's handler takes, and `EXC_MASK_CORPSE_NOTIFY`
+    /// (0x2000), whose handler gets the task of a crashed program.
+    const EXC_MASK_HANDLED: u32 = 0x1bfe | 0x400 | 0x2000;
     const EXCEPTION_DEFAULT: u32 = 1;
     const THREAD_STATE_NONE: i32 = 0;
     const MACH_PORT_RIGHT_RECEIVE: u32 = 1;
@@ -3872,6 +3975,7 @@ mod unix {
         "start-orphaned",
         "fork-walk",
         "await-signal",
+        "type-interrupt",
     ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
@@ -3915,6 +4019,13 @@ mod unix {
             }
             "start-forked" => start_forked(target),
             "start-orphaned" => start_orphaned(target),
+            // Writes the interrupt character, Ctrl+C, to descriptor `target`. Into the master side
+            // of a pseudo-terminal, that is a user typing it.
+            "type-interrupt" => {
+                // SAFETY: write reads one byte from the buffer.
+                let written = unsafe { libc::write(number(target)?, [3u8].as_ptr().cast(), 1) };
+                check(written as libc::c_int).map(|_| String::new())
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "unknown action",

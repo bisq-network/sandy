@@ -192,10 +192,12 @@ fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
         };
         shortfalls.push(format!(
             "signals = \"isolated\" is enforced only in part on macOS: the program can still \
-             have the kernel send {signals} to a process outside the sandbox, by making that \
-             process the owner of a socket or a pipe with an ioctl (FIOSETOWN, SIOCSPGRP, \
-             TIOCSPGRP) that no profile rule reaches; a process that does not handle the signal \
-             discards it (docs/macos.md, \"Signals the profile does not cover\")"
+             have the kernel send {signals} to a process outside the sandbox, including one of \
+             another user, by making that process the owner of a socket or a pipe with an ioctl \
+             (FIOSETOWN, SIOCSPGRP, TIOCSPGRP) that no profile rule reaches; the macOS kernel \
+             sends it with no owner check, so this is outside sandy's reach, and a process that \
+             does not handle the signal discards it (docs/macos.md, \"Signals the profile does \
+             not cover\")"
         ));
         if !contained {
             shortfalls.push(

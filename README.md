@@ -411,7 +411,7 @@ it.
 |---|---|
 | the program's status | `sandy run` started the program |
 | 128 + signal number | Linux and macOS with `children = "contained"`, and Linux with `--explain`: a signal ended the program |
-| 125 | sandy failed or refused: invalid policy, a requirement this host cannot enforce, a socket on a standard stream that the policy denies, a setup error; with `children = "contained"` or `--explain` also a failure while sandy supervises the program |
+| 125 | sandy failed or refused: invalid policy, a requirement this host cannot enforce, a socket on a standard stream that the policy denies, a pseudo-terminal master on one with `signals = "isolated"`, a setup error; with `children = "contained"` or `--explain` also a failure while sandy supervises the program |
 | 0 / 1 | `sandy check`: the policy is enforceable / not enforceable |
 
 On Windows the program's 32-bit exit code is passed through unchanged.
@@ -552,18 +552,18 @@ are errors, so a misspelled key never becomes a silent default.
   for programs you would also run without a sandbox.
 - A socket on standard input, output or error keeps the access it was created with: it exists
   before the sandbox, and no sandbox can take rights from what is already open. sandy therefore
-  accepts such a socket only when the policy lets the program create one like it, and else
-  refuses to start the program, with status 125 and the stream and the socket named. It refuses
-  an IP socket under `ip = "none"`, an unconnected, datagram or listening Unix socket under
-  `unix_sockets = "none"`, and under every policy a raw IP socket, which only a privileged
-  process can create, and a socket of any other family, for example a netlink socket that lists
-  the sockets of the host. An ICMP datagram socket counts as an IP socket, because an
-  unprivileged program can create one where the system allows it. On Linux `ip = "all"` also
-  accepts a route netlink socket, which the program may create. A connected Unix stream or seqpacket
-  socket is accepted: that is how a parent passes a pipe. A service that is handed its
-  connection on standard input (inetd-style, systemd `Accept=yes`) needs `ip = "all"`.
-  `sandy check` cannot report this, because its own streams are not the streams of the later
-  `run`.
+  accepts such a socket only when the policy lets the program create one like it, and else refuses
+  to start the program, with status 125 and the stream and the socket named. It refuses an IP
+  socket under `ip = "none"`, an unconnected, datagram or listening Unix socket under
+  `unix_sockets = "none"`, and under every policy a raw IP socket, which only a privileged process
+  can create, an IP socket of a protocol other than TCP, UDP, ICMP and MPTCP (SCTP, for example),
+  and a socket of any other family, for example a netlink socket that lists the sockets of the
+  host. An ICMP datagram socket counts as an IP socket, because an unprivileged program can create
+  one where the system allows it. On Linux `ip = "all"` also accepts a route netlink socket, which
+  the program may create. A connected Unix stream or seqpacket socket is accepted: that is how a
+  parent passes a pipe. A service that is handed its connection on standard input (inetd-style,
+  systemd `Accept=yes`) needs `ip = "all"`. `sandy check` cannot report this, because its own
+  streams are not the streams of the later `run`.
 - `expose` entries: `listen` must be a loopback address, must differ from the program's own
   address, and may appear only once. They need `ip = "all"` in this version. At most 256
   connections per port are relayed at the same time. A connection that is still open when the
@@ -578,9 +578,10 @@ are errors, so a misspelled key never becomes a silent default.
 - `forward` entries: on Linux the relay closes a connection whose other end the kernel names as
   another local user's, so it never reaches the service. A socket its process has closed has no
   owner for the kernel to name, and such a connection is served, because it is the program's
-  own in any ordinary run. Another local user can therefore still deliver a blind write, usually
-  on the first attempt, by writing and closing at once, but never read the answer
-  (docs/linux.md). On macOS every connection is served. Forward only to services that
+  own in any ordinary run, unless the kernel still names another user for it, as Linux 6.17 and
+  newer do for a moment. Another local user can therefore still deliver a blind write, on
+  Linux 6.8 usually on the first attempt, by writing and closing at once, but never read the
+  answer (docs/linux.md). On macOS every connection is served. Forward only to services that
   authenticate their clients.
 - A dead relay frees the program's forward port, and any local user can then bind it and
   receive what the program sends there. With `children = "contained"` on Linux and macOS, sandy
@@ -596,15 +597,19 @@ are errors, so a misspelled key never becomes a silent default.
   Landlock ABI 6 (kernel 6.12 or newer); older kernels refuse such a policy. The kernel also
   signals whole process groups for terminal job control, without that check, so on Linux the
   program can then neither join another job's process group nor take the terminal from the
-  foreground job nor resize it. A shell inside the sandbox therefore has no job control. The
+  foreground job nor resize it, nor signal the other side of a pseudo-terminal with `TIOCSIG`.
+  A shell inside the sandbox therefore has no job control. On Linux and macOS, sandy also
+  refuses to start a program that gets the master side of a pseudo-terminal on a standard
+  stream: typing Ctrl+C into a master signals the processes on the other side. The
   program's reads from the terminal still stop the job that sandy runs in, including processes
   of that job outside the sandbox, as they would without a sandbox. On macOS a profile cannot
   filter the arguments of `setpgid`, so the program can still join
   another job's process group of its terminal session and have the kernel stop that job; taking
   the terminal and resizing it are denied there in every mode, and `children = "contained"`
   closes the rest. A program on macOS can also still have the kernel send SIGIO to a process
-  outside the sandbox, through an ioctl on a socket or a pipe; a process that does not handle
-  SIGIO ignores it (see [docs/macos.md](docs/macos.md)).
+  outside the sandbox, including one of another user, through an ioctl on a socket or a pipe; the
+  macOS kernel sends it with no owner check, so this is outside sandy's reach, and a process that
+  does not handle SIGIO ignores it (see [docs/macos.md](docs/macos.md)).
 - `children` decides whether the program may start processes:
   - `allowed` (the default): yes. On Linux and macOS these processes can outlive the program; on
     Windows they end with it.
@@ -662,12 +667,14 @@ are errors, so a misspelled key never becomes a silent default.
 
 Landlock does not control `chmod`, `chown`, `utimensat` and `setxattr`. With the default
 `path_metadata = "deny"`, sandy denies these calls when they take a path, everywhere, also inside
-writable paths. The calls on an open file (`fchmod`, `futimens`, `fsetxattr`) keep working, also
-on a file the program may only read. The file system ioctls that change a file the same way, and
-fs-verity, fscrypt and btrfs subvolume ioctls, are denied under every policy. Tools that change
-metadata by path (`install`, `cp -a`, `rsync -a`, `unzip`, `git`) need `"allow"`; then the
-program can change the metadata of every file the user owns. `cp -p` works under `"deny"`,
-because it sets the metadata through the descriptor it wrote.
+writable paths, and the owner and extended attribute calls on an open file (`fchown`, `fsetxattr`)
+too. The mode and time calls on an open file (`fchmod`, `futimens`) keep working, also on a file
+the program may only read. The file system ioctls that change a file the same way, and fs-verity,
+fscrypt, deduplication and btrfs subvolume ioctls, are denied under every policy. Tools that change
+metadata by path (`install`, `cp -a` on a directory, `rsync -a`, `unzip`, `git`) need `"allow"`;
+then the program can change the metadata of every file the user owns. `cp -p`, and `cp -a` on a
+single file, work under `"deny"`, because they set the metadata through the descriptor they
+wrote.
 
 ## Platform notes
 
@@ -712,6 +719,9 @@ because it sets the metadata through the descriptor it wrote.
   loader and the system library cache. sandy refuses it there unless a policy path covers "/".
 - No Mach services are reachable from the sandbox, so programs that need them (for example to open
   other apps, use the pasteboard or read preferences) do not work.
+- The system writes the crash report of a program that sandy runs to
+  `/Library/Logs/DiagnosticReports`, which administrators can read and standard users cannot,
+  instead of the user's `~/Library/Logs/DiagnosticReports`.
 - Terminal programs that change terminal modes fail; only a few terminal requests are allowed.
 - With `children = "contained"`, the program cannot use `posix_spawn` (see
   [Processes](#processes)).
@@ -777,7 +787,10 @@ Recommendations:
 7. **Give the program pipes, files or a terminal on its standard streams.** sandy passes
    descriptors 0, 1 and 2 on as it got them, so a socket among them would keep its access; sandy
    refuses to start the program then. The connected Unix stream socket that most runtimes pass
-   for a pipe (libuv, and so Node.js) is accepted.
+   for a pipe (libuv, and so Node.js) is accepted. With `signals = "isolated"` sandy also refuses
+   the master side of a pseudo-terminal, which a terminal emulator or `expect` holds, because
+   the program could type Ctrl+C into it and so signal the processes on the other side. Pass
+   the slave side, the terminal a program normally runs in, or a pipe.
 
 ## Security model
 

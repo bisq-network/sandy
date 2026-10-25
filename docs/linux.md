@@ -73,13 +73,13 @@ can write, so the rule then reaches nothing that this process could not reach al
 |---|---|
 | FilesystemConfined | Landlock with every file system right of the ABI handled. The seccomp filter denies opening a file with access mode 3 and `openat2` (see "Access mode 3"). Before ABI 3 it also denies `truncate` for every path and `O_TRUNC` on a read-only open. |
 | NoPrivilegeEscalation | no_new_privs. The filters deny namespaces, mounts, `bpf`, `perf_event_open`, io_uring, keyrings, `userfaultfd`, calls that need capabilities, setuid and setgid mode bits, unknown system calls and other CPU architectures. sandy refuses to run as root or with capabilities. |
-| ProcessMemoryIsolated | Landlock: a domain cannot ptrace, open `/proc/<pid>/mem` or `environ`, or use `process_vm_readv` on processes outside it (all ABIs). The denylist also denies `ptrace`, `process_vm_readv`, `process_vm_writev`, `pidfd_getfd`, `kcmp`, `process_madvise`, System V IPC and POSIX message queues, and changes of the limits, priority and CPU affinity of other processes. |
+| ProcessMemoryIsolated | Landlock: a domain cannot ptrace, open `/proc/<pid>/mem` or `environ`, or use `process_vm_readv` on processes outside it (all ABIs). The denylist also denies `ptrace`, `process_vm_readv`, `process_vm_writev`, `pidfd_getfd`, `kcmp`, `process_madvise`, `MADV_MERGEABLE`, System V IPC and POSIX message queues, and changes of the limits, priority and CPU affinity of other processes. |
 | InheritedHandlesClosed | Close-on-exec on every descriptor above 2. |
 | EnvironmentControlled | `execve` with exactly the policy environment. The backend adds no variables. |
 | IpNetworkDenied | The socket family allowlist has no `AF_INET`, `AF_INET6` or `AF_NETLINK`; io_uring is denied. From ABI 4, Landlock also denies TCP bind and connect. |
 | UnixSocketsDenied | The allowlist has no `AF_UNIX`, and socket pairs are limited to stream and seqpacket. From ABI 6, Landlock scopes abstract sockets; from ABI 9 it denies connections to pathname sockets. |
-| SignalsIsolated | Landlock signal scope (ABI 6) and the denylist, which denies `setpgid` into a process group that exists and the terminal ioctls `TIOCSPGRP` and `TIOCSWINSZ` (see "Signals and the terminal"). Unavailable on older ABIs. |
-| MetadataConfined | The denylist denies the metadata calls that take a path (see "Metadata"). |
+| SignalsIsolated | Landlock signal scope (ABI 6) and the denylist, which denies `setpgid` into a process group that exists and the terminal ioctls `TIOCSPGRP`, `TIOCSWINSZ` and `TIOCSIG` (see "Signals and the terminal"). Unavailable on older ABIs. |
+| MetadataConfined | The denylist denies the metadata calls that take a path, and `fchown`, `fsetxattr` and `fremovexattr` on a descriptor (see "Metadata"). |
 | ChildProcessesDenied | The denylist denies `fork`, `vfork` and `clone` without `CLONE_THREAD`; `clone3` fails with `ENOSYS` (see "Child processes"). |
 | ChildProcessesContained | sandy stays the parent and ends the program's process group; the denylist denies `setsid` and `setpgid` (see "Contained child processes"). |
 | EndsWithParent | A watcher process outside the sandbox ends the program when sandy's parent ends (see "Ending with the parent"). |
@@ -111,9 +111,10 @@ One relay process serves all pairs. sandy starts it before it confines itself:
      the target ports of the pairs (Landlock TCP rules match the port, not the address); from
      ABI 6 the signal and abstract socket scopes;
    - the shared allowlist filter and a relay filter that allows only TCP sockets, `accept`,
-     `connect`, reading and writing, polling, memory calls, thread creation without namespace
-     flags, `timer_settime` for the watchdog below, `rt_sigtimedwait` and `FIONBIO`. Every other
-     call fails with `EPERM`; `clone3` fails with `ENOSYS`.
+     `connect`, reading and writing, polling, memory calls, `clone` for threads only (with
+     `CLONE_THREAD` and without namespace flags, because the relay never starts a process),
+     `timer_settime` for the watchdog below, `rt_sigtimedwait` and `FIONBIO`. Every other call
+     fails with `EPERM`; `clone3` fails with `ENOSYS`.
 4. The relay starts and joins one test thread (so a filter that blocks threads fails here) and
    reports "ready" over the pipe. sandy reads the report and continues only on success. Any
    failure of the relay is reported back, and sandy refuses to run. The relay then polls the
@@ -213,13 +214,16 @@ name the same connection. Every failure closes the connection, and sandy checks 
 connection of its own before it starts the relay, so a kernel without `inet_diag` refuses the
 run instead of refusing every connection later.
 
-One answer names nobody, and this is the residual of the check. The owner the kernel reports
-comes from the socket's file, so closing the socket takes it away: from the close onwards the
-answer carries no inode, which is how the kernel says it has no owner to give. The user in such
-an answer cannot be read instead, because kernels differ on it. Up to 6.8 the answer reports
-user 0 from the close; 6.17 and later keep the user until the kernel replaces the socket with a
-timewait record a few milliseconds afterwards. The relay therefore reads the inode, which says
-the same thing on every kernel, and serves a connection that no owner can be found for.
+One answer names nobody, and this is the residual of the check. The owner the kernel reports comes
+from the socket's file, so closing the socket takes it away: from the close onwards the answer
+carries no inode, which is how the kernel says it has no owner to give. The user in such an answer
+cannot be read instead, because kernels differ on it. Up to 6.8 the answer reports user 0 from the
+close; 6.17 and later keep the user until the kernel replaces the socket with a timewait record,
+which reports user 0: about a millisecond after the close, and about 40 milliseconds when the peer
+wrote before it closed (measured on 6.8, 6.17 and 7.2). The relay therefore reads the inode, which
+says the same thing on every kernel, and serves a connection that no owner can be found for. A user
+that such an answer still carries counts, though: user 0 says nothing and sandy's own user is the
+program's, but any other user is the closed socket of someone else, and the relay refuses it.
 
 It has to. The kernel completes a handshake by itself, so a program that connects and exits is
 always ahead of the relay's accept, and the relay cannot be made to win that race. Refusing
@@ -240,19 +244,25 @@ there this is the difference between a forwarded port that mostly works and one 
 does not. Dropping the program's own connection is the one thing a forwarded port must not do,
 and version 1.3.2 had no check at all, so refusing them was a reliability regression against it.
 
-What this leaves open: another local user can deliver a blind write to the service, usually on the
-first attempt. A peer that connects, writes and closes at once is usually closed before the relay
-asks, as most connections of a program that connects and exits were in the measurement above. It
-cannot read what comes back. Losing the file is what loses the owner, and it also gives up the
-answer, so the service cannot be used interactively, read from, or probed for a reply. A peer that
-only shuts down its sending side keeps its socket and its file, so it keeps its owner and is
+What this leaves open: another local user can deliver a blind write to the service when its closed
+socket no longer carries its user. On 6.8 that is from the close, so the write usually arrives on
+the first attempt: a peer that connects, writes and closes at once is usually closed before the
+relay asks, as most connections of a program that connects and exits were in the measurement above.
+On 6.17 and later the closed socket keeps its user until the timewait record replaces it, so the
+write arrives only when the relay asks after that, which a busy host makes more likely. Measured on
+7.2 with a sub-user ID of a user namespace as the other user, writing and closing 50 times: 41
+writes reached the service before the relay refused such answers, none after, and all 50 of sandy's
+own user both times; the tests are `a_peer_that_closed_its_socket_has_no_owner` and
+`an_answer_is_judged_by_the_user_it_carries`. The Ubuntu VMs have no second user to measure with.
+The peer cannot read what comes back. Losing the file is what loses the owner, and it also gives up
+the answer, so the service cannot be used interactively, read from, or probed for a reply. A peer
+that only shuts down its sending side keeps its socket and its file, so it keeps its owner and is
 refused like any other: half closing is not a way around the check, and because a half closed peer
 and a closed one are both in FIN_WAIT2, the check must read the inode and never the state. The only
 way to close the residual rather than narrow it is a listener other local users cannot reach at
 all, which on Linux means a network namespace, as the AppContainer gives on Windows. Forward only
 to services that are safe against an unauthenticated local write, or that authenticate their
-clients themselves. `sandy check` prints this as a warning for every policy with a forwarded
-port.
+clients themselves. `sandy check` prints this as a warning for every policy with a forwarded port.
 
 Two further limits are inherent: the owner is the user that created the socket, so a process of
 sandy's own user that acts for someone else still passes, and a descriptor passed between
@@ -519,6 +529,31 @@ filter still denies `TIOCSTI`, `TIOCLINUX` and `TIOCSETD` on every descriptor; t
 them. Cost: tools that attach a line discipline, such as `ldattach`, fail with `EPERM`; they
 need privileges anyway.
 
+`TIOCEXCL` is denied as well. It puts a terminal in exclusive mode, after which every open of
+it fails with `EBUSY` for processes without `CAP_SYS_ADMIN`, also after the program that set it
+has ended (measured on Linux 7.2: a shell redirection to the terminal failed). A program that
+inherited the user's terminal could otherwise keep a pager in a pipeline or a password prompt,
+which open `/dev/tty`, from working until someone clears the mode. Clearing it (`TIOCNXCL`) and
+asking for it (`TIOCGEXCL`) stay allowed. The test is `the_terminal_cannot_be_made_exclusive`.
+Cost: a serial terminal program that asks for exclusive access to its line gets `EPERM`;
+`minicom` does not ask (measured), pyserial locks with `flock` instead, and the bash, Python,
+git, curl, nano, less, tmux, `stty` and `reset` runs of the measurement did not use it.
+
+The filter also denies the console ioctls that change a Linux virtual console: its keyboard map,
+the strings of its function keys, its keyboard mode, its fonts and colors, and which console the
+screen shows (`KDSKBENT`, `KDSKBSENT`, `KDSKBMODE`, `PIO_FONT`, `VT_ACTIVATE` and the others in
+`CONSOLE_IOCTLS` in `filter.rs`). When the user starts sandy from a text console, that console is
+the program's controlling terminal, and the kernel's console code lets a process make most of these
+changes on its controlling terminal without privileges. The key map and the function key strings
+belong to every console of the host, so a program could map a key the user presses later to a
+command of its choice, which the shell outside the sandbox then reads as typed input, as with
+`TIOCSTI`. The calls that only read stay allowed (`KDGKBTYPE`, `VT_GETSTATE`; nano asks the second
+whether it runs on a console). The test `console_ioctls_are_denied` checks the filter on the
+kernel; no test host gives an unprivileged process a virtual console, so the effect on a real
+console is taken from the kernel's console code and was not measured. Cost: `loadkeys`, `setfont`,
+`chvt`, `kbd_mode -s` and `setleds` fail with `EPERM` on a text console; the bash, Python, git,
+curl, nano, less, `stty` and `reset` runs of the measurement used none of these calls.
+
 ### Access mode 3
 
 Linux accepts the access mode 3 (`O_RDWR | O_WRONLY`) in `open`. It means "check read and write
@@ -559,7 +594,8 @@ opens, and its flags live in an `open_how` structure in memory, which seccomp ca
 rule cannot be applied to it and the call is left out of the allowlist (`ENOSYS`). Allowing it
 from some ABI upwards would reopen the hole on every kernel, so sandy does not. The cost is GNU
 tar (see "Structure" below). `landlock_alone_allows_access_mode_3` in `escape_linux.rs` holds the
-measurement, so a kernel that closes the hole is noticed.
+measurement, so a kernel that closes the hole is noticed. `FIDEDUPERANGE` is denied as well, on
+every descriptor (see "Metadata"), so the oracle is closed twice.
 
 ## Seccomp
 
@@ -571,8 +607,8 @@ fifth only with `--explain` (see "Diagnostic mode"):
 1. **Allowlist.** Every number of the reviewed table is allowed: the Linux 7.2 table, on x86_64
    0 to 336 and 424 to 471, on arm64 0 to 243, 260 to 294 and 424 to 471. Every other number
    fails with `ENOSYS`: system calls of newer kernels until sandy reviews them, x32 numbers,
-   `clone3`, `openat2` and `fanotify_init`. A system call of another architecture (for example
-   `int 0x80` on x86_64) kills the process.
+   `clone3`, `openat2`, `fanotify_init` and `name_to_handle_at`. A system call of another
+   architecture (for example `int 0x80` on x86_64) kills the process.
 2. **Denylist.** Rules with argument checks return `EPERM`.
 3. **Extended attribute reads.** With `path_metadata = "deny"`, the reads that take a path
    return `ENOTSUP`.
@@ -606,11 +642,11 @@ The rules return `EPERM`, except where the table says otherwise.
 
 | System calls | Rule | Reason |
 |---|---|---|
-| `socket` (`EAFNOSUPPORT`) | family not in the allowlist | `AF_UNIX` only with `unix_sockets = "all"`. `AF_INET`, `AF_INET6` and `AF_NETLINK` with protocol `NETLINK_ROUTE` only with `ip = "all"`. A denylist would miss families that reach TCP, for example `AF_SMC`. Route netlink lets the C library list interfaces (`getifaddrs`, `getaddrinfo`); other netlink protocols expose, for example, every socket of the host (`sock_diag`). `AF_VSOCK`, `AF_ALG`, `AF_PACKET` and the rest are always denied. |
+| `socket` (`EAFNOSUPPORT`) | family not in the allowlist; with `ip = "all"` an IP protocol other than 0, ICMP, TCP, UDP, ICMPv6 and MPTCP | `AF_UNIX` only with `unix_sockets = "all"`. `AF_INET`, `AF_INET6` and `AF_NETLINK` with protocol `NETLINK_ROUTE` only with `ip = "all"`. A denylist would miss families that reach TCP, for example `AF_SMC`. Within `AF_INET` and `AF_INET6` the kernel loads the module of a protocol when a program asks for a socket of it, for any user: SCTP, L2TP over IP, and since Linux 6.14 SMC through `IPPROTO_SMC`, which reaches the same code as `AF_SMC`. On Fedora 44 the modules `sctp`, `l2tp_ip`, `l2tp_ip6` and `smc` are installed and not blocked (checked with `modinfo` and `modprobe -c`). That is kernel code no common program needs: the measured programs used 0, TCP (Python, curl, Java, Node, Go), MPTCP (Go), ICMP and ICMPv6 (ping), and ran the same with the rule. `ip_sockets_of_unusual_protocols_are_denied` checks it with protocol 253, which has no module. Route netlink lets the C library list interfaces (`getifaddrs`, `getaddrinfo`); other netlink protocols expose, for example, every socket of the host (`sock_diag`). `AF_VSOCK`, `AF_ALG`, `AF_PACKET` and the rest are always denied. |
 | `socketpair` | other family than `AF_UNIX`; datagram or raw type when `unix_sockets = "none"` | A datagram socket can send to any address, also from a pair. `AF_UNIX` treats `SOCK_RAW` as `SOCK_DGRAM`. Stream and seqpacket pairs stay allowed. |
-| `ioctl` | `TIOCSTI`, `TIOCLINUX`, `TIOCSETD`, and the file system ioctls that change a file; with `signals = "isolated"` also `TIOCSPGRP` and `TIOCSWINSZ` | `TIOCSTI` and `TIOCLINUX` can inject input into the terminal of the user. `TIOCSETD` changes its line discipline, and the kernel loads the module of a discipline on demand when `dev.tty.ldisc_autoload` is 1, which is kernel attack surface. For the file system ioctls see "Metadata", for the two others "Signals and the terminal". |
+| `ioctl` | `TIOCSTI`, `TIOCLINUX`, `TIOCSETD`, `TIOCEXCL`, the console ioctls that change a virtual console, and the file system ioctls that change a file; with `signals = "isolated"` also `TIOCSPGRP`, `TIOCSWINSZ` and `TIOCSIG` | `TIOCSTI` and `TIOCLINUX` can inject input into the terminal of the user. `TIOCSETD` changes its line discipline, and the kernel loads the module of a discipline on demand when `dev.tty.ldisc_autoload` is 1, which is kernel attack surface. `TIOCEXCL` keeps every process outside from opening the terminal again. The console ioctls change the key map and the fonts of every console of the host (see "Device ioctls and the terminal"). For the file system ioctls see "Metadata", for the three others "Signals and the terminal". |
 | `fcntl` | `F_SETLEASE` with anything but `F_UNLCK`, `F_SETDELEG` | A lease or a delegation needs only a read descriptor of a file or directory the user owns, and Landlock does not cover `fcntl`. While the program holds one, a process outside that opens the file for writing, or creates, renames or removes an entry in the directory, waits until `/proc/sys/fs/lease-break-time` passes (45 seconds by default; measured: 48 seconds). Giving one up stays allowed. |
-| `clone` | any `CLONE_NEW*` flag | Namespaces expose kernel interfaces that are otherwise reserved for root. |
+| `clone` | any `CLONE_NEW*` flag, and `CLONE_PARENT` | Namespaces expose kernel interfaces that are otherwise reserved for root. `CLONE_PARENT` makes the new process a child of the program's parent, a process outside the sandbox, which then receives a `SIGCHLD` it did not ask for and has to reap a process it never started (measured: the process that started sandy reaped it). None of the measured programs used it; container runtimes do, and they fail in the sandbox anyway. |
 | `unshare` | any `CLONE_NEW*` flag, including `CLONE_NEWTIME` | Same. `unshare(CLONE_FILES)` stays allowed. |
 | `setns` | always | Same. |
 | `personality` | other values than 0, 0x8, 0x20000, 0x20008, 0x40000, 0x40008, 0x60000, 0x60008, 0xffffffff | The values Docker allows, and `ADDR_NO_RANDOMIZE` (0x40000) alone and with those flags, which `setarch -R`, `rr` and the thread sanitizer need; it weakens address space randomization only inside the sandbox. The rest are old exploit helpers, for example `READ_IMPLIES_EXEC`. |
@@ -618,16 +654,19 @@ The rules return `EPERM`, except where the table says otherwise.
 | `truncate` | before ABI 3, for every path | Landlock cannot check it, and the call shows the filter no access mode. `ftruncate` and `O_TRUNC` with write access stay allowed, so a writable path still works. |
 | io_uring (3 calls) | always | io_uring operations bypass seccomp, including socket creation. |
 | `ptrace`, `process_vm_readv`, `process_vm_writev`, `pidfd_getfd`, `kcmp`, `process_madvise` | always | Second layer to Landlock. Debuggers do not work inside the sandbox. |
+| `madvise` | `MADV_MERGEABLE` | Where an administrator enabled KSM, the kernel shares the program's mergeable pages with identical pages of other processes, and the time a write to such a page takes tells whether another process holds the same content. KSM is off on the Fedora test host (`/sys/kernel/mm/ksm/run` is 0), so the effect was not measured. No measured program used the advice; `MADV_UNMERGEABLE` and the other advice stay allowed. |
 | System V IPC (12 calls), POSIX message queues (6 calls) | always | These objects belong to all processes of the user and Landlock does not cover them. `shmat` would give access to the memory of processes outside the sandbox. |
 | `mount`, `umount2`, `pivot_root`, `chroot`, new mount API, `open_tree_attr`, `mount_setattr` | always | Second layer; Landlock denies mounts already. |
 | `statmount`, `listmount`, `listns` | always | They show the mount and namespace topology of the host, which leaving out `/proc` otherwise hides (`/proc/self/mountinfo`, `/proc/*/ns`). |
+| `ioctl` with `PIDFD_GET_INFO` (every size of its structure) | always | `pidfd_open` takes any process of the host, and this call then tells its parent, its user and group IDs, its cgroup and how it ended, which leaving out `/proc` otherwise hides (measured: for process 1, also with `signals = "isolated"`). Only libsystemd uses it, for the peers of a bus, and does without: `busctl` lists no peer process IDs in the sandbox before and after. |
 | `lsm_get_self_attr`, `lsm_set_self_attr`, `lsm_list_modules` | always | They show which security modules the host runs and the program's own security attributes, which leaving out `/proc` and `/sys/kernel/security` otherwise hides, and `lsm_set_self_attr` changes them. |
 | `bpf`, `perf_event_open`, `userfaultfd` | always | Kernel attack surface. |
 | `keyctl`, `add_key`, `request_key` | always | The keyrings of the user are shared by all its processes. |
-| `kexec_*`, module calls, `reboot`, `swapon`, `swapoff`, `acct`, `quotactl`, `quotactl_fd`, `syslog`, `open_by_handle_at`, `settimeofday`, `clock_settime`; on x86_64 `iopl`, `ioperm`, `modify_ldt`, `uselib` | always | They need capabilities, which sandy never passes on. A second layer. |
-| metadata calls by path | with `linux.path_metadata = "deny"` | See "Metadata". |
-| `getxattr`, `lgetxattr`, `listxattr`, `llistxattr`, `getxattrat`, `listxattrat`, `file_getattr` (`ENOTSUP`) | with `linux.path_metadata = "deny"` | They read extended attributes of every file the user can reach, outside the policy as well. See "Metadata". |
+| `kexec_*`, module calls, `reboot`, `swapon`, `swapoff`, `acct`, `quotactl`, `quotactl_fd`, `syslog`, `open_by_handle_at`, `settimeofday`, `clock_settime`, `vhangup`, `sethostname`, `setdomainname`, `setgroups`; on x86_64 `iopl`, `ioperm`, `modify_ldt`, `uselib` | always | They need capabilities, which sandy never passes on. A second layer. |
+| metadata calls by path, `fchown` | with `linux.path_metadata = "deny"` | See "Metadata". |
+| `getxattr`, `lgetxattr`, `listxattr`, `llistxattr`, `getxattrat`, `listxattrat`, `file_getattr`, `fsetxattr`, `fremovexattr` (`ENOTSUP`) | with `linux.path_metadata = "deny"` | The reads see extended attributes of every file the user can reach, outside the policy as well; the two calls on a descriptor change those of a file the program may only read. See "Metadata". |
 | `fanotify_init` (`ENOSYS`, from the allowlist) | always | An unprivileged fanotify group reports which files change on every path the user can reach, outside the policy as well. Landlock has no hook for it. |
+| `name_to_handle_at` (`ENOSYS`, from the allowlist) | always | It gives the file handle (inode, parent and generation on btrfs) and the mount of every path the user can reach, outside the policy as well (measured: `~/.bashrc` under a policy without it), and only `open_by_handle_at`, which needs a capability, takes the handle. No measured program used it; without it a program works with paths, as on a kernel built without file handles. |
 | `clone`; on x86_64 also `fork`, `vfork` | with `process.children = "none"`: `clone` without `CLONE_THREAD`, `fork` and `vfork` always | See "Child processes". |
 | `setsid`, `setpgid` | with `process.children = "contained"`: always | See "Contained child processes". |
 | `setpgid` | with `signals = "isolated"`: a process group other than 0 | See "Signals and the terminal". |
@@ -642,31 +681,46 @@ Landlock does not restrict `chmod`, `chown`, `utimensat` or extended attributes.
 
 - `fchmodat`, `fchmodat2`, `fchownat`, `setxattr`, `lsetxattr`, `removexattr`, `lremovexattr`,
   `setxattrat`, `removexattrat`, `file_setattr`, and `utimensat` with a path;
-- on x86_64 also `chmod`, `chown`, `lchown`, `utime`, `utimes` and `futimesat`.
+- on x86_64 also `chmod`, `chown`, `lchown`, `utime`, `utimes` and `futimesat`;
+- through a descriptor, `fchown`, and `fsetxattr` and `fremovexattr` with `ENOTSUP`.
 
 `fchmodat`, `fchmodat2` and `fchownat` are denied completely, because they accept an `O_PATH`
-descriptor with `AT_EMPTY_PATH`, and `O_PATH` opens need no Landlock right. `fchmod`, `fchown`,
-`fsetxattr`, `fremovexattr` and `utimensat` without a path stay allowed. They reject `O_PATH`
-descriptors, and access mode 3 is denied, so they only reach files that Landlock let the program
-open for reading or writing, also read-only (see "Known limitations"). Programs that change
-metadata by path need `path_metadata = "allow"`; then the program can change the metadata of
-every file the user owns. Measured on Fedora 44: `install`, `cp -a`, `rsync -a`, `unzip`,
-`cpio -idm` and `git` fail under `"deny"` and work under `"allow"`, while `cp -p` works under
-both, because it sets the metadata through the descriptor it wrote.
+descriptor with `AT_EMPTY_PATH`, and `O_PATH` opens need no Landlock right. The calls on a
+descriptor reject `O_PATH` descriptors, and access mode 3 is denied, so they only reach files that
+Landlock let the program open, but that includes a file of a `read` path opened read-only and a
+file the caller passed on a standard stream: seccomp sees only the descriptor number, not how the
+file was opened. So the owner and the extended attributes, among them ACLs and the SELinux label,
+are denied through a descriptor too. The programs that set them on the files they write carry on
+without them (measured on Fedora 44: `sed -i`, `gzip`, `xz`, `zstd`, `patch`, `cp -p`, `mv` to
+another file system, Java's `Files.copy` with `COPY_ATTRIBUTES`, and Node's `copyFileSync` behaved
+the same before and after). `fchown` fails with `EPERM`, as for any user who may not give a file
+away. The attribute calls fail with `ENOTSUP`, as on a file system without extended attributes,
+because with `EPERM` `sed -i` and `patch` printed a warning for every file. `fchmod` and
+`utimensat` without a path stay allowed: `cp`, `touch` and Rust's `fs::copy` need them on the files
+they write (see "Known limitations"). Programs that change metadata by path need
+`path_metadata = "allow"`; then the program can change the metadata of every file the user owns.
+Measured on Fedora 44: `install`, `rsync -a`, `unzip`, `cpio -idm` and `git` fail under `"deny"`
+and work under `"allow"`, while `cp -p` works under both, because it sets the metadata through the
+descriptor it wrote. `cp -a` is in between: it copies a single file under `"deny"` too, with its
+mode and times and, since the descriptor calls for attributes fail, without its extended
+attributes, but it fails on a directory, whose times it sets by path ("preserving times ...:
+Operation not permitted"), and works there under `"allow"`. A tree that holds a symbolic link
+fails under both settings, because a writable path never gets the right to make one. The test is
+`cp_a_copies_a_file_under_deny_and_a_directory_only_under_allow`.
 
-The same setting decides the reads. `getxattr`, `lgetxattr`, `listxattr` and `llistxattr` with
-a path, and `getxattrat`, `listxattrat` and `file_getattr`, fail with `ENOTSUP`, the error of a
-file system without extended attributes. Landlock has no hook for them, so they otherwise read
-the attributes of every file the user can reach, outside the policy as well: the names and
-values of user attributes, ACLs and, on a host with SELinux, the security label. `fgetxattr`
-and `flistxattr` stay allowed for the same reason as the calls that write metadata through a
-descriptor. `getxattrat`, `listxattrat` and `file_getattr` are denied completely, because they
-read the descriptor itself with `AT_EMPTY_PATH`.
+The same setting decides the reads. `getxattr`, `lgetxattr`, `listxattr` and `llistxattr` with a
+path, and `getxattrat`, `listxattrat` and `file_getattr`, fail with `ENOTSUP`, the error of a file
+system without extended attributes. Landlock has no hook for them, so they otherwise read the
+attributes of every file the user can reach, outside the policy as well: the names and values of
+user attributes, ACLs and, on a host with SELinux, the security label. `fgetxattr` and `flistxattr`
+stay allowed: they only reach files that Landlock let the program open, and reading what the
+program may read changes nothing. `getxattrat`, `listxattrat` and `file_getattr` are denied
+completely, because they read the descriptor itself with `AT_EMPTY_PATH`.
 
-Cost: `cp -a` keeps the extended attributes of files, which it copies through descriptors, and
-loses those of directories; `rsync -X`, `tar --xattrs`, `getfacl` and `ls -Z` read by path and
-see none. `path_metadata = "allow"` brings both the reads and the writes back. The test
-`extended_attributes_by_path_are_unreadable` checks both settings.
+Cost: `cp -a` and `cp --preserve=xattr` copy no extended attributes; `rsync -X`,
+`tar --xattrs`, `getfacl` and `ls -Z` read by path and see none. `path_metadata = "allow"`
+brings both the reads and the writes back. The tests `extended_attributes_by_path_are_unreadable`
+and `a_read_only_descriptor_changes_only_the_mode_and_the_times` check both settings.
 
 Under every policy the denylist also denies the file system ioctls that change a file or a
 directory. Landlock checks ioctls only on device files, so they reach every descriptor the
@@ -688,6 +742,12 @@ program holds, also one of a file in a `read` path (measured on Linux 7.2):
   `BTRFS_IOC_SET_RECEIVED_SUBVOL` and its 32-bit form, which a 64-bit kernel also takes, change
   the identity by which `btrfs receive` finds the parent of an incremental stream (measured on
   Linux 7.2 with a descriptor opened read-only).
+- `FIDEDUPERANGE` makes a file share blocks with another file of the same content. The kernel
+  takes a destination the user owns also when it was opened read-only, so the program could
+  change how a file of a `read` path is stored (measured on btrfs: the file's extent became
+  shared with a file of the program), and the answer tells whether a guessed block equals a
+  block of the destination, the oracle of "Access mode 3". `FICLONE`, which `cp` uses, needs a
+  destination opened for writing and stays allowed.
 
 The reading forms (`FS_IOC_GETFLAGS`, `FS_IOC_FSGETXATTR`, `FS_IOC_MEASURE_VERITY`) stay
 allowed. The test `file_system_ioctls_cannot_change_readable_files` checks the denials.
@@ -730,18 +790,23 @@ editor the user suspended in the same shell (measured on Linux 7.2):
 - It takes the terminal with `TIOCSPGRP`. The job that had the foreground stops as soon as it
   reads the terminal again.
 - It changes the window size with `TIOCSWINSZ`, which sends `SIGWINCH` to the foreground group.
+- On the master side of a pseudo-terminal, `TIOCSIG` sends `SIGINT`, `SIGQUIT` or `SIGTSTP` to
+  the foreground group of the other side (measured: an outside process on the other side
+  received `SIGINT`). A program holds a master when the policy grants `/dev/ptmx`, or when its
+  caller passes one on a standard stream, which `sandy run` refuses (see below).
 
 With `signals = "isolated"` the denylist therefore allows `setpgid` only with process group 0,
-which makes the caller a group leader, and denies `TIOCSPGRP` and `TIOCSWINSZ`. seccomp cannot
-compare two arguments, so `setpgid(pid, pid)` is denied as well; a program that wants its own
-group uses `setpgid(0, 0)` or `setsid`, which stay allowed. The three routes are checked by
-`other_jobs_of_the_terminal_cannot_be_stopped`,
-`the_terminal_cannot_be_taken_from_the_foreground_job` and
-`terminal_resize_cannot_signal_outside`.
+which makes the caller a group leader, and denies `TIOCSPGRP`, `TIOCSWINSZ` and `TIOCSIG`.
+seccomp cannot compare two arguments, so `setpgid(pid, pid)` is denied as well; a program that
+wants its own group uses `setpgid(0, 0)` or `setsid`, which stay allowed. The four routes are
+checked by `other_jobs_of_the_terminal_cannot_be_stopped`,
+`the_terminal_cannot_be_taken_from_the_foreground_job`, `terminal_resize_cannot_signal_outside`
+and `a_pseudo_terminal_master_cannot_signal_outside`.
 
 Cost: a shell inside the sandbox has no job control, because it cannot put a pipeline in a group
 of its own and cannot hand the terminal to it. Programs that resize their terminal (`stty rows`,
-`resize`) fail with `EPERM`. What stays open: the program's own reads from the terminal still
+`resize`) fail with `EPERM`; tmux inside the sandbox still works (measured), because it ends
+its panes with `kill`. What stays open: the program's own reads from the terminal still
 stop its own process group. In the exec model that is the group sandy was started in, so the
 processes outside the sandbox that share it stop as well: the shell that ran sandy without job
 control, for example in a script, and the other commands of its pipeline. They are the job the
@@ -749,6 +814,21 @@ user started, which stops as it would without a sandbox; no other job is reached
 `a_terminal_read_stops_the_group_sandy_was_started_in` records this. `sandy check` prints it as
 a warning for every policy with `signals = "isolated"` and without `children = "contained"`,
 which gives the program a process group of its own.
+
+The interrupt, quit and suspend characters reach the same group: a program that holds a master
+writes Ctrl+C, Ctrl+\ or Ctrl+Z into it, and the kernel sends the same signals as `TIOCSIG`
+(measured on Linux 7.2, also with `children = "contained"`). A write cannot be told from any
+other, so with `signals = "isolated"` `sandy run` refuses a master on a standard stream with
+status 125, naming the stream and saying to pass the slave side or a pipe instead. sandy knows a
+master by its device number, which the kernel fixes: every Unix98 master is open on a ptmx
+device, 5:2, whether `/dev/ptmx` or the `ptmx` of another devpts instance, as in a container, and
+the legacy BSD masters (`CONFIG_LEGACY_PTYS`, which Fedora leaves out) have major 2. The slave
+side, which a program gets when it runs in a terminal, is accepted. A master the program opens
+itself through a grant on `/dev/ptmx` belongs to a new pseudo-terminal, whose other side has no
+process until one outside opens it as its terminal. The filter denies `TIOCSIG` on it as well;
+the characters stay open there. The tests are
+`a_pseudo_terminal_master_on_a_standard_stream_needs_signals_any` and
+`a_master_of_another_devpts_instance_is_refused`.
 
 ### Other processes
 
@@ -884,6 +964,18 @@ one it denied. That is a wrong report, not a weaker sandbox: see DESIGN.md.
   `SIGTERM` with `SIGKILL`, is refused unless `children = "contained"` supervises the run.
 - The watcher is a thread of sandy, outside the sandbox, which parses bytes the program
   controls. It reads at most one path of `PATH_MAX` bytes per call and acts on none of them.
+  Once it holds the notification descriptor, it confines itself with a seccomp filter on that
+  thread alone (`filter::explain_watcher`): polling, the three notification ioctls on that
+  descriptor only, `process_vm_readv`, the `stat`, `access` and `readlink` family, writes to
+  standard error only, memory calls without `PROT_EXEC`, futexes and ending. Any other call ends
+  sandy with `SIGSYS`, because a watcher that went on after a denied call would report what it
+  did not see; the program keeps its sandbox, and its watched calls fail with `ENOSYS` from then
+  on. The filter keeps the thread from opening files, starting processes, signalling, using the
+  network and making code of its own. It shares its memory with sandy's main thread, which has
+  no filter, so a flaw in the parsing that gives control of the thread could still reach that
+  thread's code: the filter narrows the watcher, it does not wall it off. The test is
+  `the_watcher_thread_confines_itself`; measured: bash, Python, git, curl, Java, Node, Go and
+  coreutils ran under `--explain` with the filter in the glibc and musl builds.
 - The report goes to sandy's standard error, which is usually the program's as well. A reader
   that goes away does not end the run: sandy ignores `SIGPIPE` (the program gets the default
   action back before it confines itself), and a line that cannot be written is dropped.
@@ -1209,27 +1301,31 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   protocol with `SO_DOMAIN`, `SO_TYPE` and `SO_PROTOCOL`. Refused are an IP socket or a route
   netlink socket with `ip = "none"`, an unconnected, datagram or listening Unix socket with
   `unix_sockets = "none"`, and under every policy a raw IP socket (`SOCK_RAW`, which needs
-  `CAP_NET_RAW`) and a socket of every other family, a netlink socket of another protocol included.
-  The kernel turns an `AF_INET` socket of the obsolete type `SOCK_PACKET` into an `AF_PACKET`
-  socket, which is refused as another family. An ICMP datagram socket follows `ip` like any IP
-  datagram socket, because the kernel lets an unprivileged program create one within
-  `net.ipv4.ping_group_range`. A connected Unix stream or seqpacket socket is accepted, because it
-  reaches only the peer it already has. `sandy check` cannot report this: the streams it is given
-  are not the streams of the later `run`. The tests are
+  `CAP_NET_RAW`), an IP socket of a protocol the filter denies (see "Denylist"), and a socket of
+  every other family, a netlink socket of another protocol included. The kernel turns an `AF_INET`
+  socket of the obsolete type `SOCK_PACKET` into an `AF_PACKET` socket, which is refused as another
+  family. An ICMP datagram socket follows `ip` like any IP datagram socket, because the kernel lets
+  an unprivileged program create one within `net.ipv4.ping_group_range`. A connected Unix stream or
+  seqpacket socket is accepted, because it reaches only the peer it already has. `sandy check`
+  cannot report this: the streams it is given are not the streams of the later `run`. The tests are
   `a_socket_on_standard_input_gives_no_network_access`,
   `a_socket_of_another_family_on_standard_input_is_refused` (sock_diag netlink, AF_VSOCK and
   AF_ALG), `route_netlink_on_standard_input_follows_ip` and
   `a_raw_ip_socket_on_standard_input_is_refused`, which creates the raw socket in a user and
   network namespace of its own, where it holds `CAP_NET_RAW`, and executes sandy from there.
+- With `signals = "isolated"`, a standard stream that carries the master side of a
+  pseudo-terminal: `sandy run` refuses with exit code 125 and names the stream. The program could
+  write the interrupt character into it and so signal the processes on the other side (see
+  "Signals and the terminal").
 
 ## Known limitations
 
-- **Paths outside the policy are visible.** `stat`, `access`, `readlink`, `name_to_handle_at`
-  and `inotify` watches work on every path the user can reach. The program can learn which files
-  exist, their sizes and times, and when other programs touch them. It cannot open them:
-  `open_by_handle_at` needs a capability. Landlock has no right for these calls, and seccomp
-  cannot read the path a call names, so only a mount namespace would hide them, which is a
-  non-goal (see "Threat model" in [DESIGN.md](DESIGN.md)). Two details are easy to miss:
+- **Paths outside the policy are visible.** `stat`, `access`, `readlink` and `inotify` watches work
+  on every path the user can reach. The program can learn which files exist, their sizes and times,
+  and when other programs touch them. It cannot open them: `open_by_handle_at` needs a capability.
+  Landlock has no right for these calls, and seccomp cannot read the path a call names, so only a
+  mount namespace would hide them, which is a non-goal (see "Threat model" in
+  [DESIGN.md](DESIGN.md)). Two details are easy to miss:
   - An `inotify` watch on a directory the program cannot list reports the **names** of the
     entries that appear in it, not only that something changed (tested:
     `inotify_reports_names_in_unlistable_directories` reads the name of a file that another
@@ -1240,8 +1336,8 @@ path rules is refused before that, with exit code 125 and the paths it compared.
     path is opened, and such a descriptor was opened before the sandbox. The entries in it
     cannot be opened; only their names are readable. Pass a directory on a standard stream only
     when its listing may be seen.
-  The reads of extended attributes by path and `fanotify_init` are denied (see "Metadata" and
-  "Denylist").
+  The reads of extended attributes by path, `fanotify_init` and `name_to_handle_at` are denied
+  (see "Metadata" and "Denylist").
 - **Abstract socket names with `ip = "all"`.** The program can bind one end of a socket pair to
   a free abstract name, because the filter cannot tell a socket's family from its descriptor and
   the Landlock scope checks connect and send, not bind. A service outside that binds the same
@@ -1254,17 +1350,19 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   `unix_sockets = "none"` the filter denies `bind`, `listen`, `connect` and `accept`, which no
   socket pair needs.
 - **System information.** `uname`, `sysinfo` and `statfs` stay allowed. They show the kernel
-  version, load and memory, and file system statistics. The mount and namespace listing calls
-  and the security module calls (`lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr`)
-  are denied, like the `/proc` and `/sys` files that hold the same facts.
-- **Metadata through open files.** `fchmod`, `fchown`, `fsetxattr`, `fremovexattr` and
-  `futimens` work on every file the program may open, also on a descriptor of a file in a `read`
-  path, except for setuid and setgid bits. seccomp sees only the descriptor number, not how the
-  file was opened, and Landlock has no metadata right, so the only remaining fix is a helper
-  outside the sandbox that performs these calls after checking the descriptor. With `fsetxattr`
-  this includes ACLs and, on a host with SELinux, the security label. The file system ioctls
-  of the same kind are denied (see "Metadata"). The test
-  `metadata_calls_on_a_read_only_descriptor_still_work` records this.
+  version, load and memory, and file system statistics. The mount and namespace listing calls,
+  the security module calls (`lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr`) and
+  `PIDFD_GET_INFO` are denied, like the `/proc` and `/sys` files that hold the same facts. What
+  stays: a pidfd of any process says when it ends, which Python's asyncio and Go need for their
+  own children, and `stat` on `/proc/PID` shows the owner of a process.
+- **Metadata through open files.** `fchmod` and `futimens` work on every file the program may
+  open, also on a descriptor of a file in a `read` path, except for setuid and setgid bits; with
+  `path_metadata = "allow"` so do `fchown`, `fsetxattr` and `fremovexattr`. seccomp sees only
+  the descriptor number, not how the file was opened, Landlock has no metadata right, and `cp`,
+  `touch` and Rust's `fs::copy` need the two calls on the files they write, so the only remaining
+  fix is a helper outside the sandbox that performs these calls after checking the descriptor.
+  The file system ioctls of the same kind are denied (see "Metadata"). The test
+  `a_read_only_descriptor_changes_only_the_mode_and_the_times` records this.
 - **Files the program writes can be executed outside the sandbox.** The program gets no execute
   right in a writable path, but a file it writes keeps the mode it gives it: the filter strips
   only the setuid and setgid bits, and Landlock has no right over the execute bit. A process
@@ -1288,13 +1386,15 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   processes are not the program's and are not covered.
 - **Standard streams.** sandy passes descriptors 0, 1 and 2 on as it got them, so whatever they
   carry keeps working inside the sandbox: a file outside the policy can be read and written, a
-  directory stays listable, and the metadata calls on an open file work (see "Metadata through
-  open files"). A socket the policy denies is refused at the start instead (see "Refusals"). A
+  directory stays listable, and its mode and times can change (see "Metadata through open
+  files"). A socket the policy denies is refused at the start instead, and so is a
+  pseudo-terminal master with `signals = "isolated"` (see "Refusals"). A
   connected Unix stream or seqpacket socket is accepted, and the program then reaches whatever
   its peer is, so pass one only from a process that is the peer itself.
 - **The terminal.** If standard input or output is the user's terminal, the program can read
-  input, write escape sequences and change terminal modes. `TIOCSTI`, `TIOCLINUX` and `TIOCSETD`
-  are always denied, and with `signals = "isolated"` also `TIOCSPGRP` and `TIOCSWINSZ`.
+  input, write escape sequences and change terminal modes. `TIOCSTI`, `TIOCLINUX`, `TIOCSETD`,
+  `TIOCEXCL` and the console ioctls that change a virtual console are always denied, and with
+  `signals = "isolated"` also `TIOCSPGRP`, `TIOCSWINSZ` and `TIOCSIG`.
 - **`unix_sockets = "all"`** gives every Unix socket the user can reach, including the D-Bus
   session bus. Through the systemd user manager on that bus, the program can start commands
   outside the sandbox. Use it only for programs that are trusted with this.
@@ -1307,13 +1407,14 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   can link a file into a writable path while the program runs, and the program can then change
   that file. The program cannot do it itself: it gets no `refer` right out of its writable paths
   and no execute right inside them.
-- **What fails inside the sandbox:** 32-bit programs (killed), user namespace sandboxes of
-  browsers (they fall back or fail), io_uring, debuggers, System V IPC, datagram socket pairs,
-  `mkfifo` and symbolic links in writable paths, metadata changes and extended attribute reads
-  by path with the default setting, `fanotify`, `chattr` and the other file system ioctls that
-  change a file, file leases, `ldattach`, job control in a shell and terminal resizing with
-  `signals = "isolated"`, GNU tar extracting an archive that holds a directory (it uses
-  `openat2`), and system calls newer than the reviewed table (`ENOSYS`).
+- **What fails inside the sandbox:** 32-bit programs (killed), user namespace sandboxes of browsers
+  (they fall back or fail), io_uring, debuggers, System V IPC, datagram socket pairs, `mkfifo` and
+  symbolic links in writable paths, metadata changes and extended attribute reads by path with the
+  default setting, `fanotify`, `chattr` and the other file system ioctls that change a file, block
+  deduplication (`duperemove`), file leases, `ldattach`, the console tools that change a text
+  console (`loadkeys`, `setfont`, `chvt`), exclusive mode on a terminal, job control in a shell and
+  terminal resizing with `signals = "isolated"`, GNU tar extracting an archive that holds a
+  directory (it uses `openat2`), and system calls newer than the reviewed table (`ENOSYS`).
 - **Landlock errata.** sandy does not check the errata bitmask. A kernel without the fix for
   erratum 3 lets rights widen through renames of directories that a bind mount disconnected.
   The program cannot mount, and `refer` is granted only inside writable paths, so the practical

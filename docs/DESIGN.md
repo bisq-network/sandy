@@ -144,13 +144,15 @@ Rules:
    `contained` also needs `signals = "isolated"`: otherwise the program could kill sandy and the
    process that ends the group. sandy rejects the policy when either condition is missing.
 10. `linux.path_metadata = "deny"` (the default) requires that permissions, owner, timestamps and
-   extended attributes of files outside the policy paths cannot change. Landlock does not
-   control these calls, so the Linux backend denies the path-based variants (`chmod`, `chown`,
-   `utimensat` with a path, `setxattr` and relatives) everywhere, also inside writable paths. The
-   calls on an open file (`fchmod`, `futimens`, `fsetxattr`) keep working, which is why `cp -p`
-   needs nothing. `allow` removes the requirement for programs that change metadata by path
-   (`install`, `cp -a`, `rsync -a`, `git`); they can then change the metadata of every file the
-   user owns. macOS and Windows protect metadata outside the writable paths in every case.
+   extended attributes of files outside the policy paths cannot change. Landlock does not control
+   these calls, so the Linux backend denies the path-based variants (`chmod`, `chown`, `utimensat`
+   with a path, `setxattr` and relatives) everywhere, also inside writable paths, and the owner and
+   extended attribute calls on an open file (`fchown`, `fsetxattr`). The mode and time calls on an
+   open file (`fchmod`, `futimens`) keep working, which is why `cp -p` needs nothing; they also
+   reach a file the program may only read. `allow` removes the requirement for programs that change
+   metadata by path (`install`, `cp -a` on a directory, `rsync -a`, `git`); they can then change
+   the metadata of every file the user owns. macOS and Windows protect metadata outside the
+   writable paths in every case.
 11. `process.end_with_parent = true` ends the program when the process that started sandy
    ends, for example when the application that runs a helper in the sandbox crashes. The program
    gets a request to end (SIGTERM on Linux and macOS) and is killed if it has not ended 5 seconds
@@ -201,17 +203,19 @@ Rules:
    mount table, and the message says to set `HOME`. On Windows a known folder that cannot be
    found makes the filesystem requirement unavailable for every policy.
 
-13. The standard streams stay the caller's choice, except for the sockets among them. sandy
-   passes descriptors 0, 1 and 2 on as it received them and closes every other one, because a
-   program reads its input and writes its output through them. Nothing inside the sandbox can
+13. The standard streams stay the caller's choice, except for the sockets among them and, with
+   `signals = "isolated"`, the master side of a pseudo-terminal. sandy passes descriptors 0, 1
+   and 2 on as it received them and closes every other one, because a program reads its input
+   and writes its output through them. Nothing inside the sandbox can
    take rights away from what is already open, so a socket on a standard stream keeps the access
    it was created with, whatever the policy says about networking. `run` therefore looks at the
    three streams before it applies the sandbox and accepts a socket only when the policy lets
    the program create one like it. Otherwise it refuses with status 125, naming the stream and
    the socket: an IP socket with `ip = "none"`, an unconnected, datagram or listening Unix
-   socket with `unix_sockets = "none"`, and under every policy a raw IP socket and a socket of
-   any other family, because no setting lets the program create one. A raw IP socket needs
-   privileges: CAP_NET_RAW on Linux, which sandy refuses to start with, root on macOS and
+   socket with `unix_sockets = "none"`, and under every policy a raw IP socket, an IP socket of
+   a protocol outside the usual ones (`streams::IP_PROTOCOLS`: TCP, UDP, ICMP, MPTCP) and a
+   socket of any other family, because no setting lets the program create one. A raw IP socket
+   needs privileges: CAP_NET_RAW on Linux, which sandy refuses to start with, root on macOS and
    administrator rights on Windows; sandy refuses an inherited one also where the caller has
    them, so that a policy means the same everywhere. An ICMP datagram socket follows `ip`,
    because an unprivileged program can create one where the kernel allows it (on Linux within
@@ -223,8 +227,16 @@ Rules:
    stream or seqpacket socket is accepted, because it talks only to the peer it already has,
    which is how a parent passes a pipe (libuv, journald, `ssh` without a terminal); what that
    peer is stays the caller's choice, as with a file. A service that is handed its connection
-   on standard input, inetd-style or with systemd `Accept=yes`, needs `ip = "all"`. `check`
-   cannot report this: the streams it is given are not the streams of the later `run`.
+   on standard input, inetd-style or with systemd `Accept=yes`, needs `ip = "all"`. With
+   `signals = "isolated"` `run` also refuses the master side of a pseudo-terminal on a standard
+   stream, naming the stream and saying to pass the slave side or a pipe instead
+   (`streams::terminal_master_refusal`). Writing the interrupt, quit or suspend character into
+   a master makes the kernel send SIGINT, SIGQUIT or SIGTSTP to the foreground group of the
+   other side, without the check that isolates signals (measured on Linux and macOS), and a
+   write cannot be told from any other. The slave side, which a program gets when it runs in a
+   terminal, is accepted. Linux knows a master by its device number, macOS by the major number
+   of `/dev/ptmx` (see the platform docs); Windows has no such device. `check` cannot report
+   any of this: the streams it is given are not the streams of the later `run`.
 
 ## Links and file identity
 
@@ -361,13 +373,16 @@ Rules:
    answer shows by carrying no inode. The relay serves such a connection. It has to: the kernel
    completes a handshake by itself, so a program that connects and exits is always ahead of the
    relay's accept, and refusing those answers dropped more than half of such a program's
-   connections on every kernel measured, which is the opposite of what a forwarded port is for. What
-   it leaves open is that another local user can deliver a blind write, usually on the first
-   attempt, because a peer that connects, writes and closes at once is usually closed before the
-   relay asks. It cannot read the answer, because losing the file is what loses the owner and
-   also gives up the reply, so the service cannot be used interactively or read from; and a peer
-   that only half closes keeps its file and its owner, so that is not a way around the check
-   either (docs/linux.md).
+   connections on every kernel measured, which is the opposite of what a forwarded port is for.
+   Where the answer still carries a user other than sandy's and 0, which kernels from 6.17 do until
+   a timewait record replaces the closed socket, the relay refuses it. What it leaves open is that
+   another local user can deliver a blind write once its closed socket carries no user: on 6.8 from
+   the close, usually on the first attempt, because a peer that connects, writes and closes at once
+   is usually closed before the relay asks; on newer kernels only when the relay asks after the
+   replacement. It cannot read the answer, because losing the file is what loses the owner and also
+   gives up the reply, so the service cannot be used interactively or read from; and a peer that
+   only half closes keeps its file and its owner, so that is not a way around the check either
+   (docs/linux.md).
 7. The relay passes the end of a stream on as it came: a normal end as a half close, and a reset,
    or data the relay cannot deliver, as a reset of the other side. After one direction of a
    connection has ended, the other ends when it stays idle for `sandy_relay::HALF_CLOSED_IDLE`
@@ -415,8 +430,8 @@ exceptions:
 | Platform | When | What stays open |
 |---|---|---|
 | Linux | `signals = "isolated"` without `children = "contained"` | a read from the terminal in the background stops the group sandy was started in, with the processes outside the sandbox in it |
-| Linux | `forward` | another local user can deliver a write to the forwarded service, through a connection it closed before the relay asked who owns it |
-| macOS | `signals = "isolated"` | SIGIO, and SIGURG with `ip = "all"`, through the owner ioctls of sockets and pipes; without `children = "contained"` also joining another job of the terminal session and stopping it |
+| Linux | `forward` | another local user can deliver a write to the forwarded service, through a connection it closed before the relay asked who owns it, and that no longer carries its user (from the close on Linux 6.8, after the timewait record on newer kernels) |
+| macOS | `signals = "isolated"` | SIGIO (to a process of any user), and SIGURG with `ip = "all"`, through the owner ioctls of sockets and pipes; without `children = "contained"` also joining another job of the terminal session and stopping it |
 | macOS | `forward` | every local user reaches the forwarded service |
 | macOS | `expose` or `forward` with `signals = "any"` | a stopped relay has no time limit |
 | Windows | a `read_write` path | rules 3, 4, 6 and 12 compare paths by their spelling only |
@@ -425,6 +440,13 @@ exceptions:
 `children = "contained"` on macOS gets a warning as well, although it gives its full
 guarantee: it denies `posix_spawn`, which many runtimes start processes with, and that cost is
 easy to miss.
+
+Within an exception sandy still closes every route it can. When a platform leaves one way to an
+effect open, sandy denies the other ways it can deny, unless that breaks common programs: macOS
+denies `fcntl(F_SETOWN)` under `signals = "isolated"` although the owner ioctls stay open, so a
+later macOS that closes the ioctls needs no change in sandy to close the rest. Each open route
+has a test that records it, so a platform release that closes one shows up as a failing test,
+and sandy then removes the exception.
 
 The backend reports each requirement as enforced (naming the mechanism) or unavailable (naming the
 reason). `EnforcementPlan::new` treats a requirement without a report as unavailable, so a backend
@@ -509,9 +531,12 @@ What the mode costs: two context switches per watched call, sandy as the program
 program that outlives sandy whose watched calls then fail with `ENOSYS`, and `EINTR` from a
 watched call that a signal interrupts while it waits, in a program whose handler does not
 restart calls. That is why it is opt in and documented as a tool for working out a policy. It
-also runs an unconfined watcher in sandy's own process for as long as the program runs, which
-parses bytes the program controls; it reads at most one path of bounded length per call and
-never acts on what it reads.
+also runs a watcher in sandy's own process for as long as the program runs, which parses bytes
+the program controls; it reads at most one path of bounded length per call and never acts on
+what it reads. On Linux the watcher is a thread with a seccomp filter of its own, which ends
+sandy at any call the watcher does not need. The thread shares its memory with sandy's
+unconfined main thread, so the filter narrows what a flaw in the parsing reaches without walling
+it off.
 
 ## Mechanisms (each backend section is owned by its backend)
 
@@ -529,25 +554,29 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   scopes signals (required for `signals = "isolated"`) and abstract Unix sockets; ABI 9 denies
   pathname Unix sockets when `unix_sockets = "none"`; ABI 4 denies TCP when `ip = "none"`.
 - Seccomp allowlist: the reviewed system call table of Linux 7.2; every other number, x32 numbers,
-  `clone3`, `openat2` and `fanotify_init` fail with `ENOSYS`; other CPU architectures are killed.
+  `clone3`, `openat2`, `fanotify_init` and `name_to_handle_at` fail with `ENOSYS`; other CPU
+  architectures are killed.
   `openat2` stays out because its flags live in memory, so the rule against access mode 3 below
   cannot be applied to it. The cost is GNU tar, which does not fall back (docs/linux.md).
-- Seccomp socket family filter: `socket` with a family outside the policy (an allowlist) fails
-  with `EAFNOSUPPORT`, so that programs fall back as they would on a kernel without the family.
-- Seccomp extended attribute filter: with `path_metadata = "deny"`, the reads that take a path
-  fail with `ENOTSUP`, the error of a file system without extended attributes, so that programs
-  skip them instead of failing.
-- Seccomp denylist (`EPERM`): datagram socket pairs when Unix sockets are denied, io_uring,
-  ptrace and `process_vm_*`, System V IPC, POSIX message queues, namespaces, mounts, `bpf`,
-  `perf_event_open`, `userfaultfd`, keyrings, the security module calls,
-  `TIOCSTI`/`TIOCLINUX`/`TIOCSETD`, the file system ioctls that change a file through a
-  read-only descriptor (inode flags, fs-verity, fscrypt policies, btrfs subvolumes), file leases
-  and delegations (`F_SETLEASE`, `F_SETDELEG`), with `signals = "isolated"` also `TIOCSPGRP`,
-  `TIOCSWINSZ` and `setpgid` into a process group that exists, calls that need capabilities,
-  `open` with access mode 3 (Landlock does not check it), the path-based metadata calls when
-  `path_metadata = "deny"`, setuid and setgid mode bits, changes of the limits, priority and CPU
-  affinity of other processes, and before Landlock ABI 3 `truncate` for every path and
-  `O_TRUNC` on a read-only open.
+- Seccomp socket family filter: `socket` with a family outside the policy (an allowlist), or
+  with `ip = "all"` an IP protocol outside `streams::IP_PROTOCOLS`, whose module the kernel would
+  load, fails with `EAFNOSUPPORT`, so that programs fall back as they would on a kernel without
+  the family.
+- Seccomp extended attribute filter: with `path_metadata = "deny"`, the reads that take a path,
+  and `fsetxattr` and `fremovexattr` on a descriptor, fail with `ENOTSUP`, the error of a file
+  system without extended attributes, so that programs skip them instead of failing.
+- Seccomp denylist (`EPERM`): datagram socket pairs when Unix sockets are denied, io_uring, ptrace
+  and `process_vm_*`, `MADV_MERGEABLE`, System V IPC, POSIX message queues, namespaces,
+  `CLONE_PARENT`, mounts, `bpf`, `perf_event_open`, `userfaultfd`, keyrings, the security module
+  calls, `PIDFD_GET_INFO`, `TIOCSTI`/`TIOCLINUX`/`TIOCSETD`/`TIOCEXCL`, the console ioctls that
+  change a virtual console or its keyboard, the file system ioctls that change a file through a
+  read-only descriptor (inode flags, fs-verity, fscrypt policies, btrfs subvolumes, deduplication),
+  file leases and delegations (`F_SETLEASE`, `F_SETDELEG`), with `signals = "isolated"` also
+  `TIOCSPGRP`, `TIOCSWINSZ`, `TIOCSIG` and `setpgid` into a process group that exists, calls that
+  need capabilities, `open` with access mode 3 (Landlock does not check it), the path-based
+  metadata calls and `fchown` when `path_metadata = "deny"`, setuid and setgid mode bits, changes
+  of the limits, priority and CPU affinity of other processes, and before Landlock ABI 3 `truncate`
+  for every path and `O_TRUNC` on a read-only open.
 - `process.children = "none"`: the seccomp denylist allows `clone` only with `CLONE_THREAD` and
   denies `fork` and `vfork`; `clone3` fails with `ENOSYS`, so threads use `clone`.
 - `process.children = "contained"`: sandy becomes a child subreaper and forks a guard process,
@@ -734,7 +763,7 @@ Details, limitations and sources: `docs/windows.md`.
 |---|---|
 | program's status | `sandy run` started the program |
 | 128 + signal number | Linux and macOS with `process.children = "contained"`, and Linux with `--explain`: a signal ended the program |
-| 125 | sandy failed or refused (invalid policy, unenforceable policy, a socket on a standard stream the policy denies, setup failure); where sandy stays the parent also a failure while it supervises the program |
+| 125 | sandy failed or refused (invalid policy, unenforceable policy, a socket on a standard stream the policy denies, a pseudo-terminal master on one with `signals = "isolated"`, setup failure); where sandy stays the parent also a failure while it supervises the program |
 | 0 / 1 | `sandy check`: enforceable / not enforceable |
 
 The caller sees sandy's process ID where sandy stays the parent, and 125 means both "sandy

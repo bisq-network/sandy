@@ -514,19 +514,17 @@ fn setattrlist_cannot_change_files_outside_writable_paths() {
 }
 
 /// `getfsstat` lists every mounted volume with the directory it is mounted on. It takes no path,
-/// so no file rule of the profile applies to it. This records that the list is readable: it
-/// names the volumes of the machine, including the names of attached disks under /Volumes.
+/// so no file rule of the profile applies to it; the profile denies it by system call number
+/// (getfsstat and getfsstat64, the latter the one libc calls), like the by-id lookups. The list
+/// names the disks of the system, including attached external disks, which is information about
+/// the system outside the sandbox that no documented guarantee needs. The control outside the
+/// sandbox shows the call works there.
 #[test]
-fn the_volume_list_is_readable() {
+fn the_volume_list_is_denied() {
     let fixture = Fixture::new("macos-getfsstat");
     probe_outside(&[("getfsstat", "")])[0].assert_ok();
     let inside = probe_inside(&fixture.access_args(), &[("getfsstat", "")]);
-    assert_eq!(
-        inside[0].result, "ok",
-        "getfsstat is denied; the documented limitation is stale: {}",
-        inside[0].detail
-    );
-    assert!(inside[0].detail.contains(" volumes: /"), "{:?}", inside[0]);
+    inside[0].assert_blocked();
 }
 
 /// `kill(pid, 0)` checks permission without sending anything, so it tells a live process from a

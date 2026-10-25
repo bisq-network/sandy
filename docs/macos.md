@@ -123,6 +123,18 @@ listening socket by what the kernel does tell about it: it has no peer. `sandy c
 any of this, because the streams it is given are not the streams of the later `run`. The test is
 `a_socket_of_another_family_on_standard_input_is_refused` (AF_ROUTE and AF_SYSTEM).
 
+With `signals = "isolated"` `run` also refuses the master side of a pseudo-terminal on a standard
+stream, with exit code 125, naming the stream and saying to pass the slave side or a pipe
+instead. Writing Ctrl+C, Ctrl+\ or Ctrl+Z into a master makes the kernel send SIGINT, SIGQUIT or
+SIGTSTP to the foreground group of the other side, and the profile's signal rule never sees it
+(measured on macOS 26.5: a process outside the sandbox on the other side received each, also
+with `children = "contained"`). A write cannot be told from any other. The kernel numbers its
+drivers as it starts, so sandy knows a master by the major number of `/dev/ptmx`, of which every
+master is a clone; the slaves `/dev/ttys*` have another. The legacy BSD masters `/dev/pty*` cannot
+be opened by an ordinary user (`EAGAIN`, measured), and sandy does not look for them. The slave
+side, which a program gets when it runs in a terminal, is accepted. The test is
+`a_pseudo_terminal_master_on_a_standard_stream_needs_signals_any`.
+
 ### Inherited Mach port rights
 
 Mach port rights are not file descriptors, and the profile cannot close them: every lookup
@@ -131,10 +143,11 @@ the task already holds needs no lookup. The kernel copies the task's exception p
 creates a task and keeps them across `exec`, so a caller with a crash reporter (Crashpad,
 Sentry, a debugger) would hand the program a send right to its handler, which the program could
 use for forged exception messages. Before it applies the profile, sandy therefore sets the
-handler of every machine-independent exception (`EXC_MASK_ALL`, as Chromium's launcher does)
-and of the crash port (`EXC_MASK_CRASH`) to `MACH_PORT_NULL`. The crash port is not part of
-`EXC_MASK_ALL`, and it is the one Crashpad's handler takes. It happens before the relay and the
-watcher are forked, so they drop the ports too.
+handler of every machine-independent exception (`EXC_MASK_ALL`, as Chromium's launcher does),
+of the crash port (`EXC_MASK_CRASH`) and of the corpse notification (`EXC_MASK_CORPSE_NOTIFY`)
+to `MACH_PORT_NULL`. The crash port is not part of `EXC_MASK_ALL`, and it is the one Crashpad's
+handler takes. It happens before the relay and the watcher are forked, so they drop the ports
+too.
 
 A program that is started by a caller with its own crash reporter loses that reporter, which is
 the point. Measured on macOS 26.5: a task starts with a handler for `EXC_MASK_RESOURCE` even
@@ -145,9 +158,19 @@ only a caller's own crash reporter puts one there. A caller that installs `EXC_M
 process of its own handed the program a live send right for the crash port until it was reset
 too (`inherited_mach_exception_ports_are_reset`).
 
-What stays: the handler of `EXC_MASK_CORPSE_NOTIFY`, which every task has; and the host name
-port, which every process inherits (see "Information the target can still read"). A caller that
-replaces the corpse notification handler with its own passes that one on.
+Every task has a corpse notification handler, which gets the task of a crashed program. Measured
+on macOS 26.5, a process started over SSH has one that leads to the user's ReportCrash agent, a
+service outside the sandbox, and a caller can install its own, which then received the crashed
+program's task. Without the reset the program would keep a send right to either of them. After
+it, the kernel hands a crash to the host's handler, the ReportCrash daemon that runs as root,
+which still writes the crash report, but to `/Library/Logs/DiagnosticReports` instead of the
+user's `~/Library/Logs/DiagnosticReports`. That directory and its reports are readable only by
+root and the group `_analyticsusers`: on the test Mac the administrator account was a member and
+the standard account was not. So a standard user cannot read the crash reports of a program
+that sandy runs, and the user's own ReportCrash agent does not see the crash.
+
+What stays: the host name port, which every process inherits (see "Information the target can
+still read").
 
 ### SIGPIPE
 
@@ -230,6 +253,13 @@ of earlier definitions"), so the protections come last. The unit test
     - `(deny syscall-unix (syscall-number 142))`: `gethostuuid` returns the hardware UUID, an
       identifier of the machine that every user and every reinstall share. IOKit would give the
       same value (`IOPlatformUUID`) only with `iokit-get-properties`, which the profile denies.
+    - `(deny syscall-unix (syscall-number 18) (syscall-number 347))`: `getfsstat` and
+      `getfsstat64` list every mounted volume and the directory it is mounted on. The call takes
+      no path, so no file rule reaches it, and the list names the disks of the system, including
+      any attached external disks. No documented guarantee needs it and no common program reads
+      it at startup (measured on macOS 26.5: a shell, Python, git and curl start and run with it
+      denied). Number 347 is the 64-bit inode variant that libc calls; 18 is the legacy call.
+      `statfs` and `fstatfs`, which take a path the sandbox checks, stay allowed.
     - With `process.children = "contained"`: `(deny syscall-unix (syscall-number 82)
       (syscall-number 147) (syscall-number 244))`, that is `setpgid`, `setsid` and `posix_spawn`
       (see [Contained child processes](#contained-child-processes)).
@@ -533,14 +563,22 @@ without that check, because the kernel sends those signals itself:
   closes one way of naming the owner, not all of them: the ioctls `FIOSETOWN` (sockets and
   pipes), `SIOCSPGRP` (sockets) and `TIOCSPGRP` (pipes) set the same owner, and Seatbelt checks
   `file-ioctl`, and with it the ioctl allowlist, only for files and devices. No operation of the
-  profile language reaches them; `socket-ioctl` compiles but stops none of them. Measured on
+  profile language reaches them all: `socket-ioctl` stops only `SIOCSPGRP` on an IP socket, where
+  `FIOSETOWN` still works, and with an `ioctl-command` filter it matches nothing. Measured on
   macOS 26.5, each of the four delivers SIGIO to a process outside the sandbox under
-  `signals = "isolated"` (`sigio_through_owner_ioctls_follows_no_signal_policy`). The same owner
+  `signals = "isolated"` (`sigio_through_owner_ioctls_follows_no_signal_policy`). The owner may
+  belong to another user: the kernel sends SIGIO across the user boundary with no owner check, so
+  that reach is a macOS kernel behaviour outside sandy's reach. Measured on macOS 26.5 with a
+  second account: from `sandy run --signals isolated` as one user (uid 502), SIGIO reached a
+  process of another user (uid 501) that handled it, through each owner ioctl, by process id and
+  by negative process group; `F_SETOWN` stayed denied. SIGURG was measured within one user only,
+  and a target owned by root was not tested. The same owner
   gets SIGURG when urgent data arrives on a TCP socket, which with `ip = "all"` the program can
   send itself over loopback; measured the same way. Not even the `ioctl` system call as a whole
   can be denied: a `syscall-unix` rule for its number has no effect, while the same rule stops
   `fsgetpath` (measured on macOS 26.5). The program cannot choose the signal, and the default
-  action of SIGIO and SIGURG is to discard it, so only a process that handles them notices. With
+  action of SIGIO and SIGURG is to discard it, so only a process that handles them notices; a
+  negative owner names a process group, so one ioctl reaches every such process of a group. With
   the default `signals = "any"` the program may signal every process anyway, so the `F_SETOWN`
   rule is only added for `isolated`.
 - Job control. The kernel stops a whole process group when one of its processes reads a terminal
@@ -564,6 +602,8 @@ without that check, because the kernel sends those signals itself:
 
 `sandy check` prints both routes as warnings for a policy with `signals = "isolated"`: SIGIO
 always, SIGURG with `ip = "all"`, and the job control route without `children = "contained"`.
+The interrupt characters typed into a pseudo-terminal master are one more such route; `run`
+refuses a master on a standard stream instead (see [Inherited descriptors](#inherited-descriptors)).
 
 ## Contained child processes
 
@@ -811,9 +851,6 @@ no privilege, and closing them would break ordinary programs:
   (`getattrlist_discloses_paths_outside_the_policy`). Denying `getattrlist` and `getattrlistat`
   by number closes it, but `realpath(3)` is built on the same call and then fails for every
   program in the sandbox, so the profile leaves them open.
-- The mounted volumes and the directories they are mounted on, through `getfsstat`, which takes
-  no path (`the_volume_list_is_readable`). The names of attached disks under `/Volumes` are part
-  of that list.
 - Which process ids exist. `kill(pid, 0)` only asks for permission: with isolated signals a live
   process outside the sandbox answers `EPERM` and an unused process id `ESRCH`
   (`process_ids_outside_the_sandbox_stay_countable`). macOS answers the same way for a process
@@ -864,11 +901,13 @@ none, so the backend answers nothing and sandy refuses the option.
   `TIOCSPGRP` is not allowed either, so a shell inside the sandbox cannot give the terminal to a
   job.
 - With `signals = "isolated"`, `fcntl(F_SETOWN)` fails, and the program can still have the
-  kernel send SIGIO to a process outside the sandbox through an ioctl on a socket or a pipe (see
+  kernel send SIGIO to a process outside the sandbox, including one of another user, through an
+  ioctl on a socket or a pipe (see
   [Signals the profile does not cover](#signals-the-profile-does-not-cover)).
 - Standard input, output and error keep what they were opened with, so a file outside the policy
   on a standard stream can be read and written. A socket the policy denies is refused at the
-  start (see [Inherited descriptors](#inherited-descriptors)); a connected Unix stream socket is
+  start, and so is a pseudo-terminal master with `signals = "isolated"` (see
+  [Inherited descriptors](#inherited-descriptors)); a connected Unix stream socket is
   accepted, and the program then reaches whatever its peer is, so pass one only from a process
   that is the peer itself.
 - `link(2)` fails everywhere (see the hard link rule above).
@@ -924,8 +963,9 @@ none, so the backend answers nothing and sandy refuses the option.
 - With `signals = "any"`, the target can signal every process of the user, as on other platforms.
 - Open question that the escape tests do not answer: whether `(deny default)` covers every other
   operation that the profile never mentions. Chromium and WebKit name a few exceptions, and the
-  profile denies all of those explicitly. Two that it does not cover are measured above:
-  `getattrlist` with `ATTR_CMN_FULLPATH` and `getfsstat`.
+  profile denies all of those explicitly. One that it does not cover is measured above:
+  `getattrlist` with `ATTR_CMN_FULLPATH`, which stays open because `realpath(3)` is built on it.
+  `getfsstat`, which it did not cover either, is now denied by number (see the protections above).
 
 ## Verification
 
@@ -951,11 +991,11 @@ macOS only:
   and 2 are inherited, and job control with a pseudo-terminal. `parent.rs` tests
   `process.end_with_parent`, also with `contained` and against signals to the caller's process
   group.
-- `review_macos.rs` holds the checks the security reviews added, and the measurements that
-  record what the sandbox does where it cannot stop something: the by-id calls, `getattrlist`,
-  `getfsstat`, the existence of paths outside the policy, process ids, SIGIO and the process
-  groups of the terminal session. A check that this host cannot run reports a skip, and
-  `tests/expected-skips/macos-26-arm.txt` lists the ones that are expected.
+- `review_macos.rs` holds the checks the security reviews added, the denials they led to (the
+  by-id calls and `getfsstat`), and the measurements that record what the sandbox does where it
+  cannot stop something: `getattrlist`, the existence of paths outside the policy, process ids,
+  SIGIO and the process groups of the terminal session. A check that this host cannot run reports
+  a skip, and `tests/expected-skips/macos-26-arm.txt` lists the ones that are expected.
 
 To see what the sandbox denies on a Mac, from an administrator account (a standard user gets
 no log, see [Diagnostic mode](#diagnostic-mode)):

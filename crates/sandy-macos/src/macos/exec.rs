@@ -33,9 +33,9 @@ unsafe extern "C" {
 }
 
 /// Every machine-independent exception, as `EXC_MASK_ALL` in <mach/exception_types.h> (0x1bfe on
-/// macOS 26.5), and `EXC_MASK_CRASH` (0x400), which is not part of it and which Crashpad's
-/// handler takes. `EXC_MASK_CORPSE_NOTIFY` stays.
-const EXC_MASK_HANDLED: u32 = 0x1bfe | 0x400;
+/// macOS 26.5), `EXC_MASK_CRASH` (0x400), which is not part of it and which Crashpad's handler
+/// takes, and `EXC_MASK_CORPSE_NOTIFY` (0x2000), whose handler gets the task of a crashed program.
+const EXC_MASK_HANDLED: u32 = 0x1bfe | 0x400 | 0x2000;
 /// `EXCEPTION_DEFAULT` and `THREAD_STATE_NONE`: the behaviour and thread state flavour of a
 /// handler. They are required arguments; with MACH_PORT_NULL as the handler they have no effect.
 const EXCEPTION_DEFAULT: u32 = 1;
@@ -49,7 +49,9 @@ const THREAD_STATE_NONE: i32 = 0;
 /// debugger) therefore hands the program a send right to its handler, which the program could
 /// use to send forged exception messages. Measured on macOS 26.5, neither a login over SSH nor
 /// a launchd job has a task handler for `EXC_MASK_CRASH`, so only a caller's own crash reporter
-/// puts one there; the handler of `EXC_MASK_CORPSE_NOTIFY`, which every task has, stays.
+/// puts one there. Every task has a handler for `EXC_MASK_CORPSE_NOTIFY`: the user's ReportCrash
+/// agent, or a caller's own. Without it the kernel hands a crash to the host's handler, the
+/// ReportCrash daemon that runs as root, which still writes the crash report (docs/macos.md).
 pub fn reset_exception_ports() -> Result<(), SandboxError> {
     // SAFETY: mach_task_self only reads the task port name that libSystem set up at start; the
     // libc binding is deprecated in favour of the mach2 crate, which sandy does not depend on.

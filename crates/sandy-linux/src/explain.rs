@@ -564,6 +564,13 @@ fn watch(receive: &OwnedFd, stop: &File, rules: &Rules) -> Counts {
     let Some(listener) = receive_descriptor(receive) else {
         return counts;
     };
+    if let Err(error) = confine_watcher(&listener) {
+        report(&format!(
+            "the watcher cannot confine itself and stops, so the watched calls of the program \
+             fail with ENOSYS from now on: {error}"
+        ));
+        return counts;
+    }
     let mut reported = BTreeSet::new();
     while wait_for_call(&listener, stop) {
         let Some(notification) = receive_notification(&listener) else {
@@ -574,6 +581,16 @@ fn watch(receive: &OwnedFd, stop: &File, rules: &Rules) -> Counts {
         answer_continue(&listener, notification.id);
     }
     counts
+}
+
+/// Confines the watcher thread before it reads anything the program controls, with a seccomp
+/// filter of its own on this thread alone (`filter::explain_watcher`). sandy's other thread
+/// stays unconfined and shares the memory, so this narrows what a flaw in the watcher's parsing
+/// reaches; it does not wall the thread off.
+fn confine_watcher(listener: &OwnedFd) -> Result<(), String> {
+    let program = filter::explain_watcher(listener.as_raw_fd(), &NOTIFICATION_REQUESTS)
+        .map_err(|error| error.to_string())?;
+    seccompiler::apply_filter(&program).map_err(|error| error.to_string())
 }
 
 /// Reports the call of `notification` when the rules do not grant what it needs.
@@ -1020,6 +1037,10 @@ const READ_WRITE: u32 = 3;
 const NOTIF_RECV: libc::c_ulong = ioctl_number(READ_WRITE, 0, mem::size_of::<Notification>());
 const NOTIF_SEND: libc::c_ulong = ioctl_number(READ_WRITE, 1, mem::size_of::<Response>());
 const NOTIF_ID_VALID: libc::c_ulong = ioctl_number(WRITE, 2, mem::size_of::<u64>());
+/// Every request the watcher makes on the notification descriptor, as the kernel reads an ioctl
+/// command: 32 bits.
+pub(crate) const NOTIFICATION_REQUESTS: [u32; 3] =
+    [NOTIF_RECV as u32, NOTIF_SEND as u32, NOTIF_ID_VALID as u32];
 
 /// Refuses the mode when the kernel's notification structures are not the ones above.
 fn check_notification_sizes() -> Result<(), SandboxError> {

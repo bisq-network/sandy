@@ -304,7 +304,7 @@ fn sandbox(
             if !plan.is_enforceable() {
                 return Err(refusal(&plan));
             }
-            refuse_sockets_on_standard_streams(&resolved, backend.ip_also_allows())?;
+            refuse_unsafe_standard_streams(&resolved, backend.ip_also_allows())?;
             let program = resolved
                 .program
                 .clone()
@@ -377,14 +377,21 @@ fn refuse_writable_trusted_files(
         .map_err(|error| error.to_string())
 }
 
-/// The program inherits standard input, output and error as they are, and a socket among them
-/// keeps the access it was created with (see `sandy_core::streams`). Only `run` can check this:
-/// the streams of a `check` are not the streams the later `run` gets.
-fn refuse_sockets_on_standard_streams(
+/// The program inherits standard input, output and error as they are: a socket among them keeps
+/// the access it was created with, and the master side of a pseudo-terminal lets the program
+/// signal the processes on the other side (see `sandy_core::streams`). Only `run` can check
+/// this: the streams of a `check` are not the streams the later `run` gets.
+fn refuse_unsafe_standard_streams(
     resolved: &ResolvedPolicy,
     ip_also_allows: &[CreatableSocket],
 ) -> Result<(), String> {
     for stream in StandardStream::ALL {
+        if stdio::terminal_master_on(stream)? {
+            if let Some(reason) = sandy_core::streams::terminal_master_refusal(resolved, stream) {
+                return Err(reason);
+            }
+            continue;
+        }
         let Some(socket) = stdio::socket_on(stream)? else {
             continue;
         };

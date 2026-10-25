@@ -249,6 +249,66 @@ fn a_file_moved_out_of_a_granted_directory_keeps_its_grant() {
     lines[1].assert_blocked();
 }
 
+/// The "Links and identity" exception (docs/windows.md) says sandy compares policy paths by
+/// their spelling, so a second name of a file inside a writable path is not seen. This records
+/// that the sandboxed program itself cannot make such a second name: it cannot hard-link a file
+/// of a read, read-exec or unreadable path into a writable path, cannot make a junction that
+/// points out of its writable paths, and cannot make a symbolic link at all (the AppContainer
+/// token holds no `SeCreateSymbolicLinkPrivilege`). The residual therefore needs a second name
+/// planted by a process other than the sandboxed one. Each denial has an outside control that
+/// succeeds for the file owner, so a denial inside is the sandbox and not an impossible action.
+#[test]
+fn the_program_cannot_plant_a_link_reaching_outside_its_writable_paths() {
+    let fixture = Fixture::new("plant-link");
+    let outside_targets = || {
+        // A file in the read-exec directory to hard-link, and a writable subdirectory to point a
+        // junction at as the in-policy control. Recreated after `reset`.
+        fs::write(fixture.path("bin/file"), b"content").unwrap();
+        fs::create_dir_all(fixture.path("rw/sub")).unwrap();
+    };
+    let p = |from: &str, to: &str| format!("{}\u{1f}{}", fixture.arg(from), fixture.arg(to));
+    // Index 0 and 4 stay inside the writable path and are the positive controls: the operation
+    // itself works in the sandbox, so the other denials are about the target, not the call.
+    let hard = [
+        ("hardlink", p("rw/file", "rw/hl-in")),
+        ("hardlink", p("ro/file", "rw/hl-ro")),
+        ("hardlink", p("bin/file", "rw/hl-rx")),
+        ("hardlink", p("secret/file", "rw/hl-secret")),
+        ("junction", p("rw/sub", "rw/j-in")),
+        ("junction", p("ro", "rw/j-ro")),
+        ("junction", p("secret", "rw/j-secret")),
+    ];
+    let hard: Vec<(&str, &str)> = hard.iter().map(|(a, t)| (*a, t.as_str())).collect();
+
+    outside_targets();
+    for line in probe_outside(&hard) {
+        line.assert_ok();
+    }
+    fixture.reset();
+    outside_targets();
+    let inside = probe_inside(&fixture.access_args(), &hard);
+    inside[0].assert_ok(); // hard link within the writable path
+    inside[1].assert_blocked();
+    inside[2].assert_blocked();
+    inside[3].assert_blocked();
+    inside[4].assert_ok(); // junction within the writable path
+    inside[5].assert_blocked();
+    inside[6].assert_blocked();
+
+    // A symbolic link needs a privilege the AppContainer token never has. The outside control
+    // needs it too, so this part runs only where the test host grants it (an elevated session or
+    // developer mode); a standard user without it would see the same denial inside anyway.
+    let link = p("secret", "rw/s-secret");
+    let symlink = [("symbolic-link", link.as_str())];
+    fixture.reset();
+    outside_targets();
+    if probe_outside(&symlink)[0].result == "ok" {
+        fixture.reset();
+        outside_targets();
+        probe_inside(&fixture.access_args(), &symlink)[0].assert_blocked();
+    }
+}
+
 #[test]
 fn refuses_to_grant_through_a_junction() {
     let fixture = Fixture::new("junction");
