@@ -399,9 +399,49 @@ The sandbox refuses access, it does not hide what exists. Paths outside the poli
 
 So the program can tell whether a path exists, and from the names it guesses it learns what the
 user has. Hiding paths would need a separate view of the file system, which `DESIGN.md` names a
-non-goal. The same holds for the user's processes: the program cannot open them, but a Toolhelp
-snapshot still lists them. The file case is recorded in
+non-goal. The file case is recorded in
 `review_windows::an_existing_path_outside_the_policy_is_told_apart_from_a_missing_one`.
+
+Processes are different: the AppContainer gives the program a narrower view than the file system
+does. The program cannot open the user's processes (see "Other processes"), and it cannot list
+them either. Every enumerator that reads the whole process list outside the sandbox returns,
+inside the AppContainer, only the pid 0 placeholder and the program's own AppContainer processes:
+the program itself, its console host, and the relays of `expose` or `forward`, which run
+`sandy.exe` in the same AppContainer. Measured on build 26200 for a Toolhelp snapshot
+(`CreateToolhelp32Snapshot`), `EnumProcesses`, `NtQuerySystemInformation(SystemProcessInformation)`
+and `WTSEnumerateProcessesW`; all four agree, and the control outside the sandbox lists the whole
+machine. The low box (AppContainer) token filters the system process list, so this does not
+depend on how the program was started: the same filtered list of three came back under the test
+VM's network logon (its SSH session), under a scheduled task run as the user with an S4U
+(batch-like) logon, and under a scheduled task run as SYSTEM. Process isolation is documented for
+the AppContainer [AppContainer isolation], and the filtered list has been reported since Windows 8
+[MalwareTech]; sandy supports Windows 10 1809 and later, where the mechanism predates the floor,
+but the measurement here is on build 26200 only. The listing is recorded in
+`review_windows::the_sandbox_process_list_holds_only_its_own_processes` and
+`wts_process_enumeration_is_also_filtered`.
+
+Two narrower facts about processes still reach the program:
+
+- **A guessed process id.** The filtered list does not hide whether a given id is live. `OpenProcess`
+  on an id outside the AppContainer answers `ERROR_ACCESS_DENIED` (5), and on an id that no process
+  has answers `ERROR_INVALID_PARAMETER` (87), so by trying ids the program can still tell which are
+  in use, as it can tell an existing path from a missing one. sandy cannot change this: the answer
+  is the kernel's, and Windows gives the program no system-call filter to intercept it. Recorded in
+  `review_windows::a_guessed_process_id_still_tells_existence_apart_from_absence`.
+- **The session number.** The sandbox does not move the program into a session of its own, so
+  `ProcessIdToSessionId` tells it the Terminal Services session it shares with sandy. This is the
+  session number alone, nothing about other processes. Recorded in
+  `review_windows::the_sandbox_runs_in_sandys_session`.
+
+Two further routes to other processes could not be measured in the test VM's non-interactive
+sessions. Window enumeration (`EnumWindows`, `FindWindow`) needs `user32.dll`, which cannot
+initialize in an AppContainer in such a session (limitation 13); under `windows.win32k = "deny"`
+the win32k system calls that back those functions are gone outright, so a program cannot enumerate
+windows at all. WMI reaches a process list through COM, which also does not load in an AppContainer
+in these sessions (see `com_services_outside_the_sandbox_are_unreachable`), and the COM boundary
+denies the sandbox where COM does load. Both belong on an interactive session to measure, like the
+ConPTY question (see the release notes). Performance-counter data (Perflib through the registry,
+and PDH on top of it) was not measured.
 
 ### Removing the changes
 
@@ -770,7 +810,9 @@ pipe grants nothing to AppContainers [CreateNamedPipeW] [Implementing an AppCont
 - **Other processes.** A process created outside the AppContainer has a default DACL that grants
   nothing to the AppContainer SID, so the program cannot open it, read its memory or terminate it
   [Implementing an AppContainer]. The escape test `cannot_open_processes_outside` checks
-  `PROCESS_VM_READ` and `PROCESS_TERMINATE`.
+  `PROCESS_VM_READ` and `PROCESS_TERMINATE`. The AppContainer token also filters the system
+  process list, so the program cannot even list the user's processes; it sees only its own (see
+  "What the program can see").
 - **Console.** A process on the console of sandy could send Ctrl+C and Ctrl+Break to every
   process on that console; the console host applies no check to `GenerateConsoleCtrlEvent`
   [Synacktiv] [Terminal]. On Windows 10 2004 to 21H1, it could also write keystrokes into the
@@ -1024,7 +1066,7 @@ Host: Windows 11 build 26200 (VM), binaries built for `x86_64-pc-windows-gnu`. T
 an elevated SSH session and without administrator rights. Latest elevated run, every test
 passing: `sandy_core` 65, `sandy_relay` 12, `sandy_windows` 77, `sandy` 14, `escape` 27,
 `escape_windows` 63, `expose` 5, `forward` 3, `children` 5, `parent` 5, `check` 11, `runner` 3,
-`review_windows` 7. The
+`review_windows` 11. The
 COM check of `review_windows` is skipped there: the SSH session is session 0, where `ole32.dll`
 does not load in an AppContainer (limitation 13), so a denial would not be the COM boundary.
 Earlier non-administrator runs used a scheduled task with `/RL LIMITED` (medium integrity,
@@ -1062,6 +1104,15 @@ Facts these runs established:
 - The program cannot open other processes of the user (`PROCESS_VM_READ`, `PROCESS_TERMINATE`),
   write to the registry autostart key, open a named pipe with the default DACL, or receive
   inherited handles other than the standard ones.
+- The program cannot list the user's processes. A Toolhelp snapshot, `EnumProcesses`,
+  `NtQuerySystemInformation(SystemProcessInformation)` and `WTSEnumerateProcessesW` each return,
+  inside the AppContainer, only the pid 0 placeholder and the program's own AppContainer processes
+  (itself and its console host), while the control outside lists the whole machine (107 processes
+  in the latest run). The same filtered list came back under the SSH (network) logon, a scheduled
+  task with an S4U logon as the user, and a scheduled task as SYSTEM, so the filter is the low box
+  token, not the logon type. `OpenProcess` still tells an existing process id outside the
+  AppContainer (`ERROR_ACCESS_DENIED`) from one no process has (`ERROR_INVALID_PARAMETER`), and
+  `ProcessIdToSessionId` reports the session the program shares with sandy.
 - A process in the AppContainer can open a relay in the same AppContainer with
   `PROCESS_VM_READ` and `PROCESS_TERMINATE`, but not `sandy.exe` outside it.
 - A relay without network capabilities reaches the program over loopback. Without the loopback
@@ -1140,6 +1191,7 @@ Facts these runs established:
 ## Sources
 
 - [AF_UNIX] AF_UNIX comes to Windows: https://devblogs.microsoft.com/commandline/af_unix-comes-to-windows/
+- [AppContainer isolation] https://learn.microsoft.com/en-us/windows/win32/secauthz/appcontainer-isolation
 - [BatBadBut] Rust security advisory CVE-2024-24576: https://blog.rust-lang.org/2024/04/09/cve-2024-24576.html
 - [Capabilities] App capability declarations: https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/app-capability-declarations
 - [Chromium design] Sandbox design: https://chromium.googlesource.com/chromium/src/+/main/docs/design/sandbox.md
@@ -1160,6 +1212,7 @@ Facts these runs established:
 - [LaunchAppContainer] Microsoft SandboxSecurityTools: https://github.com/microsoft/SandboxSecurityTools/blob/HEAD/LaunchAppContainer/README.md
 - [Legacy apps] AppContainer for legacy applications: https://learn.microsoft.com/en-us/windows/win32/secauthz/appcontainer-for-legacy-applications-
 - [Loopback] How to enable loopback and troubleshoot network isolation: https://learn.microsoft.com/en-us/previous-versions/windows/apps/hh780593(v=win.10)
+- [MalwareTech] Advanced desktop application sandboxing via AppContainer: https://malwaretech.com/2015/09/advanced-desktop-application-sandboxing.html
 - [MSRC] Windows security servicing criteria: https://www.microsoft.com/en-us/msrc/windows-security-servicing-criteria
 - [NetworkIsolationSetAppContainerConfig] https://learn.microsoft.com/en-us/windows/win32/api/netfw/nf-netfw-networkisolationsetappcontainerconfig
 - [Parsing arguments] Parsing C command-line arguments: https://learn.microsoft.com/en-us/cpp/c-language/parsing-c-command-line-arguments

@@ -177,6 +177,10 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
         "grant-all-packages" => windows_actions::grant_all_packages(target),
         "open-process-right" => windows_actions::open_process_right(target),
         "open-thread-right" => windows_actions::open_thread_right(target),
+        "list-processes" => windows_actions::list_processes(),
+        "session-id" => windows_actions::session_id(),
+        "wts-processes" => windows_actions::wts_processes(),
+        "enum-windows" => windows_actions::enum_windows(),
         "junction" => windows_actions::junction(target),
         "symbolic-link" => windows_actions::symbolic_link(target),
         // Connects to the AF_UNIX socket whose path the file `target` holds; the test writes the
@@ -2337,6 +2341,191 @@ mod windows_actions {
         Ok((id, right))
     }
 
+    /// Lists the processes this token can see, three ways: a Toolhelp snapshot, `EnumProcesses`
+    /// and `NtQuerySystemInformation(SystemProcessInformation)`. The detail is
+    /// `toolhelp=N enumproc=M ntqsi=K self=PID names=a.exe,b.exe`, where the names are the
+    /// distinct executable names of the Toolhelp entries, so a caller can tell an AppContainer's
+    /// filtered list (only its own processes and the pid 0 placeholder) from the full list a
+    /// control outside the sandbox sees.
+    pub fn list_processes() -> io::Result<String> {
+        use std::collections::BTreeSet;
+        use windows_sys::Wdk::System::SystemInformation::{
+            NtQuerySystemInformation, SystemProcessInformation,
+        };
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        };
+        use windows_sys::Win32::System::ProcessStatus::EnumProcesses;
+
+        /// Counts the process entries `NtQuerySystemInformation(SystemProcessInformation)`
+        /// returns. The entries form a linked list whose `NextEntryOffset` (the first `u32` of
+        /// each entry) reaches the next one and is zero on the last.
+        fn ntqsi_process_count() -> io::Result<usize> {
+            let mut buffer = vec![0u8; 1 << 20];
+            loop {
+                let mut needed = 0u32;
+                // SAFETY: the buffer and its length are passed; needed is a valid out pointer.
+                let status = unsafe {
+                    NtQuerySystemInformation(
+                        SystemProcessInformation,
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len() as u32,
+                        &mut needed,
+                    )
+                };
+                // STATUS_INFO_LENGTH_MISMATCH: grow the buffer and try again.
+                if status == 0xC0000004u32 as i32 {
+                    buffer.resize((needed as usize).max(buffer.len() * 2), 0);
+                    continue;
+                }
+                if status < 0 {
+                    return Err(io::Error::from_raw_os_error(status));
+                }
+                let mut offset = 0usize;
+                let mut count = 0usize;
+                loop {
+                    if offset + 4 > buffer.len() {
+                        break;
+                    }
+                    count += 1;
+                    let next =
+                        u32::from_ne_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+                    if next == 0 {
+                        break;
+                    }
+                    offset += next;
+                }
+                return Ok(count);
+            }
+        }
+
+        // Toolhelp: count the entries and collect their executable names.
+        // SAFETY: a process snapshot takes no process id.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the structure is plain data; dwSize is set before use.
+        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut toolhelp = 0usize;
+        let mut names = BTreeSet::new();
+        // SAFETY: snapshot is valid and entry has its size set.
+        let mut more = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+        while more {
+            toolhelp += 1;
+            let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(0);
+            names.insert(String::from_utf16_lossy(&entry.szExeFile[..len]));
+            // SAFETY: as above.
+            more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+        }
+        // SAFETY: snapshot is a handle this function owns.
+        unsafe { CloseHandle(snapshot) };
+
+        // EnumProcesses: the count of process ids it returns.
+        let mut pids = vec![0u32; 8192];
+        let mut returned = 0u32;
+        // SAFETY: the buffer length in bytes is passed; returned is a valid out pointer.
+        let ok = unsafe {
+            EnumProcesses(
+                pids.as_mut_ptr(),
+                (pids.len() * size_of::<u32>()) as u32,
+                &mut returned,
+            )
+        };
+        let enumproc = if ok == 0 {
+            return Err(io::Error::last_os_error());
+        } else {
+            returned as usize / size_of::<u32>()
+        };
+
+        // NtQuerySystemInformation: walk the linked list and count the entries.
+        let ntqsi = ntqsi_process_count()?;
+
+        let names: Vec<_> = names.into_iter().collect();
+        Ok(format!(
+            "toolhelp={toolhelp} enumproc={enumproc} ntqsi={ntqsi} self={} names={}",
+            std::process::id(),
+            names.join(",")
+        ))
+    }
+
+    /// This process's Terminal Services session id (`ProcessIdToSessionId`). A sandboxed program
+    /// shares sandy's session; the detail is `session=N`.
+    pub fn session_id() -> io::Result<String> {
+        use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+
+        let mut session = 0u32;
+        // SAFETY: session is a valid out pointer.
+        let ok = unsafe { ProcessIdToSessionId(std::process::id(), &mut session) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(format!("session={session}"))
+    }
+
+    /// Lists the processes `WTSEnumerateProcessesW` returns for the current server, a route that
+    /// does not go through the Toolhelp or NT process list. The detail is `wts=N`.
+    pub fn wts_processes() -> io::Result<String> {
+        use windows_sys::Win32::System::RemoteDesktop::{
+            WTS_CURRENT_SERVER_HANDLE, WTS_PROCESS_INFOW, WTSEnumerateProcessesW, WTSFreeMemory,
+        };
+
+        let mut info: *mut WTS_PROCESS_INFOW = ptr::null_mut();
+        let mut count = 0u32;
+        // SAFETY: info and count are valid out pointers; version 1 is required.
+        let ok = unsafe {
+            WTSEnumerateProcessesW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut info, &mut count)
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: info points to memory WTS allocated; free it exactly once.
+        unsafe { WTSFreeMemory(info.cast()) };
+        Ok(format!("wts={count}"))
+    }
+
+    /// Counts the top-level windows `EnumWindows` returns. `user32.dll` is loaded at run time so
+    /// a session where it cannot initialize in an AppContainer (docs/windows.md limitation 13)
+    /// reports the load error instead of failing at startup. The detail is `windows=N`.
+    pub fn enum_windows() -> io::Result<String> {
+        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+
+        unsafe extern "system" fn count(_window: HANDLE, param: isize) -> i32 {
+            // SAFETY: param is the &mut usize this function passed as lParam.
+            unsafe { *(param as *mut usize) += 1 };
+            TRUE
+        }
+
+        let module = {
+            let wide = wide("user32.dll");
+            // SAFETY: the name is NUL-terminated.
+            unsafe { LoadLibraryW(wide.as_ptr()) }
+        };
+        if module.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the module is loaded and the name is NUL-terminated.
+        let address = unsafe { GetProcAddress(module, c"EnumWindows".as_ptr().cast()) }
+            .ok_or_else(io::Error::last_os_error)?;
+        type Export = unsafe extern "system" fn() -> isize;
+        type EnumWindows = unsafe extern "system" fn(
+            unsafe extern "system" fn(HANDLE, isize) -> i32,
+            isize,
+        ) -> i32;
+        // SAFETY: EnumWindows has this signature.
+        let enum_windows = unsafe { std::mem::transmute::<Export, EnumWindows>(address) };
+        let mut total = 0usize;
+        // SAFETY: count is a valid callback and total outlives the call.
+        let ok = unsafe { enum_windows(count, &mut total as *mut usize as isize) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(format!("windows={total}"))
+    }
+
     /// `KEY\VALUE` below HKEY_CURRENT_USER.
     fn registry_target(target: &str) -> io::Result<(Vec<u16>, Vec<u16>)> {
         let (key, value) = target
@@ -2884,6 +3073,22 @@ mod windows_actions {
     }
 
     pub fn symbolic_link(_target: &str) -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn list_processes() -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn session_id() -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn wts_processes() -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn enum_windows() -> io::Result<String> {
         unsupported()
     }
 }

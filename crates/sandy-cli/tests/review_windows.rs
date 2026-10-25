@@ -20,6 +20,48 @@ const C_COM: &str = "sandy.review.com";
 const C_SYSSET: &str = "sandy.review.sysset";
 const C_REGRANT: &str = "sandy.review.regrant";
 const C_RELINK: &str = "sandy.review.relink";
+const C_PROCLIST: &str = "sandy.review.proclist";
+const C_WTS: &str = "sandy.review.wts";
+const C_PIDORACLE: &str = "sandy.review.pidoracle";
+const C_SESSION: &str = "sandy.review.session";
+
+/// The executable names a minimal sandbox run shows in its own process list: the always-present
+/// pid 0 placeholder, the program, its console host, and (with `expose`/`forward`) the relays,
+/// which run `sandy.exe` in the same AppContainer. Everything else is another AppContainer's or
+/// the rest of the machine's, which the AppContainer token filters out (measured on build 26200).
+const OWN_PROCESS_NAMES: &[&str] = &[
+    "[system process]",
+    "sandy-probe.exe",
+    "conhost.exe",
+    "sandy.exe",
+];
+
+/// Parses a `list-processes` detail (`toolhelp=N enumproc=M ntqsi=K self=PID names=a.exe,b.exe`)
+/// into the three counts and the lowercased set of names.
+fn parse_process_list(detail: &str) -> ([usize; 3], Vec<String>) {
+    let value = |key: &str| -> &str {
+        detail
+            .split(' ')
+            .find_map(|token| token.strip_prefix(key))
+            .unwrap_or("")
+    };
+    let counts = [
+        value("toolhelp=").parse().unwrap_or(0),
+        value("enumproc=").parse().unwrap_or(0),
+        value("ntqsi=").parse().unwrap_or(0),
+    ];
+    // The names field is last and may itself hold spaces (the placeholder), so take everything
+    // after "names=".
+    let names = detail
+        .split_once("names=")
+        .map(|(_, rest)| rest)
+        .unwrap_or("")
+        .split(',')
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    (counts, names)
+}
 
 fn args(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| s.to_string()).collect()
@@ -361,4 +403,173 @@ fn system_set_exposes_no_user_profile_data() {
         line.assert_blocked();
     }
     delete_profile(C_SYSSET);
+}
+
+/// Recorded: a program in the sandbox sees only its own processes. Three enumerators that each
+/// read the whole system process list outside the sandbox (a Toolhelp snapshot, `EnumProcesses`
+/// and `NtQuerySystemInformation(SystemProcessInformation)`) return, inside the AppContainer,
+/// only the pid 0 placeholder and the program's own AppContainer processes (itself and its
+/// console host). The AppContainer (low box) token filters the system process list, so this is
+/// a narrower view than docs/windows.md once claimed ("a Toolhelp snapshot still lists them").
+/// The control outside the sandbox lists the whole machine, so the filtering is the sandbox and
+/// not an empty machine.
+#[test]
+fn the_sandbox_process_list_holds_only_its_own_processes() {
+    delete_profile(C_PROCLIST);
+
+    let outside = probe_outside(&[("list-processes", ".")]);
+    let (out_counts, out_names) = parse_process_list(&outside[0].detail);
+    // The control lists the whole machine: many processes, and names that are not the sandbox's
+    // own, so the comparison below is meaningful.
+    for count in out_counts {
+        assert!(
+            count > 10,
+            "control listed too few processes: {:?}",
+            outside[0]
+        );
+    }
+    assert!(
+        out_names
+            .iter()
+            .any(|name| !OWN_PROCESS_NAMES.contains(&name.as_str())),
+        "control listed only sandbox-own names: {:?}",
+        outside[0]
+    );
+
+    let inside = probe_inside(
+        &args(&["--appcontainer", C_PROCLIST]),
+        &[("list-processes", ".")],
+    );
+    let (in_counts, in_names) = parse_process_list(&inside[0].detail);
+    // All three enumerators agree, and every name is one of the program's own processes.
+    assert_eq!(
+        in_counts[0], in_counts[1],
+        "toolhelp and enumproc disagree: {:?}",
+        inside[0]
+    );
+    assert_eq!(
+        in_counts[0], in_counts[2],
+        "toolhelp and ntqsi disagree: {:?}",
+        inside[0]
+    );
+    assert!(in_counts[0] >= 1, "empty process list: {:?}", inside[0]);
+    assert!(
+        in_counts[0] <= OWN_PROCESS_NAMES.len(),
+        "the sandbox listed more processes than its own: {:?}",
+        inside[0]
+    );
+    for name in &in_names {
+        assert!(
+            OWN_PROCESS_NAMES.contains(&name.as_str()),
+            "the sandbox listed a process that is not its own ({name}): {:?}",
+            inside[0]
+        );
+    }
+    assert!(
+        in_names.iter().any(|name| name == "sandy-probe.exe"),
+        "the program does not see its own process: {:?}",
+        inside[0]
+    );
+
+    delete_profile(C_PROCLIST);
+}
+
+/// Recorded: `WTSEnumerateProcessesW`, a route to the process list that does not go through
+/// Toolhelp or the NT process information class, is filtered the same way. Inside the sandbox it
+/// returns only the program's own processes; the control outside returns the whole machine. So
+/// it is not a way around the filtering of the other enumerators.
+#[test]
+fn wts_process_enumeration_is_also_filtered() {
+    delete_profile(C_WTS);
+
+    let outside = probe_outside(&[("wts-processes", ".")]);
+    let out = outside[0]
+        .detail
+        .strip_prefix("wts=")
+        .and_then(|n| n.parse::<usize>().ok());
+    let out = out.unwrap_or_else(|| panic!("control WTS count unreadable: {:?}", outside[0]));
+    assert!(
+        out > 10,
+        "control listed too few processes over WTS: {:?}",
+        outside[0]
+    );
+
+    let inside = probe_inside(&args(&["--appcontainer", C_WTS]), &[("wts-processes", ".")]);
+    // WTS may be filtered (a small count) or denied outright; either way it is no bypass. A
+    // success must carry a count no larger than the program's own set.
+    if inside[0].result == "ok" {
+        let count = inside[0]
+            .detail
+            .strip_prefix("wts=")
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("sandbox WTS count unreadable: {:?}", inside[0]));
+        assert!(
+            count <= OWN_PROCESS_NAMES.len(),
+            "WTS listed more than the program's own processes: {:?}",
+            inside[0]
+        );
+    } else {
+        assert_eq!(
+            inside[0].result, "denied",
+            "unexpected WTS result: {:?}",
+            inside[0]
+        );
+    }
+
+    delete_profile(C_WTS);
+}
+
+/// Recorded: the filtered process list does not hide whether a given process id exists. The
+/// program cannot open a process outside its AppContainer, but `OpenProcess` tells "exists but
+/// denied" (ERROR_ACCESS_DENIED, 5) apart from "no such process" (ERROR_INVALID_PARAMETER, 87),
+/// so by guessing ids a program still learns which ones are live. This is the process analogue
+/// of the path existence oracle (see
+/// `an_existing_path_outside_the_policy_is_told_apart_from_a_missing_one`); sandy cannot close
+/// it, because the answer is the kernel's, so it is recorded here. The outside control, which
+/// owns the process, opens it, so the denial inside is the AppContainer boundary.
+#[test]
+fn a_guessed_process_id_still_tells_existence_apart_from_absence() {
+    delete_profile(C_PIDORACLE);
+    let existing = std::process::id().to_string(); // this test's own process, outside the sandbox
+    let missing = "999996"; // no such process (a multiple of four well above the live ids)
+
+    let outside = probe_outside(&[("open-process-read", &existing)]);
+    outside[0].assert_ok();
+
+    let inside = probe_inside(
+        &args(&["--appcontainer", C_PIDORACLE]),
+        &[
+            ("open-process-read", &existing),
+            ("open-process-read", missing),
+        ],
+    );
+    // An existing process outside the AppContainer: access denied, not "missing".
+    assert_eq!(inside[0].result, "denied", "{:?}", inside[0]);
+    assert!(inside[0].detail.contains("os error 5"), "{:?}", inside[0]);
+    // A process id that does not exist: a different error, so the two are distinguishable.
+    assert!(inside[1].detail.contains("os error 87"), "{:?}", inside[1]);
+
+    delete_profile(C_PIDORACLE);
+}
+
+/// Recorded: the sandbox does not move the program into a session of its own, so
+/// `ProcessIdToSessionId` tells the program the session it shares with sandy. This leaks the
+/// session number, nothing about other processes; the inside and outside answers match because
+/// both run in the same session.
+#[test]
+fn the_sandbox_runs_in_sandys_session() {
+    delete_profile(C_SESSION);
+    let outside = probe_outside(&[("session-id", ".")]);
+    outside[0].assert_ok();
+    let inside = probe_inside(
+        &args(&["--appcontainer", C_SESSION]),
+        &[("session-id", ".")],
+    );
+    inside[0].assert_ok();
+    assert_eq!(
+        inside[0].detail, outside[0].detail,
+        "the sandbox is in a different session than the control: {:?} vs {:?}",
+        inside[0], outside[0]
+    );
+    delete_profile(C_SESSION);
 }
