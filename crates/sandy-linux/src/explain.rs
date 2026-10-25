@@ -42,7 +42,7 @@ use seccompiler::BpfProgram;
 
 use crate::contain::{SIGNALED, START_FAILED, default_child_action};
 use crate::filter;
-use crate::helper::{block_signals, pipe};
+use crate::helper::{block_signals, pipe, set_dumpable, set_undumpable};
 use crate::launch::ensure_single_thread;
 use crate::plan::{LandlockConfig, PathRights};
 
@@ -815,6 +815,9 @@ pub fn supervise(
     status: &StatusReport,
 ) -> Result<i32, SandboxError> {
     ensure_single_thread()?;
+    // Before the fork, as in `contain::run`: a program with a write grant on `/proc` must never
+    // find sandy dumpable, or it could raise sandy's out-of-memory priority.
+    set_undumpable()?;
     let child_action = default_child_action()?;
     // Before the fork: a signal for the program that comes while it starts then waits for
     // `follow` instead of ending sandy.
@@ -878,6 +881,9 @@ fn program_main(
     start: impl FnOnce() -> SandboxError,
 ) -> ! {
     let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Err(error) = set_dumpable() {
+            return error;
+        }
         // SAFETY: restores the action that `default_child_action` returned.
         if unsafe { libc::sigaction(libc::SIGCHLD, child_action, std::ptr::null_mut()) } != 0 {
             return SandboxError::io("cannot restore SIGCHLD", io::Error::last_os_error());

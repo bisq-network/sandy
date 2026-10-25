@@ -395,7 +395,8 @@ impl ResolvedPolicy {
         protected: &'protected [ProtectedPath],
         identity: &PathIdentity,
     ) -> Option<(&'policy PathRule, &'protected ProtectedPath)> {
-        self.writable_conflicts(protected, identity).next()
+        self.writable_conflicts(protected, identity, Unknown::Overlaps)
+            .next()
     }
 
     /// Every writable path that reaches one of `protected`, with the location it reaches, in the
@@ -405,6 +406,7 @@ impl ResolvedPolicy {
         &'policy self,
         protected: &'protected [ProtectedPath],
         identity: &PathIdentity,
+        unknown: Unknown,
     ) -> impl Iterator<Item = (&'policy PathRule, &'protected ProtectedPath)> {
         self.paths
             .iter()
@@ -412,7 +414,7 @@ impl ResolvedPolicy {
             .flat_map(move |rule| {
                 protected
                     .iter()
-                    .filter(move |location| reaches(location, &rule.path, identity))
+                    .filter(move |location| reaches(location, &rule.path, identity, unknown))
                     .map(move |location| (rule, location))
             })
     }
@@ -425,14 +427,16 @@ impl ResolvedPolicy {
     /// sandy enforces. The advice names what removes the risk: a `PATH` without the directory
     /// only silences the warning, because the user's shell still looks there.
     ///
-    /// The backends pass the directories, as they do for `writable_conflict`, so a warning and a
-    /// refusal never disagree about what reaches what. A host whose comparison cannot be read
-    /// gets no warning: its policy is refused anyway, for the same reason.
+    /// The backends pass the directories, as they do for `writable_conflict`, and the comparison
+    /// is the same, except where sandy cannot read the identity of a directory on the way: a
+    /// warning then follows the spellings (`Unknown::Spelling`), so it names only an overlap sandy
+    /// sees. A host whose comparison cannot be read gets no warning: its policy is refused
+    /// anyway, for the same reason.
     pub fn path_directory_notes(&self, directories: &[ProtectedPath]) -> Vec<String> {
         let Ok(identity) = PathIdentity::read() else {
             return Vec::new();
         };
-        self.writable_conflicts(directories, &identity)
+        self.writable_conflicts(directories, &identity, Unknown::Spelling)
             .map(|(rule, directory)| {
                 format!(
                     "the writable path {} overlaps {}, a directory on sandy's PATH or on the \
@@ -449,16 +453,31 @@ impl ResolvedPolicy {
     }
 }
 
+/// What a comparison counts as when sandy cannot read the identity of a file on the way, which
+/// happens on Windows only: an elevated process may not follow a junction that a less trusted
+/// one made (`ERROR_UNTRUSTED_MOUNT_POINT`), for example.
+#[derive(Debug, Clone, Copy)]
+enum Unknown {
+    /// For a refusal: an overlap, so sandy refuses what it cannot tell apart.
+    Overlaps,
+    /// For a warning: what the spellings say. `within` compares them first, and a location has
+    /// a canonical spelling besides its own, so the warning names only an overlap sandy sees.
+    Spelling,
+}
+
 /// Whether the writable path `writable` reaches `location`: it contains the location, or it lies
 /// inside one that protects its tree.
-fn reaches(location: &ProtectedPath, writable: &Path, identity: &PathIdentity) -> bool {
-    let contains = location
-        .spellings()
-        .any(|path| identity.within(path, writable));
-    let inside = location.subtree
-        && location
-            .spellings()
-            .any(|path| identity.within(writable, path));
+fn reaches(
+    location: &ProtectedPath,
+    writable: &Path,
+    identity: &PathIdentity,
+    unknown: Unknown,
+) -> bool {
+    let within = |inner: &Path, outer: &Path| {
+        within(inner, outer, &identity.mounts).unwrap_or(matches!(unknown, Unknown::Overlaps))
+    };
+    let contains = location.spellings().any(|path| within(path, writable));
+    let inside = location.subtree && location.spellings().any(|path| within(writable, path));
     contains || inside
 }
 
@@ -673,45 +692,59 @@ fn lookup(base: &Path, path: &Path) -> std::io::Result<(PathBuf, Vec<OsString>)>
 /// A symbolic link at `inner` itself counts where it lies, not where it leads, as
 /// `traversed_entries` spells its entries: a link outside `outer` that points at it is not inside
 /// it, and the place it leads to is an entry or a spelling of its own that the callers compare.
+///
+/// What sandy cannot tell apart counts as within: the callers refuse on a match.
 fn is_within(inner: &Path, outer: &Path, mounts: &Mounts) -> bool {
-    inner.starts_with(outer)
-        || same_object_among_ancestors(inner, outer)
-        || same_physical_location(inner, outer, mounts)
+    within(inner, outer, mounts).unwrap_or(true)
 }
 
+/// The comparison of `is_within`, or `None` when the spellings differ and the identity of a
+/// file on the way cannot be read.
+fn within(inner: &Path, outer: &Path, mounts: &Mounts) -> Option<bool> {
+    if inner.starts_with(outer) || same_physical_location(inner, outer, mounts) {
+        return Some(true);
+    }
+    same_object_among_ancestors(inner, outer)
+}
+
+/// Unix always tells: a path whose metadata cannot be read matches nothing.
 #[cfg(unix)]
-fn same_object_among_ancestors(inner: &Path, outer: &Path) -> bool {
+fn same_object_among_ancestors(inner: &Path, outer: &Path) -> Option<bool> {
     use std::os::unix::fs::MetadataExt;
     let identity =
         |metadata: std::io::Result<std::fs::Metadata>| metadata.ok().map(|m| (m.dev(), m.ino()));
     let Some(outer) = identity(outer.metadata()) else {
-        return false;
+        return Some(false);
     };
-    identity(inner.symlink_metadata()) == Some(outer)
+    let same = identity(inner.symlink_metadata()) == Some(outer)
         || inner
             .ancestors()
             .skip(1)
-            .any(|ancestor| identity(ancestor.metadata()) == Some(outer))
+            .any(|ancestor| identity(ancestor.metadata()) == Some(outer));
+    Some(same)
 }
 
-/// An object whose identity cannot be read counts as `outer`: the callers refuse or warn on a
-/// match, so sandy refuses what it cannot tell apart instead of passing it. A path where no
-/// object is matches nothing, as on Unix.
+/// A path where no object is matches nothing, as on Unix. `None` when no path on the way
+/// matches but the identity of one cannot be read.
 #[cfg(windows)]
-fn same_object_among_ancestors(inner: &Path, outer: &Path) -> bool {
-    let matches = |id: std::io::Result<FileId>, outer: FileId| match id {
-        Ok(id) => id == outer,
-        Err(error) => !windows::no_object(&error),
-    };
+fn same_object_among_ancestors(inner: &Path, outer: &Path) -> Option<bool> {
     let outer = match windows::file_id(outer, true) {
         Ok(id) => id,
-        Err(error) => return !windows::no_object(&error),
+        Err(error) if windows::no_object(&error) => return Some(false),
+        Err(_) => return None,
     };
-    matches(windows::file_id(inner, false), outer)
-        || inner
-            .ancestors()
-            .skip(1)
-            .any(|ancestor| matches(windows::file_id(ancestor, true), outer))
+    let on_the_way = std::iter::once((inner, false))
+        .chain(inner.ancestors().skip(1).map(|ancestor| (ancestor, true)));
+    let mut unknown = false;
+    for (path, follow) in on_the_way {
+        match windows::file_id(path, follow) {
+            Ok(id) if id == outer => return Some(true),
+            Ok(_) => {}
+            Err(error) if windows::no_object(&error) => {}
+            Err(_) => unknown = true,
+        }
+    }
+    (!unknown).then_some(false)
 }
 
 /// Where the file systems of this host are mounted. A path says which directory it leads to but
@@ -2402,6 +2435,64 @@ mod tests {
             conflict(&data, &[ProtectedPath::tree(&home)]),
             Some((data.clone(), home.clone()))
         );
+    }
+
+    /// A link at `link` to the directory `target`: a symbolic link on Unix, a junction on
+    /// Windows.
+    fn directory_link(link: &Path, target: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        junction(link, target);
+    }
+
+    /// A warning names only a real overlap (rule 12). A PATH directory that does not exist, also
+    /// one below a link that leads elsewhere, does not reach an unrelated writable path, and one
+    /// whose identity sandy cannot read is compared by its spellings, while a refusal counts it
+    /// as an overlap. On Windows a name the file system rejects stands for such a directory: the
+    /// junction that an elevated process may not follow cannot be made from here (see
+    /// `escape_windows::warns_only_about_path_directories_a_writable_path_really_holds`).
+    #[test]
+    fn a_path_directory_is_warned_about_only_where_a_writable_path_holds_it() {
+        let dir = temp_dir();
+        let (tools, data) = (dir.join("tools"), dir.join("data"));
+        fs::create_dir_all(tools.join("1.0")).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        directory_link(&tools.join("current"), &tools.join("1.0"));
+        directory_link(&dir.join("into"), &data);
+        let notes = |writable: &Path, directories: &[PathBuf]| {
+            let policy = policy_with(&[], &[], &[writable]);
+            let resolved = ResolvedPolicy::resolve(&policy, None).unwrap();
+            let directories: Vec<ProtectedPath> =
+                directories.iter().map(ProtectedPath::entry).collect();
+            resolved.path_directory_notes(&directories).len()
+        };
+        let unreadable = dir.join("bad|name").join("bin");
+
+        let mut unrelated = vec![
+            tools.join("current").join("bin"),
+            dir.join("missing").join("bin"),
+        ];
+        unrelated.push(unreadable.clone());
+        for directory in &unrelated {
+            assert_eq!(
+                notes(&data, std::slice::from_ref(directory)),
+                0,
+                "{directory:?}"
+            );
+        }
+        // Controls: inside the writable path, also through a link into it and not created yet.
+        let inside = [data.join("bin"), dir.join("into").join("bin")];
+        for directory in &inside {
+            assert_eq!(
+                notes(&data, std::slice::from_ref(directory)),
+                1,
+                "{directory:?}"
+            );
+        }
+        // A refusal counts what sandy cannot tell apart as an overlap.
+        let refused = writable_conflict(&data, &[ProtectedPath::entry(&unreadable)]);
+        assert_eq!(refused.is_some(), cfg!(windows), "{refused:?}");
     }
 
     /// A writable path that holds a directory on PATH is warned about, not refused (rule 12),

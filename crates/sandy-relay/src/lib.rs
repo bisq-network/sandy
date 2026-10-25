@@ -241,6 +241,17 @@ fn relay_streams(client: TcpStream, server: TcpStream) -> io::Result<()> {
 fn relay_streams_with(client: TcpStream, server: TcpStream, idle: Duration) -> io::Result<()> {
     let _registered = Registered::new(&client, &server);
     let state = Connection::default();
+    // Without a timeout a read would block until the peer sends, also after an abort. Both are
+    // set before either direction starts: macOS refuses socket options (EINVAL) on a socket
+    // whose two directions have ended, although its unread bytes can still be read, and the
+    // other direction's half close can end the second one at any moment. Before anything is
+    // relayed, a socket refuses it only once it has been reset.
+    if client.set_read_timeout(Some(READ_TICK)).is_err()
+        || server.set_read_timeout(Some(READ_TICK)).is_err()
+    {
+        state.abort([&client, &server]);
+        return Ok(());
+    }
     thread::scope(|scope| {
         thread::Builder::new().spawn_scoped(scope, || {
             pump(
@@ -282,7 +293,7 @@ impl Connection {
 
 /// Copies `from` to `to` until `from` ends, the connection is aborted, or the other direction
 /// has ended and this one stayed idle for `idle`. `[ended, other_ended]` are the end flags of
-/// this direction and of the other one.
+/// this direction and of the other one. `from` must have a read timeout.
 fn pump(
     mut from: &TcpStream,
     mut to: &TcpStream,
@@ -293,10 +304,6 @@ fn pump(
     let mut buffer = vec![0u8; BUFFER_SIZE];
     let mut active = Instant::now();
     let mut saw_other_end = false;
-    // Without the timeout a read would block until the peer sends, also after an abort.
-    if from.set_read_timeout(Some(READ_TICK)).is_err() {
-        connection.abort([from, to]);
-    }
     while !connection.aborted.load(Ordering::Acquire) {
         match from.read(&mut buffer) {
             Ok(0) => {
@@ -795,6 +802,47 @@ mod tests {
         let mut answer = Vec::new();
         stream.read_to_end(&mut answer).unwrap();
         answer
+    }
+
+    /// A target that answers and ends its side at once, and a client that sends its request and
+    /// ends its side before it reads: both ends of the relay end at nearly the same moment, in
+    /// either order. Every request must still reach the target and every answer the client.
+    #[test]
+    fn a_request_and_an_answer_that_end_together_both_arrive() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap();
+        let (sender, requests) = std::sync::mpsc::channel();
+        // It answers on the thread that accepts, so the answer and its end follow the accept
+        // as closely as they can.
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let _ = stream.write_all(b"answer");
+                let _ = stream.shutdown(Shutdown::Write);
+                let mut request = Vec::new();
+                let received = stream.read_to_end(&mut request).map(|_| request);
+                let _ = sender.send(received.map_err(|error| error.kind()));
+            }
+        });
+        let relay = relay_to(target);
+        for round in 0..1000 {
+            let mut client = TcpStream::connect(relay).unwrap();
+            client.write_all(b"request").unwrap();
+            client.shutdown(Shutdown::Write).unwrap();
+            let mut answer = Vec::new();
+            let answered = client.read_to_end(&mut answer).map(|_| answer);
+            let request = requests.recv_timeout(Duration::from_secs(10));
+            assert_eq!(
+                request,
+                Ok(Ok(b"request".to_vec())),
+                "round {round}: the target did not get the request"
+            );
+            assert_eq!(
+                answered.map_err(|error| error.kind()),
+                Ok(b"answer".to_vec()),
+                "round {round}: the client did not get the answer"
+            );
+        }
     }
 
     #[test]

@@ -2644,6 +2644,66 @@ fn warns_about_a_writable_path_that_holds_a_directory_on_path() {
     assert!(!warnings.contains(&fixture.arg("rw/bin")), "{warnings}");
 }
 
+/// A warning names only a real overlap. A PATH entry that leads through a junction this session
+/// may not follow cannot be identified: an elevated process does not traverse a junction that a
+/// less trusted process made (`ERROR_UNTRUSTED_MOUNT_POINT`, measured on Windows 11 for a
+/// junction that the sandboxed program made, as a package manager of the user makes them). A
+/// PATH entry that does not exist leads nowhere. Neither reaches an unrelated writable path, so
+/// `check` compares the canonical spellings and does not warn. The controls are the same kinds of
+/// entry inside the writable path, through such a junction, through one this test made and one
+/// that does not exist yet, which the program could create; all of them are warned about.
+#[test]
+fn warns_only_about_path_directories_a_writable_path_really_holds() {
+    let fixture = Fixture::new("path-untrusted");
+    for dir in [r"tools\1.0", "data", r"rw\1.0\bin"] {
+        fs::create_dir_all(fixture.path(dir)).unwrap();
+    }
+    for (writable, version) in [("tools", r"tools\1.0"), ("rw", r"rw\1.0")] {
+        let link = format!(
+            "{}\u{1f}{}",
+            fixture.arg(version),
+            fixture.arg(&format!(r"{writable}\current"))
+        );
+        let made = probe_inside(
+            &args(&["--read-write", &fixture.arg(writable)]),
+            &[("junction", &link)],
+        );
+        made[0].assert_ok();
+    }
+    let _into = DirectoryLink::new("/J", &fixture.path("into"), &fixture.path("rw"))
+        .expect("mklink /J failed");
+    let entry = |relative: &str| plain_path(&fixture.path(relative));
+    let warned = |entries: &[String], writable: &str| {
+        let output = check_with_path(
+            &format!("{};C:\\Windows\\system32", entries.join(";")),
+            &fixture.arg(writable),
+        );
+        let warnings = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let named: Vec<bool> = entries
+            .iter()
+            .map(|entry| {
+                warnings
+                    .lines()
+                    .any(|line| line.starts_with("warning: ") && line.contains(entry.as_str()))
+            })
+            .collect();
+        (named, warnings)
+    };
+
+    let unrelated = [entry(r"tools\current\bin"), entry(r"missing\bin")];
+    let (named, warnings) = warned(&unrelated, "data");
+    assert_eq!(named, [false, false], "{warnings}");
+
+    let inside = [
+        entry(r"rw\current\bin"),
+        entry(r"into\1.0\bin"),
+        entry(r"rw\later\bin"),
+    ];
+    let (named, warnings) = warned(&inside, "rw");
+    assert_eq!(named, [true, true, true], "{warnings}");
+}
+
 /// A writable path that holds a directory on PATH and a trusted location stays refused: the
 /// warning never replaces the refusal. The folder on PATH does not have to exist, so this only
 /// reads state, as the test above.

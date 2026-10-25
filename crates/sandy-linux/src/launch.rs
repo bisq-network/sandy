@@ -18,7 +18,7 @@ use landlock::{
 use sandy_core::{ParentProcess, SandboxError, StatusReport, TargetCommand};
 
 use crate::explain::{self, Observer};
-use crate::filter::{FilterConfig, Filters};
+use crate::filter::{FilterConfig, Filters, TargetProcess};
 use crate::host::THREADS_DIR;
 use crate::plan::{FileIdentity, LandlockConfig, Sandbox};
 use crate::{contain, filter, relay, watch};
@@ -103,10 +103,31 @@ pub fn launch(
     }
 }
 
-/// The filters for this process. The denylist names the caller's process ID.
+/// The filters for this process. The denylist names its process, user and group IDs.
 fn build_filters(config: &FilterConfig) -> Result<Filters, SandboxError> {
-    filter::build(config, std::process::id())
+    filter::build(config, &this_process()?)
         .map_err(|error| SandboxError::new(format!("cannot build the seccomp filter: {error}")))
+}
+
+fn this_process() -> Result<TargetProcess, SandboxError> {
+    let (mut real, mut effective, mut saved) = (0, 0, 0);
+    let (mut real_group, mut effective_group, mut saved_group) = (0, 0, 0);
+    // SAFETY: both calls write three IDs through valid pointers.
+    let read = unsafe {
+        libc::getresuid(&mut real, &mut effective, &mut saved) == 0
+            && libc::getresgid(&mut real_group, &mut effective_group, &mut saved_group) == 0
+    };
+    if !read {
+        return Err(SandboxError::io(
+            "cannot read the user and group IDs",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(TargetProcess {
+        pid: std::process::id(),
+        uids: [real, effective, saved],
+        gids: [real_group, effective_group, saved_group],
+    })
 }
 
 /// Restricts this process step by step: descriptors, no_new_privs, Landlock, seccomp. The

@@ -738,20 +738,23 @@ fn file_system_ioctls_cannot_change_readable_files() {
 
 /// docs/linux.md, "Metadata through open files": with `path_metadata = "deny"`, a descriptor of a
 /// file that a `read` path opened cannot change the owner or the extended attributes of the file
-/// (EPERM and ENOTSUP), and with `allow` it can. The mode and the times still change, which
-/// records a documented limitation: seccomp sees only the descriptor number, not how the file
-/// was opened, and cp, touch and Rust's `fs::copy` need `fchmod` and `futimens` on the files
-/// they write. If that part fails, sandy gained a way to tell the two apart.
+/// (EPERM and ENOTSUP), and with `allow` it can. The mode and the times still change, of the
+/// file and of the directory of the `read` path, which records the exception of DESIGN.md that
+/// `check` warns about: seccomp sees only the descriptor number, not how the file was opened,
+/// and cp, touch and Rust's `fs::copy` need `fchmod` and `futimens` on the files they write. If
+/// that part fails, sandy gained a way to tell the two apart.
 #[test]
 fn a_read_only_descriptor_changes_only_the_mode_and_the_times() {
     let fixture = Fixture::new("conformance-fdmeta");
-    let file = fixture.arg("ro/file");
+    let (file, directory) = (fixture.arg("ro/file"), fixture.arg("ro"));
     // fchown on the file as standard input, with no new owner or group: the kernel still
     // checks the call and updates the change time.
     let chown = format!("{}:0:-1:-1", libc::SYS_fchown);
     let actions = [
         ("fchmod-ro", file.as_str()),
         ("utime-ro", file.as_str()),
+        ("fchmod-ro", directory.as_str()),
+        ("utime-ro", directory.as_str()),
         ("raw-syscall", chown.as_str()),
         ("setxattr-fd", file.as_str()),
     ];
@@ -773,9 +776,9 @@ fn a_read_only_descriptor_changes_only_the_mode_and_the_times() {
             continue;
         }
         allowed[index].assert_ok();
-        match index {
-            0 | 1 => inside[index].assert_ok(),
-            2 => assert!(is_eperm(&inside[index]), "{inside:?}"),
+        match control.action.as_str() {
+            "fchmod-ro" | "utime-ro" => inside[index].assert_ok(),
+            "raw-syscall" => assert!(is_eperm(&inside[index]), "{inside:?}"),
             _ => assert!(has_errno(&inside[index], libc::ENOTSUP), "{inside:?}"),
         }
     }

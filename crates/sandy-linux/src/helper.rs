@@ -172,13 +172,29 @@ pub(crate) fn start(name: &str, main: impl FnOnce(Ready)) -> Result<libc::pid_t,
 /// Gives this process's `/proc/<pid>` files to root, so that the program cannot change them even
 /// with a write grant on `/proc`. Without this the program can set `oom_score_adj` of sandy's
 /// processes to the maximum and let the kernel's out-of-memory killer end them before anything
-/// else, which takes away the guarantee they stand for. The kernel resets the flag on execve, so
-/// the program itself is unaffected.
+/// else, which takes away the guarantee they stand for. A child forked afterwards starts with the
+/// flag, which the kernel resets when the child executes the target, so the program itself is
+/// unaffected.
 pub(crate) fn set_undumpable() -> Result<(), SandboxError> {
     // SAFETY: PR_SET_DUMPABLE only sets a process flag.
     if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
         return Err(SandboxError::io(
             "cannot hide the process from the program",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+/// Makes a forked program dumpable again, which it inherited undumpable from sandy: the watcher of
+/// the diagnostic mode reads the path of the program's execve out of its memory, which the kernel
+/// allows only for a dumpable process (measured on Linux 7.2: every such path was unreadable).
+/// It changes only this process, not sandy or the guard.
+pub(crate) fn set_dumpable() -> Result<(), SandboxError> {
+    // SAFETY: PR_SET_DUMPABLE only sets a process flag.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) } != 0 {
+        return Err(SandboxError::io(
+            "cannot make the program readable for the diagnostic mode",
             io::Error::last_os_error(),
         ));
     }

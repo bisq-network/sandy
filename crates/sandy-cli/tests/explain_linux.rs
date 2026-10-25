@@ -222,6 +222,9 @@ fn the_mode_names_a_path_a_child_of_the_program_uses() {
     );
 }
 
+/// With `contained`, the supervising sandy is undumpable from before it forks the program, and
+/// the program makes itself dumpable again, because the watcher reads the path of its execve out
+/// of its memory: no watched path may be unreadable.
 #[test]
 fn the_mode_works_while_sandy_contains_the_children() {
     if !isolates_signals() {
@@ -244,6 +247,30 @@ fn the_mode_works_while_sandy_contains_the_children() {
         lines.iter().any(|line| line.contains(&denied)),
         "the path is not named: {lines:?}"
     );
+    let summary = lines.last().expect("a summary");
+    assert!(!summary.contains("could not be read"), "{lines:?}");
+}
+
+/// sandy stays the program's parent in this mode. Like the supervisor of `contained`, it is
+/// undumpable from before the fork, so a program with a write grant on `/proc` cannot raise its
+/// out-of-memory priority and have the kernel end it first, while the program may raise its own
+/// (the control). The program's paths stay readable for the watcher.
+#[test]
+fn the_program_cannot_raise_the_oom_priority_of_sandy() {
+    let fixture = Fixture::new("explain-oom");
+    let mut with_mode = fixture.access_args();
+    with_mode.extend(args(&["--explain", "--read-write", "/proc"]));
+    let output = run(
+        &with_mode,
+        &[("oom-raise", "self"), ("oom-raise", "parent")],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let lines = parse(&output);
+    lines[0].assert_ok();
+    lines[1].assert_blocked();
+    let explained = explained(&output);
+    let summary = explained.last().expect("a summary");
+    assert!(!summary.contains("could not be read"), "{explained:?}");
 }
 
 /// sandy stays the program's parent in this mode, so it cannot pass on the signals that

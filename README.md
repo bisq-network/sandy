@@ -691,12 +691,12 @@ Landlock does not control `chmod`, `chown`, `utimensat` and `setxattr`. With the
 `path_metadata = "deny"`, sandy denies these calls when they take a path, everywhere, also inside
 writable paths, and the owner and extended attribute calls on an open file (`fchown`, `fsetxattr`)
 too. The mode and time calls on an open file (`fchmod`, `futimens`) keep working, also on a file
-the program may only read. The file system ioctls that change a file the same way, and fs-verity,
-fscrypt, deduplication and btrfs subvolume ioctls, are denied under every policy. Tools that change
-metadata by path (`install`, `cp -a` on a directory, `rsync -a`, `unzip`, `git`) need `"allow"`;
-then the program can change the metadata of every file the user owns. `cp -p`, and `cp -a` on a
-single file, work under `"deny"`, because they set the metadata through the descriptor they
-wrote.
+the program may only read, which `sandy check` warns about. The file system ioctls that change a
+file the same way, and fs-verity, fscrypt, deduplication and btrfs subvolume ioctls, are denied
+under every policy. Tools that change metadata by path (`install`, `cp -a` on a directory,
+`rsync -a`, `unzip`, `git`) need `"allow"`; then the program can change the metadata of every file
+the user owns. `cp -p`, and `cp -a` on a single file, work under `"deny"`, because they set the
+metadata through the descriptor they wrote.
 
 ## Platform notes
 
@@ -817,6 +817,12 @@ Recommendations:
    the master side of a pseudo-terminal, which a terminal emulator or `expect` holds, because
    the program could type Ctrl+C into it and so signal the processes on the other side. Pass
    the slave side, the terminal a program normally runs in, or a pipe.
+8. **Do not give an untrusted program your terminal.** What the program writes to a terminal
+   reaches the terminal emulator, which acts on some escape sequences, for example to set the
+   clipboard, and on Linux the program can also change the terminal's modes. These are ordinary
+   writes, which no system call filter can tell apart, so sandy cannot stop them. Redirect the
+   program's output to a file or a pipe, and show it to a person only through a filter that
+   removes control sequences. A later option could have sandy relay the terminal and filter it.
 
 ## Security model
 
@@ -837,7 +843,10 @@ sandy does not protect:
 
 - secrets the program itself holds, and the data in its `read_write` paths,
 - network traffic the program may send with `ip = "client"` or `ip = "all"`,
-- the availability of the machine (CPU, memory, disk use),
+- the terminal the program writes to (recommendation 8 above),
+- the availability of the machine (CPU, memory, disk use), and of files the program may read: a
+  lock it holds on such a file stalls programs outside that lock the same file, and on Windows
+  also those that read or write it,
 - against bugs in the operating system kernel.
 
 What remains visible from inside the sandbox differs by platform; for example, on Linux the
@@ -889,7 +898,9 @@ After a run, `cargo test -p sandy-cli --test runner -- --ignored --exact
 skips_match_the_expected_list` compares the log with the list of the runner and fails on a skip
 that is not in the list, and on a listed skip that did not happen. A check that quietly stops
 running is then a diff to review, not a silent pass. A runner without a list fails that
-comparison and prints the list to commit.
+comparison and prints the list to commit. A run for another target is a runner of its own, named
+`<runner>-<target>` as in CI, because what it can check differs: the static musl build, for
+example, has no loader to check (`fedora-44-x86_64-unknown-linux-musl.txt`).
 
 ### The snapshot of the compiled seccomp filters
 

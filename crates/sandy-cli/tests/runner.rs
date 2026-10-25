@@ -39,6 +39,10 @@ use common::*;
 const EXPECTED_SKIPS: &[(&str, &str)] = &[
     ("fedora-44", include_str!("expected-skips/fedora-44.txt")),
     (
+        "fedora-44-x86_64-unknown-linux-musl",
+        include_str!("expected-skips/fedora-44-x86_64-unknown-linux-musl.txt"),
+    ),
+    (
         "macos-26-arm",
         include_str!("expected-skips/macos-26-arm.txt"),
     ),

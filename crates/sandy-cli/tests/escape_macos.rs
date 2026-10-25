@@ -816,6 +816,97 @@ fn forward_relay_reaches_only_the_forward_target() {
     );
 }
 
+/// What the service behind the forwarded port answers to every request.
+const SERVICE_ANSWER: &[u8] = b"answer of the service";
+/// What the test process outside the sandbox sends through the forwarded port.
+const OUTSIDE_REQUEST: &[u8] = b"request from outside the sandbox";
+
+/// The open route of the exceptions row for `forward` on macOS in DESIGN.md: the relay cannot
+/// tell who is at the other end of a connection, so a forwarded port serves any local process,
+/// not only the program (docs/macos.md, "Who may connect, and who may stop the relay"). This
+/// test process runs outside the sandbox, and its bytes reach the forwarded service and the
+/// answer comes back. When this fails, the route is closed and the exception has to go.
+#[test]
+fn a_forwarded_port_serves_a_process_outside_the_sandbox() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let fixture = home_fixture("forward-outside");
+    let service = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = service.local_addr().unwrap().port();
+    let (sender, received) = std::sync::mpsc::channel();
+    // The service answers only after the request has ended, so the two directions of a
+    // relayed connection never end at the same moment.
+    std::thread::spawn(move || {
+        for mut stream in service.incoming().flatten() {
+            let mut request = Vec::new();
+            let _ = stream.read_to_end(&mut request);
+            let _ = stream.write_all(SERVICE_ANSWER);
+            let _ = sender.send(request);
+        }
+    });
+    let inner = free_port();
+    let address = format!("127.0.0.1:{inner}");
+    let args = with(
+        home_args(&fixture),
+        &[
+            "--ip",
+            "all",
+            "--forward",
+            &format!("{inner}=127.0.0.1:{target}"),
+        ],
+    );
+    // The program sends through its own connection, then keeps its relay running until the test
+    // sends it a line.
+    let mut program = Command::new(sandy_path())
+        .args(run_args(
+            &args,
+            &[("tcp-send", address.as_str()), ("read-line", "-")],
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(program.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    parse_line(line.trim_end()).assert_ok();
+
+    let mut outside = TcpStream::connect(&address).unwrap();
+    outside.set_read_timeout(Some(WAIT)).unwrap();
+    outside.write_all(OUTSIDE_REQUEST).unwrap();
+    outside.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut answer = Vec::new();
+    let _ = outside.read_to_end(&mut answer);
+
+    program.stdin.take().unwrap().write_all(b"\n").unwrap();
+    std::io::copy(&mut stdout, &mut std::io::sink()).unwrap();
+    let output = program.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let deadline = Instant::now() + WAIT;
+    let mut requests: Vec<Vec<u8>> = Vec::new();
+    while requests.len() < 2 {
+        match received.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(request) => requests.push(request),
+            Err(_) => break,
+        }
+    }
+    // Control: the program's own connection reaches the service.
+    assert!(
+        requests.iter().any(|request| request == TCP_SEND_PAYLOAD),
+        "the program's own request did not reach the service: {requests:?}"
+    );
+    assert!(
+        requests.iter().any(|request| request == OUTSIDE_REQUEST),
+        "the request of a process outside the sandbox no longer reaches the forwarded service, \
+         so the exception for `forward` on macOS is stale: {requests:?}"
+    );
+    assert_eq!(
+        answer, SERVICE_ANSWER,
+        "a process outside the sandbox no longer reads the answer of the forwarded service, so \
+         the exception for `forward` on macOS is stale"
+    );
+}
+
 /// The forward relay listens on the program's loopback port outside the sandbox and ends with
 /// the program, also when the program is killed with SIGKILL.
 #[test]

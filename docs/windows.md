@@ -256,7 +256,12 @@ file identity" in [DESIGN.md](DESIGN.md)). On Windows the identity of a file is 
 number of its volume and its file ID (`FILE_ID_INFO`, or `BY_HANDLE_FILE_INFORMATION` on a file
 system without 128-bit file IDs), read with the object opened for its attributes only. An object
 whose identity sandy cannot read counts as the one it is compared with, so the check refuses
-instead of passing it. Junctions count as symbolic links, as `std::fs` counts them. On Windows:
+instead of passing it. The warning for a directory on `PATH` follows the spellings instead, the
+one given and the canonical one, so it names only an overlap sandy sees. Such an object is, for
+example, a directory behind a junction that a less trusted process made: an elevated process
+does not follow it (`ERROR_UNTRUSTED_MOUNT_POINT`), and package managers of the user make such
+junctions (`scoop\apps\<app>\current`). Junctions count as symbolic links, as `std::fs` counts
+them. On Windows:
 
 - A policy path, sandy's executable or the policy file reached through a junction or a
   symbolic link inside a writable path is refused, as a symbolic link there is on Linux and
@@ -964,7 +969,10 @@ about a path is worse than none, so the backend answers nothing and sandy refuse
 7. Ctrl+C ends the program; it cannot handle it.
 8. The program's console is its own and has no window, and it never gets a console handle of
    sandy's. Programs that read passwords from `CONIN$` read from that console, which nobody
-   types into, and wait forever.
+   types into, and wait forever. sandy writes the program's output to its own console as it
+   is, except bytes that are not UTF-8, so escape sequences reach that console, which acts on
+   them when virtual terminal processing is on, for example by setting the clipboard
+   (DESIGN.md, "Non-goals").
 9. A volume without ACLs (FAT, exFAT) cannot hold grants; sandy fails when a policy path lies
    there. Whether the AppContainer can access such volumes outside the policy depends on the
    security descriptor of the volume device and is not verified.
@@ -1004,6 +1012,11 @@ about a path is worse than none, so the backend answers nothing and sandy refuse
     path (see "Network and share paths").
 16. With `ip = "client"` the program reaches no host of a private or domain network (see
     "Client networking").
+17. The program can lock a file it may only read: `LockFileEx` needs only a handle opened for
+    reading, and Windows locks are mandatory, so while the program holds an exclusive lock, other
+    processes can neither lock the file nor read or write it (measured on Windows 11:
+    `ERROR_LOCK_VIOLATION`). The lock gives the program no access of its own. The test is
+    `a_lock_on_a_readable_file_holds_off_other_processes`.
 
 ## Verified on Windows 11
 
@@ -1099,6 +1112,10 @@ Facts these runs established:
   `C:\Windows\System32\cmd.exe` a second name in `WinSxS`. Through `\\localhost\C$`,
   `FILE_ID_INFO` reports the volume serial number and file ID of the local folder, and
   `FindFirstFileNameW` fails with `ERROR_NOT_SUPPORTED` (see "Links and identity").
+- The elevated SSH session does not follow a junction that the sandboxed program made, or one
+  that scoop made for the user: opening a path through it fails with
+  `ERROR_UNTRUSTED_MOUNT_POINT` (448), while a junction that the session made itself is
+  followed (`warns_only_about_path_directories_a_writable_path_really_holds`).
 - The AppContainer token holds only `SeChangeNotifyPrivilege` and `SeIncreaseWorkingSetPrivilege`,
   with and without `children = "none"`, while the elevated session outside holds two dozen; it
   can enable no privilege beyond those two.

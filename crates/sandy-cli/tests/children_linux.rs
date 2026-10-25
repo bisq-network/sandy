@@ -420,8 +420,10 @@ fn another_process_of_the_job_reads_the_terminal() {
 /// A program with a write grant on `/proc` could set the out-of-memory priority of sandy's own
 /// processes to the maximum, so that the kernel ends the supervisor and the guard before anything
 /// else and the program's group outlives them. Both are undumpable, which gives their `/proc`
-/// files to root. The first action is the control: the program may raise its own priority, so a
-/// denial for the other two is not the missing grant.
+/// files to root, and both from their first instruction: sandy runs under a filter that holds
+/// every `prctl(PR_SET_DUMPABLE, 0)` for a while, so a process that became undumpable only after
+/// a fork would leave the program that long to write. The first action is the control: the
+/// program may raise its own priority, so a denial for the other two is not the missing grant.
 #[test]
 fn a_program_cannot_raise_the_oom_priority_of_sandys_helpers() {
     let fixture = Fixture::new("contained-oom");
@@ -430,16 +432,268 @@ fn a_program_cannot_raise_the_oom_priority_of_sandys_helpers() {
     }
     let mut args = contained(&fixture);
     args.extend(["--read-write", "/proc"].map(String::from));
-    let lines = probe_inside(
-        &args,
-        &[
-            ("oom-raise", "self"),
-            ("oom-raise", "parent"),
-            ("oom-raise", "group"),
-        ],
-    );
+    let actions = [
+        ("oom-raise", "self"),
+        ("oom-raise", "parent"),
+        ("oom-raise", "group"),
+    ];
+    let output = late_undumpable::sandy(&run_args(&args, &actions), Duration::from_millis(500));
+    assert!(output.status.success(), "{output:?}");
+    let lines = parse(&output);
+    assert_eq!(lines.len(), actions.len(), "{lines:?}");
     lines[0].assert_ok();
     // The supervisor, which is the program's parent, and the guard, which leads its group.
     lines[1].assert_blocked();
     lines[2].assert_blocked();
+}
+
+/// Runs sandy under a seccomp filter that holds every `prctl(PR_SET_DUMPABLE, 0)` of sandy and of
+/// the processes it starts, so that the order of that call and a fork shows up reliably.
+mod late_undumpable {
+    use std::io;
+    use std::mem::{offset_of, size_of};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Output, Stdio};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// `AUDIT_ARCH_X86_64` and `AUDIT_ARCH_AARCH64`.
+    #[cfg(target_arch = "x86_64")]
+    const NATIVE: u32 = 62 | 0x8000_0000 | 0x4000_0000;
+    #[cfg(target_arch = "aarch64")]
+    const NATIVE: u32 = 183 | 0x8000_0000 | 0x4000_0000;
+    /// The `_IOC` type of the seccomp notification requests, `'!'`.
+    const SECCOMP_IOC: u32 = 0x21;
+
+    /// Runs sandy with `args`; each `prctl(PR_SET_DUMPABLE, 0)` waits `delay` before it runs.
+    pub fn sandy(args: &[String], delay: Duration) -> Output {
+        let mut filter = filter();
+        let program = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_mut_ptr(),
+        };
+        let program_address = &program as *const libc::sock_fprog as usize;
+        let mut ends = [0; 2];
+        // SAFETY: socketpair writes two new descriptors into `ends`.
+        let made = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                ends.as_mut_ptr(),
+            )
+        };
+        assert_eq!(made, 0, "socketpair: {}", io::Error::last_os_error());
+        // SAFETY: both descriptors are new and owned here.
+        let (ours, theirs) =
+            unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+        let theirs_fd = theirs.as_raw_fd();
+        let mut command = Command::new(super::common::sandy_path());
+        command
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // SAFETY: the closure runs in the forked child before execve and calls only prctl,
+        // seccomp, sendmsg and close, which are async-signal-safe; the filter program it points
+        // to lives in this stack frame until `spawn` has returned.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let listener = libc::syscall(
+                    libc::SYS_seccomp,
+                    libc::SECCOMP_SET_MODE_FILTER,
+                    libc::SECCOMP_FILTER_FLAG_NEW_LISTENER,
+                    program_address as *const libc::sock_fprog,
+                );
+                if listener < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let sent = send_descriptor(theirs_fd, listener as RawFd);
+                libc::close(listener as RawFd);
+                sent
+            });
+        }
+        let child = command.spawn().unwrap();
+        drop(theirs);
+        drop(filter);
+        let listener = receive_descriptor(&ours);
+        let done = Arc::new(AtomicBool::new(false));
+        let supervisor = {
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || supervise(&listener, delay, &done))
+        };
+        let output = child.wait_with_output().unwrap();
+        done.store(true, Ordering::Relaxed);
+        supervisor.join().unwrap();
+        output
+    }
+
+    /// Notifies for `prctl(PR_SET_DUMPABLE, 0)` of this architecture and allows every other call.
+    fn filter() -> Vec<libc::sock_filter> {
+        let arg =
+            |index: usize| (offset_of!(libc::seccomp_data, args) + index * size_of::<u64>()) as u32;
+        vec![
+            load(offset_of!(libc::seccomp_data, arch) as u32),
+            equals(NATIVE, 0, 7),
+            load(offset_of!(libc::seccomp_data, nr) as u32),
+            equals(libc::SYS_prctl as u32, 0, 5),
+            load(arg(0)),
+            equals(libc::PR_SET_DUMPABLE as u32, 0, 3),
+            load(arg(1)),
+            equals(0, 0, 1),
+            ret(libc::SECCOMP_RET_USER_NOTIF),
+            ret(libc::SECCOMP_RET_ALLOW),
+        ]
+    }
+
+    /// Answers each notification after `delay` by letting the call run, until `done`.
+    fn supervise(listener: &OwnedFd, delay: Duration, done: &AtomicBool) {
+        let mut sizes = libc::seccomp_notif_sizes {
+            seccomp_notif: 0,
+            seccomp_notif_resp: 0,
+            seccomp_data: 0,
+        };
+        // SAFETY: the kernel writes the three sizes into the structure.
+        let read = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                libc::SECCOMP_GET_NOTIF_SIZES,
+                0,
+                &mut sizes as *mut libc::seccomp_notif_sizes,
+            )
+        };
+        assert_eq!(read, 0, "{}", io::Error::last_os_error());
+        let receive = request(0, sizes.seccomp_notif);
+        let send = request(1, sizes.seccomp_notif_resp);
+        // 64-bit elements keep the buffers aligned for the structures of the kernel's size.
+        let mut notification = vec![0u64; usize::from(sizes.seccomp_notif).div_ceil(8)];
+        let mut response = vec![0u64; usize::from(sizes.seccomp_notif_resp).div_ceil(8)];
+        while !done.load(Ordering::Relaxed) {
+            let mut watched = libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll reads and writes the one structure passed.
+            if unsafe { libc::poll(&mut watched, 1, 100) } <= 0
+                || watched.revents & libc::POLLIN == 0
+            {
+                continue;
+            }
+            notification.fill(0);
+            let request = notification.as_mut_ptr().cast::<libc::seccomp_notif>();
+            // SAFETY: the buffer has the size the kernel reported for this request.
+            if unsafe { libc::ioctl(listener.as_raw_fd(), receive, request) } < 0 {
+                continue;
+            }
+            std::thread::sleep(delay);
+            response.fill(0);
+            let answer = response.as_mut_ptr().cast::<libc::seccomp_notif_resp>();
+            // SAFETY: both buffers are large enough for their structures; the ioctl filled the
+            // request, and the answer is zeroed apart from the two fields set here.
+            unsafe {
+                (*answer).id = (*request).id;
+                (*answer).flags = libc::SECCOMP_USER_NOTIF_FLAG_CONTINUE as u32;
+                libc::ioctl(listener.as_raw_fd(), send, answer);
+            }
+        }
+    }
+
+    /// Sends `descriptor` over the stream socket `socket`. Async-signal-safe.
+    fn send_descriptor(socket: RawFd, descriptor: RawFd) -> io::Result<()> {
+        let mut byte = 0u8;
+        let mut iov = libc::iovec {
+            iov_base: (&mut byte as *mut u8).cast(),
+            iov_len: 1,
+        };
+        // A control buffer for one descriptor, aligned like a cmsghdr.
+        let mut control = [0u64; 4];
+        // SAFETY: msghdr is plain data; the fields set below point into this stack frame, and
+        // CMSG_FIRSTHDR returns a header inside `control`, which is large enough for one
+        // descriptor.
+        unsafe {
+            let mut message: libc::msghdr = std::mem::zeroed();
+            message.msg_iov = &mut iov;
+            message.msg_iovlen = 1;
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen = libc::CMSG_SPACE(size_of::<RawFd>() as u32) as _;
+            let header = libc::CMSG_FIRSTHDR(&message);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as _;
+            libc::CMSG_DATA(header)
+                .cast::<RawFd>()
+                .write_unaligned(descriptor);
+            if libc::sendmsg(socket, &message, 0) != 1 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    fn receive_descriptor(socket: &OwnedFd) -> OwnedFd {
+        let mut byte = 0u8;
+        let mut iov = libc::iovec {
+            iov_base: (&mut byte as *mut u8).cast(),
+            iov_len: 1,
+        };
+        let mut control = [0u64; 4];
+        // SAFETY: as in `send_descriptor`; recvmsg writes at most the buffers it was given, and
+        // the descriptor it received is new and owned here.
+        unsafe {
+            let mut message: libc::msghdr = std::mem::zeroed();
+            message.msg_iov = &mut iov;
+            message.msg_iovlen = 1;
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen = size_of_val(&control) as _;
+            let read = libc::recvmsg(socket.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC);
+            assert_eq!(
+                read,
+                1,
+                "sandy did not start: {}",
+                io::Error::last_os_error()
+            );
+            let header = libc::CMSG_FIRSTHDR(&message);
+            assert!(!header.is_null(), "no descriptor arrived");
+            OwnedFd::from_raw_fd(libc::CMSG_DATA(header).cast::<RawFd>().read_unaligned())
+        }
+    }
+
+    /// A `SECCOMP_IOWR(number, structure)` request number, as linux/seccomp.h builds it.
+    fn request(number: u32, size: u16) -> libc::Ioctl {
+        const READ_WRITE: u32 = 3;
+        (READ_WRITE << 30 | u32::from(size) << 16 | SECCOMP_IOC << 8 | number) as libc::Ioctl
+    }
+
+    fn load(offset: u32) -> libc::sock_filter {
+        statement((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, offset)
+    }
+
+    fn ret(value: u32) -> libc::sock_filter {
+        statement((libc::BPF_RET | libc::BPF_K) as u16, value)
+    }
+
+    /// Continues with the next instruction when the loaded word is `value`, and jumps `otherwise`
+    /// instructions ahead when it is not.
+    fn equals(value: u32, then: u8, otherwise: u8) -> libc::sock_filter {
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt: then,
+            jf: otherwise,
+            k: value,
+        }
+    }
+
+    fn statement(code: u16, k: u32) -> libc::sock_filter {
+        libc::sock_filter {
+            code,
+            jt: 0,
+            jf: 0,
+            k,
+        }
+    }
 }

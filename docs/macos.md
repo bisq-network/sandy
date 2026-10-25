@@ -545,10 +545,12 @@ program alone, and the relay reaches `to` as sandy's user, so a connection of an
 pass an owner rule of a packet filter or a peer credential check in that service. On Linux the
 relay asks the kernel who owns the other end and refuses the rest; macOS has no equivalent of
 `SO_PEERCRED` for TCP and no checked way to read the owner of another socket, so it serves every
-local user. Looking through the program's own processes for the socket cannot take the place of
-that check (see [Looking for the program's socket](#looking-for-the-programs-socket)). Forward
-only to services that authenticate their clients. `sandy check` prints this as a warning for
-every policy with a forwarded port.
+local process, of any user (`a_forwarded_port_serves_a_process_outside_the_sandbox` records it
+for a process of sandy's own user). Looking through the program's own processes for the socket
+cannot take the place of that check (see
+[Looking for the program's socket](#looking-for-the-programs-socket)). Forward only to services
+that authenticate their clients. `sandy check` prints this as a warning for every policy with a
+forwarded port.
 
 With the default `signals = "any"` the program can also stop the relay with `SIGSTOP`, which no
 process can block. A stopped relay keeps its listen ports bound until someone continues or kills
@@ -987,7 +989,8 @@ none, so the backend answers nothing and sandy refuses the option.
   use other device ioctls fail. The reason: `TIOCSTI` on the controlling terminal would let the
   target type commands into the shell that started sandy. Job control fails for the same reason:
   `TIOCSPGRP` is not allowed either, so a shell inside the sandbox cannot give the terminal to a
-  job.
+  job. Escape sequences are ordinary writes and still reach the terminal emulator, which acts on
+  some of them, for example by setting the clipboard (DESIGN.md, "Non-goals").
 - With `signals = "isolated"`, `fcntl(F_SETOWN)` fails, and the program can still have the
   kernel send SIGIO to a process outside the sandbox, including one of another user, through an
   ioctl on a socket or a pipe (see
@@ -998,6 +1001,10 @@ none, so the backend answers nothing and sandy refuses the option.
   [Inherited descriptors](#inherited-descriptors)); a connected Unix stream socket is
   accepted, and the program then reaches whatever its peer is, so pass one only from a process
   that is the peer itself.
+- The program can lock a file it may only read (`flock`, or a shared `fcntl` lock), and a
+  process outside that locks the same file then waits or fails; macOS makes the two kinds
+  conflict. The locks are advisory and give no access (measured on macOS 27.0.1, test
+  `a_lock_on_a_readable_file_holds_off_other_processes`).
 - `link(2)` fails everywhere (see the hard link rule above).
 - With `system = "none"` no program starts on macOS: every program is linked dynamically, and dyld
   itself needs the root directory and the shared cache from the system set. sandy refuses such a

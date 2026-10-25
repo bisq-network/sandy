@@ -15,7 +15,7 @@
 //! seccompiler compiles all of them. Numbers come from `libc::SYS_*`, so sandy controls the
 //! table.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sandy_core::streams::{CreatableSocket, IP_PROTOCOLS};
 use seccompiler::{
@@ -78,6 +78,8 @@ mod arch {
     pub const OPEN_CALLS: &[(i64, u8)] = &[(libc::SYS_open, 1), (libc::SYS_openat, 2)];
     /// chmod variants that only x86_64 has, with the index of their mode argument.
     pub const CHMOD_CALLS: &[(i64, u8)] = &[(libc::SYS_chmod, 1)];
+    /// chown variants that only x86_64 has, with the index of their user ID argument.
+    pub const CHOWN_CALLS: &[(i64, u8)] = &[(libc::SYS_chown, 1), (libc::SYS_lchown, 1)];
     /// Calls the relay and the watcher need that only x86_64 has (arm64 has only ppoll).
     pub const RELAY_CALLS: &[i64] = &[libc::SYS_poll];
     /// Lookups by path that only x86_64 has besides their `*at` forms.
@@ -105,6 +107,7 @@ mod arch {
     pub const PATH_METADATA: &[i64] = &[];
     pub const OPEN_CALLS: &[(i64, u8)] = &[(libc::SYS_openat, 2)];
     pub const CHMOD_CALLS: &[(i64, u8)] = &[];
+    pub const CHOWN_CALLS: &[(i64, u8)] = &[];
     pub const RELAY_CALLS: &[i64] = &[];
     pub const PATH_LOOKUP_CALLS: &[i64] = &[];
     pub const FORK_CALLS: &[i64] = &[];
@@ -119,6 +122,7 @@ mod arch {
     pub const PATH_METADATA: &[i64] = &[];
     pub const OPEN_CALLS: &[(i64, u8)] = &[];
     pub const CHMOD_CALLS: &[(i64, u8)] = &[];
+    pub const CHOWN_CALLS: &[(i64, u8)] = &[];
     pub const RELAY_CALLS: &[i64] = &[];
     pub const PATH_LOOKUP_CALLS: &[i64] = &[];
     pub const FORK_CALLS: &[i64] = &[];
@@ -231,6 +235,119 @@ const DENIED: &[i64] = &[
     libc::SYS_setdomainname,
     libc::SYS_setgroups,
 ];
+
+/// prctl options that only work with a capability, which sandy never passes on. A second layer,
+/// like the calls of `DENIED` that need one. The option is an int.
+///
+/// - PR_CAPBSET_DROP needs CAP_SETPCAP.
+/// - PR_SET_MM needs CAP_SYS_RESOURCE. Its forms PR_SET_MM_MAP and PR_SET_MM_MAP_SIZE do not,
+///   but the executable that PR_SET_MM_MAP can set needs CAP_CHECKPOINT_RESTORE and lies in
+///   memory, where seccomp cannot read it. Only tools that restore checkpointed processes use
+///   them, and those need ptrace, which the sandbox denies.
+/// - PR_SET_IO_FLUSHER needs CAP_SYS_RESOURCE.
+///
+/// PR_CAP_AMBIENT has a rule of its own. PR_SET_SECUREBITS stays allowed: since Linux 6.14 a
+/// process may set SECBIT_EXEC_RESTRICT_FILE and SECBIT_EXEC_DENY_INTERACTIVE without a
+/// capability, so whether a call needs one depends on the bits the process already holds, and
+/// the other bits change only how the kernel treats root and capabilities, which the program has
+/// neither of.
+const CAPABILITY_PRCTLS: &[i32] = &[libc::PR_CAPBSET_DROP, libc::PR_SET_MM, PR_SET_IO_FLUSHER];
+/// PR_SET_IO_FLUSHER of Linux 5.6, which the libc crate does not have.
+const PR_SET_IO_FLUSHER: i32 = 57;
+
+/// The calls that set user or group IDs, with the number of IDs each takes. Without CAP_SETUID
+/// or CAP_SETGID a process may only switch among its real, effective and saved IDs, and -1
+/// leaves an ID as it is. setfsuid and setfsgid ignore any other ID instead of failing.
+const UID_CALLS: &[(i64, u8)] = &[
+    (libc::SYS_setuid, 1),
+    (libc::SYS_setreuid, 2),
+    (libc::SYS_setresuid, 3),
+    (libc::SYS_setfsuid, 1),
+];
+const GID_CALLS: &[(i64, u8)] = &[
+    (libc::SYS_setgid, 1),
+    (libc::SYS_setregid, 2),
+    (libc::SYS_setresgid, 3),
+    (libc::SYS_setfsgid, 1),
+];
+
+/// The calls that change the owner of a file on every architecture, with the index of their user
+/// ID argument. Without CAP_CHOWN a process may only keep the owner of its own file, which is its
+/// file system user ID, one of the IDs it holds; -1 leaves the owner as it is.
+const CHOWN_CALLS: &[(i64, u8)] = &[(libc::SYS_fchown, 1), (libc::SYS_fchownat, 2)];
+
+/// The bits of the class in an I/O priority (an int, the class from bit 13), and the real-time
+/// class, which needs CAP_SYS_ADMIN or CAP_SYS_NICE.
+const IOPRIO_CLASS_MASK: u64 = 0x7 << 13;
+const IOPRIO_CLASS_RT: u64 = 1 << 13;
+
+/// Socket options that only work with a capability, as level and option, both ints. setsockopt
+/// only; reading them needs none.
+///
+/// - SO_SNDBUFFORCE and SO_RCVBUFFORCE (CAP_NET_ADMIN) go past the buffer limits of the host,
+///   and SO_MARK (CAP_NET_RAW or CAP_NET_ADMIN) selects routing tables and firewall rules.
+/// - IP_IPSEC_POLICY, IP_XFRM_POLICY and their IPv6 forms (CAP_NET_ADMIN) set the IPsec policy
+///   of a socket.
+/// - TCP_REPAIR (CAP_NET_ADMIN) rewrites the state of a connection, and TCP_REPAIR_QUEUE,
+///   TCP_QUEUE_SEQ, TCP_REPAIR_OPTIONS and TCP_REPAIR_WINDOW work only in repair mode.
+const CAPABILITY_SOCKET_OPTIONS: &[(i32, i32)] = &[
+    (libc::SOL_SOCKET, libc::SO_SNDBUFFORCE),
+    (libc::SOL_SOCKET, libc::SO_RCVBUFFORCE),
+    (libc::SOL_SOCKET, libc::SO_MARK),
+    (libc::SOL_IP, libc::IP_IPSEC_POLICY),
+    (libc::SOL_IP, libc::IP_XFRM_POLICY),
+    (libc::SOL_IPV6, libc::IPV6_IPSEC_POLICY),
+    (libc::SOL_IPV6, libc::IPV6_XFRM_POLICY),
+    (libc::SOL_TCP, libc::TCP_REPAIR),
+    (libc::SOL_TCP, libc::TCP_REPAIR_QUEUE),
+    (libc::SOL_TCP, libc::TCP_QUEUE_SEQ),
+    (libc::SOL_TCP, libc::TCP_REPAIR_OPTIONS),
+    (libc::SOL_TCP, libc::TCP_REPAIR_WINDOW),
+];
+
+/// The options of the legacy firewall interfaces, as level and first and last option, for
+/// setsockopt and getsockopt: iptables (64 to 67), ipset (83), arptables (96 to 99), ebtables
+/// (128 to 132) and IPVS (1152 to 1167) on IPv4 sockets, ip6tables (64, 65, 68 and 69) on IPv6
+/// sockets. Each needs CAP_NET_ADMIN before the module behind it parses the request. No other
+/// IP option has these numbers; IPV6_RECVTCLASS (66), IPV6_TCLASS (67) and SO_ORIGINAL_DST (80),
+/// which transparent proxies read without a capability, lie between them.
+const FIREWALL_SOCKET_OPTIONS: &[(i32, u32, u32)] = &[
+    (libc::SOL_IP, 64, 67),
+    (libc::SOL_IP, 83, 83),
+    (libc::SOL_IP, 96, 99),
+    (libc::SOL_IP, 128, 132),
+    (libc::SOL_IP, 1152, 1167),
+    (libc::SOL_IPV6, 64, 65),
+    (libc::SOL_IPV6, 68, 69),
+];
+
+/// Terminal and file system ioctls that only work with CAP_SYS_ADMIN. A second layer. The numbers
+/// are the same on x86_64 and arm64.
+///
+/// - TIOCVHANGUP hangs up a terminal like `vhangup`, TIOCCONS sends the console messages of the
+///   host to a terminal, and TIOCSLCKTRMIOS locks the settings of a terminal.
+/// - FIFREEZE and FITHAW freeze and thaw the whole file system of a descriptor, FITRIM discards
+///   its free blocks, FS_IOC_SHUTDOWN shuts it down, and FS_IOC_SETFSLABEL renames it.
+///
+/// The management ioctls of single file systems (resizing, devices, quotas) stay with the
+/// kernel's check.
+const CAPABILITY_IOCTLS: &[u32] = &[
+    // TIOCVHANGUP, TIOCCONS, TIOCSLCKTRMIOS.
+    0x5437,
+    0x541d,
+    0x5457,
+    // FIFREEZE, FITHAW, FITRIM, FS_IOC_SHUTDOWN, FS_IOC_SETFSLABEL.
+    0xc004_5877,
+    0xc004_5878,
+    0xc018_5879,
+    0x8004_587d,
+    0x4100_9432,
+];
+
+/// MPOL_MF_MOVE_ALL, which the libc crate does not have: mbind and move_pages then also move the
+/// pages that other processes map, which needs CAP_SYS_NICE. The flags are the sixth argument of
+/// both, an unsigned int and an int.
+const MPOL_MF_MOVE_ALL: u64 = 1 << 2;
 
 /// Landlock does not restrict metadata changes. fchmodat, fchmodat2 and fchownat accept O_PATH
 /// descriptors with AT_EMPTY_PATH, so they are denied completely. utimensat has its own rule. The
@@ -442,9 +559,20 @@ pub struct Filters {
     pub families: Option<BpfProgram>,
 }
 
-/// Builds the filters for `config` and the CPU architecture sandy was built for. `own_pid` is
-/// the process ID of the process that executes the target, which the target keeps after execve.
-pub fn build(config: &FilterConfig, own_pid: u32) -> Result<Filters, BackendError> {
+/// The process that executes the target. The target keeps its process ID after execve, and under
+/// no_new_privs its user and group IDs too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetProcess {
+    pub pid: u32,
+    /// The real, effective and saved user IDs.
+    pub uids: [u32; 3],
+    /// The real, effective and saved group IDs.
+    pub gids: [u32; 3],
+}
+
+/// Builds the filters for `config` and the CPU architecture sandy was built for, to be installed
+/// by `process`.
+pub fn build(config: &FilterConfig, process: &TargetProcess) -> Result<Filters, BackendError> {
     let target = arch::TARGET
         .ok_or_else(|| BackendError::InvalidTargetArch(std::env::consts::ARCH.to_string()))?;
     let path_xattrs = config
@@ -453,7 +581,7 @@ pub fn build(config: &FilterConfig, own_pid: u32) -> Result<Filters, BackendErro
         .transpose()?;
     Ok(Filters {
         allowlist: allowlist(target)?,
-        denylist: denylist(config, own_pid, target)?,
+        denylist: denylist(config, process, target)?,
         path_xattrs,
         families: Some(family_filter(config, target)?),
     })
@@ -522,7 +650,7 @@ fn rule(conditions: Vec<SeccompCondition>) -> Result<SeccompRule, BackendError> 
 
 fn denylist(
     config: &FilterConfig,
-    own_pid: u32,
+    process: &TargetProcess,
     target: TargetArch,
 ) -> Result<BpfProgram, BackendError> {
     let mut rules = Rules::default();
@@ -531,11 +659,32 @@ fn denylist(
     }
     rules.add(libc::SYS_ioctl, ioctl_rules(config)?);
     rules.add(libc::SYS_fcntl, lease_rules()?);
+    rules.add(libc::SYS_socket, raw_ip_rules()?);
+    rules.add(libc::SYS_setsockopt, socket_option_rules(true)?);
+    rules.add(libc::SYS_getsockopt, socket_option_rules(false)?);
+    for call in [libc::SYS_mbind, libc::SYS_move_pages] {
+        let move_all = SeccompCmpOp::MaskedEq(MPOL_MF_MOVE_ALL);
+        rules.add(call, vec![rule(vec![low(5, move_all, MPOL_MF_MOVE_ALL)?])?]);
+    }
+    for (calls, held) in [(UID_CALLS, &process.uids), (GID_CALLS, &process.gids)] {
+        for &(call, count) in calls {
+            rules.add(call, unheld_id_rules(0..count, held)?);
+        }
+    }
     // Where an administrator enabled KSM, the kernel shares mergeable pages of the program with
     // identical pages of other processes, and the time a write to such a page takes tells the
-    // program whether another process holds the same content.
+    // program whether another process holds the same content. PR_SET_MEMORY_MERGE makes every
+    // page of the process mergeable, without a capability; turning it off (0, compared on all
+    // 64 bits like the kernel) stays allowed.
     let mergeable = low(2, SeccompCmpOp::Eq, libc::MADV_MERGEABLE as u64)?;
     rules.add(libc::SYS_madvise, vec![rule(vec![mergeable])?]);
+    let merge_all = rule(vec![
+        low(0, SeccompCmpOp::Eq, libc::PR_SET_MEMORY_MERGE as u64)?,
+        SeccompCondition::new(1, SeccompCmpArgLen::Qword, SeccompCmpOp::Ne, 0)?,
+    ])?;
+    let mut prctl = prctl_rules()?;
+    prctl.push(merge_all);
+    rules.add(libc::SYS_prctl, prctl);
     rules.add(libc::SYS_socketpair, socketpair_rules(config)?);
     if !config.allow_ip && !config.allow_unix {
         // The only sockets left are connected pairs, which need none of these. bind would let
@@ -611,16 +760,28 @@ fn denylist(
         {
             rules.add(call, setid_rules(mode)?);
         }
+        // Under "deny" these calls are denied completely. The group stays with the kernel: a
+        // process may give its file any of its supplementary groups, which the filter does not
+        // know.
+        for &(call, uid) in CHOWN_CALLS.iter().chain(arch::CHOWN_CALLS) {
+            rules.add(call, unheld_id_rules([uid], &process.uids)?);
+        }
     }
     // With children = "allowed", a process the program started can outlive it, and once the
     // program's ID belongs to another process of the user, the exemption would cover that one.
-    let own_pid = (config.deny_children || config.keep_process_group).then_some(u64::from(own_pid));
+    let own_pid =
+        (config.deny_children || config.keep_process_group).then_some(u64::from(process.pid));
     for &(call, pid) in PROCESS_CALLS {
         rules.add(call, vec![other_process(pid, own_pid)?]);
     }
     for &(call, one_process) in PROCESS_SELECTOR_CALLS {
         let group_or_user = rule(vec![low(0, SeccompCmpOp::Ne, one_process)?])?;
-        rules.add(call, vec![group_or_user, other_process(1, own_pid)?]);
+        let mut selector_rules = vec![group_or_user, other_process(1, own_pid)?];
+        if call == libc::SYS_ioprio_set {
+            let class = SeccompCmpOp::MaskedEq(IOPRIO_CLASS_MASK);
+            selector_rules.push(rule(vec![low(2, class, IOPRIO_CLASS_RT)?])?);
+        }
+        rules.add(call, selector_rules);
     }
     for &(call, flags) in arch::OPEN_CALLS {
         rules.add(call, open_rules(flags, config.restrict_truncate)?);
@@ -661,7 +822,7 @@ impl Rules {
 /// send SIGWINCH to the foreground group, and the third, on the master side of a pseudo-terminal,
 /// sends SIGINT, SIGQUIT or SIGTSTP to the foreground group of the other side. Writing the
 /// interrupt, quit or suspend character into the master does the same and stays possible, because
-/// a write cannot be told from any other.
+/// a write cannot be told from any other. `CAPABILITY_IOCTLS` need a capability.
 fn ioctl_rules(config: &FilterConfig) -> Result<Vec<SeccompRule>, BackendError> {
     let mut commands = vec![
         libc::TIOCSTI as u32,
@@ -671,6 +832,7 @@ fn ioctl_rules(config: &FilterConfig) -> Result<Vec<SeccompRule>, BackendError> 
     ];
     commands.extend(CONSOLE_IOCTLS);
     commands.extend(FILE_SYSTEM_IOCTLS);
+    commands.extend(CAPABILITY_IOCTLS);
     if config.isolate_signals {
         commands.extend([
             libc::TIOCSPGRP as u32,
@@ -703,6 +865,64 @@ fn lease_rules() -> Result<Vec<SeccompRule>, BackendError> {
     ])?;
     let delegation = rule(vec![low(1, SeccompCmpOp::Eq, F_SETDELEG)?])?;
     Ok(vec![lease, delegation])
+}
+
+/// `CAPABILITY_PRCTLS`, and raising an ambient capability, which needs the capability in the
+/// permitted and inheritable sets, both empty for the program. Lowering, clearing and asking stay
+/// allowed. The kernel compares the subcommand, an unsigned long, on all 64 bits.
+fn prctl_rules() -> Result<Vec<SeccompRule>, BackendError> {
+    let option = |option: i32| low(0, SeccompCmpOp::Eq, option as u64);
+    let mut rules: Vec<SeccompRule> = CAPABILITY_PRCTLS
+        .iter()
+        .map(|&denied| rule(vec![option(denied)?]))
+        .collect::<Result<_, _>>()?;
+    let raise = SeccompCondition::new(
+        1,
+        SeccompCmpArgLen::Qword,
+        SeccompCmpOp::Eq,
+        libc::PR_CAP_AMBIENT_RAISE as u64,
+    )?;
+    rules.push(rule(vec![option(libc::PR_CAP_AMBIENT)?, raise])?);
+    Ok(rules)
+}
+
+/// Raw IP sockets need CAP_NET_RAW. A second layer; ping uses ICMP datagram sockets, which need
+/// none. Where the policy denies IP, the EAFNOSUPPORT of the family filter wins.
+fn raw_ip_rules() -> Result<Vec<SeccompRule>, BackendError> {
+    [libc::AF_INET, libc::AF_INET6]
+        .into_iter()
+        .map(|family| {
+            rule(vec![
+                low(0, SeccompCmpOp::Eq, family as u64)?,
+                low(
+                    1,
+                    SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
+                    libc::SOCK_RAW as u64,
+                )?,
+            ])
+        })
+        .collect()
+}
+
+/// `CAPABILITY_SOCKET_OPTIONS` when `set`, and `FIREWALL_SOCKET_OPTIONS` for both calls. A
+/// second layer.
+fn socket_option_rules(set: bool) -> Result<Vec<SeccompRule>, BackendError> {
+    let level = |level: i32| low(1, SeccompCmpOp::Eq, level as u64);
+    let mut rules = Vec::new();
+    if set {
+        for &(at, option) in CAPABILITY_SOCKET_OPTIONS {
+            let option = low(2, SeccompCmpOp::Eq, option as u64)?;
+            rules.push(rule(vec![level(at)?, option])?);
+        }
+    }
+    for &(at, first, last) in FIREWALL_SOCKET_OPTIONS {
+        rules.push(rule(vec![
+            level(at)?,
+            low(2, SeccompCmpOp::Ge, u64::from(first))?,
+            low(2, SeccompCmpOp::Le, u64::from(last))?,
+        ])?);
+    }
+    Ok(rules)
 }
 
 /// An allowlist of socket families. A denylist of AF_INET and AF_INET6 is not enough: other
@@ -768,6 +988,25 @@ fn setid_rules(mode: u8) -> Result<Vec<SeccompRule>, BackendError> {
         .map(|bit| {
             let bit = u64::from(bit);
             rule(vec![low(mode, SeccompCmpOp::MaskedEq(bit), bit)?])
+        })
+        .collect()
+}
+
+/// One rule per ID argument at `args`: it matches an ID that is neither one of `held` nor -1. A
+/// second layer, like the calls of `DENIED` that need a capability. The kernel reads the IDs as
+/// 32-bit values.
+fn unheld_id_rules(
+    args: impl IntoIterator<Item = u8>,
+    held: &[u32; 3],
+) -> Result<Vec<SeccompRule>, BackendError> {
+    let allowed: BTreeSet<u32> = held.iter().copied().chain([u32::MAX]).collect();
+    args.into_iter()
+        .map(|arg| {
+            let unheld = allowed
+                .iter()
+                .map(|&id| low(arg, SeccompCmpOp::Ne, u64::from(id)))
+                .collect::<Result<_, _>>()?;
+            rule(unheld)
         })
         .collect()
 }
@@ -1190,9 +1429,16 @@ mod tests {
     /// Runs every filter like the kernel: the most restrictive action wins, and among equal
     /// actions the most recently installed filter.
     const OWN_PID: u32 = 4242;
+    const OWN_UID: u32 = 1000;
+    const OWN_GID: u32 = 100;
+    const OWN: TargetProcess = TargetProcess {
+        pid: OWN_PID,
+        uids: [OWN_UID; 3],
+        gids: [OWN_GID; 3],
+    };
 
     fn decide(config: &FilterConfig, arch: u32, nr: i64, args: [u64; 6]) -> u32 {
-        decide_with(&build(config, OWN_PID).unwrap(), arch, nr, args)
+        decide_with(&build(config, &OWN).unwrap(), arch, nr, args)
     }
 
     fn decide_with(filters: &Filters, arch: u32, nr: i64, args: [u64; 6]) -> u32 {
@@ -1272,7 +1518,7 @@ mod tests {
     #[test]
     fn programs_fit_the_kernel_limit() {
         for config in [strict(), open()] {
-            let filters = build(&config, OWN_PID).unwrap();
+            let filters = build(&config, &OWN).unwrap();
             let programs = filters
                 .families
                 .iter()
@@ -1372,8 +1618,8 @@ mod tests {
         }
 
         fn snapshot() -> String {
-            let strict = build(&strict(), OWN_PID).unwrap();
-            let open = build(&open(), OWN_PID).unwrap();
+            let strict = build(&strict(), &OWN).unwrap();
+            let open = build(&open(), &OWN).unwrap();
             let watcher = watcher(WATCHED_PROGRAM).unwrap();
             let relay = relay().unwrap();
             let mut out = SNAPSHOT_HEADER.to_string();
@@ -1721,7 +1967,16 @@ mod tests {
     fn memory_cannot_be_offered_for_merging() {
         const HIGH: u64 = 0xffff_ffff_0000_0000;
         let advice = |advice: i32| args(&[0x7fff_0000_0000, 4096, HIGH | advice as u64]);
+        let merge_all = |on: u64| args(&[HIGH | libc::PR_SET_MEMORY_MERGE as u64, on]);
         for config in [strict(), open()] {
+            // The whole process at once, with any value the kernel reads as "on".
+            for on in [1, 2, 1 << 32] {
+                let decision = call(&config, libc::SYS_prctl, merge_all(on));
+                assert_eq!(decision, RET_EPERM, "{on:#x}");
+            }
+            assert_eq!(call(&config, libc::SYS_prctl, merge_all(0)), RET_ALLOW);
+            let ask = args(&[libc::PR_GET_MEMORY_MERGE as u64]);
+            assert_eq!(call(&config, libc::SYS_prctl, ask), RET_ALLOW);
             let merge = advice(libc::MADV_MERGEABLE);
             assert_eq!(call(&config, libc::SYS_madvise, merge), RET_EPERM);
             for other in [
@@ -1794,6 +2049,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ioctls_that_need_a_capability_are_denied() {
+        const HIGH: u64 = 0xffff_ffff_0000_0000;
+        let named = [libc::TIOCVHANGUP, libc::TIOCCONS, libc::TIOCSLCKTRMIOS];
+        for command in named.map(|command| command as u32) {
+            assert!(CAPABILITY_IOCTLS.contains(&command), "{command:#x}");
+        }
+        for &command in CAPABILITY_IOCTLS {
+            let args = args(&[0, HIGH | u64::from(command)]);
+            for config in [strict(), open()] {
+                let decision = call(&config, libc::SYS_ioctl, args);
+                assert_eq!(decision, RET_EPERM, "{command:#x}");
+            }
+        }
+        // The forms that only read stay allowed: TIOCGLCKTRMIOS and FS_IOC_GETFSLABEL. So does
+        // TIOCSCTTY, which needs a capability only to take a terminal from another session.
+        let allowed = [
+            libc::TIOCGLCKTRMIOS as u32,
+            0x8100_9431,
+            libc::TIOCSCTTY as u32,
+        ];
+        for command in allowed {
+            let args = args(&[0, u64::from(command), 1]);
+            let decision = call(&open(), libc::SYS_ioctl, args);
+            assert_eq!(decision, RET_ALLOW, "{command:#x}");
+        }
+    }
+
+    /// MPOL_MF_MOVE_ALL moves the pages that other processes map as well. MPOL_MF_MOVE, which
+    /// moves only the caller's own pages, stays allowed.
+    #[test]
+    fn pages_that_other_processes_map_cannot_be_moved() {
+        const HIGH: u64 = 0xffff_ffff_0000_0000;
+        const MPOL_MF_MOVE: u64 = 1 << 1;
+        for config in [strict(), open()] {
+            for nr in [libc::SYS_mbind, libc::SYS_move_pages] {
+                let with_flags = |flags: u64| args(&[0, 0, 0, 0, 0, flags]);
+                for flags in [MPOL_MF_MOVE_ALL, MPOL_MF_MOVE_ALL | MPOL_MF_MOVE] {
+                    let decision = call(&config, nr, with_flags(HIGH | flags));
+                    assert_eq!(decision, RET_EPERM, "{nr} {flags:#x}");
+                }
+                for flags in [0, MPOL_MF_MOVE, HIGH] {
+                    let decision = call(&config, nr, with_flags(flags));
+                    assert_eq!(decision, RET_ALLOW, "{nr} {flags:#x}");
+                }
+            }
+        }
+    }
+
     /// The program of the diagnostic mode has only these two answers, so it can never be the
     /// filter that decides a call: every other action is more restrictive than USER_NOTIF, and
     /// the kernel takes ALLOW only when every other filter allows the call too.
@@ -1825,7 +2129,7 @@ mod tests {
         let program = observer(&watched);
         let rank = |action: u32| (action & libc::SECCOMP_RET_ACTION_FULL) as i32;
         for config in [strict(), open()] {
-            let filters = build(&config, OWN_PID).unwrap();
+            let filters = build(&config, &OWN).unwrap();
             for nr in -1..=LAST_CALL {
                 let without = decide_with(&filters, NATIVE, nr, [0; 6]);
                 let observed = evaluate(&program, NATIVE, nr, [0; 6]);
@@ -1859,6 +2163,231 @@ mod tests {
                 let args = fcntl(command as u64, 0);
                 assert_eq!(call(&config, libc::SYS_fcntl, args), RET_ALLOW, "{command}");
             }
+        }
+    }
+
+    /// The prctl options that only work with a capability, also with high bits in the option,
+    /// which the kernel reads as an int. The options a program uses without one stay allowed.
+    #[test]
+    fn prctl_options_that_need_a_capability_are_denied() {
+        const HIGH: u64 = 0xffff_ffff_0000_0000;
+        let prctl = |option: i32, subcommand: u64| args(&[HIGH | option as u64, subcommand]);
+        for config in [strict(), open()] {
+            let decide = |args| call(&config, libc::SYS_prctl, args);
+            for option in CAPABILITY_PRCTLS.iter().copied() {
+                assert_eq!(decide(prctl(option, 0)), RET_EPERM, "{option}");
+            }
+            assert!(CAPABILITY_PRCTLS.contains(&libc::PR_CAPBSET_DROP));
+            assert!(CAPABILITY_PRCTLS.contains(&PR_SET_IO_FLUSHER));
+            for form in [
+                libc::PR_SET_MM_START_CODE,
+                libc::PR_SET_MM_EXE_FILE,
+                libc::PR_SET_MM_MAP,
+                libc::PR_SET_MM_MAP_SIZE,
+            ] {
+                let set_mm = prctl(libc::PR_SET_MM, form as u64);
+                assert_eq!(decide(set_mm), RET_EPERM, "{form}");
+            }
+            let ambient = |subcommand: i32| prctl(libc::PR_CAP_AMBIENT, subcommand as u64);
+            assert_eq!(decide(ambient(libc::PR_CAP_AMBIENT_RAISE)), RET_EPERM);
+            for subcommand in [
+                libc::PR_CAP_AMBIENT_LOWER,
+                libc::PR_CAP_AMBIENT_IS_SET,
+                libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            ] {
+                assert_eq!(decide(ambient(subcommand)), RET_ALLOW, "{subcommand}");
+            }
+            // The kernel compares the subcommand on all 64 bits, so this is no raise for it.
+            let not_a_raise = args(&[
+                libc::PR_CAP_AMBIENT as u64,
+                HIGH | libc::PR_CAP_AMBIENT_RAISE as u64,
+            ]);
+            assert_eq!(decide(not_a_raise), RET_ALLOW);
+            for option in [
+                libc::PR_SET_NAME,
+                libc::PR_SET_PDEATHSIG,
+                libc::PR_SET_DUMPABLE,
+                libc::PR_SET_NO_NEW_PRIVS,
+                libc::PR_SET_CHILD_SUBREAPER,
+                libc::PR_SET_KEEPCAPS,
+                libc::PR_CAPBSET_READ,
+                libc::PR_GET_SECUREBITS,
+                libc::PR_SET_SECUREBITS,
+                libc::PR_SET_TIMERSLACK,
+                libc::PR_SET_VMA,
+            ] {
+                assert_eq!(decide(prctl(option, 1)), RET_ALLOW, "{option}");
+            }
+        }
+    }
+
+    /// The real-time I/O class needs a capability, also for the program itself. The class is in
+    /// bits 13 to 15 of an int; the bits above it do not change it.
+    #[test]
+    fn realtime_io_priority_is_denied() {
+        const HIGH: u64 = 0xffff_ffff_0000_0000;
+        let class = |class: u64| (class << 13) | 4;
+        let own = |ioprio: u64| args(&[IOPRIO_WHO_PROCESS, 0, ioprio]);
+        for config in [strict(), open()] {
+            let decide = |args| call(&config, libc::SYS_ioprio_set, args);
+            for realtime in [class(1), class(1) | 1 << 16, HIGH | class(1)] {
+                assert_eq!(decide(own(realtime)), RET_EPERM, "{realtime:#x}");
+            }
+            // None, best effort, idle, and the invalid class 7, which the kernel rejects.
+            for other in [0, class(2), class(3), class(2) | 1 << 16, class(7)] {
+                assert_eq!(decide(own(other)), RET_ALLOW, "{other:#x}");
+            }
+        }
+    }
+
+    /// Another user or group ID needs CAP_SETUID or CAP_SETGID. Each ID argument is checked on
+    /// its own and on 32 bits; -1 leaves an ID as it is.
+    #[test]
+    fn ids_the_process_does_not_hold_cannot_be_set() {
+        const HIGH: u64 = 0xffff_ffff_0000_0000;
+        const UNCHANGED: u64 = 0xffff_ffff;
+        for config in [strict(), open()] {
+            for (calls, own) in [(UID_CALLS, OWN_UID), (GID_CALLS, OWN_GID)] {
+                let own = u64::from(own);
+                for &(nr, count) in calls {
+                    assert_eq!(call(&config, nr, [own; 6]), RET_ALLOW, "{nr}");
+                    for index in 0..usize::from(count) {
+                        for (id, expected) in [
+                            (0, RET_EPERM),
+                            (own + 1, RET_EPERM),
+                            (HIGH, RET_EPERM),
+                            (HIGH | own, RET_ALLOW),
+                            (UNCHANGED, RET_ALLOW),
+                        ] {
+                            let mut ids = [own; 6];
+                            ids[index] = id;
+                            let decision = call(&config, nr, ids);
+                            assert_eq!(decision, expected, "{nr} argument {index}: {id:#x}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(UID_CALLS.contains(&(libc::SYS_setresuid, 3)));
+        assert!(GID_CALLS.contains(&(libc::SYS_setresgid, 3)));
+        // A process whose real, effective and saved IDs differ may switch among them.
+        let switching = TargetProcess {
+            uids: [1000, 1001, 1002],
+            gids: [100, 101, 102],
+            ..OWN
+        };
+        let filters = build(&open(), &switching).unwrap();
+        let set = |nr: i64, id: u64| decide_with(&filters, NATIVE, nr, args(&[id]));
+        for id in [1000, 1001, 1002] {
+            assert_eq!(set(libc::SYS_setuid, id), RET_ALLOW, "{id}");
+            assert_eq!(set(libc::SYS_setgid, id - 900), RET_ALLOW, "{id}");
+        }
+        assert_eq!(set(libc::SYS_setuid, 1003), RET_EPERM);
+        assert_eq!(set(libc::SYS_setgid, 103), RET_EPERM);
+    }
+
+    /// Raw IPv4 and IPv6 sockets need CAP_NET_RAW. The type is an int with flags above the low
+    /// four bits.
+    #[test]
+    fn raw_ip_sockets_are_denied() {
+        let flags = libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
+        for (family, icmp) in [
+            (libc::AF_INET, libc::IPPROTO_ICMP),
+            (libc::AF_INET6, libc::IPPROTO_ICMPV6),
+        ] {
+            for kind in [libc::SOCK_RAW, libc::SOCK_RAW | flags] {
+                for protocol in [icmp, 0] {
+                    let mut args = socket(family, kind, protocol);
+                    assert_eq!(call(&open(), libc::SYS_socket, args), RET_EPERM);
+                    args[1] |= 1 << 32;
+                    assert_eq!(call(&open(), libc::SYS_socket, args), RET_EPERM);
+                }
+            }
+            // The ICMP datagram sockets of ping.
+            let ping = socket(family, libc::SOCK_DGRAM | flags, icmp);
+            assert_eq!(call(&open(), libc::SYS_socket, ping), RET_ALLOW);
+        }
+        // Raw netlink and Unix sockets need no capability.
+        for (family, protocol) in [(libc::AF_NETLINK, libc::NETLINK_ROUTE), (libc::AF_UNIX, 0)] {
+            let raw = socket(family, libc::SOCK_RAW, protocol);
+            assert_eq!(call(&open(), libc::SYS_socket, raw), RET_ALLOW, "{family}");
+        }
+    }
+
+    /// The socket options that only work with a capability, also with high bits in the level and
+    /// the option, which are ints. The neighbours of the firewall ranges, and the same numbers at
+    /// another level, stay allowed.
+    #[test]
+    fn socket_options_that_need_a_capability_are_denied() {
+        const HIGH: u64 = 0xffff_ffff_0000_0000;
+        let option =
+            |level: i32, name: u32| args(&[3, HIGH | level as u64, HIGH | u64::from(name)]);
+        for config in [strict(), open()] {
+            let set = |args| call(&config, libc::SYS_setsockopt, args);
+            let get = |args| call(&config, libc::SYS_getsockopt, args);
+            for &(level, name) in CAPABILITY_SOCKET_OPTIONS {
+                assert_eq!(set(option(level, name as u32)), RET_EPERM, "{level} {name}");
+                assert_eq!(get(option(level, name as u32)), RET_ALLOW, "{level} {name}");
+            }
+            for (level, name) in [
+                (libc::SOL_SOCKET, libc::SO_MARK),
+                (libc::SOL_IP, libc::IP_XFRM_POLICY),
+                (libc::SOL_TCP, libc::TCP_REPAIR),
+            ] {
+                assert!(CAPABILITY_SOCKET_OPTIONS.contains(&(level, name)));
+            }
+            for &(level, first, last) in FIREWALL_SOCKET_OPTIONS {
+                for name in [first, last] {
+                    assert_eq!(set(option(level, name)), RET_EPERM, "{level} {name}");
+                    assert_eq!(get(option(level, name)), RET_EPERM, "{level} {name}");
+                }
+            }
+            for name in [63, 68, 80, 82, 84, 95, 100, 127, 133, 1151, 1168] {
+                assert_eq!(get(option(libc::SOL_IP, name)), RET_ALLOW, "{name}");
+            }
+            for name in [63, 66, 67, 70, 80] {
+                assert_eq!(get(option(libc::SOL_IPV6, name)), RET_ALLOW, "{name}");
+                assert_eq!(set(option(libc::SOL_IPV6, name)), RET_ALLOW, "{name}");
+            }
+            for (level, name) in [
+                (libc::SOL_SOCKET, libc::SO_RCVBUF),
+                (libc::SOL_SOCKET, libc::SO_PRIORITY),
+                (libc::SOL_TCP, libc::TCP_NODELAY),
+                (libc::SOL_IP, libc::IP_TOS),
+                // IP_DROP_MEMBERSHIP, which has the number of SO_MARK.
+                (libc::SOL_IP, libc::SO_MARK),
+            ] {
+                assert_eq!(set(option(level, name as u32)), RET_ALLOW, "{level} {name}");
+            }
+        }
+    }
+
+    /// With path metadata allowed, a file can only keep its owner without CAP_CHOWN, so a user ID
+    /// the process does not hold is denied, on 32 bits. The group is the kernel's to check.
+    /// Under "deny" the calls are denied completely (`path_metadata_calls_follow_the_policy`).
+    #[test]
+    fn files_cannot_be_given_to_another_user() {
+        const HIGH: u64 = 0xffff_ffff_0000_0000;
+        const UNCHANGED: u64 = 0xffff_ffff;
+        let own = u64::from(OWN_UID);
+        let mut calls = CHOWN_CALLS.to_vec();
+        calls.extend(arch::CHOWN_CALLS);
+        assert!(calls.contains(&(libc::SYS_fchownat, 2)));
+        for (nr, uid_index) in calls {
+            let chown = |uid: u64, gid: u64| {
+                let mut args = [3, 0x7fff_0000_1000, 0, 0, 0, 0];
+                args[usize::from(uid_index)] = uid;
+                args[usize::from(uid_index) + 1] = gid;
+                args
+            };
+            for uid in [0, own + 1, HIGH] {
+                assert_eq!(call(&open(), nr, chown(uid, 0)), RET_EPERM, "{nr} {uid:#x}");
+            }
+            for (uid, gid) in [(own, 0), (HIGH | own, 0), (UNCHANGED, 0), (UNCHANGED, 1234)] {
+                let decision = call(&open(), nr, chown(uid, gid));
+                assert_eq!(decision, RET_ALLOW, "{nr} {uid:#x} {gid}");
+            }
+            assert_eq!(call(&strict(), nr, chown(own, 0)), RET_EPERM, "{nr}");
         }
     }
 
@@ -1943,9 +2472,12 @@ mod tests {
             SYS_FILE_SETATTR,
         ];
         calls.extend(arch::PATH_METADATA);
+        // The program's own user ID in every argument, which the chown calls may keep under
+        // "allow" (`files_cannot_be_given_to_another_user`), and a mode without setuid bits.
+        let own = [u64::from(OWN_UID); 6];
         for nr in calls {
-            assert_eq!(call(&deny, nr, [0; 6]), RET_EPERM, "system call {nr}");
-            assert_eq!(call(&allow, nr, [0; 6]), RET_ALLOW, "system call {nr}");
+            assert_eq!(call(&deny, nr, own), RET_EPERM, "system call {nr}");
+            assert_eq!(call(&allow, nr, own), RET_ALLOW, "system call {nr}");
         }
         // Through a descriptor, the owner and the extended attributes follow the policy too;
         // the attributes fail like on a file system without them. The mode stays allowed.
@@ -1958,7 +2490,7 @@ mod tests {
             libc::SYS_fsetxattr,
             libc::SYS_fremovexattr,
         ] {
-            assert_eq!(call(&allow, nr, [0; 6]), RET_ALLOW, "system call {nr}");
+            assert_eq!(call(&allow, nr, own), RET_ALLOW, "system call {nr}");
         }
         assert_eq!(call(&deny, libc::SYS_fchmod, [0; 6]), RET_ALLOW);
         let path = args(&[3, 0x7fff_0000_1000]);
@@ -1985,7 +2517,7 @@ mod tests {
         for nr in [libc::SYS_fgetxattr, libc::SYS_flistxattr] {
             assert_eq!(call(&strict(), nr, [0; 6]), RET_ALLOW, "system call {nr}");
         }
-        assert!(build(&open(), OWN_PID).unwrap().path_xattrs.is_none());
+        assert!(build(&open(), &OWN).unwrap().path_xattrs.is_none());
     }
 
     /// An unprivileged fanotify group reports events on every path the user can reach, which

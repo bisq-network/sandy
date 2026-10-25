@@ -367,6 +367,32 @@ fn check_warns_that_a_forwarded_port_takes_a_write_of_another_user() {
     assert!(!warns(&stderr, gap), "{stderr}");
 }
 
+/// seccomp cannot tell a descriptor opened for reading from one opened for writing, so with
+/// `path_metadata = "deny"` the program can still change the mode and the times of a file it may
+/// only read (docs/linux.md, "Metadata through open files"). check says so when the policy has a
+/// path the program may only read, and not when it has none or allows metadata changes anyway.
+#[cfg(target_os = "linux")]
+#[test]
+fn check_warns_that_a_read_only_descriptor_changes_the_mode_and_the_times() {
+    let fixture = Fixture::new("check-fdmeta");
+    let gap = "path_metadata = \"deny\" is enforced only in part";
+    for read_only in ["--read", "--read-exec"] {
+        let stderr = check_warnings(&[read_only, &fixture.arg("ro")]);
+        assert!(warns(&stderr, gap), "{stderr}");
+    }
+
+    let stderr = check_warnings(&["--read-write", &fixture.arg("rw")]);
+    assert!(!warns(&stderr, gap), "{stderr}");
+    let allow = [
+        "--linux-path-metadata",
+        "allow",
+        "--read",
+        &fixture.arg("ro"),
+    ];
+    let stderr = check_warnings(&allow);
+    assert!(!warns(&stderr, gap), "{stderr}");
+}
+
 /// The kernel sends SIGIO, and SIGURG for urgent TCP data, to the owner of a socket or a pipe
 /// without the check that isolated signals are (docs/macos.md, "Signals the profile does not
 /// cover"). SIGURG needs TCP, so check names it only with IP networking.

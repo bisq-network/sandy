@@ -31,9 +31,10 @@
 //! The group's ID is the guard's process ID. sandy reaps neither the guard nor the program before
 //! it has killed the group, so no other process can have these IDs while sandy may signal them.
 //!
-//! sandy and the guard make themselves undumpable once the program is forked, so a program with a
-//! write grant on `/proc` cannot raise their `oom_score_adj` and have the kernel end them under
-//! memory pressure. The kernel clears the flag when the program executes the target.
+//! sandy makes itself undumpable before it forks the guard and the program, so that both start
+//! undumpable and a program with a write grant on `/proc` never has a moment to raise the
+//! `oom_score_adj` of sandy or the guard and have the kernel end them under memory pressure. The
+//! kernel makes the program dumpable again when it executes the target.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -44,7 +45,7 @@ use std::ptr;
 use sandy_core::{SandboxError, StatusReport};
 
 use crate::explain::Explain;
-use crate::helper::{block_signals, close_descriptors_except, pipe, set_undumpable};
+use crate::helper::{block_signals, close_descriptors_except, pipe, set_dumpable, set_undumpable};
 use crate::launch::ensure_single_thread;
 
 /// Shells report a program that a signal ended with this status plus the signal number.
@@ -72,6 +73,9 @@ pub fn run(
 ) -> Result<i32, SandboxError> {
     ensure_single_thread()?;
     set_child_subreaper()?;
+    // Before the forks: a flag set after a fork would leave the child's program a moment to
+    // raise the out-of-memory priority of the process that sets it.
+    set_undumpable()?;
     let child_action = default_child_action()?;
     let signals = Signals::block()?;
     let mut group = Group::start(ended, relay)?;
@@ -87,14 +91,17 @@ pub fn run(
         }
         0 => {
             drop(report);
-            program_main(&group, &signals, &child_action, report_write, start)
+            let explained = explain.is_some();
+            program_main(
+                &group,
+                &signals,
+                &child_action,
+                report_write,
+                explained,
+                start,
+            )
         }
-        pid => {
-            group.program = Some(pid);
-            // After the fork, so that the program never has the flag: the kernel clears it on
-            // execve, but a child that fails before execve would keep it.
-            set_undumpable()?;
-        }
+        pid => group.program = Some(pid),
     }
     drop(report_write);
     // Before the report is read: the execve that ends the report pipe is a watched call and
@@ -397,10 +404,7 @@ fn guard_main(end: File, ended: Option<File>, relay: Option<OwnedFd>, report: Op
     keep.extend(relay.as_ref().map(AsRawFd::as_raw_fd));
     keep.extend(report.as_ref().map(AsRawFd::as_raw_fd));
     // SAFETY: setpgid takes process IDs.
-    if unsafe { libc::setpgid(0, 0) } != 0
-        || set_undumpable().is_err()
-        || close_descriptors_except(&keep).is_err()
-    {
+    if unsafe { libc::setpgid(0, 0) } != 0 || close_descriptors_except(&keep).is_err() {
         // SAFETY: ends the guard without running sandy's cleanup. sandy kills the group by ID.
         unsafe { libc::_exit(1) };
     }
@@ -471,9 +475,13 @@ fn program_main(
     signals: &Signals,
     child_action: &libc::sigaction,
     mut report: File,
+    explained: bool,
     start: impl FnOnce() -> SandboxError,
 ) -> ! {
     let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if explained && let Err(error) = set_dumpable() {
+            return error;
+        }
         // SAFETY: setpgid takes process IDs.
         if unsafe { libc::setpgid(0, group.leader) } != 0 {
             return SandboxError::io(

@@ -195,6 +195,7 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
             let (from, to) = pair(target)?;
             fs::hard_link(from, to).map(|()| String::new())
         }
+        "lock-read" => lock_read(target),
         "signal-disposition" => initial_signals::disposition(target),
         "tcp-send" => {
             let mut stream = TcpStream::connect_timeout(&socket_address(target)?, CONNECT_TIMEOUT)?;
@@ -296,6 +297,50 @@ fn truncate(target: &str) -> io::Result<String> {
         .truncate(true)
         .open(target)
         .map(|_| String::new())
+}
+
+/// An exclusive lock on all of `target`, opened for reading only, without waiting: `flock` on
+/// Unix, `LockFileEx` on Windows. The probe keeps the file open, so the lock holds until it
+/// exits.
+#[cfg(unix)]
+fn lock_read(target: &str) -> io::Result<String> {
+    use std::os::fd::AsRawFd;
+
+    let file = ManuallyDrop::new(fs::File::open(target)?);
+    // SAFETY: flock takes an open descriptor and flags.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(String::new())
+}
+
+#[cfg(windows)]
+fn lock_read(target: &str) -> io::Result<String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let file = ManuallyDrop::new(fs::File::open(target)?);
+    // SAFETY: OVERLAPPED is plain data, and all zeros mean offset 0 and no event.
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let flags = LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY;
+    // SAFETY: the handle is an open file and overlapped outlives this synchronous call.
+    let locked = unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            flags,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if locked == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(String::new())
 }
 
 /// Empties a file through a read-only open with `O_TRUNC`, which asks for no write access.

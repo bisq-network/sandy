@@ -1228,3 +1228,51 @@ fn datagram(listener: &UdpSocket, timeout: Duration) -> Option<Vec<u8>> {
     let (read, _) = listener.recv_from(&mut buffer).ok()?;
     Some(buffer[..read].to_vec())
 }
+
+/// A lock needs only a descriptor or handle opened for reading, so the program can lock a file it
+/// may only read, and a process outside that locks the same file fails while the program holds
+/// the lock. On Windows the lock also keeps other processes from reading and writing the file.
+/// It gives the program no access of its own. This records a limitation of every platform
+/// document; if the lock fails inside, the platform has started to deny it.
+#[test]
+fn a_lock_on_a_readable_file_holds_off_other_processes() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let fixture = Fixture::new("lock-read");
+    let file = fixture.arg("ro/file");
+    let lock = [("lock-read", file.as_str())];
+    let held = [lock[0], ("sleep", "3000")];
+    let mut sandy = Command::new(sandy_path())
+        .args(run_args(&fixture.access_args(), &held))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut first = String::new();
+    BufReader::new(sandy.stdout.as_mut().unwrap())
+        .read_line(&mut first)
+        .unwrap();
+    parse_line(first.trim_end()).assert_ok();
+
+    let outside = probe_outside(&lock);
+    assert_ne!(outside[0].result, "ok", "{outside:?}");
+    // Linux and macOS locks are advisory, so a process that takes none still reads and writes.
+    // Windows locks are mandatory: ERROR_LOCK_VIOLATION.
+    let written = fs::OpenOptions::new()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .write(b"x");
+    let read = fs::read(&file);
+    if cfg!(windows) {
+        assert_eq!(written.unwrap_err().raw_os_error(), Some(33));
+        assert_eq!(read.unwrap_err().raw_os_error(), Some(33));
+    } else {
+        written.unwrap();
+        read.unwrap();
+    }
+
+    // Control: once the program has ended, the lock is free.
+    assert!(sandy.wait().unwrap().success());
+    probe_outside(&lock)[0].assert_ok();
+}

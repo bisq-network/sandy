@@ -75,8 +75,8 @@ pub struct PathRights {
 
 const FILTER_BASELINE: &str = "seccomp denies namespaces, mounts and their listing (statmount, \
     listmount, listns), bpf, perf_event_open, io_uring, \
-    keyrings, userfaultfd, calls that need capabilities, setuid and setgid mode bits, and unknown \
-    or foreign system calls";
+    keyrings, userfaultfd, calls and arguments that need capabilities, setuid and setgid mode \
+    bits, and unknown or foreign system calls";
 const FILTER_METADATA: &str = "seccomp denies chmod, chown, utime and xattr calls that take a \
     path, and fchmodat, fchmodat2 and fchownat";
 const FILTER_PROCESSES: &str = "seccomp denies ptrace, process_vm_readv, process_vm_writev, \
@@ -256,6 +256,20 @@ fn shortfalls(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
              deliver a write to the forwarded service, though it cannot read the answer; \
              forward only to services that are safe against such a write or authenticate their \
              clients (docs/linux.md, \"Exposed and forwarded ports\")"
+                .to_string(),
+        );
+    }
+    let read_only = |rule: &PathRule| rule.access != PathAccess::ReadWrite;
+    if policy.path_metadata == PathMetadata::Deny && policy.paths.iter().any(read_only) {
+        shortfalls.push(
+            "path_metadata = \"deny\" is enforced only in part on Linux: through a descriptor it \
+             opened for reading, the program can still change the mode, except the setuid and \
+             setgid bits, and the times of a file or directory it may only read (fchmod, \
+             futimens), for example make a file of a read path writable for other local users, \
+             because seccomp cannot tell such a descriptor from one opened for writing and cp, \
+             touch and many runtimes need both calls on the files they write; the content, the \
+             owner and the extended attributes stay protected (docs/linux.md, \"Metadata \
+             through open files\")"
                 .to_string(),
         );
     }

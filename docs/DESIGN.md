@@ -23,6 +23,12 @@ everything else is denied. sandy supports Linux, macOS and Windows.
 - Protecting the program from the user, or protecting secrets the program itself holds.
 - Resource limits (memory, CPU, process count). They can come later.
 - Containers, images or a separate root file system.
+- Filtering what the program writes to a terminal. A program whose standard output is the user's
+  terminal can send escape sequences that some terminal emulators act on, for example to set the
+  clipboard, and on Linux it can also change the terminal's modes. These are ordinary writes, so
+  no system call filter can tell them apart. A program that is not trusted with the terminal gets
+  a pipe or a file instead (README.md, "Using sandy from another program"). A later option could
+  have sandy relay the terminal and filter what passes.
 
 ## Threat model
 
@@ -265,7 +271,8 @@ write the other changes what programs read.
   directory with it. sandy refuses the policy when it cannot read the mount table, because it
   could not tell the two apart then; the Linux backend needs `/proc` anyway. On Windows a
   directory whose identity sandy cannot read counts as the same directory, so the check
-  refuses (see docs/windows.md).
+  refuses; the warning for a directory on `PATH` (rule 12) follows the spellings then, so it
+  names only an overlap sandy sees (see docs/windows.md).
 - **Two names, one file.** A hard link gives one file a second name. The kernels check the name
   a call uses, so a file that is executable under one name and writable under another is both.
   At the start sandy looks for a second name inside the writable paths of every file that must
@@ -455,6 +462,7 @@ exceptions:
 | Linux | `signals = "isolated"` without `children = "contained"` | a read from the terminal in the background stops the group sandy was started in, with the processes outside the sandbox in it |
 | Linux | `ip = "client"` | a UDP socket that is not connected receives datagrams from every sender, at the port the kernel chose for it, and before Landlock ABI 10 at any port the program binds |
 | Linux | `forward` | another local user can deliver a write to the forwarded service, through a connection it closed before the relay asked who owns it, and that no longer carries its user (from the close on Linux 6.8, after the timewait record on newer kernels) |
+| Linux | `path_metadata = "deny"` with a `read` or `read_exec` path | the mode, except the setuid and setgid bits, and the times of a file or directory the program may only read, through a descriptor it opened for reading (`fchmod`, `futimens`) |
 | macOS | `signals = "isolated"` | SIGIO (to a process of any user), and SIGURG with `ip = "client"` or `ip = "all"`, through the owner ioctls of sockets and pipes; without `children = "contained"` also joining another job of the terminal session and stopping it |
 | macOS | `ip = "client"` | a UDP socket that is not connected receives datagrams from every sender, at any port the program binds |
 | macOS | `forward` | every local user reaches the forwarded service |
@@ -595,14 +603,16 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   system without extended attributes, so that programs skip them instead of failing.
 - Seccomp denylist (`EPERM`): datagram socket pairs when Unix sockets are denied, with
   `ip = "client"` `listen`, `accept` and `accept4` for every socket, io_uring, ptrace
-  and `process_vm_*`, `MADV_MERGEABLE`, System V IPC, POSIX message queues, namespaces,
+  and `process_vm_*`, `MADV_MERGEABLE` and `PR_SET_MEMORY_MERGE`, System V IPC, POSIX message
+  queues, namespaces,
   `CLONE_PARENT`, mounts, `bpf`, `perf_event_open`, `userfaultfd`, keyrings, the security module
   calls, `PIDFD_GET_INFO`, `TIOCSTI`/`TIOCLINUX`/`TIOCSETD`/`TIOCEXCL`, the console ioctls that
   change a virtual console or its keyboard, the file system ioctls that change a file through a
   read-only descriptor (inode flags, fs-verity, fscrypt policies, btrfs subvolumes, deduplication),
   file leases and delegations (`F_SETLEASE`, `F_SETDELEG`), with `signals = "isolated"` also
   `TIOCSPGRP`, `TIOCSWINSZ`, `TIOCSIG` and `setpgid` into a process group that exists, calls that
-  need capabilities, `open` with access mode 3 (Landlock does not check it), the path-based
+  need capabilities and the arguments of allowed calls that need one (see docs/linux.md), `open`
+  with access mode 3 (Landlock does not check it), the path-based
   metadata calls and `fchown` when `path_metadata = "deny"`, setuid and setgid mode bits, changes
   of the limits, priority and CPU affinity of other processes, and before Landlock ABI 3 `truncate`
   for every path and `O_TRUNC` on a read-only open.
@@ -629,7 +639,8 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   ending and the memory and clock calls of the Rust runtime; it has no Landlock signal scope,
   because it must signal the program. Its filter allows the signal only through the program's
   descriptor. It is also undumpable, so a program with a write grant on `/proc` cannot make the
-  out-of-memory killer end it first; the supervising sandy and its guard do the same. With
+  out-of-memory killer end it first; the supervising sandy and its guard do the same, sandy from
+  before it forks the guard and the program, so that neither child starts dumpable. With
   `--parent-start` sandy checks field 22 of `/proc/PID/stat` of the named process after
   `pidfd_open` instead of asking whether it is its own parent; a caller can also let the kernel
   do the whole job with `clone3(CLONE_PIDFD_AUTOKILL | CLONE_AUTOREAP | CLONE_NNP)` on Linux 7
