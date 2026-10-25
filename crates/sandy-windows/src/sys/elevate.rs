@@ -37,6 +37,16 @@ type CoInitializeEx = unsafe extern "system" fn(*const core::ffi::c_void, u32) -
 const FALLBACK: &str = "nothing changed; until setup is done, run policies that need no setup \
     on this host";
 
+/// The refusal of `command` in a process without administrator rights, with status 3 as on
+/// Linux. Whether a step would change anything shows only once it is tried, so it refuses also
+/// where nothing would change: the status then means the same on every host.
+pub fn needs_rights(command: &str) -> SetupOutcome {
+    SetupOutcome::Refused(format!(
+        "{command} needs administrator rights; `sandy {command} --elevate` asks for them with \
+         the UAC prompt, or run it from an elevated prompt; {FALLBACK}"
+    ))
+}
+
 /// Whether this process runs with administrator rights that UAC does not hold back.
 pub fn is_elevated() -> Result<bool, SandboxError> {
     let mut token: HANDLE = ptr::null_mut();

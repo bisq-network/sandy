@@ -21,6 +21,7 @@ use std::process::Command;
 
 use sandy_core::{SandboxError, SetupOptions, SetupOutcome};
 
+use crate::namespace;
 use crate::setup::{self, FALLBACK};
 
 const PKEXEC: &str = "/usr/bin/pkexec";
@@ -92,11 +93,14 @@ pub fn elevate(
             setup::setup(options)
         };
     }
-    // Decided without rights, so a host that needs nothing asks for no password.
+    // Decided without rights, so a host that needs nothing, or where setup cannot help, asks
+    // for no password.
     if remove {
         if !setup::something_to_remove(options) {
             return Ok(SetupOutcome::Done("nothing to remove".to_string()));
         }
+    } else if let Some(reason) = setup::disabled(&namespace::support()) {
+        return Ok(SetupOutcome::Refused(format!("{reason}; {FALLBACK}")));
     } else if let Some(reason) = setup::unrestricted() {
         return Ok(SetupOutcome::Done(format!("nothing to do: {reason}")));
     }

@@ -1011,7 +1011,7 @@ Details, limitations and sources: `docs/windows.md`.
 | 0 / 1 | `sandy check`: enforceable / not enforceable |
 | 2 | `sandy check`: not enforceable on this host until `sandy setup`, run once with administrator rights, prepares it; nothing else is missing |
 | 0 | `sandy setup` and `sandy setup --remove`: done, or nothing to do |
-| 3 | `sandy setup` and `sandy setup --remove`: not done, and nothing changed: the rights were not given (on Linux, run without root and without `--elevate`; with `--elevate`, a dismissed prompt, no authentication agent, not authorized), or setup is not allowed for this binary |
+| 3 | `sandy setup` and `sandy setup --remove`: not done, and nothing changed: the rights were not given (run without administrator rights and without `--elevate`; with `--elevate`, a dismissed prompt, no authentication agent, not authorized), setup is not allowed for this binary, or on Linux user namespaces are disabled on the host, which setup cannot change |
 
 The caller sees sandy's process ID where sandy stays the parent, and 125 means both "sandy
 refused" and "the program exited with 125". These are additions, not changes: `--status-fd`

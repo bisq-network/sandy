@@ -473,14 +473,19 @@ only root can change.
 
 `sandy setup`, run as root:
 
-1. Where the restriction does not apply, it does nothing and says so, with exit status 0: the
+1. Where the host disables user namespaces altogether (`user.max_user_namespaces` or
+   `kernel.unprivileged_userns_clone` 0), it installs nothing and ends with status 3: a profile
+   lifts only the AppArmor restriction, and `check` reports such a host as plainly unavailable
+   (status 1). The message says so and gives the fallback. `--elevate` then asks for no rights
+   (`setup_cannot_enable_disabled_user_namespaces`).
+2. Where the restriction does not apply, it does nothing and says so, with exit status 0: the
    sysctl is absent or 0, or AppArmor is not enabled (`/sys/module/apparmor/parameters/enabled`
    is not `Y`). That covers Ubuntu 22.04 and the distributions without the sysctl (measured on
    Ubuntu 22.04 and Fedora 44).
-2. It checks that only root can change the file the kernel runs as sandy (`/proc/self/exe`; see
+3. It checks that only root can change the file the kernel runs as sandy (`/proc/self/exe`; see
    "The root-only check" below). If not, it refuses with exit status 3 and names
    `--install-copy` and installing from a package.
-3. It writes `/etc/apparmor.d/sandy-setup.PATH`, with the path's `/` as `.`. For
+4. It writes `/etc/apparmor.d/sandy-setup.PATH`, with the path's `/` as `.`. For
    `/usr/bin/sandy`:
 
    ```text
@@ -496,7 +501,7 @@ only root can change.
    with a dot, which the AppArmor parser skips when it loads the directory at boot, and renames it
    into place. An identical file stays as it is, a file with the same marker is replaced, and a
    file without it is left alone: setup then refuses with status 3.
-4. It loads the profile with `apparmor_parser --replace` and checks that the kernel lists an
+5. It loads the profile with `apparmor_parser --replace` and checks that the kernel lists an
    unconfined profile of that name. The profile loads again at every boot, with the others.
 
 The profile allows `userns` and nothing more: `flags=(unconfined)` leaves every other right as an
@@ -574,10 +579,12 @@ Where the restriction does not apply, the first read ends it.
 
 **The program's label.** The profile is unconfined, and a program that sandy starts keeps
 sandy's label when no other profile attaches to it (the kernel's `domain.c`, "unconfined exec no
-attachment"), so the program runs under a label that allows user namespaces. sandy's seccomp
-filter still denies it every namespace call. Measured on Ubuntu 25.10: a program that the copy
-runs reads `sandy-setup.usr.local.libexec.sandy.2.1.0.sandy (unconfined)` as its label, and
-`unshare -U` and `unshare -n` fail there with "Operation not permitted".
+attachment"). So the program and every process it starts run under the profile's label, which
+allows user namespaces, and sandy's seccomp filter is what keeps the program from creating
+them: it denies every namespace call. Measured on Ubuntu 25.10: a program that the copy runs
+reads `sandy-setup.usr.local.libexec.sandy.2.1.0.sandy (unconfined)` as its label, and
+`unshare -U` and `unshare -n` fail there with "Operation not permitted". The requirement holds
+through the filter, so this is no exception of `IpNetworkPrivate`.
 
 ### Removing
 
@@ -588,6 +595,11 @@ the path, so it also finds the profile after a package replaced the file. With `
 it also removes the copy's profile, the copy, temporary files that setup left in the copy's
 directory, that directory, and `/usr/local/libexec/sandy` when it is empty then. It is
 idempotent: with nothing to remove it says so and exits 0, also without root.
+
+A profile whose file someone deleted by hand stays loaded until the next boot, or until an
+administrator unloads it: `apparmor_parser -R` with a file that defines it, or its name written
+to `/sys/kernel/security/apparmor/.remove`. `--remove` leaves it alone, because nothing marks it
+as sandy's any more.
 
 ### Asking for root's rights: `--elevate`
 
@@ -646,7 +658,7 @@ writes the whole command, script included, to the system log (measured in `/var/
 | Status | `sandy setup` and `sandy setup --remove` |
 |---|---|
 | 0 | done, or nothing to do |
-| 3 | not done, and nothing changed: not root and no `--elevate`, the rights were not given, or setup is not allowed for this binary |
+| 3 | not done, and nothing changed: not root and no `--elevate`, the rights were not given, user namespaces are disabled on this host, or setup is not allowed for this binary |
 | 125 | failed, for example when the AppArmor parser rejected the profile |
 
 A program that starts sandy can decide by status alone. When `check` exits with 2, it runs

@@ -81,8 +81,8 @@ Setup options:
 Exit status: the program's status; 125 when sandy fails or refuses; for check, 0 when the policy
 is enforceable, 1 when it is not, and 2 when only `sandy setup`, run once with administrator
 rights, is missing; for setup, 0 when it is done or nothing is to do, 3 when it is not done and
-nothing changed (the rights were not given, or setup is not allowed for this binary), and 125
-when it failed.
+nothing changed (the rights were not given, setup cannot help on this host, or it is not
+allowed for this binary), and 125 when it failed.
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

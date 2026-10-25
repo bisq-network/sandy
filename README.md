@@ -344,8 +344,9 @@ no warnings: its standard error belongs to the program.
   root-owned copy of the running sandy as `/usr/local/libexec/sandy/VERSION/sandy` and prepares
   that copy instead; a sandy of that version elsewhere then hands its `run` and `check` over to
   the copy, which still checks the first sandy's file against the policy: the variable
-  `SANDY_STARTED_AS` carries its names, and sandy removes it before the program starts. Elsewhere
-  on Linux setup has nothing to do. See
+  `SANDY_STARTED_AS` carries its names, and sandy removes it before the program starts. Where
+  user namespaces are disabled altogether, a profile cannot help, and setup exits with status 3.
+  Elsewhere on Linux setup has nothing to do. See
   [docs/linux.md](docs/linux.md), "Setup on Ubuntu", also for packaging scripts.
 - **macOS**: nothing to do.
 
@@ -454,7 +455,7 @@ it.
 | 0 / 1 | `sandy check`: the policy is enforceable / not enforceable |
 | 2 | `sandy check`: not enforceable until `sandy setup`, run once with administrator rights, prepares this host, and nothing else is missing |
 | 0 | `sandy setup`, with or without `--remove`: done, or nothing to do |
-| 3 | `sandy setup`, with or without `--remove`: not done, and nothing changed: the rights were not given (on Linux, no root and no `--elevate`; with `--elevate`, a dismissed prompt, no authentication agent, not authorized), or setup is not allowed for this binary |
+| 3 | `sandy setup`, with or without `--remove`: not done, and nothing changed: the rights were not given (no administrator rights and no `--elevate`; with `--elevate`, a dismissed prompt, no authentication agent, not authorized), setup is not allowed for this binary, or on Linux user namespaces are disabled on this host |
 
 A program that starts sandy can act on these without reading text. On status 2 from `check`, it
 runs `sandy setup --elevate` with the same policy, adding `--install-copy` on Linux when it
@@ -866,8 +867,9 @@ metadata through the descriptor they wrote.
   otherwise), so the program can connect to services on 127.0.0.1, and with `expose` it grants
   the relay access to `sandy.exe` if your user cannot. `--elevate` asks for the rights with the
   UAC prompt, when only administrators can change `sandy.exe` and its directories, for example
-  below `C:\Program Files`; the elevated sandy's messages go to its own console, so only its exit
-  status comes back.
+  below `C:\Program Files`. The elevated sandy's messages do not reach the caller, only its exit
+  status does. Without administrator rights and without `--elevate`, setup and `setup --remove`
+  change nothing and exit with status 3.
 - **Inbound loopback.** Windows blocks every connection from outside into an AppContainer, also
   on 127.0.0.1. Use `expose` for programs that accept connections.
 - **Private network.** `ip = "private"` runs the program in its AppContainer without network

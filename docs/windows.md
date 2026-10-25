@@ -463,7 +463,8 @@ Old grants grant nothing, so removing them is cleanup, not a security step.
 
 `sandy setup --remove`, with the policy whose changes should go, does all of it:
 
-- the loopback exemption of the AppContainer (administrator rights, and only when it is there);
+- the loopback exemption of the AppContainer, when it is there. The removal needs
+  administrator rights as a whole: without them it changes nothing and exits with status 3;
 - the access control entry of every policy path, and of `sandy.exe` for the relays. Only the
   capability SIDs sandy derives for this AppContainer and these objects are removed. Other
   software (Chromium, for example) uses capability SIDs too, and a capability SID cannot be
@@ -812,7 +813,11 @@ the program's end (`relay_stops_listening_as_soon_as_the_program_ends`).
 `sandy setup` makes the loopback exemption of the policy's AppContainer match the policy: present
 with `ip = "client"` and `ip = "all"`, absent with `ip = "none"` and `ip = "private"`. With
 `--expose`, it also grants the relays read and execute on `sandy.exe` (see "Exposed ports"). Run
-it once per machine as administrator:
+it once per machine as administrator. Without administrator rights and without `--elevate`,
+`setup` and `setup --remove` change nothing and exit with status 3, as on Linux, also where
+nothing would change, because whether something changes shows only once it is tried
+(`setup_without_administrator_rights_is_not_done`, which runs sandy under a `LUA_TOKEN` copy
+of its token, as UAC restricts an administrator without elevation):
 
 ```text
 sandy setup --appcontainer example.app --ip all     # add the exemption (also --ip client)
@@ -840,9 +845,10 @@ Allow entries count with or without a condition, deny entries are ignored, and a
 kind sandy does not read refuses, so the check errs towards refusing. The account of an
 administrator does not count as administrators: its processes without elevation hold its SID
 too. Below `C:\Program Files` the check passes; in a user's profile it fails, and sandy refuses
-with status 3. A dismissed UAC prompt also ends with status 3. The elevated sandy has a console
-of its own, which closes when it ends, so its messages do not reach the caller and only its
-exit status does; to read them, run the same command from an elevated prompt.
+with status 3. A dismissed UAC prompt also ends with status 3. The elevated process's messages
+do not reach the caller, only its exit status does: the elevated sandy has a console of its
+own, which closes when it ends, and `ShellExecuteExW` takes no handles to pass on. To read the
+messages, run the same command from an elevated prompt.
 `ShellExecuteExW` and `CoInitializeEx` are loaded at run time, like `SHGetKnownFolderPath`:
 shell32.dll and ole32.dll load user32.dll, which fails to initialize in an AppContainer in an
 SSH session, and `sandy.exe` also runs the relays there. Only the elevated route was tested: the

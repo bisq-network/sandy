@@ -43,9 +43,8 @@ fn restricted() -> bool {
         && read("/sys/module/apparmor/parameters/enabled") == "Y"
 }
 
-/// Whether this test may use `sudo -n` and the host restricts user namespaces with AppArmor;
-/// records a skip when not.
-fn root_on_a_restricted_host() -> bool {
+/// Whether this test may use `sudo -n`; records a skip when not.
+fn passwordless_sudo() -> bool {
     let sudo = Command::new("sudo")
         .args(["-n", "true"])
         .stdin(Stdio::null())
@@ -55,6 +54,15 @@ fn root_on_a_restricted_host() -> bool {
             "passwordless-sudo",
             "the test needs root, and sudo -n asks for a password here",
         );
+        return false;
+    }
+    true
+}
+
+/// Whether this test may use `sudo -n` and the host restricts user namespaces with AppArmor;
+/// records a skip when not.
+fn root_on_a_restricted_host() -> bool {
+    if !passwordless_sudo() {
         return false;
     }
     if !restricted() {
@@ -551,6 +559,104 @@ fn setup_leaves_a_profile_file_it_did_not_write() {
     assert!(String::from_utf8_lossy(&removed.stdout).contains("nothing to remove"));
     assert_eq!(fs::read_to_string(&file).unwrap(), foreign);
     assert!(!is_loaded(&profile_name(&installed.sandy)));
+}
+
+const UNPRIVILEGED_USERNS_CLONE: &str = "/proc/sys/kernel/unprivileged_userns_clone";
+
+/// Writes `value` to the sysctl file `path` as root.
+fn set_sysctl(path: &str, value: &str) {
+    let mut tee = Command::new("sudo")
+        .args(["-n", "tee", path])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(&mut tee.stdin.take().unwrap(), value.as_bytes()).unwrap();
+    assert!(
+        tee.wait().unwrap().success(),
+        "cannot set {path} to {value}"
+    );
+}
+
+/// Sets a sysctl back to the value it had, also when a test fails.
+struct Restore {
+    path: &'static str,
+    value: String,
+}
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        set_sysctl(self.path, &self.value);
+    }
+}
+
+/// Where the host disables user namespaces for unprivileged processes, `check` reports them
+/// unavailable (status 1), and setup, which only lifts the AppArmor restriction, installs
+/// nothing and ends with status 3, with root, without it and with `--elevate`, which then asks
+/// for nothing. The test turns `kernel.unprivileged_userns_clone` off for its duration.
+#[test]
+fn setup_cannot_enable_disabled_user_namespaces() {
+    let _serial = serial();
+    if !passwordless_sudo() {
+        return;
+    }
+    let before = read(UNPRIVILEGED_USERNS_CLONE);
+    if before.is_empty() {
+        return skip(
+            "unprivileged-userns-clone",
+            "only Debian and Ubuntu kernels have kernel.unprivileged_userns_clone",
+        );
+    }
+    // A setup that wrongly went ahead would install the copy too; take it back then.
+    let copy_existed = copy_path().parent().unwrap().exists();
+    let _removal = (!copy_existed).then(|| CopyRemoval {
+        directory_existed: Path::new(COPY_DIRECTORY).exists(),
+    });
+    let installed = Installed::new();
+    let _restore = Restore {
+        path: UNPRIVILEGED_USERNS_CLONE,
+        value: before,
+    };
+    set_sysctl(UNPRIVILEGED_USERNS_CLONE, "0");
+
+    let check = check_private(&installed.sandy);
+    assert_eq!(check.status.code(), Some(1), "{}", text(&check));
+    assert!(
+        String::from_utf8_lossy(&check.stdout).contains("kernel.unprivileged_userns_clone = 0"),
+        "{}",
+        text(&check)
+    );
+    let sandy = installed.sandy.as_os_str();
+    for output in [
+        sudo([sandy, "setup".as_ref()]),
+        sudo([sandy, "setup".as_ref(), "--install-copy".as_ref()]),
+        output_within(
+            Command::new(sandy).args(["setup", "--elevate"]),
+            Duration::from_secs(60),
+        ),
+        sandy_output(sandy, &["setup"]),
+    ] {
+        assert_eq!(
+            output.status.code(),
+            Some(EXIT_NOT_DONE),
+            "{}",
+            text(&output)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for part in [
+            "user namespaces are disabled on this host",
+            "setup cannot change that",
+            "until setup is done, run policies without ip = \"private\"",
+        ] {
+            assert!(stderr.contains(part), "{part}: {stderr}");
+        }
+    }
+    assert_no_profile(&installed.sandy);
+    assert_eq!(copy_path().parent().unwrap().exists(), copy_existed);
+}
+
+fn sandy_output(sandy: &std::ffi::OsStr, args: &[&str]) -> Output {
+    Command::new(sandy).args(args).output().unwrap()
 }
 
 /// (e) `--elevate` asks pkexec for root's rights. Over SSH no authentication agent runs for the

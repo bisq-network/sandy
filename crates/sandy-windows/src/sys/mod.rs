@@ -265,7 +265,7 @@ impl Backend for WindowsBackend {
     /// `ip = "client"` and `ip = "all"`, absent with `ip = "none"` and `ip = "private"`
     /// (`plan::loopback_exemption`). With exposed or forwarded ports, also lets the relays run
     /// sandy's executable, which a user without the right to change its permissions cannot do at
-    /// run time. Needs administrator rights when it changes something.
+    /// run time. Without administrator rights it changes nothing (`elevate::needs_rights`).
     fn setup(
         &self,
         policy: &ResolvedPolicy,
@@ -275,6 +275,9 @@ impl Backend for WindowsBackend {
             SandboxError::new("the policy names no AppContainer; pass --appcontainer NAME")
         })?;
         validate_appcontainer_name(name).map_err(SandboxError::new)?;
+        if !elevate::is_elevated()? {
+            return Ok(elevate::needs_rights("setup"));
+        }
         let container = appcontainer::sid(name)?;
         let exempt = loopback_exemption(policy.ip);
         network::set_loopback_exempt(&container, exempt)?;
@@ -303,7 +306,7 @@ impl Backend for WindowsBackend {
     /// for this AppContainer are removed; other software uses capability SIDs too.
     ///
     /// Entries on objects that have left the policy stay, because nothing says where they are.
-    /// Needs administrator rights only where it changes the loopback exemption.
+    /// Without administrator rights it changes nothing (`elevate::needs_rights`).
     fn remove(
         &self,
         policy: &ResolvedPolicy,
@@ -313,6 +316,9 @@ impl Backend for WindowsBackend {
             SandboxError::new("the policy names no AppContainer; pass --appcontainer NAME")
         })?;
         validate_appcontainer_name(name).map_err(SandboxError::new)?;
+        if !elevate::is_elevated()? {
+            return Ok(elevate::needs_rights("setup --remove"));
+        }
         let container = appcontainer::sid(name)?;
         // A run of this AppContainer would lose its access in the middle.
         let _idle = singleton::hold_idle(&container)?;

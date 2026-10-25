@@ -24,7 +24,7 @@ use std::process::{Command, Stdio};
 
 use sandy_core::{SandboxError, SetupOptions, SetupOutcome};
 
-use crate::namespace::APPARMOR_RESTRICTION;
+use crate::namespace::{self, APPARMOR_RESTRICTION, Missing};
 
 const APPARMOR_ENABLED: &str = "/sys/module/apparmor/parameters/enabled";
 const PROFILE_DIRECTORY: &str = "/etc/apparmor.d";
@@ -286,6 +286,9 @@ pub fn setup(options: SetupOptions) -> Result<SetupOutcome, SandboxError> {
 }
 
 fn prepare(options: SetupOptions) -> Step<String> {
+    if let Some(reason) = disabled(&namespace::support()) {
+        return Err(Stop::Refused(reason));
+    }
     if let Some(reason) = unrestricted() {
         return Ok(format!("nothing to do: {reason}"));
     }
@@ -298,6 +301,18 @@ fn prepare(options: SetupOptions) -> Step<String> {
         own
     };
     install_profile(&target)
+}
+
+/// Why setup cannot help where the host disables user namespaces altogether, which `check`
+/// reports as plainly unavailable: a profile lifts only the AppArmor restriction. `None` for
+/// what `support` says otherwise.
+pub fn disabled(support: &namespace::Support) -> Option<String> {
+    match support {
+        Err(Missing::Unavailable(reason)) => Some(format!(
+            "{reason}; setup cannot change that, because an AppArmor profile does not enable              them"
+        )),
+        Err(Missing::NeedsSetup(_)) | Ok(()) => None,
+    }
 }
 
 /// Why setup refuses a sandy whose own file is not root-owned, and what to do instead.
@@ -675,6 +690,22 @@ mod tests {
         assert!(Profile::for_path(Path::new("/opt/My_Tool-2.1.0+rc1/sandy")).is_ok());
         let long = format!("/{}", "a".repeat(250));
         assert!(Profile::for_path(Path::new(&long)).is_err());
+    }
+
+    /// Where the host disables user namespaces, `check` reports them unavailable (status 1),
+    /// so setup, which only lifts the AppArmor restriction, refuses instead of preparing.
+    #[test]
+    fn disabled_user_namespaces_are_beyond_setup() {
+        let reason = "user namespaces are disabled on this host \
+                      (kernel.unprivileged_userns_clone = 0)";
+        let refusal = disabled(&Err(Missing::Unavailable(reason.to_string()))).unwrap();
+        assert!(refusal.starts_with(reason), "{refusal}");
+        assert!(refusal.contains("setup cannot change that"), "{refusal}");
+        assert_eq!(
+            disabled(&Err(Missing::NeedsSetup("restricted".to_string()))),
+            None
+        );
+        assert_eq!(disabled(&Ok(())), None);
     }
 
     #[test]

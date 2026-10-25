@@ -291,17 +291,27 @@ fn loopback_args(sandbox_args: &[String]) -> Vec<String> {
 }
 
 /// Installs the loopback exemption for this test's `appcontainer_loopback_name`. It needs
-/// administrator rights, which the elevated VM phase and the CI runners have; `sandy setup` does
-/// nothing and needs no rights when the exemption is already there, so the limited VM phase
-/// reuses the exemption the elevated phase created for the same name.
+/// administrator rights, which the elevated VM phase and the CI runners have. Without them
+/// `sandy setup` changes nothing and ends with status 3, also when the exemption is there
+/// already, so the limited VM phase reuses the exemption the elevated phase created for the
+/// same name, which `check` of a policy without IP networking reports.
 pub fn prepare_loopback_exemption() {
     let name = appcontainer_loopback_name();
     let output = sandy(["setup", "--appcontainer", &name, "--ip", "all"]);
+    if output.status.code() == Some(3) {
+        let check = sandy(["check", "--appcontainer", &name]);
+        assert!(
+            String::from_utf8_lossy(&check.stdout).contains("is exempt from loopback isolation"),
+            "`sandy setup --appcontainer {name} --ip all` needs administrator rights, so the \
+             elevated phase or a CI runner must create the exemption before a non-admin run \
+             reuses it: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     assert!(
         output.status.success(),
-        "`sandy setup --appcontainer {name} --ip all` failed; it needs administrator rights, so \
-         the elevated phase or a CI runner must create the exemption before a non-admin run \
-         reuses it: {}",
+        "`sandy setup --appcontainer {name} --ip all` failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

@@ -376,12 +376,26 @@ fn check_reports_a_path_whose_permissions_the_user_cannot_change() {
 /// Runs sandy with `sandy_args` under the token of this process without its privileges. Returns
 /// the exit code and the standard output and error.
 fn sandy_without_privileges(sandy_args: &[String]) -> (u32, String) {
+    sandy_with_restricted_token(
+        windows_sys::Win32::Security::DISABLE_MAX_PRIVILEGE,
+        sandy_args,
+    )
+}
+
+/// Runs sandy with `sandy_args` under a token that UAC would give this user without elevation:
+/// the administrators group for deny only and no privileges (`LUA_TOKEN`).
+fn sandy_without_administrator_rights(sandy_args: &[String]) -> (u32, String) {
+    sandy_with_restricted_token(windows_sys::Win32::Security::LUA_TOKEN, sandy_args)
+}
+
+/// Runs sandy with `sandy_args` under the token of this process restricted with `flags`
+/// (`CreateRestrictedToken`). Returns the exit code and the standard output and error.
+fn sandy_with_restricted_token(flags: u32, sandy_args: &[String]) -> (u32, String) {
     use std::io::Read;
     use std::os::windows::io::{FromRawHandle, OwnedHandle};
     use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
     use windows_sys::Win32::Security::{
-        CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
-        TOKEN_QUERY,
+        CreateRestrictedToken, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
     };
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::{
@@ -406,7 +420,7 @@ fn sandy_without_privileges(sandy_args: &[String]) -> (u32, String) {
     let restricted = unsafe {
         CreateRestrictedToken(
             own.as_raw_handle(),
-            DISABLE_MAX_PRIVILEGE,
+            flags,
             0,
             std::ptr::null(),
             0,
@@ -747,6 +761,54 @@ fn elevate_with_administrator_rights_runs_setup_directly() {
         "{removed:?}"
     );
     assert_eq!(check(), Some(0));
+    delete_profile(name);
+}
+
+/// Without administrator rights and without `--elevate`, setup and its removal change nothing
+/// and end with status 3, as on Linux, also where nothing would change, and say how to get the
+/// rights. Control: the same commands with the rights succeed.
+#[test]
+fn setup_without_administrator_rights_is_not_done() {
+    let name = "sandy.limited-setup-test";
+    let args = |values: &[&str]| {
+        values
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+    };
+    let exempt = || {
+        String::from_utf8_lossy(&sandy(["check", "--appcontainer", name]).stdout)
+            .contains("is exempt from loopback isolation")
+    };
+    assert!(!exempt());
+    for command in [
+        args(&["setup", "--appcontainer", name, "--ip", "all"]),
+        args(&["setup", "--appcontainer", name]),
+        args(&["setup", "--remove", "--appcontainer", name]),
+    ] {
+        let (code, output) = sandy_without_administrator_rights(&command);
+        assert_eq!(code as i32, 3, "{command:?}: {output}");
+        for part in [
+            "needs administrator rights",
+            "--elevate",
+            "elevated prompt",
+            "nothing changed",
+        ] {
+            assert!(output.contains(part), "{command:?}: {part}: {output}");
+        }
+    }
+    assert!(!exempt());
+
+    let setup = sandy(["setup", "--appcontainer", name, "--ip", "all"]);
+    assert!(setup.status.success(), "{setup:?}");
+    assert!(exempt());
+    let (code, output) =
+        sandy_without_administrator_rights(&args(&["setup", "--remove", "--appcontainer", name]));
+    assert_eq!(code as i32, 3, "{output}");
+    assert!(exempt(), "the removal without rights changed the exemption");
+    let removed = sandy(["setup", "--remove", "--appcontainer", name]);
+    assert!(removed.status.success(), "{removed:?}");
+    assert!(!exempt());
     delete_profile(name);
 }
 
