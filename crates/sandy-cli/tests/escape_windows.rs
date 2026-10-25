@@ -735,8 +735,10 @@ fn elevate_with_administrator_rights_runs_setup_directly() {
     let stdout = String::from_utf8_lossy(&setup.stdout);
     assert!(setup.status.success(), "{setup:?}");
     assert!(stdout.contains("is in the loopback exemption"), "{stdout}");
+    // The exemption that setup gave the policy with `ip = "all"` is one that setup for the
+    // policy without IP networking takes back, so check names setup.
     let check = || sandy(["check", "--appcontainer", name]).status.code();
-    assert_eq!(check(), Some(EXIT_NOT_ENFORCEABLE));
+    assert_eq!(check(), Some(EXIT_NEEDS_SETUP));
 
     let removed = sandy(["setup", "--remove", "--elevate", "--appcontainer", name]);
     assert!(removed.status.success(), "{removed:?}");

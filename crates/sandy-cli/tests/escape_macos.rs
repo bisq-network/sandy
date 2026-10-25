@@ -867,7 +867,7 @@ fn forwarded_port_serves_a_process_outside_the_sandbox(ip: &str) {
     });
     let inner = free_port();
     let address = format!("127.0.0.1:{inner}");
-    let args = with(
+    let mut args = with(
         home_args(&fixture),
         &[
             "--ip",
@@ -876,6 +876,10 @@ fn forwarded_port_serves_a_process_outside_the_sandbox(ip: &str) {
             &format!("{inner}=127.0.0.1:{target}"),
         ],
     );
+    if ip == "private" {
+        // A port that sandy holds needs isolated signals on macOS.
+        args = with(args, &["--signals", "isolated"]);
+    }
     // The program sends through its own connection, then keeps its relay running until the test
     // sends it a line.
     let mut program = Command::new(sandy_path())

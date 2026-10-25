@@ -475,8 +475,10 @@ fn check_warns_that_a_stopped_relay_has_no_time_limit() {
 }
 
 /// Seatbelt's `localhost` is every address of the Mac, so a private network lets the program
-/// listen on its exposed ports, and reach its forwarded ports, at every address; check names both
-/// (docs/macos.md, "The private network"). The control: a private network without relays.
+/// listen on its exposed ports at every address, and reach its forwarded and egress ports at
+/// addresses the Mac gains later; check names both, and that every local user reaches the
+/// egress broker (docs/macos.md, "The private network"). The control: a private network without
+/// relays.
 #[cfg(target_os = "macos")]
 #[test]
 fn check_reports_a_private_network_and_warns_where_it_reaches_other_addresses() {
@@ -484,9 +486,10 @@ fn check_reports_a_private_network_and_warns_where_it_reaches_other_addresses() 
     let mut args = forward_args(&to);
     args[1] = "private".to_string();
     let expose = format!("{}=8080", free_address());
-    let mut check = vec!["check"];
+    let egress = free_address().rsplit_once(':').unwrap().1.to_string();
+    let mut check = vec!["check", "--signals", "isolated"];
     check.extend(args.each_ref().map(String::as_str));
-    check.extend(["--expose", &expose]);
+    check.extend(["--expose", &expose, "--egress", &egress]);
     let output = sandy(&check);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
@@ -502,8 +505,18 @@ fn check_reports_a_private_network_and_warns_where_it_reaches_other_addresses() 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(warns(&stderr, exposed), "{stderr}");
     assert!(warns(&stderr, forwarded), "{stderr}");
-    // The relay still cannot tell who connects, as with ip = "all".
+    // The relay still cannot tell who connects, as with ip = "all", and neither can the broker.
     assert!(warns(&stderr, "serves every local user"), "{stderr}");
+    assert!(
+        warns(&stderr, "the egress broker serves every local user"),
+        "{stderr}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.starts_with(
+            "enforced     connections out only through the egress broker: Seatbelt profile: "
+        )),
+        "{stdout}"
+    );
 
     let stderr = check_warnings(&["--ip", "private"]);
     assert!(!warns(&stderr, exposed), "{stderr}");

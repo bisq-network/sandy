@@ -7,8 +7,8 @@
 //! 2. It forks the guard, which starts a process group of its own and forks the anchor. The
 //!    anchor leads the program's process group and only waits to be killed; it is the guard's
 //!    child, so the group's ID stays reserved until the guard reaps it. The guard keeps only its
-//!    pipes from and to sandy and, with exposed or forwarded ports, the write end of the pipe
-//!    that tells the relay that the group has ended.
+//!    pipes from and to sandy and, with a relay or an egress broker, the write end of the pipe
+//!    that tells them that the group has ended.
 //! 3. It forks the program. The program joins the anchor's group and then sends its own process
 //!    ID to the guard, so that the guard learns it even if sandy never runs again after the fork,
 //!    and learns it only once the program is in the group, so a kill of the group reaches it from
@@ -19,9 +19,9 @@
 //!    kills the group with SIGKILL until no live process is left in it. The guard is not in the
 //!    group, so it can repeat the signal: on macOS a process forked while a group signal is
 //!    delivered can escape one signal. So the group ends with the program also while sandy is
-//!    stopped. Then it closes the relay's pipe, waits until sandy is done, reaps the anchor and
-//!    ends. With exposed or forwarded ports the guard watches the relay too, and when the relay
-//!    ends while the program runs, it tells sandy so and ends the group in the same way.
+//!    stopped. Then it closes the helpers' pipe, waits until sandy is done, reaps the anchor and
+//!    ends. The guard watches the relay and the egress broker too, and when one of them ends
+//!    while the program runs, it tells sandy which and ends the group in the same way.
 //! 4. The program applies the profile and executes the target with execve; it reports a failure
 //!    over a close-on-exec pipe. The profile denies setpgid, setsid and posix_spawn, whose
 //!    POSIX_SPAWN_SETSID and POSIX_SPAWN_SETPGROUP flags would change the group inside the
@@ -36,7 +36,7 @@
 //! 6. When the program exits, sandy gives the terminal back, kills the group with SIGKILL until
 //!    no live process is left in it, tells the guard that it is done, reaps the guard and the
 //!    program, and exits with the program's exit status, or 128 plus the signal number if a
-//!    signal ended it. If the guard reported that the relay ended first, sandy fails instead.
+//!    signal ended it. If the guard reported that a helper ended first, sandy fails instead.
 //!
 //! macOS has no child subreaper: launchd adopts a process whose parent ends, so neither sandy nor
 //! the guard can wait for the processes of the group. Instead they repeat the SIGKILL until the
@@ -63,8 +63,14 @@ const SIGNALED: i32 = 128;
 /// The forked child's exit status when it cannot start the program. sandy reports the message
 /// from the pipe instead.
 const START_FAILED: i32 = 125;
-/// What the guard writes to sandy when the relay ended while the program ran.
-const RELAY_ENDED: u8 = b'r';
+/// A helper of the program that the guard watches, the relay or the egress broker. Without it
+/// the ports it served would be left to whatever binds them next.
+#[derive(Debug, Clone, Copy)]
+pub struct Helper {
+    pub pid: libc::pid_t,
+    /// What it is, for the message when it ends first.
+    pub name: &'static str,
+}
 /// How long sandy waits between two SIGKILLs to the group while processes of it are left.
 const KILL_POLL: Duration = Duration::from_millis(10);
 /// Signals whose default action is to ignore them. macOS discards a signal on arrival while its
@@ -98,19 +104,18 @@ const NOT_CAUGHT: [libc::c_int; 11] = [
 
 /// Starts the program in a process group that sandy ends when the program ends, and returns the
 /// exit status for sandy. `start` runs in the forked child: it confines the child and executes
-/// the target, and returns only on failure. `ended` is the write end of the relay's pipe, if a
-/// relay runs: the guard closes it once the group has ended. `relay` is the relay's process ID,
-/// which the guard watches.
+/// the target, and returns only on failure. `ended` is the write end of the helpers' pipe, if a
+/// helper runs: the guard closes it once the group has ended. The guard watches the `helpers`.
 pub fn run(
     start: impl FnOnce() -> SandboxError,
     ended: Option<File>,
-    relay: Option<libc::pid_t>,
+    helpers: Vec<Helper>,
     status: &StatusReport,
 ) -> Result<i32, SandboxError> {
     require_single_thread()?;
     let actions = CaughtSignals::catch()?;
     let signals = Signals::block()?;
-    let mut group = Group::start(ended, relay)?;
+    let mut group = Group::start(ended, helpers)?;
     let (mut report, report_write) = pipe("the program's report pipe")?;
     // SAFETY: sandy is single-threaded (checked above), so the child may run any code. It leaves
     // only through execve or `_exit`, never by returning into sandy's code.
@@ -166,14 +171,16 @@ struct Group {
     /// The write end of the pipe to the guard. The forked program writes its process ID into it;
     /// closing it tells the guard that sandy is done.
     to_guard: Option<File>,
-    /// The read end of the pipe from the guard: the group's ID, then `RELAY_ENDED` if the guard
-    /// ended the group because the relay ended.
+    /// The read end of the pipe from the guard: the group's ID, then the index of a helper if the
+    /// guard ended the group because that helper ended.
     from_guard: File,
+    helpers: Vec<Helper>,
     ended: bool,
 }
 
 impl Group {
-    fn start(ended: Option<File>, relay: Option<libc::pid_t>) -> Result<Group, SandboxError> {
+    fn start(ended: Option<File>, helpers: Vec<Helper>) -> Result<Group, SandboxError> {
+        let watched: Vec<libc::pid_t> = helpers.iter().map(|helper| helper.pid).collect();
         let (guard_reads, to_guard) = pipe("the pipe to the guard")?;
         let (from_guard, guard_writes) = pipe("the pipe from the guard")?;
         // SAFETY: sandy is single-threaded (checked in `run`). The guard leaves only through
@@ -188,7 +195,7 @@ impl Group {
             0 => {
                 drop(to_guard);
                 drop(from_guard);
-                guard_main(guard_reads, guard_writes, ended, relay)
+                guard_main(guard_reads, guard_writes, ended, &watched)
             }
             pid => pid,
         };
@@ -203,6 +210,7 @@ impl Group {
             program_has_terminal: false,
             to_guard: Some(to_guard),
             from_guard,
+            helpers,
             ended: false,
         };
         let mut id = [0u8; mem::size_of::<libc::pid_t>()];
@@ -217,18 +225,19 @@ impl Group {
 
     /// Forwards signals and follows the program until it exits. Returns how it ended.
     ///
-    /// A relay that is gone leaves its ports to whatever binds them next, and a local user who
-    /// binds the program's forward port receives what the program sends there, so the guard ends
-    /// the program with it, and sandy reports that as its own failure.
+    /// A relay or a broker that is gone leaves its ports to whatever binds them next, and a local
+    /// user who binds the program's forward or egress port receives what the program sends there,
+    /// so the guard ends the program with it, and sandy reports that as its own failure.
     fn supervise(&mut self, signals: &Signals) -> Result<ChildState, SandboxError> {
         let program = self.program.expect("the program was started");
         loop {
             if let Some(exited) = self.reap_others(program)? {
-                if self.relay_ended() {
-                    return Err(SandboxError::new(
-                        "the relay of the exposed or forwarded ports ended before the program; \
-                         the ports it served are gone and the program has been ended with it",
-                    ));
+                if let Some(helper) = self.helper_ended() {
+                    return Err(SandboxError::new(format!(
+                        "{} ended before the program; the ports it served are gone and the \
+                         program has been ended with it",
+                        helper.name
+                    )));
                 }
                 return Ok(exited);
             }
@@ -246,10 +255,10 @@ impl Group {
         }
     }
 
-    /// Whether the guard ended the group because the relay ended while the program ran. The
-    /// guard reports that before it kills the group, so the report is there once sandy sees the
+    /// The helper whose end made the guard end the group while the program ran, if one did. The
+    /// guard reports it before it kills the group, so the report is there once sandy sees the
     /// program end.
-    fn relay_ended(&self) -> bool {
+    fn helper_ended(&self) -> Option<Helper> {
         let mut poll = libc::pollfd {
             fd: self.from_guard.as_raw_fd(),
             events: libc::POLLIN,
@@ -257,10 +266,13 @@ impl Group {
         };
         // SAFETY: one valid pollfd, and a zero timeout does not block.
         if unsafe { libc::poll(&mut poll, 1, 0) } <= 0 {
-            return false;
+            return None;
         }
         let mut report = [0u8; 1];
-        matches!((&self.from_guard).read(&mut report), Ok(1) if report[0] == RELAY_ENDED)
+        match (&self.from_guard).read(&mut report) {
+            Ok(1) => self.helpers.get(usize::from(report[0])).copied(),
+            _ => None,
+        }
     }
 
     /// Reaps every exited child except the program and the guard. Returns the program's state
@@ -410,14 +422,14 @@ fn kill_group(id: libc::pid_t) {
 }
 
 /// The guard: starts the anchor, which leads the program's group, and kills the group when the
-/// program ends, sandy ends or the relay ends. `from_sandy` brings the program's process ID and
-/// ends when sandy is done or gone; `to_sandy` takes the group's ID and the report that the relay
-/// ended; `ended` is the relay's pipe, and `relay` the relay's process ID.
+/// program ends, sandy ends or a helper ends. `from_sandy` brings the program's process ID and
+/// ends when sandy is done or gone; `to_sandy` takes the group's ID and the index of a helper
+/// that ended; `ended` is the helpers' pipe, and `helpers` their process IDs.
 fn guard_main(
     from_sandy: File,
     mut to_sandy: File,
     ended: Option<File>,
-    relay: Option<libc::pid_t>,
+    helpers: &[libc::pid_t],
 ) -> ! {
     let mut keep = vec![from_sandy.as_raw_fd(), to_sandy.as_raw_fd()];
     keep.extend(ended.as_ref().map(AsRawFd::as_raw_fd));
@@ -449,10 +461,10 @@ fn guard_main(
             libc::_exit(1)
         }
     }
-    let relay_ended = watch_program(&from_sandy).is_some_and(|queue| wait_for_end(&queue, relay));
-    if relay_ended {
+    let helper_ended = watch_program(&from_sandy).and_then(|queue| wait_for_end(&queue, helpers));
+    if let Some(index) = helper_ended {
         // Before the kill, so that sandy finds the report once it sees the program end.
-        let _ = to_sandy.write_all(&[RELAY_ENDED]);
+        let _ = to_sandy.write_all(&[index]);
     }
     drop(to_sandy);
     kill_group(anchor);
@@ -517,27 +529,37 @@ fn watch_program(end: &File) -> Option<OwnedFd> {
     Some(queue)
 }
 
-/// Waits until the program ends, the pipe from sandy ends, or the relay ends. Returns whether the
-/// relay ended while the program ran and sandy was there. A relay that cannot be registered has
-/// ended already, or cannot be watched, and counts as ended.
-fn wait_for_end(queue: &OwnedFd, relay: Option<libc::pid_t>) -> bool {
-    let relay = relay.map(|relay| relay as usize);
-    let is_relay =
-        |event: &libc::kevent| event.filter == libc::EVFILT_PROC && Some(event.ident) == relay;
-    let watched = relay
-        .is_none_or(|relay| register(queue, relay, libc::EVFILT_PROC, libc::NOTE_EXIT).is_ok());
-    let mut events = [NO_EVENT; 3];
-    if watched {
-        // Any event is an end: the program's exit, the end of the pipe, or the relay's exit.
-        match wait_events(queue, &mut events, None) {
-            Ok(count) if count > 0 && events[..count].iter().all(is_relay) => {}
-            _ => return false,
-        }
-    }
-    // Once more, so that a program that ended together with the relay is the end of a run and
+/// Waits until the program ends, the pipe from sandy ends, or a helper ends. Returns the index
+/// of the helper that ended while the program ran and sandy was there. A helper that cannot be
+/// registered has ended already, or cannot be watched, and counts as ended.
+fn wait_for_end(queue: &OwnedFd, helpers: &[libc::pid_t]) -> Option<u8> {
+    let helper_of = |event: &libc::kevent| {
+        helpers
+            .iter()
+            .position(|pid| event.filter == libc::EVFILT_PROC && event.ident == *pid as usize)
+    };
+    let unwatched = helpers.iter().position(|pid| {
+        register(queue, *pid as usize, libc::EVFILT_PROC, libc::NOTE_EXIT).is_err()
+    });
+    let mut events = [NO_EVENT; 4];
+    let ended = match unwatched {
+        Some(index) => index,
+        // Any event is an end: the program's exit, the end of the pipe, or a helper's exit.
+        None => match wait_events(queue, &mut events, None) {
+            Ok(count) if count > 0 && events[..count].iter().all(|e| helper_of(e).is_some()) => {
+                helper_of(&events[0])?
+            }
+            _ => return None,
+        },
+    };
+    // Once more, so that a program that ended together with a helper is the end of a run and
     // not a failure.
     let count = wait_events(queue, &mut events, Some(Duration::ZERO)).unwrap_or(0);
-    events[..count].iter().all(is_relay)
+    if events[..count].iter().all(|e| helper_of(e).is_some()) {
+        u8::try_from(ended).ok()
+    } else {
+        None
+    }
 }
 
 /// The forked child: joins the group, tells the guard its process ID, restores the signal state

@@ -232,26 +232,33 @@ fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
                 .to_string(),
         );
     }
-    if policy.ip == IpAccess::Private && !policy.forward.is_empty() {
-        let relay_ended = match (contained, policy.signals) {
-            // The guard ends the program with its relay.
-            (true, _) => "",
-            (false, SignalScope::Isolated) => {
-                ", and once the relay has ended any process that binds the port does"
-            }
-            (false, SignalScope::Any) => {
-                ", and once the relay has ended any process that binds the port does; with \
-                 signals = \"any\" the program can end its relay itself"
-            }
+    let held = !policy.forward.is_empty() || policy.egress.is_some();
+    if policy.ip == IpAccess::Private && held {
+        // The guard ends a contained program with its helpers.
+        let ended = if contained {
+            ""
+        } else {
+            ", and once the relay or the broker has ended, also when something outside the \
+             sandbox ends it, any process that binds the port does"
         };
         shortfalls.push(format!(
             "ip = \"private\" keeps the program off this Mac's other addresses only in part on \
              macOS: Seatbelt's localhost matches every address of this Mac, so the program may \
-             connect to its forwarded ports at each of them, and the relay holds those ports \
-             only at the wildcard addresses: a process of sandy's own user that listens on one \
-             of them at another address of this Mac receives the program's connections \
-             there{relay_ended} (docs/macos.md, \"The private network\")"
+             connect to its forwarded and egress ports at each of them; the relay and the \
+             broker hold those ports at every address the Mac had when they started, but a \
+             process of sandy's own user that listens on one at an address the Mac gains later, \
+             such as a new temporary IPv6 or VPN address, receives the program's connections \
+             there{ended} (docs/macos.md, \"The private network\")"
         ));
+    }
+    if policy.egress.is_some() {
+        shortfalls.push(
+            "the egress broker serves every local user on macOS: macOS cannot tell the broker \
+             which user holds the other end of a TCP connection, so another user can connect out \
+             through it, as sandy's user, to every destination the policy's reach allows \
+             (docs/macos.md, \"The egress broker\")"
+                .to_string(),
+        );
     }
     if policy.unix_sockets == NetworkAccess::All {
         shortfalls.push(
@@ -347,9 +354,6 @@ enum Mechanism {
     Missing(&'static str),
 }
 
-/// For the requirements of sandy 2.1 that this backend does not enforce yet.
-const NOT_YET: &str = "the macOS backend does not enforce this yet";
-
 fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
     let contained = policy.children == ChildProcesses::Contained;
     let text = match requirement {
@@ -442,19 +446,29 @@ fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
              or Mach services, ends when the target ends (kqueue NOTE_EXIT)"
         }
         Requirement::IpNetworkPrivate => {
+            let held = !policy.forward.is_empty() || policy.egress.is_some();
+            if held && policy.signals == SignalScope::Any {
+                return Mechanism::Missing(
+                    "with signals = \"any\" the program can end its relay or its egress broker, \
+                     and on macOS its forwarded or egress port then reaches whatever binds that \
+                     port next, at any address of this Mac; set signals = \"isolated\" \
+                     (docs/macos.md, \"The private network\")",
+                );
+            }
             if policy.unix_sockets == NetworkAccess::All {
-                "TCP only: network-outbound only to the forwarded ports, network-bind and \
-                 network-inbound only on the exposed ports, both at every address of this Mac, \
-                 which is what Seatbelt's localhost matches; the relay binds the forwarded ports \
-                 at the wildcard addresses without listening; no UDP, no NECP calls; the name \
-                 resolver (mDNSResponder) stays reachable like every Unix socket \
-                 (unix_sockets = \"all\")"
+                "TCP only: network-outbound only to the forwarded and egress ports, network-bind \
+                 and network-inbound only on the exposed ports, both at every address of this \
+                 Mac, which is what Seatbelt's localhost matches; the relay and the broker bind \
+                 their ports without listening at the wildcard addresses and at every current \
+                 address of this Mac; no UDP, no NECP calls; the name resolver (mDNSResponder) \
+                 stays reachable like every Unix socket (unix_sockets = \"all\")"
             } else {
-                "TCP only: network-outbound only to the forwarded ports, network-bind and \
-                 network-inbound only on the exposed ports, both at every address of this Mac, \
-                 which is what Seatbelt's localhost matches; the relay binds the forwarded ports \
-                 at the wildcard addresses without listening; no UDP, no NECP calls, and the name \
-                 resolver (mDNSResponder) is unreachable"
+                "TCP only: network-outbound only to the forwarded and egress ports, network-bind \
+                 and network-inbound only on the exposed ports, both at every address of this \
+                 Mac, which is what Seatbelt's localhost matches; the relay and the broker bind \
+                 their ports without listening at the wildcard addresses and at every current \
+                 address of this Mac; no UDP, no NECP calls; names resolve only from /etc/hosts, \
+                 the name resolver (mDNSResponder) is unreachable"
             }
         }
         Requirement::PathsHidden => {
@@ -470,7 +484,14 @@ fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
              missing path does: (deny file-read* file-test-existence (with errno ENOENT)) before \
              every allow"
         }
-        Requirement::EgressBrokered => return Mechanism::Missing(NOT_YET),
+        Requirement::EgressBrokered => {
+            "a broker process on the program's 127.0.0.1 egress port that is not a child of the \
+             target (forked twice, so launchd adopts it) and checks every destination \
+             (sandy_core::destination, with the addresses and subnets of this Mac's interfaces \
+             from getifaddrs); confined by its own profile: accept on its port, TCP out, no \
+             connection to an address of this Mac (localhost denied), the routing sysctl, no \
+             files, no Mach services; it ends when the target ends (kqueue NOTE_EXIT)"
+        }
         Requirement::Win32kDenied => {
             return Mechanism::Exec(
                 "nothing to deny: win32k is the GUI part of the Windows kernel, and macOS has \
@@ -825,7 +846,11 @@ mod tests {
     }
 
     fn private_network() -> ResolvedPolicy {
-        let mut private = policy(IpAccess::Private, NetworkAccess::None, SignalScope::Any);
+        let mut private = policy(
+            IpAccess::Private,
+            NetworkAccess::None,
+            SignalScope::Isolated,
+        );
         private.forward = vec![sandy_core::ForwardedPort {
             port: 18081,
             to: "127.0.0.1:8081".parse().unwrap(),
@@ -834,12 +859,16 @@ mod tests {
             listen: "127.0.0.1:18080".parse().unwrap(),
             port: 8080,
         }];
+        private.egress = Some(sandy_core::Egress {
+            port: 1080,
+            reach: sandy_core::EgressReach::Public,
+        });
         private
     }
 
-    /// The profile gives the private network; the egress broker is not built yet.
+    /// The profiles give the private network and the egress broker.
     #[test]
-    fn a_private_network_is_enforced_by_the_profile() {
+    fn a_private_network_and_its_broker_are_enforced_by_the_profiles() {
         let private = private_network();
         let Status::Enforced { mechanism } = status_of(&private, Requirement::IpNetworkPrivate)
         else {
@@ -849,29 +878,51 @@ mod tests {
             mechanism.starts_with("Seatbelt profile: TCP only"),
             "{mechanism}"
         );
-        assert!(mechanism.contains("wildcard addresses"), "{mechanism}");
-        assert!(
-            mechanism.contains("resolver (mDNSResponder) is unreachable"),
-            "{mechanism}"
-        );
+        assert!(mechanism.contains("every current address"), "{mechanism}");
+        assert!(mechanism.contains("only from /etc/hosts"), "{mechanism}");
+        let Status::Enforced { mechanism } = status_of(&private, Requirement::EgressBrokered)
+        else {
+            panic!("not enforced");
+        };
+        assert!(mechanism.contains("localhost denied"), "{mechanism}");
         let unix = format!("{:?}", status_of(&private, Requirement::UnixSocketsDenied));
         assert!(!unix.contains("mDNSResponder"), "{unix}");
         let plan = EnforcementPlan::new(&private.requirements(), plan_for(&private, &capable()));
         assert!(plan.is_enforceable(), "{plan}");
 
-        let mut all_unix = private.clone();
+        let mut all_unix = private;
         all_unix.unix_sockets = NetworkAccess::All;
         let mechanism = format!("{:?}", status_of(&all_unix, Requirement::IpNetworkPrivate));
         assert!(mechanism.contains("stays reachable"), "{mechanism}");
+    }
 
-        let mut egress = private;
-        egress.egress = Some(sandy_core::Egress {
-            port: 1080,
-            reach: sandy_core::EgressReach::Public,
-        });
+    /// With signals = "any" the program could end its relay or broker and leave the port to
+    /// whatever binds it next, at any address of the Mac, so the plan refuses; a private network
+    /// without forwarded or egress ports holds nothing and needs no such rule.
+    #[test]
+    fn a_held_port_of_a_private_network_needs_isolated_signals() {
+        for (forward, egress) in [(true, false), (false, true)] {
+            let mut private = private_network();
+            private.signals = SignalScope::Any;
+            if !forward {
+                private.forward.clear();
+            }
+            if !egress {
+                private.egress = None;
+            }
+            let Status::Unavailable { reason } = status_of(&private, Requirement::IpNetworkPrivate)
+            else {
+                panic!("enforced with signals = \"any\"");
+            };
+            assert!(reason.contains("set signals = \"isolated\""), "{reason}");
+        }
+        let mut exposed = private_network();
+        exposed.signals = SignalScope::Any;
+        exposed.forward.clear();
+        exposed.egress = None;
         assert!(matches!(
-            status_of(&egress, Requirement::EgressBrokered),
-            Status::Unavailable { .. }
+            status_of(&exposed, Requirement::IpNetworkPrivate),
+            Status::Enforced { .. }
         ));
     }
 
@@ -898,8 +949,8 @@ mod tests {
     }
 
     /// Seatbelt's localhost is every address of the Mac, so check names what a private network
-    /// leaves open there: listening on the exposed ports, and the forwarded ports at other
-    /// addresses.
+    /// leaves open there: listening on the exposed ports, and the forwarded and egress ports at
+    /// addresses the Mac gains later; and that every local user reaches the broker.
     #[test]
     fn warns_where_a_private_network_reaches_other_addresses() {
         let count = |policy: &ResolvedPolicy, start: &str| {
@@ -909,32 +960,44 @@ mod tests {
                 .count()
         };
         let exposed = "ip = \"private\" keeps the program's exposed ports off the network";
-        let forwarded = "ip = \"private\" keeps the program off this Mac's other addresses";
+        let held = "ip = \"private\" keeps the program off this Mac's other addresses";
+        let broker = "the egress broker serves every local user";
         let mut private = private_network();
         assert_eq!(count(&private, exposed), 1);
-        assert_eq!(count(&private, forwarded), 1);
-        let forward_note = |policy: &ResolvedPolicy| {
+        assert_eq!(count(&private, held), 1);
+        assert_eq!(count(&private, broker), 1);
+        let held_note = |policy: &ResolvedPolicy| {
             notes(policy)
                 .into_iter()
-                .find(|note| note.starts_with(forwarded))
+                .find(|note| note.starts_with(held))
                 .unwrap()
         };
-        assert!(forward_note(&private).contains("the program can end its relay itself"));
-        private.signals = SignalScope::Isolated;
-        let isolated = forward_note(&private);
-        assert!(isolated.contains("once the relay has ended"), "{isolated}");
-        assert!(!isolated.contains("end its relay itself"), "{isolated}");
-        // The guard ends a contained program with its relay.
+        let isolated = held_note(&private);
+        assert!(
+            isolated.contains("an address the Mac gains later"),
+            "{isolated}"
+        );
+        assert!(
+            isolated.contains("once the relay or the broker has ended"),
+            "{isolated}"
+        );
+        // The guard ends a contained program with its helpers.
         private.children = ChildProcesses::Contained;
-        assert!(!forward_note(&private).contains("once the relay has ended"));
+        assert!(!held_note(&private).contains("has ended"));
+        let mut forward_only = private_network();
+        forward_only.egress = None;
+        assert_eq!(count(&forward_only, held), 1);
+        assert_eq!(count(&forward_only, broker), 0);
 
         let mut alone = private_network();
         alone.expose.clear();
         alone.forward.clear();
-        assert_eq!(count(&alone, exposed) + count(&alone, forwarded), 0);
+        alone.egress = None;
+        assert_eq!(count(&alone, exposed) + count(&alone, held), 0);
         let mut all = private_network();
         all.ip = IpAccess::All;
-        assert_eq!(count(&all, exposed) + count(&all, forwarded), 0);
+        all.egress = None;
+        assert_eq!(count(&all, exposed) + count(&all, held), 0);
     }
 
     #[test]

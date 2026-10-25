@@ -2,7 +2,7 @@
 //! tested on every platform.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use sandy_core::{
@@ -77,18 +77,92 @@ pub fn relay_pairs(policy: &ResolvedPolicy) -> Vec<RelayPair> {
     exposed.chain(forwarded).collect()
 }
 
-/// The ports that the relay binds at the wildcard addresses of both families without listening:
-/// under `ip = "private"` the forwarded ports, which the program's profile lets it reach at every
-/// address of this Mac. A connection to one of them at an address other than the relay's
-/// listener then finds sandy's socket there and goes unanswered, and, by XNU's `in_pcbbind`, no
-/// process of another user can bind the port at any address while the relay runs.
-pub fn held_ports(policy: &ResolvedPolicy) -> Vec<u16> {
+/// A port that a helper binds without listening at the wildcard addresses and at every current
+/// address of this Mac (`macos::holder`), except `leave`, where a listener of sandy's or the
+/// program listens. Under `ip = "private"` the program's profile lets it reach the forwarded and
+/// the egress port at every address of this Mac, so a connection to one of them at another
+/// address finds sandy's socket and goes unanswered, and, by XNU's `in_pcbbind`, no process of
+/// another user can bind the port at any address while the holder runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hold {
+    pub port: u16,
+    pub leave: Vec<IpAddr>,
+}
+
+/// The ports the relay holds: under `ip = "private"` the forwarded ports.
+pub fn relay_holds(policy: &ResolvedPolicy) -> Vec<Hold> {
     if policy.ip != IpAccess::Private {
         return Vec::new();
     }
     let ports: BTreeSet<u16> = policy.forward.iter().map(|entry| entry.port).collect();
-    ports.into_iter().collect()
+    ports.into_iter().map(|port| hold(policy, port)).collect()
 }
+
+/// The port the egress broker holds: its own, unless the relay holds it already because a
+/// forwarded port of the other family has the same number.
+pub fn broker_holds(policy: &ResolvedPolicy) -> Option<Hold> {
+    let port = policy.egress?.port;
+    let forwarded = policy.forward.iter().any(|entry| entry.port == port);
+    (!forwarded).then(|| hold(policy, port))
+}
+
+fn hold(policy: &ResolvedPolicy, port: u16) -> Hold {
+    let exposed = policy
+        .expose
+        .iter()
+        .flat_map(|entry| [entry.listen, entry.target()]);
+    let forwarded = policy.forward.iter().map(|entry| entry.listen());
+    let egress = policy.egress.iter().map(|egress| egress.listen());
+    let mut leave: Vec<IpAddr> = exposed
+        .chain(forwarded)
+        .chain(egress)
+        .filter(|address| address.port() == port)
+        .map(|address| address.ip())
+        .collect();
+    leave.sort();
+    leave.dedup();
+    Hold { port, leave }
+}
+
+/// The profile of the egress broker. Like the relay it keeps running the code that sandy has
+/// already loaded and needs no file. It accepts on its listener at `port`, connects out over TCP
+/// to the destinations `sandy_core::destination` allows, and reads the addresses of this Mac's
+/// interfaces for that check (`macos::interfaces`).
+pub fn broker_profile(port: u16) -> Profile {
+    let mut writer = Writer::default();
+    writer.line("(version 1)");
+    writer.line("(deny default)");
+    writer.comment("(deny default) does not cover these operations, and the broker needs none.");
+    writer.line("(deny process-info* file-map-executable file-ioctl file-write*)");
+    writer.comment(
+        "Accept on the broker's listener and connect out over TCP; the broker checks every\n\
+         destination. localhost is every address of this Mac, which the broker never connects\n\
+         to: the deny keeps the kernel from it as well, and must follow the allow.",
+    );
+    writer.line(&format!(
+        "(allow network-inbound (local tcp \"localhost:{port}\"))"
+    ));
+    writer.line("(allow network-outbound (remote tcp \"*:*\"))");
+    writer.line(BROKER_LOCALHOST_DENY);
+    writer.comment(
+        "getifaddrs reads the routing sysctl; no shorter name than this prefix matches it.",
+    );
+    writer.line("(allow sysctl-read (sysctl-name-prefix \"net.route\"))");
+    writer.comment("Non-blocking mode for the sockets (connect with a timeout).");
+    let flags: Vec<String> = [system::FIONBIO, system::FIOASYNC]
+        .iter()
+        .map(|request| format!("(ioctl-command {request})"))
+        .collect();
+    writer.rule("allow", &["file-ioctl"], &flags);
+    hardening_rules(&mut writer);
+    Profile {
+        text: writer.text,
+        parameters: writer.parameters,
+    }
+}
+
+/// The broker's kernel layer against connections to this Mac.
+pub const BROKER_LOCALHOST_DENY: &str = "(deny network-outbound (remote ip \"localhost:*\"))";
 
 /// The profile of the watcher of `process.end_with_parent`. Like the relay, it keeps running the
 /// code that sandy has already loaded and needs no file. It registered its kqueue events before
@@ -359,13 +433,19 @@ fn network_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
         IpAccess::None => {}
         IpAccess::Private => {
             writer.comment(
-                "ip = \"private\": TCP only, out only to the forwarded ports and in only on the\n\
-                 exposed ports. Seatbelt's localhost is every address of this Mac, not loopback,\n\
-                 so the relay holds the forwarded ports at the wildcard addresses. No UDP and no\n\
-                 name resolution.",
+                "ip = \"private\": TCP only, out only to the forwarded ports and the egress port\n\
+                 and in only on the exposed ports. Seatbelt's localhost is every address of this\n\
+                 Mac, not loopback, so the relay and the broker hold their ports at every other\n\
+                 address. No UDP, and names resolve only from /etc/hosts, which getaddrinfo reads\n\
+                 itself when mDNSResponder is out of reach.",
             );
-            let forwarded: BTreeSet<u16> = policy.forward.iter().map(|entry| entry.port).collect();
-            let filters: Vec<String> = forwarded
+            let out: BTreeSet<u16> = policy
+                .forward
+                .iter()
+                .map(|entry| entry.port)
+                .chain(policy.egress.map(|egress| egress.port))
+                .collect();
+            let filters: Vec<String> = out
                 .iter()
                 .map(|port| format!("(remote tcp \"localhost:{port}\")"))
                 .collect();
@@ -376,6 +456,8 @@ fn network_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
                 .map(|port| format!("(local tcp \"localhost:{port}\")"))
                 .collect();
             writer.rule("allow", &["network-bind", "network-inbound"], &filters);
+            let hosts = writer.grant("DNS", Path::new(system::HOSTS_FILE));
+            writer.rule("allow", READ, &[literal(hosts)]);
         }
         IpAccess::Client => {
             writer.comment(
@@ -1366,8 +1448,10 @@ mod tests {
         assert!(!generate(&policy).text.contains("(allow network-"));
     }
 
+    /// The relay holds the forwarded ports of a private network, the broker the egress port, and
+    /// each leaves the addresses where a listener of sandy's or the program listens at that port.
     #[test]
-    fn only_a_private_network_holds_the_forwarded_ports() {
+    fn a_private_network_holds_the_forwarded_and_the_egress_ports() {
         let mut policy = typical("/srv");
         policy.forward = vec![
             sandy_core::ForwardedPort {
@@ -1384,17 +1468,115 @@ mod tests {
             },
         ];
         policy.expose = vec![sandy_core::ExposedPort {
-            listen: "127.0.0.1:18080".parse().unwrap(),
+            listen: "[::1]:18082".parse().unwrap(),
             port: 8080,
         }];
         for ip in [IpAccess::Client, IpAccess::All] {
             policy.ip = ip;
-            assert!(held_ports(&policy).is_empty(), "{ip:?}");
+            assert!(relay_holds(&policy).is_empty(), "{ip:?}");
         }
         policy.ip = IpAccess::Private;
-        assert_eq!(held_ports(&policy), [18081, 18082]);
+        let loopback = |text: &str| text.parse::<IpAddr>().unwrap();
+        assert_eq!(
+            relay_holds(&policy),
+            [
+                Hold {
+                    port: 18081,
+                    leave: vec![loopback("127.0.0.1"), loopback("::1")],
+                },
+                Hold {
+                    port: 18082,
+                    leave: vec![loopback("127.0.0.1"), loopback("::1")],
+                },
+            ]
+        );
+        assert_eq!(broker_holds(&policy), None);
+        policy.egress = Some(sandy_core::Egress {
+            port: 1080,
+            reach: sandy_core::EgressReach::Public,
+        });
+        assert_eq!(
+            broker_holds(&policy),
+            Some(Hold {
+                port: 1080,
+                leave: vec![loopback("127.0.0.1")],
+            })
+        );
+        // A forwarded port of the other family with the same number: the relay holds it.
+        policy.egress = Some(sandy_core::Egress {
+            port: 18081,
+            reach: sandy_core::EgressReach::Public,
+        });
+        assert_eq!(broker_holds(&policy), None);
         policy.forward.clear();
-        assert!(held_ports(&policy).is_empty());
+        assert!(relay_holds(&policy).is_empty());
+    }
+
+    /// A private network reaches the egress port like a forwarded port, and reads /etc/hosts,
+    /// which is how localhost resolves without mDNSResponder.
+    #[test]
+    fn a_private_network_reaches_the_egress_port_and_reads_the_hosts_file() {
+        let mut policy = typical("/srv");
+        policy.ip = IpAccess::Private;
+        policy.egress = Some(sandy_core::Egress {
+            port: 1080,
+            reach: sandy_core::EgressReach::Public,
+        });
+        let profile = generate(&policy);
+        assert!(
+            profile
+                .text
+                .contains("(allow network-outbound\n  (remote tcp \"localhost:1080\"))"),
+            "{}",
+            profile.text
+        );
+        let hosts = profile
+            .parameters
+            .iter()
+            .find(|(_, path)| path == Path::new(system::HOSTS_FILE))
+            .map(|(name, _)| format!("(literal (param \"{name}\"))"))
+            .expect("the hosts file");
+        assert!(profile.text.contains(&format!(
+            "(allow file-read* file-test-existence\n  {hosts})"
+        )));
+    }
+
+    /// The broker accepts on its port, connects out over TCP, never to this Mac (the deny after
+    /// the allow), reads the routing sysctl and nothing else, and ends like the relay's profile.
+    #[test]
+    fn the_broker_profile_allows_only_its_port_tcp_out_and_the_interfaces() {
+        let profile = broker_profile(1080);
+        assert!(profile.parameters.is_empty());
+        let rules: Vec<&str> = profile
+            .text
+            .lines()
+            .filter(|line| line.starts_with("(allow") || line.starts_with("  ("))
+            .filter(|line| !line.contains("syscall-number"))
+            .collect();
+        assert_eq!(
+            rules,
+            [
+                "(allow network-inbound (local tcp \"localhost:1080\"))",
+                "(allow network-outbound (remote tcp \"*:*\"))",
+                "(allow sysctl-read (sysctl-name-prefix \"net.route\"))",
+                "(allow file-ioctl",
+                "  (ioctl-command 2147772030)",
+                "  (ioctl-command 2147772029))",
+            ]
+        );
+        let allow = profile
+            .text
+            .find("(allow network-outbound (remote tcp")
+            .unwrap();
+        let deny = profile.text.find(BROKER_LOCALHOST_DENY).unwrap();
+        assert!(deny > allow);
+        assert!(profile.text.starts_with("(version 1)\n(deny default)\n"));
+        assert!(
+            profile
+                .text
+                .contains("(deny mach-lookup (xpc-service-name-prefix \"\"))")
+        );
+        assert!(!profile.text.contains("file-read"));
     }
 
     #[test]

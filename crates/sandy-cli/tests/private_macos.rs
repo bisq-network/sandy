@@ -1,10 +1,12 @@
-//! macOS tests of `ip = "private"`. macOS has no loopback of the program's own, so the profile is
-//! relay only: TCP out to the forwarded ports and in on the exposed ports. Seatbelt's `localhost`
-//! matches every address of the Mac, not loopback, so the relay holds the forwarded ports at the
-//! wildcard addresses (docs/macos.md, "The private network"). Tests whose name says "only",
-//! "holds" or "refuses" check an invariant; the others record a route that stays open, each
-//! named by a row of the exceptions table in DESIGN.md, so that a change shows up as a failing
-//! test.
+//! macOS tests of `ip = "private"` and its egress broker. macOS has no loopback of the program's
+//! own, so the profile is relay only: TCP out to the forwarded and egress ports and in on the
+//! exposed ports. Seatbelt's `localhost` matches every address of the Mac, not loopback, so the
+//! relay and the broker hold their ports at the wildcard addresses and at every address the Mac
+//! has (docs/macos.md, "The private network"). Tests whose name says "only", "holds", "refuses"
+//! or "ends" check an invariant; the others record a route that stays open, each named by a row
+//! of the exceptions table in DESIGN.md, so that a change shows up as a failing test. One part
+//! of a row has no test: an address that the Mac gains while sandy runs, which no test can add
+//! without administrator rights.
 #![cfg(target_os = "macos")]
 
 mod common;
@@ -123,15 +125,57 @@ fn skip_without_addresses() {
     );
 }
 
+/// A private network with a forwarded port. A port that sandy holds needs isolated signals on
+/// macOS, so that the program cannot end its relay.
 fn private_forward(fixture: &Fixture, port: u16, to: SocketAddr) -> Vec<String> {
     let mut args = fixture.access_args();
     args.extend([
         "--ip".to_string(),
         "private".to_string(),
+        "--signals".to_string(),
+        "isolated".to_string(),
         "--forward".to_string(),
         format!("{port}={to}"),
     ]);
     args
+}
+
+/// A private network with the egress broker on `port`.
+fn private_egress(fixture: &Fixture, port: u16, reach: &str) -> Vec<String> {
+    let mut args = fixture.access_args();
+    args.extend([
+        "--ip".to_string(),
+        "private".to_string(),
+        "--signals".to_string(),
+        "isolated".to_string(),
+        "--egress".to_string(),
+        format!("{port}={reach}"),
+    ]);
+    args
+}
+
+/// Every address of this Mac outside loopback and the other loopback family, at `port`, for
+/// the holder checks.
+fn held_addresses(others: &[SocketAddr], port: u16) -> Vec<SocketAddr> {
+    let mut held: Vec<SocketAddr> = others.iter().map(|address| at(*address, port)).collect();
+    held.extend(
+        ["0.0.0.0", "[::]", "[::1]"]
+            .map(|ip| format!("{ip}:{port}").parse::<SocketAddr>().unwrap()),
+    );
+    held
+}
+
+/// Binds every address of `held` the way another program of this user would, which the holder
+/// must refuse while it runs.
+fn assert_held(held: &[SocketAddr]) {
+    for address in held {
+        let taken = TcpListener::bind(address).map(drop).map_err(|e| e.kind());
+        assert_eq!(
+            taken,
+            Err(std::io::ErrorKind::AddrInUse),
+            "a socket of this user took {address} next to the holder"
+        );
+    }
 }
 
 /// The program under sandy with its standard input and output piped, so the test can let it go
@@ -195,7 +239,8 @@ fn receive(listener: &TcpListener) -> Option<Vec<u8>> {
 
 /// The program reaches its forwarded port and nothing else of IP: not the service behind it
 /// directly, not a listener at another address of the Mac, no datagram, no listening socket, no
-/// name resolution, no NECP. Every control succeeds outside the sandbox.
+/// name resolver, no NECP. Every control succeeds outside the sandbox. `localhost` resolves from
+/// /etc/hosts, which getaddrinfo reads itself, and a name that only DNS knows does not.
 #[test]
 fn a_private_network_reaches_only_its_forwarded_ports() {
     let Some(others) = other_addresses() else {
@@ -213,7 +258,6 @@ fn a_private_network_reaches_only_its_forwarded_ports() {
         ("tcp-connect", other_host_address.as_str()),
         ("udp-send", direct.as_str()),
         ("tcp-listen", other_port.as_str()),
-        ("resolve", "localhost"),
         ("necp-open", ""),
         ("unix-connect", DNS_RESOLVER),
     ];
@@ -221,12 +265,22 @@ fn a_private_network_reaches_only_its_forwarded_ports() {
         line.assert_ok();
     }
     let forwarded = format!("127.0.0.1:{port}");
-    let mut actions = vec![("tcp-connect", forwarded.as_str())];
+    let mut actions = vec![
+        ("tcp-connect", forwarded.as_str()),
+        ("resolve", "localhost"),
+        ("resolve", "example.com"),
+    ];
     actions.extend(controls);
     let inside = probe_inside(&private_forward(&fixture, port, service), &actions);
     inside[0].assert_ok();
-    for line in &inside[1..] {
+    inside[1].assert_ok();
+    for line in &inside[3..] {
         line.assert_blocked();
+    }
+    if probe_outside(&[("resolve", "example.com")])[0].result == "ok" {
+        inside[2].assert_blocked();
+    } else {
+        skip("dns", "this Mac resolves no name through DNS");
     }
     let start = Instant::now();
     while accepted.load(Ordering::SeqCst) == 0 {
@@ -236,11 +290,12 @@ fn a_private_network_reaches_only_its_forwarded_ports() {
 }
 
 /// Seatbelt lets the program connect to a forwarded port at every address of the Mac. The
-/// relay binds the port at the wildcard addresses without listening, so while it runs no other
-/// socket of this user can take them, and a connection to the port at an address where no one
-/// listens goes unanswered instead of being refused. Afterwards the port is free again.
+/// relay binds the port without listening at the wildcard addresses and at every address the Mac
+/// has, so while it runs no other socket of this user can take any of them, and a connection to
+/// the port at such an address goes unanswered instead of being refused. Afterwards the port is
+/// free again.
 #[test]
-fn the_relay_holds_the_forwarded_ports_at_the_wildcard_addresses() {
+fn the_relay_holds_the_forwarded_ports_at_every_address() {
     let Some(others) = other_addresses() else {
         return skip_without_addresses();
     };
@@ -260,14 +315,7 @@ fn the_relay_holds_the_forwarded_ports_at_the_wildcard_addresses() {
     );
     let (mut program, mut stdout) = start(&private_forward(&fixture, port, service), &actions);
     wait_for_program(program.id());
-    for wildcard in ["0.0.0.0", "::"] {
-        let taken = TcpListener::bind((wildcard, port));
-        assert_eq!(
-            taken.as_ref().map_err(std::io::Error::kind).err(),
-            Some(std::io::ErrorKind::AddrInUse),
-            "{wildcard}: {taken:?}"
-        );
-    }
+    assert_held(&held_addresses(&others, port));
     program.stdin.take().unwrap().write_all(b"\n").unwrap();
     next_line(&mut stdout).assert_ok();
     let results: Vec<ProbeLine> = targets.iter().map(|_| next_line(&mut stdout)).collect();
@@ -285,16 +333,23 @@ fn the_relay_holds_the_forwarded_ports_at_the_wildcard_addresses() {
     }
 }
 
-/// A listener of another socket at a wildcard address of a forwarded port would receive the
-/// program's connections to the port at the other addresses of the Mac, so sandy refuses, and
-/// check says so first. With `ip = "all"` the program reaches that listener anyway, so the same
-/// forward runs there.
+/// A socket that already listens on a forwarded port, at a wildcard address or at an address of
+/// the Mac, would receive the program's connections there, so sandy refuses, and check says so
+/// first. With `ip = "all"` the program reaches that listener anyway, so the same forward runs
+/// there.
 #[test]
-fn a_wildcard_listener_on_a_forwarded_port_refuses_a_private_network() {
+fn a_listener_on_a_forwarded_port_refuses_a_private_network() {
+    let Some(others) = other_addresses() else {
+        return skip_without_addresses();
+    };
     let fixture = Fixture::new("private-refused");
     let (service, _) = counting_service();
-    for wildcard in ["0.0.0.0", "::"] {
-        let listener = TcpListener::bind((wildcard, 0)).unwrap();
+    let mut addresses: Vec<SocketAddr> = ["0.0.0.0:0", "[::]:0", "[::1]:0"]
+        .map(|address| address.parse().unwrap())
+        .to_vec();
+    addresses.push(others[0]);
+    for address in addresses {
+        let listener = TcpListener::bind(address).unwrap();
         let port = listener.local_addr().unwrap().port();
         let args = private_forward(&fixture, port, service);
         let output = sandy(run_args(&args, &[("pid", "")]));
@@ -302,7 +357,7 @@ fn a_wildcard_listener_on_a_forwarded_port_refuses_a_private_network() {
         assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
         assert!(
             stderr.contains(&format!("cannot hold port {port}")),
-            "{stderr}"
+            "{address}: {stderr}"
         );
 
         let mut check = vec!["check".to_string()];
@@ -325,47 +380,36 @@ fn a_wildcard_listener_on_a_forwarded_port_refuses_a_private_network() {
     }
 }
 
-/// The exceptions row for `ip = "private"` with `forward` on macOS: the relay holds a forwarded
-/// port only at the wildcard addresses, so a process of sandy's own user can listen on it at an
-/// address of the Mac outside loopback, and receives the program's connection there. When this
-/// fails, the route is closed and the row has to go.
+/// With `signals = "any"` the program could end its relay or broker and leave the port to
+/// whatever binds it next at any address of the Mac, so sandy refuses a held port then, and says
+/// what to set. A private network with only an exposed port holds nothing and runs.
 #[test]
-fn a_process_of_the_same_user_takes_a_forwarded_port_at_another_address() {
-    let Some(others) = other_addresses() else {
-        return skip_without_addresses();
-    };
-    let fixture = Fixture::new("private-taken");
+fn a_held_port_refuses_signals_any() {
+    let fixture = Fixture::new("private-signals");
     let (service, _) = counting_service();
-    let port = free_port();
-    let target = at(others[0], port).to_string();
-    let (mut program, mut stdout) = start(
-        &private_forward(&fixture, port, service),
-        &[("read-line", "-"), ("tcp-send", target.as_str())],
-    );
-    wait_for_program(program.id());
-    let taken = TcpListener::bind(at(others[0], port)).expect(
-        "a process of sandy's user can no longer bind a forwarded port next to the holder, so \
-         the exception for ip = \"private\" with forward on macOS is stale",
-    );
-    program.stdin.take().unwrap().write_all(b"\n").unwrap();
-    next_line(&mut stdout).assert_ok();
-    let received = receive(&taken);
-    let sent = next_line(&mut stdout);
-    let output = program.wait_with_output().unwrap();
-    assert!(output.status.success(), "{output:?}");
-    sent.assert_ok();
-    assert_eq!(
-        received.as_deref(),
-        Some(TCP_SEND_PAYLOAD),
-        "the program's connection to {target} no longer reaches a listener of the same user, \
-         so the exception for ip = \"private\" with forward on macOS is stale"
-    );
+    let mut forward = fixture.access_args();
+    forward.extend(["--ip", "private", "--forward"].map(String::from));
+    forward.push(format!("{}={service}", free_port()));
+    let mut egress = fixture.access_args();
+    egress.extend(["--ip", "private", "--egress"].map(String::from));
+    egress.push(free_port().to_string());
+    for args in [forward, egress] {
+        let output = sandy(run_args(&args, &[("pid", "")]));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+        assert!(stderr.contains("set signals = \"isolated\""), "{stderr}");
+    }
+    let mut exposed = fixture.access_args();
+    exposed.extend(["--ip", "private", "--expose"].map(String::from));
+    exposed.push(format!("127.0.0.1:{}={}", free_port(), free_port()));
+    probe_inside(&exposed, &[("pid", "")])[0].assert_ok();
 }
 
-/// The same row: once the relay has ended, its holder binds and its listener are gone, and the
-/// program's forwarded port reaches whatever binds it next. With `signals = "any"` the program
-/// could end the relay itself; here the test does. With `children = "contained"` the guard ends
-/// the program with its relay instead (`review_relays.rs`).
+/// The exceptions row for `ip = "private"` with `forward` on macOS: once the relay has ended,
+/// here because the test ends it from outside the sandbox, its holder binds and its listener are
+/// gone, and the program's forwarded port reaches whatever binds it next. With
+/// `children = "contained"` the guard ends the program with its relay instead
+/// (`review_relays.rs`). When this fails, the route is closed and that part of the row has to go.
 #[test]
 fn a_forwarded_port_reaches_whatever_binds_it_once_the_relay_has_ended() {
     let fixture = Fixture::new("private-relay-ended");
@@ -490,4 +534,290 @@ fn the_program_listens_on_its_exposed_port_at_every_address() {
     for line in &rest {
         line.assert_blocked();
     }
+}
+
+/// The probe's `socks5-connect` target: the broker on `port`, then the destination.
+fn through(port: u16, destination: &str) -> String {
+    format!("127.0.0.1:{port}\u{1f}{destination}")
+}
+
+/// The reply code in the detail of a `socks5-connect` result.
+fn reply_of(line: &ProbeLine) -> u8 {
+    line.assert_ok();
+    line.detail
+        .strip_prefix("reply ")
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("{line:?}"))
+}
+
+/// The default gateway of this Mac, from `route`; `None` without one.
+fn gateway() -> Option<Ipv4Addr> {
+    let output = Command::new("/sbin/route")
+        .args(["-n", "get", "default"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("gateway: "))
+        .and_then(|gateway| gateway.parse().ok())
+}
+
+/// The public destination of the tests, when this Mac reaches it.
+const PUBLIC: &str = "1.1.1.1:443";
+
+fn internet() -> bool {
+    TcpStream::connect_timeout(&PUBLIC.parse().unwrap(), Duration::from_secs(5)).is_ok()
+}
+
+/// The broker refuses every form of this Mac with reply 2: loopback, `0.0.0.0` and `::`, the
+/// address on the local network and its IPv4-mapped form, an IPv6 address of an interface, and
+/// the gateway, which `public` counts as the local network. It refuses a name with reply 8. None
+/// of them reaches the listener that waits on every address at that port.
+#[test]
+fn the_broker_refuses_this_mac_its_network_and_names() {
+    let Some(others) = other_addresses() else {
+        return skip_without_addresses();
+    };
+    let fixture = Fixture::new("egress-refused");
+    let canary = TcpListener::bind("[::]:0").unwrap();
+    canary.set_nonblocking(true).unwrap();
+    let port = canary.local_addr().unwrap().port();
+    let lan = match others[0].ip() {
+        std::net::IpAddr::V4(ip) => ip,
+        std::net::IpAddr::V6(_) => unreachable!("the first address is IPv4"),
+    };
+    let mut destinations: Vec<String> = [
+        "127.0.0.1".to_string(),
+        "[::1]".to_string(),
+        "[::ffff:127.0.0.1]".to_string(),
+        "0.0.0.0".to_string(),
+        "[::]".to_string(),
+        lan.to_string(),
+        format!("[{}]", lan.to_ipv6_mapped()),
+    ]
+    .iter()
+    .map(|ip| format!("{ip}:{port}"))
+    .collect();
+    destinations.extend(
+        others
+            .iter()
+            .filter(|address| address.is_ipv6())
+            .map(|address| at(*address, port).to_string()),
+    );
+    let gateway = gateway();
+    destinations.extend(gateway.map(|gateway| format!("{gateway}:80")));
+    let egress = free_port();
+    let mut actions: Vec<(&str, String)> = destinations
+        .iter()
+        .map(|destination| ("socks5-connect", through(egress, destination)))
+        .collect();
+    actions.push(("socks5-connect", through(egress, "example.com:80")));
+    let actions: Vec<(&str, &str)> = actions
+        .iter()
+        .map(|(action, target)| (*action, target.as_str()))
+        .collect();
+    let inside = probe_inside(&private_egress(&fixture, egress, "public"), &actions);
+    let (names, addresses) = inside.split_last().unwrap();
+    for line in addresses {
+        assert_eq!(reply_of(line), 2, "{line:?}");
+    }
+    assert_eq!(reply_of(names), 8, "{names:?}");
+    assert!(
+        canary.accept().is_err(),
+        "a refused destination reached this Mac"
+    );
+    if gateway.is_none() {
+        skip("default-gateway", "this Mac has no default gateway");
+    }
+}
+
+/// `public-and-local` allows the local network: the broker tries the gateway, so its reply is
+/// not 2, but it still refuses this Mac's own address there.
+#[test]
+fn public_and_local_reaches_the_gateway_but_not_this_mac() {
+    let Some(others) = other_addresses() else {
+        return skip_without_addresses();
+    };
+    let Some(gateway) = gateway() else {
+        return skip("default-gateway", "this Mac has no default gateway");
+    };
+    let fixture = Fixture::new("egress-local");
+    let egress = free_port();
+    let to_gateway = through(egress, &format!("{gateway}:80"));
+    let to_self = through(egress, &at(others[0], 80).to_string());
+    let inside = probe_inside(
+        &private_egress(&fixture, egress, "public-and-local"),
+        &[
+            ("socks5-connect", to_gateway.as_str()),
+            ("socks5-connect", to_self.as_str()),
+        ],
+    );
+    let reply = reply_of(&inside[0]);
+    assert!(
+        reply != 2 && reply != 1,
+        "the broker did not try the gateway: {inside:?}"
+    );
+    assert_eq!(reply_of(&inside[1]), 2, "{inside:?}");
+}
+
+/// The broker connects to a public address. Only the connection is checked; nothing is sent.
+#[test]
+fn the_broker_connects_to_a_public_address() {
+    if !internet() {
+        return skip("internet", "this Mac does not reach 1.1.1.1:443");
+    }
+    let fixture = Fixture::new("egress-public");
+    let egress = free_port();
+    let target = through(egress, PUBLIC);
+    let inside = probe_inside(
+        &private_egress(&fixture, egress, "public"),
+        &[("socks5-connect", target.as_str()), ("tcp-connect", PUBLIC)],
+    );
+    assert_eq!(reply_of(&inside[0]), 0, "{inside:?}");
+    // The program itself reaches only the broker.
+    inside[1].assert_blocked();
+}
+
+/// The broker holds its port like the relay: no other socket of this user can bind it at the
+/// wildcard or any current address while it runs, and the program's connection to the port at
+/// another address of the Mac goes unanswered.
+#[test]
+fn the_broker_holds_its_port_at_every_address() {
+    let Some(others) = other_addresses() else {
+        return skip_without_addresses();
+    };
+    let fixture = Fixture::new("egress-holder");
+    let egress = free_port();
+    let elsewhere = at(others[0], egress).to_string();
+    let (mut program, mut stdout) = start(
+        &private_egress(&fixture, egress, "public"),
+        &[("read-line", "-"), ("tcp-connect", elsewhere.as_str())],
+    );
+    wait_for_program(program.id());
+    assert_held(&held_addresses(&others, egress));
+    program.stdin.take().unwrap().write_all(b"\n").unwrap();
+    next_line(&mut stdout).assert_ok();
+    let connected = next_line(&mut stdout);
+    let output = program.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        connected.result == "error" && connected.detail.contains("timed out"),
+        "{connected:?}"
+    );
+}
+
+/// What a SOCKS5 client outside the sandbox gets from the broker at `port` for `destination`.
+fn socks_reply(port: u16, destination: SocketAddr) -> std::io::Result<u8> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    stream.set_read_timeout(Some(WAIT))?;
+    stream.write_all(&[5, 1, 0])?;
+    let mut answer = [0u8; 2];
+    stream.read_exact(&mut answer)?;
+    let mut request = vec![5, 1, 0, 1];
+    match destination {
+        SocketAddr::V4(v4) => request.extend(v4.ip().octets()),
+        SocketAddr::V6(_) => unreachable!("the tests ask for IPv4"),
+    }
+    request.extend(destination.port().to_be_bytes());
+    stream.write_all(&request)?;
+    let mut reply = [0u8; 10];
+    stream.read_exact(&mut reply)?;
+    Ok(reply[1])
+}
+
+/// The exceptions row for `egress` on macOS: the broker cannot tell who connects, so this test
+/// process, outside the sandbox, connects out through it as sandy's user. When this fails, the
+/// route is closed and the row has to go.
+#[test]
+fn the_broker_serves_a_process_outside_the_sandbox() {
+    if !internet() {
+        return skip("internet", "this Mac does not reach 1.1.1.1:443");
+    }
+    let fixture = Fixture::new("egress-outside");
+    let egress = free_port();
+    let (mut program, _stdout) = start(
+        &private_egress(&fixture, egress, "public"),
+        &[("read-line", "-")],
+    );
+    wait_for_program(program.id());
+    let reply = socks_reply(egress, PUBLIC.parse().unwrap());
+    program.stdin.take().unwrap().write_all(b"\n").unwrap();
+    let output = program.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        reply.ok(),
+        Some(0),
+        "a process outside the sandbox no longer connects out through the broker, so the \
+         exception for egress on macOS is stale"
+    );
+}
+
+/// The broker ends with the program: its listener and its holder binds are gone right after.
+#[test]
+fn the_broker_ends_with_the_program() {
+    let fixture = Fixture::new("egress-end");
+    let egress = free_port();
+    let (mut program, mut stdout) = start(
+        &private_egress(&fixture, egress, "public"),
+        &[("read-line", "-")],
+    );
+    wait_for_program(program.id());
+    let broker = relay_of(egress);
+    program.stdin.take().unwrap().write_all(b"\n").unwrap();
+    next_line(&mut stdout).assert_ok();
+    let output = program.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let start = Instant::now();
+    // SAFETY: signal 0 only asks whether the process exists.
+    while unsafe { libc::kill(broker, 0) } == 0 {
+        assert!(start.elapsed() < WAIT, "the broker outlived the program");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(TcpStream::connect(("127.0.0.1", egress)).is_err());
+    TcpListener::bind(("0.0.0.0", egress)).unwrap();
+}
+
+/// With `children = "contained"` the guard watches the broker as it watches the relay: a broker
+/// that dies ends the program, and sandy fails with status 125 and says why.
+#[test]
+fn a_dead_broker_ends_a_contained_program() {
+    let fixture = Fixture::new("egress-contained");
+    let egress = free_port();
+    let mut args = private_egress(&fixture, egress, "public");
+    args.extend(["--children", "contained"].map(String::from));
+    let (mut program, _stdout) = start(&args, &[("read-line", "-"), ("exit", "7")]);
+    let start = Instant::now();
+    let broker = loop {
+        let output = Command::new("/usr/sbin/lsof")
+            .args([
+                "-nP",
+                &format!("-iTCP@127.0.0.1:{egress}"),
+                "-sTCP:LISTEN",
+                "-t",
+            ])
+            .output()
+            .unwrap();
+        if let Some(pid) = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.trim().parse::<libc::pid_t>().ok())
+        {
+            break pid;
+        }
+        assert!(start.elapsed() < WAIT, "no broker listens on {egress}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // SAFETY: kill has no memory arguments.
+    assert_eq!(unsafe { libc::kill(broker, libc::SIGKILL) }, 0);
+    let start = Instant::now();
+    while program.try_wait().unwrap().is_none() {
+        assert!(
+            start.elapsed() < WAIT,
+            "sandy kept the program running after its broker was gone"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = program.wait_with_output().unwrap();
+    let reason = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    assert!(reason.contains("the egress broker ended"), "{reason}");
 }

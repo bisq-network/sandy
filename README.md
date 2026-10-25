@@ -831,11 +831,13 @@ metadata through the descriptor they wrote.
   of any process, its own included. The names in `/` and the directories above the policy paths
   stay visible, also with `view = "policy"`.
 - `ip = "private"` has no loopback of its own on macOS: the program may only connect to its
-  forwarded ports and listen on its exposed ports, so its own processes cannot talk to each
-  other over IP, names do not resolve, and Network.framework and URLSession fail. The program
-  can listen on its exposed ports at every address of the Mac, where other hosts reach it, and
-  a process of your user can take a forwarded port at another address of the Mac; `sandy check`
-  warns about both. `egress` is not available on macOS yet.
+  forwarded ports and the egress port and listen on its exposed ports, so its own processes
+  cannot talk to each other over IP, names resolve only from `/etc/hosts`, and Network.framework
+  and URLSession programs cannot use those ports. A forwarded or egress port needs
+  `--signals isolated` there. The program can listen on its exposed ports at every address of
+  the Mac, where other hosts reach it, every local user can connect out through the egress
+  broker, and a process of your user can take a forwarded or egress port at an address the Mac
+  gains while sandy runs; `sandy check` warns about each.
 - The system writes the crash report of a program that sandy runs to
   `/Library/Logs/DiagnosticReports`, which administrators can read and standard users cannot,
   instead of the user's `~/Library/Logs/DiagnosticReports`.

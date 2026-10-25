@@ -9,7 +9,7 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::mem::ManuallyDrop;
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -278,6 +278,8 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
         // Accepts one connection on the listening socket the caller passed as standard stream
         // STREAM (0, 1 or 2).
         "accept-fd" => accept_fd(target),
+        // BROKER<U+001F>DESTINATION: asks the SOCKS5 broker at BROKER for a connection to
+        // DESTINATION, a socket address or NAME:PORT, and reports the broker's reply code.
         action if win32k::ACTIONS.contains(&action) => win32k::perform(action, target),
         action if unix::ACTIONS.contains(&action) => unix::perform(action, target),
         action if linux::ACTIONS.contains(&action) => linux::perform(action, target),
@@ -558,39 +560,34 @@ fn pair(target: &str) -> io::Result<(&str, &str)> {
 /// the connection. It does not exchange data, so it never waits on what the destination says.
 fn socks5_connect(target: &str) -> io::Result<String> {
     let (broker, destination) = pair(target)?;
-    let (host, port) = destination
-        .rsplit_once(':')
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "expected host:port"))?;
-    let port: u16 = port
-        .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid port"))?;
-    // A bracketed IPv6 literal, as in [::1]:80.
-    let host = host
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .unwrap_or(host);
     let mut request = vec![5u8, 1, 0];
-    match host.parse() {
-        Ok(IpAddr::V4(ip)) => {
+    // A socket address, also an IPv6 one with a scope (`[fe80::1%12]:80`), goes as an address;
+    // anything else as a domain name.
+    let port = match destination.parse::<SocketAddr>() {
+        Ok(SocketAddr::V4(v4)) => {
             request.push(1);
-            request.extend(ip.octets());
+            request.extend(v4.ip().octets());
+            v4.port()
         }
-        Ok(IpAddr::V6(ip)) => {
+        Ok(SocketAddr::V6(v6)) => {
             request.push(4);
-            request.extend(ip.octets());
+            request.extend(v6.ip().octets());
+            v6.port()
         }
         Err(_) => {
-            let length = u8::try_from(host.len())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name too long"))?;
+            let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "expected NAME:PORT");
+            let (name, port) = destination.rsplit_once(':').ok_or_else(invalid)?;
             request.push(3);
-            request.push(length);
-            request.extend(host.as_bytes());
+            request.push(u8::try_from(name.len()).map_err(|_| invalid())?);
+            request.extend(name.as_bytes());
+            port.parse().map_err(|_| invalid())?
         }
-    }
+    };
     request.extend(port.to_be_bytes());
 
     let mut stream = TcpStream::connect_timeout(&socket_address(broker)?, CONNECT_TIMEOUT)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    // The broker may take its whole connect timeout of 10 seconds before it replies.
+    stream.set_read_timeout(Some(Duration::from_secs(20)))?;
     stream.write_all(&[5, 1, 0])?;
     let mut greeting = [0u8; 2];
     stream.read_exact(&mut greeting)?;

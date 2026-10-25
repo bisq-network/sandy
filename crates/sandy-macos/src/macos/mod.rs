@@ -1,10 +1,12 @@
 //! The parts that call macOS: loading Seatbelt, applying the profile and replacing sandy with
 //! the target.
 
+mod broker;
 mod contain;
 mod exec;
 mod helper;
 mod holder;
+mod interfaces;
 mod relay;
 mod seatbelt;
 mod watch;
@@ -19,8 +21,16 @@ use std::io::Read;
 
 use crate::binary;
 use crate::plan::{HostCapabilities, SHEBANG_LEVELS, executable_paths, plan_for};
-use crate::profile::{generate, held_ports, relay_pairs, relay_profile, watcher_profile};
+use crate::profile::{
+    broker_holds, broker_profile, generate, relay_holds, relay_pairs, relay_profile,
+    watcher_profile,
+};
 use seatbelt::Seatbelt;
+
+/// The tests that bind ports at every address of this Mac take this first: a port that one of
+/// them chose as free can be the next one the kernel hands another of them for an address.
+#[cfg(test)]
+static BINDS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // The profile is generated on every platform, so it carries its own copy of these numbers.
 const _: () = {
@@ -54,14 +64,25 @@ impl Backend for MacosBackend {
 
     fn verify(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
         let mut items = sandy_core::verify::relay_listeners(policy);
-        // Like the listeners, the ports the relay holds can be taken; the sockets close at once.
-        items.extend(held_ports(policy).into_iter().find_map(|port| {
-            let error = holder::hold(port).err()?;
+        // Like the listeners, the ports the relay and the broker hold can be taken; the trial
+        // sockets close at once.
+        let holds = relay_holds(policy).into_iter().chain(broker_holds(policy));
+        items.extend(holds.into_iter().find_map(|hold| {
+            let error = holder::hold(hold.port, &hold.leave).err()?;
             Some(PlanItem::unavailable(
                 Requirement::IpNetworkPrivate,
                 error.to_string(),
             ))
         }));
+        if let Some(egress) = policy.egress {
+            let listen = egress.listen();
+            if let Err(error) = std::net::TcpListener::bind(listen) {
+                items.push(PlanItem::unavailable(
+                    Requirement::EgressBrokered,
+                    format!("cannot listen on {listen}: {error}"),
+                ));
+            }
+        }
         if let Err(reason) = applies_in_a_trial(policy) {
             items.extend(crate::plan::profile_unavailable(policy, &reason));
         }
@@ -86,20 +107,39 @@ impl Backend for MacosBackend {
         exec::reset_exception_ports()?;
         let contained = policy.children == ChildProcesses::Contained;
         let pairs = relay_pairs(policy);
-        // With `contained`, the relay also ends when the guard has ended the program's group,
-        // and the guard watches the relay in turn (see `contain::run`).
+        // With `contained`, the relay and the broker also end when the guard has ended the
+        // program's group, and the guard watches them in turn (see `contain::run`).
         let mut group_ended = None;
-        let mut relay = None;
-        if !pairs.is_empty() {
-            let ended = if contained {
-                let (read, write) = helper::pipe("the pipe of the group's end")?;
-                group_ended = Some(write);
-                Some(read)
-            } else {
-                None
-            };
-            relay = Some(relay::start(&pairs, &held_ports(policy), &seatbelt, ended)?);
+        let mut ended = None;
+        if contained && (!pairs.is_empty() || policy.egress.is_some()) {
+            let (read, write) = helper::pipe("the pipe of the group's end")?;
+            group_ended = Some(write);
+            ended = Some(read);
         }
+        let ended_copy = || {
+            ended
+                .as_ref()
+                .map(std::fs::File::try_clone)
+                .transpose()
+                .map_err(|error| SandboxError::io("cannot copy the pipe of the group's end", error))
+        };
+        let mut helpers = Vec::new();
+        if !pairs.is_empty() {
+            let pid = relay::start(&pairs, &relay_holds(policy), &seatbelt, ended_copy()?)?;
+            helpers.push(contain::Helper {
+                pid,
+                name: "the relay of the exposed or forwarded ports",
+            });
+        }
+        if let Some(egress) = policy.egress {
+            let hold = broker_holds(policy);
+            let pid = broker::start(egress, hold.as_ref(), &seatbelt, ended_copy()?)?;
+            helpers.push(contain::Helper {
+                pid,
+                name: "the egress broker",
+            });
+        }
+        drop(ended);
         if policy.end_with_parent {
             let parent = command.parent.unwrap_or_else(|| ParentProcess {
                 // SAFETY: getppid has no preconditions.
@@ -126,7 +166,7 @@ impl Backend for MacosBackend {
                     Err(error) => error,
                 },
                 group_ended,
-                relay,
+                helpers,
                 status,
             );
         }
@@ -138,7 +178,8 @@ impl Backend for MacosBackend {
 }
 
 /// Loads Seatbelt and compiles the profiles of `policy` (the program's, the relay's with exposed
-/// or forwarded ports, and the watcher's with `end_with_parent`) without applying them. Neither
+/// or forwarded ports, the egress broker's, and the watcher's with `end_with_parent`) without
+/// applying them. Neither
 /// step changes the sandbox state of the process.
 fn detect(policy: &ResolvedPolicy) -> HostCapabilities {
     let interpreter = policy.interpreter_problem(SHEBANG_LEVELS, &executable_paths(policy));
@@ -158,6 +199,14 @@ fn detect(policy: &ResolvedPolicy) -> HostCapabilities {
                     seatbelt
                         .compile(&relay_profile(&pairs))
                         .map_err(|message| format!("relay profile: {message}"))
+                })
+                .and_then(|()| {
+                    let Some(egress) = policy.egress else {
+                        return Ok(());
+                    };
+                    seatbelt
+                        .compile(&broker_profile(egress.port))
+                        .map_err(|message| format!("egress broker profile: {message}"))
                 })
                 .and_then(|()| {
                     if !policy.end_with_parent {
@@ -356,7 +405,7 @@ mod tests {
                 }
             }
         }
-        // The relay rules of a private network, and the view.
+        // The relay and egress rules of a private network, and the view.
         policies.push(ResolvedPolicy {
             ip: IpAccess::Private,
             expose: vec![sandy_core::ExposedPort {
@@ -373,6 +422,10 @@ mod tests {
                     to: "[::1]:8082".parse().unwrap(),
                 },
             ],
+            egress: Some(sandy_core::Egress {
+                port: 1080,
+                reach: sandy_core::EgressReach::Public,
+            }),
             view: sandy_core::FileView::Policy,
             ..base.clone()
         });
@@ -426,6 +479,93 @@ mod tests {
         let profile = watcher_profile();
         if let Err(message) = seatbelt.compile(&profile) {
             panic!("{message}\n{}", profile.text);
+        }
+    }
+
+    #[test]
+    fn this_macos_compiles_the_broker_profile() {
+        let seatbelt = Seatbelt::load().expect("Seatbelt functions");
+        let profile = crate::profile::broker_profile(1080);
+        if let Err(message) = seatbelt.compile(&profile) {
+            panic!("{message}\n{}", profile.text);
+        }
+    }
+
+    /// Set in the child process of `the_broker_profile_keeps_this_mac_out_of_reach`: `deny` or
+    /// `allow`, then the addresses to connect to, separated by commas.
+    const BROKER_TRIAL: &str = "SANDY_BROKER_PROFILE_TRIAL";
+
+    /// The broker's profile denies connections to `localhost`, every address of this Mac, after
+    /// the allow of TCP out. Seatbelt's compiler drops some denials that follow a broad allow,
+    /// depending on the rest of the profile (docs/macos.md, "The egress broker"), so this applies
+    /// the real profile, in a child process of its own, and connects to listeners at loopback and
+    /// at this Mac's address on the local network: both are refused. The control is the same
+    /// profile without the deny, which reaches both. The child also reads this Mac's addresses,
+    /// which the destination check needs under the profile.
+    #[test]
+    fn the_broker_profile_keeps_this_mac_out_of_reach() {
+        if let Ok(trial) = std::env::var(BROKER_TRIAL) {
+            return broker_trial(&trial);
+        }
+        let _binds = BINDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut listeners = vec![std::net::TcpListener::bind("127.0.0.1:0").unwrap()];
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        if probe.connect("192.0.2.1:9").is_ok() {
+            let own = probe.local_addr().unwrap().ip();
+            listeners.push(std::net::TcpListener::bind((own, 0)).unwrap());
+        }
+        let targets: Vec<String> = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap().to_string())
+            .collect();
+        for (mode, expected) in [("deny", "denied"), ("allow", "connected")] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "macos::tests::the_broker_profile_keeps_this_mac_out_of_reach",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(BROKER_TRIAL, format!("{mode},{}", targets.join(",")))
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{output:?}");
+            for target in &targets {
+                assert!(
+                    stdout.contains(&format!("trial {target} {expected}")),
+                    "{mode}: {stdout}"
+                );
+            }
+            assert!(stdout.contains("trial addresses read"), "{mode}: {stdout}");
+        }
+    }
+
+    fn broker_trial(trial: &str) {
+        let mut fields = trial.split(',');
+        let mode = fields.next().unwrap();
+        let mut profile = crate::profile::broker_profile(1080);
+        if mode == "allow" {
+            profile.text = profile
+                .text
+                .replace(crate::profile::BROKER_LOCALHOST_DENY, "");
+        }
+        Seatbelt::load().unwrap().apply(&profile).unwrap();
+        for target in fields {
+            let address: std::net::SocketAddr = target.parse().unwrap();
+            let result =
+                std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(3));
+            let outcome = match result {
+                Ok(_) => "connected",
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => "denied",
+                Err(_) => "failed",
+            };
+            println!("trial {target} {outcome}");
+        }
+        if interfaces::addresses().is_ok_and(|all| !all.is_empty()) {
+            println!("trial addresses read");
         }
     }
 

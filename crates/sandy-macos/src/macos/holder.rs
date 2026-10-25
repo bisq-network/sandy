@@ -1,40 +1,69 @@
-//! Holder binds for `ip = "private"` (`profile::held_ports`). Seatbelt's `localhost` is every
-//! address of this Mac, so the profile that lets the program reach a forwarded port at loopback
-//! lets it reach that port at the local network, link-local and VPN addresses too. sandy binds
-//! the port at `0.0.0.0` and at `[::]` (IPv6 only) without listening: a connection to the port at
-//! an address where nothing more specific listens then finds this socket, which never answers.
+//! Holder binds for `ip = "private"` (`profile::held_ports`, `profile::broker_holds`).
+//! Seatbelt's `localhost` is every address of this Mac, so the profile that lets the program
+//! reach a forwarded or egress port at loopback lets it reach that port at the local network,
+//! link-local and VPN addresses too. sandy binds the port without listening at `0.0.0.0`, at
+//! `[::]` (IPv6 only) and at every address the Mac has now, except where its own listener or the
+//! program listens: a connection to the port at such an address finds sandy's socket, which never
+//! answers, and a socket that already holds one of them makes the bind, and so the run, fail.
 //!
 //! `SO_REUSEADDR` keeps a connection of an earlier run that waits in `TIME_WAIT` from refusing the
-//! bind, and still refuses it when another socket is bound at the same wildcard address, or a
-//! socket of another user at any address of the port.
+//! bind, and still refuses it when another socket is bound at the same address, or a socket of
+//! another user at any address of the port. An address that the Mac gains later is held only by
+//! the wildcard binds, next to which a process of sandy's user can still bind it.
 
 use std::io;
 use std::mem::size_of;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use sandy_core::SandboxError;
 
-/// Binds `port` at the wildcard address of both families. The sockets hold the port until they
-/// are closed.
-pub fn hold(port: u16) -> Result<[OwnedFd; 2], SandboxError> {
-    let bind = |address: SocketAddr| {
-        bind_without_listening(address).map_err(|error| {
-            let advice = if error.kind() == io::ErrorKind::AddrInUse {
-                " (another socket uses the port there; forward a port that is free)"
-            } else {
-                ""
-            };
-            SandboxError::io(
-                format!("cannot hold port {port} at {address} for ip = \"private\"{advice}"),
-                error,
-            )
-        })
+use super::interfaces;
+
+/// Binds `port` at the wildcard addresses and at every address of this Mac but `leave`. The
+/// sockets hold the port until they are closed.
+pub fn hold(port: u16, leave: &[IpAddr]) -> Result<Vec<OwnedFd>, SandboxError> {
+    let refused = |address: SocketAddr, error: io::Error| {
+        let advice = if error.kind() == io::ErrorKind::AddrInUse {
+            " (another socket uses the port there; use a port that is free)"
+        } else {
+            ""
+        };
+        SandboxError::io(
+            format!("cannot hold port {port} at {address} for ip = \"private\"{advice}"),
+            error,
+        )
     };
-    Ok([
-        bind(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port))?,
-        bind(SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port))?,
-    ])
+    let mut held = Vec::new();
+    for wildcard in [
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        Ipv6Addr::UNSPECIFIED.into(),
+    ] {
+        let address = SocketAddr::new(wildcard, port);
+        held.push(bind_without_listening(address).map_err(|error| refused(address, error))?);
+    }
+    let addresses = interfaces::addresses().map_err(|error| {
+        SandboxError::io("cannot read the addresses of this Mac's interfaces", error)
+    })?;
+    let mut done: Vec<SocketAddr> = Vec::new();
+    for interface in addresses {
+        let address = match interface.address {
+            IpAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(v6, port, 0, interface.scope)),
+            v4 => SocketAddr::new(v4, port),
+        };
+        if leave.contains(&interface.address) || done.contains(&address) {
+            continue;
+        }
+        done.push(address);
+        match bind_without_listening(address) {
+            Ok(socket) => held.push(socket),
+            // An address that is not ready yet, such as a tentative IPv6 address, takes no bind;
+            // the wildcard bind holds it.
+            Err(error) if error.raw_os_error() == Some(libc::EADDRNOTAVAIL) => {}
+            Err(error) => return Err(refused(address, error)),
+        }
+    }
+    Ok(held)
 }
 
 fn bind_without_listening(address: SocketAddr) -> io::Result<OwnedFd> {
@@ -75,6 +104,7 @@ fn bind_without_listening(address: SocketAddr) -> io::Result<OwnedFd> {
             raw.sin6_family = libc::AF_INET6 as libc::sa_family_t;
             raw.sin6_port = v6.port().to_be();
             raw.sin6_addr.s6_addr = v6.ip().octets();
+            raw.sin6_scope_id = v6.scope_id();
             // SAFETY: raw is a sockaddr_in6 of the length passed.
             unsafe { libc::bind(fd, (&raw const raw).cast(), raw.sin6_len.into()) }
         }
@@ -116,39 +146,76 @@ mod tests {
             .port()
     }
 
-    /// The holder takes the wildcard addresses of the port, and leaves the loopback address to the
-    /// relay's listener, whichever binds first.
-    #[test]
-    fn holds_the_wildcard_addresses_next_to_the_relay_listener() {
-        let port = free_port();
-        let held = hold(port).unwrap();
-        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
-        for wildcard in ["0.0.0.0", "::"] {
-            let error = TcpListener::bind((wildcard, port)).unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::AddrInUse, "{wildcard}");
+    fn at(interface: &interfaces::InterfaceAddress, port: u16) -> SocketAddr {
+        match interface.address {
+            IpAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(v6, port, 0, interface.scope)),
+            v4 => SocketAddr::new(v4, port),
         }
-        drop(held);
-        drop(listener);
+    }
+
+    /// The holder takes the wildcard addresses and every address of this Mac, and leaves the
+    /// relay's listener its address, whichever binds first. Closed, its sockets hold nothing.
+    #[test]
+    fn holds_every_address_but_the_listeners() {
+        let _binds = super::super::BINDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let port = free_port();
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let held = hold(port, &[loopback]).unwrap();
+        let listener = TcpListener::bind((loopback, port)).unwrap();
+        let mut others: Vec<SocketAddr> = interfaces::addresses()
+            .unwrap()
+            .iter()
+            .filter(|interface| interface.address != loopback)
+            .map(|interface| at(interface, port))
+            .collect();
+        others.extend(
+            ["0.0.0.0", "[::]"].map(|ip| format!("{ip}:{port}").parse::<SocketAddr>().unwrap()),
+        );
+        for address in &others {
+            let taken = TcpListener::bind(address).map(drop).map_err(|e| e.kind());
+            assert!(
+                matches!(
+                    taken,
+                    Err(io::ErrorKind::AddrInUse | io::ErrorKind::AddrNotAvailable)
+                ),
+                "{address}: {taken:?}"
+            );
+        }
+        drop((held, listener));
+        for wildcard in ["0.0.0.0", "::"] {
+            if let Err(error) = TcpListener::bind((wildcard, port)) {
+                panic!("{wildcard}:{port} after the hold: {error}");
+            }
+        }
 
         let port = free_port();
         let listener = TcpListener::bind(("::1", port)).unwrap();
-        let held = hold(port).unwrap();
-        drop((held, listener));
-        // Closed sockets hold nothing.
-        let _free = TcpListener::bind(("0.0.0.0", port)).unwrap();
+        drop((hold(port, &[Ipv6Addr::LOCALHOST.into()]).unwrap(), listener));
     }
 
-    /// A process that listens on the port at a wildcard address would receive the program's
-    /// connections to the other addresses of this Mac, so the hold fails.
+    /// A socket that already listens on the port, at a wildcard address or at an address of this
+    /// Mac, would receive the program's connections there, so the hold fails.
     #[test]
-    fn a_wildcard_listener_of_another_socket_refuses_the_hold() {
-        for wildcard in ["0.0.0.0", "::"] {
-            let other = TcpListener::bind((wildcard, 0)).unwrap();
+    fn a_listener_of_another_socket_refuses_the_hold() {
+        let _binds = super::super::BINDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut addresses: Vec<IpAddr> =
+            vec![Ipv4Addr::UNSPECIFIED.into(), Ipv6Addr::UNSPECIFIED.into()];
+        addresses.push(Ipv6Addr::LOCALHOST.into());
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        if probe.connect("192.0.2.1:9").is_ok() {
+            addresses.push(probe.local_addr().unwrap().ip());
+        }
+        for ip in addresses {
+            let other = TcpListener::bind((ip, 0)).unwrap();
             let port = other.local_addr().unwrap().port();
-            let error = hold(port).unwrap_err().to_string();
+            let error = hold(port, &[]).unwrap_err().to_string();
             assert!(
                 error.contains(&format!("cannot hold port {port}")),
-                "{wildcard}: {error}"
+                "{ip}: {error}"
             );
         }
     }

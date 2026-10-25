@@ -19,7 +19,7 @@ use sandy_core::SandboxError;
 use super::helper::{self, NO_EVENT, Ready, new_queue, register};
 use super::holder;
 use super::seatbelt::Seatbelt;
-use crate::profile::{Profile, RelayPair, relay_profile};
+use crate::profile::{Hold, Profile, RelayPair, relay_profile};
 
 /// After the target ends, the relay closes its listeners at once and gives the connections it
 /// already accepted this long to deliver what is left (DESIGN.md, "Forwarded ports", rule 5).
@@ -29,19 +29,19 @@ const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(50);
 
 /// Starts the relay for `pairs` as a helper process (see `helper`). Returns its process ID once
 /// the relay is confined, watches this process and serves; any failure before that is an error,
-/// and then no relay serves. The relay also keeps the `held` ports bound at the wildcard
-/// addresses for as long as it runs (`holder`). With `children = "contained"`, `ended` is the
+/// and then no relay serves. The relay also keeps the ports of `holds` bound for as long as it
+/// runs (`holder`). With `children = "contained"`, `ended` is the
 /// read end of a pipe whose write end only the guard holds: its end means that the program's
 /// group has ended, also while the supervising sandy is stopped.
 pub fn start(
     pairs: &[RelayPair],
-    held: &[u16],
+    holds: &[Hold],
     seatbelt: &Seatbelt,
     ended: Option<File>,
 ) -> Result<libc::pid_t, SandboxError> {
-    let mut holders = Vec::with_capacity(held.len() * 2);
-    for port in held {
-        holders.extend(holder::hold(*port)?);
+    let mut holders = Vec::new();
+    for hold in holds {
+        holders.extend(holder::hold(hold.port, &hold.leave)?);
     }
     let mut listeners = Vec::with_capacity(pairs.len());
     for pair in pairs {
@@ -58,14 +58,21 @@ pub fn start(
     keep.extend(ended.as_ref().map(AsRawFd::as_raw_fd));
     keep.extend(holders.iter().map(AsRawFd::as_raw_fd));
     helper::start("the relay", &keep, move |ready| {
-        serve(listeners, ended, &profile, &seatbelt, watched, ready);
-        drop(holders);
+        serve(
+            (listeners, holders),
+            ended,
+            &profile,
+            &seatbelt,
+            watched,
+            ready,
+        )
     })
 }
 
-/// The relay process. Returns when the target has ended.
+/// The relay process. Returns when the target has ended. The holder sockets go with the
+/// listeners.
 fn serve(
-    listeners: Vec<(TcpListener, SocketAddr)>,
+    (listeners, holders): (Vec<(TcpListener, SocketAddr)>, Vec<OwnedFd>),
     ended: Option<File>,
     profile: &Profile,
     seatbelt: &Seatbelt,
@@ -93,6 +100,7 @@ fn serve(
     // The program has ended: no new connections, and the accepted ones get a last moment to
     // deliver what the program sent before it exited.
     drop(listeners);
+    drop(holders);
     let start = Instant::now();
     while total() > 0 && start.elapsed() < DRAIN {
         std::thread::sleep(DRAIN_POLL);
