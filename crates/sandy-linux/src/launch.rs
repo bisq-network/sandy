@@ -38,8 +38,9 @@ pub fn launch(
     if command.explain && sandbox.end_with_parent && !sandbox.contain {
         return Err(SandboxError::new(
             "--explain cannot be used with process.end_with_parent unless \
-             children = \"contained\": sandy stays the program's parent in this mode, and only \
-             the supervising sandy of \"contained\" passes on the signals that end the program",
+             children = \"contained\": sandy stays the program's parent in this mode, and the \
+             SIGKILL that ends a program which outlasts SIGTERM would end sandy alone; only the \
+             guard of \"contained\" ends the program then",
         ));
     }
     // With `contained`, the relay also ends when the guard has ended the program's group, and
@@ -84,7 +85,6 @@ pub fn launch(
             SandboxError::io(format!("cannot change to {}", cwd.display()), error)
         })?;
     }
-    restore_sigpipe()?;
     let start = || match confine(ruleset, &sandbox.filter, observer.as_ref()) {
         Ok(()) => exec.execute(),
         Err(error) => error,
@@ -116,6 +116,9 @@ fn confine(
     filter: &FilterConfig,
     observer: Option<&Observer>,
 ) -> Result<(), SandboxError> {
+    // Not before: until here sandy writes for itself, the status record of `--status-fd` for
+    // one, and a reader that has gone must not end it, nor make it signal the program.
+    restore_sigpipe()?;
     let filters = build_filters(filter)?;
     mark_descriptors_close_on_exec()?;
     set_no_new_privs()?;

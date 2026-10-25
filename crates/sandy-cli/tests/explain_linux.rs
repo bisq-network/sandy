@@ -30,6 +30,16 @@ fn run(sandbox_args: &[String], actions: &[(&str, &str)]) -> Output {
     sandy(run_args(sandbox_args, actions))
 }
 
+/// Whether this host can isolate signals, which `contained` and `end_with_parent` need (Landlock
+/// ABI 6). Records the skip when it cannot.
+fn isolates_signals() -> bool {
+    if common::linux::landlock_abi() >= 6 {
+        return true;
+    }
+    skip("landlock-abi-6", "signal isolation needs Landlock ABI 6");
+    false
+}
+
 #[test]
 fn the_mode_names_a_path_the_program_does_not_complain_about() {
     let fixture = Fixture::new("explain-silent");
@@ -77,6 +87,67 @@ fn the_mode_names_a_path_the_program_does_not_complain_about() {
         !lines.iter().any(|line| line.contains(&secret)),
         "a granted path is reported: {lines:?}"
     );
+}
+
+/// The mode names only what Landlock denies. A file that does not exist is missing with every
+/// grant, Landlock does not check an `O_PATH` open or the pipe that `/dev/stdin` leads to, and
+/// removing a symbolic link removes the link in its own directory, wherever it points. Naming
+/// those would advise grants that change nothing, one of them on the link's target. The denied
+/// read of an existing file in the same run is the control that the mode reports at all.
+#[test]
+fn the_mode_names_only_what_landlock_denies() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let fixture = Fixture::new("explain-accurate");
+    let (secret, missing) = (fixture.arg("secret/file"), fixture.arg("secret/missing"));
+    let target = fixture.path("secret/target");
+    std::fs::write(&target, b"x").unwrap();
+    let link = fixture.path("rw/link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let (target, link) = (
+        target.to_str().unwrap().to_string(),
+        link.to_str().unwrap().to_string(),
+    );
+    let mut with_mode = fixture.access_args();
+    with_mode.push("--explain".to_string());
+    let stdin = "/dev/stdin".to_string();
+    let actions = [
+        ("read-optional", missing.as_str()),
+        ("opath-read", target.as_str()),
+        ("delete", link.as_str()),
+        ("read", stdin.as_str()),
+        ("read-optional", secret.as_str()),
+    ];
+    let mut child = Command::new(sandy_path())
+        .args(run_args(&with_mode, &actions))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let results = parse(&output);
+    assert_eq!(
+        results[2].result, "ok",
+        "the link was not removed: {results:?}"
+    );
+    results[3].assert_ok();
+    let lines = explained(&output);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains(&format!("cannot read {secret}:"))),
+        "the denied read is not named: {lines:?}"
+    );
+    for path in [&missing, &target, &link, &stdin] {
+        assert!(
+            !lines.iter().any(|line| line.contains(path.as_str())),
+            "{path} is named although Landlock did not deny it: {lines:?}"
+        );
+    }
 }
 
 /// The mode must not be a way around the sandbox: what the program may do is the same with it
@@ -153,6 +224,9 @@ fn the_mode_names_a_path_a_child_of_the_program_uses() {
 
 #[test]
 fn the_mode_works_while_sandy_contains_the_children() {
+    if !isolates_signals() {
+        return;
+    }
     let fixture = Fixture::new("explain-contained");
     let denied = fixture.arg("secret/file");
     let mut with_mode = fixture.access_args();
@@ -176,6 +250,9 @@ fn the_mode_works_while_sandy_contains_the_children() {
 /// `end_with_parent` sends it. The combination is refused instead of ending the program late.
 #[test]
 fn the_mode_is_refused_with_end_with_parent() {
+    if !isolates_signals() {
+        return;
+    }
     let fixture = Fixture::new("explain-parent");
     let mut with_mode = fixture.access_args();
     with_mode.extend(args(&[
@@ -269,5 +346,136 @@ fn the_program_keeps_its_exit_status() {
     let mut with_mode = fixture.access_args();
     with_mode.push("--explain".to_string());
     let output = run(&with_mode, &[("exit", "7")]);
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+}
+
+/// Ctrl+C reaches the program and sandy alike, because both are in the terminal's foreground
+/// group. sandy must stay until the program has ended: a program that goes on after Ctrl+C, as
+/// one that cleans up does, would otherwise lose its watcher halfway, and every watched call it
+/// makes from then on would fail with ENOSYS. The program here ignores the signal and writes a
+/// file afterwards; sandy must report its exit status and the closing line, not die of SIGINT.
+#[test]
+fn ctrl_c_does_not_take_the_watcher_from_the_program() {
+    use std::io::{BufRead, BufReader, Read};
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::process::{Command, Stdio};
+
+    let fixture = Fixture::new("explain-ctrl-c");
+    let mut with_mode = fixture.access_args();
+    with_mode.push("--explain".to_string());
+    let after = fixture.arg("rw/after");
+    let actions = [
+        ("ignore-signal", "2"),
+        ("sleep", "300"),
+        ("write", after.as_str()),
+    ];
+    let mut child = Command::new(sandy_path())
+        .args(run_args(&with_mode, &actions))
+        // A group of their own, as a shell gives a job, so the signal reaches only these two.
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut first = String::new();
+    stdout.read_line(&mut first).unwrap();
+    parse_line(first.trim_end()).assert_ok();
+    // What the terminal does on Ctrl+C.
+    // SAFETY: kill takes a process group ID; the group is the one created above.
+    assert_eq!(unsafe { libc::kill(-(child.id() as i32), libc::SIGINT) }, 0);
+    let mut rest = String::new();
+    stdout.read_to_string(&mut rest).unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let status = child.wait().unwrap();
+
+    let lines: Vec<ProbeLine> = rest.lines().map(parse_line).collect();
+    assert_eq!(lines.len(), 2, "{rest}");
+    lines[1].assert_ok();
+    assert_eq!(
+        status.signal(),
+        None,
+        "sandy died of a signal before the program ended: {stderr}"
+    );
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains("watched calls"),
+        "no closing line: {stderr}"
+    );
+}
+
+/// sandy stays the program's parent in this mode, so a caller that signals sandy's process ID
+/// must still reach the program, as it does in the exec model: sandy passes the signal on and
+/// reports how the program ended. The program exits with 42 when SIGTERM arrives.
+#[test]
+fn a_signal_sent_to_sandy_reaches_the_program() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+
+    let fixture = Fixture::new("explain-sigterm");
+    let mut with_mode = fixture.access_args();
+    with_mode.push("--explain".to_string());
+    let mut child = Command::new(sandy_path())
+        .args(run_args(&with_mode, &[("await-signal", "15")]))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The probe says when its handler is in place; the report of the mode comes on the same
+    // stream.
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut line = String::new();
+    while line.trim_end() != "await-signal ready" {
+        line.clear();
+        assert_ne!(
+            stderr.read_line(&mut line).unwrap(),
+            0,
+            "the program did not start"
+        );
+    }
+    std::thread::spawn(move || std::io::copy(&mut stderr, &mut std::io::sink()));
+    // To sandy's process ID alone, as a caller that holds sandy's handle sends it.
+    // SAFETY: kill takes a process ID and a signal; the test started the process.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    let status = child.wait().unwrap();
+    assert_eq!(
+        status.signal(),
+        None,
+        "sandy died of the signal: {status:?}"
+    );
+    assert_eq!(
+        status.code(),
+        Some(42),
+        "the program did not get it: {status:?}"
+    );
+}
+
+/// A caller that ignores SIGCHLD passes that on to sandy, and the kernel then reaps sandy's
+/// children by itself, so sandy could not learn how the program ended.
+#[test]
+fn the_program_keeps_its_exit_status_when_the_caller_ignores_sigchld() {
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+
+    let fixture = Fixture::new("explain-sigchld");
+    let mut with_mode = fixture.access_args();
+    with_mode.push("--explain".to_string());
+    let mut command = Command::new(sandy_path());
+    command.args(run_args(&with_mode, &[("exit", "7")]));
+    // SAFETY: signal is async-signal-safe and the closure calls nothing else.
+    unsafe {
+        command.pre_exec(|| match libc::signal(libc::SIGCHLD, libc::SIG_IGN) {
+            libc::SIG_ERR => Err(std::io::Error::last_os_error()),
+            _ => Ok(()),
+        });
+    }
+    let output = command.output().unwrap();
     assert_eq!(output.status.code(), Some(7), "{output:?}");
 }

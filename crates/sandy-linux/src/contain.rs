@@ -493,11 +493,25 @@ struct Signals {
 }
 
 impl Signals {
-    /// Blocks every signal except the faults. Blocked signals stay pending until sandy waits for
-    /// them, also when their action is to ignore them.
+    /// Blocks every signal except the faults and SIGPIPE. Blocked signals stay pending until
+    /// sandy waits for them, also when their action is to ignore them. SIGPIPE stays ignored, as
+    /// the Rust runtime set it: a write of sandy's own whose reader has gone raises it, the
+    /// status record's for one, and blocked it would wait here and reach the program as a
+    /// forwarded signal.
     fn block() -> Result<Signals, SandboxError> {
-        let (blocked, previous) =
-            block_signals().map_err(|error| SandboxError::io("cannot block signals", error))?;
+        let failed = |error| SandboxError::io("cannot block signals", error);
+        let (mut blocked, previous) = block_signals().map_err(failed)?;
+        // SAFETY: sigset_t is plain data; the calls initialize and change the two sets, and
+        // sigprocmask reads one of them.
+        unsafe {
+            let mut pipe: libc::sigset_t = mem::zeroed();
+            libc::sigemptyset(&mut pipe);
+            libc::sigaddset(&mut pipe, libc::SIGPIPE);
+            libc::sigdelset(&mut blocked, libc::SIGPIPE);
+            if libc::sigprocmask(libc::SIG_UNBLOCK, &pipe, ptr::null_mut()) != 0 {
+                return Err(failed(io::Error::last_os_error()));
+            }
+        }
         Ok(Signals { blocked, previous })
     }
 
@@ -596,7 +610,7 @@ fn set_child_subreaper() -> Result<(), SandboxError> {
 
 /// sandy must be able to wait for its children, which an ignored SIGCHLD (inherited from the
 /// caller) prevents. Returns the previous action, which the program gets back.
-fn default_child_action() -> Result<libc::sigaction, SandboxError> {
+pub(crate) fn default_child_action() -> Result<libc::sigaction, SandboxError> {
     // SAFETY: sigaction is plain data; the call reads `action` and writes `previous`.
     unsafe {
         let mut action: libc::sigaction = mem::zeroed();

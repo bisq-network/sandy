@@ -24,10 +24,12 @@ The research behind the design is in [research/linux-mechanisms.md](research/lin
    records the device and inode of every path a Landlock rule names.
 3. Build the Landlock ruleset with all its rules (see "Rule paths" below), compile the seccomp
    filters, and build the `execve` arguments and environment as C strings. Change to the working
-   directory if the policy sets one. Reset SIGPIPE to its default action, because the Rust
-   runtime ignores it and an ignored signal stays ignored across `execve`.
+   directory if the policy sets one.
 
-Then sandy restricts itself, in this order:
+Then sandy resets SIGPIPE to its default action, because the Rust runtime ignores it and an
+ignored signal stays ignored across `execve`. Not earlier: until then sandy writes for itself,
+the record of `--status-fd` for one, and a reader that has gone must not end it. Then it
+restricts itself, in this order:
 
 4. Mark every descriptor above 2 close-on-exec (`close_range` with `CLOSE_RANGE_CLOEXEC`; before
    Linux 5.11 through the list in `/proc/self/fd`). Closing them now would also close the
@@ -161,7 +163,9 @@ One relay process serves all pairs. sandy starts it before it confines itself:
    supervisor, holds a pidfd for the relay, and ends the program's group as soon as the relay is
    gone, so there is no program left for a continued relay to be serving on behalf of. The
    caller sees that as exit 125 with the reason on standard error, and as a status record of
-   `pid` followed by `failed` rather than `exited` or `signaled`.
+   `pid` followed by `failed` rather than `exited` or `signaled`. A relay that the watchdog
+   killed is gone as well, so on a host too busy to run the relay for two seconds a contained
+   program with exposed or forwarded ports ends with that status too.
 
 The listeners and the pidfd are close-on-exec, and sandy closes its copies before it confines
 itself, so the program never holds them. The relay has `/dev/null` as its standard descriptors,
@@ -183,9 +187,12 @@ end of every connection it accepts on a forwarded port, and closes the connectio
 answer names another user. It asks over a `NETLINK_SOCK_DIAG` socket that sandy opens before the
 relay confines itself, with an exact lookup of the connection's four addresses
 (`SOCK_DIAG_BY_FAMILY`), and it compares the answer with what it asked, so a lookup that matched
-a listening socket instead is refused like any other failure. Every failure closes the
-connection, and sandy checks the lookup on a connection of its own before it starts the relay,
-so a kernel without `inet_diag` refuses the run instead of refusing every connection later.
+a listening socket instead is refused like any other failure. A dual-stack IPv6 socket that
+reached an IPv4 port, which is how Java connects by default, is answered in IPv6 form with
+IPv4-mapped addresses; the comparison reads them as the IPv4 addresses they map, because they
+name the same connection. Every failure closes the connection, and sandy checks the lookup on a
+connection of its own before it starts the relay, so a kernel without `inet_diag` refuses the
+run instead of refusing every connection later.
 
 One answer names nobody, and this is the residual of the check. The owner the kernel reports
 comes from the socket's file, so closing the socket takes it away: from the close onwards the
@@ -263,7 +270,9 @@ when the program ends. sandy does not replace itself with the program:
    be blocked or caught, so a `SIGKILL` to sandy leaves the guard to end the group and a
    `SIGSTOP` stops only sandy. The fault signals (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`,
    `SIGSYS`, `SIGABRT`, `SIGTRAP`) stay unblocked, so `kill -SEGV` to sandy ends sandy and the
-   guard then kills the group instead of the program receiving the signal. sandy also reaps
+   guard then kills the group instead of the program receiving the signal. `SIGPIPE` stays
+   unblocked and ignored, because sandy's own writes raise it when their reader has gone (the
+   status record of `--status-fd`, for one), and it must not reach the program. sandy also reaps
    processes that were re-parented to it, and refuses to continue if the guard ends before the
    program. With a terminal (one of sandy's standard descriptors is its controlling terminal),
    sandy follows job control:
@@ -761,6 +770,17 @@ The watched calls are the ones that take a path and that Landlock can deny: `ope
 but are not denied by any Landlock right (measured on Linux 7.2 in a domain that handles every
 right and grants nothing), so watching them would only cost two context switches per call.
 
+The verdict follows the order in which the kernel checks a call. A call that the kernel answers
+before it asks Landlock is not named, because no grant changes that answer: a file to use or a
+name to remove that does not exist (`ENOENT`), a name to add that exists already (`EEXIST`), an
+empty path (`ENOENT`, except for `execveat` with `AT_EMPTY_PATH`, which executes its descriptor),
+and an `O_PATH` open, which Landlock does not check at all. Neither does it check a file that
+has no path of its own, such as the pipe that `/dev/stdin` leads to when standard input is a
+pipe, so that is not named either. A right that adds or removes a name (create, remove,
+symbolic link, device, named pipe, socket) is checked on the directory that holds the name, as
+Landlock checks it, and a symbolic link at the end of such a path is not followed: removing a
+link removes the link, not what it points to.
+
 ### What it cannot see
 
 The mode reports less than the kernel denies, and a report that is read as complete is worse
@@ -779,32 +799,61 @@ than none. It does not see:
   result, which the watcher never sees. It is the same rule set Landlock gets, compared against
   the path after symbolic links are resolved, so the two agree in the cases that matter; they
   can differ where a path reaches a granted directory by another route, for example through a
-  bind mount, which the mode then names although the kernel allowed it.
+  bind mount, which the mode then names although the kernel allowed it. sandy also resolves
+  symbolic links in its own process, so a link into `/proc/self`, such as `/dev/stdin` or
+  `/dev/fd/3`, leads to sandy's descriptor with that number and not the program's. For the
+  standard streams the program inherited they are the same file; for any other they can differ.
 - **A path the watcher could not read**, because the process ended first or the host forbids
   reading another process's memory (`ptrace_scope` 2 or 3). The closing line counts these.
 - **A process that outlives sandy.** The watcher ends with sandy, and the watched calls of such
-  a process then fail with `ENOSYS`. Do not use `--explain` for a program that daemonizes.
+  a process then fail with `ENOSYS`; it stays confined. That is also what a `SIGKILL` to sandy
+  leaves behind. Do not use `--explain` for a program that daemonizes.
 - **More than 1000 paths.** The program decides how many paths it uses, and the watcher keeps
   every path it named so that it names it only once. After 1000 it names no more, and the
   closing line says so.
 
-The program can also change the path between the watcher's read and the call, which makes the
-report name a path the kernel never saw. That is a wrong report, not a weaker sandbox: see
-DESIGN.md.
+The program can also change the path between the watcher's read and the call, or create and
+remove files in between, which makes the report name a path the kernel never saw or leave out
+one it denied. That is a wrong report, not a weaker sandbox: see DESIGN.md.
 
 ### Cost and other effects
 
 - Two context switches per watched call. Measured on Fedora 44: a run with about 4900 watched
   calls took 0.11 to 0.24 seconds instead of 0.03, roughly 25 microseconds per call.
+- A watched call waits for the watcher in a state that a signal interrupts. When the program
+  handles that signal without `SA_RESTART`, the call fails with `EINTR` where it would otherwise
+  have completed, also an `open` of a local file, which programs rarely retry. Measured on Linux
+  7.2: 420 to 550 of 20000 opens with a 200 microsecond interval timer, none without the mode.
+  `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` (Linux 5.19) would only narrow this, to 93 of 20000,
+  because a signal that comes before the watcher has taken the call still interrupts it, and it
+  would let nothing but SIGKILL reach a program whose call the watcher holds; sandy does not use
+  it. Programs that retry on `EINTR`, as the Go runtime does, are not affected.
 - sandy stays the program's parent, so the caller's process ID is sandy's and not the program's
-  (as with `contained`; `--status-fd` reports the program's). sandy does not pass signals on in
-  this mode, which is why `--explain` with `process.end_with_parent` is refused unless
-  `children = "contained"` supervises the run.
+  (as with `contained`; `--status-fd` reports the program's). sandy blocks the signals it can
+  wait for, waits with `sigwaitinfo` and passes each one on to the program, so a caller that
+  signals sandy's process ID reaches the program, with these exceptions:
+  - `SIGINT` and `SIGQUIT` are ignored while the program runs, as `system(3)` does. The terminal
+    sends Ctrl+C and Ctrl+\ to the program as well, and a sandy that ended first would leave a
+    program that cleans up after them with `ENOSYS` for every watched call. Sent to sandy alone,
+    they do not reach the program.
+  - `SIGTSTP`, `SIGTTIN`, `SIGTTOU` and `SIGCONT` keep their default actions, so the terminal
+    stops and continues sandy together with the program and a shell sees the job stop.
+  - A signal the kernel sent for the terminal or the process group (`si_code` `SI_KERNEL`, such
+    as `SIGHUP` on a hangup or `SIGWINCH`) reached the program as well and is not passed on a
+    second time (measured: a window resize arrives at sandy with `SI_KERNEL`, a `kill` with
+    `SI_USER`).
+  - A signal sent with `kill` to the whole process group reaches both processes and cannot be
+    told from one sent to sandy alone, so the program receives it twice.
+
+  `SIGKILL` and `SIGSTOP` cannot be caught. `SIGKILL` ends sandy alone: the program keeps
+  running, confined as before, and its watched calls fail with `ENOSYS`. That is why
+  `--explain` with `process.end_with_parent`, whose watcher ends a program that outlasts
+  `SIGTERM` with `SIGKILL`, is refused unless `children = "contained"` supervises the run.
 - The watcher is a thread of sandy, outside the sandbox, which parses bytes the program
   controls. It reads at most one path of `PATH_MAX` bytes per call and acts on none of them.
 - The report goes to sandy's standard error, which is usually the program's as well. A reader
-  that goes away does not end the run: sandy ignores `SIGPIPE` from the moment the program is
-  forked (the program keeps the default action), and a line that cannot be written is dropped.
+  that goes away does not end the run: sandy ignores `SIGPIPE` (the program gets the default
+  action back before it confines itself), and a line that cannot be written is dropped.
   Without that, sandy would die and the program would lose its watcher.
 - A run with `--explain` is otherwise the same run: the Landlock ruleset and the other filters
   are built exactly as without it.

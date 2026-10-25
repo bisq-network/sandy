@@ -40,9 +40,9 @@ use landlock::{AccessFs, BitFlags};
 use sandy_core::{SandboxError, StatusReport, canonical_location};
 use seccompiler::BpfProgram;
 
-use crate::contain::{SIGNALED, START_FAILED};
+use crate::contain::{SIGNALED, START_FAILED, default_child_action};
 use crate::filter;
-use crate::helper::pipe;
+use crate::helper::{block_signals, pipe};
 use crate::launch::ensure_single_thread;
 use crate::plan::{LandlockConfig, PathRights};
 
@@ -145,6 +145,31 @@ impl Need {
             // Only with unix_sockets = "all"; `policy_rights` adds MakeSock then.
             Need::Socket => Some("read_write with unix_sockets = \"all\""),
         }
+    }
+
+    /// Whether the call adds a name to a directory.
+    fn adds_a_name(self) -> bool {
+        matches!(
+            self,
+            Need::Create
+                | Need::CreateDirectory
+                | Need::Symlink
+                | Need::Device
+                | Need::Fifo
+                | Need::Socket
+        )
+    }
+
+    /// Whether the call takes a name out of a directory.
+    fn removes_a_name(self) -> bool {
+        matches!(self, Need::Remove | Need::RemoveDirectory)
+    }
+
+    /// Whether Landlock checks the right on the directory that holds the name, as it does for
+    /// every right that adds or removes a name, instead of on the path itself. Such a call does
+    /// not follow a symbolic link at the end of the path either.
+    fn on_directory(self) -> bool {
+        self.adds_a_name() || self.removes_a_name()
     }
 }
 
@@ -331,13 +356,17 @@ impl Rules {
     /// handle is never checked, so it is never a gap.
     fn gap(&self, path: &Path, need: Need) -> Option<Gap> {
         let right = need.right();
-        if !self.handled.contains(right) || self.granted(path).contains(right) {
+        let checked = match need.on_directory() {
+            true => path.parent().unwrap_or(path),
+            false => path,
+        };
+        if !self.handled.contains(right) || self.granted(checked).contains(right) {
             return None;
         }
         Some(Gap {
             path: path.to_path_buf(),
             need,
-            covered_by: self.covering(path).first().map(|rule| rule.path.clone()),
+            covered_by: self.covering(checked).first().map(|rule| rule.path.clone()),
         })
     }
 }
@@ -353,9 +382,11 @@ struct Gap {
 
 impl Gap {
     fn line(&self, call: &str, pid: u32) -> String {
-        let what = match &self.covered_by {
-            Some(rule) => format!("the rule {} does not allow it", rule.display()),
-            None => "no rule covers it".to_string(),
+        let directory = self.path.parent().filter(|_| self.need.on_directory());
+        let what = match (&self.covered_by, directory) {
+            (Some(rule), _) => format!("the rule {} does not allow it", rule.display()),
+            (None, Some(directory)) => format!("no rule covers {}", directory.display()),
+            (None, None) => "no rule covers it".to_string(),
         };
         let advice = match self.need.grant() {
             Some(grant) => format!("grant it with {grant}"),
@@ -475,7 +506,8 @@ impl Explain {
     /// answer.
     pub fn start(&mut self) -> Result<(), SandboxError> {
         drop(self.send.take());
-        ignore_broken_report()?;
+        // A report that nobody reads must not end sandy: the program would lose its watcher.
+        ignore(libc::SIGPIPE)?;
         let (stop_read, stop_write) = pipe("the watcher's stop pipe")?;
         self.stop = Some(stop_write);
         let receive = self.receive.take().expect("the watcher starts once");
@@ -556,16 +588,30 @@ fn inspect(
         return;
     };
     let pid = notification.pid;
-    let Some(path) = read_path(pid, notification.data.args[usize::from(watched.path)]) else {
+    let args = &notification.data.args;
+    let Some(path) = read_path(pid, args[usize::from(watched.path)]) else {
         counts.unreadable += 1;
         return;
     };
-    let Some(path) = absolute(pid, watched, &notification.data.args, &path) else {
+    // An empty path names nothing, and the kernel answers ENOENT, unless execveat is asked to
+    // execute its descriptor (AT_EMPTY_PATH), which is how fexecve works.
+    if path.as_os_str().is_empty() && !executes_descriptor(watched, args) {
+        return;
+    }
+    let Some(path) = absolute(pid, watched, args, &path) else {
         counts.unreadable += 1;
         return;
     };
-    let path = canonical_location(&path);
-    let need = need_of(watched, &notification.data.args, &path);
+    let Some(need) = need_of(watched, args, &path) else {
+        return;
+    };
+    let path = match need.on_directory() {
+        true => canonical_name(&path),
+        false => canonical_location(&path),
+    };
+    if !reaches_landlock(need, &path) {
+        return;
+    }
     let Some(gap) = rules.gap(&path, need) else {
         return;
     };
@@ -584,12 +630,13 @@ fn inspect(
 }
 
 /// What the call needs, from its arguments. A call that creates a file needs `MakeReg` only when
-/// the file does not exist yet; on an existing one it is an ordinary open.
-fn need_of(watched: &Watched, args: &[u64; 6], path: &Path) -> Need {
+/// the file does not exist yet; on an existing one it is an ordinary open. `None` for an
+/// `O_PATH` open, which Landlock does not check.
+fn need_of(watched: &Watched, args: &[u64; 6], path: &Path) -> Option<Need> {
     let argument = |index: u8| args[usize::from(index)] as u32;
-    match watched.purpose {
+    Some(match watched.purpose {
         Use::Always(need) => need,
-        Use::Open(flags) => open_need(argument(flags), path),
+        Use::Open(flags) => return open_need(argument(flags), path),
         Use::Unlink(flags) => {
             if argument(flags) & libc::AT_REMOVEDIR as u32 != 0 {
                 Need::RemoveDirectory
@@ -603,33 +650,62 @@ fn need_of(watched: &Watched, args: &[u64; 6], path: &Path) -> Need {
             libc::S_IFSOCK => Need::Socket,
             _ => Need::Create,
         },
-    }
+    })
 }
 
-fn open_need(flags: u32, path: &Path) -> Need {
+/// The kernel's mask of the access mode in the open flags. musl's `O_ACCMODE` also holds
+/// `O_PATH`, and sandy ships musl binaries.
+const O_ACCMODE: u32 = 3;
+
+fn open_need(flags: u32, path: &Path) -> Option<Need> {
     let flag = |flag: libc::c_int| flags & flag as u32 != 0;
-    let mode = flags & libc::O_ACCMODE as u32;
+    if flag(libc::O_PATH) {
+        return None;
+    }
+    let mode = flags & O_ACCMODE;
     let writing = mode == libc::O_WRONLY as u32 || mode == libc::O_RDWR as u32;
-    if flag(libc::O_DIRECTORY) {
+    Some(if flag(libc::O_DIRECTORY) {
         Need::List
-    } else if writing {
-        Need::Write
     } else if flag(libc::O_CREAT) && !path.exists() {
         Need::Create
+    } else if writing {
+        Need::Write
     } else if flag(libc::O_TRUNC) {
         Need::Truncate
     } else {
         Need::Read
+    })
+}
+
+/// Whether the kernel asks Landlock about this use of `path` at all. It answers ENOENT for a
+/// file to use or a name to remove that does not exist, and EEXIST for a name to add that
+/// exists already, before Landlock sees the call. No grant changes those answers. A file to use
+/// that has no path of its own, such as the pipe that `/dev/stdin` can lead to, is not one
+/// Landlock checks either.
+fn reaches_landlock(need: Need, path: &Path) -> bool {
+    let named = path.symlink_metadata().is_ok();
+    if need.adds_a_name() {
+        !named
+    } else if need.removes_a_name() {
+        named
+    } else {
+        path.canonicalize().is_ok()
     }
 }
 
+/// Whether `watched` executes the file of its descriptor argument instead of a path: execveat
+/// with AT_EMPTY_PATH.
+fn executes_descriptor(watched: &Watched, args: &[u64; 6]) -> bool {
+    watched.call == libc::SYS_execveat && args[4] & libc::AT_EMPTY_PATH as u64 != 0
+}
+
 /// `path` as an absolute path, resolved as the kernel resolves it for process `pid`: against the
-/// directory of the call's descriptor argument, or against the process's current directory.
+/// directory of the call's descriptor argument, or against the process's current directory. An
+/// empty path is that directory or descriptor itself.
 fn absolute(pid: u32, watched: &Watched, args: &[u64; 6], path: &Path) -> Option<PathBuf> {
     if path.is_absolute() {
         return Some(own_process(pid, path));
     }
-    let empty = path.as_os_str().is_empty();
     let descriptor = watched
         .directory
         .map(|index| args[usize::from(index)] as i32);
@@ -637,18 +713,22 @@ fn absolute(pid: u32, watched: &Watched, args: &[u64; 6], path: &Path) -> Option
         Some(descriptor) if descriptor != libc::AT_FDCWD => {
             format!("/proc/{pid}/fd/{descriptor}")
         }
-        // An empty path without a descriptor names nothing, and the kernel answers ENOENT.
-        _ if empty => return None,
         _ => format!("/proc/{pid}/cwd"),
     };
     let directory = std::fs::read_link(directory).ok()?;
-    // An empty path with a descriptor is the descriptor itself (AT_EMPTY_PATH), which is how
-    // fexecve executes a file it already has open.
-    Some(if empty {
-        directory
-    } else {
-        directory.join(path)
-    })
+    if path.as_os_str().is_empty() {
+        return Some(directory);
+    }
+    Some(own_process(pid, &directory.join(path)))
+}
+
+/// `path` with its directory resolved and its last name kept as it is: a call that adds or
+/// removes a name acts on the name itself, also when it is a symbolic link.
+fn canonical_name(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => canonical_location(parent).join(name),
+        _ => canonical_location(path),
+    }
 }
 
 /// `/proc/self` and `/proc/thread-self` lead to the directory of the process that uses them, so
@@ -718,6 +798,11 @@ pub fn supervise(
     status: &StatusReport,
 ) -> Result<i32, SandboxError> {
     ensure_single_thread()?;
+    let child_action = default_child_action()?;
+    // Before the fork: a signal for the program that comes while it starts then waits for
+    // `follow` instead of ending sandy.
+    let (mut waited, previous) =
+        block_signals().map_err(|error| SandboxError::io("cannot block signals", error))?;
     let (mut report, report_write) = pipe("the program's report pipe")?;
     // SAFETY: sandy is single-threaded (checked above), so the child may run any code. It leaves
     // only through execve or `_exit`, never by returning into sandy's code.
@@ -730,7 +815,7 @@ pub fn supervise(
         }
         0 => {
             drop(report);
-            program_main(report_write, start)
+            program_main(report_write, &child_action, &previous, start)
         }
         pid => pid,
     };
@@ -738,6 +823,12 @@ pub fn supervise(
     // Before the report is read: the execve that ends the report pipe is a watched call and
     // waits for the watcher.
     explain.start()?;
+    // The terminal sends Ctrl+C and Ctrl+\ to its whole foreground group, the program included.
+    // sandy waits for the program to end, as system(3) does, instead of ending first and taking
+    // the watcher from a program that is still cleaning up.
+    ignore(libc::SIGINT)?;
+    ignore(libc::SIGQUIT)?;
+    keep_actions(&mut waited)?;
     let mut message = Vec::new();
     report
         .read_to_end(&mut message)
@@ -747,7 +838,7 @@ pub fn supervise(
         return Err(SandboxError::new(String::from_utf8_lossy(&message)));
     }
     status.started(program as u32);
-    let code = wait_for(program)?;
+    let code = follow(program, &waited)?;
     explain.finish();
     match code {
         Ended::Exited(code) => {
@@ -761,13 +852,65 @@ pub fn supervise(
     }
 }
 
-/// The forked program: confines itself and executes the target. Reports a failure over `report`.
-fn program_main(mut report: File, start: impl FnOnce() -> SandboxError) -> ! {
-    let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(start));
+/// The forked program: restores the signal state the caller gave sandy, confines itself and
+/// executes the target. Reports a failure over `report`.
+fn program_main(
+    mut report: File,
+    child_action: &libc::sigaction,
+    mask: &libc::sigset_t,
+    start: impl FnOnce() -> SandboxError,
+) -> ! {
+    let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: restores the action that `default_child_action` returned.
+        if unsafe { libc::sigaction(libc::SIGCHLD, child_action, std::ptr::null_mut()) } != 0 {
+            return SandboxError::io("cannot restore SIGCHLD", io::Error::last_os_error());
+        }
+        // SAFETY: sets the mask from a valid sigset_t; execve keeps it.
+        if unsafe { libc::sigprocmask(libc::SIG_SETMASK, mask, std::ptr::null_mut()) } != 0 {
+            return SandboxError::io("cannot restore the signal mask", io::Error::last_os_error());
+        }
+        start()
+    }));
     let error = started.unwrap_or_else(|_| SandboxError::new("starting the program panicked"));
     let _ = report.write_all(error.to_string().as_bytes());
     // SAFETY: ends the child without running sandy's cleanup.
     unsafe { libc::_exit(START_FAILED) }
+}
+
+/// The signals sandy leaves to their own action instead of passing them on. The program
+/// receives the keyboard's from the terminal itself, and sandy ignores them; the job control
+/// signals stop and continue sandy together with the program, as without the mode, so that a
+/// shell sees the job stop; and SIGPIPE comes from sandy's own writes, which it ignores.
+const NOT_PASSED_ON: [libc::c_int; 7] = [
+    libc::SIGINT,
+    libc::SIGQUIT,
+    libc::SIGPIPE,
+    libc::SIGTSTP,
+    libc::SIGTTIN,
+    libc::SIGTTOU,
+    libc::SIGCONT,
+];
+
+/// Unblocks `NOT_PASSED_ON` and takes them out of `waited`, once sandy's own actions for them
+/// are in place.
+fn keep_actions(waited: &mut libc::sigset_t) -> Result<(), SandboxError> {
+    // SAFETY: sigset_t is plain data; the calls initialize and change the two sets, and
+    // sigprocmask reads one of them.
+    unsafe {
+        let mut kept: libc::sigset_t = mem::zeroed();
+        libc::sigemptyset(&mut kept);
+        for signal in NOT_PASSED_ON {
+            libc::sigaddset(&mut kept, signal);
+            libc::sigdelset(waited, signal);
+        }
+        if libc::sigprocmask(libc::SIG_UNBLOCK, &kept, std::ptr::null_mut()) != 0 {
+            return Err(SandboxError::io(
+                "cannot unblock signals",
+                io::Error::last_os_error(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 enum Ended {
@@ -775,25 +918,53 @@ enum Ended {
     Signaled(i32),
 }
 
-/// Waits until the program has ended. A stop of the program stops sandy too: both are in the
-/// group the caller started, so the terminal signals reach both.
-fn wait_for(program: libc::pid_t) -> Result<Ended, SandboxError> {
+/// Passes on to the program every signal sent to sandy until the program has ended, as the
+/// supervising sandy of `contain` does, so that a caller that signals sandy's process ID
+/// reaches the program. Both are in the group the caller started, so a signal the kernel
+/// generated for the terminal or for that group (`SI_KERNEL`, a hangup for one) has reached
+/// the program already and is not passed on a second time.
+fn follow(program: libc::pid_t, waited: &libc::sigset_t) -> Result<Ended, SandboxError> {
     loop {
-        let mut status = 0;
-        // SAFETY: waits for the forked program and writes its status into `status`.
-        if unsafe { libc::waitpid(program, &mut status, 0) } < 0 {
+        if let Some(ended) = ended(program)? {
+            return Ok(ended);
+        }
+        // SAFETY: siginfo_t is plain data, which sigwaitinfo fills in.
+        let mut info: libc::siginfo_t = unsafe { mem::zeroed() };
+        // SAFETY: waits for a signal of a valid set and writes its details into `info`.
+        let signal = unsafe { libc::sigwaitinfo(waited, &mut info) };
+        if signal < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            return Err(SandboxError::io("cannot wait for the program", error));
+            return Err(SandboxError::io("cannot wait for signals", error));
         }
-        if libc::WIFEXITED(status) {
-            return Ok(Ended::Exited(libc::WEXITSTATUS(status)));
+        if signal == libc::SIGCHLD || info.si_code == libc::SI_KERNEL {
+            continue;
         }
-        if libc::WIFSIGNALED(status) {
-            return Ok(Ended::Signaled(libc::WTERMSIG(status)));
+        // SAFETY: kill takes a process ID; sandy has not reaped the program, so the ID is still
+        // the program's.
+        unsafe { libc::kill(program, signal) };
+    }
+}
+
+/// How the program ended, without blocking. `None` while it runs.
+fn ended(program: libc::pid_t) -> Result<Option<Ended>, SandboxError> {
+    let mut status = 0;
+    // SAFETY: waits for the forked program without blocking and writes its status.
+    match unsafe { libc::waitpid(program, &mut status, libc::WNOHANG) } {
+        0 => Ok(None),
+        reaped if reaped > 0 && libc::WIFEXITED(status) => {
+            Ok(Some(Ended::Exited(libc::WEXITSTATUS(status))))
         }
+        reaped if reaped > 0 && libc::WIFSIGNALED(status) => {
+            Ok(Some(Ended::Signaled(libc::WTERMSIG(status))))
+        }
+        reaped if reaped > 0 => Ok(None),
+        _ => Err(SandboxError::io(
+            "cannot wait for the program",
+            io::Error::last_os_error(),
+        )),
     }
 }
 
@@ -983,14 +1154,13 @@ fn answer_continue(listener: &OwnedFd, id: u64) {
     notify(listener, NOTIF_SEND, &mut response);
 }
 
-/// Keeps a report that nobody reads from ending sandy. The program is already forked when this
-/// runs, so it keeps the default action that `launch` restored for it; only sandy stops dying
-/// of a standard error whose reader is gone.
-fn ignore_broken_report() -> Result<(), SandboxError> {
-    // SAFETY: setting the disposition of SIGPIPE has no memory safety requirements.
-    if unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) } == libc::SIG_ERR {
+/// Makes sandy ignore `signal`. The program is already forked when this runs, so it keeps the
+/// action it had.
+fn ignore(signal: libc::c_int) -> Result<(), SandboxError> {
+    // SAFETY: setting the disposition of a signal has no memory safety requirements.
+    if unsafe { libc::signal(signal, libc::SIG_IGN) } == libc::SIG_ERR {
         return Err(SandboxError::io(
-            "cannot ignore SIGPIPE for the diagnostic report",
+            format!("cannot ignore signal {signal}"),
             io::Error::last_os_error(),
         ));
     }
@@ -1179,27 +1349,29 @@ mod tests {
     #[test]
     fn open_flags_say_what_the_call_needs() {
         let missing = Path::new("/sandy-explain-no-such-path");
-        let read_only = libc::O_RDONLY as u32;
-        assert_eq!(open_need(read_only, missing), Need::Read);
-        assert_eq!(open_need(libc::O_WRONLY as u32, missing), Need::Write);
-        assert_eq!(open_need(libc::O_RDWR as u32, missing), Need::Write);
+        let need = |flags: libc::c_int, path| open_need(flags as u32, path);
+        assert_eq!(need(libc::O_RDONLY, missing), Some(Need::Read));
+        assert_eq!(need(libc::O_WRONLY, missing), Some(Need::Write));
+        assert_eq!(need(libc::O_RDWR, missing), Some(Need::Write));
+        assert_eq!(need(libc::O_DIRECTORY, missing), Some(Need::List));
+        assert_eq!(need(libc::O_CREAT, missing), Some(Need::Create));
+        // Creating comes first: Landlock checks it on the directory before the file can be
+        // opened for writing.
         assert_eq!(
-            open_need(read_only | libc::O_DIRECTORY as u32, missing),
-            Need::List
-        );
-        assert_eq!(
-            open_need(read_only | libc::O_CREAT as u32, missing),
-            Need::Create
+            need(libc::O_WRONLY | libc::O_CREAT, missing),
+            Some(Need::Create)
         );
         // An existing file is not created, whatever O_CREAT says.
+        let existing = Path::new("/");
+        assert_eq!(need(libc::O_CREAT, existing), Some(Need::Read));
         assert_eq!(
-            open_need(read_only | libc::O_CREAT as u32, Path::new("/")),
-            Need::Read
+            need(libc::O_WRONLY | libc::O_CREAT, existing),
+            Some(Need::Write)
         );
-        assert_eq!(
-            open_need(read_only | libc::O_TRUNC as u32, missing),
-            Need::Truncate
-        );
+        assert_eq!(need(libc::O_TRUNC, missing), Some(Need::Truncate));
+        // Landlock does not check an O_PATH open, so it needs no right at all.
+        assert_eq!(need(libc::O_PATH, missing), None);
+        assert_eq!(need(libc::O_PATH | libc::O_DIRECTORY, existing), None);
     }
 
     #[test]
@@ -1209,23 +1381,26 @@ mod tests {
         let path = Path::new("/");
         assert_eq!(
             need_of(watched(libc::SYS_unlinkat), &args, path),
-            Need::Remove
+            Some(Need::Remove)
         );
         args[2] = libc::AT_REMOVEDIR as u64;
         assert_eq!(
             need_of(watched(libc::SYS_unlinkat), &args, path),
-            Need::RemoveDirectory
+            Some(Need::RemoveDirectory)
         );
         args[2] = u64::from(libc::S_IFIFO);
-        assert_eq!(need_of(watched(libc::SYS_mknodat), &args, path), Need::Fifo);
+        assert_eq!(
+            need_of(watched(libc::SYS_mknodat), &args, path),
+            Some(Need::Fifo)
+        );
         args[2] = u64::from(libc::S_IFCHR);
         assert_eq!(
             need_of(watched(libc::SYS_mknodat), &args, path),
-            Need::Device
+            Some(Need::Device)
         );
         assert_eq!(
             need_of(watched(libc::SYS_execveat), &args, path),
-            Need::Execute
+            Some(Need::Execute)
         );
     }
 
@@ -1262,9 +1437,59 @@ mod tests {
         let own = unsafe { libc::getpid() } as u32;
         let path = absolute(own, watched, &args, Path::new("")).expect("the descriptor's file");
         assert_eq!(path, PathBuf::from(format!("/proc/{own}/stat")));
-        // Without a descriptor an empty path names nothing.
-        args[0] = libc::AT_FDCWD as u64;
-        assert_eq!(absolute(own, watched, &args, Path::new("")), None);
+        // Only with AT_EMPTY_PATH; the kernel answers ENOENT for an empty path otherwise, and
+        // for every other watched call.
+        assert!(!executes_descriptor(watched, &args));
+        args[4] = libc::AT_EMPTY_PATH as u64;
+        assert!(executes_descriptor(watched, &args));
+        let openat = watched_call(libc::SYS_openat).expect("openat is watched");
+        assert!(!executes_descriptor(openat, &args));
+    }
+
+    /// The kernel answers some calls before it asks Landlock, and no grant changes that answer:
+    /// a file to use or a name to remove that does not exist, and a name to add that does.
+    #[test]
+    fn a_call_the_kernel_answers_first_is_no_gap() {
+        let missing = Path::new("/sandy-explain-no-such-path");
+        let existing = Path::new("/");
+        for need in [Need::Read, Need::Write, Need::Execute, Need::Remove] {
+            assert!(!reaches_landlock(need, missing), "{need:?}");
+            assert!(reaches_landlock(need, existing), "{need:?}");
+        }
+        for need in [Need::Create, Need::CreateDirectory, Need::Symlink] {
+            assert!(reaches_landlock(need, missing), "{need:?}");
+            assert!(!reaches_landlock(need, existing), "{need:?}");
+        }
+    }
+
+    /// Landlock checks a right that adds or removes a name on the directory that holds it, so a
+    /// rule on the path itself does not grant it, and the report names that directory.
+    #[test]
+    fn a_name_is_added_and_removed_in_its_directory() {
+        let rules = rules(vec![rule("/a/b", READ | AccessFs::RemoveDir)]);
+        let line = gap(&rules, "/a/b", Need::RemoveDirectory).expect("/a grants nothing");
+        assert_eq!(
+            line,
+            "cannot remove the directory /a/b: no rule covers /a; grant it with read_write \
+             (openat in process 7)"
+        );
+        assert_eq!(gap(&rules, "/a/b/c", Need::RemoveDirectory), None);
+    }
+
+    /// A call that adds or removes a name does not follow a symbolic link at the end of its
+    /// path. Resolving it would name the link's target, and advise a grant for that.
+    #[test]
+    fn the_last_name_is_not_resolved() {
+        let root = std::env::temp_dir().join(format!("sandy-explain-name-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let link = root.join("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink("/etc/hostname", &link).unwrap();
+        let named = canonical_name(&link);
+        let resolved = canonical_location(&link);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(named, canonical_location(&root).join("link"));
+        assert_eq!(resolved, canonical_location(Path::new("/etc/hostname")));
     }
 
     /// `/proc/self` means the calling process, not sandy.

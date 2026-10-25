@@ -141,7 +141,8 @@ fn end_with_parent_needs_isolated_signals() {
 #[test]
 fn a_program_that_ignores_the_request_is_killed() {
     let fixture = Fixture::new("parent-ignore");
-    if unsupported().is_some() {
+    if let Some(reason) = unsupported() {
+        skip("landlock-abi-6", reason);
         return;
     }
     let program = [("ignore-signal", "15"), ("sleep", LONG_SLEEP)];
@@ -165,7 +166,8 @@ fn a_program_that_ignores_the_request_is_killed() {
 #[test]
 fn contained_processes_end_with_sandys_parent() {
     let fixture = Fixture::new("parent-contained");
-    if unsupported().is_some() {
+    if let Some(reason) = unsupported() {
+        skip("landlock-abi-6", reason);
         return;
     }
     let mut args = ending_with_parent(&fixture);
@@ -233,7 +235,8 @@ fn a_named_parent_must_be_sandys_parent() {
     args.extend(["--parent-pid".to_string(), other.clone()]);
     let output = sandy(run_args(&args, &[("env", "PATH")]));
     assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
-    if unsupported().is_some() {
+    if let Some(reason) = unsupported() {
+        skip("landlock-abi-6", reason);
         return;
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -256,7 +259,8 @@ fn a_named_parent_must_be_sandys_parent() {
 #[test]
 fn a_parent_that_ended_before_sandy_ran_is_refused() {
     let fixture = Fixture::new("parent-early");
-    if unsupported().is_some() {
+    if let Some(reason) = unsupported() {
+        skip("landlock-abi-6", reason);
         return;
     }
     let mut args = ending_with_parent(&fixture);
@@ -365,7 +369,8 @@ fn a_named_parent_can_be_reached_through_a_wrapper() {
     args.extend(["--parent-pid".to_string(), std::process::id().to_string()]);
     let output = through_wrapper(&args, &[("env", "PATH")]);
     assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
-    if unsupported().is_some() {
+    if let Some(reason) = unsupported() {
+        skip("landlock-abi-6", reason);
         return;
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -417,7 +422,8 @@ fn shell_word(value: &str) -> String {
 #[test]
 fn the_program_ends_with_a_named_parent_behind_a_wrapper() {
     let fixture = Fixture::new("parent-wrapper-end");
-    if unsupported().is_some() {
+    if let Some(reason) = unsupported() {
+        skip("landlock-abi-6", reason);
         return;
     }
     let mut args = ending_with_parent(&fixture);
@@ -482,7 +488,8 @@ fn a_stopped_program_cannot_end_the_watcher_through_its_process_group() {
     use std::os::unix::process::CommandExt;
 
     let fixture = Fixture::new("parent-orphaned");
-    if unsupported().is_some() {
+    if let Some(reason) = unsupported() {
+        skip("landlock-abi-6", reason);
         return;
     }
     let program = [
@@ -516,7 +523,8 @@ fn a_signal_to_the_callers_process_group_does_not_end_the_watcher() {
     use std::os::unix::process::CommandExt;
 
     let fixture = Fixture::new("parent-group-signal");
-    if unsupported().is_some() {
+    if let Some(reason) = unsupported() {
+        skip("landlock-abi-6", reason);
         return;
     }
     let program = [("ignore-signal", "2"), ("sleep", LONG_SLEEP)];

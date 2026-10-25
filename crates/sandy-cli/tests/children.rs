@@ -170,6 +170,55 @@ fn a_signal_death_is_in_the_status_record() {
     assert_eq!(record, format!("pid {program}\nsignaled 15\n"), "{record}");
 }
 
+/// Writing the record is best effort: a caller that closed its end of the channel gets no record,
+/// and the program runs as it would without the option. Such a write raises SIGPIPE, which must
+/// neither end sandy before it starts the program nor reach the program through the supervising
+/// sandy of `contained`, which passes signals on.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_status_channel_nobody_reads_changes_nothing() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+
+    let fixture = Fixture::new("status-unread");
+    let mut runs = vec![fixture.access_args()];
+    match unsupported() {
+        None => runs.push(contained(&fixture)),
+        Some(reason) => skip("landlock-abi-6", reason),
+    }
+    for sandbox_args in runs {
+        let mut ends = [0; 2];
+        // SAFETY: pipe2 writes two new close-on-exec descriptors into `ends`.
+        let made = unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) };
+        assert_eq!(made, 0, "cannot create the status pipe");
+        // SAFETY: both descriptors are new and nothing else owns them.
+        let writer = unsafe {
+            drop(OwnedFd::from_raw_fd(ends[0]));
+            OwnedFd::from_raw_fd(ends[1])
+        };
+        let raw = writer.as_raw_fd();
+        let mut args = run_args(&sandbox_args, &[("sleep", "200"), ("exit", "7")]);
+        args.splice(1..1, ["--status-fd".to_string(), "3".to_string()]);
+        let mut command = std::process::Command::new(sandy_path());
+        command.args(args);
+        // SAFETY: dup2 is async-signal-safe and the closure calls nothing else.
+        unsafe {
+            command.pre_exec(move || match libc::dup2(raw, 3) {
+                3 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            });
+        }
+        let output = command.output().unwrap();
+        drop(writer);
+        assert_eq!(
+            output.status.code(),
+            Some(7),
+            "{sandbox_args:?}: {output:?}"
+        );
+        parse(&output)[0].assert_ok();
+    }
+}
+
 #[test]
 fn children_contained_needs_isolated_signals() {
     let fixture = Fixture::new("contained-signals");
@@ -225,10 +274,14 @@ mod unix {
         group_ended(group)
     }
 
-    /// Starts sandy with `actions`, the first of which is `fork-walk`, and returns sandy and the
-    /// program's process group, which the probe reports.
-    fn start_walkers(fixture: &Fixture, after: (&str, &str)) -> (Child, libc::pid_t) {
-        let actions = [("fork-walk", WALKERS), after];
+    /// Starts sandy with `walkers` processes of `fork-walk` and then `after`, and returns sandy
+    /// and the program's process group, which the probe reports.
+    fn start_walkers(
+        fixture: &Fixture,
+        walkers: &str,
+        after: (&str, &str),
+    ) -> (Child, libc::pid_t) {
+        let actions = [("fork-walk", walkers), after];
         let mut sandy = Command::new(sandy_path())
             .args(run_args(&contained(fixture), &actions))
             .stdout(Stdio::piped())
@@ -248,7 +301,8 @@ mod unix {
     #[test]
     fn processes_that_keep_forking_end_when_sandy_is_killed() {
         let fixture = Fixture::new("contained-walk-kill");
-        if unsupported().is_some() {
+        if let Some(reason) = unsupported() {
+            skip("landlock-abi-6", reason);
             return;
         }
         // Control: outside the sandbox the processes outlive the probe that started them.
@@ -265,7 +319,7 @@ mod unix {
         kill_group(group);
         assert!(survived, "control: the processes ended with the probe");
 
-        let (mut sandy, group) = start_walkers(&fixture, ("sleep", LONG_SLEEP));
+        let (mut sandy, group) = start_walkers(&fixture, WALKERS, ("sleep", LONG_SLEEP));
         std::thread::sleep(Duration::from_millis(500));
         // The program still sleeps, so only the guard can end the group.
         sandy.kill().unwrap();
@@ -283,12 +337,18 @@ mod unix {
     #[test]
     fn processes_that_keep_forking_end_while_sandy_is_stopped() {
         let fixture = Fixture::new("contained-walk-stop");
-        if unsupported().is_some() {
+        if let Some(reason) = unsupported() {
+            skip("landlock-abi-6", reason);
             return;
         }
-        let (mut sandy, group) = start_walkers(&fixture, ("sleep", "500"));
+        // Every step of a walk leaves an exited process for sandy to reap, and a stopped sandy
+        // reaps none: with four walkers for half a second that was 76000 processes on a 24-core
+        // host, which exhausted the user's task limit of a small VM and made the tests running
+        // next to this one fail to fork. One walker for a tenth of a second keeps the group
+        // forking while sandy is stopped and the pile a few thousand at most.
+        let (mut sandy, group) = start_walkers(&fixture, "1", ("sleep", "100"));
         signal(&sandy, libc::SIGSTOP);
-        // The program exits after half a second; the guard ends the group then.
+        // The program exits after a tenth of a second; the guard ends the group then.
         let ended = group_ends(group, END_TIMEOUT);
         let left = live_members(group);
         signal(&sandy, libc::SIGCONT);
@@ -305,7 +365,8 @@ mod unix {
     #[test]
     fn the_relay_ends_with_the_program_while_sandy_is_stopped() {
         let fixture = Fixture::new("contained-relay-stop");
-        if unsupported().is_some() {
+        if let Some(reason) = unsupported() {
+            skip("landlock-abi-6", reason);
             return;
         }
         let port = |_| {
@@ -349,11 +410,14 @@ mod unix {
         }
         let still = reachable();
         signal(&sandy, libc::SIGCONT);
-        let _ = sandy.wait();
+        let status = sandy.wait().unwrap();
         assert!(
             !still,
             "the relay outlived the program while sandy was stopped"
         );
+        // A relay that ended with the program is the normal end of a run, also when sandy sees
+        // it gone before it sees the program's end.
+        assert!(status.success(), "{status:?}");
     }
 
     /// sandy forwards signals to the program, also those that sandy's caller ignores and those
@@ -362,7 +426,8 @@ mod unix {
     #[test]
     fn ignored_signals_reach_the_program() {
         let fixture = Fixture::new("contained-ignored-signals");
-        if unsupported().is_some() {
+        if let Some(reason) = unsupported() {
+            skip("landlock-abi-6", reason);
             return;
         }
         for (signal_number, caller_ignores) in [

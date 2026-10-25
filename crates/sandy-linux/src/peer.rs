@@ -121,7 +121,7 @@ impl PeerCheck {
         };
         // A lookup that matches no connection falls back to a listening socket, which comparing
         // the answer with what was asked catches.
-        if !message.id.same_as(&request.id) {
+        if message.connection() != Some((canonical(peer), canonical(local))) {
             return Owner::AnotherUser;
         }
         // Only a peer that closed its socket is unnamed, and such a peer can no longer read.
@@ -222,24 +222,6 @@ struct SockId {
     cookie: [u32; 2],
 }
 
-impl SockId {
-    /// Whether the kernel answered about the connection that was asked about. The cookie is not
-    /// compared: the request carries `INET_DIAG_NOCOOKIE`, the answer the socket's own cookie.
-    fn same_as(&self, asked: &SockId) -> bool {
-        (
-            self.source_port,
-            self.destination_port,
-            self.source,
-            self.destination,
-        ) == (
-            asked.source_port,
-            asked.destination_port,
-            asked.source,
-            asked.destination,
-        )
-    }
-}
-
 /// A netlink header followed by `struct inet_diag_req_v2`.
 #[repr(C)]
 struct Request {
@@ -271,6 +253,33 @@ struct Message {
 const _: () = assert!(size_of::<SockId>() == 48);
 const _: () = assert!(size_of::<Request>() == 72);
 const _: () = assert!(size_of::<Message>() == 72);
+
+impl Message {
+    /// The connection the kernel answered about: the socket's own address and its peer's, in the
+    /// family of the socket, which need not be the family that was asked in. A dual-stack IPv6
+    /// socket that connected to an IPv4 listener (Java's default, for one) has IPv4-mapped
+    /// addresses, and the IPv4 lookup finds it under the plain IPv4 ones. The cookie is not part
+    /// of it: the request carries `INET_DIAG_NOCOOKIE`, the answer the socket's own cookie.
+    fn connection(&self) -> Option<(SocketAddr, SocketAddr)> {
+        let ip = |bytes: [u8; 16]| match i32::from(self.family) {
+            libc::AF_INET => Some(IpAddr::from([bytes[0], bytes[1], bytes[2], bytes[3]])),
+            libc::AF_INET6 => Some(IpAddr::from(bytes)),
+            _ => None,
+        };
+        let address = |bytes, port: u16| {
+            ip(bytes).map(|ip| canonical(SocketAddr::new(ip, u16::from_be(port))))
+        };
+        Some((
+            address(self.id.source, self.id.source_port)?,
+            address(self.id.destination, self.id.destination_port)?,
+        ))
+    }
+}
+
+/// `address` with an IPv4-mapped IPv6 address written as the IPv4 address it maps.
+fn canonical(address: SocketAddr) -> SocketAddr {
+    SocketAddr::new(address.ip().to_canonical(), address.port())
+}
 
 impl Request {
     /// The lookup for the socket whose own address is `source` and whose peer is `destination`,
@@ -321,7 +330,7 @@ impl Request {
 mod tests {
     use super::*;
 
-    use std::net::Shutdown;
+    use std::net::{Ipv4Addr, Shutdown};
     use std::time::{Duration, Instant};
 
     /// The same lookup with another user's ID, which is what a forward listener answers for a
@@ -355,6 +364,25 @@ mod tests {
             assert!(!other.may_relay(peer, local));
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// A dual-stack IPv6 socket reaches an IPv4 listener through an IPv4-mapped address, and the
+    /// kernel answers about it in its own family. It is the same connection and the same owner.
+    #[test]
+    fn a_dual_stack_peer_reports_its_owner() {
+        let check = PeerCheck::open().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mapped = SocketAddr::from((Ipv4Addr::LOCALHOST.to_ipv6_mapped(), port));
+        let client = TcpStream::connect(mapped).unwrap();
+        assert!(
+            client.local_addr().unwrap().is_ipv6(),
+            "not a dual-stack socket"
+        );
+        let (accepted, peer) = listener.accept().unwrap();
+        let local = accepted.local_addr().unwrap();
+        assert_eq!(check.owner(peer, local), Owner::Us);
+        assert!(!as_another_user(&check).may_relay(peer, local));
     }
 
     /// A peer that closed its socket has no file for the kernel to read an owner from, so no

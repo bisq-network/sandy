@@ -347,6 +347,9 @@ fn a_stopped_relay_ends_with_the_program() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_dead_relay_ends_a_contained_program() {
+    if common::linux::landlock_abi() < 6 {
+        return skip("landlock-abi-6", "signal isolation needs Landlock ABI 6");
+    }
     let (service_port, stop_service) = holding_service();
     let inner = free_port();
     let sandbox_args = [
@@ -370,10 +373,16 @@ fn a_dead_relay_ends_a_contained_program() {
         .unwrap();
     let relay = relay_of(inner, &mut program);
     let address = format!("127.0.0.1:{inner}").parse().unwrap();
-    // Control: the port serves while the program and its relay run.
+    // Control: the port serves while the program and its relay run, and sandy keeps the program
+    // through several of its looks at a relay that lives, so the end below is the kill's doing.
     assert!(
         TcpStream::connect_timeout(&address, HALF_SECOND).is_ok(),
         "the forward port did not serve before the relay was killed"
+    );
+    thread::sleep(Duration::from_secs(1));
+    assert!(
+        program.try_wait().unwrap().is_none(),
+        "sandy ended the program while its relay was alive"
     );
 
     kill_process(relay);

@@ -389,19 +389,25 @@ a moment later.
   directly.
 - Linux and macOS with `process.children = "contained"`: sandy forks the program and stays its
   parent. sandy forwards every signal it receives to the program, except `SIGCHLD`, `SIGCONT`,
-  `SIGTTIN`, `SIGTTOU` and the fault signals, which it cannot wait for, and `SIGKILL` and
-  `SIGSTOP`, which cannot be caught at all. It exits with the program's exit status, or 128
-  plus the signal number when a signal ended the program. With a terminal, sandy follows job
+  `SIGTTIN`, `SIGTTOU` and the fault signals, which it cannot wait for, on Linux `SIGPIPE`,
+  which its own writes raise and which it ignores, and `SIGKILL` and `SIGSTOP`, which cannot be
+  caught at all. It exits with the program's exit status, or 128 plus the signal number when a
+  signal ended the program. With a terminal, sandy follows job
   control: the program's process group gets the terminal when the program uses it, and the rest
   of sandy's job gets it back when it uses it; any other stop of the program stops sandy, and
   `SIGCONT` to sandy continues the group.
 - Linux with `--explain`: sandy forks the program and stays its parent, as with `contained`,
   because the watcher of the diagnostic mode must be allowed to read the memory of the program.
-  It waits for the program and exits with its status, or 128 plus the signal number. It does not
-  block or pass on signals: both processes are in the group the caller started, so a terminal
-  signal reaches the program directly and job control works, but a signal sent to sandy alone
-  ends sandy and leaves the program without its watcher (see below). `process.end_with_parent`
-  relies on such a signal, so sandy refuses that combination unless `contained` supervises.
+  It waits for the program and exits with its status, or 128 plus the signal number. Both
+  processes are in the group the caller started, so a terminal signal reaches the program
+  directly and job control works. sandy passes on to the program the signals sent to it, as
+  with `contained`, except `SIGINT` and `SIGQUIT`, which it ignores as `system(3)` does, the job
+  control signals, which stop and continue it with the program, and a signal the kernel sent
+  for the terminal or the group (`SI_KERNEL`), which the program received itself. A signal sent
+  with `kill` to the whole group reaches the program twice, because sandy cannot tell it from
+  one sent to sandy alone. `SIGKILL` ends sandy alone and leaves the program without its
+  watcher, still confined (see below). `process.end_with_parent` ends a program that outlasts
+  `SIGTERM` with `SIGKILL`, so sandy refuses that combination unless `contained` supervises.
 - Windows: there is no `execve`. sandy creates the program inside the AppContainer and a job
   object with kill-on-close, waits, and exits with the program's exit code. If sandy dies, the job
   closes and the program dies with it.
@@ -442,11 +448,13 @@ answer, and the calls that take two paths are not watched. An integrator who rea
 "nothing was denied" would be wrong, so a backend that cannot report at all refuses the option
 instead of printing nothing.
 
-What the mode costs: two context switches per watched call, sandy as the program's parent, and
-a program that outlives sandy whose watched calls then fail with `ENOSYS`. That is why it is
-opt in and documented as a tool for working out a policy. It also runs an unconfined watcher in
-sandy's own process for as long as the program runs, which parses bytes the program controls;
-it reads at most one path of bounded length per call and never acts on what it reads.
+What the mode costs: two context switches per watched call, sandy as the program's parent, a
+program that outlives sandy whose watched calls then fail with `ENOSYS`, and `EINTR` from a
+watched call that a signal interrupts while it waits, in a program whose handler does not
+restart calls. That is why it is opt in and documented as a tool for working out a policy. It
+also runs an unconfined watcher in sandy's own process for as long as the program runs, which
+parses bytes the program controls; it reads at most one path of bounded length per call and
+never acts on what it reads.
 
 ## Mechanisms (each backend section is owned by its backend)
 

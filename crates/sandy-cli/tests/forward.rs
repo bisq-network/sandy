@@ -67,13 +67,17 @@ fn forwarded_port_reaches_the_outside_service() {
 fn forward_without_ip_is_refused() {
     let fixture = Fixture::new("forward-noip");
     let mut args = fixture.access_args();
+    // Two different ports: the same port twice is refused for another reason.
+    let port = free_port();
     args.extend([
         "--forward".to_string(),
-        format!("{}=127.0.0.1:{}", free_port(), free_port()),
+        format!("{port}=127.0.0.1:{}", port ^ 1),
     ]);
     let output = sandy(run_args(&args, &[("env", "PATH")]));
     assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
     assert!(output.stdout.is_empty(), "{output:?}");
+    let reason = String::from_utf8_lossy(&output.stderr);
+    assert!(reason.contains("ip = \"all\""), "{reason}");
 }
 
 /// A program that writes more than the target reads in time, and exits. When the one second of
@@ -199,6 +203,44 @@ fn a_forward_port_refuses_other_users() {
     drop(second);
     kill_process(program.id());
     let _ = program.wait();
+}
+
+/// A program with a dual-stack IPv6 socket, which Java uses by default, reaches an IPv4 forward
+/// port through the IPv4-mapped address. The kernel then names the owner of the other end in
+/// IPv6 form, and the relay must still recognize the connection as the one it asked about. The
+/// plain IPv4 connection first is the control.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_forward_port_serves_a_dual_stack_socket() {
+    use std::io::Write;
+
+    let fixture = Fixture::new("forward-dual-stack");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let service = listener.local_addr().unwrap().to_string();
+    thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let _ = stream.write_all(b"hi");
+        }
+    });
+    let inner = free_port();
+    let mut args = fixture.access_args();
+    args.extend([
+        "--ip".to_string(),
+        "all".to_string(),
+        "--forward".to_string(),
+        format!("{inner}={service}"),
+    ]);
+    // The program holds the connection until the service's answer has come, so the kernel
+    // names its owner: a peer that closed first is served whatever the check says.
+    let lines = probe_inside(
+        &args,
+        &[
+            ("tcp-connect-read", &format!("127.0.0.1:{inner}")),
+            ("tcp-connect-read", &format!("[::ffff:127.0.0.1]:{inner}")),
+        ],
+    );
+    assert_eq!(lines[0].detail, "2 bytes", "{lines:?}");
+    assert_eq!(lines[1].detail, "2 bytes", "{lines:?}");
 }
 
 /// How to run `probe` as a local user that is not sandy's: with `sudo -n -u nobody`, or else in a
