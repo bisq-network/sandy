@@ -11,6 +11,9 @@ The Linux backend restricts sandy's own process and then replaces it with the pr
   families, io_uring, namespaces, System V IPC, metadata changes by path, and more.
 - **no_new_privs** stops setuid programs and file capabilities from adding privileges.
 
+With `ip = "private"` the program also runs in a user and network namespace of its own (see
+"Private network").
+
 The research behind the design is in [research/linux-mechanisms.md](research/linux-mechanisms.md).
 
 ## Launch sequence
@@ -25,6 +28,9 @@ The research behind the design is in [research/linux-mechanisms.md](research/lin
 3. Build the Landlock ruleset with all its rules (see "Rule paths" below), compile the seccomp
    filters, and build the `execve` arguments and environment as C strings. Change to the working
    directory if the policy sets one.
+
+With `ip = "private"` the process then enters its namespaces, after the relay and the watcher
+have started and before step 4 (see "Private network").
 
 Then sandy resets SIGPIPE to its default action, because the Rust runtime ignores it and an
 ignored signal stays ignored across `execve`. Not earlier: until then sandy writes for itself,
@@ -77,6 +83,7 @@ can write, so the rule then reaches nothing that this process could not reach al
 | InheritedHandlesClosed | Close-on-exec on every descriptor above 2. |
 | EnvironmentControlled | `execve` with exactly the policy environment. The backend adds no variables. |
 | IpNetworkDenied | The socket family allowlist has no `AF_INET`, `AF_INET6` or `AF_NETLINK`; io_uring is denied. From ABI 4, Landlock also denies TCP bind and connect. |
+| IpNetworkPrivate | A user and a network namespace with only `lo`, which the relays alone cross; the filters of `ip = "all"` and the denial of namespaces (see "Private network"). |
 | InboundIpDenied | The denylist denies `listen`, `accept` and `accept4` for every socket. A second Landlock ruleset lets sockets bind only port 0: TCP from ABI 4, UDP from ABI 10 (see "Client networking"). |
 | UnixSocketsDenied | The allowlist has no `AF_UNIX`, and socket pairs are limited to stream and seqpacket. From ABI 6, Landlock scopes abstract sockets; from ABI 9 it denies connections to pathname sockets. |
 | SignalsIsolated | Landlock signal scope (ABI 6) and the denylist, which denies `setpgid` into a process group that exists and the terminal ioctls `TIOCSPGRP`, `TIOCSWINSZ` and `TIOCSIG` (see "Signals and the terminal"). Unavailable on older ABIs. |
@@ -124,7 +131,9 @@ and `dig` against systemd-resolved all work as with `ip = "all"`.
 Both are pairs of a loopback address that the relay listens on and a loopback address it connects
 to. `network.expose` listens on `listen` outside and connects to the program's port.
 `network.forward` listens on the program's loopback port and connects to `to`, a service outside.
-One relay process serves all pairs. sandy starts it before it confines itself:
+One relay process serves all pairs. sandy starts it before it confines itself (with
+`ip = "private"` the program's side is a network namespace of its own, which changes steps 1 and
+4 and the owner check below; see "Private network"):
 
 1. sandy binds every listen address (for `forward` the program's own loopback port, which is
    therefore taken before the program starts) and opens a pidfd for its own process ID. The
@@ -303,6 +312,151 @@ sandy's own user that acts for someone else still passes, and a descriptor passe
 processes keeps the owner of its creator. macOS has no such check; on Windows only the program's
 AppContainer reaches the forward listener.
 
+
+## Private network
+
+`ip = "private"` gives the program a network of its own: a user namespace and a network
+namespace that holds only `lo`. Inside it the program may use IP freely: the socket family filter
+allows what `ip = "all"` allows, and neither `listen` nor `bind` is restricted. No route leaves
+the namespace. The relays of `expose` and `forward` are the only ways in and out.
+
+### Launch order
+
+The process that becomes the program enters the namespaces: sandy itself in the exec model, so
+the program keeps sandy's process ID, and the forked child with `children = "contained"` and with
+`--explain`, so the supervising sandy stays in the host's namespaces. It does so after the relay
+and the watcher have started, which must stay in the host's namespaces, and before step 4 of the
+launch sequence:
+
+1. One `unshare(CLONE_NEWUSER | CLONE_NEWNET)`, with one thread, which sandy checks. The forked
+   child of `contained` first makes itself dumpable again: it inherits sandy's undumpable flag,
+   and the map files of step 2 belong to root while a process is undumpable. The kernel makes the
+   program dumpable at `execve` in any case; sandy and the guard stay undumpable.
+2. `deny` into `/proc/self/setgroups`, then single-ID maps: the effective user ID to itself in
+   `uid_map` and the effective group ID to itself in `gid_map`. Root is never mapped. A process
+   that is root in its user namespace keeps its capabilities there across `execve`; a mapped
+   user keeps none.
+3. `lo` up (`SIOCSIFFLAGS`), which needs `CAP_NET_ADMIN` in the new user namespace. The process
+   holds every capability there until step 5.
+4. The forward listeners are bound inside and handed to the relay (see "The relays" below).
+5. Every capability is dropped: the bounding set (`PR_CAPBSET_DROP`), the ambient set, and the
+   effective, permitted and inheritable sets. All five read zero in the program's
+   `/proc/self/status`.
+6. With exposed ports, the socket factory starts (see below).
+7. The launch continues with step 4. The filters are built there: the rules of the set*id calls
+   name the user and group IDs that `getresuid` and `getresgid` return, which between the
+   `unshare` and the map writes is the overflow ID 65534.
+
+The denylist still denies the program every namespace and mount call, so it cannot create a
+namespace of its own, where it would hold capabilities, or join another one.
+
+### The relays
+
+A socket belongs to the network namespace it was created in, and the relay must stay in the
+host's namespace, where it listens for exposed ports and connects to forward targets:
+
+- **Forwarded ports.** The relay is forked before the `unshare`, as without the namespace. In
+  step 4 sandy binds each forward listener inside the namespace and sends it to the relay over a
+  socket pair (`SCM_RIGHTS`), before the program can run and take the port. The relay reports
+  ready before the listeners arrive, because with `contained` sandy must know the relay before it
+  forks the guard, and the child that binds the listeners comes after the guard. It then waits for
+  them while it watches the end of the program and of the guard's pipe and, with
+  `signals = "any"`, re-arms its watchdog. Its filter allows `recvmsg` for that. A forward port
+  below 1024 works, because the capability that binds one is still there in step 4.
+- **No owner check.** Only processes inside the namespace, or ones that enter it, reach a
+  forward listener there, and the `NETLINK_SOCK_DIAG` socket of the check would see the host's
+  namespace anyway, so the relay checks no owner. The `forward` exception of DESIGN.md does not
+  apply under `ip = "private"`, and `sandy check` does not print its warning.
+- **Exposed ports.** The outer listener is bound in the host's namespace before the `unshare`, as
+  without the namespace, but the connection to the program's port must start inside. A socket
+  factory makes the sockets for it: a helper process (forked twice, a session of its own,
+  `/dev/null` as its standard descriptors), started in step 6, so it holds no capability. It
+  confines itself with no_new_privs, Landlock without file access and without TCP bind and
+  connect (from ABI 4) and with the signal and abstract socket scopes (from ABI 6), and a seccomp
+  filter that allows reading a request, `sendmsg` for the answer, `socket` for an IPv4 or IPv6
+  TCP socket with protocol 0, and ending. For each accepted connection the relay asks it for one
+  socket over a seqpacket pair and connects that socket itself, so the relay's Landlock rules
+  decide the port, as for its own sockets. The factory creates sockets and nothing else: it
+  cannot connect, bind, listen, open a file or start a process.
+- **Lifetime.** The factory ends when the relay ends: its side of the pair then reads nothing more.
+  The relay polls its own side and ends when the factory has ended, because no exposed connection
+  reaches the program without it. With `contained` the child starts the factory after sandy has
+  forked the guard, so the guard cannot watch it; the relay's end makes the guard end the program
+  as for a dead relay (step 7 of "Exposed and forwarded ports",
+  `a_dead_socket_factory_ends_a_contained_program`). The supervising sandy closes its copies of
+  both socket pairs right after the fork, so that the relay sees the end of the factory, and the
+  end of a child that fails before it binds the forward listeners. With `signals = "any"` the
+  program can stop or kill the factory, as it can the relay.
+
+### Detection
+
+`plan` reads, without trying anything:
+
+1. `user.max_user_namespaces`: 0 disables user namespaces, and the requirement is unavailable.
+2. `kernel.unprivileged_userns_clone`, which only Debian and Ubuntu kernels have: 0 disables them
+   for unprivileged processes, and the requirement is unavailable.
+3. `kernel.apparmor_restrict_unprivileged_userns` (Ubuntu 23.10 and newer) and sandy's own
+   AppArmor label, `/proc/self/attr/apparmor/current`. With the restriction on (1) and the label
+   `unconfined`, the user namespace sandy creates gives it no rights: the write to `setgroups`
+   fails with `EACCES`, the maps and `lo` with `EPERM` (measured on Ubuntu 25.10). An AppArmor
+   profile for sandy with the `userns,` rule lifts the restriction for sandy alone, and
+   `sandy setup` installs one, so the requirement needs setup, and `check` exits with status 2
+   when nothing else is missing. The plan says: "Ubuntu's AppArmor restriction of unprivileged
+   user namespaces (kernel.apparmor_restrict_unprivileged_userns = 1) applies to sandy, which runs
+   unconfined: the user namespace it creates gives it no rights, so it cannot set up the private
+   network; an AppArmor profile that allows sandy user namespaces lifts the restriction for sandy
+   alone". An administrator can also set the sysctl to 0, which lifts it for every program. Any
+   other label is a profile, and whether that allows user namespaces only a trial shows.
+
+When nothing of this rules the namespaces out, `check` also tries them (`Backend::verify`): a
+forked child runs steps 1 to 3 and 5 and reports the first that fails. The namespaces end with
+the child. On Ubuntu the kernel log keeps the AppArmor audit records of the `unshare`, which is
+all a trial leaves behind. The trial finds what the host does not say, for example a sandbox
+around sandy whose seccomp filter denies `unshare`, as sandy's own does
+(`check_tries_the_namespaces_inside_a_sandbox_that_denies_them`). `run` stays the authoritative
+answer: a step that fails refuses the run with the step's error.
+
+### Costs
+
+- Start time, as the median of 100 runs of `sandy run -- /usr/bin/true` with the release build on
+  Fedora 44 (kernel 7.2, a busy 24 CPU host): about 0.3 to 0.6 ms more than with `ip = "all"`
+  (4.5 against 3.9 to 4.2 ms), and about 2.5 ms more with an exposed port, which the start of the
+  socket factory takes. A forwarded port adds nothing measurable.
+- Inside, files of other users and of root show the owner and group 65534, and so does every
+  supplementary group except the user's own in `getgroups`. The kernel still checks access with
+  the real groups. `setgroups` fails, also for the user's own groups.
+- `ping` and other ICMP datagram sockets fail with `EACCES`: `net.ipv4.ping_group_range` of a new
+  network namespace admits no group.
+- No name server is reachable, unless a forwarded port reaches one over TCP. The system set
+  keeps `/etc/hosts` and the resolver configuration readable, so `localhost` resolves.
+- Each exposed connection asks the factory for its socket: one round trip over a socket pair.
+- On Ubuntu every run, and every `check` that tries the namespaces, adds AppArmor audit records to
+  the kernel log.
+
+### What stays open
+
+- **Processes of the user that runs sandy.** The namespaces belong to that user, so its processes
+  outside the sandbox hold every capability in them (the owner rule of `cap_capable`). A
+  single-threaded one can enter them (`nsenter --target PID --user --net --preserve-credentials`)
+  and reach the program's ports and the forward listeners without a relay. With `ip = "all"` such
+  a process reaches the program's ports directly. A process of another user can do neither:
+  opening the program's `/proc/PID/ns` files fails with `EACCES`, and `setns` through a pidfd,
+  as `nsenter` does it, with `EPERM` (measured with a sub-user ID on Fedora 44). This is an exception of
+  `IpNetworkPrivate` (DESIGN.md, "Requirements and the enforcement plan"): `sandy check` warns
+  about it, and `another_user_cannot_reach_a_forward_port` records it with sandy's own user as
+  the control. By the same owner rule, Yama's `ptrace_scope` 1 no longer keeps the user's other
+  processes from tracing the program (from the kernel source; not measured). Protecting the
+  program from the user is a non-goal (DESIGN.md, "Non-goals").
+- **Unix sockets.** A pathname Unix socket is not part of a network namespace, so with
+  `unix_sockets = "all"` the program still reaches every Unix socket service of the host, and
+  through some of them the network; the warning of that setting applies. Abstract names belong to
+  the namespace, so no abstract socket of the host is reachable
+  (`the_program_reaches_no_abstract_socket_of_the_host`), and the program cannot take one of the
+  host's names either.
+- **Standard streams.** A socket on a standard stream belongs to the network it was created in,
+  so sandy refuses every IP socket there (see "Refusals").
+- The namespace hides nothing of the file system: `/proc` and `/sys`, when granted, describe the
+  host, apart from `/proc/net`, which shows the network namespace of the process that reads it.
 
 ## Contained child processes
 
@@ -1422,6 +1576,11 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   Without the check, `execve` would fail with "Permission denied" after the sandbox is in place.
   The minimal system set grants execute on the dynamic loader, so a chain that ends there is
   covered.
+- `ip = "private"` where user namespaces are disabled (`user.max_user_namespaces` or
+  `kernel.unprivileged_userns_clone` 0), or where a trial of the namespaces fails, for example
+  inside another sandbox: IpNetworkPrivate is unavailable. Under Ubuntu's AppArmor restriction of
+  unprivileged user namespaces it needs setup, and `sandy check` exits with status 2 (see
+  "Private network").
 - A listening address of a relay that another process holds: ExposedPortsRelayed or
   ForwardedPortsRelayed is unavailable. `sandy check` binds the same addresses for a moment and
   releases them again, so it reports what `run` refuses. The answer can be stale one moment
@@ -1437,8 +1596,9 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   the socket family filter allows its family and protocol, and creating it needs no capability,
   because sandy never starts the program with one. sandy reads the family, the type and the
   protocol with `SO_DOMAIN`, `SO_TYPE` and `SO_PROTOCOL`. Refused are an IP socket or a route
-  netlink socket with `ip = "none"`, a listening or datagram IP socket with `ip = "client"` (a
-  connected TCP socket is accepted), an unconnected, datagram or listening Unix socket with
+  netlink socket with `ip = "none"` and with `ip = "private"`, where such a socket belongs to the
+  host's network and not the sandbox's (`an_inherited_ip_socket_is_refused`), a listening or
+  datagram IP socket with `ip = "client"` (a connected TCP socket is accepted), an unconnected, datagram or listening Unix socket with
   `unix_sockets = "none"`, and under every policy a raw IP socket (`SOCK_RAW`, which needs
   `CAP_NET_RAW`), an IP socket of a protocol the filter denies (see "Denylist"), and a socket of
   every other family, a netlink socket of another protocol included. The kernel turns an `AF_INET`
@@ -1487,7 +1647,9 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   and then disconnects with `connect(AF_UNSPEC)` receives what clients send to it (measured on
   Linux 7.2), and an ordinary AF_UNIX socket can listen, except under `ip = "client"`. With
   `ip = "none"` and `unix_sockets = "none"` the filter denies `bind`, `listen`, `connect` and
-  `accept`, which no socket pair needs.
+  `accept`, which no socket pair needs. With `ip = "private"` the abstract names are the
+  sandbox's own, because they belong to its network namespace, so the program can take none of
+  the host's.
 - **System information.** `uname`, `sysinfo` and `statfs` stay allowed. They show the kernel
   version, load and memory, and file system statistics. The mount and namespace listing calls,
   the security module calls (`lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr`) and

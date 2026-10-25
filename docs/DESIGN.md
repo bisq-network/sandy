@@ -391,8 +391,10 @@ Rules:
    the relay serves every connection there. A forwarded port is for the program alone, and the
    relay reaches `to` as sandy's user. On Linux it therefore refuses a connection whose other end
    the kernel names as another user's, and refuses the run when the kernel cannot answer such a
-   lookup at all (docs/linux.md). On macOS it cannot ask, so a forwarded port is reachable by
-   every local user (docs/macos.md). On Windows only the program's AppContainer reaches it.
+   lookup at all (docs/linux.md). With `ip = "private"` the forward listener is in the
+   sandbox's own network namespace, which no other user reaches, so the relay asks nothing there.
+   On macOS it cannot ask, so a forwarded port is reachable by every local user
+   (docs/macos.md). On Windows only the program's AppContainer reaches it.
 
    There is one answer the kernel cannot give, and the residual that comes with it. The owner it
    reports comes from the socket's file, so a socket its process has closed has none, which the
@@ -532,7 +534,8 @@ exceptions:
 |---|---|---|
 | Linux | `signals = "isolated"` without `children = "contained"` | a read from the terminal in the background stops the group sandy was started in, with the processes outside the sandbox in it |
 | Linux | `ip = "client"` | a UDP socket that is not connected receives datagrams from every sender, at the port the kernel chose for it, and before Landlock ABI 10 at any port the program binds |
-| Linux | `forward` | another local user can deliver a write to the forwarded service, through a connection it closed before the relay asked who owns it, and that no longer carries its user (from the close on Linux 6.8, after the timewait record on newer kernels) |
+| Linux | `forward` with `ip = "client"` or `ip = "all"` | another local user can deliver a write to the forwarded service, through a connection it closed before the relay asked who owns it, and that no longer carries its user (from the close on Linux 6.8, after the timewait record on newer kernels) |
+| Linux | `ip = "private"` | processes of the user that runs sandy can enter the sandbox's network namespace, which belongs to that user, and reach the program's ports and forwarded ports there without a relay |
 | Linux | `path_metadata = "deny"` with a `read` or `read_exec` path | the mode, except the setuid and setgid bits, and the times of a file or directory the program may only read, through a descriptor it opened for reading (`fchmod`, `futimens`) |
 | macOS | `signals = "isolated"` | SIGIO (to a process of any user), and SIGURG with `ip = "client"` or `ip = "all"`, through the owner ioctls of sockets and pipes; without `children = "contained"` also joining another job of the terminal session and stopping it |
 | macOS | `ip = "client"` | a UDP socket that is not connected receives datagrams from every sender, at any port the program binds |
@@ -652,6 +655,18 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   has one thread, Landlock `restrict_self`, up to four seccomp filters (TSYNC), `execve`.
   Everything that can fail on bad input is prepared before the first step. Landlock restricts
   the calling thread, so the thread check is what makes the domain cover the whole process.
+  With `ip = "private"` the namespaces come first, after the relay and the watcher have started.
+- `ip = "private"`: one `unshare(CLONE_NEWUSER | CLONE_NEWNET)` in the process that becomes the
+  program (sandy in the exec model, so the program keeps its process ID; the forked child with
+  `contained` and with `--explain`), then `setgroups` denied and single-ID maps of the user's own
+  user and group ID, never root, and `lo` up. sandy binds the forward listeners inside and hands
+  them to the relay over a socket pair, drops every capability of the namespace, the bounding set
+  included, and with exposed ports starts a socket factory there. The filters read their IDs
+  after the maps, and the program's filter is the one of `ip = "all"`; it still denies namespaces
+  and mounts. `plan` reads `user.max_user_namespaces`, `kernel.unprivileged_userns_clone`, and
+  `kernel.apparmor_restrict_unprivileged_userns` with sandy's AppArmor label: under the Ubuntu
+  restriction an unconfined sandy gets no rights in its user namespace, and the requirement needs
+  setup (an AppArmor profile). `check` also tries the steps in a forked child.
 - Landlock (ABI 1 or newer, read from the kernel at run time) handles every file system right of
   the ABI. Writable paths never get execute, symbolic link, named pipe or device rights. Each
   rule path is opened without following links and must still be the file sandy planned with. ABI 6
@@ -724,10 +739,17 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   `signals = "any"`; under `"isolated"` the program cannot stop the relay. It confines itself with
   no_new_privs, Landlock without file access (TCP connect only to the relay targets from ABI 4)
   and a seccomp filter limited to TCP, copying, threads and that timer. A forwarded port refuses
-  a connection the kernel names as another user's (rule 6 of "Forwarded ports").
+  a connection the kernel names as another user's (rule 6 of "Forwarded ports"). With
+  `ip = "private"` the relay stays in the host's namespace: it receives the forward listeners
+  from inside and checks no owner there, because no other user reaches that namespace, and it
+  connects an exposed port with a socket that the factory inside creates. The factory is a helper
+  without capabilities, file access or TCP rights whose filter allows creating TCP sockets and
+  passing them on, and nothing else. The relay ends when the factory ends, so the guard of
+  `contained`, which watches the relay, ends the program then.
 - Refused: no Landlock (the reason names the fix), no seccomp, root or any capability, a writable
   path that overlaps the minimal system set (rule 6), a program whose ELF loader no executable
-  path covers (the kernel opens it during `execve`).
+  path covers (the kernel opens it during `execve`), and `ip = "private"` where user namespaces
+  are disabled or a trial of them fails (under Ubuntu's AppArmor restriction it needs setup).
 
 ### macOS
 

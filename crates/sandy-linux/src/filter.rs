@@ -1067,6 +1067,9 @@ const RELAY_CALLS: &[i64] = &[
     libc::SYS_close,
     libc::SYS_recvfrom,
     libc::SYS_sendto,
+    // With ip = "private", the forward listeners and the sockets of the factory arrive over a
+    // socket pair (`handover`, `factory`).
+    libc::SYS_recvmsg,
     libc::SYS_accept,
     libc::SYS_accept4,
     libc::SYS_connect,
@@ -1110,15 +1113,39 @@ const RELAY_CALLS: &[i64] = &[
 ];
 
 /// What the watcher of `end_with_parent` needs: poll two pidfds, signal the program through its
-/// pidfd, write the readiness report, and end. The memory calls cover allocations of the Rust
+/// pidfd, write the readiness report with its process ID, and end. The memory calls cover allocations of the Rust
 /// runtime. Everything else fails with EPERM. `pidfd_send_signal` has rules of its own.
 const WATCHER_CALLS: &[i64] = &[
     libc::SYS_ppoll,
     libc::SYS_write,
     libc::SYS_close,
+    libc::SYS_getpid,
     libc::SYS_clock_gettime,
     libc::SYS_mmap,
     libc::SYS_munmap,
+    libc::SYS_brk,
+    libc::SYS_madvise,
+    libc::SYS_mprotect,
+    libc::SYS_rt_sigprocmask,
+    libc::SYS_rt_sigreturn,
+    libc::SYS_restart_syscall,
+    libc::SYS_exit,
+    libc::SYS_exit_group,
+];
+
+/// What the socket factory of exposed ports needs once it is confined: read a request, send a
+/// socket back, write the readiness report with its process ID, and end. The memory calls cover
+/// allocations of the Rust runtime. `socket` has a rule of its own; everything else fails with
+/// EPERM, `connect`, `bind` and `listen` among them.
+const FACTORY_CALLS: &[i64] = &[
+    libc::SYS_read,
+    libc::SYS_write,
+    libc::SYS_sendmsg,
+    libc::SYS_close,
+    libc::SYS_getpid,
+    libc::SYS_mmap,
+    libc::SYS_munmap,
+    libc::SYS_mremap,
     libc::SYS_brk,
     libc::SYS_madvise,
     libc::SYS_mprotect,
@@ -1174,7 +1201,9 @@ pub fn watcher(program: i32) -> Result<Filters, BackendError> {
 
 /// Builds the filters of the relay: the shared allowlist and the relay's own list, which allows
 /// only `RELAY_CALLS`, TCP sockets, threads without namespaces, and FIONBIO. The relay serves
-/// each connection in a thread and never starts a process, so clone needs CLONE_THREAD.
+/// each connection in a thread and never starts a process, so clone needs CLONE_THREAD. A
+/// socket must use protocol 0, which is TCP: another stream protocol, such as SCTP or MPTCP,
+/// would make the kernel load its module.
 pub fn relay() -> Result<Filters, BackendError> {
     let target = arch::TARGET
         .ok_or_else(|| BackendError::InvalidTargetArch(std::env::consts::ARCH.to_string()))?;
@@ -1190,6 +1219,7 @@ pub fn relay() -> Result<Filters, BackendError> {
                 SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
                 libc::SOCK_STREAM as u64,
             )?,
+            low(2, SeccompCmpOp::Eq, 0)?,
         ])
     };
     rules.add(
@@ -1205,6 +1235,44 @@ pub fn relay() -> Result<Filters, BackendError> {
     rules.add(libc::SYS_clone, vec![rule(vec![no_namespace, a_thread])?]);
     let fionbio = low(1, SeccompCmpOp::Eq, u64::from(libc::FIONBIO as u32))?;
     rules.add(libc::SYS_ioctl, vec![rule(vec![fionbio])?]);
+    let filter = SeccompFilter::new(
+        rules.0,
+        SeccompAction::Errno(libc::EPERM as u32),
+        SeccompAction::Allow,
+        target,
+    )?;
+    Ok(Filters {
+        allowlist: allowlist(target)?,
+        denylist: filter.try_into()?,
+        path_xattrs: None,
+        families: None,
+    })
+}
+
+/// Builds the filters of the socket factory: the shared allowlist and a list that allows only
+/// `FACTORY_CALLS` and `socket` for TCP over IPv4 and IPv6 with protocol 0, which is TCP.
+pub fn factory() -> Result<Filters, BackendError> {
+    let target = arch::TARGET
+        .ok_or_else(|| BackendError::InvalidTargetArch(std::env::consts::ARCH.to_string()))?;
+    let mut rules = Rules::default();
+    for &call in FACTORY_CALLS {
+        rules.add(call, Vec::new());
+    }
+    let tcp = |family: i32| -> Result<SeccompRule, BackendError> {
+        rule(vec![
+            low(0, SeccompCmpOp::Eq, family as u64)?,
+            low(
+                1,
+                SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
+                libc::SOCK_STREAM as u64,
+            )?,
+            low(2, SeccompCmpOp::Eq, 0)?,
+        ])
+    };
+    rules.add(
+        libc::SYS_socket,
+        vec![tcp(libc::AF_INET)?, tcp(libc::AF_INET6)?],
+    );
     let filter = SeccompFilter::new(
         rules.0,
         SeccompAction::Errno(libc::EPERM as u32),
@@ -1622,12 +1690,14 @@ mod tests {
             let open = build(&open(), &OWN).unwrap();
             let watcher = watcher(WATCHED_PROGRAM).unwrap();
             let relay = relay().unwrap();
+            let factory = factory().unwrap();
             let mut out = SNAPSHOT_HEADER.to_string();
             for (name, filters) in [
                 ("strict", &strict),
                 ("open", &open),
                 ("watcher", &watcher),
                 ("relay", &relay),
+                ("factory", &factory),
             ] {
                 assert_eq!(
                     checksum(&filters.allowlist),
@@ -2637,6 +2707,7 @@ mod tests {
             libc::SYS_ppoll,
             libc::SYS_write,
             libc::SYS_close,
+            libc::SYS_getpid,
             libc::SYS_exit_group,
         ] {
             assert_eq!(watcher(nr), RET_ALLOW, "system call {nr}");
@@ -2754,6 +2825,7 @@ mod tests {
             libc::SYS_write,
             libc::SYS_recvfrom,
             libc::SYS_sendto,
+            libc::SYS_recvmsg,
             libc::SYS_shutdown,
             libc::SYS_close,
             libc::SYS_ppoll,
@@ -2785,6 +2857,11 @@ mod tests {
         assert_eq!(relay(libc::SYS_socket, tcp(libc::AF_UNIX)), RET_EPERM);
         let udp = socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
         assert_eq!(relay(libc::SYS_socket, udp), RET_EPERM);
+        // Stream sockets of another protocol, whose module the kernel would load.
+        for protocol in [libc::IPPROTO_SCTP, libc::IPPROTO_MPTCP, libc::IPPROTO_TCP] {
+            let other = socket(libc::AF_INET, libc::SOCK_STREAM, protocol);
+            assert_eq!(relay(libc::SYS_socket, other), RET_EPERM, "{protocol}");
+        }
         let user = thread | libc::CLONE_NEWUSER as u64;
         assert_eq!(relay(libc::SYS_clone, args(&[user])), RET_EPERM);
         // No process: neither fork's flags nor posix_spawn's, also with high bits set.
@@ -2801,6 +2878,50 @@ mod tests {
         assert_eq!(relay(libc::SYS_ioctl, tiocsti), RET_EPERM);
         // The shared allowlist still decides clone3, so threads fall back to clone.
         assert_eq!(relay(libc::SYS_clone3, [0; 6]), RET_ENOSYS);
+    }
+
+    #[test]
+    fn the_factory_can_only_make_tcp_sockets() {
+        let filters = factory().unwrap();
+        let factory = |nr: i64, args: [u64; 6]| decide_with(&filters, NATIVE, nr, args);
+        for nr in [
+            libc::SYS_read,
+            libc::SYS_sendmsg,
+            libc::SYS_close,
+            libc::SYS_exit_group,
+        ] {
+            assert_eq!(factory(nr, [0; 6]), RET_ALLOW, "system call {nr}");
+        }
+        for family in [libc::AF_INET, libc::AF_INET6] {
+            let tcp = socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            assert_eq!(factory(libc::SYS_socket, tcp), RET_ALLOW);
+            let sctp = socket(family, libc::SOCK_STREAM, libc::IPPROTO_SCTP);
+            assert_eq!(factory(libc::SYS_socket, sctp), RET_EPERM);
+        }
+        // The relay connects the sockets; the factory reaches nothing with them.
+        for nr in [
+            libc::SYS_connect,
+            libc::SYS_bind,
+            libc::SYS_listen,
+            libc::SYS_accept4,
+            libc::SYS_sendto,
+            libc::SYS_recvmsg,
+            libc::SYS_openat,
+            libc::SYS_execve,
+            libc::SYS_clone,
+            libc::SYS_kill,
+            libc::SYS_ioctl,
+        ] {
+            assert_eq!(factory(nr, [0; 6]), RET_EPERM, "system call {nr}");
+        }
+        for (family, kind) in [
+            (libc::AF_UNIX, libc::SOCK_STREAM),
+            (libc::AF_INET, libc::SOCK_DGRAM),
+            (libc::AF_NETLINK, libc::SOCK_RAW),
+        ] {
+            let other = socket(family, kind, 0);
+            assert_eq!(factory(libc::SYS_socket, other), RET_EPERM);
+        }
     }
 
     #[test]

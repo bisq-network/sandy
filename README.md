@@ -592,11 +592,11 @@ The block names every key; it is not a policy that runs as written, because `exp
   before the sandbox, and no sandbox can take rights from what is already open. sandy therefore
   accepts such a socket only when the policy lets the program create one like it, and else refuses
   to start the program, with status 125 and the stream and the socket named. It refuses an IP
-  socket under `ip = "none"`, an unconnected, datagram or listening Unix socket under
-  `unix_sockets = "none"`, and under every policy a raw IP socket, which only a privileged process
-  can create, an IP socket of a protocol other than TCP, UDP, ICMP and MPTCP (SCTP, for example),
-  and a socket of any other family, for example a netlink socket that lists the sockets of the
-  host. An ICMP datagram socket counts as an IP socket, because an unprivileged program can create
+  socket under `ip = "none"` and under `ip = "private"`, where it would belong to the host's
+  network, an unconnected, datagram or listening Unix socket under `unix_sockets = "none"`, and
+  under every policy a raw IP socket, which only a privileged process can create, an IP socket of
+  a protocol other than TCP, UDP, ICMP and MPTCP (SCTP, for example), and a socket of any other
+  family, for example a netlink socket that lists the sockets of the host. An ICMP datagram socket counts as an IP socket, because an unprivileged program can create
   one where the system allows it. On Linux `ip = "all"` and `ip = "client"` also accept a route
   netlink socket, which the program may create. A connected Unix stream or seqpacket socket is
   accepted: that is how a parent passes a pipe. Under `ip = "client"` only a connected TCP socket
@@ -606,10 +606,11 @@ The block names every key; it is not a policy that runs as written, because `exp
   listening socket `ip = "all"`. `sandy check` cannot report this, because its own
   streams are not the streams of the later `run`.
 - `expose` entries: `listen` must be a loopback address, must differ from the program's own
-  address, and may appear only once. They need `ip = "all"`: the program listens for the relay's
-  connections, which `ip = "client"` denies, so sandy refuses `expose` with it. At most 256
-  connections per port are relayed at the same time. A connection that is still open when the
-  relay ends, one second after the program, is reset, so a cut stream never looks complete.
+  address, and may appear only once. They need `ip = "all"` or `ip = "private"`: the program
+  listens for the relay's connections, which `ip = "client"` denies, so sandy refuses `expose`
+  with it. At most 256 connections per port are relayed at the same time. A connection that is
+  still open when the relay ends, one second after the program, is reset, so a cut stream never
+  looks complete.
   With `signals = "any"` the program may stop its own relay. On Linux a stopped relay is killed
   two seconds later and its ports are released; on macOS nothing bounds it, so only
   `signals = "isolated"` keeps the bound there. A relay that is continued before that can serve
@@ -623,8 +624,9 @@ The block names every key; it is not a policy that runs as written, because `exp
   own in any ordinary run, unless the kernel still names another user for it, as Linux 6.17 and
   newer do for a moment. Another local user can therefore still deliver a blind write, on
   Linux 6.8 usually on the first attempt, by writing and closing at once, but never read the
-  answer (docs/linux.md). On macOS every connection is served. Forward only to services that
-  authenticate their clients.
+  answer (docs/linux.md). Under `ip = "private"` on Linux the forward port is in the sandbox's
+  own network namespace, which no other user reaches. On macOS every connection is served.
+  Forward only to services that authenticate their clients.
 - A dead relay frees the program's forward port, and any local user can then bind it and
   receive what the program sends there. With `children = "contained"` on Linux and macOS, sandy
   therefore ends the program when its relay dies, and exits with status 125. Without it nothing
@@ -749,6 +751,13 @@ metadata through the descriptor they wrote.
   `openat2`, which sandy denies because seccomp cannot read that call's flags and therefore
   cannot reject the open mode that gets past Landlock, and tar does not fall back. Creating and
   listing archives work, and so does `bsdtar` ([docs/linux.md](docs/linux.md)).
+- **`ip = "private"`** runs the program in a user and network namespace of its own, so it needs
+  unprivileged user namespaces. Ubuntu 23.10 and newer restrict them for programs without an
+  AppArmor profile; there `sandy check` exits with status 2 until `sandy setup` installs one for
+  sandy. Inside, files of other users and of root show the owner 65534, and `ping` does not work.
+  Other users cannot reach the program's ports, but your own processes can enter the namespace,
+  for example with `nsenter`, and `sandy check` warns about that
+  ([docs/linux.md](docs/linux.md), "Private network").
 - **Name resolution across network changes.** A Landlock rule binds a file, so a file the
   system replaces by rename is lost to a program that is already running. With `--ip all` or
   `--ip client`, sandy grants systemd-resolved's directory, so name resolution keeps working when

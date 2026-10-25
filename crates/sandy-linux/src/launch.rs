@@ -12,14 +12,17 @@ use std::path::{Component, Path, PathBuf};
 use std::ptr;
 
 use landlock::{
-    CompatLevel, Compatible, PathBeneath, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr,
-    RulesetError, RulesetStatus,
+    ABI, CompatLevel, Compatible, PathBeneath, Ruleset, RulesetAttr, RulesetCreated,
+    RulesetCreatedAttr, RulesetError, RulesetStatus,
 };
 use sandy_core::{ParentProcess, SandboxError, StatusReport, TargetCommand};
 
 use crate::explain::{self, Observer};
+use crate::factory;
 use crate::filter::{FilterConfig, Filters, TargetProcess};
+use crate::handover::Handover;
 use crate::host::THREADS_DIR;
+use crate::namespace::{self, Namespaces};
 use crate::plan::{FileIdentity, LandlockConfig, Sandbox};
 use crate::{contain, filter, relay, watch};
 
@@ -47,6 +50,10 @@ pub fn launch(
     // the guard watches the relay in turn (see `contain::run`).
     let mut group_ended = None;
     let mut relay_alive = None;
+    // What the process that enters the namespaces binds and starts there for the helpers
+    // outside. A helper that serves a listener inside adds its handover here.
+    let mut handovers = Vec::new();
+    let mut factory = None;
     if let Some(relay) = &sandbox.relay {
         let ended = if sandbox.contain {
             let (read, write) = crate::helper::pipe("the pipe of the group's end")?;
@@ -55,7 +62,9 @@ pub fn launch(
         } else {
             None
         };
-        let started = relay::start(relay, ended)?;
+        let (started, inside) = relay::start(relay, ended)?;
+        handovers.extend(inside.handover);
+        factory = inside.factory;
         if sandbox.contain {
             relay_alive = Some(crate::helper::pidfd_open(started, "the relay")?);
         }
@@ -86,9 +95,19 @@ pub fn launch(
             SandboxError::io(format!("cannot change to {}", cwd.display()), error)
         })?;
     }
-    let start = || match confine(ruleset, binds, &sandbox.filter, observer.as_ref()) {
-        Ok(()) => exec.execute(),
-        Err(error) => error,
+    // With `contain` and with `--explain` this runs in the forked child, so the supervising sandy
+    // stays in the host's namespaces, and it drops its copies of the handovers and the factory
+    // after the fork.
+    let start = || {
+        if let Some(namespaces) = sandbox.namespaces
+            && let Err(error) = enter(namespaces, handovers, factory, sandbox.landlock.abi)
+        {
+            return error;
+        }
+        match confine(ruleset, binds, &sandbox.filter, observer.as_ref()) {
+            Ok(()) => exec.execute(),
+            Err(error) => error,
+        }
     };
     if sandbox.contain {
         contain::run(start, group_ended, relay_alive, status, explain.as_mut())
@@ -103,7 +122,28 @@ pub fn launch(
     }
 }
 
-/// The filters for this process. The denylist names its process, user and group IDs.
+/// Moves this process into `namespaces` and does there what the helpers outside need (steps 2 to
+/// 5 of `namespace`): binds the listeners of `handovers` and hands them over, and starts the
+/// socket factory of the exposed ports after the capabilities are gone, so it inherits none.
+fn enter(
+    namespaces: Namespaces,
+    handovers: Vec<Handover>,
+    factory: Option<factory::Pending>,
+    abi: ABI,
+) -> Result<(), SandboxError> {
+    namespaces.enter()?;
+    for handover in handovers {
+        handover.send()?;
+    }
+    namespace::drop_capabilities()?;
+    if let Some(factory) = factory {
+        factory.start(abi)?;
+    }
+    Ok(())
+}
+
+/// The filters for this process. The denylist names its process, user and group IDs. Built after
+/// `enter`: until the maps are written, the IDs read as 65534.
 fn build_filters(config: &FilterConfig) -> Result<Filters, SandboxError> {
     filter::build(config, &this_process()?)
         .map_err(|error| SandboxError::new(format!("cannot build the seccomp filter: {error}")))

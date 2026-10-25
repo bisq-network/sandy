@@ -101,7 +101,12 @@ pub fn run(
                 start,
             )
         }
-        pid => group.program = Some(pid),
+        pid => {
+            // What the child needed is the child's now: a copy kept here would hold the
+            // relay's handover and factory sockets open after the child is gone.
+            drop(start);
+            group.program = Some(pid);
+        }
     }
     drop(report_write);
     // Before the report is read: the execve that ends the report pipe is a watched call and

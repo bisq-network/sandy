@@ -223,7 +223,9 @@ pub fn relay(client: TcpStream, target: SocketAddr) -> io::Result<()> {
     relay_streams(client, connect(target)?)
 }
 
-/// Relays between two connected streams in both directions and returns when both are done.
+/// Relays between two connected streams in both directions and returns when both are done. A
+/// backend that opens the other side itself, for example with a socket from another network
+/// namespace, calls this instead of `relay`.
 ///
 /// Both directions use the same two sockets from two threads instead of clones. On Windows a
 /// clone (`try_clone`, which calls `WSADuplicateSocketW`) of a socket whose non-blocking connect
@@ -233,7 +235,7 @@ pub fn relay(client: TcpStream, target: SocketAddr) -> io::Result<()> {
 /// A direction that reaches the end of its stream passes the end on as a half close. A direction
 /// that fails (a reset, or a write the other peer refuses) aborts the connection: both sockets
 /// close with a reset, so neither peer takes a cut stream for a complete one.
-fn relay_streams(client: TcpStream, server: TcpStream) -> io::Result<()> {
+pub fn relay_streams(client: TcpStream, server: TcpStream) -> io::Result<()> {
     relay_streams_with(client, server, HALF_CLOSED_IDLE)
 }
 

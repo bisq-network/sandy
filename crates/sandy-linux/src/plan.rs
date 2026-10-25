@@ -19,6 +19,7 @@ use crate::filter::FilterConfig;
 use crate::host::HostCapabilities;
 use crate::launch;
 use crate::loader;
+use crate::namespace::{Missing, Namespaces};
 use crate::openssl;
 use crate::relay::RelayConfig;
 use crate::system::{self, Needed, SystemPath, SystemUse};
@@ -39,6 +40,8 @@ pub struct Sandbox {
     pub filter: FilterConfig,
     /// The relay for exposed ports, when the policy has any.
     pub relay: Option<RelayConfig>,
+    /// The namespaces the program runs in, `None` for the host's own (see `namespace`).
+    pub namespaces: Option<Namespaces>,
     /// `process.children = "contained"`: sandy stays the program's parent and ends its process
     /// group when the program ends, instead of replacing itself with the program.
     pub contain: bool,
@@ -82,6 +85,11 @@ const FILTER_METADATA: &str = "seccomp denies chmod, chown, utime and xattr call
 const FILTER_PROCESSES: &str = "seccomp denies ptrace, process_vm_readv, process_vm_writev, \
     pidfd_getfd, kcmp, process_madvise, System V IPC and POSIX message queues, and changes of the \
     limits, priority and CPU affinity of other processes";
+const PRIVATE_NETWORK: &str = "a user and a network namespace of the sandbox's own, created \
+    before the sandbox is applied: only lo, up; the user's own user and group ID mapped to \
+    themselves and setgroups denied, so root is not mapped; every capability in the namespace \
+    dropped, the bounding set included; the relays are the only ways in and out; seccomp denies \
+    the program new namespaces";
 const NO_WIN32K: &str =
     "nothing to deny: win32k is the GUI part of the Windows kernel, and Linux has none";
 
@@ -117,9 +125,10 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
     let items: Vec<PlanItem> = policy
         .requirements()
         .into_iter()
-        .map(|requirement| plan_item(requirement, host, abi, conflict.as_deref()))
+        .map(|requirement| plan_item(requirement, policy, host, abi, conflict.as_deref()))
         .collect();
     let enforceable = items.iter().all(PlanItem::is_enforced);
+    let private = policy.ip == IpAccess::Private;
     let sandbox = match (abi, landlock) {
         (Ok(abi), Some(landlock)) if enforceable => Some(Sandbox {
             landlock,
@@ -137,7 +146,14 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
                 keep_process_group: policy.children == ChildProcesses::Contained,
                 isolate_signals: policy.signals == SignalScope::Isolated,
             },
-            relay: RelayConfig::new(&policy.expose, &policy.forward, policy.signals, abi),
+            relay: RelayConfig::new(
+                &policy.expose,
+                &policy.forward,
+                policy.signals,
+                abi,
+                private,
+            ),
+            namespaces: private.then_some(Namespaces { network: true }),
             contain: policy.children == ChildProcesses::Contained,
             end_with_parent: policy.end_with_parent,
             identities,
@@ -247,7 +263,19 @@ fn shortfalls(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
                 .to_string(),
         );
     }
-    if !policy.forward.is_empty() {
+    if policy.ip == IpAccess::Private {
+        shortfalls.push(
+            "ip = \"private\" keeps out other users, but not this user, on Linux: the sandbox's \
+             network namespace belongs to the user that runs sandy, so a process of this user \
+             outside the sandbox can enter it (nsenter) and reach the program's ports and \
+             forwarded ports there without a relay, as it reaches them directly with \
+             ip = \"all\"; no process of another user can (docs/linux.md, \"Private network\")"
+                .to_string(),
+        );
+    }
+    // With ip = "private" the forward listener is in the sandbox's network namespace, which no
+    // other user reaches.
+    if !policy.forward.is_empty() && policy.ip != IpAccess::Private {
         shortfalls.push(
             "a forwarded port keeps other users out only in part on Linux: the relay refuses a \
              connection that the kernel names as another user's, but once the client has closed \
@@ -292,6 +320,7 @@ pub fn landlock_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Option<
 
 fn plan_item(
     requirement: Requirement,
+    policy: &ResolvedPolicy,
     host: &HostCapabilities,
     abi: Result<ABI, &str>,
     conflict: Option<&str>,
@@ -435,7 +464,7 @@ fn plan_item(
                 (Err(reason), _, _) | (_, Err(reason), _) | (_, _, Err(reason)) => {
                     unavailable(reason)
                 }
-                _ => enforced(relay_mechanism(abi)),
+                _ => enforced(relay_mechanism(abi, policy.ip == IpAccess::Private)),
             }
         }
         Requirement::MetadataConfined => match &host.seccomp {
@@ -443,7 +472,12 @@ fn plan_item(
             Ok(()) => enforced(FILTER_METADATA.to_string()),
         },
         Requirement::Win32kDenied => enforced(NO_WIN32K.to_string()),
-        Requirement::IpNetworkPrivate | Requirement::EgressBrokered | Requirement::PathsHidden => {
+        Requirement::IpNetworkPrivate => match (&host.user_namespaces, &host.seccomp) {
+            (Err(Missing::NeedsSetup(reason)), _) => PlanItem::needs_setup(requirement, reason),
+            (Err(Missing::Unavailable(reason)), _) | (_, Err(reason)) => unavailable(reason),
+            (Ok(()), Ok(())) => enforced(PRIVATE_NETWORK.to_string()),
+        },
+        Requirement::EgressBrokered | Requirement::PathsHidden => {
             unavailable("the Linux backend does not enforce this yet")
         }
         // The kernel sends the job control signals of a terminal without the check that the
@@ -463,7 +497,7 @@ fn plan_item(
 }
 
 /// One relay process serves exposed and forwarded ports, so both requirements name it.
-fn relay_mechanism(abi: ABI) -> String {
+fn relay_mechanism(abi: ABI, private: bool) -> String {
     let mut mechanism = format!(
         "relay process outside the sandbox, not a child of the program, that ends with it \
          (pidfd); confined by no_new_privs, Landlock ABI {abi} without file access"
@@ -472,6 +506,13 @@ fn relay_mechanism(abi: ABI) -> String {
         mechanism.push_str(", TCP connect only to the relay targets and no bind");
     }
     mechanism.push_str(", and a seccomp filter that allows only TCP, copying bytes and threads");
+    if private {
+        mechanism.push_str(
+            "; the forward listeners are bound inside the sandbox's network namespace and handed \
+             to the relay, and an exposed connection starts inside it with a socket from a \
+             factory process there that can create TCP sockets and nothing else",
+        );
+    }
     mechanism
 }
 
@@ -750,6 +791,7 @@ mod tests {
             landlock: abi.ok_or_else(|| "no Landlock here".to_string()),
             thread_count: Ok(()),
             process_group: Ok(()),
+            user_namespaces: Ok(()),
             seccomp: Ok(()),
             no_new_privs: Ok(()),
             unprivileged: Ok(()),
@@ -972,6 +1014,107 @@ mod tests {
         policy.forward.clear();
         let plan = plan_for(&policy, &host(Some(9)));
         assert!(plan.sandbox.unwrap().relay.is_none());
+    }
+
+    /// `ip = "private"` runs the program in namespaces of its own, with the filter of
+    /// `ip = "all"` as a second layer, and both relays know the namespace.
+    #[test]
+    fn a_private_network_enters_namespaces_and_allows_ip_inside() {
+        let mut policy = policy();
+        policy.ip = IpAccess::Private;
+        policy.expose = vec![ExposedPort {
+            listen: "127.0.0.1:18080".parse().unwrap(),
+            port: 8080,
+        }];
+        policy.forward = vec![ForwardedPort {
+            port: 18082,
+            to: "127.0.0.1:8082".parse().unwrap(),
+        }];
+        let plan = plan_for(&policy, &host(Some(9)));
+        assert_eq!(unavailable(&plan), vec![]);
+        let Status::Enforced { mechanism } = status(&plan, Requirement::IpNetworkPrivate) else {
+            panic!("{plan:?}");
+        };
+        assert!(mechanism.contains("network namespace"), "{mechanism}");
+        let Status::Enforced { mechanism } = status(&plan, Requirement::ForwardedPortsRelayed)
+        else {
+            panic!("{plan:?}");
+        };
+        assert!(mechanism.contains("handed to the relay"), "{mechanism}");
+        let sandbox = plan.sandbox.unwrap();
+        assert_eq!(sandbox.namespaces, Some(Namespaces { network: true }));
+        assert!(sandbox.relay.unwrap().private);
+        assert!(sandbox.filter.allow_ip && !sandbox.filter.deny_inbound);
+        assert!(sandbox.landlock.handled_net.is_empty());
+        assert_eq!(sandbox.client_binds, 0);
+
+        for ip in [IpAccess::None, IpAccess::Client, IpAccess::All] {
+            let mut other = policy.clone();
+            other.ip = ip;
+            other.expose.clear();
+            other.forward.clear();
+            let sandbox = plan_for(&other, &host(Some(9))).sandbox.unwrap();
+            assert_eq!(sandbox.namespaces, None, "{ip:?}");
+        }
+    }
+
+    /// What the host says against user namespaces becomes the requirement's status: a matter of
+    /// `sandy setup` only for the AppArmor restriction.
+    #[test]
+    fn a_private_network_follows_what_the_host_says() {
+        let mut policy = policy();
+        policy.ip = IpAccess::Private;
+        let mut restricted = host(Some(9));
+        restricted.user_namespaces = Err(Missing::NeedsSetup("restricted".to_string()));
+        let plan = plan_for(&policy, &restricted);
+        assert_eq!(
+            status(&plan, Requirement::IpNetworkPrivate),
+            &Status::NeedsSetup {
+                reason: "restricted".to_string()
+            }
+        );
+        assert!(plan.sandbox.is_none());
+
+        let mut disabled = host(Some(9));
+        disabled.user_namespaces = Err(Missing::Unavailable("disabled".to_string()));
+        let plan = plan_for(&policy, &disabled);
+        assert_eq!(
+            status(&plan, Requirement::IpNetworkPrivate),
+            &Status::Unavailable {
+                reason: "disabled".to_string()
+            }
+        );
+
+        let mut no_seccomp = host(Some(9));
+        no_seccomp.seccomp = Err("no seccomp".to_string());
+        let plan = plan_for(&policy, &no_seccomp);
+        assert!(unavailable(&plan).contains(&Requirement::IpNetworkPrivate));
+    }
+
+    /// The forward warning of the other `ip` values does not apply in a namespace no other user
+    /// reaches; the one of `ip = "private"` names the user's own processes instead.
+    #[test]
+    fn private_notes_name_what_stays_open() {
+        let mut policy = policy();
+        policy.forward = vec![ForwardedPort {
+            port: 18082,
+            to: "127.0.0.1:8082".parse().unwrap(),
+        }];
+        let warned = |policy: &ResolvedPolicy, text: &str| {
+            notes(policy, &host(Some(9)))
+                .iter()
+                .any(|note| note.contains(text))
+        };
+        let forward = "another local user can deliver a write";
+        let own_user = "a process of this user outside the sandbox can enter it";
+        for ip in [IpAccess::Client, IpAccess::All] {
+            policy.ip = ip;
+            assert!(warned(&policy, forward), "{ip:?}");
+            assert!(!warned(&policy, own_user), "{ip:?}");
+        }
+        policy.ip = IpAccess::Private;
+        assert!(!warned(&policy, forward));
+        assert!(warned(&policy, own_user));
     }
 
     #[test]

@@ -26,6 +26,17 @@
 //!    `Watchdog`). With `signals = "isolated"` the program cannot signal the relay, and the relay
 //!    has no timer: there it could only kill a healthy relay that the host was slow to schedule.
 //!
+//! With `ip = "private"` the program's side of each pair is the sandbox's network namespace
+//! (`namespace`), while the relay stays in the host's, so that it can listen and connect there.
+//! A socket belongs to the namespace it was created in, so:
+//!
+//! - A forward listener is bound inside after sandy entered the namespace and handed to the
+//!   relay (`handover`), which waits for it once it is confined. No other user reaches that
+//!   namespace, so the relay checks no owner there (`peer`).
+//! - An exposed listener is bound outside in step 1, as without the namespace. The connection to
+//!   the program's port must start inside, so the relay asks the socket factory there for each
+//!   socket and connects it itself (`factory`). When the factory ends, the relay ends.
+//!
 
 use std::fs::File;
 use std::io;
@@ -39,7 +50,9 @@ use std::time::{Duration, Instant};
 use landlock::{ABI, Scope};
 use sandy_core::{ExposedPort, ForwardedPort, SandboxError, SignalScope};
 
+use crate::factory::{self, Factory};
 use crate::filter;
+use crate::handover::{self, Handover, Inbox};
 use crate::helper::{self, Ready};
 use crate::peer::PeerCheck;
 
@@ -63,6 +76,9 @@ pub struct RelayConfig {
     /// stop it (see `Watchdog`).
     pub watchdog: bool,
     pub abi: ABI,
+    /// `ip = "private"`: the program's side is the sandbox's network namespace (see the module
+    /// documentation).
+    pub private: bool,
 }
 
 impl RelayConfig {
@@ -72,6 +88,7 @@ impl RelayConfig {
         forward: &[ForwardedPort],
         signals: SignalScope,
         abi: ABI,
+        private: bool,
     ) -> Option<Self> {
         let exposed = expose.iter().map(|expose| RelayPair {
             listen: expose.listen,
@@ -87,8 +104,26 @@ impl RelayConfig {
             forwarded: forward.len(),
             watchdog: signals == SignalScope::Any,
             abi,
+            private,
         })
     }
+
+    fn exposed(&self) -> &[RelayPair] {
+        &self.pairs[..self.pairs.len() - self.forwarded]
+    }
+
+    fn forwarded(&self) -> &[RelayPair] {
+        &self.pairs[self.pairs.len() - self.forwarded..]
+    }
+}
+
+/// What the process that enters the sandbox's network namespace still does for a started relay,
+/// with `RelayConfig::private`: bind the forward listeners and hand them over, and start the
+/// socket factory of the exposed ports. Both after `Namespaces::enter`.
+#[derive(Debug, Default)]
+pub struct Inside {
+    pub handover: Option<Handover>,
+    pub factory: Option<factory::Pending>,
 }
 
 /// One listening socket of the relay and what it does with the connections it accepts.
@@ -98,46 +133,105 @@ struct Served {
     target: SocketAddr,
     /// Whether a connection the kernel names as another user's is refused (see `peer`).
     refuse_other_users: bool,
+    /// With `RelayConfig::private`, an exposed port connects through the socket factory.
+    factory: Option<Arc<Factory>>,
 }
 
-/// Starts the relay and returns its process ID once it is confined and serving. `ended` is the
-/// read end of the guard's pipe with `children = "contained"` (see the module documentation).
-pub fn start(config: &RelayConfig, ended: Option<File>) -> Result<libc::pid_t, SandboxError> {
-    let exposed = config.pairs.len() - config.forwarded;
-    let listeners = config
-        .pairs
+impl Served {
+    fn new(listener: TcpListener, pair: &RelayPair) -> Served {
+        Served {
+            listener,
+            listen: pair.listen,
+            target: pair.target,
+            refuse_other_users: false,
+            factory: None,
+        }
+    }
+}
+
+/// Starts the relay and returns its process ID once it is confined, and what is left to do
+/// inside the namespace with `RelayConfig::private`. `ended` is the read end of the guard's pipe
+/// with `children = "contained"` (see the module documentation).
+pub fn start(
+    config: &RelayConfig,
+    ended: Option<File>,
+) -> Result<(libc::pid_t, Inside), SandboxError> {
+    let bind = |pair: &RelayPair| {
+        TcpListener::bind(pair.listen)
+            .map(|listener| Served::new(listener, pair))
+            .map_err(|error| SandboxError::io(format!("cannot listen on {}", pair.listen), error))
+    };
+    let mut inside = Inside::default();
+    let (factory, pending) = match config.private && !config.exposed().is_empty() {
+        true => {
+            let (factory, pending) = factory::pair()?;
+            (Some(Arc::new(factory)), Some(pending))
+        }
+        false => (None, None),
+    };
+    inside.factory = pending;
+    let mut listeners = config
+        .exposed()
         .iter()
-        .enumerate()
-        .map(|(index, pair)| {
-            let listener = TcpListener::bind(pair.listen).map_err(|error| {
-                SandboxError::io(format!("cannot listen on {}", pair.listen), error)
-            })?;
-            Ok(Served {
-                listener,
-                listen: pair.listen,
-                target: pair.target,
-                refuse_other_users: index >= exposed,
-            })
+        .map(|pair| {
+            let mut served = bind(pair)?;
+            served.factory = factory.clone();
+            Ok(served)
         })
         .collect::<Result<Vec<_>, SandboxError>>()?;
-    // The check needs a netlink socket, which the relay cannot open once it is confined, and it
-    // refuses the run here when the kernel cannot answer.
-    let peers = (config.forwarded > 0).then(PeerCheck::open).transpose()?;
+    let mut inbox = None;
+    let mut peers = None;
+    if config.private {
+        if !config.forwarded().is_empty() {
+            let addresses = config.forwarded().iter().map(|pair| pair.listen).collect();
+            let (handover, received) = handover::pair(addresses, "the relay")?;
+            inside.handover = Some(handover);
+            inbox = Some(received);
+        }
+    } else if !config.forwarded().is_empty() {
+        for pair in config.forwarded() {
+            let mut served = bind(pair)?;
+            served.refuse_other_users = true;
+            listeners.push(served);
+        }
+        // The check needs a netlink socket, which the relay cannot open once it is confined, and
+        // it refuses the run here when the kernel cannot answer.
+        peers = Some(PeerCheck::open()?);
+    }
     // SAFETY: getpid has no preconditions.
     let program = helper::pidfd_open(unsafe { libc::getpid() }, "the program")?;
-    helper::start("the relay", move |ready| {
-        relay_main(listeners, peers, program, ended, ready, config)
-    })
+    let relay = Relay {
+        listeners,
+        inbox,
+        factory,
+        peers,
+        program,
+        ended,
+    };
+    let pid = helper::start("the relay", move |ready| relay_main(relay, ready, config))?;
+    Ok((pid, inside))
 }
 
-fn relay_main(
+/// What the relay process owns.
+struct Relay {
     listeners: Vec<Served>,
+    /// With `RelayConfig::private`, where the forward listeners arrive.
+    inbox: Option<Inbox>,
+    factory: Option<Arc<Factory>>,
     peers: Option<PeerCheck>,
     program: OwnedFd,
     ended: Option<File>,
-    ready: Ready,
-    config: &RelayConfig,
-) {
+}
+
+fn relay_main(relay: Relay, ready: Ready, config: &RelayConfig) {
+    let Relay {
+        mut listeners,
+        inbox,
+        factory,
+        peers,
+        program,
+        ended,
+    } = relay;
     let mut keep: Vec<RawFd> = listeners
         .iter()
         .map(|served| served.listener.as_raw_fd())
@@ -146,8 +240,10 @@ fn relay_main(
     keep.extend(helper::STANDARD_DESCRIPTORS);
     keep.extend(ended.as_ref().map(AsRawFd::as_raw_fd));
     keep.extend(peers.as_ref().map(PeerCheck::fd));
+    keep.extend(inbox.as_ref().map(Inbox::fd));
+    keep.extend(factory.as_ref().map(|factory| factory.fd()));
     let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        sandy_relay::raise_descriptor_limit(listeners.len()).map_err(|error| {
+        sandy_relay::raise_descriptor_limit(config.pairs.len()).map_err(|error| {
             SandboxError::io("cannot raise the relay's descriptor limit", error)
         })?;
         // Created before the filter is installed, so only re-arming it has to pass the filter.
@@ -171,19 +267,73 @@ fn relay_main(
         }
         Ok::<Option<Watchdog>, SandboxError>(watchdog)
     }));
-    match started {
-        Ok(Ok(watchdog)) => {
-            ready.report();
-            serve_until_exit(
-                listeners,
-                peers.as_ref(),
-                &program,
-                ended.as_ref(),
-                watchdog.as_ref(),
-            );
-        }
+    let watchdog = match started {
+        Ok(Ok(watchdog)) => watchdog,
         Ok(Err(error)) => ready.fail(&error.to_string()),
         Err(_) => ready.fail("the relay panicked"),
+    };
+    ready.report();
+    let mut ends = vec![program.as_raw_fd()];
+    ends.extend(ended.as_ref().map(AsRawFd::as_raw_fd));
+    if let Some(inbox) = inbox {
+        let Some(received) = wait_for_listeners(inbox, &ends, watchdog.as_ref()) else {
+            return;
+        };
+        for (listener, pair) in received.into_iter().zip(config.forwarded()) {
+            if listener.set_nonblocking(true).is_err() {
+                return;
+            }
+            listeners.push(Served::new(listener, pair));
+        }
+    }
+    serve_until_exit(
+        listeners,
+        peers.as_ref(),
+        &ends,
+        factory.as_deref(),
+        watchdog.as_ref(),
+    );
+}
+
+/// Waits for the forward listeners that sandy binds inside the namespace (`handover`), while it
+/// watches `ends` as the poll loop does and keeps the watchdog armed. `None` when the program
+/// ended first or the listeners never came.
+fn wait_for_listeners(
+    inbox: Inbox,
+    ends: &[RawFd],
+    watchdog: Option<&Watchdog>,
+) -> Option<Vec<TcpListener>> {
+    let mut polls: Vec<libc::pollfd> = [inbox.fd()]
+        .into_iter()
+        .chain(ends.iter().copied())
+        .map(|fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    let tick = match watchdog {
+        Some(_) => WATCHDOG_TICK.as_millis() as libc::c_int,
+        None => -1,
+    };
+    loop {
+        if let Some(watchdog) = watchdog {
+            watchdog.rearm();
+        }
+        // SAFETY: `polls` holds `len` valid pollfd entries.
+        let ready = unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, tick) };
+        if ready < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return None;
+        }
+        if polls[1..].iter().any(|poll| poll.revents != 0) {
+            return None;
+        }
+        if polls[0].revents != 0 {
+            return inbox.receive().ok();
+        }
     }
 }
 
@@ -274,11 +424,14 @@ impl Watchdog {
 /// then closes the listeners at once and gives the accepted connections at most `DRAIN` to
 /// deliver what is left. A program that connects, writes and exits therefore does not lose its
 /// data, as it would not without a relay.
+///
+/// `ends` are the program's pidfd and the guard's pipe. With a socket factory the relay also
+/// ends when the factory has ended: without it, no exposed connection reaches the program.
 fn serve_until_exit(
     listeners: Vec<Served>,
     peers: Option<&PeerCheck>,
-    program: &OwnedFd,
-    ended: Option<&File>,
+    ends: &[RawFd],
+    factory: Option<&Factory>,
     watchdog: Option<&Watchdog>,
 ) {
     // One count per listener: clients of one port cannot take the connections of another.
@@ -292,21 +445,26 @@ fn serve_until_exit(
             .map(|count| count.load(Ordering::Acquire))
             .sum::<usize>()
     };
-    // The end watches come first; the listeners follow.
-    let ends: Vec<RawFd> = [program.as_raw_fd()]
-        .into_iter()
-        .chain(ended.map(AsRawFd::as_raw_fd))
-        .collect();
-    let mut polls: Vec<libc::pollfd> = ends
-        .iter()
-        .copied()
-        .chain(listeners.iter().map(|served| served.listener.as_raw_fd()))
-        .map(|fd| libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        })
-        .collect();
+    // The end watches come first; the listeners follow. The factory's socket carries answers
+    // for the connection threads, so only its end counts here: poll reports a hangup without
+    // being asked.
+    let readable = |fd| libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let mut polls: Vec<libc::pollfd> = ends.iter().copied().map(readable).collect();
+    polls.extend(factory.map(|factory| libc::pollfd {
+        fd: factory.fd(),
+        events: 0,
+        revents: 0,
+    }));
+    let watched = polls.len();
+    polls.extend(
+        listeners
+            .iter()
+            .map(|served| readable(served.listener.as_raw_fd())),
+    );
     let tick = match watchdog {
         Some(_) => WATCHDOG_TICK.as_millis() as libc::c_int,
         None => -1,
@@ -325,13 +483,13 @@ fn serve_until_exit(
             break;
         }
         let stopped = was_stopped();
-        let over = polls[..ends.len()].iter().any(|poll| poll.revents != 0);
+        let over = polls[..watched].iter().any(|poll| poll.revents != 0);
         // Connections that completed together with the end of the program are still taken. Not
         // so after a stop: the relay did not run, so its backlog may hold connections that were
         // made after the program ended.
         if !(over && stopped) {
-            let watched = polls[ends.len()..].iter().zip(&listeners).zip(&active);
-            for ((poll, served), count) in watched {
+            let waiting = polls[watched..].iter().zip(&listeners).zip(&active);
+            for ((poll, served), count) in waiting {
                 if poll.revents != 0 {
                     accept_all(served, peers, count);
                 }
@@ -416,10 +574,16 @@ fn accept_all(served: &Served, peers: Option<&PeerCheck>, active: &Arc<AtomicUsi
             continue;
         }
         let slot = Slot(Arc::clone(active));
+        let factory = served.factory.clone();
         // If the thread cannot start, the closure and its slot are dropped, which frees the slot.
         let _ = thread::Builder::new().spawn(move || {
             let _slot = slot;
-            let _ = sandy_relay::relay(client, target);
+            let _ = match factory {
+                Some(factory) => factory
+                    .connect(target)
+                    .and_then(|server| sandy_relay::relay_streams(client, server)),
+                None => sandy_relay::relay(client, target),
+            };
         });
     }
 }
@@ -521,6 +685,7 @@ mod tests {
             forwarded: 0,
             watchdog: true,
             abi: ABI::from(version),
+            private: false,
         };
         let other = other.local_addr().unwrap();
         // SAFETY: the child only runs `try_escapes` and leaves through `_exit`.

@@ -42,7 +42,10 @@ use seccompiler::BpfProgram;
 
 use crate::contain::{SIGNALED, START_FAILED, default_child_action};
 use crate::filter;
-use crate::helper::{block_signals, pipe, set_dumpable, set_undumpable};
+use crate::helper::{
+    block_signals, pipe, receive_descriptor, send_descriptor, set_dumpable, set_undumpable,
+    socket_pair,
+};
 use crate::launch::ensure_single_thread;
 use crate::plan::{LandlockConfig, PathRights};
 
@@ -472,7 +475,7 @@ pub struct Observer {
 /// interface is not the one sandy was built for.
 pub fn prepare(landlock: &LandlockConfig) -> Result<(Explain, Observer), SandboxError> {
     check_notification_sizes()?;
-    let (receive, send) = socket_pair()?;
+    let (receive, send) = socket_pair(libc::SOCK_STREAM, "the socket pair of the diagnostic mode")?;
     let observer = Observer {
         send: send.as_raw_fd(),
         program: filter::observer(&watched_calls()),
@@ -837,7 +840,11 @@ pub fn supervise(
             drop(report);
             program_main(report_write, &child_action, &previous, start)
         }
-        pid => pid,
+        pid => {
+            // As in `contain::run`: what the child needed is the child's now.
+            drop(start);
+            pid
+        }
     };
     drop(report_write);
     // Before the report is read: the execve that ends the report pipe is a watched call and
@@ -1192,104 +1199,6 @@ fn ignore(signal: libc::c_int) -> Result<(), SandboxError> {
         ));
     }
     Ok(())
-}
-
-/// A close-on-exec socket pair: (sandy's end, the program's end).
-fn socket_pair() -> Result<(OwnedFd, OwnedFd), SandboxError> {
-    let mut fds = [0; 2];
-    // SAFETY: socketpair writes two new descriptors into `fds`.
-    let created = unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-            0,
-            fds.as_mut_ptr(),
-        )
-    };
-    if created != 0 {
-        return Err(SandboxError::io(
-            "cannot create the socket pair of the diagnostic mode",
-            io::Error::last_os_error(),
-        ));
-    }
-    // SAFETY: both descriptors were just created and nothing else owns them.
-    unsafe { Ok((OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))) }
-}
-
-/// The control message of one descriptor, rounded up as the kernel expects it.
-const CONTROL_SIZE: usize = {
-    // SAFETY: CMSG_SPACE only computes a size.
-    unsafe { libc::CMSG_SPACE(mem::size_of::<RawFd>() as u32) as usize }
-};
-
-fn send_descriptor(socket: RawFd, descriptor: RawFd) -> io::Result<()> {
-    let mut body = [0u8; 1];
-    let mut buffer = [0u8; CONTROL_SIZE];
-    let mut iov = libc::iovec {
-        iov_base: body.as_mut_ptr().cast(),
-        iov_len: body.len(),
-    };
-    // SAFETY: msghdr is plain data; the fields below describe the buffers above, which live
-    // until the call has returned.
-    let mut message: libc::msghdr = unsafe { mem::zeroed() };
-    message.msg_iov = &mut iov;
-    message.msg_iovlen = 1;
-    message.msg_control = buffer.as_mut_ptr().cast();
-    message.msg_controllen = buffer.len() as _;
-    // SAFETY: the control buffer is large enough for one descriptor (CONTROL_SIZE), so
-    // CMSG_FIRSTHDR returns a pointer into it.
-    unsafe {
-        let header = libc::CMSG_FIRSTHDR(&message);
-        (*header).cmsg_level = libc::SOL_SOCKET;
-        (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN(mem::size_of::<RawFd>() as u32) as _;
-        libc::CMSG_DATA(header).cast::<RawFd>().write(descriptor);
-    }
-    // SAFETY: sends the message above over an open socket.
-    let sent = unsafe { libc::sendmsg(socket, &message, 0) };
-    if sent < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// Receives the notification descriptor. `None` when the program ended before it sent one.
-fn receive_descriptor(socket: &OwnedFd) -> Option<OwnedFd> {
-    let mut body = [0u8; 1];
-    let mut buffer = [0u8; CONTROL_SIZE];
-    let mut iov = libc::iovec {
-        iov_base: body.as_mut_ptr().cast(),
-        iov_len: body.len(),
-    };
-    // SAFETY: as in `send_descriptor`.
-    let mut message: libc::msghdr = unsafe { mem::zeroed() };
-    message.msg_iov = &mut iov;
-    message.msg_iovlen = 1;
-    message.msg_control = buffer.as_mut_ptr().cast();
-    message.msg_controllen = buffer.len() as _;
-    loop {
-        // SAFETY: receives into the buffers above.
-        let received = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, 0) };
-        if received < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        if received <= 0 {
-            return None;
-        }
-        break;
-    }
-    // SAFETY: reads the control message the kernel wrote into the buffer.
-    unsafe {
-        let header = libc::CMSG_FIRSTHDR(&message);
-        if header.is_null()
-            || (*header).cmsg_level != libc::SOL_SOCKET
-            || (*header).cmsg_type != libc::SCM_RIGHTS
-        {
-            return None;
-        }
-        let descriptor = libc::CMSG_DATA(header).cast::<RawFd>().read();
-        Some(OwnedFd::from_raw_fd(descriptor))
-    }
 }
 
 #[cfg(test)]

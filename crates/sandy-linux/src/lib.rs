@@ -6,11 +6,14 @@
 mod cgroup;
 mod contain;
 mod explain;
+mod factory;
 mod filter;
+mod handover;
 mod helper;
 mod host;
 mod launch;
 mod loader;
+mod namespace;
 mod openssl;
 mod peer;
 mod plan;
@@ -20,9 +23,13 @@ mod trust;
 mod watch;
 
 use sandy_core::streams::CreatableSocket;
-use sandy_core::{Backend, PlanItem, ResolvedPolicy, SandboxError, StatusReport, TargetCommand};
+use sandy_core::{
+    Backend, IpAccess, PlanItem, Requirement, ResolvedPolicy, SandboxError, StatusReport,
+    TargetCommand,
+};
 
 use host::HostCapabilities;
+use namespace::Namespaces;
 
 #[derive(Debug, Default)]
 pub struct LinuxBackend;
@@ -34,6 +41,27 @@ impl Backend for LinuxBackend {
 
     fn plan(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
         plan::plan_for(policy, &HostCapabilities::detect_for(policy)).items
+    }
+
+    /// The trial binds of the relay ports, and with `ip = "private"` a trial of the namespace
+    /// steps when the host says nothing against them. The forward listeners then bind inside the
+    /// sandbox's new network namespace, where no port is taken, so a busy port on the host's
+    /// loopback says nothing about them.
+    fn verify(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
+        let private = policy.ip == IpAccess::Private;
+        let mut items = sandy_core::verify::relay_listeners(policy);
+        if private {
+            items.retain(|item| item.requirement != Requirement::ForwardedPortsRelayed);
+            if namespace::support().is_ok()
+                && let Err(reason) = namespace::probe(Namespaces { network: true })
+            {
+                items.push(PlanItem::unavailable(
+                    Requirement::IpNetworkPrivate,
+                    format!("a trial of the sandbox's namespaces failed: {reason}"),
+                ));
+            }
+        }
+        items
     }
 
     fn notes(&self, policy: &ResolvedPolicy) -> Vec<String> {

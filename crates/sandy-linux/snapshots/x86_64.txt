@@ -214,8 +214,8 @@ checksum 0x8890d920da03e633
 42-511 allow
 
 [watcher denylist]
-instructions 121
-checksum 0xa831fe02797704c0
+instructions 126
+checksum 0xb2b4a08d48712a40
 0 EPERM
 1 allow
 2 EPERM
@@ -228,7 +228,9 @@ checksum 0xa831fe02797704c0
 14-15 allow
 16-27 EPERM
 28 allow
-29-59 EPERM
+29-38 EPERM
+39 allow
+40-59 EPERM
 60 allow
 61-218 EPERM
 219 allow
@@ -241,8 +243,8 @@ checksum 0xa831fe02797704c0
 272-511 EPERM
 
 [relay denylist]
-instructions 256
-checksum 0xf84f1a3d0c05c994
+instructions 265
+checksum 0x9528bc10d8e06e44
 0-1 allow
 2 EPERM
 3 allow
@@ -262,8 +264,8 @@ checksum 0xf84f1a3d0c05c994
 39 allow
 40-41 EPERM
 42-45 allow
-46-47 EPERM
-48 allow
+46 EPERM
+47-48 allow
 49-53 EPERM
 54-55 allow
 56-59 EPERM
@@ -301,6 +303,32 @@ checksum 0xf84f1a3d0c05c994
 335-434 EPERM
 435 allow
 436-511 EPERM
+
+[factory denylist]
+instructions 107
+checksum 0xdfba2738f8c4f915
+0-1 allow
+2 EPERM
+3 allow
+4-8 EPERM
+9-12 allow
+13 EPERM
+14-15 allow
+16-24 EPERM
+25 allow
+26-27 EPERM
+28 allow
+29-38 EPERM
+39 allow
+40-45 EPERM
+46 allow
+47-59 EPERM
+60 allow
+61-218 EPERM
+219 allow
+220-230 EPERM
+231 allow
+232-511 EPERM
 
 [allowlist]
 instructions 1910

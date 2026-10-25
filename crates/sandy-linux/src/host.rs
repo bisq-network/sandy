@@ -4,9 +4,10 @@
 use std::io;
 use std::ptr;
 
-use sandy_core::{ChildProcesses, ProtectedPath, ResolvedPolicy};
+use sandy_core::{ChildProcesses, IpAccess, ProtectedPath, ResolvedPolicy};
 
 use crate::filter;
+use crate::namespace;
 use crate::system::{self, SystemPath};
 use crate::trust;
 
@@ -32,6 +33,9 @@ pub struct HostCapabilities {
     /// Whether sandy may put a process into a process group, which `children = "contained"`
     /// needs. Only probed for a policy that needs it (`detect_for`).
     pub process_group: Support,
+    /// Whether the host rules out the user and network namespace of `ip = "private"`, as far as
+    /// it says without a trial. Only read for a policy that needs it (`detect_for`).
+    pub user_namespaces: namespace::Support,
     /// The candidates of the minimal system set that exist on this host.
     pub system_paths: Vec<SystemPath>,
     /// Where every candidate of the minimal system set is or would be, also missing ones.
@@ -52,6 +56,7 @@ impl HostCapabilities {
             thread_count: thread_count_support(),
             pidfd: pidfd_support(),
             process_group: Ok(()),
+            user_namespaces: Ok(()),
             seccomp: seccomp_support(),
             no_new_privs: no_new_privs_support(),
             unprivileged: unprivileged(),
@@ -69,6 +74,9 @@ impl HostCapabilities {
         let mut host = Self::detect();
         if policy.children == ChildProcesses::Contained {
             host.process_group = process_group_support();
+        }
+        if policy.ip == IpAccess::Private {
+            host.user_namespaces = namespace::support();
         }
         host
     }
@@ -226,17 +234,17 @@ struct CapabilitySets {
     permitted: u64,
 }
 
-const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+pub(crate) const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 
 #[repr(C)]
-struct CapHeader {
-    version: u32,
-    pid: libc::c_int,
+pub(crate) struct CapHeader {
+    pub(crate) version: u32,
+    pub(crate) pid: libc::c_int,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct CapData {
+pub(crate) struct CapData {
     effective: u32,
     permitted: u32,
     inheritable: u32,
