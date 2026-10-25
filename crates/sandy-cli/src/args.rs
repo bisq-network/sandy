@@ -114,6 +114,9 @@ impl Overrides {
         filesystem.read_exec.extend(self.read_exec);
         filesystem.read_write.extend(self.read_write);
         if let Some(system) = self.system {
+            if system == SystemAccess::Minimal && filesystem.system == SystemAccess::None {
+                note("--system", "minimal", "system", "none");
+            }
             filesystem.system = system;
         }
         if let Some(ip) = self.ip {
@@ -490,6 +493,29 @@ mod tests {
                 port: 8080
             }]
         );
+    }
+
+    /// `--system minimal` adds the system set to what the program may read, so it widens a file
+    /// that says `system = "none"`. The other way round it narrows the file and says nothing.
+    #[test]
+    fn a_system_set_over_a_file_without_one_is_named() {
+        let weakened = |file: SystemAccess, option: &str, from_file: bool| {
+            let mut policy = Policy::default();
+            policy.filesystem.system = file;
+            invocation(&["check", "--system", option])
+                .overrides
+                .apply(&mut policy, from_file)
+        };
+        assert_eq!(
+            weakened(SystemAccess::None, "minimal", true),
+            vec![
+                "--system minimal replaces system = \"none\" from the policy file and allows more \
+                 than the file does"
+                    .to_string()
+            ]
+        );
+        assert!(weakened(SystemAccess::Minimal, "none", true).is_empty());
+        assert!(weakened(SystemAccess::None, "minimal", false).is_empty());
     }
 
     #[test]

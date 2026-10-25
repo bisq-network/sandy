@@ -575,7 +575,8 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   process's recorded start time instead of `getppid`, before and after the registration. It
   refuses process 1: macOS has no child subreaper, so launchd is the parent of every orphan.
 - `sandy check` compiles the profile without applying it, so it reports operations or filters that
-  this macOS does not know.
+  this macOS does not know, and then applies it in a helper process that ends right after,
+  because a profile that compiles can still be refused when it is applied.
 - Refused: sandy running through Rosetta, and on Apple silicon a program without arm64 code, or
   a script whose interpreter has none; Rosetta cannot load its runtime inside the sandbox.
 - `docs/macos.md` describes the profile, the system set with a reason per entry, and the known
@@ -661,8 +662,8 @@ Details, limitations and sources: `docs/windows.md`.
 | Status | Meaning |
 |---|---|
 | program's status | `sandy run` started the program |
-| 128 + signal number | Linux and macOS with `process.children = "contained"`: a signal ended the program |
-| 125 | sandy failed or refused (invalid policy, unenforceable policy, a socket on a standard stream the policy denies, setup failure) |
+| 128 + signal number | Linux and macOS with `process.children = "contained"`, and Linux with `--explain`: a signal ended the program |
+| 125 | sandy failed or refused (invalid policy, unenforceable policy, a socket on a standard stream the policy denies, setup failure); where sandy stays the parent also a failure while it supervises the program |
 | 0 / 1 | `sandy check`: enforceable / not enforceable |
 
 The caller sees sandy's process ID where sandy stays the parent, and 125 means both "sandy
@@ -736,7 +737,7 @@ until the certificates exist.
 
 | Crate | Role | May depend on |
 |---|---|---|
-| `sandy-core` | policy, validation, requirements, plan, backend trait | nothing platform-specific |
+| `sandy-core` | policy, validation, requirements, plan, backend trait | no other sandy crate; `libc` on Unix |
 | `sandy-linux`, `sandy-macos`, `sandy-windows` | one backend each; empty on other platforms | `sandy-core`, `sandy-relay` |
-| `sandy-relay` | byte relay behind `expose` and `forward` | nothing platform-specific |
+| `sandy-relay` | byte relay behind `expose` and `forward` | no other sandy crate; `libc` or `windows-sys` |
 | `sandy-cli` | command line, backend selection, test probe | all of the above |

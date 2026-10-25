@@ -159,6 +159,7 @@ fn check_warns_when_an_option_weakens_the_policy_file() {
     let stderr = with(&["--children", "none", "--unix-sockets", "none"]);
     assert!(!stderr.contains("replaces"), "{stderr}");
 }
+
 /// `run` binds the listeners of exposed and forwarded ports outside the sandbox, so a port that
 /// another process holds makes it refuse. `check` binds them too and reports the same.
 #[test]
@@ -266,7 +267,10 @@ fn check_reports_a_script_whose_interpreter_cannot_be_executed() {
 #[test]
 fn check_reports_contained_children_inside_a_contained_sandbox() {
     if common::linux::landlock_abi() < 6 {
-        return;
+        return skip(
+            "landlock-abi-6",
+            "children = contained needs Landlock ABI 6",
+        );
     }
     let fixture = Fixture::new("check-nested");
     let inner = fixture.path("bin/sandy");
@@ -328,10 +332,6 @@ fn check_reports_contained_children_inside_a_contained_sandbox() {
     assert!(stderr.contains("process group"), "{stderr}");
 }
 
-/// Every program on macOS is linked dynamically, and `system = "none"` leaves out the root
-/// directory, /usr/lib and the dyld shared cache, so no program starts with it. check reported
-/// such a policy as enforced and the program then died at its start. A policy that reads the root
-/// directory brings those paths itself.
 /// `check --explain-path` says which rule decides a path. A backend that cannot answer must
 /// refuse the question instead of printing a guess that a caller would act on.
 #[test]
@@ -395,6 +395,10 @@ fn explain_is_refused_where_it_reports_nothing() {
     }
 }
 
+/// Every program on macOS is linked dynamically, and `system = "none"` leaves out the root
+/// directory, /usr/lib and the dyld shared cache, so no program starts with it. check reported
+/// such a policy as enforced and the program then died at its start. A policy that reads the root
+/// directory brings those paths itself.
 #[cfg(target_os = "macos")]
 #[test]
 fn check_refuses_system_none_without_the_root_directory() {

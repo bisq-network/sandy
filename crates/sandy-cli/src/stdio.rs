@@ -118,7 +118,7 @@ pub fn socket_on(stream: StandardStream) -> Result<Option<Socket>, String> {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Networking::WinSock::{
         AF_INET, AF_INET6, AF_UNIX, SO_ACCEPTCONN, SO_PROTOCOL_INFOW, SOCK_DGRAM, SOCK_SEQPACKET,
-        SOCK_STREAM, SOCKADDR, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAENOTCONN, WSAENOTSOCK,
+        SOCK_STREAM, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAENOTCONN, WSAENOTSOCK,
         WSAGetLastError, WSAPROTOCOL_INFOW, getpeername, getsockopt,
     };
     use windows_sys::Win32::System::Console::{
@@ -193,10 +193,12 @@ pub fn socket_on(stream: StandardStream) -> Result<Option<Socket>, String> {
     };
     let listening = result != SOCKET_ERROR && flag != 0;
 
-    let mut peer = MaybeUninit::<SOCKADDR>::zeroed();
-    let mut length = size_of::<SOCKADDR>() as i32;
+    // Room for every family: Winsock fails with WSAEFAULT when the peer's address, an IPv6 or
+    // AF_UNIX one for example, does not fit.
+    let mut peer = MaybeUninit::<SOCKADDR_STORAGE>::zeroed();
+    let mut length = size_of::<SOCKADDR_STORAGE>() as i32;
     // SAFETY: the buffer holds `length` bytes, which the call does not exceed.
-    let connected = if unsafe { getpeername(socket, peer.as_mut_ptr(), &mut length) } == 0 {
+    let connected = if unsafe { getpeername(socket, peer.as_mut_ptr().cast(), &mut length) } == 0 {
         true
     } else {
         // SAFETY: WSAGetLastError has no preconditions.

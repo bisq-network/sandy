@@ -407,7 +407,7 @@ it.
 |---|---|
 | the program's status | `sandy run` started the program |
 | 128 + signal number | Linux and macOS with `children = "contained"`, and Linux with `--explain`: a signal ended the program |
-| 125 | sandy failed or refused: invalid policy, a requirement this host cannot enforce, a socket on a standard stream that the policy denies, a setup error; with `children = "contained"` also a failure while sandy supervises the program |
+| 125 | sandy failed or refused: invalid policy, a requirement this host cannot enforce, a socket on a standard stream that the policy denies, a setup error; with `children = "contained"` or `--explain` also a failure while sandy supervises the program |
 | 0 / 1 | `sandy check`: the policy is enforceable / not enforceable |
 
 On Windows the program's 32-bit exit code is passed through unchanged.
@@ -423,7 +423,7 @@ without changing any exit status. sandy writes short lines to the descriptor, in
 |---|---|
 | `pid N` | the program runs; `N` is its process ID |
 | `exited N` | sandy saw the program exit with status `N` |
-| `signaled N` | sandy saw signal `N` end the program (Linux and macOS with `contained`) |
+| `signaled N` | sandy saw signal `N` end the program (Linux and macOS with `contained`, Linux with `--explain`) |
 | `failed` | sandy itself failed or refused; without a `pid` line the program never ran |
 
 In the exec model (Linux and macOS without `contained` and without `--explain`) sandy becomes
@@ -431,7 +431,9 @@ the program, so the record ends after `pid` and the caller's own wait status is 
 line right before it replaces itself with the program, so a `failed` line after it means that
 the `execve` failed. sandy makes the descriptor close-on-exec, and on Windows it keeps the
 handle out of what the program inherits, so the program never has it. Writing is best effort: a
-caller that closed the read end gets no record, and the program keeps running.
+caller that closed the read end gets no record, and the program keeps running. An empty record
+with status 125 means that sandy stopped before it took the descriptor, at a usage error for
+example.
 
 ## Policy reference
 
@@ -466,7 +468,9 @@ path_metadata = "deny"          # "deny" | "allow"
 appcontainer_name = "example.app"
 ```
 
-Unknown keys are errors, so a misspelled key never becomes a silent default.
+The block names every key; it is not a policy that runs as written, because `expose` and
+`forward` need `ip = "all"` and one path cannot be both `read_exec` and `read_write`. Unknown keys
+are errors, so a misspelled key never becomes a silent default.
 
 ### Rules
 
@@ -723,10 +727,10 @@ Recommendations:
    the `warning:` lines on standard error are advice about the policy and do not change the exit
    status.
 2. **Treat exit status 125 as "not started".** sandy prints the reason on standard error. Two
-   exceptions: a program can exit with 125 itself, and with `children = "contained"` sandy can
-   fail while it supervises a running program (its message is `sandy: run failed: ...`). Pass
-   `--status-fd` when you need to tell these apart, or need the program's process ID (see
-   [The status record](#the-status-record)).
+   exceptions: a program can exit with 125 itself, and with `children = "contained"` or
+   `--explain` sandy can fail while it supervises a running program (its message is
+   `sandy: run failed: ...`). Pass `--status-fd` when you need to tell these apart, or need the
+   program's process ID (see [The status record](#the-status-record)).
 3. **Keep sandy, the policy and the program's binaries out of every writable path.** Use separate
    directories for binaries (`read_exec`) and data (`read_write`). A program that can rewrite its
    own binary or library directory can escape at the next start.
@@ -843,7 +847,9 @@ stays although its standalone repository is archived.
 ### What CI runs
 
 The tests run on Ubuntu 22.04 and 24.04 (x86_64) and 24.04 (arm64), macOS 15, and Windows Server
-2022 and 2025. Each runner names the features it must be able to check and, on Linux, the lowest
+2022 and 2025. On Ubuntu 24.04 they run a second time for the musl target of the Linux release
+on that architecture, because musl and glibc differ in constants that sandy builds its filters
+from. Each runner names the features it must be able to check and, on Linux, the lowest
 Landlock ABI it must report; after the suite, CI compares the skips with the runner's list. The
 `audit` workflow runs `cargo deny`, weekly as well, because an advisory can appear without a
 push. The `release` workflow builds archives for Linux, macOS and Windows on x86_64 and arm64

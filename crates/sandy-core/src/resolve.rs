@@ -88,12 +88,17 @@ pub fn path_directories(path: Option<&std::ffi::OsStr>) -> Vec<ProtectedPath> {
     directories.iter().map(ProtectedPath::entry).collect()
 }
 
+/// As the kernel's limit for one path lookup (MAXSYMLINKS).
+const MAX_LINKS: usize = 40;
+
 /// `path` in the canonical form that policy paths have, also when it does not exist: the
 /// canonical form of its nearest existing ancestor with the rest appended. A location that does
-/// not exist counts, because the program could create it.
+/// not exist counts, because the program could create it, and so does the target of a symbolic
+/// link that does not exist yet: whoever creates it there changes what the link leads to.
 pub fn canonical_location(path: &Path) -> PathBuf {
     let mut names = Vec::new();
-    let mut base = path;
+    let mut base = path.to_path_buf();
+    let mut links = 0;
     loop {
         if let Ok(canonical) = base.canonicalize() {
             return names
@@ -101,11 +106,21 @@ pub fn canonical_location(path: &Path) -> PathBuf {
                 .rev()
                 .fold(canonical, |path, name| path.join(name));
         }
+        if links < MAX_LINKS
+            && let Ok(target) = std::fs::read_link(&base)
+        {
+            links += 1;
+            base = match base.parent() {
+                Some(parent) => parent.join(target),
+                None => target,
+            };
+            continue;
+        }
         let (Some(parent), Some(name)) = (base.parent(), base.file_name()) else {
             return path.to_path_buf();
         };
-        names.push(name);
-        base = parent;
+        names.push(name.to_os_string());
+        base = parent.to_path_buf();
     }
 }
 
@@ -469,10 +484,9 @@ pub fn shebang(file: &Path) -> Option<PathBuf> {
     /// As Linux (BINPRM_BUF_SIZE). macOS reads less.
     const HEADER: usize = 256;
 
+    let file = open_regular_file(file)?;
     let mut header = Vec::with_capacity(HEADER);
-    std::fs::File::open(file)
-        .and_then(|file| file.take(HEADER as u64).read_to_end(&mut header))
-        .ok()?;
+    file.take(HEADER as u64).read_to_end(&mut header).ok()?;
     let line = header.strip_prefix(b"#!")?;
     // Without a newline the kernel uses what it read, so the end of the header ends the line.
     let end = line.iter().position(|byte| *byte == b'\n');
@@ -481,6 +495,28 @@ pub fn shebang(file: &Path) -> Option<PathBuf> {
         .split(|byte| matches!(byte, b' ' | b'\t'))
         .find(|word| !word.is_empty())?;
     Some(path_from_bytes(word))
+}
+
+/// `file` opened for reading when it is a regular file, the only kind the kernel executes. The
+/// open does not wait: without O_NONBLOCK, opening a named pipe waits for a writer, and sandy
+/// would hang on a program path that names one.
+#[cfg(unix)]
+fn open_regular_file(file: &Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(file)
+        .ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
+/// Windows opens a named pipe without waiting.
+#[cfg(not(unix))]
+fn open_regular_file(file: &Path) -> Option<std::fs::File> {
+    let file = std::fs::File::open(file).ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
 }
 
 #[cfg(unix)]
@@ -528,14 +564,16 @@ fn resolve_path(path: &Path, access: PathAccess) -> Result<(PathRule, Traversal)
 /// The directory entries that resolving `path` passes, each as its canonical parent plus its
 /// name: every component of the path and of every symbolic link on the way, in order. Whoever
 /// can write the directory of one of them can make the path resolve to another object.
+///
+/// An entry that is no symbolic link is spelled as the file system spells it, which on macOS can
+/// differ from the given name in case and Unicode normalization, so that it compares with the
+/// canonical policy paths: the writable path itself, named in another case, is not inside it.
 #[cfg(unix)]
 fn traversed_entries(path: &Path) -> std::io::Result<Vec<PathBuf>> {
     use std::collections::VecDeque;
     use std::ffi::OsString;
     use std::path::Component;
 
-    /// As the kernel's limit for one path lookup (MAXSYMLINKS).
-    const MAX_LINKS: usize = 40;
     fn queue_front(pending: &mut VecDeque<OsString>, path: &Path) {
         for component in path.components().rev() {
             match component {
@@ -558,8 +596,8 @@ fn traversed_entries(path: &Path) -> std::io::Result<Vec<PathBuf>> {
         }
         let entry = resolved.join(&name);
         let metadata = std::fs::symlink_metadata(&entry)?;
-        entries.push(entry.clone());
         if metadata.file_type().is_symlink() {
+            entries.push(entry.clone());
             links += 1;
             if links > MAX_LINKS {
                 return Err(std::io::Error::other("too many levels of symbolic links"));
@@ -570,7 +608,8 @@ fn traversed_entries(path: &Path) -> std::io::Result<Vec<PathBuf>> {
             }
             queue_front(&mut pending, &target);
         } else {
-            resolved = entry;
+            resolved = entry.canonicalize()?;
+            entries.push(resolved.clone());
         }
     }
     Ok(entries)
@@ -587,6 +626,10 @@ fn traversed_entries(_path: &Path) -> std::io::Result<Vec<PathBuf>> {
 /// directory reachable under two paths (a bind mount, a macOS firmlink) counts as one. On Linux
 /// the physical location is compared as well, which also sees an alias of a subdirectory of
 /// `outer`, which has no ancestor with `outer`'s identity.
+///
+/// A symbolic link at `inner` itself counts where it lies, not where it leads, as
+/// `traversed_entries` spells its entries: a link outside `outer` that points at it is not inside
+/// it, and the place it leads to is an entry or a spelling of its own that the callers compare.
 fn is_within(inner: &Path, outer: &Path, mounts: &Mounts) -> bool {
     inner.starts_with(outer)
         || same_object_among_ancestors(inner, outer)
@@ -596,13 +639,16 @@ fn is_within(inner: &Path, outer: &Path, mounts: &Mounts) -> bool {
 #[cfg(unix)]
 fn same_object_among_ancestors(inner: &Path, outer: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let identity = |path: &Path| path.metadata().ok().map(|m| (m.dev(), m.ino()));
-    let Some(outer) = identity(outer) else {
+    let identity =
+        |metadata: std::io::Result<std::fs::Metadata>| metadata.ok().map(|m| (m.dev(), m.ino()));
+    let Some(outer) = identity(outer.metadata()) else {
         return false;
     };
-    inner
-        .ancestors()
-        .any(|ancestor| identity(ancestor) == Some(outer))
+    identity(inner.symlink_metadata()) == Some(outer)
+        || inner
+            .ancestors()
+            .skip(1)
+            .any(|ancestor| identity(ancestor.metadata()) == Some(outer))
 }
 
 #[cfg(not(unix))]
@@ -1769,6 +1815,56 @@ mod tests {
         ResolvedPolicy::resolve(&policy, None).unwrap();
     }
 
+    /// A writable path named through a symbolic link that lies outside it, a home directory link
+    /// to another disk for example, or `/tmp` on macOS. The program cannot change that link, so
+    /// the next start resolves the same way.
+    #[cfg(unix)]
+    #[test]
+    fn accepts_a_writable_path_named_through_a_link_outside_it() {
+        use std::os::unix::fs::symlink;
+        let root = temp_dir();
+        let (data, link) = (root.join("data"), root.join("link"));
+        fs::create_dir_all(data.join("sub")).unwrap();
+        symlink(&data, &link).unwrap();
+
+        let resolved = ResolvedPolicy::resolve(&policy_with(&[], &[], &[&link]), None).unwrap();
+        assert_eq!(resolved.paths[0].path, data);
+        let trusted = root.join("policy.toml");
+        fs::write(&trusted, b"").unwrap();
+        resolved.check_trusted(&[trusted]).unwrap();
+
+        // Control: a path that continues through the link into the writable path is refused.
+        let policy = policy_with(&[&link.join("sub")], &[], &[&link]);
+        assert!(matches!(
+            ResolvedPolicy::resolve(&policy, None),
+            Err(PolicyError::InsideWritable { .. })
+        ));
+    }
+
+    /// The file systems of macOS ignore case and Unicode normalization by default, so a writable
+    /// path may be named in another spelling than the one on disk. It is then the writable path
+    /// itself, not an entry inside it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn accepts_a_writable_path_named_in_another_spelling() {
+        let root = temp_dir();
+        let (composed, decomposed) = ("caf\u{e9}", "cafe\u{301}");
+        for (on_disk, given) in [("Data", "DATA"), (composed, decomposed)] {
+            fs::create_dir_all(root.join(on_disk).join("sub")).unwrap();
+            let given = root.join(given);
+            let policy = policy_with(&[], &[], &[&given]);
+            let resolved = ResolvedPolicy::resolve(&policy, None).unwrap();
+            assert_eq!(resolved.paths[0].path, root.join(on_disk));
+
+            // Control: a path below it in the same spelling lies inside it.
+            let policy = policy_with(&[&given.join("sub")], &[], &[&given]);
+            assert!(matches!(
+                ResolvedPolicy::resolve(&policy, None),
+                Err(PolicyError::InsideWritable { .. })
+            ));
+        }
+    }
+
     /// One directory under two paths is one object: rules 3 and 4 compare file identity too.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
@@ -1788,6 +1884,27 @@ mod tests {
         assert!(is_within(&other.join("sub"), &dir, &mounts));
         assert!(is_within(&dir.join("sub"), &other, &mounts));
         assert!(!is_within(&dir, &dir.join("sub"), &mounts));
+    }
+
+    /// A named pipe is no program. Reading its `#!` line must not wait for a writer that never
+    /// comes, or check and run hang instead of reporting.
+    #[cfg(unix)]
+    #[test]
+    fn a_named_pipe_has_no_shebang_and_does_not_block() {
+        let dir = temp_dir();
+        // Control: the `#!` line of a script.
+        let script = dir.join("script");
+        fs::write(&script, b"#!/bin/sh -e\n").unwrap();
+        assert_eq!(shebang(&script), Some(PathBuf::from("/bin/sh")));
+
+        let pipe = dir.join("pipe");
+        let path = std::ffi::CString::new(pipe.to_str().unwrap()).unwrap();
+        // SAFETY: the path is NUL-terminated.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o700) }, 0);
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || send.send(shebang(&pipe)));
+        let result = receive.recv_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(result, Ok(None));
     }
 
     /// Rule 3 by identity: one file under two names, one of them writable.
@@ -1962,7 +2079,17 @@ mod tests {
         let shell_file = ProtectedPath::entry(link.join(".bashrc"));
         assert_eq!(
             writable_conflict(&real, &[shell_file]),
-            Some((real, link.join(".bashrc")))
+            Some((real.clone(), link.join(".bashrc")))
+        );
+
+        // A link whose target does not exist yet, which the program could create.
+        let home = dir.join("home");
+        fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink("../real/profile", home.join(".profile")).unwrap();
+        let profile = ProtectedPath::entry(home.join(".profile"));
+        assert_eq!(
+            writable_conflict(&real, &[profile]),
+            Some((real, home.join(".profile")))
         );
     }
 

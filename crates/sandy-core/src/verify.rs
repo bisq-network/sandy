@@ -49,9 +49,10 @@ mod tests {
     fn a_busy_listener_is_reported_and_a_free_one_is_not() {
         let held = TcpListener::bind("127.0.0.1:0").unwrap();
         let busy = held.local_addr().unwrap();
+        // Any port of the program but the listener's; the listener can have the last one.
         let expose = vec![ExposedPort {
             listen: busy,
-            port: busy.port() + 1,
+            port: busy.port().checked_add(1).unwrap_or(1),
         }];
         let forward = vec![ForwardedPort {
             port: busy.port(),

@@ -28,13 +28,19 @@ jobs:
     env:
       # Paths of the build machine must not end up in the binary.
       RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/sandy ${{ contains(matrix.target, 'windows-msvc') && '-C target-feature=+crt-static' || '' }}
-      # Both are empty: these secrets do not exist. They gate the two signing steps below, which
-      # stay skipped until someone creates them. A step's `if` cannot read a secret, so they are
-      # read here.
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      WINDOWS_SIGNING_CERTIFICATE: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE }}
+      # Whether the signing secrets exist, which gates the two signing steps below; today they
+      # do not, so both steps stay skipped. A step's `if` cannot read a secret, so the test is
+      # made here, and only its answer is kept: every step sees this block, also the build, which
+      # runs the build scripts and macros of the dependencies. The secrets themselves go only to
+      # the step that signs.
+      APPLE_SIGNING: ${{ secrets.APPLE_SIGNING_IDENTITY != '' }}
+      WINDOWS_SIGNING: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE != '' }}
     steps:
+      # The token of the job stays out of .git/config, where the build scripts of the
+      # dependencies could read it: no step here pushes or fetches.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Check that the tag matches the crate version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -61,9 +67,10 @@ jobs:
       # runtime still lets sandy load /usr/lib/libsandbox.1.dylib and exec an unsigned program.
       # A bare Mach-O cannot be stapled, so Gatekeeper checks the notarization online.
       - name: Sign and notarize the macOS binary
-        if: ${{ contains(matrix.target, 'apple') && env.APPLE_SIGNING_IDENTITY != '' }}
+        if: ${{ contains(matrix.target, 'apple') && env.APPLE_SIGNING == 'true' }}
         shell: bash
         env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_SIGNING_CERTIFICATE: ${{ secrets.APPLE_SIGNING_CERTIFICATE }}
           APPLE_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
           APPLE_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
@@ -96,9 +103,10 @@ jobs:
       # (the PKCS#12 file, base64 encoded) and WINDOWS_SIGNING_CERTIFICATE_PASSWORD. Neither
       # exists today.
       - name: Sign sandy.exe
-        if: ${{ contains(matrix.target, 'windows') && env.WINDOWS_SIGNING_CERTIFICATE != '' }}
+        if: ${{ contains(matrix.target, 'windows') && env.WINDOWS_SIGNING == 'true' }}
         shell: pwsh
         env:
+          WINDOWS_SIGNING_CERTIFICATE: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE }}
           WINDOWS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
@@ -119,17 +127,20 @@ jobs:
           exe=sandy; [[ "${{ matrix.target }}" == *windows* ]] && exe=sandy.exe
           mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/$exe" README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          # Every entry carries the time of the commit, not of this build, so that the archive
+          # depends only on what it holds.
+          epoch=$(git log -1 --format=%ct)
           cd dist
           if [[ "${{ matrix.target }}" == *windows* ]]; then
+            # 7-Zip stores the modification time of each file, so the files get the commit's
+            # (GNU touch, from Git for Windows).
+            touch -d "@$epoch" "$name" "$name"/*
             7z a -tzip -bd "$name.zip" "$name" > /dev/null
           else
-            mtime="@$(git log -1 --format=%ct)"
+            # Only GNU tar sorts the entries and sets their time and owner.
             tar=tar; command -v gtar > /dev/null && tar=gtar
-            if $tar --version 2> /dev/null | grep -q GNU; then
-              $tar --sort=name --mtime="$mtime" --owner=0 --group=0 --numeric-owner -czf "$name.tar.gz" "$name"
-            else
-              tar -czf "$name.tar.gz" "$name"
-            fi
+            $tar --version 2> /dev/null | grep -q GNU || { echo "a reproducible archive needs GNU tar"; exit 1; }
+            $tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner -czf "$name.tar.gz" "$name"
           fi
           ls -l "$name"/"$exe" ./*.tar.gz ./*.zip 2> /dev/null || true
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -152,6 +163,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: first
+          persist-credentials: false
       - name: Build twice and compare
         shell: bash
         run: |

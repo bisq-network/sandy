@@ -72,9 +72,10 @@ allow = [
     { crate = "windows-link" },
     { crate = "winnow" },
 ]
-# A warning, not an error: the derive macros of serde and thiserror pull in two major versions
-# of syn, which this project cannot choose. Both are build-time only. cargo-deny refuses a crate
-# that is in `allow` and in `skip`, so a duplicate cannot be excused one crate at a time here.
+# A warning, not an error: the derive macros of serde and thiserror use syn 3, and the one of
+# enumflags2, which landlock uses, syn 2. This project cannot choose either; both are build-time
+# only. cargo-deny refuses a crate that is in `allow` and in `skip`, so a duplicate cannot be
+# excused one crate at a time here.
 multiple-versions = "warn"
 wildcards = "deny"
 # sandy's own crates depend on each other by path, which has no version to pin.

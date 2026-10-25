@@ -14,9 +14,19 @@ jobs:
       # Per runner: the lowest Landlock ABI it must report, and the features that must be
       # checkable on it (skipping one of them fails that test). The check step prints the ABI
       # the runner has, so raise the floor when a runner image moves to a newer kernel.
+      #
+      # A `target` runs the suite for that target instead of the runner's own. The Linux
+      # releases are static musl builds, a plain cargo test builds for glibc, and the two
+      # differ in constants that sandy compiles into its filters (O_ACCMODE includes O_PATH on
+      # musl), so the release targets run the suite too. Their skips have a list of their own:
+      # a static program has no loader to check.
       matrix:
         include:
           - os: ubuntu-24.04
+            min_landlock_abi: 5
+            require: pty
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
             min_landlock_abi: 5
             require: pty
           - os: ubuntu-22.04
@@ -25,30 +35,46 @@ jobs:
           - os: ubuntu-24.04-arm
             min_landlock_abi: 5
             require: pty
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            min_landlock_abi: 5
+            require: pty
           - os: macos-15
             require: pty
           - os: windows-2025
           - os: windows-2022
     runs-on: ${{ matrix.os }}
     env:
-      SANDY_TEST_RUNNER: ${{ matrix.os }}
-      SANDY_TEST_SKIP_LOG: ${{ runner.temp }}/sandy-skips.log
+      SANDY_TEST_RUNNER: ${{ matrix.target && format('{0}-{1}', matrix.os, matrix.target) || matrix.os }}
       SANDY_TEST_MIN_LANDLOCK_ABI: ${{ matrix.min_landlock_abi }}
       SANDY_TEST_REQUIRE: ${{ matrix.require }}
+      # The cargo option for an entry that names a target, else nothing. CARGO_BUILD_TARGET
+      # would not do: cargo refuses it empty.
+      TARGET_OPTION: ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
     steps:
+      # The token of the job stays out of .git/config, where the build scripts of the
+      # dependencies could read it: no step here pushes or fetches.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Show toolchain
         run: rustc --version && cargo --version
       - name: Check how this runner enforces the default policy
-        run: cargo run --bin sandy -- check ${{ runner.os == 'Windows' && '--appcontainer sandy.escape-tests' || '' }}
+        run: cargo run ${{ env.TARGET_OPTION }} --bin sandy -- check ${{ runner.os == 'Windows' && '--appcontainer sandy.escape-tests' || '' }}
+      # The skip log is named per step: the runner context, which holds the temporary
+      # directory, does not exist in the env block of a job, and the workflow would not load.
       - name: Test
-        run: cargo test --workspace --all-targets --no-fail-fast
+        env:
+          SANDY_TEST_SKIP_LOG: ${{ runner.temp }}/sandy-skips.log
+        run: cargo test ${{ env.TARGET_OPTION }} --workspace --all-targets --no-fail-fast
       - name: Compare the checks this runner skipped with its expected-skip list
         # Also after a failed test: a check that stopped running is what this step looks for. A
         # runner without a list in crates/sandy-cli/tests/expected-skips fails here and prints
         # the list to commit.
         if: ${{ !cancelled() }}
-        run: cargo test -p sandy-cli --test runner -- --ignored --exact skips_match_the_expected_list --nocapture
+        env:
+          SANDY_TEST_SKIP_LOG: ${{ runner.temp }}/sandy-skips.log
+        run: cargo test ${{ env.TARGET_OPTION }} -p sandy-cli --test runner -- --ignored --exact skips_match_the_expected_list --nocapture
       - name: Show sandbox denials (macOS)
         if: failure() && runner.os == 'macOS'
         run: log show --last 10m --style compact --predicate 'sender == "Sandbox" OR eventMessage CONTAINS "Sandbox"' | tail -n 300
@@ -72,7 +98,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+      - run: cargo clippy --workspace --all-targets --target x86_64-unknown-linux-musl -- -D warnings
       - run: cargo check --workspace --all-targets --target aarch64-apple-darwin

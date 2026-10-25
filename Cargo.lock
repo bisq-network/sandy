@@ -103,6 +103,7 @@ dependencies = [
 name = "sandy-core"
 version = "1.3.2"
 dependencies = [
+ "libc",
  "serde",
  "toml",
 ]

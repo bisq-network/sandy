@@ -17,7 +17,11 @@ jobs:
   deny:
     runs-on: ubuntu-24.04
     steps:
+      # The token of the job stays out of .git/config, where the build scripts of the
+      # dependencies could read it: no step here pushes or fetches.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # Built from crates.io rather than taken from an action, so that nothing but the pinned
       # toolchain and the lock file of cargo-deny itself decides what runs. The version is
       # pinned because a new major version of cargo-deny changes what deny.toml means.

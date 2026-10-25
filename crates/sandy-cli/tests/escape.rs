@@ -604,6 +604,29 @@ fn a_socket_on_standard_input_gives_no_network_access() {
     drop(waiting);
 }
 
+/// A service that is handed its connection on standard input runs with `ip = "all"`. The peer is
+/// an IPv6 address, which needs more room than an IPv4 one when sandy asks for it.
+#[test]
+fn a_connected_ipv6_socket_on_standard_input_runs_with_ip_all() {
+    let Ok(listener) = TcpListener::bind("[::1]:0") else {
+        return skip("ipv6-loopback", "this host cannot listen on ::1");
+    };
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (connection, _) = listener.accept().unwrap();
+    let sandbox_args = ["--ip".to_string(), "all".to_string()];
+    let output = run_with_stdin(
+        &run_args(&sandbox_args, &[("pid", "-")]),
+        stdin_from(connection),
+    );
+    assert!(
+        output.status.success(),
+        "a connected IP socket must be allowed with ip = \"all\": {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse(&output)[0].assert_ok();
+    drop(client);
+}
+
 /// The one socket that gives no more than a pipe: a connected Unix stream or seqpacket socket,
 /// which is how libuv, journald and `ssh` without a terminal pass a standard stream. Refusing it
 /// would break those callers, so sandy starts the program. A datagram pair can be pointed
