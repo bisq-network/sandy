@@ -21,7 +21,7 @@ const UDP_SEND_PAYLOAD: &[u8] = b"sent through an inherited socket";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.len() % 2 != 0 {
+    if !args.len().is_multiple_of(2) {
         eprintln!("usage: sandy-probe ACTION TARGET [ACTION TARGET]...");
         std::process::exit(2);
     }

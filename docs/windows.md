@@ -1022,8 +1022,9 @@ about a path is worse than none, so the backend answers nothing and sandy refuse
 
 Host: Windows 11 build 26200 (VM), binaries built for `x86_64-pc-windows-gnu`. The tests run in
 an elevated SSH session and without administrator rights. Latest elevated run, every test
-passing: `sandy_core` 55, `sandy_relay` 11, `sandy_windows` 74, `escape` 20, `escape_windows` 59,
-`expose` 4, `forward` 3, `children` 5, `parent` 5, `check` 11, `runner` 3, `review_windows` 7. The
+passing: `sandy_core` 65, `sandy_relay` 12, `sandy_windows` 77, `sandy` 14, `escape` 27,
+`escape_windows` 63, `expose` 5, `forward` 3, `children` 5, `parent` 5, `check` 11, `runner` 3,
+`review_windows` 7. The
 COM check of `review_windows` is skipped there: the SSH session is session 0, where `ole32.dll`
 does not load in an AppContainer (limitation 13), so a denial would not be the COM boundary.
 Earlier non-administrator runs used a scheduled task with `/RL LIMITED` (medium integrity,

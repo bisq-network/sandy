@@ -175,10 +175,10 @@ fn contained(
 ) -> PlanItem {
     let enforced = |mechanism: String| PlanItem::enforced(requirement, mechanism);
     let unavailable = |reason: String| PlanItem::unavailable(requirement, reason);
-    if needs_job(requirement) {
-        if let Some(reason) = job_problem(host) {
-            return unavailable(reason);
-        }
+    if needs_job(requirement)
+        && let Some(reason) = job_problem(host)
+    {
+        return unavailable(reason);
     }
     let bypass = host
         .windows

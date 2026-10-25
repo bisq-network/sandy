@@ -150,8 +150,8 @@ impl fmt::Display for Sid {
             .iter()
             .fold(0u64, |value, &byte| (value << 8) | u64::from(byte));
         write!(f, "S-{}-{authority}", bytes[0])?;
-        for chunk in bytes[8..].chunks_exact(4) {
-            let sub = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        for chunk in bytes[8..].as_chunks::<4>().0 {
+            let sub = u32::from_le_bytes(*chunk);
             write!(f, "-{sub}")?;
         }
         Ok(())

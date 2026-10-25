@@ -74,9 +74,10 @@ pub fn interpreter(program: &Path) -> Option<PathBuf> {
     file.seek(SeekFrom::Start(offset)).ok()?;
     let mut table = vec![0u8; ENTRY * count];
     file.read_exact(&mut table).ok()?;
-    let interp = table
-        .chunks_exact(ENTRY)
-        .find(|entry| u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]) == PT_INTERP)?;
+    let interp =
+        table.as_chunks::<ENTRY>().0.iter().find(|entry| {
+            u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]) == PT_INTERP
+        })?;
     let at = word(interp, 8);
     let size = word(interp, 32);
     if size == 0 || size > PATH_MAX {
