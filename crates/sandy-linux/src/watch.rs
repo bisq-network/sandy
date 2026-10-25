@@ -39,6 +39,7 @@ use sandy_core::{ParentProcess, SandboxError};
 
 use crate::filter;
 use crate::helper::{self, Ready};
+use crate::launch::Threads;
 
 /// How long the program may take to end after SIGTERM before the watcher kills it.
 pub const GRACE: Duration = Duration::from_secs(5);
@@ -56,7 +57,7 @@ pub fn start(parent: ParentProcess, abi: ABI) -> Result<(), SandboxError> {
     }
     // SAFETY: getpid has no preconditions.
     let program = helper::pidfd_open(unsafe { libc::getpid() }, "the program")?;
-    helper::start("the watcher", move |ready| {
+    helper::start("the watcher", &Threads::open()?, move |ready| {
         watcher_main(&parent_fd, &program, ready, abi)
     })?;
     Ok(())

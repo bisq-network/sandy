@@ -138,6 +138,11 @@ pub struct ResolvedPolicy {
     pub paths: Vec<PathRule>,
     /// Canonical path of the target executable, when the policy was resolved for one.
     pub program: Option<PathBuf>,
+    /// Every symbolic link that resolving the policy paths and the program passed, each where it
+    /// lies (its canonical directory plus its name), sorted. A backend that shows the program
+    /// only the policy paths recreates them, so the names the policy was written with still
+    /// lead there.
+    pub links: Vec<PathBuf>,
     pub system: SystemAccess,
     pub ip: IpAccess,
     pub unix_sockets: NetworkAccess,
@@ -182,6 +187,13 @@ impl ResolvedPolicy {
             traversals.push(traversal);
         }
 
+        let mut links: Vec<PathBuf> = traversals
+            .iter()
+            .flat_map(|traversal| traversal.links.iter().cloned())
+            .collect();
+        links.sort();
+        links.dedup();
+
         let mounts = Mounts::read()?;
         let paths = merge(rules)?;
         check_writable_not_executable(&paths, &mounts)?;
@@ -201,6 +213,7 @@ impl ResolvedPolicy {
         Ok(ResolvedPolicy {
             paths,
             program: program_path,
+            links,
             system: filesystem.system,
             ip: policy.network.ip,
             unix_sockets: policy.network.unix_sockets,
@@ -589,10 +602,12 @@ fn path_from_bytes(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
-/// The directory entries that resolving one policy path passes, and the path as given.
+/// The directory entries that resolving one policy path passes, the symbolic links among them,
+/// and the path as given.
 struct Traversal {
     path: PathBuf,
     entries: Vec<PathBuf>,
+    links: Vec<PathBuf>,
 }
 
 fn resolve_path(path: &Path, access: PathAccess) -> Result<(PathRule, Traversal), PolicyError> {
@@ -605,9 +620,11 @@ fn resolve_path(path: &Path, access: PathAccess) -> Result<(PathRule, Traversal)
     };
     let canonical = path.canonicalize().map_err(not_found)?;
     let metadata = canonical.metadata().map_err(not_found)?;
+    let (entries, links) = traversed_entries(path).map_err(not_found)?;
     let traversal = Traversal {
         path: path.to_path_buf(),
-        entries: traversed_entries(path).map_err(not_found)?,
+        entries,
+        links,
     };
     let rule = PathRule {
         path: canonical,
@@ -625,11 +642,12 @@ fn resolve_path(path: &Path, access: PathAccess) -> Result<(PathRule, Traversal)
 /// An entry that is no symbolic link is spelled as the file system spells it, which on macOS and
 /// Windows can differ from the given name in case (and on macOS in Unicode normalization), so
 /// that it compares with the canonical policy paths: the writable path itself, named in another
-/// case, is not inside it.
-fn traversed_entries(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+/// case, is not inside it. The second list holds the symbolic links among the entries.
+fn traversed_entries(path: &Path) -> std::io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     use std::collections::VecDeque;
 
     let mut entries = Vec::new();
+    let mut links_passed = Vec::new();
     let (mut resolved, names) = lookup(Path::new(""), path)?;
     let mut pending: VecDeque<OsString> = names.into();
     let mut links = 0;
@@ -642,6 +660,7 @@ fn traversed_entries(path: &Path) -> std::io::Result<Vec<PathBuf>> {
         let metadata = std::fs::symlink_metadata(&entry)?;
         if metadata.file_type().is_symlink() {
             entries.push(entry.clone());
+            links_passed.push(entry.clone());
             links += 1;
             if links > MAX_LINKS {
                 return Err(std::io::Error::other("too many levels of symbolic links"));
@@ -657,7 +676,7 @@ fn traversed_entries(path: &Path) -> std::io::Result<Vec<PathBuf>> {
             entries.push(resolved.clone());
         }
     }
-    Ok(entries)
+    Ok((entries, links_passed))
 }
 
 /// Where looking up `path` from the directory `base` starts, and the names it then looks up in
@@ -2284,6 +2303,34 @@ mod tests {
             ResolvedPolicy::resolve(&policy, None),
             Err(PolicyError::InsideWritable { .. })
         ));
+    }
+
+    /// Every symbolic link on the way to a policy path or the program is recorded where it lies,
+    /// also a link inside the target of another link, and a path without links adds none.
+    #[cfg(unix)]
+    #[test]
+    fn records_the_links_on_the_way_to_policy_paths() {
+        use std::os::unix::fs::symlink;
+        let root = temp_dir();
+        fs::create_dir_all(root.join("real/bin")).unwrap();
+        fs::create_dir_all(root.join("plain")).unwrap();
+        fs::write(root.join("real/bin/tool"), b"").unwrap();
+        symlink("real", root.join("first")).unwrap();
+        symlink("bin/tool", root.join("real/shortcut")).unwrap();
+
+        let through = root.join("first/shortcut");
+        let plain = root.join("plain");
+        let program = root.join("first/bin/tool");
+        let resolved =
+            ResolvedPolicy::resolve(&policy_with(&[&through, &plain], &[], &[]), Some(&program))
+                .unwrap();
+        assert_eq!(
+            resolved.links,
+            vec![root.join("first"), root.join("real/shortcut")]
+        );
+
+        let resolved = ResolvedPolicy::resolve(&policy_with(&[&plain], &[], &[]), None).unwrap();
+        assert!(resolved.links.is_empty(), "{:?}", resolved.links);
     }
 
     /// The file systems of macOS ignore case and Unicode normalization by default, so a writable

@@ -593,7 +593,11 @@ exceptions:
 | Linux | `ip = "client"` | a UDP socket that is not connected receives datagrams from every sender, at the port the kernel chose for it, and before Landlock ABI 10 at any port the program binds |
 | Linux | `forward` with `ip = "client"` or `ip = "all"` | another local user can deliver a write to the forwarded service, through a connection it closed before the relay asked who owns it, and that no longer carries its user (from the close on Linux 6.8, after the timewait record on newer kernels) |
 | Linux | `ip = "private"` | processes of the user that runs sandy can enter the sandbox's network namespace, which belongs to that user, and reach the program's ports and forwarded ports there without a relay, and the egress port |
-| Linux | `path_metadata = "deny"` with a `read` or `read_exec` path | the mode, except the setuid and setgid bits, and the times of a file or directory the program may only read, through a descriptor it opened for reading (`fchmod`, `futimens`) |
+| Linux | `path_metadata = "deny"` with a `read` or `read_exec` path, without `view = "policy"` | the mode, except the setuid and setgid bits, and the times of a file or directory the program may only read, through a descriptor it opened for reading (`fchmod`, `futimens`) |
+| Linux | `view = "policy"` | `statfs` of a path in the view reports the host's file system there: its type, size, free space and number of files |
+| Linux | `view = "policy"` | the directories above a granted path exist in the view, with their names |
+| Linux | `view = "policy"` | the link count of a granted file counts its names outside the view |
+| Linux | `view = "policy"` with a `/proc` path | the mount table names the host's device, file system and mount options of every mount of the view |
 | macOS | `signals = "isolated"` | SIGIO (to a process of any user), and SIGURG with an `ip` other than `"none"`, through the owner ioctls of sockets and pipes; without `children = "contained"` also joining another job of the terminal session and stopping it |
 | macOS | `ip = "client"` | a UDP socket that is not connected receives datagrams from every sender, at any port the program binds |
 | macOS | `unix_sockets = "all"` | whether a path outside the policy exists, and its path through `getattrlist`, also by inode number through `/.vol` |
@@ -717,8 +721,8 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   has one thread, Landlock `restrict_self`, up to four seccomp filters (TSYNC), `execve`.
   Everything that can fail on bad input is prepared before the first step. Landlock restricts
   the calling thread, so the thread check is what makes the domain cover the whole process.
-  With `ip = "private"` the namespaces come first, after the relay, the egress broker and the
-  watcher have started.
+  With `ip = "private"` or `view = "policy"` the namespaces come first, after the relay, the
+  egress broker and the watcher have started.
 - `ip = "private"`: one `unshare(CLONE_NEWUSER | CLONE_NEWNET)` in the process that becomes the
   program (sandy in the exec model, so the program keeps its process ID; the forked child with
   `contained` and with `--explain`), then `setgroups` denied and single-ID maps of the user's own
@@ -742,10 +746,25 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   and removes from its environment. `--elevate` uses pkexec: of sandy's own root-only file, or of
   a fixed shell script that copies `/proc/PID/exe` of its waiting parent, checks the bytes and
   the parent, and runs the copy's setup. Details in [linux.md](linux.md), "Setup on Ubuntu".
+- `view = "policy"`: a mount namespace in the same `unshare`, with the user namespace (the network
+  namespace only with `ip = "private"`). Right after the maps the process builds the view with
+  descriptors only: `/` private; every path of a Landlock rule opened with `open_rule` after the
+  `unshare`, because a descriptor of the host's namespace cannot be bound; each cloned with its
+  submounts (`open_tree` with `OPEN_TREE_CLONE | AT_RECURSIVE`), given its flags on every mount
+  (`mount_setattr` with `AT_RECURSIVE`) and moved onto its own path of a new tmpfs root
+  (`move_mount`). A bind is read-only unless a writable path holds it, without execute unless a
+  `read_exec` path, the program file, the loader or a library directory of the system set holds
+  it, nosuid, and nodev outside `/dev`; `/proc` is read-only. The links on the way to the paths
+  are recreated, `/dev` holds null, zero, full, random and urandom, and `tty` and a devpts
+  instance of its own with a terminal, the tmpfs becomes read-only, and `pivot_root` makes it
+  the root and detaches the old one. Landlock decides access as without the view. It requires
+  the fix of Landlock erratum 3, read from the errata bitmask; `run` refuses a directory on a
+  standard stream, through which the program would reach the hidden paths by name.
 - Landlock (ABI 1 or newer, read from the kernel at run time) handles every file system right of
   the ABI. Writable paths never get execute, symbolic link, named pipe or device rights. Each
   rule path is opened without following links and must still be the file sandy planned with. ABI 6
-  scopes signals (required for `signals = "isolated"`) and abstract Unix sockets; ABI 9 denies
+  scopes signals (required for `signals = "isolated"`, unless `children = "contained"` runs the
+  program in a PID namespace) and abstract Unix sockets; ABI 9 denies
   pathname Unix sockets when `unix_sockets = "none"`; ABI 4 denies TCP when `ip = "none"`. With
   `ip = "client"` a second ruleset, built with raw system calls because the `landlock` crate
   does not know the UDP right, lets sockets bind only port 0, a port the kernel chooses: TCP from
@@ -792,6 +811,16 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   is gone. With exposed or forwarded ports the guard also watches the relay with a pidfd, and the
   egress broker with another; when one ends first, it tells sandy before the kill, and sandy
   exits with status 125 (rule 5 of "Forwarded ports").
+  Where the host gives sandy a user namespace (for `contained` alone after a trial in a forked
+  child), the child unshares a PID namespace and forks an init of sandy, PID 1, and the program,
+  PID 2, which leads a group of its own; both become sandy's children. The init reaps the
+  namespace's orphans and ends when the program or sandy ends (pidfds), and the guard kills it
+  through a pidfd, which ends every process of the namespace. The guard, sandy and the init are
+  outside the program's group and namespace, so below Landlock ABI 6 the namespace isolates
+  signals: `kill`, `pidfd_open`, `F_SETOWN` and the priority calls reach no outside process by
+  ID. With the file system view and `/proc` granted, a new `/proc` of the namespace
+  (`subset=pid`) replaces the granted one. `setsid` and `setpgid` stay denied, so a policy
+  behaves the same with and without the namespace.
 - `process.end_with_parent`: a watcher process, forked twice like the relay, polls pidfds for
   sandy's parent and for the program (with `contained`: the supervising sandy). When the parent
   ends, it sends SIGTERM and SIGCONT and, 5 seconds later, SIGKILL. Like the relay, it runs in a
@@ -835,9 +864,10 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   every connection is still checked (docs/linux.md, "Egress broker").
 - Refused: no Landlock (the reason names the fix), no seccomp, root or any capability, a writable
   path that overlaps the minimal system set (rule 6), a program whose ELF loader no executable
-  path covers (the kernel opens it during `execve`), `ip = "private"` where user namespaces
-  are disabled or a trial of them fails (under Ubuntu's AppArmor restriction it needs setup), and
-  `egress` with it, or where the kernel does not answer the broker's route lookups.
+  path covers (the kernel opens it during `execve`), `ip = "private"` and `view = "policy"` where
+  user namespaces are disabled or a trial of them fails (under Ubuntu's AppArmor restriction they
+  need setup), `egress` with them, or where the kernel does not answer the broker's route
+  lookups, and `view = "policy"` on a kernel without the fix of Landlock erratum 3.
 
 ### macOS
 

@@ -47,9 +47,15 @@ const START: &str = if cfg!(target_os = "macos") {
 
 /// Why this host cannot run `children = "contained"`, if it cannot.
 fn unsupported() -> Option<&'static str> {
+    // Below Landlock ABI 6 a PID namespace isolates signals for `contained`, where the host gives
+    // sandy one.
     #[cfg(target_os = "linux")]
-    if common::linux::landlock_abi() < 6 {
-        return Some("signal isolation needs Landlock ABI 6");
+    if common::linux::landlock_abi() < 6
+        && !sandy(["check", "--children", "contained", "--signals", "isolated"])
+            .status
+            .success()
+    {
+        return Some("signal isolation needs Landlock ABI 6 or a PID namespace");
     }
     None
 }
@@ -98,6 +104,20 @@ fn children_contained_ends_what_the_program_leaves_behind() {
     );
 }
 
+/// The process ID the record names for the program that reported `own` as its own. On Linux the
+/// program can run in a PID namespace of its own, where it is process 2; the record then names
+/// its ID outside, which the caller can signal (`pid_linux.rs` checks that ID).
+fn recorded_program(own: &str, record: &str) -> String {
+    if cfg!(target_os = "linux") && own == "2" {
+        let named = record
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("pid "));
+        return named.unwrap_or_default().to_string();
+    }
+    own.to_string()
+}
+
 /// sandy stays the parent with `contained`, so its own process ID is not the program's and its
 /// exit status does not say how the program ended. `--status-fd` carries both.
 #[test]
@@ -110,7 +130,7 @@ fn the_status_record_names_the_program_and_how_it_ended() {
     let args = run_args(&contained(&fixture), &[("pid", "x"), ("exit", "7")]);
     let (output, record) = sandy_with_status(&args);
     assert_eq!(output.status.code(), Some(7), "{output:?}");
-    let program = parse(&output)[0].detail.clone();
+    let program = recorded_program(&parse(&output)[0].detail, &record);
     assert_eq!(record, format!("pid {program}\nexited 7\n"), "{record}");
 }
 
@@ -166,7 +186,7 @@ fn a_signal_death_is_in_the_status_record() {
     );
     let (output, record) = sandy_with_status(&args);
     assert_eq!(output.status.code(), Some(128 + 15), "{output:?}");
-    let program = parse(&output)[0].detail.clone();
+    let program = recorded_program(&parse(&output)[0].detail, &record);
     assert_eq!(record, format!("pid {program}\nsignaled 15\n"), "{record}");
 }
 

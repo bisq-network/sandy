@@ -674,7 +674,8 @@ The block names every key; it is not a policy that runs as written, because `exp
 ### Processes
 
 - `signals = "isolated"` limits signals to processes in the same sandbox. On Linux this needs
-  Landlock ABI 6 (kernel 6.12 or newer); older kernels refuse such a policy. The kernel also
+  Landlock ABI 6 (kernel 6.12 or newer), or with `children = "contained"` a PID namespace, which
+  sandy creates where unprivileged user namespaces work; otherwise sandy refuses such a policy. The kernel also
   signals whole process groups for terminal job control, without that check, so on Linux the
   program can then neither join another job's process group nor take the terminal from the
   foreground job nor resize it, nor signal the other side of a pseudo-terminal with `TIOCSIG`.
@@ -700,7 +701,10 @@ The block names every key; it is not a policy that runs as written, because `exp
     parent of the program instead of becoming the program: it forwards signals, gives the program
     the terminal when the program uses it, and exits with the program's status (128 plus the
     signal number if a signal ended the program). Processes in the sandbox cannot call `setsid` or
-    `setpgid`. On macOS they cannot call `posix_spawn` either, because its flags can move the new
+    `setpgid`. On Linux, where unprivileged user namespaces work, the program also runs as process
+    2 in a PID namespace of its own, below an init of sandy, and the namespace ends with the
+    program or sandy, also when sandy and its guard are both killed; inside, the program's
+    parent and process group have no process ID, so `getppid` returns 0. On macOS they cannot call `posix_spawn` either, because its flags can move the new
     process out of the group as well: programs that start processes with `fork` and `exec` (for
     example shells) work, but programs that use `posix_spawn` get `EPERM` when they start one.
     Among them are Rust's `std::process::Command` (unless it sets `pre_exec`), Java's
@@ -764,7 +768,8 @@ Landlock does not control `chmod`, `chown`, `utimensat` and `setxattr`. With the
 `path_metadata = "deny"`, sandy denies these calls when they take a path, everywhere, also inside
 writable paths, and the owner and extended attribute calls on an open file (`fchown`, `fsetxattr`)
 too. The mode and time calls on an open file (`fchmod`, `futimens`) keep working, also on a file
-the program may only read, which `sandy check` warns about. The file system ioctls that change a
+the program may only read, which `sandy check` warns about; with `view = "policy"` such a file is
+on a read-only mount, where they fail. The file system ioctls that change a
 file the same way, and fs-verity, fscrypt, deduplication and btrfs subvolume ioctls, are denied
 under every policy. Tools that change metadata by path (`install`, `cp -a` on a directory,
 `rsync -a`, `unzip`, `git`) need `"allow"`; then the program can change the metadata of every file
@@ -802,6 +807,14 @@ metadata through the descriptor they wrote.
   network namespace connects for the program. Other users cannot reach its port either, and with
   `children = "contained"` sandy ends the program when the broker dies, as when its relay dies
   ([docs/linux.md](docs/linux.md), "Egress broker").
+- **`view = "policy"`** runs the program in a mount namespace that holds only its policy paths
+  and the system set, so it needs unprivileged user namespaces as `ip = "private"` does (on
+  Ubuntu 23.10 and newer `sandy check` exits with status 2 until `sandy setup`), and a kernel with
+  the fix of Landlock erratum 3. A rename between two writable paths fails with `EXDEV`, a file
+  outside a `read_exec` path cannot be mapped as code, `/proc` is read-only, and `sandy check`
+  warns about what the view still shows: the host's file systems through `statfs`, the
+  directories above granted paths, link counts, and with `/proc` the mount table
+  ([docs/linux.md](docs/linux.md), "File system view").
 - **Name resolution across network changes.** A Landlock rule binds a file, so a file the
   system replaces by rename is lost to a program that is already running. With `--ip all` or
   `--ip client`, sandy grants systemd-resolved's directory, so name resolution keeps working when

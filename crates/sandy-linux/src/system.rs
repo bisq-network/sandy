@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemUse {
     Read,
+    /// Read, and map as code: the shared libraries, which the loader maps with `PROT_EXEC` after
+    /// a read open. Landlock grants them only reading; a file system view leaves them executable.
+    Library,
     /// Read and execute. Only for the dynamic loader, which the kernel opens for execution.
     Execute,
     /// Read and write a device that discards writes.
@@ -28,6 +31,9 @@ pub struct SystemPath {
     pub is_dir: bool,
     pub usage: SystemUse,
     pub needed: Needed,
+    /// The symbolic links that the candidate's own name passes, each where it lies, so that a
+    /// file system view can recreate the names programs use (`/lib64` on a merged `/usr`).
+    pub links: Vec<PathBuf>,
 }
 
 /// Dynamic loaders (glibc, musl) and the musl library path file of this CPU architecture.
@@ -47,10 +53,10 @@ const ARCH_CANDIDATES: &[(&str, SystemUse)] = &[
 const ARCH_CANDIDATES: &[(&str, SystemUse)] = &[];
 
 const CANDIDATES: &[(&str, SystemUse, Needed)] = &[
-    ("/usr/lib", SystemUse::Read, Needed::Always),
-    ("/usr/lib64", SystemUse::Read, Needed::Always),
-    ("/lib", SystemUse::Read, Needed::Always),
-    ("/lib64", SystemUse::Read, Needed::Always),
+    ("/usr/lib", SystemUse::Library, Needed::Always),
+    ("/usr/lib64", SystemUse::Library, Needed::Always),
+    ("/lib", SystemUse::Library, Needed::Always),
+    ("/lib64", SystemUse::Library, Needed::Always),
     ("/etc/ld.so.cache", SystemUse::Read, Needed::Always),
     ("/etc/ld.so.preload", SystemUse::Read, Needed::Always),
     ("/etc/localtime", SystemUse::Read, Needed::Always),
@@ -153,19 +159,30 @@ fn candidates() -> impl Iterator<Item = (&'static str, SystemUse, Needed)> {
 pub fn detect() -> Vec<SystemPath> {
     let mut found: Vec<SystemPath> = candidates()
         .filter_map(|(path, usage, needed)| {
-            let path = rule_path(Path::new(path).canonicalize().ok()?, RESOLVED_DIRECTORY);
-            let is_dir = path.metadata().ok()?.is_dir();
+            let path = Path::new(path);
+            let canonical = rule_path(path.canonicalize().ok()?, RESOLVED_DIRECTORY);
+            let is_dir = canonical.metadata().ok()?.is_dir();
             Some(SystemPath {
-                path,
+                path: canonical,
                 is_dir,
                 usage,
                 needed,
+                links: resolve_existing_part(path).1,
             })
         })
         .collect();
     // Merged /usr systems resolve /lib to /usr/lib, so several candidates can name one path.
     found.sort_by(|a, b| a.path.cmp(&b.path));
-    found.dedup_by(|a, b| a.path == b.path && a.usage == b.usage && a.needed == b.needed);
+    found.dedup_by(|later, kept| {
+        let same =
+            later.path == kept.path && later.usage == kept.usage && later.needed == kept.needed;
+        if same {
+            kept.links.append(&mut later.links);
+            kept.links.sort();
+            kept.links.dedup();
+        }
+        same
+    });
     found
 }
 
@@ -185,12 +202,14 @@ pub fn locations() -> Vec<SystemPath> {
                 is_dir: false,
                 usage,
                 needed,
+                links: Vec::new(),
             });
             std::iter::once(SystemPath {
                 path: location,
                 is_dir,
                 usage,
                 needed,
+                links: Vec::new(),
             })
             .chain(links)
         })
@@ -204,6 +223,12 @@ fn rule_path(path: PathBuf, replaced: &str) -> PathBuf {
         Some(parent) if parent == Path::new(replaced) => parent.to_path_buf(),
         _ => path,
     }
+}
+
+/// The symbolic links that `path` passes, each where it lies (its canonical directory plus its
+/// name).
+pub fn links_on_the_way(path: &Path) -> Vec<PathBuf> {
+    resolve_existing_part(path).1
 }
 
 /// Where `path` is or would be, like `canonicalize`, except that the part from the first missing
@@ -279,6 +304,27 @@ mod tests {
         }
         for pair in found.windows(2) {
             assert!(pair[0] != pair[1]);
+        }
+    }
+
+    /// Every recorded link is a symbolic link on this host, and a candidate named through one,
+    /// the glibc loader through `/lib64` on a merged `/usr`, records it.
+    #[test]
+    fn detected_entries_record_the_links_their_names_pass() {
+        let found = detect();
+        for link in found.iter().flat_map(|entry| &entry.links) {
+            let metadata = link.symlink_metadata().unwrap();
+            assert!(metadata.file_type().is_symlink(), "{link:?}");
+        }
+        let lib64 = Path::new("/lib64");
+        let merged = lib64
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_symlink());
+        let loader = Path::new("/lib64/ld-linux-x86-64.so.2");
+        if cfg!(target_arch = "x86_64") && merged && loader.exists() {
+            let canonical = loader.canonicalize().unwrap();
+            let entry = found.iter().find(|entry| entry.path == canonical).unwrap();
+            assert!(entry.links.iter().any(|link| link == lib64), "{entry:?}");
         }
     }
 

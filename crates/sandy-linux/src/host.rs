@@ -4,7 +4,7 @@
 use std::io;
 use std::ptr;
 
-use sandy_core::{ChildProcesses, IpAccess, ProtectedPath, ResolvedPolicy};
+use sandy_core::{ChildProcesses, FileView, IpAccess, ProtectedPath, ResolvedPolicy};
 
 use crate::filter;
 use crate::namespace;
@@ -20,6 +20,9 @@ pub type Support = Result<(), String>;
 pub struct HostCapabilities {
     /// The Landlock ABI version the kernel reports.
     pub landlock: Result<i32, String>,
+    /// The Landlock errata the kernel reports fixed, as the kernel's bitmask (erratum N is bit
+    /// N - 1), or why it reports none.
+    pub landlock_errata: Result<u64, String>,
     /// Whether sandy can count its threads, which it must do before Landlock restricts it.
     pub thread_count: Support,
     /// Seccomp filters with the actions the filter uses, for this CPU architecture.
@@ -33,9 +36,13 @@ pub struct HostCapabilities {
     /// Whether sandy may put a process into a process group, which `children = "contained"`
     /// needs. Only probed for a policy that needs it (`detect_for`).
     pub process_group: Support,
-    /// Whether the host rules out the user and network namespace of `ip = "private"`, as far as
-    /// it says without a trial. Only read for a policy that needs it (`detect_for`).
+    /// Whether the host rules out the user namespace of `ip = "private"` and `filesystem.view =
+    /// "policy"`, as far as it says without a trial. Only read for a policy that needs it
+    /// (`detect_for`).
     pub user_namespaces: namespace::Support,
+    /// Whether `children = "contained"` gets a PID namespace here, or why not. Only read for a
+    /// policy with `contained` (`detect_for`).
+    pub pid_namespace: Support,
     /// The candidates of the minimal system set that exist on this host.
     pub system_paths: Vec<SystemPath>,
     /// Where every candidate of the minimal system set is or would be, also missing ones.
@@ -53,10 +60,12 @@ impl HostCapabilities {
     pub fn detect() -> Self {
         HostCapabilities {
             landlock: landlock_abi(),
+            landlock_errata: landlock_errata(),
             thread_count: thread_count_support(),
             pidfd: pidfd_support(),
             process_group: Ok(()),
             user_namespaces: Ok(()),
+            pid_namespace: Ok(()),
             seccomp: seccomp_support(),
             no_new_privs: no_new_privs_support(),
             unprivileged: unprivileged(),
@@ -75,11 +84,40 @@ impl HostCapabilities {
         if policy.children == ChildProcesses::Contained {
             host.process_group = process_group_support();
         }
-        if policy.ip == IpAccess::Private {
-            host.user_namespaces = namespace::support();
+        let required = policy.ip == IpAccess::Private || policy.view == FileView::Policy;
+        if required {
+            host.user_namespaces = namespace::support(&namespace::Purpose::of(policy));
+        }
+        if policy.children == ChildProcesses::Contained {
+            host.pid_namespace = pid_namespace_support(required, &host.user_namespaces);
         }
         host
     }
+}
+
+/// Whether `children = "contained"` gets a PID namespace. With `ip = "private"` or `filesystem.view
+/// = "policy"` the run needs the user namespace anyway and stays the authoritative answer, as for
+/// them. Without, the PID namespace only adds to the process group, which holds the program's
+/// processes as before, so it is used only where a trial in a forked child works: a host that
+/// allows user namespaces and still denies them to sandy, a container whose seccomp profile denies
+/// `unshare` for one, keeps `contained` as it is.
+fn pid_namespace_support(required: bool, user_namespaces: &namespace::Support) -> Support {
+    let reason = |missing: &namespace::Missing| match missing {
+        namespace::Missing::Unavailable(reason) | namespace::Missing::NeedsSetup(reason) => {
+            reason.clone()
+        }
+    };
+    if required {
+        return user_namespaces.as_ref().map_err(reason).map(|_| ());
+    }
+    namespace::support(&namespace::Purpose::Processes).map_err(|missing| reason(&missing))?;
+    let namespaces = namespace::Namespaces {
+        network: false,
+        mount: false,
+        pid: true,
+    };
+    namespace::probe(namespaces)
+        .map_err(|error| format!("a trial of a PID namespace failed: {error}"))
 }
 
 /// Whether sandy may put a process into a process group. `children = "contained"` runs the
@@ -111,6 +149,30 @@ fn process_group_support() -> Support {
 }
 
 const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
+const LANDLOCK_CREATE_RULESET_ERRATA: libc::c_uint = 2;
+
+/// The errata bitmask of `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_ERRATA)`
+/// (measured: 0x5 on Ubuntu 22.04's Linux 6.8, 0x7 on 6.17, 0xf on 7.2). A kernel without the
+/// flag answers EINVAL, which says nothing about which fixes it has.
+fn landlock_errata() -> Result<u64, String> {
+    // SAFETY: with a null attribute, size 0 and the ERRATA flag, the kernel only returns the
+    // bitmask and creates nothing.
+    let errata = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            ptr::null::<libc::c_void>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_ERRATA,
+        )
+    };
+    if errata >= 0 {
+        return Ok(errata as u64);
+    }
+    Err(format!(
+        "this kernel does not report which Landlock errata it has fixed ({})",
+        io::Error::last_os_error()
+    ))
+}
 
 fn landlock_abi() -> Result<i32, String> {
     // SAFETY: with a null attribute, size 0 and the VERSION flag, the kernel only returns the ABI

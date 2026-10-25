@@ -286,7 +286,7 @@ pub fn setup(options: SetupOptions) -> Result<SetupOutcome, SandboxError> {
 }
 
 fn prepare(options: SetupOptions) -> Step<String> {
-    if let Some(reason) = disabled(&namespace::support()) {
+    if let Some(reason) = disabled(&namespace::support(&namespace::Purpose::Any)) {
         return Err(Stop::Refused(reason));
     }
     if let Some(reason) = unrestricted() {

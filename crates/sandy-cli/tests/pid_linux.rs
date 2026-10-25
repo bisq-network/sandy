@@ -1,0 +1,294 @@
+//! `children = "contained"` with a PID namespace on Linux: the program runs as PID 2 below an init
+//! of sandy, and the namespace ends with the program (docs/linux.md, "Contained child processes").
+//! Every check has a control without the namespace where one exists.
+#![cfg(target_os = "linux")]
+
+mod common;
+
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
+use std::process::{Command, Stdio};
+
+use common::*;
+
+const MECHANISM: &str = "a PID namespace of the sandbox's own";
+
+fn args(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| value.to_string()).collect()
+}
+
+fn contained() -> Vec<String> {
+    args(&["--children", "contained", "--signals", "isolated"])
+}
+
+fn has_errno(line: &ProbeLine, errno: i32) -> bool {
+    line.result != "ok" && line.detail.contains(&format!("os error {errno})"))
+}
+
+/// Whether `contained` runs the program in a PID namespace here, as `check` says; records a skip
+/// when not. Where user namespaces are unusable, `contained` keeps its process group alone.
+fn pid_namespace_works() -> bool {
+    let mut check = vec!["check".to_string()];
+    check.extend(contained());
+    let output = sandy(&check);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if output.status.success() && stdout.contains(MECHANISM) {
+        return true;
+    }
+    skip(
+        "pid-namespace",
+        &format!(
+            "contained gets no PID namespace here: {}",
+            stdout
+                .lines()
+                .find(|line| line.contains("child processes") || line.contains("signals"))
+                .unwrap_or("check failed")
+        ),
+    );
+    false
+}
+
+/// The view with /proc and `contained`: the program gets a /proc of its own.
+fn with_proc() -> Vec<String> {
+    let mut sandbox_args = contained();
+    sandbox_args.extend(args(&["--view", "policy", "--read", "/proc"]));
+    sandbox_args
+}
+
+/// The program is PID 2, PID 1 is sandy's init, and a signal from the program to its init, even
+/// SIGKILL, ends nothing: the program goes on to its next action.
+#[test]
+fn the_program_runs_as_pid_2_below_an_init_of_sandy() {
+    if !pid_namespace_works() {
+        return;
+    }
+    let lines = probe_inside(
+        &with_proc(),
+        &[
+            ("pid", "-"),
+            ("read", "/proc/1/cmdline"),
+            ("kill-signal", "1:15"),
+            ("kill-signal", "1:9"),
+            ("pid", "-"),
+        ],
+    );
+    assert_eq!(lines[0].detail, "2", "{lines:?}");
+    lines[1].assert_ok();
+    // With the Landlock signal scope the init is outside the program's domain (EPERM); without,
+    // the kernel drops a signal from inside the namespace to a PID 1 without a handler.
+    for line in &lines[2..4] {
+        assert!(
+            line.result == "ok" || has_errno(line, libc::EPERM),
+            "{lines:?}"
+        );
+    }
+    assert_eq!(lines[4].detail, "2", "{lines:?}");
+}
+
+/// An orphan of the program is re-parented to the init, which reaps it: no zombie stays in the
+/// namespace's /proc.
+#[test]
+fn orphans_are_reaped() {
+    if !pid_namespace_works() {
+        return;
+    }
+    let lines = probe_inside(&with_proc(), &[("orphan-zombies", "/proc")]);
+    assert_eq!(lines[0].detail, "0", "{lines:?}");
+}
+
+/// /proc of the program lists only the processes of its namespace: the init, the program and what
+/// the program starts. Without `contained` the bound /proc of the host lists every process.
+#[test]
+fn proc_shows_only_the_sandboxs_processes() {
+    if !pid_namespace_works() {
+        return;
+    }
+    let lines = probe_inside(&with_proc(), &[("proc-pids", "/proc")]);
+    assert_eq!(lines[0].detail, "1,2", "{lines:?}");
+    let host = probe_inside(
+        &args(&["--view", "policy", "--read", "/proc"]),
+        &[("proc-pids", "/proc")],
+    );
+    assert!(host[0].detail.split(',').count() > 10, "{host:?}");
+}
+
+/// Processes outside the namespace have no process ID inside it, so the program reaches none of
+/// them by ID: kill and pidfd_open answer ESRCH. With `signals = "any"` and no namespace the same
+/// calls reach the test process.
+#[test]
+fn processes_outside_are_unreachable_by_id() {
+    if !pid_namespace_works() {
+        return;
+    }
+    let outside = std::process::id().to_string();
+    let actions = [
+        ("signal", outside.as_str()),
+        ("pidfd-open", outside.as_str()),
+    ];
+    for line in probe_inside(&args(&["--signals", "any"]), &actions) {
+        line.assert_ok();
+    }
+    for line in probe_inside(&contained(), &actions) {
+        assert!(has_errno(&line, libc::ESRCH), "{line:?}");
+    }
+}
+
+/// The program's process group holds only its own processes: the guard is outside it, so a
+/// SIGKILL to the whole group ends the program and what it started, and sandy reports the
+/// program's signal death, not a guard that ended. Below Landlock ABI 6 nothing but the namespace
+/// and the group keep such a signal from the guard.
+#[test]
+fn a_signal_to_the_programs_group_reaches_only_the_program() {
+    if !pid_namespace_works() {
+        return;
+    }
+    let output = sandy(run_args(&contained(), &[("kill-signal", "0:9")]));
+    assert_eq!(output.status.code(), Some(128 + 9), "{output:?}");
+}
+
+/// Below Landlock ABI 6, `signals = "isolated"` holds for `contained` through the PID namespace,
+/// and `check` names that mechanism. From ABI 6 the Landlock scope comes first.
+#[test]
+fn check_names_the_pid_namespace_for_isolated_signals_below_abi_6() {
+    if !pid_namespace_works() {
+        return;
+    }
+    let mut check = vec!["check".to_string()];
+    check.extend(contained());
+    let stdout = String::from_utf8_lossy(&sandy(&check).stdout).into_owned();
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("signals limited to the sandbox"))
+        .unwrap_or_default()
+        .to_string();
+    assert!(line.starts_with("enforced"), "{stdout}");
+    if common::linux::landlock_abi() < 6 {
+        assert!(line.contains(MECHANISM), "{line}");
+        // Without contained there is no namespace, and the ABI cannot isolate signals.
+        let alone = sandy(["check", "--signals", "isolated"]);
+        assert_eq!(alone.status.code(), Some(1), "{alone:?}");
+    } else {
+        assert!(line.contains("Landlock ABI 6 signal scope"), "{line}");
+    }
+}
+
+/// The status record names the program by its process ID outside the namespace, which is sandy's
+/// child, so that a caller can signal it and sandy can follow its stops; inside it is PID 2.
+#[test]
+fn the_status_record_names_the_program_outside_its_namespace() {
+    if !pid_namespace_works() {
+        return;
+    }
+    let (reader, mut child) = spawn_with_status(&contained(), &[("sleep", "3000")]);
+    let mut first = String::new();
+    BufReader::new(reader).read_line(&mut first).unwrap();
+    let pid: u32 = first.trim().strip_prefix("pid ").unwrap().parse().unwrap();
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        field("NSpid:"),
+        vec![pid.to_string(), "2".to_string()],
+        "{status}"
+    );
+    assert_eq!(field("PPid:"), vec![child.id().to_string()], "{status}");
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// The residual of `contained` without a namespace, sandy and the guard both killed with
+/// SIGKILL, ends the program here: the init watches sandy through a pidfd and ends, and with it
+/// every process of the namespace.
+#[test]
+fn the_namespace_ends_when_sandy_and_the_guard_are_killed() {
+    if !pid_namespace_works() {
+        return;
+    }
+    let (reader, mut child) = spawn_with_status(&contained(), &[("sleep", "30000")]);
+    let mut first = String::new();
+    BufReader::new(reader).read_line(&mut first).unwrap();
+    let program: u32 = first.trim().strip_prefix("pid ").unwrap().parse().unwrap();
+    let sandy = child.id();
+    // The guard is sandy's child that leads a group of its own and is not in the namespace.
+    let guard = children_of(sandy)
+        .into_iter()
+        .find(|&pid| {
+            let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+            let single = status
+                .lines()
+                .find_map(|line| line.strip_prefix("NSpid:"))
+                .is_some_and(|ids| ids.split_whitespace().count() == 1);
+            let live = !status.lines().any(|line| line.starts_with("State:\tZ"));
+            single && live && pid != program
+        })
+        .expect("no guard");
+    kill_process(guard);
+    kill_process(sandy);
+    let _ = child.wait();
+    assert!(
+        ends_soon(program, END_TIMEOUT),
+        "the program outlived sandy and the guard"
+    );
+}
+
+/// The children of process `parent`, from the parent field of `/proc/PID/stat`.
+fn children_of(parent: u32) -> Vec<u32> {
+    fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| {
+            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+            let stat = fs::read_to_string(entry.path().join("stat")).ok()?;
+            let ppid: u32 = stat[stat.rfind(')')? + 2..]
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()?;
+            (ppid == parent).then_some(pid)
+        })
+        .collect()
+}
+
+/// Starts sandy with `--status-fd 3` and returns the read end of the record and the child.
+fn spawn_with_status(
+    sandbox_args: &[String],
+    actions: &[(&str, &str)],
+) -> (fs::File, std::process::Child) {
+    let mut ends = [0; 2];
+    // SAFETY: pipe2 writes two new close-on-exec descriptors into `ends`.
+    let made = unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) };
+    assert_eq!(made, 0, "cannot create the status pipe");
+    // SAFETY: both descriptors are new and nothing else owns them.
+    let (reader, writer) = unsafe {
+        (
+            fs::File::from_raw_fd(ends[0]),
+            OwnedFd::from_raw_fd(ends[1]),
+        )
+    };
+    let raw = writer.as_raw_fd();
+    let mut run = run_args(sandbox_args, actions);
+    run.splice(1..1, args(&["--status-fd", "3"]));
+    let mut command = Command::new(sandy_path());
+    command
+        .args(run)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: dup2 is async-signal-safe and the closure calls nothing else.
+    unsafe {
+        command.pre_exec(move || match libc::dup2(raw, 3) {
+            3 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        });
+    }
+    let child = command.spawn().unwrap();
+    drop(writer);
+    (reader, child)
+}

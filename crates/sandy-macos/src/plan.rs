@@ -531,6 +531,7 @@ mod tests {
         ResolvedPolicy {
             paths: Vec::new(),
             program: None,
+            links: Vec::new(),
             system: SystemAccess::Minimal,
             ip,
             unix_sockets,

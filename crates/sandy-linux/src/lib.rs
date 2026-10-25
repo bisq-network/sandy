@@ -27,13 +27,14 @@ mod routes;
 mod setup;
 mod system;
 mod trust;
+mod view;
 mod watch;
 
 use std::ffi::OsString;
 
 use sandy_core::streams::CreatableSocket;
 use sandy_core::{
-    Backend, IpAccess, PlanItem, Requirement, ResolvedPolicy, SandboxError, SetupOptions,
+    Backend, FileView, IpAccess, PlanItem, Requirement, ResolvedPolicy, SandboxError, SetupOptions,
     SetupOutcome, StatusReport, TargetCommand,
 };
 
@@ -54,27 +55,38 @@ impl Backend for LinuxBackend {
         plan::plan_for(policy, &HostCapabilities::detect_for(policy)).items
     }
 
-    /// The trial binds of the relay ports, and with `ip = "private"` a trial of the namespace
-    /// steps when the host says nothing against them. The forward listeners then bind inside the
-    /// sandbox's new network namespace, where no port is taken, so a busy port on the host's
+    /// The trial binds of the relay ports, and with `ip = "private"` or `filesystem.view =
+    /// "policy"` a trial of the namespace steps when the host says nothing against them. The
+    /// forward listeners then bind inside the sandbox's new network namespace, where no port is taken, so a busy port on the host's
     /// loopback says nothing about them. The egress broker needs the namespace too, and the
     /// kernel's answers about this host's addresses, which `run` asks for before it starts it.
     fn verify(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
         let private = policy.ip == IpAccess::Private;
+        let hidden = policy.view == FileView::Policy;
         let mut items = sandy_core::verify::relay_listeners(policy);
         if private {
             items.retain(|item| item.requirement != Requirement::ForwardedPortsRelayed);
-            if namespace::support().is_ok()
-                && let Err(reason) = namespace::probe(Namespaces { network: true })
-            {
-                let reason = format!("a trial of the sandbox's namespaces failed: {reason}");
-                items.push(PlanItem::unavailable(
-                    Requirement::IpNetworkPrivate,
-                    reason.clone(),
-                ));
-                if policy.egress.is_some() {
-                    items.push(PlanItem::unavailable(Requirement::EgressBrokered, reason));
-                }
+        }
+        let namespaces = Namespaces {
+            network: private,
+            mount: hidden,
+            pid: false,
+        };
+        if (private || hidden)
+            && namespace::support(&namespace::Purpose::of(policy)).is_ok()
+            && let Err(reason) = namespace::probe(namespaces)
+        {
+            let reason = format!("a trial of the sandbox's namespaces failed: {reason}");
+            let requirements = [
+                (private, Requirement::IpNetworkPrivate),
+                (
+                    private && policy.egress.is_some(),
+                    Requirement::EgressBrokered,
+                ),
+                (hidden, Requirement::PathsHidden),
+            ];
+            for (_, requirement) in requirements.into_iter().filter(|(needed, _)| *needed) {
+                items.push(PlanItem::unavailable(requirement, reason.clone()));
             }
         }
         if policy.egress.is_some()

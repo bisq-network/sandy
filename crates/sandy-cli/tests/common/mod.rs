@@ -866,6 +866,88 @@ pub mod linux {
         };
         abi.max(0)
     }
+
+    /// A process of `/proc`: its ID, parent, group, session, whether it ended, its IDs in each
+    /// PID namespace from the host's down (`NSpid`), and its PID namespace.
+    struct Process {
+        pid: u32,
+        parent: u32,
+        group: u32,
+        session: u32,
+        zombie: bool,
+        ids: Vec<String>,
+        namespace: Option<std::path::PathBuf>,
+    }
+
+    fn processes() -> Vec<Process> {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+                let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+                // After the name in parentheses: state, parent, group, session.
+                let fields: Vec<&str> = stat[stat.rfind(')')? + 2..].split(' ').collect();
+                let status = std::fs::read_to_string(entry.path().join("status")).ok()?;
+                let ids = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("NSpid:"))?
+                    .split_whitespace()
+                    .map(String::from)
+                    .collect();
+                Some(Process {
+                    pid,
+                    parent: fields.get(1)?.parse().ok()?,
+                    group: fields.get(2)?.parse().ok()?,
+                    session: fields.get(3)?.parse().ok()?,
+                    zombie: matches!(fields.first(), Some(&"Z" | &"X")),
+                    ids,
+                    namespace: std::fs::read_link(entry.path().join("ns/pid")).ok(),
+                })
+            })
+            .collect()
+    }
+
+    /// The ID outside of the process that a program, a child of `sandy` with `children =
+    /// "contained"`, reports as `reported`. Where the program runs in a PID namespace of its own
+    /// (it is process 2 there), that is the process of the namespace whose ID there is
+    /// `reported`; elsewhere `reported` itself.
+    pub fn outside_id(sandy: u32, reported: libc::pid_t) -> libc::pid_t {
+        let all = processes();
+        let program = all.iter().find(|process| {
+            process.parent == sandy && process.ids.len() > 1 && process.ids.last().unwrap() == "2"
+        });
+        let Some(namespace) = program.and_then(|program| program.namespace.clone()) else {
+            return reported;
+        };
+        all.iter()
+            .find(|process| {
+                process.namespace.as_ref() == Some(&namespace)
+                    && process.ids.last() == Some(&reported.to_string())
+            })
+            .map_or(reported, |process| process.pid as libc::pid_t)
+    }
+
+    /// The guard of a contained run of `sandy` whose program is `program` (its ID outside): the
+    /// child of sandy, outside every PID namespace of sandy's, that leads a process group of its
+    /// own but no session. Without a PID namespace the guard leads the program's group; with
+    /// one, a group of its own.
+    pub fn guard_of(sandy: u32, program: u32) -> u32 {
+        processes()
+            .into_iter()
+            .find(|process| {
+                process.parent == sandy
+                    && process.pid != program
+                    && !process.zombie
+                    && process.ids.len() == 1
+                    && process.group == process.pid
+                    && process.session != process.pid
+            })
+            .map(|process| process.pid)
+            .unwrap_or_else(|| panic!("sandy {sandy} has no guard"))
+    }
 }
 
 /// Helpers for the Linux and macOS tests.

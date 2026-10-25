@@ -368,6 +368,7 @@ mod tests {
                 rule("/bin/ls", PathAccess::ReadExec, false),
             ],
             program: Some(PathBuf::from("/bin/ls")),
+            links: Vec::new(),
             system: SystemAccess::Minimal,
             ip: IpAccess::None,
             unix_sockets: NetworkAccess::None,

@@ -45,6 +45,7 @@ use sandy_relay::Stop;
 use crate::filter;
 use crate::handover::{self, Handover, Inbox};
 use crate::helper::{self, Ready, Watchdog};
+use crate::launch::Threads;
 use crate::routes::Routes;
 
 /// Why a contained program ends when its broker ends first (`contain::Helper`).
@@ -93,7 +94,7 @@ pub fn start(
         program,
         ended,
     };
-    let pid = helper::start("the egress broker", move |ready| {
+    let pid = helper::start("the egress broker", &Threads::open()?, move |ready| {
         broker_main(broker, ready, config)
     })?;
     Ok((pid, handover))

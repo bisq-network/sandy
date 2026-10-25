@@ -30,7 +30,7 @@ use landlock::{
 use sandy_core::SandboxError;
 
 use crate::filter::{self, Filters};
-use crate::launch::{ensure_single_thread, restrict, set_no_new_privs};
+use crate::launch::{Threads, restrict, set_no_new_privs};
 
 /// What a helper writes to its readiness pipe, followed by its process ID, so that sandy can
 /// watch it. A failure writes a message instead, which never starts with this.
@@ -95,14 +95,19 @@ impl Ready {
 /// Starts `main` in a helper process named `name` (for example "the relay") and returns once it
 /// reported that it is ready. `main` runs in the helper and must call `Ready::report` after it has
 /// confined itself; the helper ends when `main` returns. What `main` owns is dropped in sandy.
-pub(crate) fn start(name: &str, main: impl FnOnce(Ready)) -> Result<libc::pid_t, SandboxError> {
+/// `threads` is this process's thread list, which `start` checks before it forks.
+pub(crate) fn start(
+    name: &str,
+    threads: &Threads,
+    main: impl FnOnce(Ready),
+) -> Result<libc::pid_t, SandboxError> {
     let null = File::options()
         .read(true)
         .write(true)
         .open("/dev/null")
         .map_err(|error| SandboxError::io("cannot open /dev/null", error))?;
     let (mut ready_read, ready_write) = pipe(&format!("{name}'s pipe"))?;
-    ensure_single_thread()?;
+    threads.ensure_single()?;
 
     // SAFETY: sandy is single-threaded (checked above), so the child may run any code. Both
     // children leave only through `_exit`, never by returning into sandy's code.

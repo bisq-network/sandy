@@ -601,9 +601,8 @@ fn a_relay_that_ends_with_the_program_is_the_normal_end_of_a_run() {
     let (service_port, stop_service) = holding_service();
     let inner = free_port();
     let (mut sandy, program) = start_contained(inner, service_port);
-    // The guard leads the program's group.
     let group = group_of(program);
-    let guard = group as u32;
+    let guard = common::linux::guard_of(sandy.id(), program);
     let relay = relay_of(inner, &mut sandy);
     let (program_end, relay_end) = (pidfd(program), pidfd(relay));
     send(sandy.id(), libc::SIGSTOP);
@@ -662,10 +661,13 @@ fn start_contained(inner: u16, service: u16) -> (std::process::Child, u32) {
     let mut stdout = BufReader::new(sandy.stdout.take().unwrap());
     let mut line = String::new();
     stdout.read_line(&mut line).unwrap();
-    let program = parse_line(line.trim_end())
+    let program: u32 = parse_line(line.trim_end())
         .detail
         .parse()
         .unwrap_or_else(|_| panic!("the program did not report its process ID: {line}"));
+    // In a PID namespace of its own the program reports its ID there.
+    #[cfg(target_os = "linux")]
+    let program = common::linux::outside_id(sandy.id(), program as libc::pid_t) as u32;
     // The program must not end on a closed pipe when it reports its next action.
     thread::spawn(move || std::io::copy(&mut stdout, &mut std::io::sink()));
     (sandy, program)

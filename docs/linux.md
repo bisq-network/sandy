@@ -12,7 +12,8 @@ The Linux backend restricts sandy's own process and then replaces it with the pr
 - **no_new_privs** stops setuid programs and file capabilities from adding privileges.
 
 With `ip = "private"` the program also runs in a user and network namespace of its own (see
-"Private network").
+"Private network"), and with `filesystem.view = "policy"` in a user and mount namespace that shows
+it only the paths of its policy (see "File system view").
 
 The research behind the design is in [research/linux-mechanisms.md](research/linux-mechanisms.md).
 
@@ -29,8 +30,9 @@ The research behind the design is in [research/linux-mechanisms.md](research/lin
    filters, and build the `execve` arguments and environment as C strings. Change to the working
    directory if the policy sets one.
 
-With `ip = "private"` the process then enters its namespaces, after the relay, the egress broker
-and the watcher have started and before step 4 (see "Private network").
+With `ip = "private"` or `filesystem.view = "policy"` the process then enters its namespaces,
+after the relay, the egress broker and the watcher have started and before step 4 (see "Private
+network" and "File system view").
 
 Then sandy resets SIGPIPE to its default action, because the Rust runtime ignores it and an
 ignored signal stays ignored across `execve`. Not earlier: until then sandy writes for itself,
@@ -85,12 +87,13 @@ can write, so the rule then reaches nothing that this process could not reach al
 | IpNetworkDenied | The socket family allowlist has no `AF_INET`, `AF_INET6` or `AF_NETLINK`; io_uring is denied. From ABI 4, Landlock also denies TCP bind and connect. |
 | IpNetworkPrivate | A user and a network namespace with only `lo`, which the relays and the egress broker alone cross; the filters of `ip = "all"` and the denial of namespaces (see "Private network"). |
 | EgressBrokered | A broker process in the host's network namespace that serves a listener handed to it from inside the sandbox's, checks every destination with the kernel's routing tables, and is confined by its own Landlock domain and seccomp filter (see "Egress broker"). |
+| PathsHidden | A user and a mount namespace whose read-only root holds only the paths the Landlock rules name, bound at their own paths; Landlock with the fix of erratum 3 and the denial of mounts and namespaces (see "File system view"). |
 | InboundIpDenied | The denylist denies `listen`, `accept` and `accept4` for every socket. A second Landlock ruleset lets sockets bind only port 0: TCP from ABI 4, UDP from ABI 10 (see "Client networking"). |
 | UnixSocketsDenied | The allowlist has no `AF_UNIX`, and socket pairs are limited to stream and seqpacket. From ABI 6, Landlock scopes abstract sockets; from ABI 9 it denies connections to pathname sockets. |
-| SignalsIsolated | Landlock signal scope (ABI 6) and the denylist, which denies `setpgid` into a process group that exists and the terminal ioctls `TIOCSPGRP`, `TIOCSWINSZ` and `TIOCSIG` (see "Signals and the terminal"). Unavailable on older ABIs. |
+| SignalsIsolated | Landlock signal scope (ABI 6) and the denylist, which denies `setpgid` into a process group that exists and the terminal ioctls `TIOCSPGRP`, `TIOCSWINSZ` and `TIOCSIG` (see "Signals and the terminal"). On older ABIs, with `children = "contained"`, the PID namespace of the program instead (see "A PID namespace"); unavailable otherwise. |
 | MetadataConfined | The denylist denies the metadata calls that take a path, and `fchown`, `fsetxattr` and `fremovexattr` on a descriptor (see "Metadata"). |
 | ChildProcessesDenied | The denylist denies `fork`, `vfork` and `clone` without `CLONE_THREAD`; `clone3` fails with `ENOSYS` (see "Child processes"). |
-| ChildProcessesContained | sandy stays the parent and ends the program's process group; the denylist denies `setsid` and `setpgid` (see "Contained child processes"). |
+| ChildProcessesContained | sandy stays the parent and ends the program's process group; the denylist denies `setsid` and `setpgid`. Where the host gives sandy a user namespace, the program also runs in a PID namespace that ends with its init (see "Contained child processes"). |
 | EndsWithParent | A watcher process outside the sandbox ends the program when sandy's parent ends (see "Ending with the parent"). |
 | ExposedPortsRelayed, ForwardedPortsRelayed | One relay process outside the program's sandbox, confined by its own Landlock domain and seccomp filters (see "Exposed and forwarded ports"). |
 
@@ -551,6 +554,175 @@ answer: a step that fails refuses the run with the step's error.
   so sandy refuses every IP socket there (see "Refusals").
 - The namespace hides nothing of the file system: `/proc` and `/sys`, when granted, describe the
   host, apart from `/proc/net`, which shows the network namespace of the process that reads it.
+  `filesystem.view = "policy"` hides what the policy does not grant (see "File system view").
+
+## File system view
+
+`filesystem.view = "policy"` runs the program in a mount namespace whose root holds only what the
+Landlock rules name: the policy paths, the program file, the minimal system set and the program's
+loader, each at its own path. Every other path looks missing: `stat`, `access`, `readlink`, `open`
+and `inotify_add_watch` answer `ENOENT`, for `/etc/passwd` as for a file in the user's home
+directory (`hidden_paths_look_missing`). The view hides and Landlock decides: the binds show the
+same files the rules name, so every rule applies as without the view, and a path the view shows
+is still denied when no rule grants it (`ls /` in the view gives `EACCES`).
+
+The view needs the user namespace of "Private network", with the same detection, and adds a
+mount namespace to the same `unshare`. It works with every other setting: `ip = "private"`,
+`children = "contained"`, `--explain` and `end_with_parent`, where a forked child builds the view
+and sandy stays outside, in the host's view (`the_view_works_with_the_process_modes`,
+`the_view_works_with_a_private_network`). The diagnostic mode names the paths of the host as
+without the view; inside, such a path is missing rather than denied.
+
+### Building the view
+
+The process that entered the namespaces builds the view right after the maps and `lo`, before it
+binds the forward listeners and drops its capabilities, which the mount calls need. It uses
+descriptors only, so no path is resolved twice:
+
+1. It makes `/` private (`MS_REC | MS_PRIVATE`), so nothing it mounts reaches the host and
+   nothing the host mounts later appears in the view.
+2. It opens every path to bind with `open_rule` (see "Rule paths"): one component at a time,
+   without following a link, and only if it is still the file of the plan. It opens them only
+   now, because a descriptor opened in the host's mount namespace cannot be bound (`EINVAL`,
+   measured on Linux 6.8 and 7.2). The Landlock ruleset keeps its own descriptors from step 3 of
+   the launch sequence: Landlock binds the inode, which is the same in both namespaces.
+3. A new tmpfs (`fsopen`, `fsmount`) becomes the root. It is attached at `/tmp` of the new
+   namespace first, because Linux before 6.15 cannot mount onto a mount that is not attached
+   (`EINVAL` on Ubuntu 22.04's 6.8, measured).
+4. Each path is cloned with its submounts (`open_tree` with `OPEN_TREE_CLONE | AT_RECURSIVE`),
+   gets its flags on every mount of the clone (`mount_setattr` with `AT_RECURSIVE`), and is moved
+   onto its place (`move_mount`). The clone is recursive because a mount whose submounts came from
+   the host's namespace is locked to them and cannot be bound alone (`EINVAL`), and because a
+   read-only flag on the top mount alone would leave the submounts writable. The flags are only
+   added: the kernel refuses to clear a flag the host set (`EPERM`), so a host's `noexec` stays.
+   - A path inside another bound path is mounted inside that bind, on the host's own file there,
+     which must still be the file of the plan; otherwise the run is refused.
+   - A path anywhere else gets the directories above it on the tmpfs, with mode 0755 whatever
+     the umask, owned by the user, and an empty file as the place of a file.
+5. The symbolic links on the way to the paths are recreated with their text, `/dev` is built,
+   the tmpfs mounts become read-only, and `pivot_root(".", ".")` with `umount2(".",
+   MNT_DETACH)` makes the tmpfs the root and detaches the old one. The process then changes to
+   the working directory it had, when the view holds it, as the path itself or a directory above
+   a granted path, and to `/` otherwise.
+
+The descriptors of `/proc/self/task` that the thread checks of the launch sequence use are opened
+before the view, because the view hides `/proc` unless the policy grants it.
+
+The program cannot change the view. It holds no capability, the filter denies every mount and
+namespace call, and measured with a user and mount namespace of its own, which the filter would
+deny, it still could not unmount a bind or make one writable (`EINVAL` and `EPERM`; research of
+2026-10-25).
+
+### Flags
+
+| Bound path | Read-only | No execute | nosuid | nodev |
+|---|---|---|---|---|
+| `read` path | yes | yes | yes | yes |
+| `read_exec` path, the program file, the loader, the library directories of the system set | yes | no | yes | yes |
+| writable path | no | yes | yes | yes |
+| other entries of the system set | yes | yes | yes | yes |
+| a path below `/dev` | as above | as above | yes | no |
+| a path below `/proc` | yes, also under a writable grant | yes | yes | yes |
+
+A bind gets the rights of every policy path that holds it, as Landlock grants them: a `read` path
+inside a `read_exec` path stays executable, and a path inside a writable path is writable.
+Executing is a right of its own, so a file that no `read_exec` path holds can neither be
+executed (`execve` gives `EACCES`) nor mapped as code (`mmap` with `PROT_EXEC` gives `EPERM`)
+(`code_maps_only_from_executable_paths`). The library directories of the system set (`/usr/lib`,
+`/usr/lib64`, `/lib`, `/lib64`) keep execute, because the loader maps the libraries as code after
+a read open. Device nodes open only on a mount without `nodev`, so a device the policy grants
+below `/dev` keeps working. `/proc` is read-only even under a writable grant, so the program
+changes nothing of its own or of other processes there (`proc_is_bound_read_only`).
+
+`fchmod` and `futimens` through a descriptor of a read-only bind fail with `EROFS`, so the
+exception of "Metadata through open files" does not apply in the view
+(`a_read_only_descriptor_changes_no_metadata_in_the_view`).
+
+### Links, `/dev` and `/proc`
+
+- **Links.** sandy recreates every symbolic link that the names of the policy paths, the program,
+  the system set, the program's loader (`PT_INTERP`) and its `#!` interpreters pass, with the
+  same text, where it lies outside every bind: `/lib64 -> usr/lib64` and `/bin -> usr/bin` on a
+  merged `/usr`, `/etc/resolv.conf` into `/run/systemd/resolve`, `/usr/bin/python3` for a script
+  that names it (`the_links_of_a_merged_usr_work`, `dynamic_programs_run_with_the_system_set`,
+  `names_resolve_under_client`). A link inside a bind is part of the host's content there. The
+  view has `/bin` only when a policy path is named through it.
+- **`/dev`** is a tmpfs with `null`, `zero`, `full`, `random` and `urandom`, each the host's node,
+  opened without following a link and checked by its device number, and bound read-only, which
+  still takes writes to `/dev/null`. The system set grants all of them but `full`, which the view
+  shows but Landlock denies. With a terminal on a standard stream, `/dev` also gets `tty` and a
+  devpts instance of its own at `/dev/pts` (`newinstance,ptmxmode=0666,mode=620`), with
+  `/dev/ptmx` a link to `pts/ptmx`; its pseudo-terminals are the sandbox's only. Opening
+  `/dev/tty` still needs a grant (`--read-write /dev/tty`), as without the view
+  (`a_terminal_works_when_one_is_attached`). Without a terminal there is no `/dev/tty`
+  (`dev_holds_the_minimal_devices`). Other devices are bound only when the policy grants them.
+- **`/proc`** exists only when the policy grants a path of it, and holds what the policy grants,
+  bound from the host's `/proc` (measured: binds of procfs and sysfs files and directories work in
+  the user namespace on Linux 6.8 and 7.2). It lists the host's processes as without the view.
+
+### Detection and refusals
+
+- The requirement needs the user namespace as "Private network" does. `plan` reads the same
+  sysctls and label, and under Ubuntu's AppArmor restriction the requirement needs setup, so
+  `sandy check --view policy` exits with status 2 on Ubuntu 23.10 and newer
+  (`check_needs_setup_under_the_apparmor_restriction` in `view_linux.rs`). The reason then says
+  that sandy "cannot set up the file system view".
+- It needs the fix of Landlock erratum 3: rights could widen through a directory that a bind
+  mount disconnected, and the view creates such binds. sandy reads the errata bitmask with
+  `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_ERRATA)`; erratum 3 is bit 2. A
+  kernel without the fix, or one that answers no bitmask, makes the requirement unavailable.
+  Measured: Ubuntu 22.04's 6.8 reports 0x5, Ubuntu 25.10's 6.17 0x7, Fedora 44's 7.2 0xf; all
+  have the fix.
+- `check` tries the namespaces in a forked child as for the private network, and with the view
+  also every kind of mount call of the run: it builds a view that holds only `/dev` and makes it
+  the root (`the_probe_tries_the_mount_steps`).
+- `run` refuses a directory on a standard stream (`a_directory_on_a_standard_stream_is_refused`).
+  Such a descriptor was opened in the host's mount namespace, and through it the program would
+  reach every path of the host by name with `openat` and `fstatat`, the hidden ones included. No
+  common program is started with a directory as a stream. A file or a pipe is accepted.
+
+### Costs
+
+- `rename` and `link` between two writable paths fail with `EXDEV`, also on one file system,
+  because each is a mount of its own. `mv` falls back to copying; a program that renames between
+  them fails (`a_rename_between_writable_paths_fails_with_exdev`). Within one writable path they
+  work.
+- Files of other users and of root show the owner and group 65534, as in "Private network".
+- A file of a `read` or a writable path cannot be mapped as code: a program that extracts a native
+  library into a writable directory and loads it, as some Java programs do, or that loads a
+  Python extension module from a `read` path, fails. Grant such a directory with `--read-exec`,
+  which a writable path cannot be.
+- `/proc` is read-only, and holds only the granted paths.
+- A program started in a directory the view does not hold starts in `/`.
+- `ttyname` of a terminal on a standard stream finds no name: the name the host gives it lies in
+  the host's devpts, and the view's `/dev/pts` is another instance.
+- `/dev/fd`, `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and `/dev/shm` exist only when granted.
+- Start time, as the median of 100 runs of `sandy run -- /usr/bin/true` with the release build:
+  about 1.2 ms more than without the view on Fedora 44 (4.8 to 5.1 against 3.7 to 3.9 ms, a busy
+  24 CPU host), and about 0.9 ms more on the Ubuntu 22.04 VM (5.3 against 4.4 ms). The binds of
+  the system set take most of it.
+- On Ubuntu every run adds the AppArmor audit records of the `unshare` to the kernel log.
+
+### What stays visible
+
+These are exceptions of `PathsHidden` (DESIGN.md, "Requirements and the enforcement plan"):
+`sandy check` warns about each, and a test records it.
+
+- **The host's file systems.** `statfs` on a path of the view reports the host's file system
+  there: its type, size, free space and number of files. `stat` reports the host's device and
+  inode numbers.
+- **The directories above a granted path.** They exist in the view with their names, for example
+  `/home` and `/home/user` above a granted `/home/user/project`, owned by the user, with the time
+  sandy built the view. The program cannot list them, because no Landlock rule covers them.
+- **Link counts.** The link count of a granted file still counts its names outside the view, so
+  the program learns that a file has another name, though not where.
+  `the_view_leaves_the_file_systems_the_parents_and_link_counts_visible` records the three.
+- **The mount table, with `/proc` granted.** `/proc/self/mountinfo` lists every mount of the view
+  with the host's device and file system and their mount options, for example the name of an
+  encrypted volume and a btrfs subvolume (`the_mount_table_names_the_hosts_devices`).
+
+Also visible, and not an exception because the policy grants it: the text of a recreated link,
+which names its target, and the content of `/proc` when it is granted.
 
 ## Setup on Ubuntu
 
@@ -872,7 +1044,8 @@ when the program ends. sandy does not replace itself with the program:
 Two rules keep every process the program starts inside the group. The denylist denies `setsid`
 and `setpgid`, the only system calls that move a process to another group. The policy must have
 `signals = "isolated"`, so the Landlock signal scope keeps the program from signaling sandy and the
-guard, which are outside its domain. The guard, not sandy, ends the group when the program ends,
+guard, which are outside its domain, or below ABI 6 the PID namespace of "A PID namespace", which
+they are outside of. The guard, not sandy, ends the group when the program ends,
 so the program cannot keep its processes alive by stopping sandy (with a terminal it can make
 sandy stop, see step 5). sandy reaps neither the guard nor the program before it has killed the
 group, so the group ID (the guard's process ID) cannot belong to another process while sandy can
@@ -905,8 +1078,87 @@ Costs and differences from the exec model:
   the terminal at the same time pass it back and forth.
 - sandy and the guard hold no descriptor of the program except standard input, output and error,
   which sandy keeps until it exits, that is after the group has ended.
-- If both sandy and the guard are killed with `SIGKILL`, nothing ends the group. Both run sandy's
-  command line, so `pkill -9 -f sandy` does this. Killing sandy alone is safe.
+- Without a PID namespace, if both sandy and the guard are killed with `SIGKILL`, nothing ends the
+  group. Both run sandy's command line, so `pkill -9 -f sandy` does this. Killing sandy alone is
+  safe. With one, the init ends the namespace then (see below).
+
+### A PID namespace
+
+Where the host gives sandy a user namespace, `contained` also runs the program in a PID namespace
+of its own, whose end ends every process in it. The detection is the one of "Private network".
+With `ip = "private"` or `filesystem.view = "policy"` the run needs the user namespace anyway and
+stays the authoritative answer. With `contained` alone the namespace only adds to the process
+group, so `plan` also tries one in a forked child on every run, and a host that allows user
+namespaces but refuses them to sandy, such as a container whose seccomp profile denies `unshare`,
+keeps `contained` as described above. Under Ubuntu's AppArmor restriction `contained` keeps that
+mechanism too, without needing setup.
+
+1. The forked child of step 3 does not join the guard's group. It adds `CLONE_NEWPID` to the
+   `unshare` of its namespaces (with `contained` alone, `CLONE_NEWUSER | CLONE_NEWPID`) and forks
+   twice: first the init, which becomes PID 1 of the namespace, then the program, which becomes
+   PID 2 and leads a process group of its own, out of sandy's. It writes both process IDs to the
+   guard and to sandy and ends. sandy is the child subreaper, so both become its children: it
+   waits for the program, forwards signals to it and follows its stops for job control as in
+   steps 5 and 6. The program, not PID 1, gets those signals: a PID 1 ignores every signal it has
+   no handler for, so a `SIGTERM` to it would be lost.
+2. The init closes every descriptor but a pidfd of sandy and the pipe from the forked child, sets
+   every signal to its default action and `SIGCHLD` to ignored, drops its capabilities and makes
+   itself undumpable. Once the pipe has ended it opens a pidfd for PID 2 and ends when the program
+   or sandy ends. The kernel re-parents the namespace's orphans to it, and with `SIGCHLD` ignored
+   the kernel reaps them as they end (`orphans_are_reaped`). From inside its namespace a PID 1
+   receives a signal only through a handler, and from outside only `SIGKILL` and `SIGSTOP`; it has
+   no handler, so the program cannot end or stop it
+   (`the_program_runs_as_pid_2_below_an_init_of_sandy`).
+3. When the init ends, the kernel ends every process of the namespace. The guard watches the
+   program and sandy as in step 3 and then kills the init through a pidfd; sandy kills the
+   program's group and the init when the program ends. The init watches sandy itself as well, so
+   the namespace also ends when sandy and the guard are both killed with `SIGKILL`
+   (`the_namespace_ends_when_sandy_and_the_guard_are_killed`).
+4. Processes outside the namespace have no process ID in it, so `kill`, `pidfd_open`,
+   `F_SETOWN`, `setpriority`, `ioprio_set` and `sched_setaffinity` reach none of them (`ESRCH`,
+   measured on Ubuntu 22.04 and Fedora 44; `processes_outside_are_unreachable_by_id`).
+   `kill(0, ...)` reaches the program's own group and `kill(-1, ...)` the namespace. The guard,
+   sandy and the init lead groups of their own, so the program reaches none of them through its
+   group either (`a_signal_to_the_programs_group_reaches_only_the_program`): without the
+   namespace the guard leads the program's group, and only the Landlock scope keeps a
+   `kill(0, ...)` from it. This is what isolates signals on kernels before Landlock ABI 6:
+   `signals = "isolated"` with `contained` is enforced there through the namespace and the rules
+   of "Signals and the terminal", and `check` names that mechanism
+   (`check_names_the_pid_namespace_for_isolated_signals_below_abi_6`). Inside the namespace the
+   program can still signal its own processes, the init, which ignores it, and with exposed ports
+   the socket factory, which ends the program when it ends (step 7 of "Exposed and forwarded
+   ports"); from ABI 6 the factory's own signal scope keeps it out of reach as well.
+5. With `filesystem.view = "policy"` and `/proc` in the policy, the view mounts a new `/proc` of
+   the namespace (`subset=pid`, read-only) over the granted one, before the old root is detached,
+   which Linux 6.8 needs (`EPERM` after, measured). It lists only the namespace's processes and
+   `self`, none of the host's files such as `meminfo` or `sys`
+   (`proc_shows_only_the_sandboxs_processes`). It gets a Landlock rule of its own with the rights
+   of the policy's `/proc`, because Landlock skips a mount point that another mount covers, and
+   the rule of the bound `/proc` would not reach it (`EACCES`, measured on Linux 7.2). `/proc/1`
+   is sandy's init, whose command line is sandy's.
+
+Without a view, a policy that grants `/proc` keeps `contained` without the namespace: the host's
+`/proc` names processes by their IDs outside it, and a program that reads `/proc/<its pid>` would
+read another process. `/proc/self` would still be right, but not every program uses it.
+
+The denylist still denies `setsid` and `setpgid`, although the namespace, not the group, now ends
+the processes. That keeps one behaviour for one policy on hosts with and without the namespace:
+a program that detaches into a session of its own fails on both, instead of working where user
+namespaces do and failing on Ubuntu 23.10. It also keeps every process of the program in the
+group that the terminal's job control signals reach.
+
+Costs and differences:
+
+- Inside, the program is process 2, and its parent has no ID there (`getppid` returns 0), nor do
+  its process group and session (`getpgrp` and `getsid` return 0). The record of `--status-fd`
+  names the program by its ID outside, which a caller can signal
+  (`the_status_record_names_the_program_outside_its_namespace`).
+- Start time: with `contained` alone, the trial of `plan` adds a fork and an `unshare` to every
+  start, and the namespace and the init add another. As the median of 100 runs of
+  `sandy run --children contained --signals isolated -- /usr/bin/true` with the release build,
+  about 1.1 to 1.4 ms more than without the namespace on Fedora 44 (5.3 to 5.5 against 4.1 to
+  4.3 ms, a busy 24 CPU host).
+- On Ubuntu every run adds AppArmor audit records to the kernel log, as in "Private network".
 
 ## Ending with the parent
 
@@ -1780,6 +2032,9 @@ the program gets `EACCES`. A policy can add `--read /proc`. The program can then
 secrets passed on command lines, and `/proc/net` of the network namespace. `/proc/<pid>/mem` and
 `environ` of processes outside the sandbox stay denied by the Landlock ptrace check (tested).
 
+With `filesystem.view = "policy"`, `/proc` holds only the granted paths, bound read-only (see "File
+system view").
+
 Without `/proc`, the program cannot read `/proc/self/maps`, `status`, `fd`, `cgroup` and
 `mountinfo`, which costs it `pthread_getattr_np` on the main thread, loops that close every open
 descriptor, and the cgroup limits (see "What the set does not cover").
@@ -1939,6 +2194,10 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   a listener in that namespace. It is also unavailable when the kernel does not answer a route
   lookup and an address dump over a `NETLINK_ROUTE` socket, which `check` tries and `run` asks
   before it starts the broker.
+- `filesystem.view = "policy"` in the same cases, and on a kernel that does not report the fix of
+  Landlock erratum 3: PathsHidden is unavailable, or needs setup under the AppArmor restriction.
+  With the view, `sandy run` also refuses a directory on a standard stream, with exit code 125
+  (see "File system view").
 - A listening address of a relay that another process holds: ExposedPortsRelayed or
   ForwardedPortsRelayed is unavailable. `sandy check` binds the same addresses for a moment and
   releases them again, so it reports what `run` refuses. The answer can be stale one moment
@@ -1977,12 +2236,13 @@ path rules is refused before that, with exit code 125 and the paths it compared.
 
 ## Known limitations
 
-- **Paths outside the policy are visible.** `stat`, `access`, `readlink` and `inotify` watches work
-  on every path the user can reach. The program can learn which files exist, their sizes and times,
-  and when other programs touch them. It cannot open them: `open_by_handle_at` needs a capability.
-  Landlock has no right for these calls, and seccomp cannot read the path a call names, so only a
-  mount namespace would hide them, which is a non-goal (see "Threat model" in
-  [DESIGN.md](DESIGN.md)). Two details are easy to miss:
+- **Paths outside the policy are visible** with the default `filesystem.view = "all"`. `stat`,
+  `access`, `readlink` and `inotify` watches work on every path the user can reach. The program
+  can learn which files exist, their sizes and times, and when other programs touch them. It
+  cannot open them: `open_by_handle_at` needs a capability. Landlock has no right for these calls,
+  and seccomp cannot read the path a call names, so only a mount namespace hides them:
+  `filesystem.view = "policy"` does (see "File system view"), where user namespaces work. Two
+  details are easy to miss:
   - An `inotify` watch on a directory the program cannot list reports the **names** of the
     entries that appear in it, not only that something changed (tested:
     `inotify_reports_names_in_unlistable_directories` reads the name of a file that another
@@ -2025,8 +2285,10 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   performs these calls after checking the descriptor.
   The file system ioctls of the same kind are denied (see "Metadata"). This is an exception of
   `MetadataConfined` (DESIGN.md, "Requirements and the enforcement plan"): `sandy check` warns
-  about it when the policy has a `read` or `read_exec` path and keeps `path_metadata = "deny"`.
-  The test `a_read_only_descriptor_changes_only_the_mode_and_the_times` records it.
+  about it when the policy has a `read` or `read_exec` path, keeps `path_metadata = "deny"` and
+  keeps the default view. The test `a_read_only_descriptor_changes_only_the_mode_and_the_times`
+  records it. With `filesystem.view = "policy"` these paths are read-only mounts, where both calls
+  fail with `EROFS`, so the exception does not apply there (see "File system view").
 - **Files the program writes can be executed outside the sandbox.** The program gets no execute
   right in a writable path, but a file it writes keeps the mode it gives it: the filter strips
   only the setuid and setgid bits, and Landlock has no right over the execute bit. A process
@@ -2048,7 +2310,8 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   records this.
 - **Signals.** With `signals = "any"` the program can kill other processes of the user. With
   `"isolated"` its own reads from the terminal still stop its own process group, which is the
-  behaviour of any background job.
+  behaviour of any background job. Below Landlock ABI 6, `"isolated"` needs `children =
+  "contained"` and a PID namespace (see "A PID namespace").
 - **Processes that outlive the program.** With `process.children = "allowed"` (the default) a
   process the program starts can outlive it. `none` and `contained` prevent this for processes the
   program starts itself or through its children. Both need `unix_sockets = "none"`, because
@@ -2090,10 +2353,12 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   console (`loadkeys`, `setfont`, `chvt`), exclusive mode on a terminal, job control in a shell and
   terminal resizing with `signals = "isolated"`, GNU tar extracting an archive that holds a
   directory (it uses `openat2`), and system calls newer than the reviewed table (`ENOSYS`).
-- **Landlock errata.** sandy does not check the errata bitmask. A kernel without the fix for
-  erratum 3 lets rights widen through renames of directories that a bind mount disconnected.
-  The program cannot mount, and `refer` is granted only inside writable paths, so the practical
-  risk is low. Whether a supported stable kernel lacks the fix is not verified.
+- **Landlock errata.** Without the file system view sandy does not check the errata bitmask. A
+  kernel without the fix for erratum 3 lets rights widen through renames of directories that a
+  bind mount disconnected. The program cannot mount, and `refer` is granted only inside writable
+  paths, so the practical risk is low. Whether a supported stable kernel lacks the fix is not
+  verified. The view creates bind mounts itself, so it requires the fix (see "File system
+  view").
 - Kernel bugs in allowed system calls are out of scope. The filters reduce the reachable kernel
   code, but they are not a full allowlist per program.
 

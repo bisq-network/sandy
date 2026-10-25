@@ -251,21 +251,34 @@ fn an_exposed_port_reaches_the_program_and_its_own_port_stays_inside() {
     }
 }
 
-/// The children of process `parent` that lead a session of their own, from `/proc/PID/stat`
-/// (fields 4 and 6, counted after the name in parentheses).
+/// The children and grandchildren of process `parent` that lead a session of their own, from
+/// `/proc/PID/stat` (fields 4 and 6, counted after the name in parentheses). The socket factory
+/// is re-parented to sandy, or in a PID namespace to its init, a child of sandy.
 fn session_leading_children(parent: u32) -> Vec<u32> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
-    entries
+    let processes: Vec<(u32, u32, u32)> = entries
         .filter_map(|entry| {
             let pid: u32 = entry.ok()?.file_name().to_str()?.parse().ok()?;
             let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
             let fields: Vec<&str> = stat[stat.rfind(')')? + 2..].split(' ').collect();
-            let (ppid, session): (u32, u32) =
-                (fields.get(1)?.parse().ok()?, fields.get(3)?.parse().ok()?);
-            (ppid == parent && session == pid).then_some(pid)
+            Some((
+                pid,
+                fields.get(1)?.parse().ok()?,
+                fields.get(3)?.parse().ok()?,
+            ))
         })
+        .collect();
+    let child = |pid: u32| {
+        processes
+            .iter()
+            .any(|&(child, ppid, _)| child == pid && ppid == parent)
+    };
+    processes
+        .iter()
+        .filter(|&&(pid, ppid, session)| session == pid && (ppid == parent || child(ppid)))
+        .map(|&(pid, _, _)| pid)
         .collect()
 }
 
@@ -1108,7 +1121,9 @@ fn a_dead_broker_ends_a_contained_program() {
     let mut stdout = std::io::BufReader::new(run.stdout.take().unwrap());
     let mut line = String::new();
     std::io::BufRead::read_line(&mut stdout, &mut line).unwrap();
-    let program: u32 = parse_line(line.trim_end()).detail.parse().unwrap();
+    let reported: libc::pid_t = parse_line(line.trim_end()).detail.parse().unwrap();
+    // In a PID namespace of its own the program reports its ID there.
+    let program = common::linux::outside_id(run.id(), reported) as u32;
     let broker = broker_of(program, port, &mut run);
     thread::sleep(Duration::from_secs(1));
     assert!(

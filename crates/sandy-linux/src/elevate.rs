@@ -99,7 +99,7 @@ pub fn elevate(
         if !setup::something_to_remove(options) {
             return Ok(SetupOutcome::Done("nothing to remove".to_string()));
         }
-    } else if let Some(reason) = setup::disabled(&namespace::support()) {
+    } else if let Some(reason) = setup::disabled(&namespace::support(&namespace::Purpose::Any)) {
         return Ok(SetupOutcome::Refused(format!("{reason}; {FALLBACK}")));
     } else if let Some(reason) = setup::unrestricted() {
         return Ok(SetupOutcome::Done(format!("nothing to do: {reason}")));

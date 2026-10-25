@@ -281,6 +281,7 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
         action if win32k::ACTIONS.contains(&action) => win32k::perform(action, target),
         action if unix::ACTIONS.contains(&action) => unix::perform(action, target),
         action if linux::ACTIONS.contains(&action) => linux::perform(action, target),
+        action if view::ACTIONS.contains(&action) => view::perform(action, target),
         action if macos::ACTIONS.contains(&action) => macos::perform(action, target),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -4703,8 +4704,15 @@ mod unix {
             "setpgid" => check(unsafe { libc::setpgid(0, 0) }).map(|_| String::new()),
             // Signal 0 only checks permission. The parent is sandy with children = "contained".
             "signal-parent" => {
-                // SAFETY: kill and getppid take and return process IDs.
-                check(unsafe { libc::kill(libc::getppid(), 0) }).map(|_| String::new())
+                // SAFETY: getppid has no preconditions.
+                let parent = unsafe { libc::getppid() };
+                // A parent outside the probe's PID namespace has no ID in it, and kill(0) would
+                // signal the probe's own group.
+                if parent == 0 {
+                    return Err(io::Error::from_raw_os_error(libc::ESRCH));
+                }
+                // SAFETY: kill takes a process ID and a signal.
+                check(unsafe { libc::kill(parent, 0) }).map(|_| String::new())
             }
             "stop-self" => stop_self(target),
             "ignore-signal" => {
@@ -5248,6 +5256,197 @@ mod win32k {
 
 #[cfg(not(windows))]
 mod win32k {
+    use std::io;
+
+    pub const ACTIONS: &[&str] = &[];
+
+    pub fn perform(_action: &str, _target: &str) -> io::Result<String> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported"))
+    }
+}
+
+/// Actions for the file system view and the PID namespace (`tests/view_linux.rs`,
+/// `tests/pid_linux.rs`): what a path looks like to the calls that do not open it, whether a file
+/// maps as code, and which processes the program sees.
+#[cfg(target_os = "linux")]
+mod view {
+    use std::ffi::CString;
+    use std::fs;
+    use std::io;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    pub const ACTIONS: &[&str] = &[
+        "lstat",
+        "access-path",
+        "readlink",
+        "inotify-watch",
+        "mmap-exec",
+        "statfs",
+        "link-count",
+        "mount-source",
+        "kill-signal",
+        "pidfd-open",
+        "proc-pids",
+        "orphan-zombies",
+    ];
+
+    pub fn perform(action: &str, target: &str) -> io::Result<String> {
+        match action {
+            "lstat" => {
+                let metadata = fs::symlink_metadata(target)?;
+                let kind = match metadata.file_type() {
+                    kind if kind.is_symlink() => "link",
+                    kind if kind.is_dir() => "directory",
+                    _ => "file",
+                };
+                Ok(format!("{kind} owner {}", metadata.uid()))
+            }
+            "access-path" => {
+                let path = CString::new(target)?;
+                // SAFETY: access takes a NUL-terminated path.
+                check(unsafe { libc::access(path.as_ptr(), libc::F_OK) }).map(|_| String::new())
+            }
+            "readlink" => fs::read_link(target).map(|link| link.display().to_string()),
+            "inotify-watch" => {
+                let path = CString::new(target)?;
+                // SAFETY: inotify_init1 takes flags only.
+                let fd = check(unsafe { libc::inotify_init1(libc::IN_CLOEXEC) })?;
+                // SAFETY: the path is NUL-terminated.
+                let watch =
+                    unsafe { libc::inotify_add_watch(fd, path.as_ptr(), libc::IN_ALL_EVENTS) };
+                let watched = check(watch).map(|_| String::new());
+                // SAFETY: closes the descriptor created above.
+                unsafe { libc::close(fd) };
+                watched
+            }
+            // Maps the first page of the file as code, as a loader does with a library.
+            "mmap-exec" => {
+                let file = fs::File::open(target)?;
+                // SAFETY: a new private mapping of an open file, unmapped right away.
+                unsafe {
+                    let page = libc::mmap(
+                        std::ptr::null_mut(),
+                        4096,
+                        libc::PROT_READ | libc::PROT_EXEC,
+                        libc::MAP_PRIVATE,
+                        file.as_raw_fd(),
+                        0,
+                    );
+                    if page == libc::MAP_FAILED {
+                        return Err(io::Error::last_os_error());
+                    }
+                    libc::munmap(page, 4096);
+                }
+                Ok(String::new())
+            }
+            "statfs" => {
+                let path = CString::new(target)?;
+                // SAFETY: statfs is plain data, which the call fills in.
+                let mut status: libc::statfs = unsafe { std::mem::zeroed() };
+                // SAFETY: the path is NUL-terminated and the struct is writable.
+                check(unsafe { libc::statfs(path.as_ptr(), &mut status) })?;
+                Ok(format!(
+                    "type {:x} blocks {} files {}",
+                    status.f_type, status.f_blocks, status.f_files
+                ))
+            }
+            "link-count" => Ok(fs::symlink_metadata(target)?.nlink().to_string()),
+            // The device or source field of the mount at `target` in /proc/self/mountinfo.
+            "mount-source" => {
+                let table = fs::read_to_string("/proc/self/mountinfo")?;
+                table
+                    .lines()
+                    .filter(|line| line.split(' ').nth(4) == Some(target))
+                    .filter_map(|line| line.split_once(" - ")?.1.split(' ').nth(1))
+                    .next_back()
+                    .map(str::to_string)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such mount"))
+            }
+            // Sends signal SIGNAL to process PID: `PID:SIGNAL`.
+            "kill-signal" => {
+                let (pid, signal) = target
+                    .split_once(':')
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "PID:SIGNAL"))?;
+                // SAFETY: kill takes a process ID and a signal.
+                check(unsafe { libc::kill(number(pid)?, number(signal)?) }).map(|_| String::new())
+            }
+            "pidfd-open" => {
+                let pid: libc::pid_t = number(target)?;
+                // SAFETY: pidfd_open takes a process ID and flags; the descriptor is closed.
+                let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+                if fd < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: closes the descriptor opened above.
+                unsafe { libc::close(fd as libc::c_int) };
+                Ok(String::new())
+            }
+            // The process IDs that the /proc at `target` lists, sorted and separated by commas.
+            "proc-pids" => {
+                let mut pids: Vec<u32> = fs::read_dir(target)?
+                    .flatten()
+                    .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+                    .collect();
+                pids.sort_unstable();
+                let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
+                Ok(pids.join(","))
+            }
+            // Leaves an orphan behind: a child forks a grandchild and ends, and the grandchild
+            // ends a moment later. Counts the zombies the /proc at `target` lists after another
+            // moment; an orphan that nobody reaps is one.
+            "orphan-zombies" => {
+                // SAFETY: the probe has one thread; the children only sleep and end.
+                unsafe {
+                    let child = libc::fork();
+                    if child == 0 {
+                        if libc::fork() == 0 {
+                            libc::usleep(100_000);
+                            libc::_exit(0);
+                        }
+                        libc::_exit(0);
+                    }
+                    libc::waitpid(child, std::ptr::null_mut(), 0);
+                    libc::usleep(500_000);
+                }
+                let zombie = |stat: &str| {
+                    stat.rfind(')')
+                        .is_some_and(|end| stat[end + 1..].trim_start().starts_with('Z'))
+                };
+                let zombies = fs::read_dir(target)?
+                    .flatten()
+                    .filter(|entry| {
+                        let name = entry.file_name();
+                        name.to_str()
+                            .is_some_and(|name| name.parse::<u32>().is_ok())
+                    })
+                    .filter_map(|entry| fs::read_to_string(entry.path().join("stat")).ok())
+                    .filter(|stat| zombie(stat))
+                    .count();
+                Ok(zombies.to_string())
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unknown action",
+            )),
+        }
+    }
+
+    fn check(result: libc::c_int) -> io::Result<libc::c_int> {
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(result)
+    }
+
+    fn number(text: &str) -> io::Result<libc::c_int> {
+        text.parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "not a number"))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod view {
     use std::io;
 
     pub const ACTIONS: &[&str] = &[];

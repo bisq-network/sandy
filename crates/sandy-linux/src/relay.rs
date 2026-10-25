@@ -54,6 +54,7 @@ use crate::factory::{self, Factory};
 use crate::filter;
 use crate::handover::{self, Handover, Inbox};
 use crate::helper::{self, Ready, WATCHDOG_TICK, Watchdog};
+use crate::launch::Threads;
 use crate::peer::PeerCheck;
 
 /// Why a contained program ends when its relay ends first (`contain::Helper`).
@@ -212,7 +213,10 @@ pub fn start(
         program,
         ended,
     };
-    let pid = helper::start("the relay", move |ready| relay_main(relay, ready, config))?;
+    let threads = Threads::open()?;
+    let pid = helper::start("the relay", &threads, move |ready| {
+        relay_main(relay, ready, config)
+    })?;
     Ok((pid, inside))
 }
 

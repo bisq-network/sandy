@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 use landlock::{ABI, Access, AccessFs, AccessNet, BitFlags, Scope, make_bitflags};
 use sandy_core::{
-    ChildProcesses, IpAccess, NetworkAccess, PathAccess, PathIdentity, PathMetadata, PathRule,
-    PlanItem, ProtectedPath, Requirement, ResolvedPolicy, SignalScope, SystemAccess,
+    ChildProcesses, FileView, IpAccess, NetworkAccess, PathAccess, PathIdentity, PathMetadata,
+    PathRule, PlanItem, ProtectedPath, Requirement, ResolvedPolicy, SignalScope, SystemAccess,
 };
 
 use crate::broker::BrokerConfig;
@@ -24,6 +24,7 @@ use crate::namespace::{Missing, Namespaces};
 use crate::openssl;
 use crate::relay::RelayConfig;
 use crate::system::{self, Needed, SystemPath, SystemUse};
+use crate::view::{Bind, Link, View};
 
 #[derive(Debug)]
 pub struct LinuxPlan {
@@ -45,6 +46,8 @@ pub struct Sandbox {
     pub broker: Option<BrokerConfig>,
     /// The namespaces the program runs in, `None` for the host's own (see `namespace`).
     pub namespaces: Option<Namespaces>,
+    /// `filesystem.view = "policy"`: what the program's mount namespace shows (see `view`).
+    pub view: Option<View>,
     /// `process.children = "contained"`: sandy stays the program's parent and ends its process
     /// group when the program ends, instead of replacing itself with the program.
     pub contain: bool,
@@ -93,6 +96,33 @@ const PRIVATE_NETWORK: &str = "a user and a network namespace of the sandbox's o
     themselves and setgroups denied, so root is not mapped; every capability in the namespace \
     dropped, the bounding set included; the relays and the egress broker are the only ways in \
     and out; seccomp denies the program new namespaces";
+const CONTAINED_GROUP: &str = "sandy stays the program's parent and puts it in a process group of \
+    its own, whose leader is a guard process of sandy; seccomp denies setsid and setpgid, so every \
+    process the program starts stays in that group; the guard kills the group when the program \
+    ends (pidfd) or sandy dies, and sandy kills it with SIGKILL when the program ends and reaps it \
+    as child subreaper";
+const CONTAINED_PID_NAMESPACE: &str = "a PID namespace of the sandbox's own, whose PID 1 is an \
+    init of sandy and whose PID 2 is the program; the kernel ends every process of the namespace \
+    when the init ends, and the init ends when the program or sandy ends (pidfd) and when a guard \
+    process of sandy, which watches the program and sandy, kills it; the program leads a process \
+    group of its own, and seccomp denies setsid and setpgid, so every process it starts stays in \
+    that group, which sandy kills with SIGKILL when the program ends; sandy stays the program's \
+    parent and reaps it as child subreaper";
+const SIGNALS_PID_NAMESPACE: &str = "a PID namespace of the sandbox's own: kill, pidfd_open, \
+    F_SETOWN, setpriority, ioprio_set and sched_setaffinity reach no process outside it by ID \
+    (ESRCH), the program's process group holds only its own processes, and seccomp denies setsid, \
+    setpgid and the terminal ioctls TIOCSPGRP, TIOCSWINSZ and TIOCSIG";
+const VIEW: &str = "a user and a mount namespace of the sandbox's own, created before the sandbox \
+    is applied: a read-only tmpfs root that holds only the paths the Landlock rules name, each \
+    bound at its own path through descriptors (open_tree, mount_setattr, move_mount), nosuid and \
+    nodev, read-only unless a writable path holds it and without execute unless the policy makes \
+    it executable; the symbolic links on the way to them; a /dev with null, zero, full, random and \
+    urandom; the old root detached (pivot_root); every capability in the namespace dropped; \
+    Landlock decides access as without the view, on a kernel with the fix of Landlock erratum 3; \
+    seccomp denies the program mounts and namespaces";
+/// Landlock erratum 3 (bit 2 of the errata bitmask): rights could widen through a directory that a
+/// bind mount disconnected, which the file system view creates.
+const ERRATUM_3: u64 = 1 << 2;
 const NO_WIN32K: &str =
     "nothing to deny: win32k is the GUI part of the Windows kernel, and Linux has none";
 
@@ -132,8 +162,11 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
         .collect();
     let enforceable = items.iter().all(PlanItem::is_enforced);
     let private = policy.ip == IpAccess::Private;
+    let hidden = policy.view == FileView::Policy;
+    let pid = pid_namespace(policy, host);
     let sandbox = match (abi, landlock) {
         (Ok(abi), Some(landlock)) if enforceable => Some(Sandbox {
+            view: hidden.then(|| view_config(policy, &landlock, &host.system_paths, pid)),
             landlock,
             client_binds: match policy.ip {
                 IpAccess::Client => port_zero_binds(host),
@@ -157,7 +190,11 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
                 private,
             ),
             broker: BrokerConfig::new(policy.egress, policy.signals, abi),
-            namespaces: private.then_some(Namespaces { network: true }),
+            namespaces: (private || hidden || pid).then_some(Namespaces {
+                network: private,
+                mount: hidden,
+                pid,
+            }),
             contain: policy.children == ChildProcesses::Contained,
             end_with_parent: policy.end_with_parent,
             identities,
@@ -165,6 +202,24 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
         _ => None,
     };
     LinuxPlan { items, sandbox }
+}
+
+/// Whether the program of `children = "contained"` runs in a PID namespace of its own. Only where
+/// the host gives one, and not where the program sees the host's `/proc` without a file system
+/// view: the host's `/proc` names processes by their IDs outside the namespace, so a program that
+/// reads `/proc/<getpid()>` would read another process. In a view it gets a `/proc` of its own.
+fn pid_namespace(policy: &ResolvedPolicy, host: &HostCapabilities) -> bool {
+    policy.children == ChildProcesses::Contained
+        && host.pid_namespace.is_ok()
+        && (policy.view == FileView::Policy || !sees_proc(policy, "/proc"))
+}
+
+/// Whether a policy path holds `path` or lies below it.
+fn sees_proc(policy: &ResolvedPolicy, path: &str) -> bool {
+    policy
+        .paths
+        .iter()
+        .any(|rule| rule.path.starts_with(path) || Path::new(path).starts_with(&rule.path))
 }
 
 /// The bind rights of `Sandbox::client_binds` on this host: TCP from Landlock ABI 4, UDP from
@@ -294,8 +349,12 @@ fn shortfalls(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
                 .to_string(),
         );
     }
+    // In a file system view these paths are read-only binds, where the calls fail with EROFS.
     let read_only = |rule: &PathRule| rule.access != PathAccess::ReadWrite;
-    if policy.path_metadata == PathMetadata::Deny && policy.paths.iter().any(read_only) {
+    if policy.path_metadata == PathMetadata::Deny
+        && policy.view == FileView::All
+        && policy.paths.iter().any(read_only)
+    {
         shortfalls.push(
             "path_metadata = \"deny\" is enforced only in part on Linux: through a descriptor it \
              opened for reading, the program can still change the mode, except the setuid and \
@@ -307,6 +366,43 @@ fn shortfalls(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
              through open files\")"
                 .to_string(),
         );
+    }
+    if policy.view == FileView::Policy {
+        shortfalls.extend(view_shortfalls(policy));
+    }
+    shortfalls
+}
+
+/// What a file system view leaves visible of the host (docs/linux.md, "File system view").
+fn view_shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
+    let hides = "filesystem.view = \"policy\" hides paths only in part on Linux";
+    let mut shortfalls = vec![
+        format!(
+            "{hides}: statfs on a path of the view reports the host's file system there, its \
+             type, size, free space and number of files, because the view binds the host's own \
+             file systems (docs/linux.md, \"File system view\")"
+        ),
+        format!(
+            "{hides}: the directories above a granted path exist in the view with their names, \
+             for example /home and /home/user above a granted /home/user/project, though the \
+             program cannot list them (docs/linux.md, \"File system view\")"
+        ),
+        format!(
+            "{hides}: the link count of a granted file still counts its names outside the view, \
+             so the program learns that a file has another name, though not where \
+             (docs/linux.md, \"File system view\")"
+        ),
+    ];
+    let proc_granted = policy
+        .paths
+        .iter()
+        .any(|rule| rule.path.starts_with("/proc") || Path::new("/proc").starts_with(&rule.path));
+    if proc_granted {
+        shortfalls.push(format!(
+            "{hides}: with /proc granted, /proc/self/mountinfo lists every mount of the view with \
+             the host's device and file system and their mount options, for example the name of \
+             an encrypted volume (docs/linux.md, \"File system view\")"
+        ));
     }
     shortfalls
 }
@@ -444,14 +540,10 @@ fn plan_item(
                 (Err(reason), _, _) | (_, Err(reason), _) | (_, _, Err(reason)) => {
                     unavailable(reason)
                 }
-                (Ok(()), Ok(()), Ok(())) => enforced(
-                    "sandy stays the program's parent and puts it in a process group of its own, \
-                     whose leader is a guard process of sandy; seccomp denies setsid and setpgid, \
-                     so every process the program starts stays in that group; the guard kills \
-                     the group when the program ends (pidfd) or sandy dies, and sandy kills it \
-                     with SIGKILL when the program ends and reaps it as child subreaper"
-                        .to_string(),
-                ),
+                (Ok(()), Ok(()), Ok(())) if pid_namespace(policy, host) => {
+                    enforced(CONTAINED_PID_NAMESPACE.to_string())
+                }
+                (Ok(()), Ok(()), Ok(())) => enforced(CONTAINED_GROUP.to_string()),
             }
         }
         Requirement::EndsWithParent => match (&host.landlock, &host.seccomp, &host.pidfd) {
@@ -503,7 +595,29 @@ fn plan_item(
                 _ => enforced(broker_mechanism(abi)),
             }
         }
-        Requirement::PathsHidden => unavailable("the Linux backend does not enforce this yet"),
+        Requirement::PathsHidden => {
+            let erratum = match &host.landlock_errata {
+                Ok(errata) if errata & ERRATUM_3 != 0 => Ok(()),
+                Ok(errata) => Err(format!(
+                    "the file system view needs the fix of Landlock erratum 3, which this kernel \
+                     lacks (errata {errata:#x}): Landlock rights could widen through a directory \
+                     that a bind mount disconnected"
+                )),
+                Err(reason) => Err(format!(
+                    "the file system view needs the fix of Landlock erratum 3, and {reason}"
+                )),
+            };
+            match (&host.user_namespaces, &host.seccomp, erratum) {
+                (_, Err(reason), _) | (Err(Missing::Unavailable(reason)), _, _) => {
+                    unavailable(reason)
+                }
+                (_, _, Err(reason)) => unavailable(&reason),
+                (Err(Missing::NeedsSetup(reason)), _, _) => {
+                    PlanItem::needs_setup(requirement, reason)
+                }
+                (Ok(()), Ok(()), Ok(())) => enforced(VIEW.to_string()),
+            }
+        }
         // The kernel sends the job control signals of a terminal without the check that the
         // Landlock scope hooks, so the scope alone does not isolate signals.
         Requirement::SignalsIsolated => match &host.seccomp {
@@ -513,11 +627,120 @@ fn plan_item(
                  exists and the terminal ioctls TIOCSPGRP, TIOCSWINSZ and TIOCSIG"
                     .to_string(),
             ),
-            Ok(()) => unavailable(&format!(
-                "signal isolation needs Landlock ABI 6 (Linux 6.12); this kernel has ABI {abi}"
-            )),
+            Ok(()) if pid_namespace(policy, host) => enforced(SIGNALS_PID_NAMESPACE.to_string()),
+            Ok(()) => {
+                let without = match (&host.pid_namespace, policy.children) {
+                    (Err(reason), ChildProcesses::Contained) => {
+                        format!(", and no PID namespace for children = \"contained\": {reason}")
+                    }
+                    (Ok(()), ChildProcesses::Contained) => {
+                        ", and children = \"contained\" gets no PID namespace while the program \
+                         sees the host's /proc; grant /proc only with filesystem.view = \"policy\""
+                            .to_string()
+                    }
+                    _ => ", or with children = \"contained\" a PID namespace".to_string(),
+                };
+                unavailable(&format!(
+                    "signal isolation needs Landlock ABI 6 (Linux 6.12){without}; this kernel has \
+                     ABI {abi}"
+                ))
+            }
         },
     }
+}
+
+/// The file system view of `filesystem.view = "policy"`: a bind for every path a Landlock rule
+/// names, so the view shows what the rules grant and nothing else, and the symbolic links on the
+/// way to them. A bind gets the rights of every path that holds it, as Landlock grants them: it
+/// is writable inside a writable path, and executable inside a path with an execute rule or a
+/// library directory of the system set, which the loader maps as code.
+fn view_config(
+    policy: &ResolvedPolicy,
+    landlock: &LandlockConfig,
+    system: &[SystemPath],
+    pid: bool,
+) -> View {
+    let writable = |path: &Path| {
+        policy
+            .paths
+            .iter()
+            .any(|rule| rule.access == PathAccess::ReadWrite && path.starts_with(&rule.path))
+    };
+    let executable = |path: &Path| {
+        let library = system
+            .iter()
+            .any(|entry| entry.usage == SystemUse::Library && path.starts_with(&entry.path));
+        library
+            || landlock
+                .rules
+                .iter()
+                .any(|rule| rule.access.contains(AccessFs::Execute) && path.starts_with(&rule.path))
+    };
+    let mut binds: Vec<Bind> = landlock
+        .rules
+        .iter()
+        .map(|rule| Bind {
+            path: rule.path.clone(),
+            is_dir: rule.is_dir,
+            writable: writable(&rule.path),
+            executable: executable(&rule.path),
+        })
+        .collect();
+    binds.sort_by(|a, b| a.path.cmp(&b.path));
+    binds.dedup_by(|later, kept| later.path == kept.path);
+
+    let bound = |path: &Path| landlock.rules.iter().any(|rule| rule.path == path);
+    let mut names: Vec<PathBuf> = policy.links.clone();
+    names.extend(
+        system
+            .iter()
+            .filter(|entry| bound(&entry.path))
+            .flat_map(|entry| entry.links.iter().cloned()),
+    );
+    names.extend(executed_names(policy));
+    names.sort();
+    names.dedup();
+    let links = names
+        .into_iter()
+        .filter(|name| !binds.iter().any(|bind| name.starts_with(&bind.path)))
+        .filter_map(|name| {
+            let target = std::fs::read_link(&name).ok()?;
+            Some(Link { path: name, target })
+        })
+        .collect();
+    // In a PID namespace the program gets a /proc of its own where the policy grants /proc, with
+    // the rights the rules of /proc and of the directories above it give.
+    let proc_rights = landlock
+        .rules
+        .iter()
+        .filter(|rule| Path::new("/proc").starts_with(&rule.path))
+        .fold(BitFlags::empty(), |rights, rule| rights | rule.access);
+    let proc = (pid && !proc_rights.is_empty()).then_some(proc_rights);
+    View { binds, links, proc }
+}
+
+/// The symbolic links that the kernel passes when it executes the program: the names of its
+/// interpreters as their `#!` lines write them, and of each loader as its ELF header writes it,
+/// up to `SHEBANG_LEVELS` scripts deep.
+fn executed_names(policy: &ResolvedPolicy) -> Vec<PathBuf> {
+    let mut links = Vec::new();
+    let Some(mut file) = policy.program.clone() else {
+        return links;
+    };
+    for _ in 0..=SHEBANG_LEVELS {
+        if let Some(loader) = loader::interpreter(&file) {
+            links.extend(system::links_on_the_way(&loader));
+        }
+        let Some(interpreter) = sandy_core::shebang(&file) else {
+            break;
+        };
+        links.extend(system::links_on_the_way(&interpreter));
+        let Ok(next) = interpreter.canonicalize() else {
+            break;
+        };
+        file = next;
+    }
+    links
 }
 
 /// One relay process serves exposed and forwarded ports, so both requirements name it.
@@ -799,7 +1022,7 @@ fn policy_rights(access: PathAccess, unix_all: bool) -> BitFlags<AccessFs> {
 
 fn system_rights(usage: SystemUse) -> BitFlags<AccessFs> {
     match usage {
-        SystemUse::Read => READ,
+        SystemUse::Read | SystemUse::Library => READ,
         SystemUse::Execute => AccessFs::ReadFile | AccessFs::Execute,
         SystemUse::Discard => AccessFs::ReadFile | AccessFs::WriteFile,
     }
@@ -819,9 +1042,10 @@ mod tests {
             is_dir,
             usage,
             needed,
+            links: Vec::new(),
         };
         let existing = vec![
-            system("/usr/lib", true, SystemUse::Read, Needed::Always),
+            system("/usr/lib", true, SystemUse::Library, Needed::Always),
             system(
                 "/usr/lib64/ld-linux-x86-64.so.2",
                 false,
@@ -835,9 +1059,11 @@ mod tests {
         let missing = system("/etc/ld.so.preload", false, SystemUse::Read, Needed::Always);
         HostCapabilities {
             landlock: abi.ok_or_else(|| "no Landlock here".to_string()),
+            landlock_errata: Ok(0xf),
             thread_count: Ok(()),
             process_group: Ok(()),
             user_namespaces: Ok(()),
+            pid_namespace: Ok(()),
             seccomp: Ok(()),
             no_new_privs: Ok(()),
             unprivileged: Ok(()),
@@ -866,6 +1092,7 @@ mod tests {
                 rule("/srv/share", PathAccess::Read, true),
             ],
             program: Some(PathBuf::from("/opt/app/bin/app")),
+            links: Vec::new(),
             system: SystemAccess::Minimal,
             ip: IpAccess::None,
             unix_sockets: NetworkAccess::None,
@@ -1088,7 +1315,14 @@ mod tests {
         };
         assert!(mechanism.contains("handed to the relay"), "{mechanism}");
         let sandbox = plan.sandbox.unwrap();
-        assert_eq!(sandbox.namespaces, Some(Namespaces { network: true }));
+        assert_eq!(
+            sandbox.namespaces,
+            Some(Namespaces {
+                network: true,
+                mount: false,
+                pid: false,
+            })
+        );
         assert!(sandbox.relay.unwrap().private);
         assert!(sandbox.filter.allow_ip && !sandbox.filter.deny_inbound);
         assert!(sandbox.landlock.handled_net.is_empty());
@@ -1240,6 +1474,162 @@ mod tests {
         assert!(warned(&policy, egress_port));
     }
 
+    /// `view = "policy"` enters a mount namespace and binds every rule path once: writable only
+    /// inside a writable path, executable inside a path with an execute rule or a library
+    /// directory of the system set.
+    #[test]
+    fn a_view_binds_the_rule_paths_with_their_rights() {
+        let mut policy = policy();
+        policy.view = FileView::Policy;
+        policy
+            .paths
+            .push(rule("/srv/share/doc", PathAccess::Read, true));
+        policy
+            .paths
+            .push(rule("/opt/app/data", PathAccess::Read, true));
+        let plan = plan_for(&policy, &host(Some(9)));
+        assert_eq!(unavailable(&plan), vec![]);
+        let Status::Enforced { mechanism } = status(&plan, Requirement::PathsHidden) else {
+            panic!("{plan:?}");
+        };
+        assert!(mechanism.contains("pivot_root"), "{mechanism}");
+        let sandbox = plan.sandbox.unwrap();
+        assert_eq!(
+            sandbox.namespaces,
+            Some(Namespaces {
+                network: false,
+                mount: true,
+                pid: false,
+            })
+        );
+        let view = sandbox.view.unwrap();
+        let bind = |path: &str| {
+            view.binds
+                .iter()
+                .find(|bind| bind.path == Path::new(path))
+                .map(|bind| (bind.writable, bind.executable))
+                .unwrap_or_else(|| panic!("no bind for {path}"))
+        };
+        assert_eq!(bind("/data"), (true, false));
+        assert_eq!(bind("/srv/share"), (false, false));
+        assert_eq!(bind("/srv/share/doc"), (false, false));
+        assert_eq!(bind("/opt/app"), (false, true));
+        // A `read` path inside a `read_exec` path keeps the execute right Landlock grants there.
+        assert_eq!(bind("/opt/app/data"), (false, true));
+        assert_eq!(bind("/opt/app/bin/app"), (false, true));
+        assert_eq!(bind("/usr/lib"), (false, true));
+        assert_eq!(bind("/usr/lib64/ld-linux-x86-64.so.2"), (false, true));
+        assert_eq!(bind("/dev/null"), (false, false));
+        // One bind per path, sorted, so a path follows the paths that hold it.
+        let paths: Vec<&Path> = view.binds.iter().map(|bind| bind.path.as_path()).collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(paths, sorted);
+        assert_eq!(paths.len(), sandbox.landlock.rules.len());
+
+        policy.view = FileView::All;
+        let sandbox = plan_for(&policy, &host(Some(9))).sandbox.unwrap();
+        assert_eq!(sandbox.namespaces, None);
+        assert_eq!(sandbox.view, None);
+    }
+
+    /// The links the policy paths and the system entries pass are recreated where they lie
+    /// outside every bind, with their text, and not where a bind already shows them.
+    #[test]
+    fn a_view_recreates_the_links_outside_the_binds() {
+        let dir = std::env::temp_dir().join(format!("sandy-plan-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::create_dir_all(dir.join("granted")).unwrap();
+        std::os::unix::fs::symlink("real", dir.join("outside")).unwrap();
+        std::os::unix::fs::symlink("../real", dir.join("granted/inside")).unwrap();
+        let mut policy = policy();
+        policy.view = FileView::Policy;
+        policy.paths.push(rule(
+            dir.join("real").to_str().unwrap(),
+            PathAccess::Read,
+            true,
+        ));
+        policy.paths.push(rule(
+            dir.join("granted").to_str().unwrap(),
+            PathAccess::Read,
+            true,
+        ));
+        policy.links = vec![dir.join("granted/inside"), dir.join("outside")];
+        let mut host = host(Some(9));
+        host.system_paths[0].links = vec![dir.join("outside")];
+        let view = plan_for(&policy, &host).sandbox.unwrap().view.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            view.links,
+            vec![Link {
+                path: dir.join("outside"),
+                target: PathBuf::from("real"),
+            }]
+        );
+    }
+
+    /// The view needs user namespaces as the private network does, and a kernel with the fix of
+    /// Landlock erratum 3; an unknown errata mask counts as missing.
+    #[test]
+    fn a_view_follows_what_the_host_says() {
+        let mut policy = policy();
+        policy.view = FileView::Policy;
+        let mut restricted = host(Some(9));
+        restricted.user_namespaces = Err(Missing::NeedsSetup("restricted".to_string()));
+        let plan = plan_for(&policy, &restricted);
+        assert_eq!(
+            status(&plan, Requirement::PathsHidden),
+            &Status::NeedsSetup {
+                reason: "restricted".to_string()
+            }
+        );
+        assert!(plan.sandbox.is_none());
+
+        for errata in [Ok(0x3), Err("no errata here".to_string())] {
+            let mut old = restricted.clone();
+            old.landlock_errata = errata.clone();
+            // A kernel without the fix is unavailable, which setup cannot change.
+            match status(&plan_for(&policy, &old), Requirement::PathsHidden) {
+                Status::Unavailable { reason } => assert!(reason.contains("erratum 3"), "{reason}"),
+                other => panic!("{errata:?}: {other:?}"),
+            }
+        }
+
+        let mut no_seccomp = host(Some(9));
+        no_seccomp.seccomp = Err("no seccomp".to_string());
+        assert!(unavailable(&plan_for(&policy, &no_seccomp)).contains(&Requirement::PathsHidden));
+    }
+
+    /// The view closes the metadata exception of `read` paths and adds its own, the mount table
+    /// one only with /proc in the policy.
+    #[test]
+    fn view_notes_name_what_stays_visible() {
+        let warned = |policy: &ResolvedPolicy, text: &str| {
+            notes(policy, &host(Some(9)))
+                .iter()
+                .any(|note| note.contains(text))
+        };
+        let metadata = "path_metadata = \"deny\" is enforced only in part";
+        let view_notes = [
+            "statfs on a path",
+            "the directories above",
+            "the link count",
+        ];
+        let mut policy = policy();
+        assert!(warned(&policy, metadata));
+        assert!(!warned(&policy, view_notes[0]));
+        policy.view = FileView::Policy;
+        assert!(!warned(&policy, metadata));
+        for note in view_notes {
+            assert!(warned(&policy, note), "{note}");
+        }
+        assert!(!warned(&policy, "mountinfo"));
+        policy.paths.push(rule("/proc", PathAccess::Read, true));
+        assert!(warned(&policy, "mountinfo"));
+    }
+
     #[test]
     fn denying_children_needs_seccomp() {
         let mut policy = policy();
@@ -1287,6 +1677,110 @@ mod tests {
             assert!(!sandbox.contain);
             assert!(!sandbox.filter.keep_process_group);
         }
+    }
+
+    /// `contained` runs the program in a PID namespace where the host gives one, keeps its process
+    /// group and the denial of setsid and setpgid, and gets none where the program would see the
+    /// host's /proc without a view.
+    #[test]
+    fn contained_uses_a_pid_namespace_where_the_host_gives_one() {
+        let mut policy = policy();
+        policy.children = ChildProcesses::Contained;
+        let mechanism = |policy: &ResolvedPolicy, host: &HostCapabilities| {
+            let plan = plan_for(policy, host);
+            match status(&plan, Requirement::ChildProcessesContained) {
+                Status::Enforced { mechanism } => mechanism.clone(),
+                other => panic!("{other:?}"),
+            }
+        };
+        let plan = plan_for(&policy, &host(Some(9)));
+        let sandbox = plan.sandbox.unwrap();
+        assert_eq!(
+            sandbox.namespaces,
+            Some(Namespaces {
+                network: false,
+                mount: false,
+                pid: true,
+            })
+        );
+        assert!(sandbox.filter.keep_process_group);
+        assert!(mechanism(&policy, &host(Some(9))).contains("PID namespace"));
+
+        let mut no_namespace = host(Some(9));
+        no_namespace.pid_namespace = Err("no user namespaces".to_string());
+        assert_eq!(
+            plan_for(&policy, &no_namespace).sandbox.unwrap().namespaces,
+            None
+        );
+        assert!(mechanism(&policy, &no_namespace).contains("whose leader is a guard"));
+
+        // The host's /proc names processes by their IDs outside the namespace.
+        let mut with_proc = policy.clone();
+        with_proc.paths.push(rule("/proc", PathAccess::Read, true));
+        assert_eq!(
+            plan_for(&with_proc, &host(Some(9)))
+                .sandbox
+                .unwrap()
+                .namespaces,
+            None
+        );
+        // A view gives the program a /proc of its own instead, with the rights of the policy's.
+        with_proc.view = FileView::Policy;
+        let sandbox = plan_for(&with_proc, &host(Some(9))).sandbox.unwrap();
+        assert!(sandbox.namespaces.unwrap().pid);
+        assert_eq!(sandbox.view.unwrap().proc, Some(READ));
+
+        for children in [ChildProcesses::Allowed, ChildProcesses::None] {
+            policy.children = children;
+            assert_eq!(
+                plan_for(&policy, &host(Some(9)))
+                    .sandbox
+                    .unwrap()
+                    .namespaces,
+                None
+            );
+        }
+    }
+
+    /// Below Landlock ABI 6 the PID namespace of `contained` isolates signals, and nothing else
+    /// does: without it, or without `contained`, the requirement stays unavailable, with the
+    /// reason.
+    #[test]
+    fn a_pid_namespace_isolates_signals_below_abi_6() {
+        let mut policy = policy();
+        policy.children = ChildProcesses::Contained;
+        let plan = plan_for(&policy, &host(Some(4)));
+        assert_eq!(unavailable(&plan), vec![]);
+        let Status::Enforced { mechanism } = status(&plan, Requirement::SignalsIsolated) else {
+            panic!("{plan:?}");
+        };
+        assert!(mechanism.contains("PID namespace"), "{mechanism}");
+        let sandbox = plan.sandbox.unwrap();
+        assert!(sandbox.filter.isolate_signals && sandbox.landlock.scopes.is_empty());
+
+        let mut no_namespace = host(Some(4));
+        no_namespace.pid_namespace = Err("no user namespaces".to_string());
+        match status(
+            &plan_for(&policy, &no_namespace),
+            Requirement::SignalsIsolated,
+        ) {
+            Status::Unavailable { reason } => {
+                assert!(reason.contains("no user namespaces"), "{reason}")
+            }
+            other => panic!("{other:?}"),
+        }
+        policy.children = ChildProcesses::Allowed;
+        assert_eq!(
+            unavailable(&plan_for(&policy, &host(Some(4)))),
+            vec![Requirement::SignalsIsolated]
+        );
+        // From ABI 6 the Landlock scope isolates signals, with or without the namespace.
+        policy.children = ChildProcesses::Contained;
+        let plan = plan_for(&policy, &host(Some(6)));
+        let Status::Enforced { mechanism } = status(&plan, Requirement::SignalsIsolated) else {
+            panic!("{plan:?}");
+        };
+        assert!(mechanism.contains("Landlock ABI 6"), "{mechanism}");
     }
 
     #[test]

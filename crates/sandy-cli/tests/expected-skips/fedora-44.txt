@@ -4,8 +4,9 @@
 # tell from a caller that is still there. Only --parent-start closes this (docs/linux.md).
 parent a_parent_that_ended_before_sandy_ran_is_refused orphan-detection-without-a-token
 # Only Ubuntu 23.10 and newer restrict the user namespaces of unconfined processes with AppArmor,
-# which makes `check --ip private` exit with status 2.
+# which makes `check --ip private` and `check --view policy` exit with status 2.
 private_linux check_needs_setup_under_the_apparmor_restriction apparmor-userns-restriction
+view_linux check_needs_setup_under_the_apparmor_restriction apparmor-userns-restriction
 # The test of egress reach = "public-and-local" needs another host of the local network, which
 # SANDY_TEST_LOCAL_PEER names; a plain run does not set it.
 private_linux public_and_local_reaches_a_host_of_the_local_network local-network-peer

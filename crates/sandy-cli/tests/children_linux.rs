@@ -28,17 +28,18 @@ fn contained(fixture: &Fixture) -> Vec<String> {
     args
 }
 
-/// Whether the kernel can isolate signals, which `contained` needs. Where it cannot, checks that
-/// sandy refuses.
+/// Whether this host can isolate signals, which `contained` needs: with Landlock ABI 6, or below
+/// it with a PID namespace. Where it cannot, checks that sandy refuses.
 fn supported(fixture: &Fixture) -> bool {
-    if landlock_abi() >= 6 {
+    let check = sandy(["check", "--children", "contained", "--signals", "isolated"]);
+    if landlock_abi() >= 6 || check.status.success() {
         return true;
     }
     let output = sandy(run_args(&contained(fixture), &[("env", "PATH")]));
     assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
     skip(
         "landlock-abi-6",
-        "signal isolation needs Landlock ABI 6; sandy refused",
+        "signal isolation needs Landlock ABI 6 or a PID namespace; sandy refused",
     );
     false
 }
@@ -169,7 +170,8 @@ fn the_guard_ends_the_group_when_sandy_is_killed() {
     let mut stdout = BufReader::new(sandy.stdout.take().unwrap());
     let mut line = String::new();
     stdout.read_line(&mut line).unwrap();
-    let pid: libc::pid_t = line.trim_end().split('\t').nth(3).unwrap().parse().unwrap();
+    let reported: libc::pid_t = line.trim_end().split('\t').nth(3).unwrap().parse().unwrap();
+    let pid = common::linux::outside_id(sandy.id(), reported);
     sandy.stdout = Some(stdout.into_inner());
     let output = output_end(&mut sandy);
 
@@ -285,7 +287,7 @@ fn a_program_that_stops_sandy_cannot_outlive_its_end() {
     with_terminal(&pty)(&mut command);
     let mut sandy = command.spawn().unwrap();
     let mut stdout = BufReader::new(sandy.stdout.take().unwrap());
-    let left: libc::pid_t = detail(&mut stdout).parse().unwrap();
+    let left = common::linux::outside_id(sandy.id(), detail(&mut stdout).parse().unwrap());
     // The second line comes after a child of the program has continued it; then it exits.
     detail(&mut stdout);
 
@@ -432,6 +434,19 @@ fn a_program_cannot_raise_the_oom_priority_of_sandys_helpers() {
     }
     let mut args = contained(&fixture);
     args.extend(["--read-write", "/proc"].map(String::from));
+    // Without a file system view the host's /proc keeps the PID namespace away, and below
+    // Landlock ABI 6 nothing else isolates signals.
+    let mut check = vec!["check".to_string()];
+    check.extend(args.iter().cloned());
+    if !sandy(&check).status.success() {
+        let refused = sandy(run_args(&args, &[("env", "PATH")]));
+        assert_eq!(refused.status.code(), Some(EXIT_FAILURE), "{refused:?}");
+        return skip(
+            "landlock-abi-6",
+            "with /proc granted and no view, contained gets no PID namespace, and signal \
+             isolation needs Landlock ABI 6; sandy refused",
+        );
+    }
     let actions = [
         ("oom-raise", "self"),
         ("oom-raise", "parent"),

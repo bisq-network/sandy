@@ -31,6 +31,7 @@ use sandy_core::SandboxError;
 
 use crate::filter;
 use crate::helper::{self, Ready, receive_descriptor, send_descriptor, socket_pair};
+use crate::launch::Threads;
 
 /// The relay's side: it asks for one socket at a time.
 #[derive(Debug)]
@@ -60,8 +61,8 @@ pub fn pair() -> Result<(Factory, Pending), SandboxError> {
 impl Pending {
     /// Starts the factory in this process's network namespace and returns its process ID once it
     /// is confined.
-    pub fn start(self, abi: ABI) -> Result<libc::pid_t, SandboxError> {
-        helper::start("the socket factory", move |ready| {
+    pub fn start(self, abi: ABI, threads: &Threads) -> Result<libc::pid_t, SandboxError> {
+        helper::start("the socket factory", threads, move |ready| {
             factory_main(&self.0, ready, abi)
         })
     }
@@ -349,7 +350,8 @@ mod tests {
         if child == 0 {
             let outcome = (|| {
                 let (factory, pending) = pair().map_err(|_| 1)?;
-                let pid = pending.start(ABI::from(version)).map_err(|_| 2)?;
+                let threads = Threads::open().map_err(|_| 2)?;
+                let pid = pending.start(ABI::from(version), &threads).map_err(|_| 2)?;
                 for address in ["127.0.0.1:0", "[::1]:0"] {
                     let Ok(listener) = TcpListener::bind(address) else {
                         continue;
