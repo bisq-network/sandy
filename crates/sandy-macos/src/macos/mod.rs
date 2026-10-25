@@ -4,13 +4,14 @@
 mod contain;
 mod exec;
 mod helper;
+mod holder;
 mod relay;
 mod seatbelt;
 mod watch;
 
 use sandy_core::{
-    Backend, ChildProcesses, ParentProcess, PlanItem, ResolvedPolicy, SandboxError, StatusReport,
-    TargetCommand,
+    Backend, ChildProcesses, ParentProcess, PlanItem, Requirement, ResolvedPolicy, SandboxError,
+    StatusReport, TargetCommand,
 };
 
 use std::ffi::CStr;
@@ -18,7 +19,7 @@ use std::io::Read;
 
 use crate::binary;
 use crate::plan::{HostCapabilities, SHEBANG_LEVELS, executable_paths, plan_for};
-use crate::profile::{generate, relay_pairs, relay_profile, watcher_profile};
+use crate::profile::{generate, held_ports, relay_pairs, relay_profile, watcher_profile};
 use seatbelt::Seatbelt;
 
 // The profile is generated on every platform, so it carries its own copy of these numbers.
@@ -53,6 +54,14 @@ impl Backend for MacosBackend {
 
     fn verify(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
         let mut items = sandy_core::verify::relay_listeners(policy);
+        // Like the listeners, the ports the relay holds can be taken; the sockets close at once.
+        items.extend(held_ports(policy).into_iter().find_map(|port| {
+            let error = holder::hold(port).err()?;
+            Some(PlanItem::unavailable(
+                Requirement::IpNetworkPrivate,
+                error.to_string(),
+            ))
+        }));
         if let Err(reason) = applies_in_a_trial(policy) {
             items.extend(crate::plan::profile_unavailable(policy, &reason));
         }
@@ -89,7 +98,7 @@ impl Backend for MacosBackend {
             } else {
                 None
             };
-            relay = Some(relay::start(&pairs, &seatbelt, ended)?);
+            relay = Some(relay::start(&pairs, &held_ports(policy), &seatbelt, ended)?);
         }
         if policy.end_with_parent {
             let parent = command.parent.unwrap_or_else(|| ParentProcess {
@@ -326,7 +335,12 @@ mod tests {
         };
         let mut policies = Vec::new();
         for system in [SystemAccess::Minimal, SystemAccess::None] {
-            for ip in [IpAccess::None, IpAccess::Client, IpAccess::All] {
+            for ip in [
+                IpAccess::None,
+                IpAccess::Private,
+                IpAccess::Client,
+                IpAccess::All,
+            ] {
                 for unix_sockets in [NetworkAccess::None, NetworkAccess::All] {
                     for signals in [SignalScope::Any, SignalScope::Isolated] {
                         policies.push(ResolvedPolicy {
@@ -342,6 +356,26 @@ mod tests {
                 }
             }
         }
+        // The relay rules of a private network, and the view.
+        policies.push(ResolvedPolicy {
+            ip: IpAccess::Private,
+            expose: vec![sandy_core::ExposedPort {
+                listen: "127.0.0.1:18080".parse().unwrap(),
+                port: 8080,
+            }],
+            forward: vec![
+                sandy_core::ForwardedPort {
+                    port: 18081,
+                    to: "127.0.0.1:8081".parse().unwrap(),
+                },
+                sandy_core::ForwardedPort {
+                    port: 18082,
+                    to: "[::1]:8082".parse().unwrap(),
+                },
+            ],
+            view: sandy_core::FileView::Policy,
+            ..base.clone()
+        });
         policies.push(ResolvedPolicy {
             children: sandy_core::ChildProcesses::None,
             end_with_parent: false,

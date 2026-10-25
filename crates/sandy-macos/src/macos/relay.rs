@@ -1,9 +1,10 @@
 //! The relay behind `network.expose` and `network.forward`. sandy binds the listeners and then
 //! starts the relay as a helper process (see `helper`), which launchd adopts, so the target,
 //! which takes over sandy's process ID, never sees it as a child and cannot reap it. The relay
-//! keeps only its listeners, watches sandy's process ID with kqueue, applies its own Seatbelt
-//! profile, and only then tells sandy that it is ready. It accepts connections until the target ends, then closes
-//! its listeners and lets the accepted connections finish for at most one second.
+//! keeps only its listeners and the holder sockets of `ip = "private"`, watches sandy's process
+//! ID with kqueue, applies its own Seatbelt profile, and only then tells sandy that it is ready.
+//! It accepts connections until the target ends, then closes its listeners and lets the accepted
+//! connections finish for at most one second.
 
 use std::fs::File;
 use std::io;
@@ -16,6 +17,7 @@ use std::time::{Duration, Instant};
 use sandy_core::SandboxError;
 
 use super::helper::{self, NO_EVENT, Ready, new_queue, register};
+use super::holder;
 use super::seatbelt::Seatbelt;
 use crate::profile::{Profile, RelayPair, relay_profile};
 
@@ -27,14 +29,20 @@ const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(50);
 
 /// Starts the relay for `pairs` as a helper process (see `helper`). Returns its process ID once
 /// the relay is confined, watches this process and serves; any failure before that is an error,
-/// and then no relay serves. With `children = "contained"`, `ended` is the read end of a pipe
-/// whose write end only the guard holds: its end means that the program's group has ended, also
-/// while the supervising sandy is stopped.
+/// and then no relay serves. The relay also keeps the `held` ports bound at the wildcard
+/// addresses for as long as it runs (`holder`). With `children = "contained"`, `ended` is the
+/// read end of a pipe whose write end only the guard holds: its end means that the program's
+/// group has ended, also while the supervising sandy is stopped.
 pub fn start(
     pairs: &[RelayPair],
+    held: &[u16],
     seatbelt: &Seatbelt,
     ended: Option<File>,
 ) -> Result<libc::pid_t, SandboxError> {
+    let mut holders = Vec::with_capacity(held.len() * 2);
+    for port in held {
+        holders.extend(holder::hold(*port)?);
+    }
     let mut listeners = Vec::with_capacity(pairs.len());
     for pair in pairs {
         let listener = TcpListener::bind(pair.listen).map_err(|error| {
@@ -48,8 +56,10 @@ pub fn start(
     let watched = unsafe { libc::getpid() };
     let mut keep: Vec<RawFd> = listeners.iter().map(|(l, _)| l.as_raw_fd()).collect();
     keep.extend(ended.as_ref().map(AsRawFd::as_raw_fd));
+    keep.extend(holders.iter().map(AsRawFd::as_raw_fd));
     helper::start("the relay", &keep, move |ready| {
-        serve(listeners, ended, &profile, &seatbelt, watched, ready)
+        serve(listeners, ended, &profile, &seatbelt, watched, ready);
+        drop(holders);
     })
 }
 

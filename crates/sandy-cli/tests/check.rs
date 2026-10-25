@@ -474,6 +474,76 @@ fn check_warns_that_a_stopped_relay_has_no_time_limit() {
     assert!(!warns(&stderr, gap), "{stderr}");
 }
 
+/// Seatbelt's `localhost` is every address of the Mac, so a private network lets the program
+/// listen on its exposed ports, and reach its forwarded ports, at every address; check names both
+/// (docs/macos.md, "The private network"). The control: a private network without relays.
+#[cfg(target_os = "macos")]
+#[test]
+fn check_reports_a_private_network_and_warns_where_it_reaches_other_addresses() {
+    let to = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut args = forward_args(&to);
+    args[1] = "private".to_string();
+    let expose = format!("{}=8080", free_address());
+    let mut check = vec!["check"];
+    check.extend(args.each_ref().map(String::as_str));
+    check.extend(["--expose", &expose]);
+    let output = sandy(&check);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.lines().any(|line| line.starts_with(
+            "enforced     IP networking limited to the sandbox's own loopback: Seatbelt profile: \
+             TCP only"
+        )),
+        "{stdout}"
+    );
+    let exposed = "keeps the program's exposed ports off the network only in part";
+    let forwarded = "keeps the program off this Mac's other addresses only in part";
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(warns(&stderr, exposed), "{stderr}");
+    assert!(warns(&stderr, forwarded), "{stderr}");
+    // The relay still cannot tell who connects, as with ip = "all".
+    assert!(warns(&stderr, "serves every local user"), "{stderr}");
+
+    let stderr = check_warnings(&["--ip", "private"]);
+    assert!(!warns(&stderr, exposed), "{stderr}");
+    assert!(!warns(&stderr, forwarded), "{stderr}");
+}
+
+/// The ENOENT rule of the profile hides every path outside the policy, so the view is enforced,
+/// with a warning for what stays visible. `unix_sockets = "all"` lets the program test every
+/// path again, so check refuses the view with it.
+#[cfg(target_os = "macos")]
+#[test]
+fn check_reports_the_view_and_refuses_it_with_every_unix_socket() {
+    let output = sandy(["check", "--view", "policy"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.lines().any(|line| line.starts_with(
+            "enforced     paths outside the policy hidden: Seatbelt profile: every path outside \
+             the policy"
+        )),
+        "{stdout}"
+    );
+    let gap = "view = \"policy\" hides paths outside the policy only in part";
+    assert!(
+        warns(&String::from_utf8_lossy(&output.stderr), gap),
+        "{output:?}"
+    );
+
+    let output = sandy(["check", "--view", "policy", "--unix-sockets", "all"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(NOT_ENFORCEABLE), "{stdout}");
+    assert!(
+        stdout.contains("UNAVAILABLE  paths outside the policy hidden: unix_sockets = \"all\""),
+        "{stdout}"
+    );
+    // Control: the same Unix sockets without the view.
+    let output = sandy(["check", "--unix-sockets", "all"]);
+    assert!(output.status.success(), "{output:?}");
+}
+
 /// A file moved out of a granted directory keeps the grant it inherited there
 /// (docs/windows.md, "Links and identity"). A grant of a single file has no such children.
 #[cfg(windows)]

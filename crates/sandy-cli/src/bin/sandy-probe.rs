@@ -4299,7 +4299,12 @@ mod macos {
 
     /// Lists a directory with `getattrlistbulk`, which returns the metadata of every entry in one
     /// call instead of one `stat` per name. Reports the entries it returned with their file ids.
+    /// `PATH<U+001F>objtype` also asks for the type of each entry.
     fn getattrlistbulk(target: &str) -> io::Result<String> {
+        let (target, object_type) = match target.split_once(super::ARGUMENT_SEPARATOR) {
+            Some((path, "objtype")) => (path, libc::ATTR_CMN_OBJTYPE),
+            _ => (target, 0),
+        };
         let path = cstr(target)?;
         // SAFETY: the path is a C string; O_RDONLY on a directory needs no mode.
         let directory = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
@@ -4307,7 +4312,10 @@ mod macos {
             return Err(io::Error::last_os_error());
         }
         let mut wanted = common_attributes(
-            libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | libc::ATTR_CMN_FILEID,
+            libc::ATTR_CMN_RETURNED_ATTRS
+                | libc::ATTR_CMN_NAME
+                | object_type
+                | libc::ATTR_CMN_FILEID,
         );
         let mut buffer = [0u8; 8192];
         // SAFETY: the call writes at most buffer.len() bytes into the buffer.
@@ -4335,9 +4343,9 @@ mod macos {
                     .ok_or_else(|| io::Error::other("the entry is cut short"))?,
             ) as usize;
             // After the length comes the set of attributes that are present (five words), then
-            // the attributes themselves in order.
+            // the attributes themselves in order; the type takes four bytes.
             let name = read_reference(&buffer, at + 4 + 20)?;
-            let id_at = at + 4 + 20 + 8;
+            let id_at = at + 4 + 20 + 8 + if object_type == 0 { 0 } else { 4 };
             let id = u64::from_ne_bytes(
                 buffer
                     .get(id_at..id_at + 8)

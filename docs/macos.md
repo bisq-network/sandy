@@ -84,6 +84,9 @@ compiler fail, and sandy fails closed.
 | `InheritedHandlesClosed` | `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`; descriptors 0, 1 and 2 are named with `posix_spawn_file_actions_addinherit_np`. The kernel closes every other descriptor during the exec. With `children = "contained"` the forked target, a single thread, marks every descriptor above 2 close-on-exec (`PROC_PIDLISTFDS`) right before `execve`. |
 | `EnvironmentControlled` | `posix_spawn` (with `children = "contained"`: `execve`) receives exactly `command.env`. The backend adds no variable. |
 | `IpNetworkDenied` | Profile: no `network-*` rule for IP, and the NECP calls are denied. The name resolver is unreachable unless `unix_sockets = "all"`. |
+| `IpNetworkPrivate` | Profile: TCP only, `network-outbound` only to `(remote tcp "localhost:P")` for each forwarded port and `network-bind` and `network-inbound` only on `(local tcp "localhost:E")` for each exposed port, and the NECP calls are denied. The relay binds the forwarded ports at the wildcard addresses without listening. The name resolver is unreachable unless `unix_sockets = "all"`. See [The private network](#the-private-network). |
+| `EgressBrokered` | Unavailable: the macOS backend has no egress broker yet, so `run` refuses `network.egress`. |
+| `PathsHidden` | Profile: the rule of step 3 of [The generated profile](#the-generated-profile), which every profile has. Unavailable with `unix_sockets = "all"`. See [The file system view](#the-file-system-view). |
 | `InboundIpDenied` | Profile: `network-outbound` and `network-bind` for IP sockets, `network-inbound` only for UDP sockets, so `listen` and `accept` fail for TCP (see [Networking](#networking)). |
 | `UnixSocketsDenied` | Profile: no `network-bind` or `network-outbound` for Unix sockets. With `ip = "client"` or `ip = "all"`, the resolver socket is the one exception. |
 | `SignalsIsolated` | Profile: `(allow signal (target self) (target same-sandbox))` instead of `(allow signal)`, and `(deny system-fcntl (fcntl-command 6))`, which closes `F_SETOWN`, one of the ways to have the kernel send SIGIO to any process. The other ways, through ioctls on sockets and pipes, and the kernel's job control signals stay outside it (see [Signals the profile does not cover](#signals-the-profile-does-not-cover)). |
@@ -295,9 +298,9 @@ of earlier definitions"), so the protections come last. The unit test
       `sh`, `bash` (also on a terminal), `zsh`, Python, git, make, clang (also with modules) and
       swiftc run without them. A program that calls one of them gets `EPERM`, for example
       Python's `os.getpgid`, `os.getsid` and `os.getpriority`.
-    - With `ip = "none"`: `(deny syscall-unix (syscall-number 460) (syscall-number 490)
-      (syscall-number 501) (syscall-number 502) (syscall-number 522) (syscall-number 523))`, the
-      NECP calls (see [Networking](#networking)).
+    - With `ip = "none"` and `ip = "private"`: `(deny syscall-unix (syscall-number 460)
+      (syscall-number 490) (syscall-number 501) (syscall-number 502) (syscall-number 522)
+      (syscall-number 523))`, the NECP calls (see [Networking](#networking)).
     - With `process.children = "contained"`: `(deny syscall-unix (syscall-number 82)
       (syscall-number 147) (syscall-number 244))`, that is `setpgid`, `setsid` and `posix_spawn`
       (see [Contained child processes](#contained-child-processes)).
@@ -489,6 +492,11 @@ gets them ignored unless the binary carries the `allow-dyld-environment-variable
   binds it to. Seatbelt cannot tell a reply from any other datagram. `sandy check` warns about it,
   and `ip_client_datagrams_from_others` records it: a datagram from a third party reached the
   socket that had sent to another peer, and one reached a port the program had bound itself.
+- `ip = "private"`: `(allow network-outbound (remote tcp "localhost:P"))` for each forwarded port
+  and `(allow network-bind network-inbound (local tcp "localhost:E"))` for each exposed port of
+  the program, and nothing else of IP. Seatbelt's `localhost` is every address of the Mac, so
+  the relay holds the forwarded ports at the other addresses; see
+  [The private network](#the-private-network).
 - `unix_sockets = "all"`: `(allow network-outbound (remote unix-socket))` and `(allow network-bind
   network-inbound (local unix-socket))`. This allows every Unix socket the user can reach,
   independent of the filesystem rules, as on every platform. A connect looks the socket's path up
@@ -502,8 +510,9 @@ gets them ignored unless the binary carries the `allow-dyld-environment-variable
   destination. `(deny default)` does not stop its calls: `necp_match_policy`, `necp_open`,
   `necp_client_action`, `necp_session_open`, `necp_session_action`, and `netagent_trigger`,
   which starts a network agent, such as a VPN on demand, in another process (numbers from
-  `sys/syscall.h` of the macOS 27 SDK). With `ip = "none"` the profile denies them by number, and
-  `necp_open` fails with `EPERM`. With `ip = "client"` and `ip = "all"` they stay allowed:
+  `sys/syscall.h` of the macOS 27 SDK). With `ip = "none"` and `ip = "private"` the profile
+  denies them by number, and `necp_open` fails with `EPERM`; a plain TCP connection to a
+  forwarded port works without them. With `ip = "client"` and `ip = "all"` they stay allowed:
   with them denied, URLSession answered "The Internet connection appears to be offline" and a
   Network.framework connection "Network is down" for a listener on 127.0.0.1, while curl, which
   uses plain sockets, kept working (measured on macOS 27.0.1). The test is `necp_follows_ip`.
@@ -531,12 +540,13 @@ allow it, so only `getaddrinfo` and the dns_sd API work.
   require `unix_sockets = "all"`. Through the resolver the target can only do what IP networking
   already allows (queries, service registration on the local network, port mappings on the
   router). The plan names this exception for `UnixSocketsDenied`.
-- `ip = "none"` and `unix_sockets = "none"`: the resolver is unreachable.
-- `ip = "none"` and `unix_sockets = "all"`: the resolver is reachable like every other Unix
-  socket. The target cannot open IP sockets, but it can make mDNSResponder send DNS queries,
-  and a DNS query can carry data out. This is a consequence of `unix_sockets = "all"`, the same
-  as on Linux, where a resolver or proxy daemon can listen on a Unix socket too. The plan says
-  so for `IpNetworkDenied`.
+- `ip = "none"` or `ip = "private"`, and `unix_sockets = "none"`: the resolver is unreachable,
+  and `getaddrinfo` resolves no name, `localhost` included (measured on macOS 27.0.1).
+- `ip = "none"` or `ip = "private"`, and `unix_sockets = "all"`: the resolver is reachable like
+  every other Unix socket. The target cannot reach the network over IP, but it can make
+  mDNSResponder send DNS queries, and a DNS query can carry data out. This is a consequence of
+  `unix_sockets = "all"`, the same as on Linux, where a resolver or proxy daemon can listen on a
+  Unix socket too. The plan says so for `IpNetworkDenied` and `IpNetworkPrivate`.
 
 ## Exposed and forwarded ports
 
@@ -552,7 +562,9 @@ works on pairs of a listen address and a target (`profile::relay_pairs`):
 
 The relay is a process of its own, outside the program's sandbox and confined by its own profile:
 
-1. sandy binds every listen address before it applies the program's profile.
+1. sandy binds every listen address before it applies the program's profile, and with
+   `ip = "private"` also each forwarded port at the wildcard addresses (see
+   [The private network](#the-private-network)).
 2. sandy checks that it runs a single thread (`proc_pidinfo(PROC_PIDTASKINFO)`), because only then
    is `fork` safe, and forks twice. The intermediate process exits at once, so launchd adopts the
    relay. The program takes over sandy's process ID after the exec; the relay is not its child,
@@ -683,6 +695,101 @@ environment of almost every process of the user, which is far more than the chec
 kernel's own list of TCP connections (`net.inet.tcp.pcblist64`), which names the user of a closed
 socket as well, shows a program without Apple's private `com.apple.private.network.statistics`
 entitlement only its own sockets, and the relay's profile denies it anyway.
+
+## The private network
+
+`ip = "private"` asks for a loopback of the program's own (DESIGN.md, "Private network and
+egress"). macOS has none: XNU has no network namespaces, and a profile cannot give a process an
+address of its own. The profile is therefore relay only. The program may:
+
+- connect over TCP to each forwarded port: `(allow network-outbound (remote tcp
+  "localhost:P"))`;
+- bind, listen and accept over TCP on each exposed port of the program: `(allow network-bind
+  network-inbound (local tcp "localhost:E"))`.
+
+Nothing else of IP: no other port, no UDP, no ICMP, no name resolution and no NECP calls (see
+[Networking](#networking) and [Name resolution](#name-resolution)), and, as under every policy,
+no Mach service, the networking ones included. The egress broker of `network.egress` does not
+exist on macOS yet, so the plan reports `EgressBrokered` as unavailable and `run` refuses it.
+
+`localhost` is every address of the Mac. SBPL knows two hosts in a network address, `*` and
+`localhost`, and has no filter for an address or an interface. Measured on macOS 27.0.1,
+`localhost` matches 127.0.0.1, ::1, 0.0.0.0, ::, ::ffff:127.0.0.1, the address on the local
+network, the unique local and link-local IPv6 addresses, fe80::1%lo0 and the link-local addresses
+of the VPN interfaces, but not 127.0.0.2, which lo0 does not carry, and not the IPv4-mapped form
+of the local network address. So the rules above let the program reach a forwarded port, and
+listen on an exposed port, at every address the Mac has.
+
+For each forwarded port the relay therefore binds `0.0.0.0:P` and `[::]:P` (IPv6 only) with
+`SO_REUSEADDR`, never listens on them, and keeps them until it ends (`macos::holder`). A
+connection to the port at an address where nothing more specific listens finds one of these
+sockets, and a socket that does not listen never answers. Measured on macOS 27.0.1 with
+`--ip private --forward P=127.0.0.1:T`:
+
+| The program connects at port P to | Without the holder | With it |
+|---|---|---|
+| 127.0.0.1, 0.0.0.0, ::ffff:127.0.0.1 | the relay | the relay |
+| ::1, :: | refused | no answer |
+| the local network, unique local and en1 link-local addresses, fe80::1%lo0 | refused | no answer |
+| the link-local addresses of utun0 and awdl0 | no answer | no answer |
+| 127.0.0.2, the IPv4-mapped local network address | `EPERM` | `EPERM` |
+| any address at another port, or UDP at P | `EPERM` | `EPERM` |
+
+"Refused" means that a process listening there would have received the connection. While the
+holder runs, another socket cannot bind `0.0.0.0:P` or `[::]:P`, also not with `SO_REUSEADDR`,
+`SO_REUSEPORT` or both (measured). By XNU's `in_pcbbind` (`bsd/netinet/in_pcb.c`) a process of
+another user cannot bind P at any address either, because a socket of a different user holds
+the wildcard address; that part is not measured, because the test Mac has no second standard
+user. A socket
+that already listens on a wildcard address of P makes the bind fail, and `run` refuses with
+"cannot hold port P at 0.0.0.0:P for ip = "private""; `check` tries the same binds and reports
+the failure for `IpNetworkPrivate`. Without `SO_REUSEADDR`, a connection of an earlier run that
+the relay accepted at 127.0.0.1:P and that waits in `TIME_WAIT` would make the bind fail for 30
+seconds (measured). The tests are `the_relay_holds_the_forwarded_ports_at_the_wildcard_addresses`
+and `a_wildcard_listener_on_a_forwarded_port_refuses_a_private_network`.
+
+What stays open with `forward`, an exception of DESIGN.md:
+
+- A process of sandy's own user that listens on a forwarded port at an address of the Mac other
+  than the relay's, the other loopback family included, before or after sandy starts, receives
+  the program's connections to that address. Measured on macOS 27.0.1: such binds at the local
+  network, unique local, link-local and ::1 address succeed next to the holder with
+  `SO_REUSEADDR` (`a_process_of_the_same_user_takes_a_forwarded_port_at_another_address`). The
+  program has to connect to that address on purpose, so the route serves a program and a process
+  outside that work together, or reaches a service that listens at exactly such an address and
+  port.
+- Once the relay has ended, its holder sockets and its listener are gone, and the forwarded port
+  reaches whatever binds it next, at any address
+  (`a_forwarded_port_reaches_whatever_binds_it_once_the_relay_has_ended`). With
+  `signals = "any"` the program can end its relay itself; with `children = "contained"` sandy
+  ends the program together with its relay (rule 5 of "Forwarded ports" in DESIGN.md).
+- Every local user reaches the forwarded service through the relay, as with `ip = "all"` (see
+  [Who may connect, and who may stop the relay](#who-may-connect-and-who-may-stop-the-relay)).
+
+`sandy check` warns about the first two for every private network with a forwarded port, and
+about the third for every forwarded port.
+
+What stays open with `expose`, an exception of DESIGN.md: the program can listen on its exposed
+ports at every address of the Mac, 0.0.0.0 included, and there every local process and other
+hosts reach it without the relay. Measured on macOS 27.0.1: the program listened at 127.0.0.1,
+::1, 0.0.0.0, ::, the local network, unique local and link-local addresses, while another port,
+and UDP at the exposed port, were denied, and a connection from another host on the local
+network reached the program's listener at 0.0.0.0
+(`the_program_listens_on_its_exposed_port_at_every_address`). A holder cannot keep the program
+off those addresses, because the program runs as sandy's user and may bind one specific address
+next to it. `sandy check` warns about it for every private network with an exposed port.
+
+Compared with Linux, a private network gives less on macOS:
+
+- The program's processes cannot talk to each other over IP. They may connect only to the
+  forwarded ports, not to a port that one of them listens on, also not to an exposed port, so a
+  program whose processes use other loopback ports among themselves does not work under
+  `ip = "private"` on macOS. Socket pairs still work, and Unix sockets with
+  `unix_sockets = "all"`.
+- Names do not resolve, `localhost` included: connect to 127.0.0.1 or ::1.
+- Network.framework and URLSession fail, because NECP is denied.
+- A connection to a forwarded port at another address of the Mac, the other loopback family
+  included, waits until it times out instead of being refused.
 
 ## Signals the profile does not cover
 
@@ -965,6 +1072,31 @@ nothing in a writable path is executable inside the sandbox. It is a gift to ano
 who can reach the file, because outside the sandbox the file runs with this user's rights. That
 is the threat Linux denies the mode bits for (docs/linux.md, "Setuid and setgid bits").
 
+## The file system view
+
+`filesystem.view = "policy"` asks that every path outside the policy and the system set look
+missing (DESIGN.md, "The file system view"). Every profile has done that since 2.0.0: step 3 of
+[The generated profile](#the-generated-profile) answers `ENOENT` to every call on such a path,
+and the plan reports `PathsHidden` as enforced by that rule, so the view changes nothing else
+for a program. With `unix_sockets = "all"` the profile allows the existence check for every path
+again, so the plan reports `PathsHidden` as unavailable and `run` refuses the view.
+
+What stays visible, an exception of DESIGN.md:
+
+- The names in the root directory. dyld opens it, so the system set lets the program read it,
+  and `readdir` returns every name. A bulk listing (`getattrlistbulk`) returns only the entries
+  that the program may look up, unless it asks for the type of each entry (`ATTR_CMN_OBJTYPE`):
+  then it returns every entry of `/` with the owner, mode and times it asks for, while every
+  other call answers `ENOENT` for them (measured on macOS 27.0.1). The root directory is the one
+  directory outside the policy that the program can read; a granted directory holds only policy
+  paths.
+- The directories above each policy path and each path of the system set exist, with their
+  metadata, because `realpath`, `getcwd` and `mkdir -p` walk through them.
+- `statfs` of a policy path names its volume and the directory that volume is mounted on.
+
+`sandy check` warns about these. The tests are `the_view_hides_every_path_outside_the_policy`
+and `the_view_leaves_the_root_names_the_ancestors_and_the_volume_visible`.
+
 ## Information the target can still read
 
 These are known and accepted, because they reveal no file contents, no other process's data and
@@ -1005,9 +1137,10 @@ no privilege, and closing them would break ordinary programs:
   (`priority_group_and_session_queries_are_denied`). The program's own children are hidden the
   same way; Seatbelt refused their information before as well (`EPERM`), and `waitpid` and
   kqueue's `EVFILT_PROC` keep working for them (measured on macOS 27.0.1).
-- The names, file ids and metadata of the entries of the root directory, through
-  `getattrlistbulk` on `/`, which the program may open
-  (`bulk_listing_reaches_only_the_root_directory`). A directory the policy does not grant cannot
+- The metadata of the entries of the root directory, through `getattrlistbulk` on `/`, which
+  the program may open: of every entry when the call asks for the type of each, otherwise only of
+  the entries the program may look up (see [The file system view](#the-file-system-view);
+  `bulk_listing_reaches_only_the_root_directory`). A directory the policy does not grant cannot
   be opened, so the call cannot reach it.
 
 ## Diagnostic mode
@@ -1131,6 +1264,10 @@ none, so the backend answers nothing and sandy refuses the option.
   mapping as executable `/Library/Apple/usr/libexec/oah`, where `libRosettaRuntime` lies. It
   needed no Mach service, no write to the translation cache and nothing in
   `/usr/libexec/rosetta`. Larger programs may need more; sandy grants none of it.
+- With `ip = "private"` the program's processes cannot talk to each other over IP, names do not
+  resolve, Network.framework fails, the program can listen on its exposed ports at every address
+  of the Mac, and a process of sandy's user can take a forwarded port at another address (see
+  [The private network](#the-private-network)).
 - With `process.children = "contained"` the target cannot use `posix_spawn`, so programs that
   start processes through it (Rust's `std::process::Command`, Java, Node.js, `system()`,
   `popen()`) fail to start them (see [Contained child processes](#contained-child-processes)).
@@ -1142,7 +1279,8 @@ none, so the backend answers nothing and sandy refuses the option.
   profile denies all of those explicitly. The ones measured that it does not cover are denied
   now: `file-test-existence`, the only check of `access`, `statfs`, `chdir` and of the path from
   `getattrlist` (step 3 of the profile), and the system calls `getfsstat`, `getpriority`,
-  `getpgid`, `getsid` and, with `ip = "none"`, the NECP calls (see the protections above).
+  `getpgid`, `getsid` and, with `ip = "none"` and `ip = "private"`, the NECP calls (see the
+  protections above).
 
 ## Verification
 
@@ -1154,8 +1292,9 @@ allowlist, the system set, and the plan with fake host capabilities (missing
 macOS only:
 
 - `macos::tests` compiles every combination of `system`, `ip`, `unix_sockets` and `signals`, plus
-  the `children` and `end_with_parent` variants and the relay and watcher profiles, with the
-  host's Seatbelt compiler, without applying it, and checks that the plan is enforceable.
+  the `children` and `end_with_parent` variants, the relay rules of a private network, and the
+  relay and watcher profiles, with the host's Seatbelt compiler, without applying it, and checks
+  that the plan is enforceable. `macos::holder::tests` checks the holder binds.
 - `crates/sandy-cli/tests/check.rs` checks that `check` reports what `run` refuses: a busy relay
   port, a script whose interpreter is not executable, `system = "none"`, and that the trial that
   applies the profile does not refuse a policy that runs.
@@ -1172,7 +1311,10 @@ macOS only:
   by-id calls, `getfsstat`, paths and processes outside the policy, the process queries), and
   the measurements that record what the sandbox does where it cannot stop something: the paths
   that `unix_sockets = "all"` lets the program test, process ids, SIGIO and the process groups
-  of the terminal session. A check that this host cannot run reports a skip, and
+  of the terminal session, and what the file system view leaves visible.
+- `private_macos.rs` tests `ip = "private"`: what the program reaches, the holder binds, and the
+  routes that stay open at the other addresses of the Mac. A check that this host cannot run
+  reports a skip, and
   `macos-26-arm.txt` and `macos-27-arm.txt` in `tests/expected-skips/` list the ones that are
   expected.
 

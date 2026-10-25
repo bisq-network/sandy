@@ -838,13 +838,20 @@ const OUTSIDE_REQUEST: &[u8] = b"request from outside the sandbox";
 
 /// The open route of the exceptions row for `forward` on macOS in DESIGN.md: the relay cannot
 /// tell who is at the other end of a connection, so a forwarded port serves any local process,
-/// not only the program (docs/macos.md, "Who may connect, and who may stop the relay"). This
-/// test process runs outside the sandbox, and its bytes reach the forwarded service and the
-/// answer comes back. When this fails, the route is closed and the exception has to go.
+/// not only the program (docs/macos.md, "Who may connect, and who may stop the relay"), also
+/// with a private network. This test process runs outside the sandbox, and its bytes reach the
+/// forwarded service and the answer comes back. When this fails, the route is closed and the
+/// exception has to go.
 #[test]
 fn a_forwarded_port_serves_a_process_outside_the_sandbox() {
+    for ip in ["all", "private"] {
+        forwarded_port_serves_a_process_outside_the_sandbox(ip);
+    }
+}
+
+fn forwarded_port_serves_a_process_outside_the_sandbox(ip: &str) {
     use std::io::{BufRead, BufReader, Read, Write};
-    let fixture = home_fixture("forward-outside");
+    let fixture = home_fixture(&format!("forward-outside-{ip}"));
     let service = TcpListener::bind("127.0.0.1:0").unwrap();
     let target = service.local_addr().unwrap().port();
     let (sender, received) = std::sync::mpsc::channel();
@@ -864,7 +871,7 @@ fn a_forwarded_port_serves_a_process_outside_the_sandbox() {
         home_args(&fixture),
         &[
             "--ip",
-            "all",
+            ip,
             "--forward",
             &format!("{inner}=127.0.0.1:{target}"),
         ],
@@ -912,13 +919,13 @@ fn a_forwarded_port_serves_a_process_outside_the_sandbox() {
     );
     assert!(
         requests.iter().any(|request| request == OUTSIDE_REQUEST),
-        "the request of a process outside the sandbox no longer reaches the forwarded service, \
-         so the exception for `forward` on macOS is stale: {requests:?}"
+        "ip = {ip}: the request of a process outside the sandbox no longer reaches the \
+         forwarded service, so the exception for `forward` on macOS is stale: {requests:?}"
     );
     assert_eq!(
         answer, SERVICE_ANSWER,
-        "a process outside the sandbox no longer reads the answer of the forwarded service, so \
-         the exception for `forward` on macOS is stale"
+        "ip = {ip}: a process outside the sandbox no longer reads the answer of the forwarded \
+         service, so the exception for `forward` on macOS is stale"
     );
 }
 

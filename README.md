@@ -717,8 +717,10 @@ The block names every key; it is not a policy that runs as written, because `exp
   (a mount namespace), and every path the policy does not make executable is mounted without
   execute, so a `read` or writable path also cannot hold code that the program maps. A rename or
   a link between two writable paths fails there with `EXDEV`, and files of other users show the
-  owner 65534. Windows cannot hide paths and refuses the setting. See docs/DESIGN.md, "The file
-  system view".
+  owner 65534. On macOS every path outside the policy looks missing under every policy already,
+  so the setting changes nothing there, except that sandy refuses it with
+  `unix_sockets = "all"`. Windows cannot hide paths and refuses the setting. See
+  docs/DESIGN.md, "The file system view".
 
 ### Linux metadata
 
@@ -788,7 +790,14 @@ metadata through the descriptor they wrote.
   tell whether a path exists, because reaching a socket needs that check. A program that saves
   its working directory first, such as `cp -R`, fails when it starts in a directory outside the
   policy. Other processes look gone, and the program cannot read the priority, group or session
-  of any process, its own included.
+  of any process, its own included. The names in `/` and the directories above the policy paths
+  stay visible, also with `view = "policy"`.
+- `ip = "private"` has no loopback of its own on macOS: the program may only connect to its
+  forwarded ports and listen on its exposed ports, so its own processes cannot talk to each
+  other over IP, names do not resolve, and Network.framework and URLSession fail. The program
+  can listen on its exposed ports at every address of the Mac, where other hosts reach it, and
+  a process of your user can take a forwarded port at another address of the Mac; `sandy check`
+  warns about both. `egress` is not available on macOS yet.
 - The system writes the crash report of a program that sandy runs to
   `/Library/Logs/DiagnosticReports`, which administrators can read and standard users cannot,
   instead of the user's `~/Library/Logs/DiagnosticReports`.

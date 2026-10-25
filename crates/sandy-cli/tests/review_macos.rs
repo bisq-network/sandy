@@ -563,6 +563,103 @@ fn volfs_names_no_file_outside_the_policy() {
     }
 }
 
+/// `view = "policy"` asks that every path outside the policy look missing. On macOS the ENOENT
+/// rule of every profile gives it, so the backend enforces the view with it.
+#[test]
+fn the_view_hides_every_path_outside_the_policy() {
+    let fixture = Fixture::new("macos-view");
+    let view = with(fixture.access_args(), &["--view", "policy"]);
+    let only_the_path = |path: String| format!("{path}{ARGUMENT_SEPARATOR}fullpath");
+    let cases = [
+        (
+            "metadata",
+            fixture.arg("secret/file"),
+            fixture.arg("secret/none"),
+        ),
+        (
+            "access",
+            fixture.arg("secret/file"),
+            fixture.arg("secret/none"),
+        ),
+        (
+            "statfs",
+            fixture.arg("secret/file"),
+            fixture.arg("secret/none"),
+        ),
+        (
+            "read",
+            fixture.arg("secret/file"),
+            fixture.arg("secret/none"),
+        ),
+        ("chdir", fixture.arg("secret"), fixture.arg("none")),
+        ("list", fixture.arg("secret"), fixture.arg("none")),
+        (
+            "getattr",
+            only_the_path(fixture.arg("secret/file")),
+            only_the_path(fixture.arg("secret/none")),
+        ),
+    ];
+    for (action, existing, missing) in &cases {
+        let actions = [(*action, existing.as_str()), (*action, missing.as_str())];
+        let outside = probe_outside(&actions);
+        outside[0].assert_ok();
+        assert_eq!(outside[1].result, "error", "{outside:?}");
+        let inside = probe_inside(&view, &actions);
+        assert_looks_missing(&inside[0], &inside[1]);
+    }
+    probe_inside(&view, &[("read", &fixture.arg("ro/file"))])[0].assert_ok();
+}
+
+/// The exceptions row for `view = "policy"` on macOS: the root directory stays listable, because
+/// dyld reads it. Its names come back, and a bulk listing that asks for the type of each entry
+/// also returns entries that every other call reports missing, with their metadata; without the
+/// type it returns only the entries the program may look up. The directories above a policy path
+/// exist, and statfs of a policy path names its volume and where that is mounted. When an
+/// assertion fails, that part of the row is stale.
+#[test]
+fn the_view_leaves_the_root_names_the_ancestors_and_the_volume_visible() {
+    let fixture = Fixture::new("macos-view-visible");
+    let view = with(fixture.access_args(), &["--view", "policy"]);
+    let typed = format!("/{ARGUMENT_SEPARATOR}objtype");
+    let ancestor = fixture.root.to_str().unwrap();
+    let readable = fixture.arg("ro/file");
+    let actions = [
+        ("list", "/"),
+        ("getattrlistbulk", "/"),
+        ("getattrlistbulk", typed.as_str()),
+        ("metadata", "/Library"),
+        ("metadata", ancestor),
+        ("statfs", readable.as_str()),
+    ];
+    let outside = probe_outside(&actions);
+    for line in &outside {
+        line.assert_ok();
+    }
+    assert!(outside[1].detail.contains(" Library#"), "{outside:?}");
+    let inside = probe_inside(&view, &actions);
+    assert_eq!(inside[0].detail, outside[0].detail, "{inside:?}");
+    assert!(
+        inside[1].result == "ok" && !inside[1].detail.contains(" Library#"),
+        "{:?}",
+        inside[1]
+    );
+    assert!(
+        inside[2].result == "ok" && inside[2].detail.contains(" Library#"),
+        "a bulk listing of / with the type no longer returns /Library: {:?}",
+        inside[2]
+    );
+    assert!(inside[3].detail.ends_with("(os error 2)"), "{inside:?}");
+    assert_eq!(
+        inside[4].result, "ok",
+        "the ancestor looks missing: {inside:?}"
+    );
+    assert!(
+        inside[5].result == "ok" && inside[5].detail.contains(" on /"),
+        "statfs no longer names the volume of a policy path: {:?}",
+        inside[5]
+    );
+}
+
 /// Paths outside the policy look missing, but a write to a `read` path must still say that it is
 /// refused: ENOENT would tell the program that a directory it can list does not exist. Outside
 /// the policy a write answers ENOENT like every other call.

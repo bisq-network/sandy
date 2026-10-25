@@ -4,8 +4,8 @@
 use std::path::Path;
 
 use sandy_core::{
-    ChildProcesses, IpAccess, NetworkAccess, PathAccess, PathIdentity, PlanItem, ProtectedPath,
-    Requirement, ResolvedPolicy, SignalScope, SystemAccess,
+    ChildProcesses, FileView, IpAccess, NetworkAccess, PathAccess, PathIdentity, PlanItem,
+    ProtectedPath, Requirement, ResolvedPolicy, SignalScope, SystemAccess,
 };
 
 use crate::system::{self, SystemAccess as Grant};
@@ -222,6 +222,37 @@ fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
                 .to_string(),
         );
     }
+    if policy.ip == IpAccess::Private && !policy.expose.is_empty() {
+        shortfalls.push(
+            "ip = \"private\" keeps the program's exposed ports off the network only in part on \
+             macOS: Seatbelt's localhost matches every address of this Mac, so the program can \
+             listen on its exposed ports at the local network address and every other address \
+             of this Mac too, where other hosts and every local process reach it without the \
+             relay (docs/macos.md, \"The private network\")"
+                .to_string(),
+        );
+    }
+    if policy.ip == IpAccess::Private && !policy.forward.is_empty() {
+        let relay_ended = match (contained, policy.signals) {
+            // The guard ends the program with its relay.
+            (true, _) => "",
+            (false, SignalScope::Isolated) => {
+                ", and once the relay has ended any process that binds the port does"
+            }
+            (false, SignalScope::Any) => {
+                ", and once the relay has ended any process that binds the port does; with \
+                 signals = \"any\" the program can end its relay itself"
+            }
+        };
+        shortfalls.push(format!(
+            "ip = \"private\" keeps the program off this Mac's other addresses only in part on \
+             macOS: Seatbelt's localhost matches every address of this Mac, so the program may \
+             connect to its forwarded ports at each of them, and the relay holds those ports \
+             only at the wildcard addresses: a process of sandy's own user that listens on one \
+             of them at another address of this Mac receives the program's connections \
+             there{relay_ended} (docs/macos.md, \"The private network\")"
+        ));
+    }
     if policy.unix_sockets == NetworkAccess::All {
         shortfalls.push(
             "unix_sockets = \"all\" lets the program tell existing paths outside the policy \
@@ -229,6 +260,17 @@ fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
              every path, so access, statfs, chdir and the path from getattrlist answer again, \
              also by inode number through /.vol (docs/macos.md, \"Information the target can \
              still read\")"
+                .to_string(),
+        );
+    }
+    if policy.view == FileView::Policy && policy.unix_sockets == NetworkAccess::None {
+        shortfalls.push(
+            "view = \"policy\" hides paths outside the policy only in part on macOS: the names \
+             in the root directory stay listable, because dyld reads that directory, and a bulk \
+             listing of it (getattrlistbulk) that asks for the type of each entry also returns \
+             their metadata; the directories above each policy path exist, with their metadata, \
+             which realpath and getcwd need; and statfs of a policy path names its volume and \
+             where that is mounted (docs/macos.md, \"The file system view\")"
                 .to_string(),
         );
     }
@@ -364,7 +406,7 @@ fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
              sockets, so no TCP socket can listen or accept"
         }
         Requirement::UnixSocketsDenied => {
-            if policy.ip != IpAccess::None {
+            if matches!(policy.ip, IpAccess::Client | IpAccess::All) {
                 "no Unix socket network-bind or network-outbound, except the socket of the name \
                  resolver (mDNSResponder), which is part of IP networking"
             } else {
@@ -399,9 +441,36 @@ fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
              addresses; not a child of the target (forked twice), its own profile without files \
              or Mach services, ends when the target ends (kqueue NOTE_EXIT)"
         }
-        Requirement::IpNetworkPrivate | Requirement::EgressBrokered | Requirement::PathsHidden => {
-            return Mechanism::Missing(NOT_YET);
+        Requirement::IpNetworkPrivate => {
+            if policy.unix_sockets == NetworkAccess::All {
+                "TCP only: network-outbound only to the forwarded ports, network-bind and \
+                 network-inbound only on the exposed ports, both at every address of this Mac, \
+                 which is what Seatbelt's localhost matches; the relay binds the forwarded ports \
+                 at the wildcard addresses without listening; no UDP, no NECP calls; the name \
+                 resolver (mDNSResponder) stays reachable like every Unix socket \
+                 (unix_sockets = \"all\")"
+            } else {
+                "TCP only: network-outbound only to the forwarded ports, network-bind and \
+                 network-inbound only on the exposed ports, both at every address of this Mac, \
+                 which is what Seatbelt's localhost matches; the relay binds the forwarded ports \
+                 at the wildcard addresses without listening; no UDP, no NECP calls, and the name \
+                 resolver (mDNSResponder) is unreachable"
+            }
         }
+        Requirement::PathsHidden => {
+            if policy.unix_sockets == NetworkAccess::All {
+                return Mechanism::Missing(
+                    "unix_sockets = \"all\" allows the existence check for every path, which a \
+                     connect to a socket outside the policy needs, so access, statfs, chdir and \
+                     the path from getattrlist answer outside the policy (docs/macos.md, \
+                     \"Information the target can still read\")",
+                );
+            }
+            "every path outside the policy and the system set answers ENOENT to every call, as a \
+             missing path does: (deny file-read* file-test-existence (with errno ENOENT)) before \
+             every allow"
+        }
+        Requirement::EgressBrokered => return Mechanism::Missing(NOT_YET),
         Requirement::Win32kDenied => {
             return Mechanism::Exec(
                 "nothing to deny: win32k is the GUI part of the Windows kernel, and macOS has \
@@ -745,6 +814,143 @@ mod tests {
         );
         let all = policy(IpAccess::All, NetworkAccess::None, SignalScope::Isolated);
         assert!(!udp(&all));
+    }
+
+    fn status_of(policy: &ResolvedPolicy, requirement: Requirement) -> Status {
+        plan_for(policy, &capable())
+            .into_iter()
+            .find(|item| item.requirement == requirement)
+            .expect("reported")
+            .status
+    }
+
+    fn private_network() -> ResolvedPolicy {
+        let mut private = policy(IpAccess::Private, NetworkAccess::None, SignalScope::Any);
+        private.forward = vec![sandy_core::ForwardedPort {
+            port: 18081,
+            to: "127.0.0.1:8081".parse().unwrap(),
+        }];
+        private.expose = vec![sandy_core::ExposedPort {
+            listen: "127.0.0.1:18080".parse().unwrap(),
+            port: 8080,
+        }];
+        private
+    }
+
+    /// The profile gives the private network; the egress broker is not built yet.
+    #[test]
+    fn a_private_network_is_enforced_by_the_profile() {
+        let private = private_network();
+        let Status::Enforced { mechanism } = status_of(&private, Requirement::IpNetworkPrivate)
+        else {
+            panic!("not enforced");
+        };
+        assert!(
+            mechanism.starts_with("Seatbelt profile: TCP only"),
+            "{mechanism}"
+        );
+        assert!(mechanism.contains("wildcard addresses"), "{mechanism}");
+        assert!(
+            mechanism.contains("resolver (mDNSResponder) is unreachable"),
+            "{mechanism}"
+        );
+        let unix = format!("{:?}", status_of(&private, Requirement::UnixSocketsDenied));
+        assert!(!unix.contains("mDNSResponder"), "{unix}");
+        let plan = EnforcementPlan::new(&private.requirements(), plan_for(&private, &capable()));
+        assert!(plan.is_enforceable(), "{plan}");
+
+        let mut all_unix = private.clone();
+        all_unix.unix_sockets = NetworkAccess::All;
+        let mechanism = format!("{:?}", status_of(&all_unix, Requirement::IpNetworkPrivate));
+        assert!(mechanism.contains("stays reachable"), "{mechanism}");
+
+        let mut egress = private;
+        egress.egress = Some(sandy_core::Egress {
+            port: 1080,
+            reach: sandy_core::EgressReach::Public,
+        });
+        assert!(matches!(
+            status_of(&egress, Requirement::EgressBrokered),
+            Status::Unavailable { .. }
+        ));
+    }
+
+    /// The ENOENT rule hides every path outside the policy, unless `unix_sockets = "all"` allows
+    /// the existence check everywhere again.
+    #[test]
+    fn the_view_holds_unless_unix_sockets_test_every_path() {
+        let mut view = strictest();
+        view.view = FileView::Policy;
+        let Status::Enforced { mechanism } = status_of(&view, Requirement::PathsHidden) else {
+            panic!("not enforced");
+        };
+        assert!(
+            mechanism.contains("(deny file-read* file-test-existence (with errno ENOENT))"),
+            "{mechanism}"
+        );
+        view.unix_sockets = NetworkAccess::All;
+        let Status::Unavailable { reason } = status_of(&view, Requirement::PathsHidden) else {
+            panic!("enforced with unix_sockets = \"all\"");
+        };
+        assert!(reason.starts_with("unix_sockets = \"all\""), "{reason}");
+        let plan = EnforcementPlan::new(&view.requirements(), plan_for(&view, &capable()));
+        assert!(!plan.is_enforceable(), "{plan}");
+    }
+
+    /// Seatbelt's localhost is every address of the Mac, so check names what a private network
+    /// leaves open there: listening on the exposed ports, and the forwarded ports at other
+    /// addresses.
+    #[test]
+    fn warns_where_a_private_network_reaches_other_addresses() {
+        let count = |policy: &ResolvedPolicy, start: &str| {
+            notes(policy)
+                .iter()
+                .filter(|note| note.starts_with(start))
+                .count()
+        };
+        let exposed = "ip = \"private\" keeps the program's exposed ports off the network";
+        let forwarded = "ip = \"private\" keeps the program off this Mac's other addresses";
+        let mut private = private_network();
+        assert_eq!(count(&private, exposed), 1);
+        assert_eq!(count(&private, forwarded), 1);
+        let forward_note = |policy: &ResolvedPolicy| {
+            notes(policy)
+                .into_iter()
+                .find(|note| note.starts_with(forwarded))
+                .unwrap()
+        };
+        assert!(forward_note(&private).contains("the program can end its relay itself"));
+        private.signals = SignalScope::Isolated;
+        let isolated = forward_note(&private);
+        assert!(isolated.contains("once the relay has ended"), "{isolated}");
+        assert!(!isolated.contains("end its relay itself"), "{isolated}");
+        // The guard ends a contained program with its relay.
+        private.children = ChildProcesses::Contained;
+        assert!(!forward_note(&private).contains("once the relay has ended"));
+
+        let mut alone = private_network();
+        alone.expose.clear();
+        alone.forward.clear();
+        assert_eq!(count(&alone, exposed) + count(&alone, forwarded), 0);
+        let mut all = private_network();
+        all.ip = IpAccess::All;
+        assert_eq!(count(&all, exposed) + count(&all, forwarded), 0);
+    }
+
+    #[test]
+    fn warns_what_the_view_leaves_visible() {
+        let warned = |view, unix_sockets| {
+            let mut policy = policy(IpAccess::None, unix_sockets, SignalScope::Isolated);
+            policy.view = view;
+            notes(&policy)
+                .iter()
+                .filter(|note| note.starts_with("view = \"policy\" hides paths"))
+                .count()
+        };
+        assert_eq!(warned(FileView::Policy, NetworkAccess::None), 1);
+        assert_eq!(warned(FileView::All, NetworkAccess::None), 0);
+        // Refused there, so nothing to warn about.
+        assert_eq!(warned(FileView::Policy, NetworkAccess::All), 0);
     }
 
     #[test]

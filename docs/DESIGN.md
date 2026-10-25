@@ -512,6 +512,7 @@ Rules:
    (Windows: docs/windows.md).
 4. What the view changes for programs is in the platform docs: on Linux a rename or a link
    between two writable paths fails with `EXDEV`, and files of other users show the owner 65534.
+   On macOS every profile hides those paths already, so the view changes nothing there.
 
 ## Requirements and the enforcement plan
 
@@ -573,11 +574,14 @@ exceptions:
 | Linux | `forward` with `ip = "client"` or `ip = "all"` | another local user can deliver a write to the forwarded service, through a connection it closed before the relay asked who owns it, and that no longer carries its user (from the close on Linux 6.8, after the timewait record on newer kernels) |
 | Linux | `ip = "private"` | processes of the user that runs sandy can enter the sandbox's network namespace, which belongs to that user, and reach the program's ports and forwarded ports there without a relay |
 | Linux | `path_metadata = "deny"` with a `read` or `read_exec` path | the mode, except the setuid and setgid bits, and the times of a file or directory the program may only read, through a descriptor it opened for reading (`fchmod`, `futimens`) |
-| macOS | `signals = "isolated"` | SIGIO (to a process of any user), and SIGURG with `ip = "client"` or `ip = "all"`, through the owner ioctls of sockets and pipes; without `children = "contained"` also joining another job of the terminal session and stopping it |
+| macOS | `signals = "isolated"` | SIGIO (to a process of any user), and SIGURG with an `ip` other than `"none"`, through the owner ioctls of sockets and pipes; without `children = "contained"` also joining another job of the terminal session and stopping it |
 | macOS | `ip = "client"` | a UDP socket that is not connected receives datagrams from every sender, at any port the program binds |
 | macOS | `unix_sockets = "all"` | whether a path outside the policy exists, and its path through `getattrlist`, also by inode number through `/.vol` |
 | macOS | `forward` | every local user reaches the forwarded service |
 | macOS | `expose` or `forward` with `signals = "any"` | a stopped relay has no time limit |
+| macOS | `ip = "private"` with `expose` | the program can listen on its exposed ports at every address of the Mac, where every local process and other hosts reach it without the relay |
+| macOS | `ip = "private"` with `forward` | a process of sandy's own user that listens on a forwarded port at another address of the Mac receives the program's connections there, and once the relay has ended any process that binds the port does |
+| macOS | `view = "policy"` | the names in the root directory, with their metadata through a bulk listing that asks for the type; the directories above each policy path; the volume and mount point that `statfs` names for a policy path |
 | Windows | a directory in the policy | a file moved out of a granted directory keeps its grant |
 
 `children = "contained"` on macOS gets a warning as well, although it gives its full
@@ -816,6 +820,14 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
 - `ip = "none"` also denies by number the calls of NECP, the kernel's network policy layer that
   Network.framework works through. With `ip = "client"` and `ip = "all"` they stay allowed,
   because URLSession and Network.framework fail without them.
+- `ip = "private"` is relay only, because macOS has no loopback of a process's own: TCP out only
+  to the forwarded ports and in only on the exposed ports, no UDP, no name resolver, NECP denied.
+  Seatbelt's `localhost` is every address of the Mac, so the relay binds the forwarded ports at
+  the wildcard addresses without listening, and a connection to one at another address meets a
+  socket of sandy's that never answers. The program's own processes cannot use loopback among
+  themselves. `network.egress` is not available on macOS yet.
+- `filesystem.view = "policy"` is the `ENOENT` rule that every profile has; it is unavailable
+  with `unix_sockets = "all"`, which allows the existence check for every path.
 - `ip = "client"`: `network-outbound` and `network-bind` for IP sockets, `network-inbound` for UDP
   only. Seatbelt checks `listen` and `accept` as `network-inbound`, so no TCP socket listens, and
   also every datagram that a socket which is not connected receives, which UDP clients need.

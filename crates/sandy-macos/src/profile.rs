@@ -77,6 +77,19 @@ pub fn relay_pairs(policy: &ResolvedPolicy) -> Vec<RelayPair> {
     exposed.chain(forwarded).collect()
 }
 
+/// The ports that the relay binds at the wildcard addresses of both families without listening:
+/// under `ip = "private"` the forwarded ports, which the program's profile lets it reach at every
+/// address of this Mac. A connection to one of them at an address other than the relay's
+/// listener then finds sandy's socket there and goes unanswered, and, by XNU's `in_pcbbind`, no
+/// process of another user can bind the port at any address while the relay runs.
+pub fn held_ports(policy: &ResolvedPolicy) -> Vec<u16> {
+    if policy.ip != IpAccess::Private {
+        return Vec::new();
+    }
+    let ports: BTreeSet<u16> = policy.forward.iter().map(|entry| entry.port).collect();
+    ports.into_iter().collect()
+}
+
 /// The profile of the watcher of `process.end_with_parent`. Like the relay, it keeps running the
 /// code that sandy has already loaded and needs no file. It registered its kqueue events before
 /// the profile applies, and it only waits and signals the program.
@@ -343,8 +356,27 @@ fn network_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
     );
     writer.line("(allow system-socket (socket-domain AF_UNIX))");
     match policy.ip {
-        // The plan refuses `private` until the backend enforces it; the profile then denies IP.
-        IpAccess::None | IpAccess::Private => {}
+        IpAccess::None => {}
+        IpAccess::Private => {
+            writer.comment(
+                "ip = \"private\": TCP only, out only to the forwarded ports and in only on the\n\
+                 exposed ports. Seatbelt's localhost is every address of this Mac, not loopback,\n\
+                 so the relay holds the forwarded ports at the wildcard addresses. No UDP and no\n\
+                 name resolution.",
+            );
+            let forwarded: BTreeSet<u16> = policy.forward.iter().map(|entry| entry.port).collect();
+            let filters: Vec<String> = forwarded
+                .iter()
+                .map(|port| format!("(remote tcp \"localhost:{port}\")"))
+                .collect();
+            writer.rule("allow", &["network-outbound"], &filters);
+            let exposed: BTreeSet<u16> = policy.expose.iter().map(|entry| entry.port).collect();
+            let filters: Vec<String> = exposed
+                .iter()
+                .map(|port| format!("(local tcp \"localhost:{port}\")"))
+                .collect();
+            writer.rule("allow", &["network-bind", "network-inbound"], &filters);
+        }
         IpAccess::Client => {
             writer.comment(
                 "IP networking out, and name resolution: getaddrinfo asks mDNSResponder through\n\
@@ -366,7 +398,7 @@ fn network_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
             writer.line("(allow network-bind network-inbound (local ip))");
         }
     }
-    if policy.ip != IpAccess::None {
+    if matches!(policy.ip, IpAccess::Client | IpAccess::All) {
         // A connect looks up the socket's path first, which is a file-test-existence.
         let resolver = writer.grant("DNS", Path::new(system::DNS_RESOLVER_SOCKET));
         writer.rule(
@@ -473,12 +505,12 @@ fn protection_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
         .map(|(_, number)| format!("(syscall-number {number})"))
         .collect();
     writer.rule("deny", &["syscall-unix"], &filters);
-    if policy.ip == IpAccess::None {
+    if matches!(policy.ip, IpAccess::None | IpAccess::Private) {
         writer.comment(
-            "ip = \"none\": no NECP, the kernel's network policy layer that Network.framework\n\
-             works through, and no trigger of its network agents: necp_match_policy,\n\
-             netagent_trigger, necp_open, necp_client_action, necp_session_open,\n\
-             necp_session_action.",
+            "ip = \"none\" and \"private\": no NECP, the kernel's network policy layer that\n\
+             Network.framework works through, and no trigger of its network agents:\n\
+             necp_match_policy, netagent_trigger, necp_open, necp_client_action,\n\
+             necp_session_open, necp_session_action.",
         );
         let filters: Vec<String> = system::NECP_SYSCALLS
             .iter()
@@ -690,10 +722,10 @@ mod tests {
   (syscall-number 151)
   (syscall-number 310))
 
-; ip = "none": no NECP, the kernel's network policy layer that Network.framework
-; works through, and no trigger of its network agents: necp_match_policy,
-; netagent_trigger, necp_open, necp_client_action, necp_session_open,
-; necp_session_action.
+; ip = "none" and "private": no NECP, the kernel's network policy layer that
+; Network.framework works through, and no trigger of its network agents:
+; necp_match_policy, netagent_trigger, necp_open, necp_client_action,
+; necp_session_open, necp_session_action.
 (deny syscall-unix
   (syscall-number 460)
   (syscall-number 490)
@@ -929,6 +961,9 @@ mod tests {
         assert_eq!(rules(IpAccess::None, None), [false, false, false, false]);
         assert_eq!(rules(IpAccess::All, None), [true, false, true, false]);
         assert_eq!(rules(IpAccess::Client, None), [true, false, true, false]);
+        // A private network reaches no resolver; its relay rules are TCP rules.
+        assert_eq!(rules(IpAccess::Private, None), [false, false, false, false]);
+        assert_eq!(rules(IpAccess::Private, All), [false, true, false, false]);
         // All Unix sockets include the resolver, as on every platform.
         assert_eq!(rules(IpAccess::None, All), [false, true, false, false]);
         assert_eq!(rules(IpAccess::All, All), [true, true, true, false]);
@@ -1251,6 +1286,7 @@ mod tests {
         );
         // The resolver reaches its socket through /var.
         assert_eq!(links(SystemAccess::None, IpAccess::Client), ["/var"]);
+        assert!(links(SystemAccess::None, IpAccess::Private).is_empty());
         assert!(links(SystemAccess::None, IpAccess::None).is_empty());
     }
 
@@ -1269,8 +1305,100 @@ mod tests {
         assert!(text.find(rule).unwrap() > deny);
     }
 
+    /// A private network is relay only: TCP out to the forwarded ports and in on the exposed
+    /// ports, each port once, and nothing else of IP, no name resolution included.
     #[test]
-    fn necp_is_denied_only_without_ip_networking() {
+    fn a_private_network_reaches_only_the_relay_ports() {
+        let mut policy = typical("/srv");
+        policy.ip = IpAccess::Private;
+        policy.forward = vec![
+            sandy_core::ForwardedPort {
+                port: 18082,
+                to: "[::1]:8082".parse().unwrap(),
+            },
+            sandy_core::ForwardedPort {
+                port: 18081,
+                to: "127.0.0.1:8081".parse().unwrap(),
+            },
+            sandy_core::ForwardedPort {
+                port: 18081,
+                to: "[::1]:8083".parse().unwrap(),
+            },
+        ];
+        policy.expose = vec![
+            sandy_core::ExposedPort {
+                listen: "127.0.0.1:18080".parse().unwrap(),
+                port: 8080,
+            },
+            sandy_core::ExposedPort {
+                listen: "[::1]:18090".parse().unwrap(),
+                port: 8080,
+            },
+        ];
+        let profile = generate(&policy);
+        let network: Vec<&str> = profile
+            .text
+            .split("\n(allow network-")
+            .skip(1)
+            .map(|rule| &rule[..rule.find("))").unwrap() + 2])
+            .collect();
+        assert_eq!(
+            network,
+            [
+                "outbound\n  (remote tcp \"localhost:18081\")\n  (remote tcp \"localhost:18082\"))",
+                "bind network-inbound\n  (local tcp \"localhost:8080\"))",
+            ]
+        );
+        assert!(
+            !profile
+                .parameters
+                .iter()
+                .any(|(_, path)| path == Path::new(system::DNS_RESOLVER_SOCKET)),
+            "{:?}",
+            profile.parameters
+        );
+        let necp = format!("(syscall-number {})", system::NECP_SYSCALLS[0].1);
+        assert!(profile.text.contains(&necp));
+
+        // Without relays the program gets no IP rule at all.
+        policy.forward.clear();
+        policy.expose.clear();
+        assert!(!generate(&policy).text.contains("(allow network-"));
+    }
+
+    #[test]
+    fn only_a_private_network_holds_the_forwarded_ports() {
+        let mut policy = typical("/srv");
+        policy.forward = vec![
+            sandy_core::ForwardedPort {
+                port: 18082,
+                to: "127.0.0.1:8082".parse().unwrap(),
+            },
+            sandy_core::ForwardedPort {
+                port: 18081,
+                to: "127.0.0.1:8081".parse().unwrap(),
+            },
+            sandy_core::ForwardedPort {
+                port: 18081,
+                to: "[::1]:8083".parse().unwrap(),
+            },
+        ];
+        policy.expose = vec![sandy_core::ExposedPort {
+            listen: "127.0.0.1:18080".parse().unwrap(),
+            port: 8080,
+        }];
+        for ip in [IpAccess::Client, IpAccess::All] {
+            policy.ip = ip;
+            assert!(held_ports(&policy).is_empty(), "{ip:?}");
+        }
+        policy.ip = IpAccess::Private;
+        assert_eq!(held_ports(&policy), [18081, 18082]);
+        policy.forward.clear();
+        assert!(held_ports(&policy).is_empty());
+    }
+
+    #[test]
+    fn necp_is_denied_unless_ip_reaches_the_network() {
         let necp = |ip| {
             let mut policy = typical("/srv");
             policy.ip = ip;
@@ -1286,13 +1414,19 @@ mod tests {
             denied
         };
         assert!(necp(IpAccess::None).iter().all(|denied| *denied));
+        assert!(necp(IpAccess::Private).iter().all(|denied| *denied));
         assert!(necp(IpAccess::Client).iter().all(|denied| !denied));
         assert!(necp(IpAccess::All).iter().all(|denied| !denied));
     }
 
     #[test]
     fn process_queries_are_denied_for_every_policy() {
-        for ip in [IpAccess::None, IpAccess::Client, IpAccess::All] {
+        for ip in [
+            IpAccess::None,
+            IpAccess::Private,
+            IpAccess::Client,
+            IpAccess::All,
+        ] {
             for signals in [SignalScope::Any, SignalScope::Isolated] {
                 let mut policy = typical("/srv");
                 policy.ip = ip;
