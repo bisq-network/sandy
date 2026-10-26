@@ -150,11 +150,18 @@ mod tests {
     use crate::DRAIN;
     use std::io::{Read, Write};
     use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, UdpSocket};
-    use std::sync::mpsc;
+    use std::sync::{OnceLock, mpsc};
     use std::thread;
     use std::time::Instant;
 
     use sandy_core::destination::Subnet;
+
+    /// How long a server at `stand_in` may take to answer, which leaves time to answer a firewall
+    /// prompt. The macOS firewall ends the connections to a test program that listens at an
+    /// address other than loopback, without data, until the program is allowed in its options.
+    /// It asked nobody when the program ran over SSH or in a Screen Sharing session other than
+    /// the one on the screen (measured on macOS 27).
+    const STAND_IN_WAIT: Duration = Duration::from_secs(30);
 
     /// A host check that answers from fixed lists.
     #[derive(Default)]
@@ -185,6 +192,73 @@ mod tests {
         probe.connect("192.0.2.1:9").ok()?;
         let ip = probe.local_addr().ok()?.ip();
         (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
+    }
+
+    /// Panics unless a server at `stand_in` answers a direct connection within `STAND_IN_WAIT`,
+    /// so that a test whose server there has to answer fails with the cause on this host rather
+    /// than as a failure of the broker. Checked once per test program.
+    fn assert_stand_in_answers(stand_in: IpAddr) {
+        static CHECKED: OnceLock<Result<(), String>> = OnceLock::new();
+        if let Err(reason) = CHECKED.get_or_init(|| stand_in_answers(stand_in)) {
+            panic!("{reason}");
+        }
+    }
+
+    fn stand_in_answers(stand_in: IpAddr) -> Result<(), String> {
+        let server = echo_server(stand_in);
+        let started = Instant::now();
+        let mut last = String::new();
+        while started.elapsed() < STAND_IN_WAIT {
+            match echo_directly(server) {
+                Ok(answer) if answer == b"echo:probe" => return Ok(()),
+                Ok(answer) => last = format!("it answered {:?}", String::from_utf8_lossy(&answer)),
+                Err(error) => last = error.to_string(),
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        Err(format!(
+            "the test needs a server at {server}, an address of this host, but it answered no \
+             direct connection within {STAND_IN_WAIT:?} (last: {last}). A firewall of this host \
+             can stop such connections: the macOS firewall{} ends them without data until the \
+             test program is allowed, and it may not ask. On macOS, add {} under System \
+             Settings, Network, Firewall, Options, with incoming connections allowed, and run the \
+             test again.",
+            firewall_state(),
+            std::env::current_exe().map_or_else(
+                |error| format!("this test program (its path is unknown: {error})"),
+                |program| program.display().to_string()
+            )
+        ))
+    }
+
+    fn echo_directly(server: SocketAddr) -> io::Result<Vec<u8>> {
+        let mut stream = TcpStream::connect_timeout(&server, Duration::from_secs(2))?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.write_all(b"probe")?;
+        stream.shutdown(Shutdown::Write)?;
+        let mut answer = Vec::new();
+        stream.read_to_end(&mut answer)?;
+        Ok(answer)
+    }
+
+    /// The state of the macOS firewall, for the message of a failure.
+    #[cfg(target_os = "macos")]
+    fn firewall_state() -> String {
+        let state = std::process::Command::new("/usr/libexec/ApplicationFirewall/socketfilterfw")
+            .arg("--getglobalstate")
+            .output();
+        match state {
+            Ok(output) => format!(
+                " (here: {})",
+                String::from_utf8_lossy(&output.stdout).trim()
+            ),
+            Err(error) => format!(" (its state here is unknown: {error})"),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn firewall_state() -> String {
+        String::new()
     }
 
     /// A test host that does not know `stand_in` as its own and has it as a subnet, so that
@@ -299,6 +373,7 @@ mod tests {
             eprintln!("skipped: this host has no address besides loopback");
             return;
         };
+        assert_stand_in_answers(stand_in);
         let target = echo_server(stand_in);
         let (broker, stop, server) = start(
             EgressReach::PublicAndLocal,
@@ -613,6 +688,7 @@ mod tests {
             eprintln!("skipped: this host has no address besides loopback");
             return;
         };
+        assert_stand_in_answers(stand_in);
         let target = echo_server(stand_in);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -632,12 +708,14 @@ mod tests {
             host: host_without(stand_in),
             reached_host: |_: &TcpStream| false,
         };
+        // The broker ends as soon as the connection has, so a drain longer than `DRAIN` costs
+        // nothing here and keeps a slow host from cutting the connection.
         serve_broker(
             listener,
             |listener| listener.accept().map(|(client, _)| client),
             broker,
             &stop,
-            DRAIN,
+            Duration::from_secs(10),
         );
         let mut answer = Vec::new();
         client.read_to_end(&mut answer).unwrap();
