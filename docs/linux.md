@@ -524,14 +524,31 @@ What the program gets, measured on Fedora 44:
    sysctl to 0, which lifts it for every program. Any other label is a profile, and whether that
    allows user namespaces only a trial shows.
 
-When nothing of this rules the namespaces out, `check` also tries them (`Backend::verify`): a
-forked child runs steps 1 to 3 and 5 and reports the first that fails, with `children =
-"contained"` together with the PID namespace that its run adds (see "A PID namespace"). The
-namespaces end with the child. On Ubuntu the kernel log keeps the AppArmor audit records of the `unshare`, which is
-all a trial leaves behind. The trial finds what the host does not say, for example a sandbox
-around sandy whose seccomp filter denies `unshare`, as sandy's own does
-(`check_tries_the_namespaces_inside_a_sandbox_that_denies_them`). `run` stays the authoritative
-answer: a step that fails refuses the run with the step's error.
+When nothing of this rules the namespaces out, `plan` also tries them, in `check` and in `run`:
+a forked child runs steps 1 to 3 and 5 and reports the first that fails, with its error number,
+with `children = "contained"` together with the PID namespace that its run adds (see "A PID
+namespace"). The namespaces end with the child. On Ubuntu the kernel log keeps the AppArmor
+audit records of the `unshare`, which is all a trial leaves behind. The trial finds what the
+host does not say, for example a sandbox around sandy whose seccomp filter denies `unshare`, as
+sandy's own does (`check_tries_the_namespaces_inside_a_sandbox_that_denies_them`). One sandy
+tries each set of namespaces once and plans every policy against that answer.
+
+What a failed trial means depends on why it failed, because only a lasting shortfall of the host
+may make sandy try a weaker fallback level:
+
+- `EPERM`, `EACCES`, `ENOSYS`, `EINVAL` and `EUSERS`, and a probe that a sandbox around sandy
+  ends with `SIGSYS`: the host refuses the namespaces for good, and the requirement is
+  unavailable (`UNAVAILABLE`, `check` status 1).
+- `ENOSPC` where `user.max_user_namespaces`, or the `user.max_*_namespaces` limit of another kind
+  the trial creates, is 0: unavailable too.
+- Everything else can pass, and others than an administrator can cause it: `EAGAIN` or `ENOMEM`
+  when the user's processes or the memory run out (any process of the user, also one an earlier
+  run left behind, counts against `RLIMIT_NPROC`), `ENOSPC` when the user's own namespaces fill
+  a limit, `EMFILE`, a probe that cannot fork or report, or one that another signal ends. The
+  requirement is then indeterminate (`UNDECIDED`): `check` and `run` fail with status 125 and
+  never take the plan as unavailable (`a_process_limit_makes_the_namespaces_undecided`).
+
+`run` stays the authoritative answer: a step that fails refuses the run with the step's error.
 
 ### Costs
 
@@ -547,8 +564,11 @@ answer: a step that fails refuses the run with the step's error.
 - No name server is reachable, unless a forwarded port reaches one over TCP. The system set
   keeps `/etc/hosts` and the resolver configuration readable, so `localhost` resolves.
 - Each exposed connection asks the factory for its socket: one round trip over a socket pair.
-- On Ubuntu every run, and every `check` that tries the namespaces, adds AppArmor audit records to
-  the kernel log.
+- The trial forks a child that creates the namespaces once more, in every `run` and `check`. It
+  adds about 1 ms to the start (0.7 to 1.2 ms in the medians of 150 runs of the release build
+  on the same host).
+- On Ubuntu every run and every `check` adds AppArmor audit records to the kernel log, for the
+  trial and for the run.
 
 ### What stays open
 
@@ -696,9 +716,10 @@ exception of "Metadata through open files" does not apply in the view
   kernel without the fix, or one that answers no bitmask, makes the requirement unavailable.
   Measured: Ubuntu 22.04's 6.8 reports 0x5, Ubuntu 25.10's 6.17 0x7, Fedora 44's 7.2 0xf; all
   have the fix.
-- `check` tries the namespaces in a forked child as for the private network, and with the view
+- `plan` tries the namespaces in a forked child as for the private network, and with the view
   also every kind of mount call of the run: it builds a view that holds only `/dev` and makes it
-  the root (`the_probe_tries_the_mount_steps`).
+  the root (`the_probe_tries_the_mount_steps`). The error number of the step that fails decides
+  as there.
 - `run` refuses a directory on a standard stream (`a_directory_on_a_standard_stream_is_refused`).
   Such a descriptor was opened in the host's mount namespace, and through it the program would
   reach every path of the host by name with `openat` and `fstatat`, the hidden ones included. No
@@ -855,6 +876,12 @@ this order:
 
 It does so before it opens anything else: before the policy file, the status descriptor and the
 standard streams. Otherwise it runs on as itself, and `check` reports that the host needs setup.
+A condition that sandy cannot read before it knows that the copy is installed (condition 3)
+counts as not holding. From there, a condition it cannot read, for example because its
+descriptor table is full, and a failed `execve` end `check` and `run` with status 125 and the
+reason, after the status descriptor is open: the copy may be the one that should run, and the
+portable sandy would report a need for setup that is not there
+(`a_failed_check_of_the_installed_copy_is_an_error`).
 The copy runs under its profile, so its label is not `unconfined` and it never hands over again;
 condition 2 stops a loop even where the label would allow one.
 
@@ -865,7 +892,7 @@ its names in the variable `SANDY_STARTED_AS`: its file (`/proc/self/exe`), the n
 given (`AT_EXECFN`), and the names it received there itself, separated by `:`. Every sandy reads
 the variable at its start, removes it from its environment, and checks each name in it that
 exists like its own. The variable can only add checks: a caller that sets it makes sandy check
-more files. A name that holds a `:` cannot pass intact, and then sandy does not hand over. The
+more files. A name that holds a `:` cannot pass intact, and then sandy fails with status 125. The
 program never sees the variable, also when the policy passes it on
 (`started_as_never_reaches_the_program`).
 
@@ -1041,8 +1068,14 @@ when the program ends. sandy does not replace itself with the program:
    program has started or ended. With exposed or forwarded ports, or an egress broker, the guard
    also keeps a pidfd for the relay and one for the broker, the write end of their pipe, and the
    write end of a pipe back to sandy (step 7 of "Exposed and forwarded ports").
-3. sandy forks the program. Once the program has reported its process ID (step 4), the guard
-   opens a pidfd for it and polls that and the pipe, and the pidfds of the relay and the broker.
+3. sandy forks the program, and then closes every descriptor it inherited from its caller and
+   does not need: each one above 2 without close-on-exec. sandy opens its own descriptors
+   close-on-exec and makes the one of `--status-fd` so, which it keeps; the program gets none of
+   them either way. Without this, a socket the caller leaked into sandy would stay open, and its
+   port busy, for as long as the program runs
+   (`sandy_closes_what_it_inherited_while_the_program_runs`). Once the program has reported its
+   process ID (step 4), the guard opens a pidfd for it and polls that and the pipe, and the
+   pidfds of the relay and the broker.
    When the program ends, when the pipe ends because sandy died (also by `SIGKILL`), or when the
    relay or the broker ends, the guard checks that it leads its group and kills the group with
    `SIGKILL`. The group therefore ends with the program even while sandy is stopped.
@@ -1133,10 +1166,15 @@ stays the authoritative answer; it asks for the PID namespace in the same `unsha
 tries both together and refuses where `run` would, on a host that gives sandy user namespaces but
 no PID namespace (`user.max_pid_namespaces` 0;
 `check_tries_the_pid_namespace_where_the_run_needs_one`). With `contained` alone the namespace
-only adds to the process group, so `plan` also tries one in a forked child on every run, and a
-host that allows user namespaces but refuses them to sandy, such as a container whose seccomp
-profile denies `unshare`, keeps `contained` as described above. Under Ubuntu's AppArmor
-restriction `contained` keeps that mechanism too, without needing setup.
+only adds to the process group, so `plan` also tries one in a forked child, once per sandy, and
+a host that allows user namespaces but refuses them to sandy, such as a container whose seccomp
+profile denies `unshare`, keeps `contained` as described above. A trial that fails for a reason
+that can pass (see "Detection" of "Private network") does not: the requirement is indeterminate
+and sandy fails with status 125, instead of running the program with the process group alone
+(`an_undecided_pid_namespace_swaps_no_mechanism`). Under Ubuntu's AppArmor restriction
+`contained` keeps the process group too, without needing setup; below Landlock ABI 6, where only
+the PID namespace isolates signals, `signals = "isolated"` then needs setup, and `check` exits
+with status 2.
 
 1. The forked child of step 3 does not join the guard's group. It adds `CLONE_NEWPID` to the
    `unshare` of its namespaces (with `contained` alone, `CLONE_NEWUSER | CLONE_NEWPID`) and forks
@@ -1829,7 +1867,9 @@ How it works:
 
 1. sandy forks the program and stays its parent, as with `children = "contained"`. Only a
    parent may read the memory of its child where Yama restricts ptrace
-   (`/proc/sys/kernel/yama/ptrace_scope` 1, the default on Debian and Ubuntu).
+   (`/proc/sys/kernel/yama/ptrace_scope` 1, the default on Debian and Ubuntu). As with
+   `contained`, sandy then closes the descriptors it inherited from its caller
+   (`sandy_closes_what_it_inherited_while_the_program_runs` in `tests/explain_linux.rs`).
 2. The forked program installs the observer filter as its last step before `execve`. It returns
    `SECCOMP_RET_USER_NOTIF` for the watched calls and allows everything else. The kernel hands
    the installer a descriptor for the filter, which the program sends to sandy over a socket
@@ -2144,9 +2184,10 @@ location that does not exist counts, because the program could create it, and ea
 it lies and where its symbolic links lead.
 
 The home directory comes from the password database (`getpwuid_r`) and from `HOME`, for the
-same reason. When neither names one, sandy cannot tell whether a writable path reaches these
-locations, so it refuses a policy with a writable path, as it does when it cannot read the mount
-table; a policy without one is not affected. This happens with the static release build, which
+same reason. When neither names one, or the password database cannot be read, sandy cannot tell
+whether a writable path reaches these locations, so a policy with a writable path is undecided
+and `check` and `run` fail with status 125, as when sandy cannot read the mount table; a policy
+without one is not affected. This happens with the static release build, which
 reads only `/etc/passwd`, for a user that only SSSD, LDAP or systemd-homed knows, started
 without `HOME`. The message says to start sandy with `HOME` set to the home directory.
 
@@ -2203,8 +2244,19 @@ rights of both, so the resolver compares files before it builds the rules.
 
 ## Refusals
 
-`sandy check` shows the reason for each unavailable requirement. A policy that breaks one of the
-path rules is refused before that, with exit code 125 and the paths it compared.
+`sandy check` shows the reason for each requirement it cannot enforce, in one of three kinds:
+
+- `UNAVAILABLE`: a lasting shortfall of the host. `check` exits with status 1, or 2 when only
+  `sandy setup` is missing.
+- `CONFLICT`: the policy contradicts the layout of this host, for example with a writable path
+  over the minimal system set.
+- `UNDECIDED`: a probe failed for a reason that can pass, such as a full process or descriptor
+  table, so sandy cannot tell now.
+
+The last two end `check` and `run` with status 125, because every fallback level of a policy has
+the same paths and program, and a passing failure says nothing about the host: neither may make
+sandy try a weaker level. A policy that breaks one of the path rules is refused before that, with
+exit code 125 and the paths it compared.
 
 - No Landlock: FilesystemConfined, ProcessMemoryIsolated and SignalsIsolated are unavailable.
 - No seccomp filter support, or a CPU architecture other than x86_64 and arm64: every requirement
@@ -2214,7 +2266,7 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   already held, and Landlock does not restrict `chmod`, so root could, for example, set the
   setuid bit on a shell.
 - A writable policy path that overlaps the minimal system set, with `system = "minimal"`:
-  FilesystemConfined is unavailable. The path contains an entry of the set, or lies inside one of
+  FilesystemConfined is a conflict. The path contains an entry of the set, or lies inside one of
   its directories. Entries that do not exist on this host count too (their location with the
   symbolic links of the existing part resolved), because the program could create them, for
   example `/etc/ld.so.preload`. A symbolic link counts where it is and where it points, also when
@@ -2224,14 +2276,15 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   the next start and programs outside the sandbox use. File permissions usually forbid this
   anyway, because these files belong to root and sandy refuses to run as root; the check keeps
   the guarantee independent of them. Paths are compared as in "Links and the mount table", so a
-  bind alias of a directory of the set is refused like the directory itself; sandy refuses the
-  policy when it cannot read the mount table.
+  bind alias of a directory of the set is refused like the directory itself. When sandy cannot
+  read the mount table, FilesystemConfined is undecided, and unavailable only where there is no
+  `/proc` at all; the same holds for the thread list `/proc/self/task`.
 - A writable policy path that overlaps a trusted user location, whatever the system access:
-  FilesystemConfined is unavailable. The locations are in "Trusted user locations" above; a
+  FilesystemConfined is a conflict. The locations are in "Trusted user locations" above; a
   directory on `PATH` warns there instead.
 - A writable policy path while neither `HOME` nor the password database names the home
-  directory: FilesystemConfined is unavailable, because sandy cannot check the locations below
-  it. Setting `HOME` fixes it.
+  directory, or the database cannot be read: FilesystemConfined is undecided, because sandy
+  cannot check the locations below it. Setting `HOME` fixes it.
 - `children = "contained"` while sandy itself runs in a sandbox that denies `setpgid`:
   ChildProcessesContained is unavailable. The program runs in a process group of its own, and
   sandy's own filter denies `setpgid` inside `contained`, so one contained sandbox cannot hold
@@ -2239,7 +2292,7 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   nothing. A session leader cannot change its own group whatever a filter allows, so sandy skips
   the probe then; the group is led by the guard, which is no session leader.
 - A program whose loader no `read_exec` path and no entry of the minimal system set covers:
-  FilesystemConfined is unavailable. The kernel opens the loader of the program's ELF
+  FilesystemConfined is a conflict. The kernel opens the loader of the program's ELF
   `PT_INTERP` header for execution during `execve`, so it needs an execute right of its own.
   Without the check, `execve` would fail with "Permission denied" after the sandbox is in place.
   It happens with `system = "none"` and no `read_exec` path for the loader, and on a host whose
@@ -2247,27 +2300,28 @@ path rules is refused before that, with exit code 125 and the paths it compared.
   loader. A statically linked program and a script have no loader; a script's interpreter is
   checked by the rule below.
 - A program that is a script whose interpreter no `read_exec` path covers: FilesystemConfined is
-  unavailable. The kernel reads the `#!` line and executes the interpreter, which needs execute
+  a conflict. The kernel reads the `#!` line and executes the interpreter, which needs execute
   access of its own, so `sandy check` reads that line too and follows up to four levels of it.
   Without the check, `execve` would fail with "Permission denied" after the sandbox is in place.
   The minimal system set grants execute on the dynamic loader, so a chain that ends there is
   covered.
 - `ip = "private"` where user namespaces are disabled (`user.max_user_namespaces` or
-  `kernel.unprivileged_userns_clone` 0), or where a trial of the namespaces fails, for example
-  inside another sandbox: IpNetworkPrivate is unavailable. Under Ubuntu's AppArmor restriction of
-  unprivileged user namespaces it needs setup, and `sandy check` exits with status 2 (see
-  "Private network" and "Setup on Ubuntu"). EgressBrokered follows it, because the broker serves
-  a listener in that namespace. It is also unavailable when the kernel does not answer a route
-  lookup and an address dump over a `NETLINK_ROUTE` socket, which `check` tries and `run` asks
-  before it starts the broker.
+  `kernel.unprivileged_userns_clone` 0), or where the kernel refuses a trial of the namespaces
+  for good, for example inside another sandbox: IpNetworkPrivate is unavailable. A trial that
+  fails for a reason that can pass leaves it undecided (see "Detection" of "Private network").
+  Under Ubuntu's AppArmor restriction of unprivileged user namespaces it needs setup, and
+  `sandy check` exits with status 2 (see "Private network" and "Setup on Ubuntu").
+  EgressBrokered follows it, because the broker serves a listener in that namespace. When the
+  kernel does not answer a route lookup and an address dump over a `NETLINK_ROUTE` socket, which
+  `check` tries and `run` asks before it starts the broker, `check` fails with status 125.
 - `filesystem.view = "policy"` in the same cases, and on a kernel that does not report the fix of
   Landlock erratum 3: PathsHidden is unavailable, or needs setup under the AppArmor restriction.
   With the view, `sandy run` also refuses a directory on a standard stream, with exit code 125
   (see "File system view").
-- A listening address of a relay that another process holds: ExposedPortsRelayed or
-  ForwardedPortsRelayed is unavailable. `sandy check` binds the same addresses for a moment and
-  releases them again, so it reports what `run` refuses. The answer can be stale one moment
-  later; `run` binds for real and stays the authoritative answer.
+- A listening address of a relay that another process holds: `sandy check` binds the same
+  addresses for a moment and releases them again, and fails with status 125 when one is taken,
+  as `run` does. Any local user can hold a port, so a busy one says nothing about the host. The
+  answer can be stale one moment later; `run` binds for real and stays the authoritative answer.
 - A standard stream that carries a socket the policy denies: `sandy run` refuses with exit code 125
   and names the stream and the socket. Such a socket was created before the sandbox, so neither
   Landlock nor the filter takes its access away: an unconnected UDP socket on standard input

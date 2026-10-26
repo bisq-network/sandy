@@ -6,6 +6,7 @@ use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::ptr;
 
+use crate::plan::ProfileError;
 use crate::profile::Profile;
 
 const LIBRARY: &CStr = c"/usr/lib/libsandbox.1.dylib";
@@ -72,14 +73,18 @@ impl Seatbelt {
         }
     }
 
-    /// Compiles `profile` without applying it, to learn whether this macOS accepts it.
-    pub fn compile(&self, profile: &Profile) -> Result<(), String> {
-        let text = profile_text(profile)?;
-        let strings = parameter_strings(profile)?;
+    /// Compiles `profile` without applying it, to learn whether this macOS accepts it. Only the
+    /// compiler's message is a verdict on the profile; the library's other failures report no
+    /// cause and come from running out of memory.
+    pub fn compile(&self, profile: &Profile) -> Result<(), ProfileError> {
+        let text = profile_text(profile).map_err(ProfileError::Failed)?;
+        let strings = parameter_strings(profile).map_err(ProfileError::Failed)?;
         // SAFETY: no arguments.
         let params = unsafe { (self.create_params)() };
         if params.is_null() {
-            return Err("sandbox_create_params failed".to_string());
+            return Err(ProfileError::Failed(
+                "sandbox_create_params failed".to_string(),
+            ));
         }
         // Frees `params` before `strings` goes out of scope: the parameter object refers to the
         // strings without copying them.
@@ -93,17 +98,22 @@ impl Seatbelt {
             let result =
                 unsafe { (self.set_param)(params.pointer, pair[0].as_ptr(), pair[1].as_ptr()) };
             if result != 0 {
-                return Err(format!(
+                return Err(ProfileError::Failed(format!(
                     "sandbox_set_param({}) failed",
                     pair[0].to_string_lossy()
-                ));
+                )));
             }
         }
         let mut error: *mut c_char = ptr::null_mut();
         // SAFETY: text is NUL-terminated, params is live, error is a valid out pointer.
         let compiled = unsafe { (self.compile_string)(text.as_ptr(), params.pointer, &mut error) };
         if compiled.is_null() {
-            return Err(self.take_error(error, "sandbox_compile_string failed"));
+            return Err(match self.message(error) {
+                Some(message) => ProfileError::Rejected(message),
+                None => ProfileError::Failed(
+                    "sandbox_compile_string failed without a message".to_string(),
+                ),
+            });
         }
         // SAFETY: compiled came from sandbox_compile_string and is freed once.
         unsafe { (self.free_profile)(compiled) };
@@ -144,15 +154,20 @@ impl Seatbelt {
     }
 
     fn take_error(&self, error: *mut c_char, fallback: &str) -> String {
+        self.message(error).unwrap_or_else(|| fallback.to_string())
+    }
+
+    /// The message the library left in `error`, which it frees; `None` when it left none.
+    fn message(&self, error: *mut c_char) -> Option<String> {
         if error.is_null() {
-            return fallback.to_string();
+            return None;
         }
         // SAFETY: the sandbox library sets error to a NUL-terminated string that the caller
         // frees with sandbox_free_error, exactly once.
         unsafe {
             let message = CStr::from_ptr(error).to_string_lossy().into_owned();
             (self.free_error)(error);
-            message
+            Some(message)
         }
     }
 }

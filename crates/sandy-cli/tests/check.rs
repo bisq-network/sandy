@@ -19,6 +19,11 @@ const WARNING: &str = "warning: ";
 /// What `check` exits with when a requirement cannot be enforced on this host.
 const NOT_ENFORCEABLE: i32 = 1;
 
+/// What `check` exits with, and how it marks the requirement, when the policy contradicts the
+/// host's layout, for example with a writable path over a trusted location: a conflict, which
+/// ends the check with status 125 so that no weaker fallback level is tried.
+const CONFLICT: (i32, &str) = (EXIT_FAILURE, "CONFLICT ");
+
 /// The variable that names the user's home directory.
 const HOME: &str = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
 
@@ -98,12 +103,9 @@ fn check_refuses_a_writable_path_that_holds_the_home_directory() {
     let output = check_with_home(&home, &["--read-write".to_string(), fixture.arg("rw")]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        output.status.code(),
-        Some(NOT_ENFORCEABLE),
-        "{stdout}{stderr}"
-    );
+    assert_eq!(output.status.code(), Some(CONFLICT.0), "{stdout}{stderr}");
     assert!(stdout.contains("runs outside the sandbox"), "{stdout}");
+    assert!(stdout.contains(CONFLICT.1), "{stdout}");
     assert!(
         stderr.contains(&fixture.path("rw").display().to_string()),
         "the writable path that holds the home directory is not named: {stderr}"
@@ -160,10 +162,11 @@ fn check_refuses_a_writable_path_over_the_cargo_configuration() {
         let stdout = String::from_utf8_lossy(&refused.stdout);
         assert_eq!(
             refused.status.code(),
-            Some(NOT_ENFORCEABLE),
+            Some(CONFLICT.0),
             "{location}: {stdout}"
         );
         assert!(stdout.contains("runs outside the sandbox"), "{stdout}");
+        assert!(stdout.contains(CONFLICT.1), "{stdout}");
 
         let allowed = check(beside);
         assert!(
@@ -695,9 +698,11 @@ fn check_warns_that_a_grant_follows_a_moved_file() {
 }
 
 /// `run` binds the listeners of exposed and forwarded ports outside the sandbox, so a port that
-/// another process holds makes it refuse. `check` binds them too and reports the same.
+/// another process holds makes it refuse. `check` binds them too and fails the same way, with
+/// status 125: any local user can hold a port, so a busy one says nothing about what the host
+/// can enforce and must never make sandy pick a weaker fallback level.
 #[test]
-fn check_reports_an_exposed_port_that_is_already_in_use() {
+fn check_fails_on_an_exposed_port_that_is_already_in_use() {
     let fixture = Fixture::new("check-busy");
     let held = TcpListener::bind("127.0.0.1:0").unwrap();
     let busy = held.local_addr().unwrap();
@@ -721,14 +726,15 @@ fn check_reports_an_exposed_port_that_is_already_in_use() {
     args.extend_from_slice(&sandbox_args);
     let output = sandy(&args);
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         output.status.code(),
-        Some(NOT_ENFORCEABLE),
-        "stdout: {stdout}\nstderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        Some(EXIT_FAILURE),
+        "stdout: {stdout}\nstderr: {stderr}"
     );
-    assert!(stdout.contains("UNAVAILABLE"), "{stdout}");
-    assert!(stdout.contains(&busy.to_string()), "{stdout}");
+    assert!(!stdout.contains("UNAVAILABLE"), "{stdout}");
+    assert!(stderr.contains("run would fail now"), "{stderr}");
+    assert!(stderr.contains(&busy.to_string()), "{stderr}");
 
     // run refuses the same policy, and the port is free again after the check.
     let output = sandy(run_args(
@@ -745,6 +751,75 @@ fn check_reports_an_exposed_port_that_is_already_in_use() {
     let output = sandy(&args);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
+}
+
+/// On Windows the relay of a forwarded port, and the one through which the egress broker reaches
+/// the program, listen on the program's loopback port inside the AppContainer, which shares the
+/// host's ports. A port that another process holds makes `run` fail, and `check` fails the same
+/// way with status 125 instead of reporting the plan as unavailable: any local user can hold a
+/// port, so a held one must never make sandy pick a weaker fallback level.
+#[cfg(windows)]
+#[test]
+fn check_and_run_fail_on_a_held_forward_or_egress_port() {
+    let fixture = Fixture::new("check-held");
+    let target = free_port();
+    for relay in ["--forward", "--egress"] {
+        let port = free_port();
+        let held = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let mut sandbox_args = fixture.access_args();
+        sandbox_args.extend([
+            "--ip".to_string(),
+            "private".to_string(),
+            relay.to_string(),
+            if relay == "--forward" {
+                format!("{port}=127.0.0.1:{target}")
+            } else {
+                port.to_string()
+            },
+        ]);
+        let check = || {
+            let mut args = vec!["check".to_string()];
+            args.extend(platform_args());
+            args.extend_from_slice(&sandbox_args);
+            sandy(&args)
+        };
+        let file = fixture.arg("ro/file");
+        let read = [("read", file.as_str())];
+
+        let output = check();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(EXIT_FAILURE),
+            "{relay}: stdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(!stdout.contains("UNAVAILABLE"), "{relay}: {stdout}");
+        assert!(stderr.contains("run would fail now"), "{relay}: {stderr}");
+        assert!(
+            stderr.contains(&format!("127.0.0.1:{port}")),
+            "{relay}: {stderr}"
+        );
+        let output = sandy(run_args(&sandbox_args, &read));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(EXIT_FAILURE),
+            "{relay}: {stderr}"
+        );
+        assert!(stderr.contains("run failed"), "{relay}: {stderr}");
+        assert!(!stderr.contains("cannot enforce"), "{relay}: {stderr}");
+
+        // Control: with the port free, the check passes and the program runs.
+        drop(held);
+        let output = check();
+        assert!(
+            output.status.success(),
+            "{relay}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        probe_inside(&sandbox_args, &read)[0].assert_ok();
+    }
 }
 
 /// The kernel executes the interpreter of a script, which needs execute access of its own. sandy
@@ -772,8 +847,8 @@ fn check_reports_a_script_whose_interpreter_cannot_be_executed() {
 
     let output = sandy_with(&fixture.access_args(), "check");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(output.status.code(), Some(NOT_ENFORCEABLE), "{stdout}");
-    assert!(stdout.contains("UNAVAILABLE"), "{stdout}");
+    assert_eq!(output.status.code(), Some(CONFLICT.0), "{stdout}");
+    assert!(stdout.contains(CONFLICT.1), "{stdout}");
     assert!(stdout.contains("interpreter"), "{stdout}");
     let output = sandy_with(&fixture.access_args(), "run");
     assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
@@ -998,9 +1073,75 @@ fn the_trial_profile_does_not_refuse_a_working_policy() {
     lines[0].assert_ok();
 }
 
+/// A process limit at its end keeps the trial's helper from starting, and any process of the
+/// user counts towards it. That says nothing about what this Mac enforces, so check fails with
+/// status 125 and reports nothing as unavailable, which would let sandy pick a weaker fallback
+/// level; run fails with 125 as well, because a contained program needs a fork. Control: without
+/// the limit both work.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_process_limit_fails_check_and_run_without_a_shortfall() {
+    use std::os::unix::process::CommandExt;
+
+    let fixture = Fixture::new("check-nproc");
+    let mut policy = fixture.access_args();
+    policy.extend(["--signals", "isolated", "--children", "contained"].map(String::from));
+    let mut check = vec!["check".to_string()];
+    check.extend(policy.clone());
+    let run = run_args(&policy, &[("read", &fixture.arg("ro/file"))]);
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes into `limit`.
+    let read = unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut limit) };
+    assert_eq!(read, 0);
+    // The user runs more than one process, so no fork of sandy's passes.
+    limit.rlim_cur = 1;
+    let sandy_with = |args: &[String], limited: bool| {
+        let mut command = Command::new(sandy_path());
+        command.args(args);
+        if limited {
+            // SAFETY: setrlimit is async-signal-safe and only reads `limit`.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::setrlimit(libc::RLIMIT_NPROC, &limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        command.output().unwrap()
+    };
+
+    let output = sandy_with(&check, true);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(EXIT_FAILURE),
+        "{stdout}\n{stderr}"
+    );
+    assert!(!stdout.contains("UNAVAILABLE"), "{stdout}");
+    assert!(stderr.contains("run would fail now"), "{stderr}");
+    assert!(stderr.contains("cannot fork the trial sandbox"), "{stderr}");
+    let output = sandy_with(&run, true);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    assert!(output.stdout.is_empty(), "the program ran: {output:?}");
+
+    let output = sandy_with(&check, false);
+    assert!(output.status.success(), "{output:?}");
+    let output = sandy_with(&run, false);
+    assert!(output.status.success(), "{output:?}");
+    parse(&output)[0].assert_ok();
+}
+
 /// Windows does not nest sandy's job, which sets UI restrictions, inside a job that has UI
 /// restrictions of its own, so `run` fails there and `check` must say so. sandy reads the UI
-/// restrictions of the job it is in, which for a chain of jobs is only the innermost one.
+/// restrictions of the job it is in, which for a chain of jobs is only the innermost one: the
+/// plan reports that one as unavailable, and the trial of `verify` finds an outer one, which
+/// like every finding of `verify` fails `check` with status 125.
 #[cfg(windows)]
 #[test]
 fn check_and_run_agree_inside_nested_jobs() {
@@ -1018,9 +1159,12 @@ fn check_and_run_agree_inside_nested_jobs() {
 
     // The UI restrictions of the outer job are the ones Windows refuses to nest under, and sandy
     // reads the restrictions of the inner job, which has none.
-    for chain in [[READ_CLIPBOARD, 0], [0, READ_CLIPBOARD]] {
+    for (chain, status) in [
+        ([READ_CLIPBOARD, 0], EXIT_FAILURE),
+        ([0, READ_CLIPBOARD], NOT_ENFORCEABLE),
+    ] {
         let (code, output) = windows::sandy_in_jobs(&chain, &check);
-        assert_eq!(code as i32, NOT_ENFORCEABLE, "{chain:?}: {output}");
+        assert_eq!(code as i32, status, "{chain:?}: {output}");
         assert!(output.contains("UI restrictions"), "{chain:?}: {output}");
         let (code, output) = windows::sandy_in_jobs(&chain, &run);
         assert_eq!(code as i32, EXIT_FAILURE, "{chain:?}: {output}");

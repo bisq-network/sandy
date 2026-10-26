@@ -1,9 +1,10 @@
 //! `process.children = "contained"`. sandy stays the parent of the program, so that it can end
 //! every process the program starts:
 //!
-//! 1. sandy catches every signal that macOS would discard while it is blocked (those whose action
-//!    is to ignore them, by default or set by the caller), blocks the signals it forwards and
-//!    waits for them with sigwait.
+//! 1. sandy closes every descriptor it inherited except 0, 1 and 2, keeping only its own: the
+//!    status record's and the helpers' pipe. It catches every signal that macOS would discard
+//!    while it is blocked (those whose action is to ignore them, by default or set by the
+//!    caller), blocks the signals it forwards and waits for them with sigwait.
 //! 2. It forks the guard, which starts a process group of its own and forks the anchor. The
 //!    anchor leads the program's process group and only waits to be killed; it is the guard's
 //!    child, so the group's ID stays reserved until the guard reaps it. The guard keeps only its
@@ -113,6 +114,15 @@ pub fn run(
     status: &StatusReport,
 ) -> Result<i32, SandboxError> {
     require_single_thread()?;
+    // sandy waits for the program as long as it runs, but needs nothing it inherited beyond the
+    // standard descriptors, and neither the program nor the helpers get any of it. A socket that
+    // the caller let sandy inherit would otherwise stay open with it, a port bound, until the
+    // program ends.
+    let mut keep = vec![0, 1, 2];
+    keep.extend(status.descriptor());
+    keep.extend(ended.as_ref().map(AsRawFd::as_raw_fd));
+    close_all_except(&keep)
+        .map_err(|error| SandboxError::io("cannot close the descriptors sandy inherited", error))?;
     let actions = CaughtSignals::catch()?;
     let signals = Signals::block()?;
     let mut group = Group::start(ended, helpers)?;

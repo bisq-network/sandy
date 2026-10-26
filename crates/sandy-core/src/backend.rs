@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use crate::plan::PlanItem;
-use crate::resolve::ResolvedPolicy;
+use crate::resolve::{ResolvedLevel, ResolvedPolicy};
 use crate::streams::CreatableSocket;
 
 /// The program to start inside the sandbox.
@@ -51,6 +51,7 @@ pub struct ParentProcess {
 /// 125". A caller that needs to tell these apart reads the record instead. One line per event,
 /// in this order:
 ///
+/// - `level NAME` first, when the policy has fallback levels: the level that runs.
 /// - `pid N` once the program runs, with the program's process ID. In the exec model (Linux and
 ///   macOS without `contained`) sandy writes it right before it replaces itself with the
 ///   program, because afterwards it cannot write any more.
@@ -80,6 +81,19 @@ impl StatusReport {
         StatusReport {
             channel: Some(RefCell::new(channel)),
         }
+    }
+
+    pub fn level(&self, name: &str) {
+        self.write(format_args!("level {name}"));
+    }
+
+    /// The descriptor the record goes to, which a backend that closes the descriptors it
+    /// inherited must keep.
+    #[cfg(unix)]
+    pub fn descriptor(&self) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd;
+
+        Some(self.channel.as_ref()?.borrow().as_raw_fd())
     }
 
     pub fn started(&self, pid: u32) {
@@ -112,8 +126,20 @@ impl StatusReport {
 ///
 /// Contract:
 /// - `plan` reports every requirement of `policy.requirements()` as enforced (naming the
-///   mechanism) or unavailable (naming the reason). It must not change any state.
-/// - `verify` adds what `plan` cannot see without touching the host. Only `check` calls it.
+///   mechanism) or not, with the reason. It must not change any state.
+/// - A requirement is `Unavailable` or `NeedsSetup` only for a lasting shortfall of the host:
+///   one that neither another local user, nor a remote party, nor an earlier run of the program
+///   can cause, because sandy then tries the next, weaker fallback level of the policy. A probe
+///   that fails for a reason that can pass (memory, process or descriptor limits, a timeout, a
+///   service that is starting, a read error) is `Indeterminate`, and a policy that contradicts
+///   itself or the host's fixed layout is a `Conflict`; both end the selection with status 125.
+/// - One backend value detects each host property at most once and keeps the answer, so every
+///   level that one invocation plans, the `notes` and `explain_paths` of the selected one, and
+///   its `run`, see the same host. A probe whose answer differs between two levels would let a
+///   passing failure pick the level.
+/// - `verify` adds what `plan` cannot see without touching the host. Only `check` calls it, for
+///   the selected level only, and every report from it that is not enforced makes `check` fail
+///   with status 125: it never makes sandy try another level.
 /// - `run` is called only when the plan is fully enforceable. It applies every mechanism the
 ///   plan named. If any step fails, it returns an error and never starts the target with a
 ///   weaker sandbox.
@@ -127,10 +153,12 @@ pub trait Backend {
     fn plan(&self, policy: &ResolvedPolicy) -> Vec<PlanItem>;
 
     /// Conditions that would make `run` refuse and that `plan` cannot see without touching the
-    /// host, for example a relay port another process holds. `check` adds these reports to the
-    /// plan, where any unavailable report wins; `run` does not call it, because it finds out
-    /// while it applies the sandbox. An implementation must leave the host as it found it, and
-    /// its answer can be stale a moment later, so `run` stays the authoritative answer.
+    /// host, for example a relay port another process holds. `check` calls it once it has
+    /// selected an enforceable level, and fails with status 125 on any report that is not
+    /// enforced, so implementations report `Status::Indeterminate`; `run` does not call it,
+    /// because it finds out while it applies the sandbox. An implementation must leave the host
+    /// as it found it, and its answer can be stale a moment later, so `run` stays the
+    /// authoritative answer.
     fn verify(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
         crate::verify::relay_listeners(policy)
     }
@@ -201,24 +229,70 @@ pub trait Backend {
         ))
     }
 
-    /// `setup --elevate` and `setup --remove --elevate`: `setup` or `remove` with the rights
-    /// they need, asked for from the user. `args` are sandy's own arguments without
-    /// `--elevate`, for a backend that runs sandy again with those rights. The rights must never
-    /// run a file that someone without them can change. A process that already holds them, and
-    /// a backend that needs none, runs the step directly.
+    /// `setup --elevate` and `setup --remove --elevate`: `setup` or `remove` of every level
+    /// (`setup_levels`) with the rights they need, asked for from the user. `args` are sandy's
+    /// own arguments without `--elevate`, for a backend that runs sandy again with those rights.
+    /// The rights must never run a file that someone without them can change. A process that
+    /// already holds them, and a backend that needs none, runs the step directly.
     fn elevate(
         &self,
-        policy: &ResolvedPolicy,
+        levels: &[ResolvedLevel],
         remove: bool,
         options: SetupOptions,
         _args: &[OsString],
     ) -> Result<SetupOutcome, SandboxError> {
-        if remove {
-            self.remove(policy, options)
-        } else {
-            self.setup(policy, options)
+        setup_levels(levels, |policy| {
+            if remove {
+                self.remove(policy, options)
+            } else {
+                self.setup(policy, options)
+            }
+        })
+    }
+}
+
+/// `setup` or `setup --remove` of every level of a policy, in order, as one step. A policy
+/// without fallback levels gets the outcome of its base unchanged. With levels it is done when
+/// every level is done, and refused when the first level refuses, before anything changed; a
+/// refusal or failure after a level changed the host is an error, because status 3 promises
+/// that nothing changed.
+pub fn setup_levels(
+    levels: &[ResolvedLevel],
+    mut step: impl FnMut(&ResolvedPolicy) -> Result<SetupOutcome, SandboxError>,
+) -> Result<SetupOutcome, SandboxError> {
+    if let [only] = levels {
+        return step(&only.policy);
+    }
+    let mut messages = Vec::new();
+    for (index, level) in levels.iter().enumerate() {
+        let failure = |reason: String| {
+            let done: Vec<&str> = levels[..index].iter().map(|l| l.name.as_str()).collect();
+            SandboxError::new(format!(
+                "level {}: {reason}; done before it: {}",
+                level.name,
+                done.join(", ")
+            ))
+        };
+        match step(&level.policy) {
+            Ok(SetupOutcome::Done(message)) => {
+                if !message.is_empty() {
+                    messages.push(format!("level {}: {message}", level.name));
+                }
+            }
+            Ok(SetupOutcome::Refused(message)) if index == 0 => {
+                return Ok(SetupOutcome::Refused(format!(
+                    "level {}: {message}",
+                    level.name
+                )));
+            }
+            Ok(SetupOutcome::Refused(message)) => return Err(failure(message)),
+            Err(error) if index == 0 => {
+                return Err(SandboxError::new(format!("level {}: {error}", level.name)));
+            }
+            Err(error) => return Err(failure(error.to_string())),
         }
     }
+    Ok(SetupOutcome::Done(messages.join("\n")))
 }
 
 /// What `sandy setup` and `sandy setup --remove` are asked for besides the policy.
@@ -277,5 +351,77 @@ impl std::error::Error for SandboxError {
         self.source
             .as_ref()
             .map(|e| e as &(dyn std::error::Error + 'static))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::Policy;
+
+    fn levels(count: usize) -> Vec<ResolvedLevel> {
+        let mut text = String::from("version = 1\n");
+        for index in 1..count {
+            text.push_str(&format!("[[fallback]]\nname = \"l{index}\"\n"));
+        }
+        ResolvedPolicy::resolve_levels(&Policy::from_toml(&text).unwrap(), None).unwrap()
+    }
+
+    fn run(
+        count: usize,
+        outcomes: &[Result<SetupOutcome, &str>],
+    ) -> (Result<SetupOutcome, String>, usize) {
+        let mut calls = 0;
+        let result = setup_levels(&levels(count), |_| {
+            calls += 1;
+            outcomes[calls - 1].clone().map_err(SandboxError::new)
+        })
+        .map_err(|error| error.to_string());
+        (result, calls)
+    }
+
+    fn done(message: &str) -> Result<SetupOutcome, &str> {
+        Ok(SetupOutcome::Done(message.to_string()))
+    }
+
+    fn refused(message: &str) -> Result<SetupOutcome, &str> {
+        Ok(SetupOutcome::Refused(message.to_string()))
+    }
+
+    /// Without levels the base's outcome passes unchanged; with levels every level is set up in
+    /// order, and status 3 (refused) stays a promise that nothing changed.
+    #[test]
+    fn setup_of_levels_keeps_the_promise_of_each_status() {
+        assert_eq!(
+            run(1, &[done("ok")]),
+            (Ok(SetupOutcome::Done("ok".into())), 1)
+        );
+        assert_eq!(
+            run(1, &[refused("no")]),
+            (Ok(SetupOutcome::Refused("no".into())), 1)
+        );
+
+        let (result, calls) = run(3, &[done("a"), done(""), done("c")]);
+        assert_eq!(calls, 3);
+        assert_eq!(
+            result,
+            Ok(SetupOutcome::Done("level base: a\nlevel l2: c".into()))
+        );
+
+        let (result, calls) = run(2, &[refused("no rights"), done("x")]);
+        assert_eq!(calls, 1);
+        assert_eq!(
+            result,
+            Ok(SetupOutcome::Refused("level base: no rights".into()))
+        );
+
+        // A refusal or failure after base changed the host is a failure, never status 3.
+        for later in [refused("no"), Err("broken")] {
+            let (result, calls) = run(3, &[done("a"), later, done("c")]);
+            assert_eq!(calls, 2);
+            let error = result.unwrap_err();
+            assert!(error.starts_with("level l1: "), "{error}");
+            assert!(error.ends_with("done before it: base"), "{error}");
+        }
     }
 }

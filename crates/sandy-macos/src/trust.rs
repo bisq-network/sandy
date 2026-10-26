@@ -14,6 +14,8 @@
 //! the same on every platform: Landlock rules are allow-only, so the Linux backend cannot carve
 //! a file out of a writable tree.
 
+use std::path::PathBuf;
+
 use sandy_core::ProtectedPath;
 use sandy_core::trust;
 
@@ -25,11 +27,10 @@ const HOME_TREES: &[&str] = &["Library/LaunchAgents"];
 /// `brew shellenv` line in `.zprofile` puts them on PATH.
 const BIN_DIRECTORIES: &[&str] = &["/opt/homebrew/bin", "/opt/homebrew/sbin"];
 
-/// Where the files are that other programs of this user read or execute. A writable path that
-/// reaches one of them is refused, and so is every writable path when no source names the home
-/// directory (`sandy_core::trust::home_directories`).
-pub fn locations() -> Result<Vec<ProtectedPath>, String> {
-    let homes = trust::home_directories()?;
+/// Where the files are that other programs of this user, with the home directories `homes`
+/// (`sandy_core::trust::home_directories`), read or execute. A writable path that reaches one of
+/// them is refused.
+pub fn locations(homes: &[PathBuf]) -> Vec<ProtectedPath> {
     let platform = homes
         .iter()
         .flat_map(|home| {
@@ -38,7 +39,7 @@ pub fn locations() -> Result<Vec<ProtectedPath>, String> {
                 .map(|name| ProtectedPath::tree(home.join(name)))
         })
         .collect();
-    Ok(trust::locations(&homes, platform))
+    trust::locations(homes, platform)
 }
 
 /// The directories on sandy's PATH and the usual ones of the user's PATH, which only warn. A
@@ -46,12 +47,8 @@ pub fn locations() -> Result<Vec<ProtectedPath>, String> {
 /// types its name, but a writable path that holds such a directory is ordinary work, a package
 /// cache whose `bin` directory is on PATH for example, so refusing it would turn away the common
 /// case (rule 12).
-pub fn path_locations() -> Vec<ProtectedPath> {
-    trust::path_locations(
-        std::env::var_os("PATH").as_deref(),
-        &trust::home_directories().unwrap_or_default(),
-        BIN_DIRECTORIES,
-    )
+pub fn path_locations(homes: &[PathBuf]) -> Vec<ProtectedPath> {
+    trust::path_locations(std::env::var_os("PATH").as_deref(), homes, BIN_DIRECTORIES)
 }
 
 #[cfg(test)]
@@ -65,8 +62,9 @@ mod tests {
         let Some(path) = std::env::var_os("PATH") else {
             return;
         };
-        let refused = locations().unwrap_or_default();
-        let warned = path_locations();
+        let homes = trust::home_directories().unwrap_or_default();
+        let refused = locations(&homes);
+        let warned = path_locations(&homes);
         let homebrew = BIN_DIRECTORIES.iter().map(std::path::PathBuf::from);
         let path = std::env::split_paths(&path).filter(|entry| entry.is_absolute());
         for directory in path.chain(homebrew) {
@@ -87,10 +85,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn the_locations_cover_the_home_directory_of_this_user() {
-        let Ok(locations) = locations() else {
+        let Ok(homes) = trust::home_directories() else {
             return;
         };
-        let home = trust::home_directories().unwrap().remove(0);
+        let locations = locations(&homes);
+        let home = homes[0].clone();
         let holds = |path: &std::path::Path| locations.iter().any(|entry| entry.path == path);
         assert!(holds(&home), "{locations:?}");
         assert!(holds(&home.join(".zshrc")), "{locations:?}");

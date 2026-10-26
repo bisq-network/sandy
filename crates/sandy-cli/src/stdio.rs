@@ -402,3 +402,61 @@ pub fn socket_on(_stream: StandardStream) -> Result<Option<Socket>, String> {
 pub fn terminal_master_on(_stream: StandardStream) -> Result<bool, String> {
     Ok(false)
 }
+
+/// The longest policy `--policy -` reads.
+const MAX_POLICY_INPUT: usize = 1024 * 1024;
+
+/// `--policy -`: reads the policy from standard input until its end, then replaces standard input
+/// with the null device, so the program, which inherits the streams, reads nothing of the
+/// caller's. Done before anything else starts.
+pub fn take_policy_input() -> Result<String, String> {
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take(MAX_POLICY_INPUT as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read the policy from standard input: {error}"))?;
+    if bytes.len() > MAX_POLICY_INPUT {
+        return Err(format!(
+            "the policy on standard input is longer than {} KiB",
+            MAX_POLICY_INPUT / 1024
+        ));
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|_| "the policy on standard input is not valid UTF-8".to_string())?;
+    null_input().map_err(|error| {
+        format!("cannot replace standard input with the null device after the policy: {error}")
+    })?;
+    Ok(text)
+}
+
+#[cfg(unix)]
+fn null_input() -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let null = std::fs::File::open("/dev/null")?;
+    // SAFETY: both are open descriptors of this process; dup2 replaces descriptor 0 atomically
+    // and clears close-on-exec on it, so the program inherits the null device there.
+    if unsafe { libc::dup2(null.as_raw_fd(), libc::STDIN_FILENO) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The Windows backend gives the program a duplicate of sandy's standard handle, so the handle
+/// sandy holds is the one to replace.
+#[cfg(windows)]
+fn null_input() -> std::io::Result<()> {
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::System::Console::{STD_INPUT_HANDLE, SetStdHandle};
+
+    let null = std::fs::File::open("NUL")?.into_raw_handle();
+    // SAFETY: null is an open handle that sandy now owns for the rest of its life; the old
+    // standard handle stays open, as other code of this process may still refer to it.
+    if unsafe { SetStdHandle(STD_INPUT_HANDLE, null) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}

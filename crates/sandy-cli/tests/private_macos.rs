@@ -335,8 +335,10 @@ fn the_relay_holds_the_forwarded_ports_at_every_address() {
 
 /// A socket that already listens on a forwarded port, at a wildcard address or at an address of
 /// the Mac, would receive the program's connections there, so sandy refuses, and check says so
-/// first. With `ip = "all"` the program reaches that listener anyway, so the same forward runs
-/// there.
+/// first. Any local user can hold a port, so a held one says nothing about what this Mac
+/// enforces: check fails with status 125 and reports nothing as unavailable, which would let
+/// sandy pick a weaker fallback level. With `ip = "all"` the program reaches that listener
+/// anyway, so the same forward runs there.
 #[test]
 fn a_listener_on_a_forwarded_port_refuses_a_private_network() {
     let Some(others) = other_addresses() else {
@@ -359,25 +361,59 @@ fn a_listener_on_a_forwarded_port_refuses_a_private_network() {
             stderr.contains(&format!("cannot hold port {port}")),
             "{address}: {stderr}"
         );
-
-        let mut check = vec!["check".to_string()];
-        check.extend(args.iter().cloned());
-        let output = sandy(&check);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert_eq!(output.status.code(), Some(1), "{stdout}");
-        assert!(
-            stdout.contains(&format!(
-                "UNAVAILABLE  IP networking limited to the sandbox's own loopback: cannot hold \
-                 port {port}"
-            )),
-            "{stdout}"
-        );
+        assert_fails_check_without_a_shortfall(&args, &format!("cannot hold port {port}"));
 
         let mut all = fixture.access_args();
         all.extend(["--ip", "all", "--forward"].map(String::from));
         all.push(format!("{port}={service}"));
         probe_inside(&all, &[("pid", "")])[0].assert_ok();
     }
+}
+
+/// The egress port held by another socket, at the broker's own listener address or at another
+/// address of this Mac, makes run fail before the program starts, and check fails the same way,
+/// with status 125 and nothing reported as unavailable, as for a forwarded port. Control: once
+/// the port is free, check passes and the program runs.
+#[test]
+fn a_listener_on_the_egress_port_fails_check_and_run() {
+    let Some(others) = other_addresses() else {
+        return skip_without_addresses();
+    };
+    let fixture = Fixture::new("private-egress-held");
+    for address in ["127.0.0.1:0".parse().unwrap(), others[0]] {
+        let listener = TcpListener::bind(address).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let args = private_egress(&fixture, port, "public");
+        let output = sandy(run_args(&args, &[("pid", "")]));
+        assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+        assert!(output.stdout.is_empty(), "the program ran: {output:?}");
+        assert_fails_check_without_a_shortfall(&args, &port.to_string());
+
+        drop(listener);
+        let mut check = vec!["check".to_string()];
+        check.extend(args.iter().cloned());
+        let output = sandy(&check);
+        assert!(output.status.success(), "{address}: {output:?}");
+        probe_inside(&args, &[("pid", "")])[0].assert_ok();
+    }
+}
+
+/// `check` with `args` fails with status 125 and names `reason`, and its plan reports nothing
+/// as unavailable: what made it fail can pass, so no fallback level may run for it.
+fn assert_fails_check_without_a_shortfall(args: &[String], reason: &str) {
+    let mut check = vec!["check".to_string()];
+    check.extend(args.iter().cloned());
+    let output = sandy(&check);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(EXIT_FAILURE),
+        "{stdout}\n{stderr}"
+    );
+    assert!(!stdout.contains("UNAVAILABLE"), "{stdout}");
+    assert!(stderr.contains("run would fail now"), "{stderr}");
+    assert!(stderr.contains(reason), "{stderr}");
 }
 
 /// With `signals = "any"` the program could end its relay or broker and leave the port to

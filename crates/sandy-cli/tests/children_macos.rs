@@ -311,6 +311,66 @@ fn the_program_inherits_only_the_standard_descriptors() {
     with_descriptor(sandy_path(), run_args(&contained(&fixture), &actions)).assert_blocked();
 }
 
+/// The supervising sandy closes what it inherited beyond 0, 1 and 2 and keeps only its own
+/// descriptors, such as the status record's. A listening socket that the caller let it inherit
+/// would otherwise stay bound for as long as the program runs, although neither the program nor
+/// the helpers get it (`the_program_inherits_only_the_standard_descriptors`). Control: the port
+/// answers while the caller still holds its own copy, and the record arrives in full.
+#[test]
+fn sandy_keeps_no_inherited_descriptor_while_the_program_runs() {
+    use std::os::fd::AsRawFd;
+    const INHERITED: libc::c_int = 47;
+    const STATUS: libc::c_int = 48;
+
+    let fixture = Fixture::new("contained-closed");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (status_read, status_write) = std::io::pipe().unwrap();
+    let (socket, record) = (listener.as_raw_fd(), status_write.as_raw_fd());
+    let mut args = run_args(&contained(&fixture), &[("read-line", "-"), ("exit", "7")]);
+    args.splice(1..1, ["--status-fd".to_string(), STATUS.to_string()]);
+    let mut command = Command::new(sandy_path());
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null());
+    // SAFETY: dup2 is async-signal-safe; it gives the child both descriptors without
+    // close-on-exec.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(socket, INHERITED) < 0 || libc::dup2(record, STATUS) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut sandy = command.spawn().unwrap();
+    drop(status_write);
+    let mut status = BufReader::new(status_read);
+    let mut started = String::new();
+    status.read_line(&mut started).unwrap();
+    assert!(started.starts_with("pid "), "{started:?}");
+
+    assert!(
+        std::net::TcpStream::connect(address).is_ok(),
+        "control: the caller's listener does not answer"
+    );
+    drop(listener);
+    let refused = std::net::TcpStream::connect(address)
+        .map(drop)
+        .map_err(|error| error.kind());
+    writeln!(sandy.stdin.take().unwrap(), "end").unwrap();
+    assert_eq!(sandy.wait().unwrap().code(), Some(7));
+    let mut rest = String::new();
+    status.read_to_string(&mut rest).unwrap();
+    assert_eq!(
+        refused,
+        Err(std::io::ErrorKind::ConnectionRefused),
+        "sandy kept the listener it inherited while the program ran"
+    );
+    assert_eq!(rest, "exited 7\n");
+}
+
 #[test]
 fn the_program_reads_the_terminal() {
     let fixture = Fixture::new("contained-terminal");

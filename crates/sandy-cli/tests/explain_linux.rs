@@ -328,6 +328,56 @@ fn the_mode_leaves_the_program_no_descriptor() {
     assert_eq!(descriptors(&plain), descriptors(&explained));
 }
 
+/// sandy stays the program's parent in the mode, as with `contained`, and must not keep what its
+/// caller left open while the program runs: a socket the caller leaked into sandy would keep its
+/// port busy. The control is the poll itself: the program still runs when the descriptor closes.
+#[test]
+fn sandy_closes_what_it_inherited_while_the_program_runs() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    const INHERITED: libc::c_int = 47;
+    let fixture = Fixture::new("explain-closes");
+    let mut sandbox_args = fixture.access_args();
+    sandbox_args.push("--explain".to_string());
+    let (read, write) = std::io::pipe().unwrap();
+    let write_fd = write.as_raw_fd();
+    let mut command = Command::new(sandy_path());
+    command
+        .args(run_args(&sandbox_args, &[("read-line", "-")]))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: dup2 is async-signal-safe; it makes the write end descriptor `INHERITED` of sandy,
+    // without close-on-exec.
+    unsafe {
+        command.pre_exec(move || match libc::dup2(write_fd, INHERITED) {
+            INHERITED => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        });
+    }
+    let mut sandy = command.spawn().unwrap();
+    drop(write);
+    let mut poll = libc::pollfd {
+        fd: read.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: polls one open descriptor for at most ten seconds.
+    let ready = unsafe { libc::poll(&mut poll, 1, 10_000) };
+    let running = sandy.try_wait().unwrap().is_none();
+    drop(sandy.stdin.take());
+    let status = sandy.wait().unwrap();
+    assert!(
+        ready == 1 && poll.revents & libc::POLLHUP != 0,
+        "sandy kept the descriptor it inherited (poll {ready}, events {:#x})",
+        poll.revents
+    );
+    assert!(running, "sandy ended before the check: {status:?}");
+    assert!(status.success(), "{status:?}");
+}
+
 /// A reader of the report that goes away must not take the watcher with it: the program would
 /// lose its watcher and every watched call would fail with ENOSYS from then on.
 #[test]

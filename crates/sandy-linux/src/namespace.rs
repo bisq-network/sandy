@@ -37,25 +37,26 @@
 //! `Namespaces`. It takes effect for the next process the entering process forks, which becomes
 //! its PID 1, so the init must be forked before the helpers of step 5.
 //!
-//! `plan` reads what the host says about user namespaces without trying one (`support`), `check`
-//! also tries the steps in a forked child (`probe`), and `run` stays the authoritative answer: a
-//! step that fails refuses the run.
+//! `plan` reads what the host says about user namespaces (`support`), and where that rules
+//! nothing out, it tries the steps in a forked child (`probe`), once per backend value
+//! (`host::Detected`). `run` stays the authoritative answer: a step that fails refuses the run.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use sandy_core::{FileView, IpAccess, ResolvedPolicy, SandboxError};
 
-use crate::helper;
-use crate::host::{CapData, CapHeader, LINUX_CAPABILITY_VERSION_3};
+use crate::host::{CapData, CapHeader, LINUX_CAPABILITY_VERSION_3, Missing};
 use crate::launch::ensure_single_thread;
 use crate::view::{self, View};
+use crate::{contain, helper};
 
 /// The namespaces of a run. Each one is opt-in; the user namespace comes with any of them,
 /// because without it an unprivileged process can create none.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Namespaces {
     /// A network namespace with only `lo` (`ip = "private"`).
     pub network: bool,
@@ -210,19 +211,14 @@ pub fn drop_capabilities() -> Result<(), SandboxError> {
     Ok(())
 }
 
-/// Why the namespaces are unusable on this host, as far as the host says without a trial.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Missing {
-    /// Nothing `sandy setup` installs changes it.
-    Unavailable(String),
-    /// An AppArmor profile that `sandy setup` installs lifts it.
-    NeedsSetup(String),
-}
-
-/// `Ok` when nothing the host says rules user namespaces out.
+/// `Ok` when nothing the host says rules user namespaces out, and where it decides, a trial
+/// works.
 pub type Support = Result<(), Missing>;
 
 const MAX_USER_NAMESPACES: &str = "/proc/sys/user/max_user_namespaces";
+const MAX_NET_NAMESPACES: &str = "/proc/sys/user/max_net_namespaces";
+const MAX_MNT_NAMESPACES: &str = "/proc/sys/user/max_mnt_namespaces";
+const MAX_PID_NAMESPACES: &str = "/proc/sys/user/max_pid_namespaces";
 const UNPRIVILEGED_USERNS_CLONE: &str = "/proc/sys/kernel/unprivileged_userns_clone";
 pub(crate) const APPARMOR_RESTRICTION: &str =
     "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
@@ -297,29 +293,62 @@ impl Purpose {
 /// example inside a container whose seccomp profile denies `unshare`, or under an AppArmor profile
 /// without `userns`; `probe` and the run find those.
 pub fn support(purpose: &Purpose) -> Support {
-    let read = |path: &str| {
-        std::fs::read_to_string(path)
-            .ok()
-            .map(|value| value.trim().to_string())
-    };
-    judge(
-        &HostFacts {
-            max_user_namespaces: read(MAX_USER_NAMESPACES),
-            unprivileged_userns_clone: read(UNPRIVILEGED_USERNS_CLONE),
-            apparmor_restriction: read(APPARMOR_RESTRICTION),
-            label: read(APPARMOR_LABEL),
-        },
-        *purpose,
-    )
+    judge(&HostFacts::read(), *purpose)
 }
 
-/// The values `support` reads, `None` for a file that is missing or unreadable.
-#[derive(Debug, Default)]
-struct HostFacts {
+/// The values `support` reads, `None` for a file that is missing or unreadable, and the limits
+/// of the other kinds of namespaces, which decide what a full count means (`zero_limit`).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct HostFacts {
     max_user_namespaces: Option<String>,
     unprivileged_userns_clone: Option<String>,
     apparmor_restriction: Option<String>,
     label: Option<String>,
+    max_net_namespaces: Option<String>,
+    max_mnt_namespaces: Option<String>,
+    max_pid_namespaces: Option<String>,
+}
+
+impl HostFacts {
+    pub(crate) fn read() -> HostFacts {
+        let read = |path: &str| {
+            std::fs::read_to_string(path)
+                .ok()
+                .map(|value| value.trim().to_string())
+        };
+        HostFacts {
+            max_user_namespaces: read(MAX_USER_NAMESPACES),
+            unprivileged_userns_clone: read(UNPRIVILEGED_USERNS_CLONE),
+            apparmor_restriction: read(APPARMOR_RESTRICTION),
+            label: read(APPARMOR_LABEL),
+            max_net_namespaces: read(MAX_NET_NAMESPACES),
+            max_mnt_namespaces: read(MAX_MNT_NAMESPACES),
+            max_pid_namespaces: read(MAX_PID_NAMESPACES),
+        }
+    }
+
+    /// What Ubuntu 25.10 says to a portable sandy: the AppArmor restriction applies to it.
+    #[cfg(test)]
+    pub(crate) fn under_apparmor_restriction() -> HostFacts {
+        HostFacts {
+            max_user_namespaces: Some("15275".to_string()),
+            unprivileged_userns_clone: Some("1".to_string()),
+            apparmor_restriction: Some("1".to_string()),
+            label: Some("unconfined".to_string()),
+            ..HostFacts::default()
+        }
+    }
+
+    /// Whether the `user.max_*_namespaces` limit of a kind that `namespaces` creates is 0: then
+    /// `unshare` fails with ENOSPC for good, where with any other limit ENOSPC only says that
+    /// this user's namespaces fill it now.
+    pub(crate) fn zero_limit(&self, namespaces: Namespaces) -> bool {
+        let zero = |limit: &Option<String>| limit.as_deref() == Some("0");
+        zero(&self.max_user_namespaces)
+            || (namespaces.network && zero(&self.max_net_namespaces))
+            || (namespaces.mount && zero(&self.max_mnt_namespaces))
+            || (namespaces.pid && zero(&self.max_pid_namespaces))
+    }
 }
 
 /// The reason `plan` gives on Ubuntu 23.10 and newer, where the AppArmor restriction applies to
@@ -334,7 +363,8 @@ pub fn apparmor_reason(purpose: Purpose) -> String {
     )
 }
 
-fn judge(facts: &HostFacts, purpose: Purpose) -> Support {
+/// What `facts` say against user namespaces for `purpose` (`support`).
+pub(crate) fn judge(facts: &HostFacts, purpose: Purpose) -> Support {
     let disabled = |sysctl: &str| {
         Missing::Unavailable(format!(
             "user namespaces are disabled on this host ({sysctl} = 0), and {}",
@@ -357,25 +387,111 @@ fn judge(facts: &HostFacts, purpose: Purpose) -> Support {
     Ok(())
 }
 
+/// How a trial of the namespaces (`probe`) failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrialFailure {
+    /// A step failed in the probe, with the error number the kernel gave for it, if any.
+    Step { message: String, errno: Option<i32> },
+    /// A signal ended the probe before it reported.
+    Signaled(i32),
+    /// The probe could not run or report: its pipe, its fork, the read of its report, or a probe
+    /// that ended without one.
+    Probe(String),
+}
+
+impl fmt::Display for TrialFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TrialFailure::Step { message, .. } | TrialFailure::Probe(message) => {
+                f.write_str(message)
+            }
+            TrialFailure::Signaled(signal) => {
+                write!(f, "signal {signal} ended the namespace probe")
+            }
+        }
+    }
+}
+
+/// The errors with which the kernel, or a sandbox around sandy, refuses a step for good: no
+/// right to the namespace (EPERM, EACCES), no such call (ENOSYS), a flag or a kind of namespace
+/// the kernel does not know (EINVAL), and user namespaces nested too deep (EUSERS).
+const REFUSALS: [i32; 5] = [
+    libc::EPERM,
+    libc::EACCES,
+    libc::ENOSYS,
+    libc::EINVAL,
+    libc::EUSERS,
+];
+
+impl TrialFailure {
+    /// Whether the failure shows a lasting shortfall of the host: a refusal (`REFUSALS`), ENOSPC
+    /// where a limit of the namespaces tried is 0 (`HostFacts::zero_limit`), and SIGSYS, with
+    /// which a sandbox around sandy ends a process that makes a call it does not allow.
+    /// Everything else can pass, and others than an administrator can cause it: EAGAIN and
+    /// ENOMEM when the user's processes or the memory run out, ENOSPC when this user's own
+    /// namespaces fill a limit, EMFILE, a signal from another process of the user, a probe that
+    /// could not fork or report.
+    pub fn is_lasting(&self, zero_limit: bool) -> bool {
+        match self {
+            TrialFailure::Step {
+                errno: Some(errno), ..
+            } => REFUSALS.contains(errno) || (*errno == libc::ENOSPC && zero_limit),
+            TrialFailure::Signaled(signal) => *signal == libc::SIGSYS,
+            TrialFailure::Step { errno: None, .. } | TrialFailure::Probe(_) => false,
+        }
+    }
+
+    /// The failure of the trial `what` as the reason a requirement is missing: unavailable when
+    /// it is lasting (`is_lasting`), else indeterminate, which never makes sandy try a weaker
+    /// fallback level.
+    pub fn missing(&self, what: &str, zero_limit: bool) -> Missing {
+        let reason = format!("{what} failed: {self}");
+        match self.is_lasting(zero_limit) {
+            true => Missing::Unavailable(reason),
+            false => Missing::Indeterminate(reason),
+        }
+    }
+}
+
 /// Tries the steps of `enter` and `drop_capabilities` for `namespaces` in a forked child and
 /// returns the first that fails. With a PID namespace it forks a process into it, which becomes
 /// its PID 1, as the init of `contain` does. With a mount namespace it also builds a file system
 /// view, one that holds only `/dev`, and makes it the root, so every kind of mount call the run
 /// makes is tried. The namespaces end with the child, so the host keeps nothing of it; on Ubuntu the
-/// kernel log keeps the AppArmor audit lines of the `unshare`. For `check` (`Backend::verify`).
-pub fn probe(namespaces: Namespaces) -> Result<(), String> {
-    let (mut report, report_write) =
-        helper::pipe("the namespace probe's pipe").map_err(|error| error.to_string())?;
+/// kernel log keeps the AppArmor audit lines of the `unshare`. For `host::Detected`, which tries
+/// each set of namespaces once per backend value.
+pub fn probe(namespaces: Namespaces) -> Result<(), TrialFailure> {
+    let failed = |error: SandboxError| TrialFailure::Probe(error.to_string());
+    // A SIGCHLD that sandy's caller ignores would reap the child unseen, and the wait would not
+    // say how it ended.
+    let child_action = contain::default_child_action().map_err(failed)?;
+    let tried = probe_in_child(namespaces);
+    // SAFETY: restores the action that `default_child_action` returned.
+    if unsafe { libc::sigaction(libc::SIGCHLD, &child_action, std::ptr::null_mut()) } != 0 {
+        return Err(failed(SandboxError::io(
+            "cannot restore SIGCHLD",
+            io::Error::last_os_error(),
+        )));
+    }
+    tried
+}
+
+/// The size of the error number at the start of a report of `probe_in_child`.
+const ERRNO: usize = std::mem::size_of::<i32>();
+
+fn probe_in_child(namespaces: Namespaces) -> Result<(), TrialFailure> {
+    let (mut report, report_write) = helper::pipe("the namespace probe's pipe")
+        .map_err(|error| TrialFailure::Probe(error.to_string()))?;
     // SAFETY: the child has one thread, which `enter` checks, and the allocator stays usable after
     // fork in glibc and musl. It leaves only through `_exit`, never by returning into sandy's
     // code.
     let child = unsafe { libc::fork() };
     match child {
         -1 => {
-            return Err(format!(
+            return Err(TrialFailure::Probe(format!(
                 "cannot fork the namespace probe: {}",
                 io::Error::last_os_error()
-            ));
+            )));
         }
         0 => {
             drop(report);
@@ -391,39 +507,70 @@ pub fn probe(namespaces: Namespaces) -> Result<(), String> {
                         false => Ok(()),
                     })
                     .and_then(|()| drop_capabilities())
-                    .map_err(|error| error.to_string())
             });
+            // The error number first, 0 for none, then the message.
             let message = match tried {
-                Ok(Ok(())) => String::new(),
-                Ok(Err(message)) => message,
-                Err(_) => "the namespace probe panicked".to_string(),
+                Ok(Ok(())) => Vec::new(),
+                Ok(Err(error)) => [
+                    &errno(&error).unwrap_or(0).to_ne_bytes()[..],
+                    error.to_string().as_bytes(),
+                ]
+                .concat(),
+                Err(_) => [&0i32.to_ne_bytes()[..], b"the namespace probe panicked"].concat(),
             };
             let mut report = report_write;
-            let _ = report.write_all(message.as_bytes());
+            let _ = report.write_all(&message);
             // SAFETY: ends the child without running sandy's cleanup.
             unsafe { libc::_exit(i32::from(!message.is_empty())) }
         }
         _ => {}
     }
     drop(report_write);
-    let mut message = String::new();
-    let read = report.read_to_string(&mut message);
+    let mut message = Vec::new();
+    let read = report.read_to_end(&mut message);
     let mut status = 0;
     // SAFETY: waits for the child forked above.
-    unsafe { libc::waitpid(child, &mut status, 0) };
+    while unsafe { libc::waitpid(child, &mut status, 0) } < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(TrialFailure::Probe(format!(
+                "cannot wait for the namespace probe: {error}"
+            )));
+        }
+    }
     if let Err(error) = read {
-        return Err(format!("cannot read the namespace probe's report: {error}"));
+        return Err(TrialFailure::Probe(format!(
+            "cannot read the namespace probe's report: {error}"
+        )));
     }
-    match (
-        message.is_empty(),
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-    ) {
-        (true, true) => Ok(()),
-        (false, _) => Err(message),
-        (true, false) => Err(format!(
+    report_of(&message, status)
+}
+
+/// What the probe's report `message` and its wait `status` say.
+fn report_of(message: &[u8], status: libc::c_int) -> Result<(), TrialFailure> {
+    if let Some((errno, text)) = message.split_first_chunk::<ERRNO>() {
+        let errno = i32::from_ne_bytes(*errno);
+        return Err(TrialFailure::Step {
+            message: String::from_utf8_lossy(text).into_owned(),
+            errno: (errno != 0).then_some(errno),
+        });
+    }
+    if libc::WIFSIGNALED(status) {
+        return Err(TrialFailure::Signaled(libc::WTERMSIG(status)));
+    }
+    if !message.is_empty() || !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+        return Err(TrialFailure::Probe(format!(
             "the namespace probe ended without a report (wait status {status})"
-        )),
+        )));
     }
+    Ok(())
+}
+
+/// The error number behind `error`, if the kernel gave one.
+fn errno(error: &SandboxError) -> Option<i32> {
+    std::error::Error::source(error)?
+        .downcast_ref::<io::Error>()?
+        .raw_os_error()
 }
 
 /// Forks a process into the new PID namespace, which becomes its PID 1 and ends at once, and
@@ -461,6 +608,7 @@ mod tests {
             unprivileged_userns_clone: clone.map(String::from),
             apparmor_restriction: restriction.map(String::from),
             label: label.map(String::from),
+            ..HostFacts::default()
         }
     }
 
@@ -537,6 +685,163 @@ mod tests {
         );
     }
 
+    /// A refusal of the kernel, a zero limit and SIGSYS are lasting; what a full process table,
+    /// memory, descriptor table or the user's own namespaces cause, a signal from another
+    /// process, and a probe that cannot run or report can pass.
+    #[test]
+    fn trial_failures_are_lasting_only_for_a_refusal() {
+        let step = |errno| TrialFailure::Step {
+            message: "cannot create the sandbox's user namespace".to_string(),
+            errno,
+        };
+        for errno in [
+            libc::EPERM,
+            libc::EACCES,
+            libc::ENOSYS,
+            libc::EINVAL,
+            libc::EUSERS,
+        ] {
+            assert!(step(Some(errno)).is_lasting(false), "{errno}");
+        }
+        for errno in [
+            libc::EAGAIN,
+            libc::ENOMEM,
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOENT,
+            libc::EINTR,
+            libc::EIO,
+        ] {
+            assert!(!step(Some(errno)).is_lasting(false), "{errno}");
+            assert!(!step(Some(errno)).is_lasting(true), "{errno}");
+        }
+        assert!(!step(Some(libc::ENOSPC)).is_lasting(false));
+        assert!(step(Some(libc::ENOSPC)).is_lasting(true));
+        assert!(!step(None).is_lasting(false));
+        assert!(TrialFailure::Signaled(libc::SIGSYS).is_lasting(false));
+        for signal in [libc::SIGKILL, libc::SIGTERM, libc::SIGSEGV] {
+            assert!(
+                !TrialFailure::Signaled(signal).is_lasting(false),
+                "{signal}"
+            );
+        }
+        let probe = TrialFailure::Probe("cannot fork the namespace probe: EAGAIN".to_string());
+        assert!(!probe.is_lasting(true));
+
+        assert_eq!(
+            step(Some(libc::EPERM)).missing("a trial", false),
+            Missing::Unavailable(
+                "a trial failed: cannot create the sandbox's user namespace".to_string()
+            )
+        );
+        assert_eq!(
+            step(Some(libc::EAGAIN)).missing("a trial", false),
+            Missing::Indeterminate(
+                "a trial failed: cannot create the sandbox's user namespace".to_string()
+            )
+        );
+    }
+
+    /// The child reports the error number and the message of the step that failed; without a
+    /// report, the wait status says what happened.
+    #[test]
+    fn the_report_carries_the_error_number() {
+        let exited = |code: libc::c_int| code << 8;
+        let report = [&libc::EAGAIN.to_ne_bytes()[..], b"cannot fork"].concat();
+        assert_eq!(
+            report_of(&report, exited(1)),
+            Err(TrialFailure::Step {
+                message: "cannot fork".to_string(),
+                errno: Some(libc::EAGAIN),
+            })
+        );
+        let report = [&0i32.to_ne_bytes()[..], b"the namespace probe panicked"].concat();
+        assert!(matches!(
+            report_of(&report, exited(1)),
+            Err(TrialFailure::Step { errno: None, .. })
+        ));
+        assert_eq!(report_of(&[], exited(0)), Ok(()));
+        assert_eq!(
+            report_of(&[], libc::SIGSYS),
+            Err(TrialFailure::Signaled(libc::SIGSYS))
+        );
+        for (message, status) in [(&[][..], exited(1)), (&[1u8, 2][..], exited(1))] {
+            assert!(
+                matches!(report_of(message, status), Err(TrialFailure::Probe(_))),
+                "{message:?} {status}"
+            );
+        }
+    }
+
+    /// A limit of 0 of a kind the trial creates makes ENOSPC lasting; a limit of 0 of another
+    /// kind does not.
+    #[test]
+    fn only_a_zero_limit_of_the_kinds_tried_counts() {
+        let pid = Namespaces {
+            network: false,
+            mount: false,
+            pid: true,
+        };
+        let network = Namespaces {
+            network: true,
+            mount: false,
+            pid: false,
+        };
+        let limits = |user: &str, pid: &str| HostFacts {
+            max_user_namespaces: Some(user.to_string()),
+            max_pid_namespaces: Some(pid.to_string()),
+            ..HostFacts::default()
+        };
+        assert!(!limits("100", "100").zero_limit(pid));
+        assert!(limits("100", "0").zero_limit(pid));
+        assert!(!limits("100", "0").zero_limit(network));
+        assert!(limits("0", "100").zero_limit(network));
+        assert!(!HostFacts::default().zero_limit(network));
+    }
+
+    /// A probe that cannot fork because the user's processes are at their limit says nothing
+    /// about the host: the failure can pass.
+    #[test]
+    fn a_probe_that_cannot_fork_can_pass() {
+        if !crate::alone::in_own_process() {
+            return;
+        }
+        // SAFETY: the child only runs the checks below and leaves through `_exit`.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            let none = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: setrlimit reads the limit above; only this child's limit changes.
+            let outcome = if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &none) } != 0 {
+                1
+            } else {
+                let pid = Namespaces {
+                    network: false,
+                    mount: false,
+                    pid: true,
+                };
+                match probe(pid) {
+                    Err(failure @ TrialFailure::Probe(_)) if !failure.is_lasting(true) => 0,
+                    _ => 2,
+                }
+            };
+            // SAFETY: ends the child without running the test harness's cleanup.
+            unsafe { libc::_exit(outcome) };
+        }
+        let mut status = 0;
+        // SAFETY: waits for the child created above.
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status), "wait status {status}");
+        // SAFETY: getuid has no preconditions.
+        if unsafe { libc::getuid() } == 0 {
+            eprintln!("skipped: root has no process limit");
+            return;
+        }
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
     /// The probe tries the real steps, with a mount namespace also those of the file system
     /// view. On a host whose plan sees no obstacle they work, and on one with the AppArmor
     /// restriction they fail at the first map write.
@@ -570,11 +875,15 @@ mod tests {
                     eprintln!("skipped: the probe failed where the host allows it: {tried:?}");
                 }
                 Ok(()) => {}
+                // The restriction refuses the step for good, with an error number that says so.
                 Err(Missing::NeedsSetup(_)) => {
-                    let error = tried.unwrap_err();
+                    let failure = tried.unwrap_err();
+                    assert!(failure.is_lasting(false), "{failure:?}");
+                    let error = failure.to_string();
                     assert!(error.contains("/proc/self/setgroups"), "{error}");
                 }
                 Err(Missing::Unavailable(_)) => assert!(tried.is_err()),
+                Err(Missing::Indeterminate(reason)) => panic!("support tries nothing: {reason}"),
             }
         }
     }
@@ -620,7 +929,7 @@ mod tests {
                     return 2;
                 }
                 match probe(view) {
-                    Err(error) if error.contains("make / private") => 0,
+                    Err(error) if error.to_string().contains("make / private") => 0,
                     _ => 3,
                 }
             })();

@@ -338,6 +338,57 @@ fn sandy_does_not_wait_for_children_it_inherited() {
     );
 }
 
+/// The waiting sandy closes the descriptors its caller left open once it has started the
+/// program, which gets none of them: the read end of a pipe whose write end only sandy inherited
+/// reaches its end while the program still runs. Otherwise a socket that a caller leaked into
+/// sandy would keep its port busy for the whole run.
+#[test]
+fn sandy_closes_what_it_inherited_while_the_program_runs() {
+    use std::os::fd::AsRawFd;
+    const INHERITED: libc::c_int = 47;
+    let fixture = Fixture::new("contained-closes");
+    if !supported(&fixture) {
+        return;
+    }
+    let (read, write) = std::io::pipe().unwrap();
+    let write_fd = write.as_raw_fd();
+    let mut command = Command::new(sandy_path());
+    command
+        .args(run_args(&contained(&fixture), &[("read-line", "-")]))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: dup2 is async-signal-safe; it makes the write end descriptor `INHERITED` of
+    // sandy, without close-on-exec.
+    unsafe {
+        command.pre_exec(move || match libc::dup2(write_fd, INHERITED) {
+            INHERITED => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        });
+    }
+    let mut sandy = command.spawn().unwrap();
+    drop(write);
+    wait_for_child(sandy.id(), "sandy-probe");
+    let mut poll = libc::pollfd {
+        fd: read.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: polls one open descriptor for at most the timeout.
+    let ready = unsafe { libc::poll(&mut poll, 1, TIMEOUT.as_millis() as libc::c_int) };
+    let running = sandy.try_wait().unwrap().is_none();
+    drop(sandy.stdin.take());
+    let ended = exits_soon(&mut sandy);
+    kill_and_reap(&mut sandy);
+    assert!(
+        ready == 1 && poll.revents & libc::POLLHUP != 0,
+        "sandy kept the descriptor it inherited (poll {ready}, events {:#x})",
+        poll.revents
+    );
+    assert!(running, "the program ended before the check");
+    assert!(ended, "sandy did not end with the program");
+}
+
 /// When sandy's caller made it a child subreaper (the flag survives execve), the relay becomes
 /// sandy's child. The relay ends after sandy; sandy must not wait for it.
 #[test]

@@ -1,6 +1,7 @@
 //! The enforcement plan: how this backend enforces each requirement of a policy on a given host.
-//! `plan_for` is pure; `sys` detects the host capabilities.
+//! `plan_for` is pure: it asks a `Host`, which `detect` answers from the probes of `sys`.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use sandy_core::{
@@ -10,38 +11,187 @@ use sandy_core::{
 use crate::name::{EGRESS_BROKER_SUFFIX, validate_appcontainer_name};
 use crate::version::{WindowsVersion, below_minimum, firewall_bypass};
 
-/// What the host offers. Each field is `Err(reason)` when it could not be determined or the
-/// mechanism is missing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostCapabilities {
-    /// The AppContainer API works on this host.
-    pub appcontainer: Result<(), String>,
+/// What the host offers for one policy, as `plan_for` asks for it. Each answer is `Err` with the
+/// class and the reason of the problem when the mechanism is missing or sandy cannot tell.
+/// `plan_for` asks only what the policy needs, so a host that probes on demand
+/// (`detect::Detection`) runs no probe that the policy does not need.
+pub trait Host {
+    /// Windows derives the SID of the policy's AppContainer name.
+    fn appcontainer(&self) -> Result<(), Problem>;
     /// Build and update revision of Windows.
-    pub windows: Result<WindowsVersion, String>,
-    /// `DeriveCapabilitySidsFromName` exists. sandy resolves it at run time, so `sandy.exe`
-    /// still starts and can explain the problem on builds that lack it.
-    pub capability_sids: Result<(), String>,
-    /// No writable path overlaps a system directory, and Windows does not let every
-    /// AppContainer execute files in one (rules 3 and 6).
-    pub writable_paths: Result<(), String>,
-    /// sandy can give the AppContainer access to every policy path: the entry is in place, or
-    /// the current user may change the path's access control list.
-    pub grants: Result<(), String>,
+    fn windows(&self) -> Result<WindowsVersion, Problem>;
+    /// `DeriveCapabilitySidsFromName` exists.
+    fn capability_sids(&self) -> Result<(), Problem>;
+    /// No writable path reaches a system directory or a trusted location, or a place where
+    /// AppContainers may execute files (rules 3 and 6).
+    fn writable_paths(&self) -> Result<(), Problem>;
+    /// sandy can give the AppContainer access to every policy path.
+    fn grants(&self) -> Result<(), Problem>;
     /// The UI restrictions of the job sandy runs in, or `None` outside a job.
-    pub outer_job_ui: Result<Option<u32>, String>,
-    /// The Windows Firewall service runs. It installs the filters that isolate AppContainers
-    /// from the network.
-    pub firewall: Result<(), String>,
+    fn outer_job_ui(&self) -> Result<Option<u32>, Problem>;
+    /// The Windows Firewall service runs.
+    fn firewall(&self) -> Result<(), Problem>;
     /// Whether the AppContainer of the policy is exempt from loopback isolation.
-    pub loopback_exempt: Result<bool, String>,
+    fn loopback_exempt(&self) -> Result<bool, Problem>;
     /// Whether the egress broker's AppContainer is exempt from loopback isolation; `Ok(false)`
     /// without `network.egress`.
-    pub broker_loopback_exempt: Result<bool, String>,
-    /// sandy's own executable, which runs the relays of exposed and forwarded ports and the egress
-    /// broker, if sandy can allow the AppContainer, and with egress the broker's, to run it.
-    pub relay_program: Result<PathBuf, String>,
+    fn broker_loopback_exempt(&self) -> Result<bool, Problem>;
+    /// sandy's own executable, which runs the relays and the egress broker.
+    fn relay_program(&self) -> Result<PathBuf, Problem>;
+    /// sandy can allow the AppContainer, and with egress the broker's, to run `relay_program`.
+    fn relay_grants(&self) -> Result<(), Problem>;
     /// AF_UNIX sockets work and the socket paths of forwarded ports fit into `sun_path`.
-    pub forward_sockets: Result<(), String>,
+    fn forward_sockets(&self) -> Result<(), Problem>;
+}
+
+/// The answers of a host as values, the field of each as `Host` describes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostCapabilities {
+    /// Windows derives the SID of the policy's AppContainer name.
+    pub appcontainer: Result<(), Problem>,
+    /// Build and update revision of Windows.
+    pub windows: Result<WindowsVersion, Problem>,
+    /// `DeriveCapabilitySidsFromName` exists. sandy resolves it at run time, so `sandy.exe`
+    /// still starts and can explain the problem on builds that lack it.
+    pub capability_sids: Result<(), Problem>,
+    /// No writable path overlaps a system directory or a trusted location, and Windows does not
+    /// let every AppContainer execute files in one (rules 3 and 6).
+    pub writable_paths: Result<(), Problem>,
+    /// sandy can give the AppContainer access to every policy path: the entry is in place, or
+    /// the current user may change the path's access control list.
+    pub grants: Result<(), Problem>,
+    /// The UI restrictions of the job sandy runs in, or `None` outside a job.
+    pub outer_job_ui: Result<Option<u32>, Problem>,
+    /// The Windows Firewall service runs. It installs the filters that isolate AppContainers
+    /// from the network.
+    pub firewall: Result<(), Problem>,
+    /// Whether the AppContainer of the policy is exempt from loopback isolation.
+    pub loopback_exempt: Result<bool, Problem>,
+    /// Whether the egress broker's AppContainer is exempt from loopback isolation; `Ok(false)`
+    /// without `network.egress`.
+    pub broker_loopback_exempt: Result<bool, Problem>,
+    /// sandy's own executable, which runs the relays of exposed and forwarded ports and the egress
+    /// broker.
+    pub relay_program: Result<PathBuf, Problem>,
+    /// sandy can allow the AppContainer, and with egress the broker's, to run `relay_program`.
+    pub relay_grants: Result<(), Problem>,
+    /// AF_UNIX sockets work and the socket paths of forwarded ports fit into `sun_path`.
+    pub forward_sockets: Result<(), Problem>,
+}
+
+impl Host for HostCapabilities {
+    fn appcontainer(&self) -> Result<(), Problem> {
+        self.appcontainer.clone()
+    }
+    fn windows(&self) -> Result<WindowsVersion, Problem> {
+        self.windows.clone()
+    }
+    fn capability_sids(&self) -> Result<(), Problem> {
+        self.capability_sids.clone()
+    }
+    fn writable_paths(&self) -> Result<(), Problem> {
+        self.writable_paths.clone()
+    }
+    fn grants(&self) -> Result<(), Problem> {
+        self.grants.clone()
+    }
+    fn outer_job_ui(&self) -> Result<Option<u32>, Problem> {
+        self.outer_job_ui.clone()
+    }
+    fn firewall(&self) -> Result<(), Problem> {
+        self.firewall.clone()
+    }
+    fn loopback_exempt(&self) -> Result<bool, Problem> {
+        self.loopback_exempt.clone()
+    }
+    fn broker_loopback_exempt(&self) -> Result<bool, Problem> {
+        self.broker_loopback_exempt.clone()
+    }
+    fn relay_program(&self) -> Result<PathBuf, Problem> {
+        self.relay_program.clone()
+    }
+    fn relay_grants(&self) -> Result<(), Problem> {
+        self.relay_grants.clone()
+    }
+    fn forward_sockets(&self) -> Result<(), Problem> {
+        self.forward_sockets.clone()
+    }
+}
+
+/// Why a requirement is not enforced, in the class that decides what sandy does next
+/// (`sandy_core::Status`): a lasting shortfall of the host and missing setup let sandy try the
+/// next fallback level of the policy, an indeterminate answer and a conflict end the selection
+/// with status 125.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Problem {
+    /// A lasting shortfall of the host, which no other local user, no remote party and no earlier
+    /// run of the program can cause (`Status::Unavailable`).
+    Unavailable(String),
+    /// `sandy setup`, run once as administrator, fixes it (`Status::NeedsSetup`).
+    NeedsSetup(String),
+    /// A probe failed for a reason that can pass (`Status::Indeterminate`).
+    Indeterminate(String),
+    /// The policy contradicts itself or the host's fixed layout (`Status::Conflict`).
+    Conflict(String),
+}
+
+impl Problem {
+    pub fn reason(&self) -> &str {
+        match self {
+            Problem::Unavailable(reason)
+            | Problem::NeedsSetup(reason)
+            | Problem::Indeterminate(reason)
+            | Problem::Conflict(reason) => reason,
+        }
+    }
+
+    /// The same class with the reason that `reword` makes of this one.
+    pub fn map(self, reword: impl FnOnce(String) -> String) -> Problem {
+        match self {
+            Problem::Unavailable(reason) => Problem::Unavailable(reword(reason)),
+            Problem::NeedsSetup(reason) => Problem::NeedsSetup(reword(reason)),
+            Problem::Indeterminate(reason) => Problem::Indeterminate(reword(reason)),
+            Problem::Conflict(reason) => Problem::Conflict(reword(reason)),
+        }
+    }
+
+    pub fn item(self, requirement: Requirement) -> PlanItem {
+        match self {
+            Problem::Unavailable(reason) => PlanItem::unavailable(requirement, reason),
+            Problem::NeedsSetup(reason) => PlanItem::needs_setup(requirement, reason),
+            Problem::Indeterminate(reason) => PlanItem::indeterminate(requirement, reason),
+            Problem::Conflict(reason) => PlanItem::conflict(requirement, reason),
+        }
+    }
+
+    /// The order of `EnforcementPlan`: a higher rank wins.
+    fn rank(&self) -> u8 {
+        match self {
+            Problem::NeedsSetup(_) => 0,
+            Problem::Unavailable(_) => 1,
+            Problem::Indeterminate(_) => 2,
+            Problem::Conflict(_) => 3,
+        }
+    }
+}
+
+impl fmt::Display for Problem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+/// The worst of `problems`, the first among equals, as `EnforcementPlan` ranks the reports of
+/// one requirement, so that a problem which ends the selection of a level is never hidden behind
+/// one that lets sandy try the next level.
+pub fn worst(problems: impl IntoIterator<Item = Problem>) -> Option<Problem> {
+    problems.into_iter().reduce(|worst, problem| {
+        if problem.rank() > worst.rank() {
+            problem
+        } else {
+            worst
+        }
+    })
 }
 
 const SYSTEM_NONE: &str = "Windows grants every AppContainer read and execute access to the \
@@ -55,8 +205,8 @@ const PATHS_HIDDEN: &str = "Windows cannot hide paths from an AppContainer witho
      change what a process sees of the file system (bind links, silos) need administrator rights \
      and act on the whole machine or a container (docs/windows.md, \"What the program can see\")";
 
-/// Reports every requirement of `policy` as enforced or unavailable on `host`.
-pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<PlanItem> {
+/// Reports every requirement of `policy` as enforced on `host`, or why not.
+pub fn plan_for(policy: &ResolvedPolicy, host: &dyn Host) -> Vec<PlanItem> {
     let container = appcontainer(policy, host);
     policy
         .requirements()
@@ -73,29 +223,29 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<PlanIte
                  LOCALAPPDATA",
             ),
             (Requirement::PathsHidden, _) => PlanItem::unavailable(requirement, PATHS_HIDDEN),
-            (_, Err(reason)) => PlanItem::unavailable(requirement, reason.clone()),
+            (_, Err(problem)) => problem.clone().item(requirement),
             (_, Ok(name)) => contained(requirement, policy, host, name),
         })
         .collect()
 }
 
-/// The validated AppContainer name, or why there is no usable AppContainer.
-fn appcontainer(policy: &ResolvedPolicy, host: &HostCapabilities) -> Result<String, String> {
+/// The validated AppContainer name, or why there is no usable AppContainer. A missing or invalid
+/// name is the policy's, the same on every host.
+fn appcontainer(policy: &ResolvedPolicy, host: &dyn Host) -> Result<String, Problem> {
     let name = policy.windows.appcontainer_name.as_deref().ok_or_else(|| {
-        "the policy names no AppContainer; set windows.appcontainer_name or pass --appcontainer \
-         NAME"
-            .to_string()
+        Problem::Conflict(
+            "the policy names no AppContainer; set windows.appcontainer_name or pass \
+             --appcontainer NAME"
+                .to_string(),
+        )
     })?;
-    validate_appcontainer_name(name)?;
-    host.appcontainer
-        .clone()
-        .map_err(|reason| format!("AppContainers are not available: {reason}"))?;
-    let version = host
-        .windows
-        .clone()
-        .map_err(|reason| format!("cannot read the Windows version: {reason}"))?;
-    if let Some(reason) = below_minimum(version) {
-        return Err(reason);
+    validate_appcontainer_name(name).map_err(Problem::Conflict)?;
+    host.appcontainer()?;
+    let version = host.windows().map_err(|problem| {
+        problem.map(|reason| format!("cannot read the Windows version: {reason}"))
+    })?;
+    if let Some(reason) = below_minimum(&version) {
+        return Err(Problem::Unavailable(reason));
     }
     Ok(name.to_string())
 }
@@ -105,14 +255,16 @@ fn appcontainer(policy: &ResolvedPolicy, host: &HostCapabilities) -> Result<Stri
 /// restrictions (`ERROR_NOT_SUPPORTED`); an outer job without UI restrictions nests, with or
 /// without breakaway. sandy does not break away from the outer job: that would escape the limits
 /// its owner set.
-fn job_problem(host: &HostCapabilities) -> Option<String> {
-    match &host.outer_job_ui {
-        Err(reason) => Some(format!("cannot read the job sandy runs in: {reason}")),
-        Ok(Some(ui)) if *ui != 0 => Some(format!(
+fn job_problem(host: &dyn Host) -> Option<Problem> {
+    match host.outer_job_ui() {
+        Err(problem) => {
+            Some(problem.map(|reason| format!("cannot read the job sandy runs in: {reason}")))
+        }
+        Ok(Some(ui)) if ui != 0 => Some(Problem::Unavailable(format!(
             "sandy runs inside a job with UI restrictions ({ui:#x}); Windows does not nest \
              sandy's job, which sets UI restrictions too, so the program cannot be put into \
              it; start sandy outside that job"
-        )),
+        ))),
         Ok(_) => None,
     }
 }
@@ -132,14 +284,16 @@ fn needs_job(requirement: Requirement) -> bool {
     )
 }
 
-/// Reports every requirement that sandy's job objects carry as unavailable with `reason`. For
-/// `verify`, which learns in a trial whether the program's job can be nested here.
-pub fn job_unavailable(policy: &ResolvedPolicy, reason: &str) -> Vec<PlanItem> {
+/// Reports every requirement that sandy's job objects carry as indeterminate with `reason`. For
+/// `verify`, which learns in a trial whether the program's job can be nested here; like every
+/// finding of `verify`, it makes `check` fail and never makes sandy try another level. Among
+/// them is `NoPrivilegeEscalation`, which every policy has.
+pub fn job_indeterminate(policy: &ResolvedPolicy, reason: &str) -> Vec<PlanItem> {
     policy
         .requirements()
         .into_iter()
         .filter(|requirement| needs_job(*requirement))
-        .map(|requirement| PlanItem::unavailable(requirement, reason))
+        .map(|requirement| PlanItem::indeterminate(requirement, reason))
         .collect()
 }
 
@@ -205,65 +359,70 @@ pub fn notes(policy: &ResolvedPolicy) -> Vec<String> {
     notes
 }
 
-/// Requirements that the AppContainer enforces.
+/// Requirements that the AppContainer enforces. A requirement that sandy's job carries also needs
+/// the job, and one that rests on AppContainer network isolation also needs the fix of
+/// CVE-2021-41338; the worst of these problems and the mechanism's own is the report.
 fn contained(
     requirement: Requirement,
     policy: &ResolvedPolicy,
-    host: &HostCapabilities,
+    host: &dyn Host,
     name: &str,
 ) -> PlanItem {
-    let enforced = |mechanism: String| PlanItem::enforced(requirement, mechanism);
-    let unavailable = |reason: String| PlanItem::unavailable(requirement, reason);
-    // `sandy setup`, run once as administrator, would make this enforceable; `check` exits 2.
-    let needs_setup = |reason: String| PlanItem::needs_setup(requirement, reason);
-    let relay = |policy, host, sandy: &dyn Fn(&Path) -> PlanItem| match relay_program(policy, host)
-    {
-        Err(RelayProblem::NeedsSetup(reason)) => needs_setup(reason),
-        Err(RelayProblem::Fixed(reason)) => unavailable(reason),
-        Ok(path) => sandy(path),
-    };
-    if needs_job(requirement)
-        && let Some(reason) = job_problem(host)
-    {
-        return unavailable(reason);
+    let mut problems = Vec::new();
+    if needs_job(requirement) {
+        problems.extend(job_problem(host));
     }
-    let bypass = host
-        .windows
-        .as_ref()
-        .ok()
-        .copied()
-        .and_then(firewall_bypass);
-    if let (
+    if isolates_network(requirement) {
+        problems.extend(host.windows().ok().as_ref().and_then(firewall_bypass));
+    }
+    let mechanism = mechanism(requirement, policy, host, name);
+    problems.extend(mechanism.as_ref().err().cloned());
+    match worst(problems) {
+        Some(problem) => problem.item(requirement),
+        // Without a problem the mechanism is there.
+        None => PlanItem::enforced(requirement, mechanism.unwrap_or_default()),
+    }
+}
+
+/// Whether the requirement rests on the filters that Windows Firewall installs for
+/// AppContainers.
+fn isolates_network(requirement: Requirement) -> bool {
+    matches!(
+        requirement,
         Requirement::IpNetworkDenied
-        | Requirement::IpNetworkPrivate
-        | Requirement::InboundIpDenied
-        | Requirement::EgressBrokered,
-        Some(reason),
-    ) = (requirement, bypass)
-    {
-        return unavailable(reason);
-    }
-    let network = network_path_problem(policy);
+            | Requirement::IpNetworkPrivate
+            | Requirement::InboundIpDenied
+            | Requirement::EgressBrokered
+    )
+}
+
+/// How the AppContainer `name` enforces `requirement` on `host`, or why it cannot.
+fn mechanism(
+    requirement: Requirement,
+    policy: &ResolvedPolicy,
+    host: &dyn Host,
+    name: &str,
+) -> Result<String, Problem> {
     match requirement {
-        Requirement::FilesystemConfined if policy.system == SystemAccess::None => {
-            unavailable(SYSTEM_NONE.into())
-        }
-        Requirement::FilesystemConfined if network.is_some() => {
-            unavailable(network.unwrap_or_default())
-        }
         Requirement::FilesystemConfined => {
-            match (&host.capability_sids, &host.writable_paths, &host.grants) {
-                (Err(reason), _, _) | (_, Err(reason), _) | (_, _, Err(reason)) => {
-                    unavailable(reason.clone())
-                }
-                (Ok(()), Ok(()), Ok(())) => enforced(format!(
-                    "AppContainer {name:?}: one capability per policy path with an access control \
+            all([
+                if policy.system == SystemAccess::None {
+                    Err(Problem::Unavailable(SYSTEM_NONE.into()))
+                } else {
+                    Ok(())
+                },
+                network_path_problem(policy).map_or(Ok(()), Err),
+                host.capability_sids(),
+                host.writable_paths(),
+                host.grants(),
+            ])?;
+            Ok(format!(
+                "AppContainer {name:?}: one capability per policy path with an access control \
                  entry on the path (no FILE_EXECUTE on read and read-write paths); besides, what \
                  Windows grants all AppContainers and the AppContainer profile folder"
-                )),
-            }
+            ))
         }
-        Requirement::ChildProcessesDenied => enforced(
+        Requirement::ChildProcessesDenied => Ok(
             "the program's job admits one active process (JOB_OBJECT_LIMIT_ACTIVE_PROCESS = \
              1), so Windows refuses every process that would join it, and every child of the \
              program joins it because the job allows no breakaway; the program holds no handle to \
@@ -272,174 +431,205 @@ fn contained(
              through them either"
                 .to_string(),
         ),
-        Requirement::EndsWithParent => enforced(
+        Requirement::EndsWithParent => Ok(
             "sandy waits for the process that started it (found in a process snapshot and \
              checked by its creation time) and ends the program's job when that process ends; \
              the AppContainer cannot open sandy"
                 .to_string(),
         ),
-        Requirement::ChildProcessesContained => enforced(
+        Requirement::ChildProcessesContained => Ok(
             "every child of the program joins the program's job, which allows no breakaway; \
              sandy ends the job when the program exits, and the job's kill-on-close ends it when \
              sandy dies; the program holds no handle to the job"
                 .to_string(),
         ),
-        Requirement::ExposedPortsRelayed => relay(policy, host, &|sandy| {
-            enforced(format!(
+        Requirement::ExposedPortsRelayed => {
+            let sandy = relay(policy, host)?;
+            Ok(format!(
                 "`sandy __relay` in AppContainer {name:?} and a job of its own, on a listening \
                  socket that sandy creates outside the AppContainer; the relay has no network \
                  capability and only read and execute access to {}; {RELAY_END}",
                 sandy.display()
             ))
-        }),
-        Requirement::ForwardedPortsRelayed => {
-            relay(policy, host, &|sandy| match &host.forward_sockets {
-                Err(reason) => unavailable(reason.clone()),
-                Ok(()) => enforced(format!(
-                    "`sandy __forward` in AppContainer {name:?} and a job of its own listens on \
-                     the program's loopback port and passes each connection over an AF_UNIX \
-                     socket that only the relays may open to sandy outside, which connects to \
-                     the target; no loopback exemption is needed; the relay has no network \
-                     capability and only read and execute access to {}; {RELAY_END}",
-                    sandy.display()
-                )),
-            })
         }
-        Requirement::MetadataConfined => enforced(format!(
+        Requirement::ForwardedPortsRelayed => {
+            let sandy = relay(policy, host);
+            all([unit(&sandy), forward_sockets(host)])?;
+            Ok(format!(
+                "`sandy __forward` in AppContainer {name:?} and a job of its own listens on the \
+                 program's loopback port and passes each connection over an AF_UNIX socket that \
+                 only the relays may open to sandy outside, which connects to the target; no \
+                 loopback exemption is needed; the relay has no network capability and only read \
+                 and execute access to {}; {RELAY_END}",
+                sandy?.display()
+            ))
+        }
+        Requirement::MetadataConfined => Ok(format!(
             "AppContainer {name:?} holds no WRITE_DAC, WRITE_OWNER, FILE_WRITE_ATTRIBUTES or \
              FILE_WRITE_EA outside read-write paths, and the AppContainer access check grants \
              no implicit owner rights"
         )),
-        Requirement::NoPrivilegeEscalation => enforced(format!(
+        Requirement::NoPrivilegeEscalation => Ok(format!(
             "AppContainer {name:?} token at low integrity, inherited by every child; job object \
              without breakaway"
         )),
-        Requirement::ProcessMemoryIsolated => enforced(format!(
+        Requirement::ProcessMemoryIsolated => Ok(format!(
             "AppContainer {name:?}: processes outside it grant its SID no access"
         )),
-        Requirement::IpNetworkDenied => match (&host.firewall, &host.loopback_exempt) {
-            (Err(reason), _) => unavailable(format!(
-                "AppContainer network isolation depends on the Windows Firewall service: {reason}"
-            )),
-            (_, Err(reason)) => unavailable(format!(
-                "cannot read the loopback exemptions of AppContainers: {reason}"
-            )),
-            (_, Ok(true)) => needs_setup(format!(
-                "AppContainer {name:?} is exempt from loopback isolation and could reach \
-                 127.0.0.1 without network capabilities; run `sandy setup --appcontainer \
-                 {name}` without --ip as administrator to remove the exemption, or use another \
-                 name for policies without IP networking"
-            )),
-            (Ok(()), Ok(false)) => enforced(format!(
+        Requirement::IpNetworkDenied => {
+            all([
+                firewall(host),
+                not_exempt(host.loopback_exempt(), || {
+                    format!(
+                        "AppContainer {name:?} is exempt from loopback isolation and could reach \
+                         127.0.0.1 without network capabilities; run `sandy setup \
+                         --appcontainer {name}` without --ip as administrator to remove the \
+                         exemption, or use another name for policies without IP networking"
+                    )
+                }),
+            ])?;
+            Ok(format!(
                 "AppContainer {name:?} without network capabilities and without loopback \
                  exemption"
-            )),
-        },
-        Requirement::IpNetworkPrivate => match (&host.firewall, &host.loopback_exempt) {
-            (Err(reason), _) => unavailable(format!(
-                "AppContainer network isolation depends on the Windows Firewall service: {reason}"
-            )),
-            (_, Err(reason)) => unavailable(format!(
-                "cannot read the loopback exemptions of AppContainers: {reason}"
-            )),
-            (_, Ok(true)) => needs_setup(format!(
-                "AppContainer {name:?} is exempt from loopback isolation and could reach \
-                 127.0.0.1 outside the sandbox without network capabilities; run `sandy setup \
-                 --appcontainer {name} --ip private` as administrator to remove the exemption, \
-                 or use another name for this policy"
-            )),
-            (Ok(()), Ok(false)) => enforced(format!(
+            ))
+        }
+        Requirement::IpNetworkPrivate => {
+            all([
+                firewall(host),
+                not_exempt(host.loopback_exempt(), || program_exempt(name)),
+            ])?;
+            Ok(format!(
                 "AppContainer {name:?} without network capabilities and without loopback \
                  exemption: its processes and the relays in it reach each other over loopback; \
                  Windows Firewall denies connections and datagrams to other hosts, loopback \
                  isolation drops the traffic between the AppContainer and the rest of this \
                  machine, and the DNS Client service resolves no name for it"
-            )),
-        },
-        Requirement::InboundIpDenied => match &host.firewall {
-            Err(reason) => unavailable(format!(
-                "AppContainer network isolation depends on the Windows Firewall service: {reason}"
-            )),
-            Ok(()) => enforced(format!(
+            ))
+        }
+        Requirement::InboundIpDenied => {
+            firewall(host)?;
+            Ok(format!(
                 "AppContainer {name:?} with the internetClient capability only: Windows Firewall \
                  drops the connections and datagrams of other hosts that the program did not \
                  start, also with its profiles off, and loopback isolation all that processes of \
                  this machine outside the AppContainer send"
-            )),
-        },
-        Requirement::UnixSocketsDenied => enforced(format!(
+            ))
+        }
+        Requirement::UnixSocketsDenied => Ok(format!(
             "connecting to an AF_UNIX socket needs write access to the socket file; \
              AppContainer {name:?} can write only in read-write paths and in its profile folder, \
              where Windows also puts TEMP"
         )),
-        Requirement::SignalsIsolated => enforced(format!(
+        Requirement::SignalsIsolated => Ok(format!(
             "own console for the program; AppContainer {name:?} cannot open processes outside \
              it; job UI restrictions and low integrity block window messages"
         )),
-        Requirement::Win32kDenied => enforced(WIN32K_LOCKDOWN.to_string()),
-        Requirement::RelaysIpv4Only => enforced(format!(
+        Requirement::Win32kDenied => Ok(WIN32K_LOCKDOWN.to_string()),
+        Requirement::RelaysIpv4Only => Ok(format!(
             "nothing to restrict: the relays and the egress broker take the program's \
              connections at 127.0.0.1 in AppContainer {name:?}, which reaches no other address \
              without network capabilities"
         )),
-        Requirement::EgressBrokered => match (
-            &host.firewall,
-            &host.loopback_exempt,
-            &host.broker_loopback_exempt,
-        ) {
-            (Err(reason), _, _) => unavailable(format!(
-                "AppContainer network isolation depends on the Windows Firewall service: {reason}"
-            )),
-            (_, Err(reason), _) | (_, _, Err(reason)) => unavailable(format!(
-                "cannot read the loopback exemptions of AppContainers: {reason}"
-            )),
-            (_, Ok(true), _) => needs_setup(format!(
-                "AppContainer {name:?} is exempt from loopback isolation and could reach \
-                 127.0.0.1 outside the sandbox without network capabilities; run `sandy setup \
-                 --appcontainer {name} --ip private` as administrator to remove the exemption, \
-                 or use another name for this policy"
-            )),
-            (_, _, Ok(true)) => needs_setup(format!(
-                "the egress broker's AppContainer \"{name}{EGRESS_BROKER_SUFFIX}\" is exempt from \
-                 loopback isolation, so nothing below the destination check keeps the broker off \
-                 this machine; run `sandy setup` with this policy as administrator to remove the \
-                 exemption"
-            )),
-            (Ok(()), Ok(false), Ok(false)) => match crate::name::egress_broker_name(name) {
-                Err(reason) => unavailable(reason),
-                Ok(broker) => relay(policy, host, &|sandy| match &host.forward_sockets {
-                    Err(reason) => unavailable(reason.clone()),
-                    Ok(()) => enforced(format!(
-                        "`sandy __broker` in AppContainer {broker:?}, its own sandbox with the \
-                         internetClient capability{capabilities}, in the relay job, serves SOCKS5 \
-                         on an AF_UNIX socket that a `sandy __forward` relay in AppContainer \
-                         {name:?} passes the program's connections to; it connects out only to \
-                         {reach} destinations (sandy_core::destination) and never to this host, \
-                         which its own loopback isolation also denies at the kernel; the broker \
-                         has only read and execute access to {}; {RELAY_END}",
-                        sandy.display(),
-                        reach = policy
-                            .egress
-                            .map(|egress| egress.reach.name())
-                            .unwrap_or("public"),
-                        capabilities = match policy.egress.map(|egress| egress.reach) {
-                            Some(EgressReach::PublicAndLocal) => {
-                                " and privateNetworkClientServer, which also admits connections \
-                                 from hosts of a private network to a socket it listens on, \
-                                 although it listens on none"
-                            }
-                            _ => "",
-                        },
-                    )),
+        Requirement::EgressBrokered => {
+            // The name is the policy's: one too long for the broker's suffix is too long on every
+            // host.
+            let broker = crate::name::egress_broker_name(name).map_err(Problem::Conflict);
+            let sandy = relay(policy, host);
+            all([
+                firewall(host),
+                not_exempt(host.loopback_exempt(), || program_exempt(name)),
+                not_exempt(host.broker_loopback_exempt(), || {
+                    format!(
+                        "the egress broker's AppContainer \"{name}{EGRESS_BROKER_SUFFIX}\" is \
+                         exempt from loopback isolation, so nothing below the destination check \
+                         keeps the broker off this machine; run `sandy setup` with this policy as \
+                         administrator to remove the exemption"
+                    )
                 }),
-            },
-        },
+                unit(&broker),
+                unit(&sandy),
+                forward_sockets(host),
+            ])?;
+            Ok(format!(
+                "`sandy __broker` in AppContainer {broker:?}, its own sandbox with the \
+                 internetClient capability{capabilities}, in the relay job, serves SOCKS5 on an \
+                 AF_UNIX socket that a `sandy __forward` relay in AppContainer {name:?} passes the \
+                 program's connections to; it connects out only to {reach} destinations \
+                 (sandy_core::destination) and never to this host, which its own loopback \
+                 isolation also denies at the kernel; the broker has only read and execute \
+                 access to {}; {RELAY_END}",
+                sandy?.display(),
+                broker = broker?,
+                reach = policy
+                    .egress
+                    .map(|egress| egress.reach.name())
+                    .unwrap_or("public"),
+                capabilities = match policy.egress.map(|egress| egress.reach) {
+                    Some(EgressReach::PublicAndLocal) => {
+                        " and privateNetworkClientServer, which also admits connections from \
+                         hosts of a private network to a socket it listens on, although it \
+                         listens on none"
+                    }
+                    _ => "",
+                },
+            ))
+        }
         Requirement::InheritedHandlesClosed
         | Requirement::EnvironmentControlled
         | Requirement::PathsHidden => {
             unreachable!("reported in plan_for")
         }
     }
+}
+
+/// `Ok` when none of `results` has a problem, otherwise the worst problem (`worst`).
+fn all(results: impl IntoIterator<Item = Result<(), Problem>>) -> Result<(), Problem> {
+    worst(results.into_iter().filter_map(Result::err)).map_or(Ok(()), Err)
+}
+
+/// `result` without its value.
+fn unit<T>(result: &Result<T, Problem>) -> Result<(), Problem> {
+    result.as_ref().map(|_| ()).map_err(Clone::clone)
+}
+
+/// The Windows Firewall service, which turns the AppContainer network rules into filters.
+fn firewall(host: &dyn Host) -> Result<(), Problem> {
+    host.firewall().map_err(|problem| {
+        problem.map(|reason| {
+            format!(
+                "AppContainer network isolation depends on the Windows Firewall service: {reason}"
+            )
+        })
+    })
+}
+
+/// That an AppContainer is not exempt from loopback isolation, from the list as read
+/// (`exempt`); `sandy setup` removes an exemption, whose problem `advice` describes.
+fn not_exempt(
+    exempt: Result<bool, Problem>,
+    advice: impl FnOnce() -> String,
+) -> Result<(), Problem> {
+    match exempt {
+        Err(problem) => Err(problem.map(|reason| {
+            format!("cannot read the loopback exemptions of AppContainers: {reason}")
+        })),
+        Ok(true) => Err(Problem::NeedsSetup(advice())),
+        Ok(false) => Ok(()),
+    }
+}
+
+/// The problem of an exempt program AppContainer under `ip = "private"` and with egress.
+fn program_exempt(name: &str) -> String {
+    format!(
+        "AppContainer {name:?} is exempt from loopback isolation and could reach 127.0.0.1 \
+         outside the sandbox without network capabilities; run `sandy setup --appcontainer \
+         {name} --ip private` as administrator to remove the exemption, or use another name for \
+         this policy"
+    )
+}
+
+fn forward_sockets(host: &dyn Host) -> Result<(), Problem> {
+    host.forward_sockets()
 }
 
 /// `windows.win32k = "deny"`. The relays get it too: the program can open them, because they
@@ -452,52 +642,38 @@ const WIN32K_LOCKDOWN: &str = "PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY with \
 const RELAY_END: &str = "when the program ends, the relay takes no new connection, lets \
      accepted ones finish, and ends within one second";
 
-/// Why the relays and the egress broker cannot run sandy's executable, and whether `sandy setup`
-/// would fix it.
-enum RelayProblem {
-    /// The current user cannot grant the AppContainer read and execute on sandy's executable;
-    /// `sandy setup`, run as administrator, adds the grant.
-    NeedsSetup(String),
-    /// sandy's executable lies in a read-write path; setup does not help.
-    Fixed(String),
-}
-
-/// sandy's executable for the relays, unless sandy cannot let the AppContainer run it (which
-/// setup fixes) or it lies in a read-write path (which it does not).
-fn relay_program<'a>(
-    policy: &ResolvedPolicy,
-    host: &'a HostCapabilities,
-) -> Result<&'a Path, RelayProblem> {
-    let sandy = host
-        .relay_program
-        .as_ref()
-        .map_err(|reason| RelayProblem::NeedsSetup(reason.clone()))?;
-    match writable_parent(policy, sandy) {
-        Some(writable) => Err(RelayProblem::Fixed(format!(
+/// sandy's executable for the relays and the egress broker, or why they cannot run it. One that
+/// lies in a read-write path is the policy's conflict, whatever the grants: the program could
+/// replace it.
+fn relay(policy: &ResolvedPolicy, host: &dyn Host) -> Result<PathBuf, Problem> {
+    let sandy = host.relay_program()?;
+    if let Some(writable) = writable_parent(policy, &sandy) {
+        return Err(Problem::Conflict(format!(
             "the relays run sandy's executable {}, which lies in the read-write path {}; the \
              program could replace it",
             sandy.display(),
             writable.display()
-        ))),
-        None => Ok(sandy),
+        )));
     }
+    host.relay_grants()?;
+    Ok(sandy)
 }
 
-/// Why a policy path that names a network share is refused. The program cannot open a share in
-/// its AppContainer with the capabilities sandy grants (docs/windows.md, "Network and share
-/// paths"), but the entry sandy adds through the share lands on the folder behind it, which the
-/// program then opens by its local path.
-fn network_path_problem(policy: &ResolvedPolicy) -> Option<String> {
+/// Why a policy path that names a network share is refused, a conflict of the policy. The program
+/// cannot open a share in its AppContainer with the capabilities sandy grants (docs/windows.md,
+/// "Network and share paths"), but the entry sandy adds through the share lands on the folder
+/// behind it, which the program then opens by its local path.
+fn network_path_problem(policy: &ResolvedPolicy) -> Option<Problem> {
     let rule = policy
         .paths
         .iter()
         .find(|rule| is_network_path(&rule.path))?;
-    Some(format!(
+    Some(Problem::Conflict(format!(
         "policy path {} is a network or share path, which sandy does not support: the program \
          cannot open it, and the access sandy grants would land on the folder behind the share; \
          name the local path instead",
         rule.path.display()
-    ))
+    )))
 }
 
 /// Whether `path` reaches its file through a network share: `\\server\share`, or
@@ -589,7 +765,7 @@ mod tests {
             appcontainer: Ok(()),
             windows: Ok(WindowsVersion {
                 build: 26200,
-                revision: Some(7000),
+                revision: Ok(7000),
             }),
             capability_sids: Ok(()),
             writable_paths: Ok(()),
@@ -599,6 +775,7 @@ mod tests {
             loopback_exempt: Ok(false),
             broker_loopback_exempt: Ok(false),
             relay_program: Ok(sandy_exe(Path::new(r"C:\Program Files\sandy"))),
+            relay_grants: Ok(()),
             forward_sockets: Ok(()),
         }
     }
@@ -663,16 +840,21 @@ mod tests {
     fn unavailable(status: Status) -> String {
         match status {
             Status::Unavailable { reason } => reason,
-            Status::NeedsSetup { reason } => panic!("needs setup: {reason}"),
-            Status::Enforced { mechanism } => panic!("enforced: {mechanism}"),
+            other => panic!("not unavailable: {other:?}"),
         }
     }
 
     fn needs_setup(status: Status) -> String {
         match status {
             Status::NeedsSetup { reason } => reason,
-            Status::Unavailable { reason } => panic!("unavailable: {reason}"),
-            Status::Enforced { mechanism } => panic!("enforced: {mechanism}"),
+            other => panic!("not needs setup: {other:?}"),
+        }
+    }
+
+    fn conflict(status: Status) -> String {
+        match status {
+            Status::Conflict { reason } => reason,
+            other => panic!("not a conflict: {other:?}"),
         }
     }
 
@@ -696,44 +878,48 @@ mod tests {
     }
 
     /// sandy grants access by adding an entry to the access control list of each policy path, so
-    /// a path whose list the user may not change makes the run fail. The plan reports it.
+    /// a path whose list the user may not change makes the run fail. The plan reports it as the
+    /// conflict `probe::path_grant` makes of it, which every level shares.
     #[test]
     fn a_policy_path_that_cannot_be_granted_refuses() {
         let host = HostCapabilities {
-            grants: Err(
+            grants: Err(Problem::Conflict(
                 r#"cannot give AppContainer "example.app" access to C:\data: the grant is missing, and the current user may not change the permissions"#
                     .into(),
-            ),
+            )),
             ..host()
         };
         let policy = with_rule(policy(), PathAccess::Read);
         assert!(!plan(&policy, &host).is_enforceable());
-        let reason = unavailable(status(&policy, &host, Requirement::FilesystemConfined));
+        let reason = conflict(status(&policy, &host, Requirement::FilesystemConfined));
         assert!(reason.contains(r"C:\data"), "{reason}");
     }
 
+    /// A missing or invalid name is the policy's on every host, so it is a conflict, which ends
+    /// the selection instead of letting sandy try a weaker level.
     #[test]
     fn needs_a_valid_appcontainer_name() {
         let mut policy = policy();
         policy.windows.appcontainer_name = None;
         let plan = plan(&policy, &host());
         assert!(!plan.is_enforceable());
-        let reason = unavailable(status(&policy, &host(), Requirement::FilesystemConfined));
+        assert!(plan.final_reports().next().is_some());
+        let reason = conflict(status(&policy, &host(), Requirement::FilesystemConfined));
         assert!(reason.contains("appcontainer"), "{reason}");
 
         policy.windows.appcontainer_name = Some("bad/name".into());
-        assert!(
-            !plan_for(&policy, &host())
-                .iter()
-                .any(|item| item.requirement == Requirement::FilesystemConfined
-                    && item.is_enforced())
-        );
+        let reason = conflict(status(&policy, &host(), Requirement::FilesystemConfined));
+        assert!(reason.contains("bad/name"), "{reason}");
+        // Control: the name of `policy()` is valid.
+        assert!(self::plan(&self::policy(), &host()).is_enforceable());
     }
 
     #[test]
     fn without_appcontainers_nothing_contained_is_enforced() {
         let host = HostCapabilities {
-            appcontainer: Err("old Windows".into()),
+            appcontainer: Err(Problem::Indeterminate(
+                "cannot derive the SID of AppContainer \"example.app\": not enough memory".into(),
+            )),
             ..host()
         };
         for item in plan_for(&policy(), &host) {
@@ -763,7 +949,7 @@ mod tests {
                     access,
                     is_dir: true,
                 });
-                let reason = unavailable(status(&policy, &host(), Requirement::FilesystemConfined));
+                let reason = conflict(status(&policy, &host(), Requirement::FilesystemConfined));
                 assert!(reason.contains("network or share path"), "{path}: {reason}");
                 assert!(reason.contains(path), "{path}: {reason}");
             }
@@ -782,6 +968,163 @@ mod tests {
                 is_dir: true,
             });
             assert!(plan(&policy, &host()).is_enforceable(), "{path}");
+        }
+    }
+
+    /// One requirement can fail for several reasons. The report is the worst of them, as
+    /// `EnforcementPlan` ranks reports, so a conflict that every level shares is never hidden
+    /// behind a shortfall that would let sandy try the next level.
+    #[test]
+    fn a_conflict_is_never_hidden_behind_a_shortfall() {
+        let mut policy = policy();
+        policy.system = SystemAccess::None;
+        policy.paths.push(PathRule {
+            path: PathBuf::from(r"\\server\share\data"),
+            access: PathAccess::Read,
+            is_dir: true,
+        });
+        let reason = conflict(status(&policy, &host(), Requirement::FilesystemConfined));
+        assert!(reason.contains("network or share path"), "{reason}");
+
+        // The job's shortfall and a writable sandy.exe for an exposed port.
+        let nested = HostCapabilities {
+            outer_job_ui: Ok(Some(0x1)),
+            relay_program: Ok(sandy_exe(&Path::new(r"C:\data").join("bin"))),
+            ..host()
+        };
+        let writable = exposing(with_rule(self::policy(), PathAccess::ReadWrite));
+        let reason = conflict(status(&writable, &nested, Requirement::ExposedPortsRelayed));
+        assert!(reason.contains("read-write"), "{reason}");
+        // Control: the job alone is a shortfall.
+        let reason = unavailable(status(
+            &exposing(self::policy()),
+            &nested,
+            Requirement::ExposedPortsRelayed,
+        ));
+        assert!(reason.contains("UI restrictions"), "{reason}");
+
+        assert_eq!(
+            worst([
+                Problem::NeedsSetup("a".into()),
+                Problem::Conflict("b".into()),
+                Problem::Indeterminate("c".into()),
+                Problem::Conflict("d".into()),
+                Problem::Unavailable("e".into()),
+            ]),
+            Some(Problem::Conflict("b".into()))
+        );
+        assert_eq!(
+            worst([
+                Problem::NeedsSetup("a".into()),
+                Problem::Unavailable("b".into())
+            ]),
+            Some(Problem::Unavailable("b".into()))
+        );
+        assert_eq!(worst([]), None);
+    }
+
+    /// Every host answer reaches the plan in the class its probe gave it (`probe`), so a probe
+    /// that fails for a passing reason ends the selection and never lets sandy try a weaker
+    /// level, whichever requirement reads it.
+    #[test]
+    fn every_host_answer_keeps_its_class() {
+        let mut policy = forwarding(exposing(with_egress(sandy_core::EgressReach::Public)));
+        policy.ip = IpAccess::Private;
+        let policy = with_rule(policy, PathAccess::ReadWrite);
+        assert!(plan(&policy, &host()).is_enforceable());
+        type Set = fn(&mut HostCapabilities, Problem);
+        let fields: [(&str, Set, Requirement); 13] = [
+            (
+                "appcontainer",
+                |h, p| h.appcontainer = Err(p),
+                Requirement::ProcessMemoryIsolated,
+            ),
+            (
+                "windows",
+                |h, p| h.windows = Err(p),
+                Requirement::FilesystemConfined,
+            ),
+            (
+                "capability_sids",
+                |h, p| h.capability_sids = Err(p),
+                Requirement::FilesystemConfined,
+            ),
+            (
+                "writable_paths",
+                |h, p| h.writable_paths = Err(p),
+                Requirement::FilesystemConfined,
+            ),
+            (
+                "grants",
+                |h, p| h.grants = Err(p),
+                Requirement::FilesystemConfined,
+            ),
+            (
+                "outer_job_ui",
+                |h, p| h.outer_job_ui = Err(p),
+                Requirement::NoPrivilegeEscalation,
+            ),
+            (
+                "firewall",
+                |h, p| h.firewall = Err(p),
+                Requirement::IpNetworkPrivate,
+            ),
+            (
+                "firewall",
+                |h, p| h.firewall = Err(p),
+                Requirement::EgressBrokered,
+            ),
+            (
+                "loopback_exempt",
+                |h, p| h.loopback_exempt = Err(p),
+                Requirement::IpNetworkPrivate,
+            ),
+            (
+                "broker_loopback_exempt",
+                |h, p| h.broker_loopback_exempt = Err(p),
+                Requirement::EgressBrokered,
+            ),
+            (
+                "relay_program",
+                |h, p| h.relay_program = Err(p),
+                Requirement::ExposedPortsRelayed,
+            ),
+            (
+                "relay_grants",
+                |h, p| h.relay_grants = Err(p),
+                Requirement::ForwardedPortsRelayed,
+            ),
+            (
+                "forward_sockets",
+                |h, p| h.forward_sockets = Err(p),
+                Requirement::ForwardedPortsRelayed,
+            ),
+        ];
+        let classes: [fn(String) -> Problem; 4] = [
+            Problem::Unavailable,
+            Problem::NeedsSetup,
+            Problem::Indeterminate,
+            Problem::Conflict,
+        ];
+        for (field, set, requirement) in fields {
+            for class in classes {
+                let problem = class(format!("the {field} probe"));
+                let mut host = host();
+                set(&mut host, problem.clone());
+                let reported = status(&policy, &host, requirement);
+                assert_eq!(
+                    std::mem::discriminant(&reported),
+                    std::mem::discriminant(&problem.clone().item(requirement).status),
+                    "{field} for {requirement:?}: {reported:?}"
+                );
+                assert!(
+                    reported
+                        .reason()
+                        .unwrap_or_default()
+                        .contains(problem.reason()),
+                    "{field}: {reported:?}"
+                );
+            }
         }
     }
 
@@ -809,20 +1152,37 @@ mod tests {
         assert!(plan(&allowed, &host).is_enforceable());
     }
 
+    /// A firewall that sandy cannot read, or one in passing, and an exemption list that sandy
+    /// cannot read end the selection; only a stopped firewall is a shortfall.
     #[test]
     fn unknown_network_state_fails_closed() {
         for host in [
             HostCapabilities {
-                firewall: Err("MpsSvc stopped".into()),
+                firewall: Err(Problem::Indeterminate(
+                    "the Windows Firewall service (MpsSvc) is starting".into(),
+                )),
                 ..host()
             },
             HostCapabilities {
-                loopback_exempt: Err("access denied".into()),
+                loopback_exempt: Err(Problem::Indeterminate("access denied".into())),
                 ..host()
             },
         ] {
-            assert!(!plan(&policy(), &host).is_enforceable());
+            let plan = plan(&policy(), &host);
+            assert!(!plan.is_enforceable());
+            let reports: Vec<_> = plan.final_reports().collect();
+            assert_eq!(reports.len(), 1, "{reports:?}");
+            assert_eq!(reports[0].requirement, Requirement::IpNetworkDenied);
         }
+        let stopped = HostCapabilities {
+            firewall: Err(Problem::Unavailable(
+                "the Windows Firewall service (MpsSvc) is stopped".into(),
+            )),
+            ..host()
+        };
+        let plan = plan(&policy(), &stopped);
+        assert!(!plan.is_enforceable());
+        assert!(plan.final_reports().next().is_none());
     }
 
     #[test]
@@ -867,15 +1227,13 @@ mod tests {
                 );
                 assert!(mechanism.contains("relays"), "{mechanism}");
             }
-            Status::Unavailable { reason } | Status::NeedsSetup { reason } => {
-                panic!("unavailable: {reason}")
-            }
+            other => panic!("not enforced: {other:?}"),
         }
         // The program never starts without an AppContainer, so nothing is enforced.
         policy.windows.appcontainer_name = None;
         assert!(matches!(
             status(&policy, &host(), Requirement::Win32kDenied),
-            Status::Unavailable { .. }
+            Status::Conflict { .. }
         ));
     }
 
@@ -896,14 +1254,12 @@ mod tests {
             Status::Enforced { mechanism } => {
                 assert!(mechanism.starts_with("nothing to restrict"), "{mechanism}")
             }
-            Status::Unavailable { reason } | Status::NeedsSetup { reason } => {
-                panic!("unavailable: {reason}")
-            }
+            other => panic!("not enforced: {other:?}"),
         }
         policy.windows.appcontainer_name = None;
         assert!(matches!(
             status(&policy, &host(), Requirement::RelaysIpv4Only),
-            Status::Unavailable { .. }
+            Status::Conflict { .. }
         ));
     }
 
@@ -916,17 +1272,23 @@ mod tests {
         let old = HostCapabilities {
             windows: Ok(WindowsVersion {
                 build: 17134,
-                revision: Some(2208),
+                revision: Ok(2208),
             }),
             ..host()
         };
         let reason = unavailable(status(&policy(), &old, Requirement::FilesystemConfined));
         assert!(reason.contains("1809"), "{reason}");
         let unknown = HostCapabilities {
-            windows: Err("RtlGetVersion failed".into()),
+            windows: Err(Problem::Indeterminate(
+                "RtlGetVersion failed with 0xc0000001".into(),
+            )),
             ..host()
         };
         assert!(!enforceable_on(&unknown));
+        assert!(matches!(
+            status(&policy(), &unknown, Requirement::FilesystemConfined),
+            Status::Indeterminate { .. }
+        ));
     }
 
     #[test]
@@ -934,7 +1296,7 @@ mod tests {
         let unpatched = HostCapabilities {
             windows: Ok(WindowsVersion {
                 build: 19043,
-                revision: Some(1287),
+                revision: Ok(1287),
             }),
             ..host()
         };
@@ -949,7 +1311,9 @@ mod tests {
     #[test]
     fn missing_capability_sids_block_the_filesystem_only() {
         let host = HostCapabilities {
-            capability_sids: Err("DeriveCapabilitySidsFromName is missing".into()),
+            capability_sids: Err(Problem::Unavailable(
+                "DeriveCapabilitySidsFromName is missing".into(),
+            )),
             ..host()
         };
         let reason = unavailable(status(&policy(), &host, Requirement::FilesystemConfined));
@@ -963,10 +1327,12 @@ mod tests {
     #[test]
     fn a_writable_path_problem_blocks_the_filesystem_only() {
         let host = HostCapabilities {
-            writable_paths: Err("writable path C:\\Program Files\\App overlaps".into()),
+            writable_paths: Err(Problem::Conflict(
+                "writable path C:\\Program Files\\App overlaps".into(),
+            )),
             ..host()
         };
-        let reason = unavailable(status(&policy(), &host, Requirement::FilesystemConfined));
+        let reason = conflict(status(&policy(), &host, Requirement::FilesystemConfined));
         assert!(reason.contains("overlaps"), "{reason}");
         assert!(matches!(
             status(&policy(), &host, Requirement::ProcessMemoryIsolated),
@@ -998,6 +1364,101 @@ mod tests {
         ));
     }
 
+    /// Every value a fallback level may give the hardening keys, on the policy of `policy()`.
+    fn levels() -> Vec<ResolvedPolicy> {
+        let mut levels = Vec::new();
+        for ip in [
+            IpAccess::None,
+            IpAccess::Private,
+            IpAccess::Client,
+            IpAccess::All,
+        ] {
+            for signals in [SignalScope::Any, SignalScope::Isolated] {
+                for children in [
+                    ChildProcesses::Allowed,
+                    ChildProcesses::None,
+                    ChildProcesses::Contained,
+                ] {
+                    for flags in 0..16u8 {
+                        let mut level = policy();
+                        level.ip = ip;
+                        level.signals = signals;
+                        level.children = children;
+                        level.end_with_parent = flags & 1 != 0;
+                        if flags & 2 != 0 {
+                            level.windows.win32k = Win32k::Deny;
+                        }
+                        if flags & 4 != 0 {
+                            level.egress = Some(sandy_core::Egress {
+                                port: 1080,
+                                reach: sandy_core::EgressReach::Public,
+                            });
+                        }
+                        if flags & 8 != 0 {
+                            level.view = sandy_core::FileView::Policy;
+                        }
+                        levels.push(level);
+                    }
+                }
+            }
+        }
+        levels
+    }
+
+    /// sandy's job carries `NoPrivilegeEscalation`, which every policy has, so a problem with
+    /// the job refuses every fallback level instead of letting sandy move to a weaker one, both
+    /// when the plan reads it and when the trial of `verify` finds it (finding 7 of the audit).
+    #[test]
+    fn a_job_problem_refuses_every_level() {
+        let hosts = [
+            HostCapabilities {
+                outer_job_ui: Ok(Some(0x1)),
+                ..host()
+            },
+            HostCapabilities {
+                outer_job_ui: Err(Problem::Indeterminate("access denied".into())),
+                ..host()
+            },
+        ];
+        for level in levels() {
+            assert!(
+                level
+                    .requirements()
+                    .contains(&Requirement::NoPrivilegeEscalation)
+            );
+            for host in &hosts {
+                let reported = status(&level, host, Requirement::NoPrivilegeEscalation);
+                assert!(
+                    reported
+                        .reason()
+                        .is_some_and(|reason| reason.contains("job")),
+                    "{reported:?}"
+                );
+                assert!(!plan(&level, host).is_enforceable());
+            }
+            let found = job_indeterminate(&level, "the trial job does not nest");
+            assert!(
+                found.iter().any(
+                    |item| item.requirement == Requirement::NoPrivilegeEscalation
+                        && matches!(item.status, Status::Indeterminate { .. })
+                ),
+                "{found:?}"
+            );
+            assert!(
+                found
+                    .iter()
+                    .all(|item| matches!(item.status, Status::Indeterminate { .. }))
+            );
+        }
+        // Control: outside a job every level without the policy view is enforceable.
+        assert!(
+            levels()
+                .iter()
+                .filter(|level| level.view == sandy_core::FileView::All)
+                .all(|level| plan(level, &host()).is_enforceable())
+        );
+    }
+
     #[test]
     fn an_outer_job_without_ui_restrictions_nests() {
         for outer in [Ok(None), Ok(Some(0))] {
@@ -1008,10 +1469,15 @@ mod tests {
             assert!(enforceable_on(&host));
         }
         let unreadable = HostCapabilities {
-            outer_job_ui: Err("access denied".into()),
+            outer_job_ui: Err(Problem::Indeterminate("access denied".into())),
             ..host()
         };
         assert!(!enforceable_on(&unreadable));
+        let reason = match status(&policy(), &unreadable, Requirement::NoPrivilegeEscalation) {
+            Status::Indeterminate { reason } => reason,
+            other => panic!("not indeterminate: {other:?}"),
+        };
+        assert!(reason.contains("cannot read the job"), "{reason}");
     }
 
     #[test]
@@ -1023,16 +1489,16 @@ mod tests {
                 assert!(mechanism.contains("sandy __relay"), "{mechanism}");
                 assert!(mechanism.contains("sandy.exe"), "{mechanism}");
             }
-            Status::Unavailable { reason } | Status::NeedsSetup { reason } => {
-                panic!("unavailable: {reason}")
-            }
+            other => panic!("not enforced: {other:?}"),
         }
     }
 
     #[test]
     fn relays_need_an_executable_sandy() {
         let host = HostCapabilities {
-            relay_program: Err("the current user may not change its permissions".into()),
+            relay_grants: Err(Problem::NeedsSetup(
+                "the current user may not change its permissions".into(),
+            )),
             ..host()
         };
         // `sandy setup` adds the grant, so the relay grant is NeedsSetup.
@@ -1055,7 +1521,7 @@ mod tests {
             ..host()
         };
         let writable = exposing(with_rule(policy(), PathAccess::ReadWrite));
-        let reason = unavailable(status(&writable, &host, Requirement::ExposedPortsRelayed));
+        let reason = conflict(status(&writable, &host, Requirement::ExposedPortsRelayed));
         assert!(reason.contains("read-write"), "{reason}");
         // Read access to the directory gives the program nothing it could replace sandy with.
         let readable = exposing(with_rule(policy(), PathAccess::Read));
@@ -1078,9 +1544,7 @@ mod tests {
                     "{mechanism}"
                 );
             }
-            Status::Unavailable { reason } | Status::NeedsSetup { reason } => {
-                panic!("unavailable: {reason}")
-            }
+            other => panic!("not enforced: {other:?}"),
         }
         // The limit lives in sandy's job, which an outer job with UI restrictions prevents.
         let nested = HostCapabilities {
@@ -1121,16 +1585,16 @@ mod tests {
                 assert!(mechanism.contains("AF_UNIX"), "{mechanism}");
                 assert!(mechanism.contains("no loopback exemption"), "{mechanism}");
             }
-            Status::Unavailable { reason } | Status::NeedsSetup { reason } => {
-                panic!("unavailable: {reason}")
-            }
+            other => panic!("not enforced: {other:?}"),
         }
     }
 
     #[test]
     fn forwarding_needs_af_unix_sockets_and_an_executable_sandy() {
         let no_sockets = HostCapabilities {
-            forward_sockets: Err("AF_UNIX sockets are not available".into()),
+            forward_sockets: Err(Problem::Unavailable(
+                "AF_UNIX sockets are not available".into(),
+            )),
             ..host()
         };
         let reason = unavailable(status(
@@ -1148,7 +1612,7 @@ mod tests {
             ..host()
         };
         let writable = forwarding(with_rule(policy(), PathAccess::ReadWrite));
-        let reason = unavailable(status(
+        let reason = conflict(status(
             &writable,
             &writable_sandy,
             Requirement::ForwardedPortsRelayed,
@@ -1221,9 +1685,7 @@ mod tests {
                 );
                 assert!(mechanism.contains("loopback isolation"), "{mechanism}");
             }
-            Status::Unavailable { reason } | Status::NeedsSetup { reason } => {
-                panic!("unavailable: {reason}")
-            }
+            other => panic!("not enforced: {other:?}"),
         }
         assert!(network_capabilities(IpAccess::Private).is_empty());
         let relayed = private(forwarding(exposing(self::policy())));
@@ -1242,20 +1704,21 @@ mod tests {
         assert!(reason.contains("--ip private"), "{reason}");
         assert!(plan(&policy, &exempt).needs_only_setup());
         let stopped = HostCapabilities {
-            firewall: Err("MpsSvc stopped".into()),
+            firewall: Err(Problem::Unavailable("MpsSvc stopped".into())),
             ..host()
         };
         let reason = unavailable(status(&policy, &stopped, Requirement::IpNetworkPrivate));
         assert!(reason.contains("Windows Firewall"), "{reason}");
         let unreadable = HostCapabilities {
-            loopback_exempt: Err("access denied".into()),
+            loopback_exempt: Err(Problem::Indeterminate("access denied".into())),
             ..host()
         };
         assert!(!plan(&policy, &unreadable).is_enforceable());
+        assert!(plan(&policy, &unreadable).final_reports().next().is_some());
         let unpatched = HostCapabilities {
             windows: Ok(WindowsVersion {
                 build: 19043,
-                revision: Some(1287),
+                revision: Ok(1287),
             }),
             ..host()
         };
@@ -1335,7 +1798,7 @@ mod tests {
             needs_setup(status(&policy, &exempt, Requirement::EgressBrokered)).contains("exempt")
         );
         let stopped = HostCapabilities {
-            firewall: Err("MpsSvc stopped".into()),
+            firewall: Err(Problem::Unavailable("MpsSvc stopped".into())),
             ..host()
         };
         assert!(
@@ -1345,7 +1808,7 @@ mod tests {
         let unpatched = HostCapabilities {
             windows: Ok(WindowsVersion {
                 build: 19043,
-                revision: Some(1287),
+                revision: Ok(1287),
             }),
             ..host()
         };
@@ -1355,7 +1818,9 @@ mod tests {
         );
         // The relay grant on sandy.exe that the broker's AppContainer also needs: setup adds it.
         let ungrantable = HostCapabilities {
-            relay_program: Err("the current user may not change its permissions".into()),
+            relay_grants: Err(Problem::NeedsSetup(
+                "the current user may not change its permissions".into(),
+            )),
             ..host()
         };
         assert!(
@@ -1372,23 +1837,20 @@ mod tests {
         assert!(reason.contains("exempt"), "{reason}");
         assert!(plan(&policy, &broker_exempt).needs_only_setup());
         let broker_unreadable = HostCapabilities {
-            broker_loopback_exempt: Err("access denied".into()),
+            broker_loopback_exempt: Err(Problem::Indeterminate("access denied".into())),
             ..host()
         };
-        assert!(
-            unavailable(status(
-                &policy,
-                &broker_unreadable,
-                Requirement::EgressBrokered
-            ))
-            .contains("loopback exemptions")
-        );
-        // A name with no room for the broker suffix.
+        match status(&policy, &broker_unreadable, Requirement::EgressBrokered) {
+            Status::Indeterminate { reason } => assert!(reason.contains("loopback exemptions")),
+            other => panic!("not indeterminate: {other:?}"),
+        }
+        // A name with no room for the broker suffix is the policy's on every host: a conflict.
         let mut long = with_egress(sandy_core::EgressReach::Public);
         long.windows.appcontainer_name = Some("a".repeat(60));
-        assert!(
-            unavailable(status(&long, &host(), Requirement::EgressBrokered)).contains("longer")
-        );
+        assert!(conflict(status(&long, &host(), Requirement::EgressBrokered)).contains("longer"));
+        // Control: the longest name that leaves room for the suffix.
+        long.windows.appcontainer_name = Some("a".repeat(51));
+        assert!(plan(&long, &host()).is_enforceable());
     }
 
     #[test]
@@ -1416,7 +1878,7 @@ mod tests {
             Status::Enforced { .. }
         ));
         let stopped = HostCapabilities {
-            firewall: Err("MpsSvc stopped".into()),
+            firewall: Err(Problem::Unavailable("MpsSvc stopped".into())),
             ..host()
         };
         let reason = unavailable(status(&client, &stopped, Requirement::InboundIpDenied));
@@ -1424,7 +1886,7 @@ mod tests {
         let unpatched = HostCapabilities {
             windows: Ok(WindowsVersion {
                 build: 19043,
-                revision: Some(1287),
+                revision: Ok(1287),
             }),
             ..host()
         };

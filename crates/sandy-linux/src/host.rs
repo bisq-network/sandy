@@ -1,18 +1,85 @@
 //! Detection of the kernel features and process state the backend depends on. Every function
 //! here only reads state, so `plan` can call it.
 
+use std::cell::{OnceCell, RefCell};
+use std::collections::BTreeMap;
 use std::io;
 use std::ptr;
 
-use sandy_core::{ChildProcesses, FileView, IpAccess, ProtectedPath, ResolvedPolicy};
+use sandy_core::{
+    ChildProcesses, FileView, IpAccess, PlanItem, ProtectedPath, Requirement, ResolvedPolicy,
+};
 
 use crate::filter;
-use crate::namespace;
+use crate::namespace::{self, Namespaces, TrialFailure};
+use crate::plan;
 use crate::system::{self, SystemPath};
 use crate::trust;
 
 /// `Ok` when a feature can be used, otherwise the reason why it cannot.
 pub type Support = Result<(), String>;
+
+/// Why a feature cannot be used here, by what it means for the choice of a fallback level
+/// (`sandy_core::Status`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Missing {
+    /// A lasting shortfall of this host that nothing `sandy setup` installs changes.
+    Unavailable(String),
+    /// A lasting shortfall that an AppArmor profile `sandy setup` installs lifts.
+    NeedsSetup(String),
+    /// A probe failed for a reason that can pass, so sandy cannot tell now.
+    Indeterminate(String),
+}
+
+impl Missing {
+    pub fn reason(&self) -> &str {
+        match self {
+            Missing::Unavailable(reason)
+            | Missing::NeedsSetup(reason)
+            | Missing::Indeterminate(reason) => reason,
+        }
+    }
+
+    /// The same kind of shortfall, with another reason.
+    pub fn because(&self, reason: String) -> Missing {
+        match self {
+            Missing::Unavailable(_) => Missing::Unavailable(reason),
+            Missing::NeedsSetup(_) => Missing::NeedsSetup(reason),
+            Missing::Indeterminate(_) => Missing::Indeterminate(reason),
+        }
+    }
+
+    /// The plan item that reports it for `requirement`.
+    pub fn item(&self, requirement: Requirement) -> PlanItem {
+        match self {
+            Missing::Unavailable(reason) => PlanItem::unavailable(requirement, reason),
+            Missing::NeedsSetup(reason) => PlanItem::needs_setup(requirement, reason),
+            Missing::Indeterminate(reason) => PlanItem::indeterminate(requirement, reason),
+        }
+    }
+
+    /// The order of `EnforcementPlan::new`: what ends the selection before what lets sandy try
+    /// the next level, and what setup cannot fix before what it can.
+    fn rank(&self) -> u8 {
+        match self {
+            Missing::NeedsSetup(_) => 0,
+            Missing::Unavailable(_) => 1,
+            Missing::Indeterminate(_) => 2,
+        }
+    }
+}
+
+/// The worst of `missing` (`Missing::rank`), the first of them among equals, `None` when nothing
+/// is missing.
+pub fn worst(missing: impl IntoIterator<Item = Option<Missing>>) -> Option<Missing> {
+    missing.into_iter().flatten().reduce(|worst, next| {
+        if next.rank() > worst.rank() {
+            next
+        } else {
+            worst
+        }
+    })
+}
 
 /// What this host and this process offer. `plan_for` turns it into a plan without further I/O,
 /// so tests can describe any host.
@@ -24,7 +91,7 @@ pub struct HostCapabilities {
     /// N - 1), or why it reports none.
     pub landlock_errata: Result<u64, String>,
     /// Whether sandy can count its threads, which it must do before Landlock restricts it.
-    pub thread_count: Support,
+    pub thread_count: Result<(), Missing>,
     /// Seccomp filters with the actions the filter uses, for this CPU architecture.
     pub seccomp: Support,
     pub no_new_privs: Support,
@@ -34,15 +101,15 @@ pub struct HostCapabilities {
     /// `children = "contained"` uses to watch the program.
     pub pidfd: Support,
     /// Whether sandy may put a process into a process group, which `children = "contained"`
-    /// needs. Only probed for a policy that needs it (`detect_for`).
+    /// needs. Only probed for a policy that needs it (`Detected::for_policy`).
     pub process_group: Support,
-    /// Whether the host rules out the user namespace of `ip = "private"` and `filesystem.view =
-    /// "policy"`, as far as it says without a trial. Only read for a policy that needs it
-    /// (`detect_for`).
+    /// Whether the host rules out the namespaces of `ip = "private"` and `filesystem.view =
+    /// "policy"`, as far as it says, and else whether a trial of them works. Only read for a
+    /// policy that needs them (`Detected::for_policy`).
     pub user_namespaces: namespace::Support,
     /// Whether `children = "contained"` gets a PID namespace here, or why not. Only read for a
-    /// policy with `contained` (`detect_for`).
-    pub pid_namespace: Support,
+    /// policy whose run would use one (`Detected::for_policy`).
+    pub pid_namespace: namespace::Support,
     /// The candidates of the minimal system set that exist on this host.
     pub system_paths: Vec<SystemPath>,
     /// Where every candidate of the minimal system set is or would be, also missing ones.
@@ -75,49 +142,134 @@ impl HostCapabilities {
             path_locations: trust::path_locations(),
         }
     }
+}
 
-    /// `detect` plus the probes that only some policies need. A probe is a system call that an
-    /// outer sandbox can answer with SIGSYS instead of an error, so it runs only for a policy
-    /// whose run would make the call anyway.
-    pub fn detect_for(policy: &ResolvedPolicy) -> Self {
-        let mut host = Self::detect();
-        if policy.children == ChildProcesses::Contained {
-            host.process_group = process_group_support();
-        }
-        let required = policy.ip == IpAccess::Private || policy.view == FileView::Policy;
-        if required {
-            host.user_namespaces = namespace::support(&namespace::Purpose::of(policy));
-        }
-        if policy.children == ChildProcesses::Contained {
-            host.pid_namespace = pid_namespace_support(required, &host.user_namespaces);
-        }
-        host
+/// The probes behind `HostCapabilities`, as a trait so that a test can count them.
+pub(crate) trait Probes: std::fmt::Debug {
+    /// What this host offers whatever the policy asks for (`HostCapabilities::detect`).
+    fn common(&self) -> HostCapabilities;
+    /// Whether sandy may put a process into a process group (`process_group_support`).
+    fn process_group(&self) -> Support;
+    /// What the host says about user namespaces without a trial.
+    fn namespace_facts(&self) -> namespace::HostFacts;
+    /// A trial of `namespaces` in a forked child (`namespace::probe`).
+    fn trial(&self, namespaces: Namespaces) -> Result<(), TrialFailure>;
+}
+
+/// The probes of this host.
+#[derive(Debug)]
+pub(crate) struct ThisHost;
+
+impl Probes for ThisHost {
+    fn common(&self) -> HostCapabilities {
+        HostCapabilities::detect()
+    }
+
+    fn process_group(&self) -> Support {
+        process_group_support()
+    }
+
+    fn namespace_facts(&self) -> namespace::HostFacts {
+        namespace::HostFacts::read()
+    }
+
+    fn trial(&self, namespaces: Namespaces) -> Result<(), TrialFailure> {
+        namespace::probe(namespaces)
     }
 }
 
-/// Whether `children = "contained"` gets a PID namespace. With `ip = "private"` or `filesystem.view
-/// = "policy"` the run needs the user namespace anyway and stays the authoritative answer, as for
-/// them. Without, the PID namespace only adds to the process group, which holds the program's
-/// processes as before, so it is used only where a trial in a forked child works: a host that
-/// allows user namespaces and still denies them to sandy, a container whose seccomp profile denies
-/// `unshare` for one, keeps `contained` as it is.
-fn pid_namespace_support(required: bool, user_namespaces: &namespace::Support) -> Support {
-    let reason = |missing: &namespace::Missing| match missing {
-        namespace::Missing::Unavailable(reason) | namespace::Missing::NeedsSetup(reason) => {
-            reason.clone()
+/// What one backend value has found out about this host. Each property is detected at most
+/// once, the first time a policy needs it, and kept, so every level that one invocation plans,
+/// the notes and explanations of the selected one, and its run see the same host (`Backend`): a
+/// probe that fails for a moment cannot fail for one level and pass for the next. A probe that
+/// only some policies need runs only for them: it is a system call that a sandbox around sandy
+/// can answer with SIGSYS, so it must not run for a level that never makes it.
+#[derive(Debug)]
+pub(crate) struct Detected {
+    probes: Box<dyn Probes>,
+    common: OnceCell<HostCapabilities>,
+    process_group: OnceCell<Support>,
+    namespace_facts: OnceCell<namespace::HostFacts>,
+    trials: RefCell<BTreeMap<Namespaces, Result<(), TrialFailure>>>,
+}
+
+impl Detected {
+    pub(crate) fn new(probes: Box<dyn Probes>) -> Detected {
+        Detected {
+            probes,
+            common: OnceCell::new(),
+            process_group: OnceCell::new(),
+            namespace_facts: OnceCell::new(),
+            trials: RefCell::new(BTreeMap::new()),
         }
-    };
-    if required {
-        return user_namespaces.as_ref().map_err(reason).map(|_| ());
     }
-    namespace::support(&namespace::Purpose::Processes).map_err(|missing| reason(&missing))?;
-    let namespaces = namespace::Namespaces {
-        network: false,
-        mount: false,
-        pid: true,
-    };
-    namespace::probe(namespaces)
-        .map_err(|error| format!("a trial of a PID namespace failed: {error}"))
+
+    /// What this host offers whatever the policy asks for.
+    pub(crate) fn common(&self) -> HostCapabilities {
+        self.common.get_or_init(|| self.probes.common()).clone()
+    }
+
+    /// `common` plus the probes that `policy` needs.
+    pub(crate) fn for_policy(&self, policy: &ResolvedPolicy) -> HostCapabilities {
+        let mut host = self.common();
+        if policy.children == ChildProcesses::Contained {
+            host.process_group = self
+                .process_group
+                .get_or_init(|| self.probes.process_group())
+                .clone();
+        }
+        let private = policy.ip == IpAccess::Private;
+        let hidden = policy.view == FileView::Policy;
+        let pid = plan::wants_pid_namespace(policy);
+        if private || hidden {
+            // The run asks for every namespace in one `unshare`, so the trial does too.
+            let namespaces = Namespaces {
+                network: private,
+                mount: hidden,
+                pid,
+            };
+            host.user_namespaces = namespace::judge(self.facts(), namespace::Purpose::of(policy))
+                .and_then(|()| self.tried(namespaces, "a trial of the sandbox's namespaces"));
+            if pid {
+                host.pid_namespace = host.user_namespaces.clone();
+            }
+        } else if pid {
+            host.pid_namespace = self.pid_namespace();
+        }
+        host
+    }
+
+    fn facts(&self) -> &namespace::HostFacts {
+        self.namespace_facts
+            .get_or_init(|| self.probes.namespace_facts())
+    }
+
+    /// The kept trial of `namespaces`, called `what` in the reason, by what it says about the
+    /// host (`TrialFailure::missing`).
+    fn tried(&self, namespaces: Namespaces, what: &str) -> namespace::Support {
+        let known = self.trials.borrow().get(&namespaces).cloned();
+        let tried = known.unwrap_or_else(|| {
+            let tried = self.probes.trial(namespaces);
+            self.trials.borrow_mut().insert(namespaces, tried.clone());
+            tried
+        });
+        tried.map_err(|failure| failure.missing(what, self.facts().zero_limit(namespaces)))
+    }
+
+    /// Whether `children = "contained"` alone gets a PID namespace. It only adds to the process
+    /// group, which holds the program's processes as before, so it is used only where a trial in
+    /// a forked child works: a host that allows user namespaces and still denies them to sandy, a
+    /// container whose seccomp profile denies `unshare` for one, keeps `contained` as it is.
+    /// What can pass is indeterminate instead, so that it never swaps one mechanism for the other.
+    fn pid_namespace(&self) -> namespace::Support {
+        namespace::judge(self.facts(), namespace::Purpose::Processes)?;
+        let namespaces = Namespaces {
+            network: false,
+            mount: false,
+            pid: true,
+        };
+        self.tried(namespaces, "a trial of a PID namespace")
+    }
 }
 
 /// Whether sandy may put a process into a process group. `children = "contained"` runs the
@@ -205,13 +357,23 @@ fn landlock_abi() -> Result<i32, String> {
 /// The directory that lists the threads of this process.
 pub const THREADS_DIR: &str = "/proc/self/task";
 
-fn thread_count_support() -> Support {
-    std::fs::read_dir(THREADS_DIR).map(|_| ()).map_err(|error| {
-        format!(
-            "cannot list {THREADS_DIR}, which sandy needs to verify that it is single-threaded \
-             before Landlock restricts it: {error}"
-        )
-    })
+fn thread_count_support() -> Result<(), Missing> {
+    std::fs::read_dir(THREADS_DIR)
+        .map(|_| ())
+        .map_err(unlisted_threads)
+}
+
+/// Why sandy cannot count its threads. Without `/proc` that lasts; any other error, such as a
+/// full descriptor table or no memory, can pass.
+fn unlisted_threads(error: io::Error) -> Missing {
+    let reason = format!(
+        "cannot list {THREADS_DIR}, which sandy needs to verify that it is single-threaded \
+         before Landlock restricts it: {error}"
+    );
+    match error.kind() {
+        io::ErrorKind::NotFound => Missing::Unavailable(reason),
+        _ => Missing::Indeterminate(reason),
+    }
 }
 
 fn pidfd_support() -> Support {
@@ -353,9 +515,202 @@ fn has_ambient_capability() -> bool {
     })
 }
 
+/// Probes that answer as a test says and record which of them ran.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct Recording {
+    /// The probes that ran, in order, shared with the test that boxed these probes.
+    pub(crate) ran: std::rc::Rc<RefCell<Vec<String>>>,
+    /// What every trial answers.
+    pub(crate) trial: Result<(), TrialFailure>,
+    /// What the host says about user namespaces.
+    pub(crate) facts: namespace::HostFacts,
+}
+
+#[cfg(test)]
+impl Recording {
+    pub(crate) fn new() -> Recording {
+        Recording {
+            ran: Default::default(),
+            trial: Ok(()),
+            facts: namespace::HostFacts::default(),
+        }
+    }
+
+    pub(crate) fn ran(&self) -> Vec<String> {
+        self.ran.borrow().clone()
+    }
+
+    fn record(&self, probe: String) {
+        self.ran.borrow_mut().push(probe);
+    }
+}
+
+#[cfg(test)]
+impl Probes for Recording {
+    fn common(&self) -> HostCapabilities {
+        self.record("common".to_string());
+        HostCapabilities::detect()
+    }
+
+    fn process_group(&self) -> Support {
+        self.record("process group".to_string());
+        Ok(())
+    }
+
+    fn namespace_facts(&self) -> namespace::HostFacts {
+        self.record("namespace facts".to_string());
+        self.facts.clone()
+    }
+
+    fn trial(&self, namespaces: Namespaces) -> Result<(), TrialFailure> {
+        self.record(format!("trial {namespaces:?}"));
+        self.trial.clone()
+    }
+}
+
+/// A resolved policy from the TOML `text`, without paths or a program, so it resolves on any
+/// host.
+#[cfg(test)]
+pub(crate) fn resolved(text: &str) -> ResolvedPolicy {
+    let policy = sandy_core::Policy::from_toml(&format!("version = 1\n{text}")).unwrap();
+    ResolvedPolicy::resolve(&policy, None).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CONTAINED: &str = "[process]\nchildren = \"contained\"\nsignals = \"isolated\"";
+
+    /// Each probe runs once, when the first policy needs it, and every later policy that needs
+    /// it gets the kept answer.
+    #[test]
+    fn a_second_policy_reuses_the_answers() {
+        let probes = Recording::new();
+        let detected = Detected::new(Box::new(probes.clone()));
+        let contained = resolved(CONTAINED);
+        let private = resolved(&format!("{CONTAINED}\n[network]\nip = \"private\""));
+
+        let first = detected.for_policy(&contained);
+        assert_eq!(
+            probes.ran(),
+            [
+                "common",
+                "process group",
+                "namespace facts",
+                "trial Namespaces { network: false, mount: false, pid: true }",
+            ]
+        );
+        let again = detected.for_policy(&contained);
+        assert_eq!(format!("{first:?}"), format!("{again:?}"));
+        // The private network tries its own set of namespaces, once.
+        detected.for_policy(&private);
+        detected.for_policy(&private);
+        detected.for_policy(&contained);
+        detected.common();
+        assert_eq!(
+            probes.ran()[4..],
+            ["trial Namespaces { network: true, mount: false, pid: true }"]
+        );
+    }
+
+    /// A trial that fails for a reason that can pass makes the namespaces indeterminate, also
+    /// the PID namespace of `contained` alone, and one that the kernel refuses for good makes
+    /// them unavailable. What the host says comes first: under the AppArmor restriction no
+    /// trial runs.
+    #[test]
+    fn a_trial_decides_by_what_it_says_about_the_host() {
+        let failed = |errno| {
+            Err(TrialFailure::Step {
+                message: "cannot fork into the sandbox's PID namespace".to_string(),
+                errno: Some(errno),
+            })
+        };
+        let contained = resolved(CONTAINED);
+        let private = resolved("[network]\nip = \"private\"");
+        for (trial, lasting) in [(failed(libc::EAGAIN), false), (failed(libc::EPERM), true)] {
+            let mut probes = Recording::new();
+            probes.trial = trial;
+            let detected = Detected::new(Box::new(probes));
+            let pid = detected.for_policy(&contained).pid_namespace.unwrap_err();
+            let user = detected.for_policy(&private).user_namespaces.unwrap_err();
+            for (missing, what) in [
+                (pid, "a trial of a PID namespace failed: cannot fork"),
+                (
+                    user,
+                    "a trial of the sandbox's namespaces failed: cannot fork",
+                ),
+            ] {
+                assert!(missing.reason().starts_with(what), "{missing:?}");
+                assert_eq!(
+                    matches!(missing, Missing::Unavailable(_)),
+                    lasting,
+                    "{missing:?}"
+                );
+                assert_eq!(matches!(missing, Missing::Indeterminate(_)), !lasting);
+            }
+        }
+
+        let mut probes = Recording::new();
+        probes.facts = namespace::HostFacts::under_apparmor_restriction();
+        let detected = Detected::new(Box::new(probes.clone()));
+        let missing = detected.for_policy(&private).user_namespaces.unwrap_err();
+        assert!(matches!(missing, Missing::NeedsSetup(_)), "{missing:?}");
+        let missing = detected.for_policy(&contained).pid_namespace.unwrap_err();
+        assert!(matches!(missing, Missing::NeedsSetup(_)), "{missing:?}");
+        assert!(!probes.ran().iter().any(|probe| probe.starts_with("trial")));
+    }
+
+    /// Without `/proc` the thread list is missing for good; any other error can pass.
+    #[test]
+    fn an_unreadable_thread_list_is_unavailable_only_without_proc() {
+        let unlisted = |errno| unlisted_threads(io::Error::from_raw_os_error(errno));
+        assert!(
+            matches!(unlisted(libc::ENOENT), Missing::Unavailable(reason) if reason.contains(THREADS_DIR))
+        );
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::EACCES] {
+            assert!(
+                matches!(unlisted(errno), Missing::Indeterminate(_)),
+                "{errno}"
+            );
+        }
+    }
+
+    /// One requirement that misses several things reports the one that weighs most, as the
+    /// core does: an indeterminate one before a lasting one, which comes before one that setup
+    /// fixes; among equals the first.
+    #[test]
+    fn the_worst_missing_thing_wins() {
+        let setup = || Some(Missing::NeedsSetup("setup".into()));
+        let lasting = |reason: &str| Some(Missing::Unavailable(reason.into()));
+        let passing = || Some(Missing::Indeterminate("passing".into()));
+        assert_eq!(worst([None, None]), None);
+        assert_eq!(worst([setup(), lasting("a"), None]), lasting("a"));
+        assert_eq!(worst([lasting("a"), lasting("b")]), lasting("a"));
+        assert_eq!(worst([lasting("a"), passing(), setup()]), passing());
+        assert_eq!(worst([setup(), None]), setup());
+    }
+
+    /// A policy that needs no process group, user namespace or PID namespace makes none of
+    /// their probes.
+    #[test]
+    fn probes_run_only_for_the_policies_that_need_them() {
+        let probes = Recording::new();
+        let detected = Detected::new(Box::new(probes.clone()));
+        detected.for_policy(&resolved(""));
+        detected.for_policy(&resolved("[process]\nsignals = \"isolated\""));
+        assert_eq!(probes.ran(), ["common"]);
+        // contained with /proc granted gets no PID namespace, so it tries none.
+        let mut with_proc = resolved(CONTAINED);
+        with_proc.paths.push(sandy_core::PathRule {
+            path: "/proc".into(),
+            access: sandy_core::PathAccess::Read,
+            is_dir: true,
+        });
+        detected.for_policy(&with_proc);
+        assert_eq!(probes.ran(), ["common", "process group"]);
+    }
 
     #[test]
     fn detection_does_not_fail_on_this_host() {

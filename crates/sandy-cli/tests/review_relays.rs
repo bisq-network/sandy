@@ -475,27 +475,15 @@ fn a_dead_relay_ends_a_contained_program() {
         return skip("landlock-abi-6", "signal isolation needs Landlock ABI 6");
     }
     let (service_port, stop_service) = holding_service();
-    let inner = free_port();
-    let sandbox_args = contained_forward(inner, service_port);
-    let address = format!("127.0.0.1:{inner}").parse().unwrap();
-    // The program runs until the test sends it a line, then exits with its own status.
-    let start = || {
-        Command::new(sandy_path())
-            .args(run_args(
-                &sandbox_args,
-                &[("read-line", "-"), ("exit", "7")],
-            ))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap()
-    };
+    // Each run has a port of its own: the relay of the first frees its port a moment after the
+    // program, as a process of its own.
+    let ports = [free_port(), free_port()];
+    let address = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
 
     // Control: the port serves while the program and its relay run, sandy keeps the program
     // while the relay lives, and the program's own end is the end of the run.
-    let mut program = start();
-    relay_of(inner, &mut program);
+    let (mut program, _) = start_contained(ports[0], service_port);
+    relay_of(ports[0], &mut program);
     assert!(
         TcpStream::connect_timeout(&address, HALF_SECOND).is_ok(),
         "the forward port did not serve while the relay ran"
@@ -514,8 +502,9 @@ fn a_dead_relay_ends_a_contained_program() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let mut program = start();
-    let relay = relay_of(inner, &mut program);
+    let address = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
+    let (mut program, _) = start_contained(ports[1], service_port);
+    let relay = relay_of(ports[1], &mut program);
     kill_process(relay);
     let deadline = Instant::now() + Duration::from_secs(20);
     while program.try_wait().unwrap().is_none() {
@@ -726,7 +715,10 @@ fn ends_within(pidfd: &std::os::fd::OwnedFd, timeout: Duration) -> bool {
 
 /// The relay of the sandbox that `program` runs: the one process that listens on
 /// 127.0.0.1:`port`. Waits until it is there, and fails if the program ends first. sandy binds
-/// the listener before it starts the relay, so until then sandy itself is that process.
+/// the listener and forks the relay twice, so until the relay has reported that it is ready,
+/// sandy or the process between the two forks can be that one process. sandy starts the program
+/// only after the report, so a caller that must not find either waits until the program runs
+/// (`start_contained`).
 fn relay_of(port: u16, program: &mut std::process::Child) -> u32 {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {

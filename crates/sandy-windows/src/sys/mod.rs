@@ -17,8 +17,9 @@ use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::AsRawSocket;
 
 use sandy_core::{
-    Backend, ChildProcesses, PlanItem, ProtectedPath, Requirement, ResolvedPolicy, SandboxError,
-    SetupOptions, SetupOutcome, Status, StatusReport, TargetCommand, Win32k, path_directories,
+    Backend, ChildProcesses, PathRule, PlanItem, ProtectedPath, Requirement, ResolvedLevel,
+    ResolvedPolicy, SandboxError, SetupOptions, SetupOutcome, StatusReport, TargetCommand, Win32k,
+    path_directories,
 };
 use windows_sys::Win32::Security::{
     WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
@@ -32,17 +33,35 @@ use windows_sys::Win32::UI::Shell::{
 };
 
 use crate::cmdline::{command_line, is_batch_file, without_verbatim_prefix};
+use crate::detect::{Detection, Probes};
 use crate::envblock::{LOCAL_APP_DATA, SYSTEM_ROOT, environment_block};
 use crate::name::validate_appcontainer_name;
-use crate::plan::{
-    HostCapabilities, NetworkCapability, loopback_exemption, network_capabilities, plan_for,
-};
+use crate::plan::{NetworkCapability, Problem, loopback_exemption, network_capabilities, worst};
+use crate::version::WindowsVersion;
 use util::{Sid, wide, wide_nul};
 
 pub use host_network::WindowsHost;
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct WindowsBackend;
+/// The Windows backend. It keeps what it learns of the host (`Detection`), so one value serves
+/// one invocation of sandy.
+#[derive(Debug)]
+pub struct WindowsBackend {
+    detection: Detection<WindowsProbes>,
+}
+
+impl WindowsBackend {
+    pub fn new() -> Self {
+        WindowsBackend {
+            detection: Detection::new(WindowsProbes),
+        }
+    }
+}
+
+impl Default for WindowsBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Backend for WindowsBackend {
     fn name(&self) -> &'static str {
@@ -50,18 +69,32 @@ impl Backend for WindowsBackend {
     }
 
     fn plan(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
-        plan_for(policy, &detect(policy))
+        self.detection.plan(policy)
     }
 
+    /// The trials that the plan cannot make without touching the host: the listeners of the
+    /// relays, the nesting of sandy's job and the win32k lockdown. Every finding is
+    /// indeterminate (`Backend::verify`).
     fn verify(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
         let mut items = sandy_core::verify::relay_listeners(policy);
-        if let Err(reason) = host::job_nests() {
-            items.extend(crate::plan::job_unavailable(policy, &reason));
+        // The `__forward` relay of the egress broker listens on the program's egress port inside
+        // the AppContainer, which shares the host's ports, like a forwarded port.
+        if let Some(egress) = policy.egress {
+            let address = egress.listen();
+            if let Err(error) = std::net::TcpListener::bind(address) {
+                items.push(PlanItem::indeterminate(
+                    Requirement::EgressBrokered,
+                    format!("cannot listen on {address}: {error}"),
+                ));
+            }
+        }
+        if let Err(reason) = host::job_nests(self.detection.outer_job_ui()) {
+            items.extend(crate::plan::job_indeterminate(policy, &reason));
         }
         if policy.windows.win32k == Win32k::Deny
             && let Err(reason) = host::win32k_lockdown()
         {
-            items.push(PlanItem::unavailable(Requirement::Win32kDenied, reason));
+            items.push(PlanItem::indeterminate(Requirement::Win32kDenied, reason));
         }
         items
     }
@@ -83,16 +116,13 @@ impl Backend for WindowsBackend {
         command: &TargetCommand,
         status: &StatusReport,
     ) -> Result<i32, SandboxError> {
-        // The caller checked the plan, but the host may have changed since. Every mechanism
-        // below is one the plan named.
+        // The plan of the selection, kept with the answers it saw: the caller checked it, and
+        // every mechanism below is one it named. A step that finds the host changed fails.
         if let Some(item) = self.plan(policy).into_iter().find(|i| !i.is_enforced()) {
-            let reason = match item.status {
-                Status::Unavailable { reason } | Status::NeedsSetup { reason } => reason,
-                Status::Enforced { .. } => unreachable!(),
-            };
             return Err(SandboxError::new(format!(
-                "{}: {reason}",
-                item.requirement.description()
+                "{}: {}",
+                item.requirement.description(),
+                item.status.reason().unwrap_or_default()
             )));
         }
         let name = policy
@@ -136,24 +166,29 @@ impl Backend for WindowsBackend {
             capabilities.push(acl::grant(name, rule, &held)?);
         }
 
-        // The egress broker runs in a sandbox of its own, so prepare it before the relays that
-        // name the AppContainer they belong to. Its profile stays like the program's: the runs
-        // of one policy share it, and one that ends must not take it from one that starts.
-        let broker = match policy.egress {
-            None => None,
-            Some(egress) => Some(EgressBroker::prepare(name, egress, &held)?),
-        };
-
-        // The relays run sandy's own executable with one capability: read and execute access to
-        // that file. The same capability opens the sockets of forwarded ports, which the egress
-        // broker also reaches, so it is needed for `egress` too.
-        let relay_capability =
+        // The relays run sandy's own executable, the one the plan read, with one capability:
+        // read and execute access to that file. The same capability opens the sockets of
+        // forwarded ports, which the egress broker also reaches, so it is needed for `egress` too.
+        let relay_rule =
             if policy.expose.is_empty() && policy.forward.is_empty() && policy.egress.is_none() {
                 None
             } else {
-                let rule = relay::relay_program(name).map_err(SandboxError::new)?;
-                Some((acl::grant(name, &rule, &held)?, rule.path))
+                match self.detection.relay() {
+                    Ok(target) => Some(target.rule().clone()),
+                    Err(problem) => return Err(SandboxError::new(problem.to_string())),
+                }
             };
+        // The egress broker runs in a sandbox of its own, so prepare it before the relays that
+        // name the AppContainer they belong to. Its profile stays like the program's: the runs
+        // of one policy share it, and one that ends must not take it from one that starts.
+        let broker = match (policy.egress, &relay_rule) {
+            (Some(egress), Some(rule)) => Some(EgressBroker::prepare(name, egress, rule, &held)?),
+            _ => None,
+        };
+        let relay_capability = match relay_rule {
+            Some(rule) => Some((acl::grant(name, &rule, &held)?, rule.path)),
+            None => None,
+        };
         let mut relays = Vec::new();
         let mut forwarding = None;
         if let Some((capability, sandy)) = &relay_capability {
@@ -350,17 +385,19 @@ impl Backend for WindowsBackend {
     /// UAC prompt (`elevate`).
     fn elevate(
         &self,
-        policy: &ResolvedPolicy,
+        levels: &[ResolvedLevel],
         remove: bool,
         options: SetupOptions,
         args: &[OsString],
     ) -> Result<SetupOutcome, SandboxError> {
         if elevate::is_elevated()? {
-            return if remove {
-                self.remove(policy, options)
-            } else {
-                self.setup(policy, options)
-            };
+            return sandy_core::setup_levels(levels, |policy| {
+                if remove {
+                    self.remove(policy, options)
+                } else {
+                    self.setup(policy, options)
+                }
+            });
         }
         elevate::run_elevated(args)
     }
@@ -376,17 +413,18 @@ struct EgressBroker {
 }
 
 impl EgressBroker {
+    /// `relay` is the rule that lets it run sandy's executable.
     fn prepare(
         program_name: &str,
         egress: sandy_core::Egress,
+        relay: &PathRule,
         held: &[Sid],
     ) -> Result<EgressBroker, SandboxError> {
         let name = crate::name::egress_broker_name(program_name).map_err(SandboxError::new)?;
         let container = appcontainer::ensure_profile(&name)?;
         // The broker can write its profile folder (its TEMP) but must not execute what it writes.
         acl::deny_execute_in_profile(&container, &profile_folder(&container)?)?;
-        let rule = relay::relay_program(&name).map_err(SandboxError::new)?;
-        let mut capabilities = vec![acl::grant(&name, &rule, held)?];
+        let mut capabilities = vec![acl::grant(&name, relay, held)?];
         for capability in crate::plan::broker_network_capabilities(egress.reach) {
             capabilities.push(network_capability_sid(*capability)?);
         }
@@ -423,61 +461,73 @@ fn process_for<'a>(
     })
 }
 
-/// Reads the host state the plan depends on. Changes nothing.
-fn detect(policy: &ResolvedPolicy) -> HostCapabilities {
-    let container = policy
-        .windows
-        .appcontainer_name
-        .as_deref()
-        .ok_or_else(|| "no AppContainer name".to_string())
-        .and_then(|name| appcontainer::sid(name).map_err(|error| error.to_string()));
-    HostCapabilities {
-        appcontainer: container.as_ref().map(|_| ()).map_err(Clone::clone),
-        windows: host::windows_version(),
-        capability_sids: host::derive_capability_sids().map(|_| ()),
-        writable_paths: check_writable_paths(policy),
-        // Only `FilesystemConfined` reads this, and only with an AppContainer name.
-        grants: match policy.windows.appcontainer_name.as_deref() {
-            Some(name) => check_grants(name, policy),
-            None => Ok(()),
-        },
-        outer_job_ui: host::outer_job_ui(),
-        firewall: network::firewall_running(),
-        loopback_exempt: container.and_then(|sid| network::is_loopback_exempt(&sid)),
-        broker_loopback_exempt: match policy.windows.appcontainer_name.as_deref() {
-            Some(name) if policy.egress.is_some() => match crate::name::egress_broker_name(name) {
-                Ok(broker) => appcontainer::sid(&broker)
-                    .map_err(|error| error.to_string())
-                    .and_then(|sid| network::is_loopback_exempt(&sid)),
-                // The plan reports a name with no room for the broker's suffix.
-                Err(_) => Ok(false),
-            },
-            _ => Ok(false),
-        },
-        // The relay requirements and the egress broker read these; the broker runs sandy's
-        // executable too, from its own AppContainer, which needs a grant of its own, and reaches
-        // the program over an AF_UNIX socket like a forwarded port.
-        relay_program: match policy.windows.appcontainer_name.as_deref() {
-            Some(name)
-                if !policy.expose.is_empty()
-                    || !policy.forward.is_empty()
-                    || policy.egress.is_some() =>
-            {
-                relay::relay_program(name).and_then(|rule| {
-                    match policy.egress.map(|_| crate::name::egress_broker_name(name)) {
-                        Some(Ok(broker)) => relay::relay_program(&broker).map(|_| rule.path),
-                        // The plan reports a name with no room for the broker's suffix.
-                        Some(Err(_)) | None => Ok(rule.path),
-                    }
-                })
-            }
-            _ => Err("no relay is needed".into()),
-        },
-        forward_sockets: if policy.forward.is_empty() && policy.egress.is_none() {
-            Err("no forwarded port".into())
-        } else {
-            forward::check()
-        },
+/// The answers of this host to the probes of the plan (`detect::Probes`). Each changes nothing.
+/// A probe that fails is indeterminate, unless it read a lasting state (`probe`).
+#[derive(Debug)]
+struct WindowsProbes;
+
+impl Probes for WindowsProbes {
+    type Sid = Sid;
+    type Relay = acl::GrantTarget;
+    type Layout = Layout;
+
+    fn windows_version(&self) -> Result<WindowsVersion, Problem> {
+        host::windows_version().map_err(Problem::Indeterminate)
+    }
+
+    fn capability_sids(&self) -> Result<(), Problem> {
+        host::derive_capability_sids()
+            .map(|_| ())
+            .map_err(Problem::Unavailable)
+    }
+
+    fn outer_job_ui(&self) -> Result<Option<u32>, Problem> {
+        host::outer_job_ui().map_err(Problem::Indeterminate)
+    }
+
+    fn firewall(&self) -> Result<(), Problem> {
+        network::firewall_running()
+    }
+
+    fn loopback_exemptions(&self) -> Result<Vec<Sid>, Problem> {
+        network::loopback_exemptions()
+    }
+
+    fn forward_sockets(&self) -> Result<(), Problem> {
+        forward::check()
+    }
+
+    fn relay(&self) -> Result<acl::GrantTarget, Problem> {
+        relay::relay_target()
+    }
+
+    fn layout(&self) -> Result<Layout, Problem> {
+        Layout::read().map_err(|error| Problem::Indeterminate(error.to_string()))
+    }
+
+    fn appcontainer_sid(&self, name: &str) -> Result<Sid, Problem> {
+        appcontainer::sid(name).map_err(|error| Problem::Indeterminate(error.to_string()))
+    }
+
+    fn relay_path<'relay>(&self, relay: &'relay acl::GrantTarget) -> &'relay std::path::Path {
+        &relay.rule().path
+    }
+
+    fn relay_grantable(&self, relay: &acl::GrantTarget, name: &str) -> Result<(), Problem> {
+        relay::grantable(relay, name)
+    }
+
+    fn writable_paths(
+        &self,
+        layout: &Layout,
+        policy: &ResolvedPolicy,
+        container: &Sid,
+    ) -> Result<(), Problem> {
+        check_writable_paths(layout, policy, container)
+    }
+
+    fn grants(&self, name: &str, policy: &ResolvedPolicy) -> Result<(), Problem> {
+        check_grants(name, policy)
     }
 }
 
@@ -661,71 +711,107 @@ fn user_profiles() -> Result<Vec<std::path::PathBuf>, SandboxError> {
     Ok(profiles)
 }
 
+/// The locations of this host that a writable path must not reach (rules 3 and 6), and how to
+/// compare paths with them. A known folder that Windows does not name makes the policy
+/// indeterminate (`WindowsProbes::layout`).
+struct Layout {
+    identity: sandy_core::PathIdentity,
+    system: Vec<ProtectedPath>,
+    trusted: Vec<ProtectedPath>,
+    state: std::path::PathBuf,
+}
+
+impl Layout {
+    fn read() -> Result<Layout, SandboxError> {
+        Ok(Layout {
+            identity: sandy_core::PathIdentity::read()
+                .map_err(|error| SandboxError::new(error.to_string()))?,
+            system: system_directories()?,
+            trusted: trusted_locations()?,
+            state: state_directory()?,
+        })
+    }
+}
+
 /// Rules 3 and 6 for the writable paths of `policy`: none may overlap a system directory or one
-/// of the user's trusted locations, and nobody the program's token carries may execute files in
-/// one. Changes nothing.
+/// of the user's trusted locations in `layout`, and nobody the program's token carries may
+/// execute files in one. `container` is the policy's AppContainer. Changes nothing.
 ///
 /// Paths are compared as rules 3 and 4 compare them (`PathIdentity`): by the identity of the
 /// directories on the way, so a junction or another spelling of a directory counts as that
-/// directory ("Links and identity" in docs/windows.md).
-fn check_writable_paths(policy: &ResolvedPolicy) -> Result<(), String> {
-    let identity = sandy_core::PathIdentity::read().map_err(|error| error.to_string())?;
-    let system = system_directories().map_err(|error| error.to_string())?;
-    if let Some((rule, directory)) = policy.writable_conflict(&system, &identity) {
-        return Err(format!(
+/// directory ("Links and identity" in docs/windows.md). An overlap is a conflict of the policy
+/// with the layout of this host; one that sandy only assumes because it cannot read the
+/// identity of a directory on the way is indeterminate.
+fn check_writable_paths(
+    layout: &Layout,
+    policy: &ResolvedPolicy,
+    container: &Sid,
+) -> Result<(), Problem> {
+    let Layout {
+        identity,
+        system,
+        trusted,
+        state,
+    } = layout;
+    let held =
+        held_sids(policy, container).map_err(|error| Problem::Indeterminate(error.to_string()))?;
+    let mut problems = Vec::new();
+    if let Some((rule, directory)) = policy.known_writable_conflict(system, identity) {
+        problems.push(Problem::Conflict(format!(
             "writable path {} overlaps the system directory {}, where Windows lets every \
              AppContainer read and execute files",
             rule.path.display(),
             directory.path.display()
-        ));
+        )));
     }
-    let trusted = trusted_locations().map_err(|error| error.to_string())?;
-    if let Some((rule, location)) = policy.writable_conflict(&trusted, &identity) {
-        let state = state_directory().map_err(|error| error.to_string())?;
-        let why = if location.path == state {
+    if let Some((rule, location)) = policy.known_writable_conflict(trusted, identity) {
+        let why = if location.path == *state {
             "where sandy keeps the state of its runs; the program could let a run with another \
              policy join its AppContainer, or make every later run wait"
         } else {
             "which programs outside the sandbox read or execute later; a file the program leaves \
              there runs outside the sandbox"
         };
-        return Err(format!(
+        problems.push(Problem::Conflict(format!(
             "writable path {} overlaps {}, {why}",
             rule.path.display(),
             location.path.display()
-        ));
+        )));
     }
-    let held = match policy.windows.appcontainer_name.as_deref() {
-        Some(name) => {
-            let container = appcontainer::sid(name).map_err(|error| error.to_string())?;
-            held_sids(policy, &container).map_err(|error| error.to_string())?
+    for protected in [system, trusted] {
+        if let Some((rule, location)) = policy.writable_conflict(protected, identity) {
+            problems.push(Problem::Indeterminate(format!(
+                "cannot tell whether writable path {} overlaps {}: sandy cannot read the identity \
+                 of a directory on the way",
+                rule.path.display(),
+                location.path.display()
+            )));
         }
-        None => Vec::new(),
-    };
-    let writable = policy
-        .paths
-        .iter()
-        .filter(|rule| rule.access == sandy_core::PathAccess::ReadWrite);
-    for rule in writable {
-        acl::check_writable(rule, &held)?;
     }
-    Ok(())
+    problems.extend(
+        policy
+            .paths
+            .iter()
+            .filter_map(|rule| acl::check_writable(rule, &held).err()),
+    );
+    worst(problems).map_or(Ok(()), Err)
 }
 
 /// Whether sandy can give the AppContainer access to every policy path. `run` adds an entry for
 /// the path's capability to the path's access control list, which needs the right to change that
 /// list, and refuses when it cannot. A path whose list is already right needs no change. Changes
 /// nothing.
-fn check_grants(appcontainer: &str, policy: &ResolvedPolicy) -> Result<(), String> {
-    for rule in &policy.paths {
-        acl::grantable(appcontainer, rule).map_err(|reason| {
+fn check_grants(appcontainer: &str, policy: &ResolvedPolicy) -> Result<(), Problem> {
+    let problems = policy.paths.iter().filter_map(|rule| {
+        let problem = acl::grantable(appcontainer, rule).err()?;
+        Some(crate::probe::path_grant(problem).map(|reason| {
             format!(
                 "cannot give AppContainer {appcontainer:?} access to {}: {reason}",
                 rule.path.display()
             )
-        })?;
-    }
-    Ok(())
+        }))
+    });
+    worst(problems).map_or(Ok(()), Err)
 }
 
 /// Where Windows puts a known folder. `KF_FLAG_DONT_VERIFY`, because the default verifies that
@@ -795,10 +881,22 @@ fn network_capability_sid(capability: NetworkCapability) -> Result<Sid, SandboxE
 
 #[cfg(test)]
 mod tests {
-    use crate::access;
+    use crate::{access, probe};
     use windows_sys::Win32::Foundation as f;
     use windows_sys::Win32::Security as ss;
     use windows_sys::Win32::Storage::FileSystem as fs;
+
+    #[test]
+    fn probe_constants_match_windows_sys() {
+        use windows_sys::Win32::Networking::WinSock::WSAEAFNOSUPPORT;
+        use windows_sys::Win32::System::Services as sv;
+        assert_eq!(probe::ERROR_ACCESS_DENIED as u32, f::ERROR_ACCESS_DENIED);
+        assert_eq!(probe::WSAEAFNOSUPPORT, WSAEAFNOSUPPORT);
+        assert_eq!(probe::SERVICE_STOPPED, sv::SERVICE_STOPPED);
+        assert_eq!(probe::SERVICE_START_PENDING, sv::SERVICE_START_PENDING);
+        assert_eq!(probe::SERVICE_STOP_PENDING, sv::SERVICE_STOP_PENDING);
+        assert_eq!(probe::SERVICE_RUNNING, sv::SERVICE_RUNNING);
+    }
 
     #[test]
     fn access_constants_match_windows_sys() {

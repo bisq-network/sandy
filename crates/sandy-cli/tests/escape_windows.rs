@@ -22,6 +22,9 @@ use common::*;
 const EXIT_NOT_ENFORCEABLE: i32 = 1;
 /// `check`: not enforceable, but `sandy setup` with administrator rights would make it so.
 const EXIT_NEEDS_SETUP: i32 = 2;
+/// `check` and `run` for a policy that contradicts itself or the layout of this host, which no
+/// fallback level changes (`Status::Conflict`).
+const EXIT_CONFLICT: i32 = EXIT_FAILURE;
 
 /// The status of a program that Ctrl+C or Ctrl+Break ended (`STATUS_CONTROL_C_EXIT`).
 const STATUS_CONTROL_C_EXIT: i32 = 0xC000_013A_u32 as i32;
@@ -163,7 +166,7 @@ fn a_writable_path_that_all_appcontainers_may_execute_is_refused() {
         .unwrap();
     assert!(granted.status.success(), "{granted:?}");
     let output = check(&fixture);
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(output.status.code(), Some(EXIT_CONFLICT), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("ALL APPLICATION PACKAGES"), "{stdout}");
 }
@@ -339,8 +342,8 @@ fn refuses_to_grant_through_a_junction() {
 
 /// sandy grants a policy path by adding an entry to its access control list, which needs the
 /// right to change that list. `check` reports a path where the user lacks it instead of calling
-/// the policy enforced, and `run` refuses it. An OWNER RIGHTS entry takes the right from the
-/// owner too.
+/// the policy enforced, as a conflict of the policy with that path, and `run` refuses it. An
+/// OWNER RIGHTS entry takes the right from the owner too.
 ///
 /// sandy runs without the privileges of this process here: an administrator's SSH session has
 /// `SeRestorePrivilege` enabled, which lets sandy change every access list, as `check` then
@@ -366,7 +369,7 @@ fn check_reports_a_path_whose_permissions_the_user_cannot_change() {
         assert!(changed.status.success(), "{changed:?}");
     }
     let (code, output) = sandy_without_privileges(&check);
-    assert_eq!(code as i32, EXIT_NOT_ENFORCEABLE, "{output}");
+    assert_eq!(code as i32, EXIT_CONFLICT, "{output}");
     assert!(output.contains(&file), "{output}");
     let run = run_program(&policy, &probe_path(), &["read", &file]);
     let (code, output) = sandy_without_privileges(&run);
@@ -1028,11 +1031,7 @@ fn refuses_batch_files() {
 #[test]
 fn needs_an_appcontainer_name() {
     let output = sandy(["check"]);
-    assert_eq!(
-        output.status.code(),
-        Some(EXIT_NOT_ENFORCEABLE),
-        "{output:?}"
-    );
+    assert_eq!(output.status.code(), Some(EXIT_CONFLICT), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("appcontainer"), "{stdout}");
 }
@@ -1792,7 +1791,7 @@ fn refuses_ambiguous_and_package_shaped_appcontainer_names() {
         let output = sandy(["check", "--appcontainer", name]);
         assert_eq!(
             output.status.code(),
-            Some(EXIT_NOT_ENFORCEABLE),
+            Some(EXIT_CONFLICT),
             "{name:?}: {output:?}"
         );
     }
@@ -2372,11 +2371,7 @@ fn refuses_a_writable_path_over_the_startup_folder() {
     }
     let refused = check_with_path("C:\\Windows\\system32", startup.to_str().unwrap());
     let report = String::from_utf8_lossy(&refused.stdout);
-    assert_eq!(
-        refused.status.code(),
-        Some(EXIT_NOT_ENFORCEABLE),
-        "{report}"
-    );
+    assert_eq!(refused.status.code(), Some(EXIT_CONFLICT), "{report}");
     assert!(report.contains("runs outside the sandbox"), "{report}");
 }
 
@@ -2428,11 +2423,7 @@ fn links_are_refused_like_their_targets(kind: &str) -> bool {
     ] {
         let refused = check_with_path("C:\\Windows\\system32", target.to_str().unwrap());
         let report = String::from_utf8_lossy(&refused.stdout);
-        assert_eq!(
-            refused.status.code(),
-            Some(EXIT_NOT_ENFORCEABLE),
-            "{report}"
-        );
+        assert_eq!(refused.status.code(), Some(EXIT_CONFLICT), "{report}");
         assert!(report.contains(reason), "{report}");
 
         let Some(link) = DirectoryLink::new(kind, &fixture.path(name), target) else {
@@ -2442,7 +2433,7 @@ fn links_are_refused_like_their_targets(kind: &str) -> bool {
         let report = String::from_utf8_lossy(&output.stdout);
         assert_eq!(
             output.status.code(),
-            Some(EXIT_NOT_ENFORCEABLE),
+            Some(EXIT_CONFLICT),
             "{} passed: {report}",
             link.arg()
         );
@@ -2722,7 +2713,7 @@ fn network_and_share_paths_are_refused() {
         let report = String::from_utf8_lossy(&output.stdout);
         assert_eq!(
             output.status.code(),
-            Some(EXIT_NOT_ENFORCEABLE),
+            Some(EXIT_CONFLICT),
             "{policy:?}: {report}"
         );
         assert!(
@@ -2761,11 +2752,7 @@ fn refuses_a_writable_path_into_sandys_state_folder() {
     for writable in [&state, &runs] {
         let refused = check_with_path("C:\\Windows\\system32", writable.to_str().unwrap());
         let report = String::from_utf8_lossy(&refused.stdout);
-        assert_eq!(
-            refused.status.code(),
-            Some(EXIT_NOT_ENFORCEABLE),
-            "{report}"
-        );
+        assert_eq!(refused.status.code(), Some(EXIT_CONFLICT), "{report}");
         assert!(report.contains("state of its runs"), "{report}");
     }
     let target = runs.join(format!("{}.probe", appcontainer_sid(&appcontainer_name())));
@@ -2891,11 +2878,7 @@ fn refuses_a_writable_path_that_holds_a_directory_on_path_and_the_startup_folder
         startup.to_str().unwrap(),
     );
     let report = String::from_utf8_lossy(&refused.stdout);
-    assert_eq!(
-        refused.status.code(),
-        Some(EXIT_NOT_ENFORCEABLE),
-        "{report}"
-    );
+    assert_eq!(refused.status.code(), Some(EXIT_CONFLICT), "{report}");
     assert!(report.contains("runs outside the sandbox"), "{report}");
     // The folder on PATH is warned about as well, so the refusal did win over a warning.
     let warnings = String::from_utf8_lossy(&refused.stderr);

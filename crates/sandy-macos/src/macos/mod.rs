@@ -18,13 +18,12 @@ use sandy_core::{
 
 use std::ffi::CStr;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use crate::binary;
-use crate::plan::{HostCapabilities, SHEBANG_LEVELS, executable_paths, plan_for};
-use crate::profile::{
-    broker_holds, broker_profile, generate, relay_holds, relay_pairs, relay_profile,
-    watcher_profile,
-};
+use crate::detect::{Detected, Probes};
+use crate::plan::{ProfileError, SHEBANG_LEVELS};
+use crate::profile::{Profile, broker_holds, generate, relay_holds, relay_pairs};
 use seatbelt::Seatbelt;
 
 /// The tests that bind ports at every address of this Mac take this first: a port that one of
@@ -45,9 +44,12 @@ const _: () = {
 
 /// Seatbelt profile applied in-process with sandbox_init_with_parameters, then the target
 /// replaces sandy, or with `children = "contained"` a forked child of sandy (see
-/// `docs/macos.md`).
+/// `docs/macos.md`). One value detects this Mac once (`Detected`), and its `run` applies the
+/// profiles with the Seatbelt functions that its plans saw.
 #[derive(Debug, Default)]
-pub struct MacosBackend;
+pub struct MacosBackend {
+    host: Detected<ThisMac>,
+}
 
 impl Backend for MacosBackend {
     fn name(&self) -> &'static str {
@@ -55,36 +57,19 @@ impl Backend for MacosBackend {
     }
 
     fn plan(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
-        plan_for(policy, &detect(policy))
+        self.host.plan(policy)
     }
 
     fn notes(&self, policy: &ResolvedPolicy) -> Vec<String> {
-        crate::plan::notes(policy)
+        self.host.notes(policy)
     }
 
+    /// Every finding here is `Indeterminate`: any local user can hold a port at an address of
+    /// this Mac, and any process of sandy's user can stop the trial's helper.
     fn verify(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
-        let mut items = sandy_core::verify::relay_listeners(policy);
-        // Like the listeners, the ports the relay and the broker hold can be taken; the trial
-        // sockets close at once.
-        let holds = relay_holds(policy).into_iter().chain(broker_holds(policy));
-        items.extend(holds.into_iter().find_map(|hold| {
-            let error = holder::hold(hold.port, &hold.leave).err()?;
-            Some(PlanItem::unavailable(
-                Requirement::IpNetworkPrivate,
-                error.to_string(),
-            ))
-        }));
-        if let Some(egress) = policy.egress {
-            let listen = egress.listen();
-            if let Err(error) = std::net::TcpListener::bind(listen) {
-                items.push(PlanItem::unavailable(
-                    Requirement::EgressBrokered,
-                    format!("cannot listen on {listen}: {error}"),
-                ));
-            }
-        }
-        if let Err(reason) = applies_in_a_trial(policy) {
-            items.extend(crate::plan::profile_unavailable(policy, &reason));
+        let mut items = held_ports(policy);
+        if let Err(reason) = self.applies_in_a_trial(policy) {
+            items.extend(crate::plan::profile_indeterminate(policy, &reason));
         }
         items
     }
@@ -102,7 +87,7 @@ impl Backend for MacosBackend {
                 SandboxError::io(format!("cannot change to {}", cwd.display()), error)
             })?;
         }
-        let seatbelt = Seatbelt::load().map_err(SandboxError::new)?;
+        let seatbelt = self.host.seatbelt().map_err(SandboxError::new)?;
         // Before anything is forked, so that no process sandy starts keeps the ports either.
         exec::reset_exception_ports()?;
         let contained = policy.children == ChildProcesses::Contained;
@@ -177,91 +162,98 @@ impl Backend for MacosBackend {
     }
 }
 
-/// Loads Seatbelt and compiles the profiles of `policy` (the program's, the relay's with exposed
-/// or forwarded ports, the egress broker's, and the watcher's with `end_with_parent`) without
-/// applying them. Neither
-/// step changes the sandbox state of the process.
-fn detect(policy: &ResolvedPolicy) -> HostCapabilities {
-    let interpreter = policy.interpreter_problem(SHEBANG_LEVELS, &executable_paths(policy));
-    let trusted_locations = crate::trust::locations();
-    match Seatbelt::load() {
-        Ok(seatbelt) => HostCapabilities {
-            seatbelt: Ok(()),
-            interpreter,
-            trusted_locations,
-            profile: seatbelt
-                .compile(&generate(policy))
-                .and_then(|()| {
-                    let pairs = relay_pairs(policy);
-                    if pairs.is_empty() {
-                        return Ok(());
-                    }
-                    seatbelt
-                        .compile(&relay_profile(&pairs))
-                        .map_err(|message| format!("relay profile: {message}"))
-                })
-                .and_then(|()| {
-                    let Some(egress) = policy.egress else {
-                        return Ok(());
-                    };
-                    seatbelt
-                        .compile(&broker_profile(egress.port))
-                        .map_err(|message| format!("egress broker profile: {message}"))
-                })
-                .and_then(|()| {
-                    if !policy.end_with_parent {
-                        return Ok(());
-                    }
-                    seatbelt
-                        .compile(&watcher_profile())
-                        .map_err(|message| format!("watcher profile: {message}"))
-                }),
-            already_sandboxed: seatbelt.is_sandboxed(),
-            rosetta: rosetta(policy),
-        },
-        Err(reason) => HostCapabilities {
-            seatbelt: Err(reason),
-            profile: Err("not compiled".to_string()),
-            already_sandboxed: false,
-            rosetta: rosetta(policy),
-            interpreter,
-            trusted_locations,
-        },
+impl MacosBackend {
+    pub fn new() -> MacosBackend {
+        MacosBackend::default()
+    }
+
+    /// Applies the program's profile in a helper process, which ends right after. `check`
+    /// compiles the profile, but a profile that compiles can still be refused when it is
+    /// applied, and sandy must not apply it to itself: `check` has to leave its own process
+    /// unsandboxed.
+    ///
+    /// The helper only applies the profile and ends. It must not execute anything: only a
+    /// `read_exec` path grants `process-exec*`, so the profile would refuse that and the trial
+    /// would report a problem the run does not have.
+    ///
+    /// A missing Seatbelt and a sandbox around sandy are reported by the plan, so the trial stays
+    /// silent about them.
+    fn applies_in_a_trial(&self, policy: &ResolvedPolicy) -> Result<(), String> {
+        let Ok(seatbelt) = self.host.seatbelt() else {
+            return Ok(());
+        };
+        if self.host.sandboxed(&seatbelt) {
+            return Ok(());
+        }
+        let profile = generate(policy);
+        helper::start("the trial sandbox", &[], move |ready| {
+            match seatbelt.apply(&profile) {
+                Ok(()) => ready.report(),
+                Err(message) => ready.fail(&message),
+            }
+        })
+        .map(drop)
+        .map_err(|error| error.to_string())
     }
 }
 
-/// Applies the program's profile in a helper process, which ends right after. `check` compiles
-/// the profile, but a profile that compiles can still be refused when it is applied, and sandy
-/// must not apply it to itself: `check` has to leave its own process unsandboxed.
-///
-/// The helper only applies the profile and ends. It must not execute anything: only a `read_exec`
-/// path grants `process-exec*`, so the profile would refuse that and the trial would report a
-/// problem the run does not have.
-///
-/// A missing Seatbelt and a sandbox around sandy are reported by the plan, so the trial stays
-/// silent about them.
-fn applies_in_a_trial(policy: &ResolvedPolicy) -> Result<(), String> {
-    let Ok(seatbelt) = Seatbelt::load() else {
-        return Ok(());
-    };
-    if seatbelt.is_sandboxed() {
-        return Ok(());
-    }
-    let profile = generate(policy);
-    helper::start("the trial sandbox", &[], move |ready| {
-        match seatbelt.apply(&profile) {
-            Ok(()) => ready.report(),
-            Err(message) => ready.fail(&message),
+/// The ports of the relay and the broker that another socket holds now, which would make `run`
+/// fail. Each is `Indeterminate`: a port can be free a moment later, and any local user can take
+/// one. The trial sockets close at once.
+fn held_ports(policy: &ResolvedPolicy) -> Vec<PlanItem> {
+    let mut items = sandy_core::verify::relay_listeners(policy);
+    let holds = relay_holds(policy).into_iter().chain(broker_holds(policy));
+    items.extend(holds.into_iter().find_map(|hold| {
+        let error = holder::hold(hold.port, &hold.leave).err()?;
+        Some(PlanItem::indeterminate(
+            Requirement::IpNetworkPrivate,
+            error.to_string(),
+        ))
+    }));
+    if let Some(egress) = policy.egress {
+        let listen = egress.listen();
+        if let Err(error) = std::net::TcpListener::bind(listen) {
+            items.push(PlanItem::indeterminate(
+                Requirement::EgressBrokered,
+                format!("cannot listen on {listen}: {error}"),
+            ));
         }
-    })
-    .map(drop)
-    .map_err(|error| error.to_string())
+    }
+    items
+}
+
+/// The probes of this Mac. Neither changes the sandbox state of the process.
+#[derive(Debug, Default)]
+struct ThisMac;
+
+impl Probes for ThisMac {
+    type Seatbelt = Seatbelt;
+
+    fn load(&self) -> Result<Seatbelt, String> {
+        Seatbelt::load()
+    }
+
+    fn sandboxed(&self, seatbelt: &Seatbelt) -> bool {
+        seatbelt.is_sandboxed()
+    }
+
+    fn compile(&self, seatbelt: &Seatbelt, profile: &Profile) -> Result<(), ProfileError> {
+        seatbelt.compile(profile)
+    }
+
+    fn rosetta(&self, program: Option<&Path>) -> Option<String> {
+        rosetta(program)
+    }
+
+    fn home_directories(&self) -> Result<Vec<PathBuf>, String> {
+        sandy_core::trust::home_directories()
+    }
 }
 
 /// Why the program would run as x86_64 code through Rosetta, if it would. Rosetta loads its
 /// runtime into every translated process, and the profile does not allow it, so the program would
 /// abort at its start. A process that runs translated executes universal programs as x86_64 too.
-fn rosetta(policy: &ResolvedPolicy) -> Option<String> {
+fn rosetta(program: Option<&Path>) -> Option<String> {
     if sysctl_flag(c"sysctl.proc_translated") {
         return Some(
             "sandy runs as x86_64 code through Rosetta, which cannot load its runtime inside the \
@@ -272,10 +264,9 @@ fn rosetta(policy: &ResolvedPolicy) -> Option<String> {
     if !sysctl_flag(c"hw.optional.arm64") {
         return None;
     }
-    let program = policy.program.as_ref()?;
     // The kernel loads a script's interpreter, so that file decides, as it does for the
     // `read_exec` check (`SHEBANG_LEVELS`).
-    let mut loaded = program.clone();
+    let mut loaded = program?.to_path_buf();
     let mut named_by = None;
     for _ in 0..SHEBANG_LEVELS {
         match sandy_core::shebang(&loaded) {
@@ -466,8 +457,8 @@ mod tests {
         let seatbelt = Seatbelt::load().expect("Seatbelt functions");
         for policy in policies() {
             let profile = generate(&policy);
-            if let Err(message) = seatbelt.compile(&profile) {
-                panic!("{message}\n{}", profile.text);
+            if let Err(error) = seatbelt.compile(&profile) {
+                panic!("{error:?}\n{}", profile.text);
             }
         }
     }
@@ -475,7 +466,7 @@ mod tests {
     #[test]
     fn this_macos_compiles_the_relay_profile() {
         let seatbelt = Seatbelt::load().expect("Seatbelt functions");
-        let profile = relay_profile(&[
+        let profile = crate::profile::relay_profile(&[
             crate::profile::RelayPair {
                 listen: "127.0.0.1:18080".parse().unwrap(),
                 target: "127.0.0.1:8080".parse().unwrap(),
@@ -485,17 +476,17 @@ mod tests {
                 target: "[::1]:8081".parse().unwrap(),
             },
         ]);
-        if let Err(message) = seatbelt.compile(&profile) {
-            panic!("{message}\n{}", profile.text);
+        if let Err(error) = seatbelt.compile(&profile) {
+            panic!("{error:?}\n{}", profile.text);
         }
     }
 
     #[test]
     fn this_macos_compiles_the_watcher_profile() {
         let seatbelt = Seatbelt::load().expect("Seatbelt functions");
-        let profile = watcher_profile();
-        if let Err(message) = seatbelt.compile(&profile) {
-            panic!("{message}\n{}", profile.text);
+        let profile = crate::profile::watcher_profile();
+        if let Err(error) = seatbelt.compile(&profile) {
+            panic!("{error:?}\n{}", profile.text);
         }
     }
 
@@ -503,8 +494,8 @@ mod tests {
     fn this_macos_compiles_the_broker_profile() {
         let seatbelt = Seatbelt::load().expect("Seatbelt functions");
         let profile = crate::profile::broker_profile(1080);
-        if let Err(message) = seatbelt.compile(&profile) {
-            panic!("{message}\n{}", profile.text);
+        if let Err(error) = seatbelt.compile(&profile) {
+            panic!("{error:?}\n{}", profile.text);
         }
     }
 
@@ -600,14 +591,49 @@ mod tests {
             text: "(version 1)\n(deny default)\n(allow no-such-operation)\n".to_string(),
             parameters: Vec::new(),
         };
-        assert!(seatbelt.compile(&profile).is_err());
+        assert!(
+            matches!(seatbelt.compile(&profile), Err(ProfileError::Rejected(_))),
+            "a compiler message is a shortfall of this macOS"
+        );
+    }
+
+    /// `verify` decides no level: the egress port that another socket holds, at the broker's
+    /// own address or at another address of this Mac, is indeterminate. Control: the free port
+    /// is reported by nothing.
+    #[test]
+    fn a_held_port_is_indeterminate() {
+        let _binds = BINDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut policy = policies().remove(0);
+        policy.ip = sandy_core::IpAccess::Private;
+        policy.signals = sandy_core::SignalScope::Isolated;
+        for address in ["127.0.0.1", "0.0.0.0"] {
+            let held = std::net::TcpListener::bind((address, 0)).unwrap();
+            policy.egress = Some(sandy_core::Egress {
+                port: held.local_addr().unwrap().port(),
+                reach: sandy_core::EgressReach::Public,
+            });
+            let items = held_ports(&policy);
+            assert!(!items.is_empty(), "{address}");
+            for item in &items {
+                assert!(
+                    matches!(item.status, sandy_core::Status::Indeterminate { .. }),
+                    "{address}: {item:?}"
+                );
+            }
+            drop(held);
+            assert_eq!(held_ports(&policy), Vec::new(), "{address}");
+        }
     }
 
     #[test]
     fn plan_is_enforceable_here() {
         let policy = policies().remove(0);
-        let plan =
-            sandy_core::EnforcementPlan::new(&policy.requirements(), MacosBackend.plan(&policy));
+        let plan = sandy_core::EnforcementPlan::new(
+            &policy.requirements(),
+            MacosBackend::new().plan(&policy),
+        );
         assert!(plan.is_enforceable(), "{plan}");
     }
 

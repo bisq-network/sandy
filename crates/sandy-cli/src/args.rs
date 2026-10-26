@@ -11,17 +11,23 @@ use sandy_core::{
 pub const USAGE: &str = "\
 Usage:
   sandy run [OPTIONS] [--] PROGRAM [ARGS...]   run PROGRAM inside the sandbox
-  sandy check [OPTIONS] [[--] PROGRAM]         show how this host enforces the policy
+  sandy check [OPTIONS] [[--] PROGRAM]         show how this host enforces the policy (needs
+                                               PROGRAM when the policy has fallback levels)
   sandy setup [OPTIONS]                        prepare the host (needs admin rights on Windows,
                                                and on Linux under Ubuntu's AppArmor restriction)
   sandy setup --remove [OPTIONS]               take back what setup and the runs of the policy
                                                left on the host
 
 PROGRAM must be an absolute path. sandy refuses to start it when any restriction of the policy
-cannot be enforced on this host.
+cannot be enforced on this host. A policy with [[fallback]] levels runs the first of its levels
+that this host can enforce.
 
 Options (they extend the policy file):
-  --policy FILE              read the policy from a TOML file
+  --policy FILE              read the policy from a TOML file; with -, from standard input,
+                             which the program then does not get (it reads the null device)
+  --level NAME               use this level of the policy only, base or a [[fallback]] name;
+                             run refuses when this host cannot enforce it
+  --json                     print the result of check as one JSON object (check only)
   --read PATH                allow reading PATH (repeatable)
   --read-exec PATH           allow reading and executing PATH (repeatable)
   --read-write PATH          allow reading and writing PATH (repeatable)
@@ -82,11 +88,14 @@ Setup options:
   --elevate                  ask for the administrator rights setup needs (pkexec on Linux,
                              UAC on Windows); --policy must then be an absolute path
 
+Setup prepares every level of the policy, or the one --level names.
+
 Exit status: the program's status; 125 when sandy fails or refuses; for check, 0 when the policy
-is enforceable, 1 when it is not, and 2 when only `sandy setup`, run once with administrator
-rights, is missing; for setup, 0 when it is done or nothing is to do, 3 when it is not done and
-nothing changed (the rights were not given, setup cannot help on this host, or it is not
-allowed for this binary), and 125 when it failed.
+or one of its levels is enforceable, 1 when none is, 2 when none is but `sandy setup`, run once
+with administrator rights, would make one so, and 125 when sandy cannot tell now or the policy
+conflicts with this host; for setup, 0 when it is done or nothing is to do, 3 when it is not
+done and nothing changed (the rights were not given, setup cannot help on this host, or it is
+not allowed for this binary), and 125 when it failed.
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,12 +131,65 @@ pub struct Overrides {
 }
 
 impl Overrides {
+    /// The policy keys these options set, each with its option.
+    fn keys(&self) -> Vec<(&'static str, &'static str)> {
+        [
+            ("--view", "filesystem.view", self.view.is_some()),
+            ("--ip", "network.ip", self.ip.is_some()),
+            ("--egress", "network.egress", self.egress.is_some()),
+            (
+                "--unix-sockets",
+                "network.unix_sockets",
+                self.unix_sockets.is_some(),
+            ),
+            ("--signals", "process.signals", self.signals.is_some()),
+            ("--children", "process.children", self.children.is_some()),
+            (
+                "--end-with-parent",
+                "process.end_with_parent",
+                self.end_with_parent,
+            ),
+            (
+                "--linux-path-metadata",
+                "linux.path_metadata",
+                self.path_metadata.is_some(),
+            ),
+            ("--macos-relays", "macos.relays", self.relays.is_some()),
+            ("--windows-win32k", "windows.win32k", self.win32k.is_some()),
+            (
+                "--appcontainer",
+                "windows.appcontainer_name",
+                self.appcontainer.is_some(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(option, key, set)| set.then_some((option, key)))
+        .collect()
+    }
+
     /// Applies the command line options to `policy`. With `from_file`, `policy` comes from a
     /// policy file, and the result names every option that replaced a stricter value of that
     /// file: the option still wins, because the caller is trusted (DESIGN.md, "Threat model"),
     /// but it widens what the program may do without the file saying so. A policy without a file
     /// is the options themselves, so there is nothing to report.
-    pub fn apply(self, policy: &mut Policy, from_file: bool) -> Vec<String> {
+    ///
+    /// An option that sets a key some fallback level of the policy sets is refused: it would be
+    /// unclear which levels it changes. The other options apply to the base, and so to every
+    /// level.
+    pub fn apply(self, policy: &mut Policy, from_file: bool) -> Result<Vec<String>, String> {
+        for (option, key) in self.keys() {
+            if let Some(level) = policy.fallback.iter().find(|level| level.sets(key)) {
+                return Err(format!(
+                    "{option} sets {key}, which fallback level {} of the policy sets too, so it \
+                     is unclear which levels it changes; set {key} in the policy instead",
+                    level.name
+                ));
+            }
+        }
+        Ok(self.apply_to_base(policy, from_file))
+    }
+
+    fn apply_to_base(self, policy: &mut Policy, from_file: bool) -> Vec<String> {
         let mut weakened = Vec::new();
         let mut note = |option: &str, value: &str, setting: &str, before: &str| {
             if !from_file {
@@ -286,10 +348,22 @@ pub const FORWARD_COMMAND: &str = "__forward";
 /// The internal command that runs the egress broker. It is not part of the documented interface.
 pub const BROKER_COMMAND: &str = "__broker";
 
+/// Where the policy comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicySource {
+    File(PathBuf),
+    /// `--policy -`: standard input, until its end.
+    Input,
+}
+
 #[derive(Debug)]
 pub struct Invocation {
     pub mode: Mode,
-    pub policy_file: Option<PathBuf>,
+    pub policy: Option<PolicySource>,
+    /// `--level`: the one level to use.
+    pub level: Option<String>,
+    /// `--json` of check.
+    pub json: bool,
     pub overrides: Overrides,
     pub cwd: Option<PathBuf>,
     pub parent_pid: Option<u32>,
@@ -355,7 +429,9 @@ where
 
     let mut invocation = Invocation {
         mode,
-        policy_file: None,
+        policy: None,
+        level: None,
+        json: false,
         overrides: Overrides::default(),
         cwd: None,
         parent_pid: None,
@@ -373,11 +449,23 @@ where
         match arg {
             Short('h') | Long("help") => return Ok(Command::Help),
             Long("policy") => {
-                if invocation.policy_file.is_some() {
+                if invocation.policy.is_some() {
                     return Err("--policy given twice".into());
                 }
-                invocation.policy_file = Some(parser.value()?.into())
+                let value = parser.value()?;
+                invocation.policy = Some(if value == "-" {
+                    PolicySource::Input
+                } else {
+                    PolicySource::File(value.into())
+                });
             }
+            Long("level") => {
+                if invocation.level.is_some() {
+                    return Err("--level given twice".into());
+                }
+                invocation.level = Some(parser.value()?.string()?)
+            }
+            Long("json") => invocation.json = true,
             Long("read") => overrides.read.push(parser.value()?.into()),
             Long("read-exec") => overrides.read_exec.push(parser.value()?.into()),
             Long("read-write") => overrides.read_write.push(parser.value()?.into()),
@@ -532,6 +620,12 @@ where
     if invocation.explain && invocation.mode != Mode::Run {
         return Err("--explain belongs to run".into());
     }
+    if invocation.json && invocation.mode != Mode::Check {
+        return Err("--json belongs to check".into());
+    }
+    if invocation.json && !invocation.explain_paths.is_empty() {
+        return Err("--json and --explain-path cannot be combined".into());
+    }
     if !invocation.explain_paths.is_empty() && invocation.mode != Mode::Check {
         return Err("--explain-path belongs to check".into());
     }
@@ -542,14 +636,20 @@ where
     if invocation.elevate && !setup {
         return Err("--elevate belongs to setup".into());
     }
-    // The elevated sandy may start in another directory: pkexec starts it in root's home.
-    if invocation.elevate
-        && invocation
-            .policy_file
-            .as_ref()
-            .is_some_and(|path| !path.is_absolute())
-    {
-        return Err("with --elevate, --policy needs an absolute path".into());
+    // The elevated sandy may start in another directory: pkexec starts it in root's home. It
+    // does not get this standard input either.
+    match &invocation.policy {
+        Some(PolicySource::File(path)) if invocation.elevate && !path.is_absolute() => {
+            return Err("with --elevate, --policy needs an absolute path".into());
+        }
+        Some(PolicySource::Input) if invocation.elevate => {
+            return Err(
+                "with --elevate, --policy cannot be -: the elevated sandy does not get this \
+                 standard input; give the path of a policy file"
+                    .into(),
+            );
+        }
+        _ => {}
     }
     Ok(Command::Sandbox(Box::new(invocation)))
 }
@@ -651,7 +751,7 @@ mod tests {
         ]);
         let mut policy = Policy::default();
         policy.filesystem.read.push("/z".into());
-        invocation.overrides.apply(&mut policy, true);
+        invocation.overrides.apply(&mut policy, true).unwrap();
         assert_eq!(
             policy.filesystem.read,
             vec![PathBuf::from("/z"), PathBuf::from("/a")]
@@ -688,7 +788,13 @@ mod tests {
             "check", "--view", "policy", "--ip", "private", "--egress", "1080",
         ]);
         let mut policy = Policy::default();
-        assert!(parsed.overrides.apply(&mut policy, false).is_empty());
+        assert!(
+            parsed
+                .overrides
+                .apply(&mut policy, false)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(policy.filesystem.view, FileView::Policy);
         assert_eq!(policy.network.ip, IpAccess::Private);
         assert_eq!(
@@ -700,7 +806,7 @@ mod tests {
         );
         let local = invocation(&["check", "--egress", "1080=public-and-local"]);
         let mut policy = Policy::default();
-        local.overrides.apply(&mut policy, false);
+        local.overrides.apply(&mut policy, false).unwrap();
         assert_eq!(
             policy.network.egress.unwrap().reach,
             EgressReach::PublicAndLocal
@@ -723,13 +829,15 @@ mod tests {
         policy.filesystem.view = FileView::Policy;
         let notes = invocation(&["check", "--view", "all"])
             .overrides
-            .apply(&mut policy, true);
+            .apply(&mut policy, true)
+            .unwrap();
         assert_eq!(notes.len(), 1, "{notes:?}");
 
         let mut policy = Policy::default();
         let notes = invocation(&["check", "--egress", "1080"])
             .overrides
-            .apply(&mut policy, true);
+            .apply(&mut policy, true)
+            .unwrap();
         assert_eq!(
             notes,
             [
@@ -739,11 +847,13 @@ mod tests {
         );
         let notes = invocation(&["check", "--egress", "1080=public-and-local"])
             .overrides
-            .apply(&mut policy, true);
+            .apply(&mut policy, true)
+            .unwrap();
         assert_eq!(notes.len(), 1, "{notes:?}");
         let notes = invocation(&["check", "--egress", "1081=public"])
             .overrides
-            .apply(&mut policy, true);
+            .apply(&mut policy, true)
+            .unwrap();
         assert!(notes.is_empty(), "{notes:?}");
 
         let mut policy = Policy::default();
@@ -752,6 +862,7 @@ mod tests {
             invocation(&["check", "--ip", "client"])
                 .overrides
                 .apply(&mut policy, true)
+                .unwrap()
                 .len(),
             1
         );
@@ -760,6 +871,7 @@ mod tests {
             invocation(&["check", "--ip", "private"])
                 .overrides
                 .apply(&mut policy, true)
+                .unwrap()
                 .len(),
             1
         );
@@ -773,7 +885,8 @@ mod tests {
             policy.network.ip = file;
             let notes = invocation(&["check", "--ip", option])
                 .overrides
-                .apply(&mut policy, true);
+                .apply(&mut policy, true)
+                .unwrap();
             assert_eq!(policy.network.ip.name(), option);
             notes
         };
@@ -805,6 +918,7 @@ mod tests {
             invocation(&["check", "--system", option])
                 .overrides
                 .apply(&mut policy, from_file)
+                .unwrap()
         };
         assert_eq!(
             weakened(SystemAccess::None, "minimal", true),
@@ -827,6 +941,7 @@ mod tests {
             invocation(&["check", "--windows-win32k", option])
                 .overrides
                 .apply(&mut policy, true)
+                .unwrap()
         };
         assert_eq!(
             weakened(Win32k::Deny, "allow"),
@@ -849,7 +964,8 @@ mod tests {
             policy.macos.relays = file;
             let notes = invocation(&["check", "--macos-relays", option])
                 .overrides
-                .apply(&mut policy, true);
+                .apply(&mut policy, true)
+                .unwrap();
             assert_eq!(policy.macos.relays.name(), option);
             notes
         };
@@ -869,6 +985,70 @@ mod tests {
         ));
     }
 
+    /// An option that sets a key a fallback level sets is refused, since it would be unclear
+    /// which levels it changes; other options apply to the base and so to every level.
+    #[test]
+    fn an_option_that_a_level_also_sets_is_refused() {
+        let policy = || {
+            Policy::from_toml(
+                "version = 1\n[[fallback]]\nname = \"weak\"\nnetwork.ip = \"all\"\n\
+                 process.end_with_parent = false\n",
+            )
+            .unwrap()
+        };
+        for args in [
+            &["check", "--ip", "none"][..],
+            &["check", "--end-with-parent"],
+        ] {
+            let error = invocation(args)
+                .overrides
+                .apply(&mut policy(), true)
+                .unwrap_err();
+            assert!(error.contains("fallback level weak"), "{args:?}: {error}");
+        }
+        let mut levelled = policy();
+        let notes = invocation(&["check", "--signals", "isolated", "--read", "/a"])
+            .overrides
+            .apply(&mut levelled, true)
+            .unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        let levels = levelled.levels();
+        assert!(levels.iter().all(|level| {
+            level.policy.process.signals == SignalScope::Isolated
+                && level.policy.filesystem.read == [PathBuf::from("/a")]
+        }));
+        assert_eq!(levels[1].policy.network.ip, IpAccess::All);
+    }
+
+    #[test]
+    fn parses_the_policy_source_the_level_and_json() {
+        let parsed = invocation(&["check", "--policy", "-", "--level", "weak", "--json"]);
+        assert_eq!(parsed.policy, Some(PolicySource::Input));
+        assert_eq!(parsed.level.as_deref(), Some("weak"));
+        assert!(parsed.json);
+        let file = invocation(&["run", "--policy", "p.toml", "/bin/true"]);
+        assert_eq!(file.policy, Some(PolicySource::File("p.toml".into())));
+        assert!(file.level.is_none() && !file.json);
+        for (args, error) in [
+            (
+                &["run", "--json", "/bin/true"][..],
+                "--json belongs to check",
+            ),
+            (
+                &["check", "--json", "--explain-path", "/a"],
+                "cannot be combined",
+            ),
+            (&["check", "--level", "a", "--level", "b"], "given twice"),
+            (
+                &["setup", "--elevate", "--policy", "-"],
+                "does not get this standard input",
+            ),
+        ] {
+            let message = parse_strs(args).unwrap_err();
+            assert!(message.contains(error), "{args:?}: {message}");
+        }
+    }
+
     #[test]
     fn parses_every_children_value() {
         for (value, expected) in [
@@ -878,7 +1058,7 @@ mod tests {
         ] {
             let invocation = invocation(&["check", "--children", value]);
             let mut policy = Policy::default();
-            invocation.overrides.apply(&mut policy, true);
+            invocation.overrides.apply(&mut policy, true).unwrap();
             assert_eq!(policy.process.children, expected);
         }
         assert!(parse_strs(&["check", "--children", "some"]).is_err());

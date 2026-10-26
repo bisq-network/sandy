@@ -6,21 +6,23 @@
 //! can answer them.
 
 use std::collections::BTreeMap;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use landlock::{ABI, Access, AccessFs, AccessNet, BitFlags, Scope, make_bitflags};
 use sandy_core::{
     ChildProcesses, FileView, IpAccess, NetworkAccess, PathAccess, PathIdentity, PathMetadata,
-    PathRule, PlanItem, ProtectedPath, Requirement, ResolvedPolicy, SignalScope, SystemAccess,
+    PathRule, PlanItem, PolicyError, ProtectedPath, Requirement, ResolvedPolicy, SignalScope,
+    SystemAccess,
 };
 
 use crate::broker::BrokerConfig;
 use crate::cgroup;
 use crate::filter::FilterConfig;
-use crate::host::HostCapabilities;
+use crate::host::{self, HostCapabilities, Missing, Support};
 use crate::launch;
 use crate::loader;
-use crate::namespace::{Missing, Namespaces};
+use crate::namespace::Namespaces;
 use crate::openssl;
 use crate::relay::RelayConfig;
 use crate::system::{self, Needed, SystemPath, SystemUse};
@@ -138,30 +140,41 @@ const SHEBANG_LEVELS: usize = 4;
 pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
     // Landlock restricts only the calling thread, so it is only usable when sandy can verify
     // that it is single-threaded.
-    let abi = match (&host.landlock, &host.thread_count) {
-        (Err(reason), _) | (Ok(_), Err(reason)) => Err(reason.as_str()),
-        (Ok(version), Ok(())) => Ok(ABI::from(*version)),
+    let abi = match host::worst([no_landlock(host), host.thread_count.clone().err()]) {
+        Some(missing) => Err(missing),
+        None => host
+            .landlock
+            .clone()
+            .map(ABI::from)
+            .map_err(Missing::Unavailable),
     };
+    let identity = PathIdentity::read().map_err(|error| unreadable_mount_table(&error));
     let loader = program_loader(policy);
-    let landlock = abi
-        .ok()
-        .map(|abi| landlock_config(policy, &host.system_paths, loader.as_deref(), abi));
+    let landlock = abi.as_ref().ok().map(|&abi| {
+        landlock_config(
+            policy,
+            &host.system_paths,
+            loader.as_deref(),
+            identity.as_ref().ok(),
+            abi,
+        )
+    });
     // Before the checks below, so that a file swapped in while they run is not the one bound.
     let identities: BTreeMap<PathBuf, FileIdentity> = landlock
         .iter()
         .flat_map(|landlock| &landlock.rules)
         .filter_map(|rule| Some((rule.path.clone(), launch::identity(&rule.path)?)))
         .collect();
-    let conflict = system_conflict(policy, &host.system_locations)
-        .or_else(|| trust_conflict(policy, &host.trusted_locations))
-        .or_else(|| loader_problem(loader.as_deref(), &executable_paths(landlock.as_ref()?)))
-        .or_else(|| {
-            policy.interpreter_problem(SHEBANG_LEVELS, &executable_paths(landlock.as_ref()?))
-        });
+    let obstacle = match &identity {
+        Err(missing) => Some(Obstacle::Missing(missing.clone())),
+        Ok(identity) => conflict(policy, host, identity, loader.as_deref(), landlock.as_ref())
+            .map(Obstacle::Conflict)
+            .or_else(|| unknown_home(policy, &host.trusted_locations).map(Obstacle::Missing)),
+    };
     let items: Vec<PlanItem> = policy
         .requirements()
         .into_iter()
-        .map(|requirement| plan_item(requirement, policy, host, abi, conflict.as_deref()))
+        .map(|requirement| plan_item(requirement, policy, host, &abi, obstacle.as_ref()))
         .collect();
     let enforceable = items.iter().all(PlanItem::is_enforced);
     let private = policy.ip == IpAccess::Private;
@@ -434,48 +447,63 @@ pub fn landlock_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Option<
         policy,
         &host.system_paths,
         loader.as_deref(),
+        PathIdentity::read().ok().as_ref(),
         ABI::from(version),
     ))
+}
+
+/// What keeps the file system from being confined as the policy says, beyond the kernel's
+/// features.
+#[derive(Debug, Clone)]
+enum Obstacle {
+    /// The policy contradicts the host's layout (`conflict`), which every fallback level shares.
+    Conflict(String),
+    /// What decides it cannot be read: the mount table, or the home directory.
+    Missing(Missing),
 }
 
 fn plan_item(
     requirement: Requirement,
     policy: &ResolvedPolicy,
     host: &HostCapabilities,
-    abi: Result<ABI, &str>,
-    conflict: Option<&str>,
+    abi: &Result<ABI, Missing>,
+    obstacle: Option<&Obstacle>,
 ) -> PlanItem {
     let enforced = |mechanism: String| PlanItem::enforced(requirement, mechanism);
     let unavailable = |reason: &str| PlanItem::unavailable(requirement, reason);
-    let abi = match abi {
-        Ok(abi) => abi,
-        Err(reason) => match requirement {
-            Requirement::FilesystemConfined
-            | Requirement::ProcessMemoryIsolated
-            | Requirement::SignalsIsolated => return unavailable(reason),
-            _ => ABI::Unsupported,
-        },
-    };
+    // Without Landlock the rest of the plan still names its mechanisms, as on ABI 0.
+    let without_landlock = abi.as_ref().err().cloned();
+    let abi = *abi.as_ref().unwrap_or(&ABI::Unsupported);
     match requirement {
         Requirement::FilesystemConfined => {
-            if let Some(conflict) = conflict {
-                unavailable(conflict)
-            } else if let Err(reason) = &host.seccomp {
-                unavailable(&format!(
+            let seccomp = host.seccomp.clone().map_err(|reason| {
+                format!(
                     "without the seccomp filter, opening a file with access mode 3 bypasses \
                      Landlock: {reason}"
-                ))
-            } else {
-                let mut mechanism = format!(
-                    "Landlock ABI {abi}; seccomp denies opening with access mode 3 and openat2"
-                );
-                if abi < ABI::V3 {
-                    mechanism.push_str(&format!(
-                        ", and truncate and O_TRUNC on read-only opens, which Landlock ABI {abi} \
-                         cannot restrict"
-                    ));
+                )
+            });
+            let unreadable = match obstacle {
+                Some(Obstacle::Missing(missing)) => Some(missing.clone()),
+                _ => None,
+            };
+            match (
+                obstacle,
+                host::worst([without_landlock, unreadable, lacking(&seccomp)]),
+            ) {
+                (Some(Obstacle::Conflict(reason)), _) => PlanItem::conflict(requirement, reason),
+                (_, Some(missing)) => missing.item(requirement),
+                (_, None) => {
+                    let mut mechanism = format!(
+                        "Landlock ABI {abi}; seccomp denies opening with access mode 3 and openat2"
+                    );
+                    if abi < ABI::V3 {
+                        mechanism.push_str(&format!(
+                            ", and truncate and O_TRUNC on read-only opens, which Landlock ABI \
+                             {abi} cannot restrict"
+                        ));
+                    }
+                    enforced(mechanism)
                 }
-                enforced(mechanism)
             }
         }
         Requirement::NoPrivilegeEscalation => {
@@ -486,10 +514,12 @@ fn plan_item(
                 _ => enforced(format!("no_new_privs; {FILTER_BASELINE}")),
             }
         }
-        Requirement::ProcessMemoryIsolated => match &host.seccomp {
-            Err(reason) => unavailable(reason),
-            Ok(()) => enforced(format!("Landlock ptrace scope; {FILTER_PROCESSES}")),
-        },
+        Requirement::ProcessMemoryIsolated => {
+            match host::worst([without_landlock, lacking(&host.seccomp)]) {
+                Some(missing) => missing.item(requirement),
+                None => enforced(format!("Landlock ptrace scope; {FILTER_PROCESSES}")),
+            }
+        }
         Requirement::InheritedHandlesClosed => enforced(
             "close-on-exec on every descriptor above 2 (close_range, or /proc/self/fd before \
              Linux 5.11)"
@@ -552,15 +582,27 @@ fn plan_item(
                     .to_string(),
             ),
         },
+        // A PID namespace that a trial could not decide is no reason to fall back to the process
+        // group alone: that would change the mechanism for something that can pass.
         Requirement::ChildProcessesContained => {
-            match (&host.seccomp, &host.pidfd, &host.process_group) {
-                (Err(reason), _, _) | (_, Err(reason), _) | (_, _, Err(reason)) => {
-                    unavailable(reason)
+            let undecided = match &host.pid_namespace {
+                Err(missing @ Missing::Indeterminate(_)) if wants_pid_namespace(policy) => {
+                    Some(missing.clone())
                 }
-                (Ok(()), Ok(()), Ok(())) if pid_namespace(policy, host) => {
+                _ => None,
+            };
+            let missing = host::worst([
+                lacking(&host.seccomp),
+                lacking(&host.pidfd),
+                lacking(&host.process_group),
+                undecided,
+            ]);
+            match missing {
+                Some(missing) => missing.item(requirement),
+                None if pid_namespace(policy, host) => {
                     enforced(CONTAINED_PID_NAMESPACE.to_string())
                 }
-                (Ok(()), Ok(()), Ok(())) => enforced(CONTAINED_GROUP.to_string()),
+                None => enforced(CONTAINED_GROUP.to_string()),
             }
         }
         Requirement::EndsWithParent => match (&host.landlock, &host.seccomp, &host.pidfd) {
@@ -589,30 +631,26 @@ fn plan_item(
         },
         Requirement::Win32kDenied => enforced(NO_WIN32K.to_string()),
         Requirement::RelaysIpv4Only => enforced(NO_IPV6_RELAY_ROUTE.to_string()),
-        Requirement::IpNetworkPrivate => match (&host.user_namespaces, &host.seccomp) {
-            (Err(Missing::Unavailable(reason)), _) | (_, Err(reason)) => unavailable(reason),
-            (Err(Missing::NeedsSetup(reason)), _) => PlanItem::needs_setup(requirement, reason),
-            (Ok(()), Ok(())) => enforced(PRIVATE_NETWORK.to_string()),
-        },
+        Requirement::IpNetworkPrivate => {
+            match host::worst([host.user_namespaces.clone().err(), lacking(&host.seccomp)]) {
+                Some(missing) => missing.item(requirement),
+                None => enforced(PRIVATE_NETWORK.to_string()),
+            }
+        }
         // The broker serves a listener in the sandbox's network namespace, so it needs what the
         // private network needs, and what the relay needs to confine itself and watch the program.
         // What setup cannot fix comes first, so that the item needs setup only when setup is all
         // that is missing.
         Requirement::EgressBrokered => {
-            match (
-                &host.user_namespaces,
-                &host.landlock,
-                &host.seccomp,
-                &host.pidfd,
-            ) {
-                (Err(Missing::Unavailable(reason)), ..)
-                | (_, Err(reason), _, _)
-                | (_, _, Err(reason), _)
-                | (_, _, _, Err(reason)) => unavailable(reason),
-                (Err(Missing::NeedsSetup(reason)), ..) => {
-                    PlanItem::needs_setup(requirement, reason)
-                }
-                _ => enforced(broker_mechanism(abi)),
+            let missing = host::worst([
+                host.user_namespaces.clone().err(),
+                no_landlock(host),
+                lacking(&host.seccomp),
+                lacking(&host.pidfd),
+            ]);
+            match missing {
+                Some(missing) => missing.item(requirement),
+                None => enforced(broker_mechanism(abi)),
             }
         }
         Requirement::PathsHidden => {
@@ -627,46 +665,71 @@ fn plan_item(
                     "the file system view needs the fix of Landlock erratum 3, and {reason}"
                 )),
             };
-            match (&host.user_namespaces, &host.seccomp, erratum) {
-                (_, Err(reason), _) | (Err(Missing::Unavailable(reason)), _, _) => {
-                    unavailable(reason)
-                }
-                (_, _, Err(reason)) => unavailable(&reason),
-                (Err(Missing::NeedsSetup(reason)), _, _) => {
-                    PlanItem::needs_setup(requirement, reason)
-                }
-                (Ok(()), Ok(()), Ok(())) => enforced(VIEW.to_string()),
+            let missing = host::worst([
+                lacking(&host.seccomp),
+                host.user_namespaces.clone().err(),
+                lacking(&erratum),
+            ]);
+            match missing {
+                Some(missing) => missing.item(requirement),
+                None => enforced(VIEW.to_string()),
             }
         }
         // The kernel sends the job control signals of a terminal without the check that the
         // Landlock scope hooks, so the scope alone does not isolate signals.
-        Requirement::SignalsIsolated => match &host.seccomp {
-            Err(reason) => unavailable(reason),
-            Ok(()) if abi >= ABI::V6 => enforced(
+        Requirement::SignalsIsolated => match host::worst([
+            without_landlock,
+            lacking(&host.seccomp),
+        ]) {
+            Some(missing) => missing.item(requirement),
+            None if abi >= ABI::V6 => enforced(
                 "Landlock ABI 6 signal scope; seccomp denies setpgid into a process group that \
                  exists and the terminal ioctls TIOCSPGRP, TIOCSWINSZ and TIOCSIG"
                     .to_string(),
             ),
-            Ok(()) if pid_namespace(policy, host) => enforced(SIGNALS_PID_NAMESPACE.to_string()),
-            Ok(()) => {
-                let without = match (&host.pid_namespace, policy.children) {
-                    (Err(reason), ChildProcesses::Contained) => {
-                        format!(", and no PID namespace for children = \"contained\": {reason}")
-                    }
-                    (Ok(()), ChildProcesses::Contained) => {
+            None if pid_namespace(policy, host) => enforced(SIGNALS_PID_NAMESPACE.to_string()),
+            // Without the PID namespace the reason keeps its kind: where setup gives sandy one,
+            // or where a trial could not decide, the requirement says so.
+            None => {
+                let (without, missing) = match (&host.pid_namespace, policy.children) {
+                    (Err(missing), ChildProcesses::Contained) => (
+                        format!(
+                            ", and no PID namespace for children = \"contained\": {}",
+                            missing.reason()
+                        ),
+                        Some(missing),
+                    ),
+                    (Ok(()), ChildProcesses::Contained) => (
                         ", and children = \"contained\" gets no PID namespace while the policy \
                          grants a path of /proc"
-                            .to_string()
-                    }
-                    _ => ", or with children = \"contained\" a PID namespace".to_string(),
+                            .to_string(),
+                        None,
+                    ),
+                    _ => (
+                        ", or with children = \"contained\" a PID namespace".to_string(),
+                        None,
+                    ),
                 };
-                unavailable(&format!(
+                let reason = format!(
                     "signal isolation needs Landlock ABI 6 (Linux 6.12){without}; this kernel has \
                      ABI {abi}"
-                ))
+                );
+                match missing {
+                    Some(missing) => missing.because(reason).item(requirement),
+                    None => unavailable(&reason),
+                }
             }
         },
     }
+}
+
+/// A plain feature that is not there, which is a lasting shortfall.
+fn lacking(support: &Support) -> Option<Missing> {
+    support.clone().err().map(Missing::Unavailable)
+}
+
+fn no_landlock(host: &HostCapabilities) -> Option<Missing> {
+    host.landlock.clone().err().map(Missing::Unavailable)
 }
 
 /// The file system view of `filesystem.view = "policy"`: a bind for every path a Landlock rule
@@ -790,6 +853,34 @@ fn broker_mechanism(abi: ABI) -> String {
     mechanism
 }
 
+/// Why the policy contradicts this host's layout: a writable path reaches the minimal system set
+/// or a trusted location of the user, or the kernel could not execute the program under this
+/// configuration. Every fallback level has the same paths and program, so this is no reason to
+/// try another level.
+fn conflict(
+    policy: &ResolvedPolicy,
+    host: &HostCapabilities,
+    identity: &PathIdentity,
+    loader: Option<&Path>,
+    landlock: Option<&LandlockConfig>,
+) -> Option<String> {
+    let trusted = host.trusted_locations.as_deref().unwrap_or_default();
+    system_conflict(policy, &host.system_locations, identity)
+        .or_else(|| trust_conflict(policy, trusted, identity))
+        .or_else(|| loader_problem(loader, &executable_paths(landlock?)))
+        .or_else(|| policy.interpreter_problem(SHEBANG_LEVELS, &executable_paths(landlock?)))
+}
+
+/// What an unreadable mount table means. Without `/proc` sandy cannot count its threads either,
+/// which lasts; any other error, such as a full descriptor table or no memory, can pass.
+fn unreadable_mount_table(error: &PolicyError) -> Missing {
+    let source = std::error::Error::source(error).and_then(|source| source.downcast_ref());
+    match source.map(io::Error::kind) {
+        Some(io::ErrorKind::NotFound) => Missing::Unavailable(error.to_string()),
+        _ => Missing::Indeterminate(error.to_string()),
+    }
+}
+
 /// The policy checks for writable paths (never executable, nothing inside a writable path) see
 /// only the policy paths; the minimal system set is added here. Its entries are code and
 /// configuration that programs trust: the dynamic loader, shared libraries, /etc/ld.so.cache and
@@ -800,8 +891,12 @@ fn broker_mechanism(abi: ABI) -> String {
 ///
 /// The comparison is the one of rules 3 and 4 (`PathIdentity`), so an alias of a directory of
 /// the set counts as that directory. Without the mount table sandy cannot see such an alias, so
-/// it refuses the policy, as the resolver does.
-fn system_conflict(policy: &ResolvedPolicy, system: &[SystemPath]) -> Option<String> {
+/// `plan_for` reports that it cannot read it instead.
+fn system_conflict(
+    policy: &ResolvedPolicy,
+    system: &[SystemPath],
+    identity: &PathIdentity,
+) -> Option<String> {
     if policy.system != SystemAccess::Minimal {
         return None;
     }
@@ -816,11 +911,7 @@ fn system_conflict(policy: &ResolvedPolicy, system: &[SystemPath]) -> Option<Str
             }
         })
         .collect();
-    let identity = match PathIdentity::read() {
-        Ok(identity) => identity,
-        Err(error) => return Some(error.to_string()),
-    };
-    let (rule, entry) = policy.writable_conflict(&protected, &identity)?;
+    let (rule, entry) = policy.writable_conflict(&protected, identity)?;
     Some(format!(
         "writable path {} overlaps {} of the minimal system set; the program could change code \
          or configuration that the next start and programs outside the sandbox use",
@@ -835,31 +926,36 @@ fn system_conflict(policy: &ResolvedPolicy, system: &[SystemPath]) -> Option<Str
 /// refuse it. Unlike the system set this applies with `system = "none"` as well: the locations
 /// belong to the user, not to the set.
 ///
-/// When no source names the home directory, sandy cannot tell whether a writable path reaches
-/// the locations below it, so a policy with a writable path is refused, as without the mount
-/// table. A policy without one reaches no location.
+/// Without the home directory (`unknown_home`) there are no locations to compare with here.
 fn trust_conflict(
     policy: &ResolvedPolicy,
-    trusted: &Result<Vec<ProtectedPath>, String>,
+    trusted: &[ProtectedPath],
+    identity: &PathIdentity,
 ) -> Option<String> {
-    let trusted = match trusted {
-        Ok(trusted) => trusted,
-        Err(reason) => {
-            let writable = |rule: &PathRule| rule.access == PathAccess::ReadWrite;
-            return policy.paths.iter().any(writable).then(|| reason.clone());
-        }
-    };
-    let identity = match PathIdentity::read() {
-        Ok(identity) => identity,
-        Err(error) => return Some(error.to_string()),
-    };
-    let (rule, location) = policy.writable_conflict(trusted, &identity)?;
+    let (rule, location) = policy.writable_conflict(trusted, identity)?;
     Some(format!(
         "writable path {} overlaps {}, which programs outside the sandbox read or execute \
          later; a file the program leaves there runs outside the sandbox",
         rule.path.display(),
         location.path.display()
     ))
+}
+
+/// When no source names the home directory, sandy cannot tell whether a writable path reaches
+/// the locations below it. The password database can fail for a moment, a directory service
+/// behind it for longer, and the caller decides about `HOME`, so a policy with a writable path
+/// is indeterminate, not unavailable. A policy without one reaches no location.
+fn unknown_home(
+    policy: &ResolvedPolicy,
+    trusted: &Result<Vec<ProtectedPath>, String>,
+) -> Option<Missing> {
+    let reason = trusted.as_ref().err()?;
+    let writable = |rule: &PathRule| rule.access == PathAccess::ReadWrite;
+    policy
+        .paths
+        .iter()
+        .any(writable)
+        .then(|| Missing::Indeterminate(reason.clone()))
 }
 
 /// Where the loader of the program is, with symbolic links resolved. A program that names none,
@@ -894,6 +990,7 @@ fn loader_problem(loader: Option<&Path>, executable: &[PathBuf]) -> Option<Strin
 fn loader_rule(
     policy: &ResolvedPolicy,
     loader: Option<&Path>,
+    identity: Option<&PathIdentity>,
     rules: &[PathRights],
 ) -> Option<PathRights> {
     let loader = loader?;
@@ -907,8 +1004,8 @@ fn loader_rule(
         return None;
     }
     // Without the mount table an alias of a writable path is indistinguishable from any other
-    // directory, so sandy grants nothing; `loader_problem` then refuses the policy.
-    let identity = PathIdentity::read().ok()?;
+    // directory, so sandy grants nothing; `plan_for` then reports the unreadable table.
+    let identity = identity?;
     let inside_writable = |rule: &PathRule| {
         rule.access == PathAccess::ReadWrite && identity.within(loader, &rule.path)
     };
@@ -938,6 +1035,7 @@ fn landlock_config(
     policy: &ResolvedPolicy,
     system: &[SystemPath],
     loader: Option<&Path>,
+    identity: Option<&PathIdentity>,
     abi: ABI,
 ) -> LandlockConfig {
     let unix_all = policy.unix_sockets == NetworkAccess::All;
@@ -989,7 +1087,7 @@ fn landlock_config(
             access: fit(system_rights(entry.usage), entry.is_dir),
         }));
     }
-    if let Some(mut rule) = loader_rule(policy, loader, &rules) {
+    if let Some(mut rule) = loader_rule(policy, loader, identity, &rules) {
         rule.access = fit(rule.access, rule.is_dir);
         rules.push(rule);
     }
@@ -1224,20 +1322,61 @@ mod tests {
         assert!(!plan.sandbox.unwrap().filter.deny_path_metadata);
     }
 
+    /// Without a thread list Landlock is unusable: for good without `/proc`, and indeterminate
+    /// when the list cannot be read now.
     #[test]
     fn landlock_needs_a_way_to_count_threads() {
-        let mut host = host(Some(9));
-        host.thread_count = Err("no /proc".to_string());
+        for missing in [
+            Missing::Unavailable("no /proc".to_string()),
+            Missing::Indeterminate("EMFILE".to_string()),
+        ] {
+            let mut host = host(Some(9));
+            host.thread_count = Err(missing.clone());
+            let plan = plan_for(&policy(), &host);
+            assert_eq!(
+                unavailable(&plan),
+                vec![
+                    Requirement::FilesystemConfined,
+                    Requirement::ProcessMemoryIsolated,
+                    Requirement::SignalsIsolated,
+                ]
+            );
+            for item in plan.items.iter().filter(|item| !item.is_enforced()) {
+                assert_eq!(item, &missing.item(item.requirement));
+            }
+            assert!(plan.sandbox.is_none());
+        }
+        // Without Landlock at all the reason that can pass still wins: sandy cannot tell now.
+        let mut host = host(None);
+        host.thread_count = Err(Missing::Indeterminate("EMFILE".to_string()));
         let plan = plan_for(&policy(), &host);
-        assert_eq!(
-            unavailable(&plan),
-            vec![
-                Requirement::FilesystemConfined,
-                Requirement::ProcessMemoryIsolated,
-                Requirement::SignalsIsolated,
-            ]
-        );
-        assert!(plan.sandbox.is_none());
+        assert!(matches!(
+            status(&plan, Requirement::FilesystemConfined),
+            Status::Indeterminate { .. }
+        ));
+    }
+
+    /// The mount table is unreadable for good only where there is no `/proc`; any other error
+    /// can pass.
+    #[test]
+    fn an_unreadable_mount_table_is_unavailable_only_without_proc() {
+        let unreadable = |errno| PolicyError::Unreadable {
+            path: PathBuf::from("/proc/self/mountinfo"),
+            source: io::Error::from_raw_os_error(errno),
+        };
+        assert!(matches!(
+            unreadable_mount_table(&unreadable(libc::ENOENT)),
+            Missing::Unavailable(reason) if reason.contains("/proc/self/mountinfo")
+        ));
+        for errno in [libc::EMFILE, libc::ENOMEM, libc::EACCES, libc::EIO] {
+            assert!(
+                matches!(
+                    unreadable_mount_table(&unreadable(errno)),
+                    Missing::Indeterminate(_)
+                ),
+                "{errno}"
+            );
+        }
     }
 
     #[test]
@@ -1786,7 +1925,7 @@ mod tests {
         assert!(mechanism(&policy, &host(Some(9))).contains("PID namespace"));
 
         let mut no_namespace = host(Some(9));
-        no_namespace.pid_namespace = Err("no user namespaces".to_string());
+        no_namespace.pid_namespace = Err(Missing::Unavailable("no user namespaces".to_string()));
         assert_eq!(
             plan_for(&policy, &no_namespace).sandbox.unwrap().namespaces,
             None
@@ -1842,7 +1981,7 @@ mod tests {
         assert!(sandbox.filter.isolate_signals && sandbox.landlock.scopes.is_empty());
 
         let mut no_namespace = host(Some(4));
-        no_namespace.pid_namespace = Err("no user namespaces".to_string());
+        no_namespace.pid_namespace = Err(Missing::Unavailable("no user namespaces".to_string()));
         match status(
             &plan_for(&policy, &no_namespace),
             Requirement::SignalsIsolated,
@@ -1864,6 +2003,97 @@ mod tests {
             panic!("{plan:?}");
         };
         assert!(mechanism.contains("Landlock ABI 6"), "{mechanism}");
+    }
+
+    /// A PID namespace that a trial could not decide is no reason to run `contained` with the
+    /// process group alone: the requirement is indeterminate on every ABI, and below ABI 6 so is
+    /// signal isolation, and nothing runs.
+    #[test]
+    fn an_undecided_pid_namespace_swaps_no_mechanism() {
+        let mut policy = policy();
+        policy.children = ChildProcesses::Contained;
+        for abi in [4, 9] {
+            let mut undecided = host(Some(abi));
+            undecided.pid_namespace = Err(Missing::Indeterminate("EAGAIN".to_string()));
+            let plan = plan_for(&policy, &undecided);
+            assert!(plan.sandbox.is_none(), "{abi}");
+            assert_eq!(
+                status(&plan, Requirement::ChildProcessesContained),
+                &Status::Indeterminate {
+                    reason: "EAGAIN".to_string()
+                }
+            );
+            match status(&plan, Requirement::SignalsIsolated) {
+                Status::Indeterminate { reason } if abi < 6 => {
+                    assert!(reason.contains("EAGAIN"), "{reason}")
+                }
+                Status::Enforced { .. } if abi >= 6 => {}
+                other => panic!("{abi}: {other:?}"),
+            }
+        }
+        // Where the policy grants /proc the program gets no PID namespace anyway, so nothing
+        // about one decides the plan.
+        let mut with_proc = policy.clone();
+        with_proc.paths.push(rule("/proc", PathAccess::Read, true));
+        let mut undecided = host(Some(9));
+        undecided.pid_namespace = Err(Missing::Indeterminate("EAGAIN".to_string()));
+        assert_eq!(unavailable(&plan_for(&with_proc, &undecided)), vec![]);
+    }
+
+    /// Below ABI 6 under Ubuntu's AppArmor restriction, the PID namespace that isolates signals
+    /// needs setup, so the requirement does too, while `contained` keeps its process group.
+    #[test]
+    fn a_pid_namespace_that_setup_gives_needs_setup_below_abi_6() {
+        let mut policy = policy();
+        policy.children = ChildProcesses::Contained;
+        let mut restricted = host(Some(4));
+        restricted.pid_namespace = Err(Missing::NeedsSetup("restricted".to_string()));
+        let plan = plan_for(&policy, &restricted);
+        match status(&plan, Requirement::SignalsIsolated) {
+            Status::NeedsSetup { reason } => assert!(
+                reason.contains("no PID namespace") && reason.contains("restricted"),
+                "{reason}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        let Status::Enforced { mechanism } = status(&plan, Requirement::ChildProcessesContained)
+        else {
+            panic!("{plan:?}");
+        };
+        assert!(mechanism.contains("whose leader is a guard"), "{mechanism}");
+        assert_eq!(unavailable(&plan), vec![Requirement::SignalsIsolated]);
+    }
+
+    /// Namespaces that a trial could not decide make the private network, the egress broker and
+    /// the view indeterminate, also where something lasting is missing too: the selection must
+    /// not move on because of them.
+    #[test]
+    fn undecided_namespaces_stop_every_requirement_that_needs_them() {
+        let mut policy = policy();
+        policy.ip = IpAccess::Private;
+        policy.view = FileView::Policy;
+        policy.egress = Some(sandy_core::Egress {
+            port: 1080,
+            reach: EgressReach::PublicAndLocal,
+        });
+        let mut undecided = host(Some(9));
+        undecided.user_namespaces = Err(Missing::Indeterminate("ENOMEM".to_string()));
+        undecided.pidfd = Err("no pidfd".to_string());
+        let plan = plan_for(&policy, &undecided);
+        for requirement in [
+            Requirement::IpNetworkPrivate,
+            Requirement::EgressBrokered,
+            Requirement::PathsHidden,
+        ] {
+            assert_eq!(
+                status(&plan, requirement),
+                &Status::Indeterminate {
+                    reason: "ENOMEM".to_string()
+                },
+                "{requirement:?}"
+            );
+        }
+        assert!(plan.sandbox.is_none());
     }
 
     #[test]
@@ -2139,7 +2369,7 @@ mod tests {
             .retain(|entry| entry.path != Path::new("/etc/hosts"));
         let plan = plan_for(&policy, &without_hosts);
         match status(&plan, Requirement::FilesystemConfined) {
-            Status::Unavailable { reason } => {
+            Status::Conflict { reason } => {
                 assert!(reason.contains("/etc/ld.so.preload"), "{reason}");
             }
             other => panic!("{other:?}"),
@@ -2156,6 +2386,10 @@ mod tests {
             policy.paths.push(rule(path, PathAccess::ReadWrite, true));
             let plan = plan_for(&policy, &host(Some(9)));
             unavailable(&plan) == vec![Requirement::FilesystemConfined]
+                && matches!(
+                    status(&plan, Requirement::FilesystemConfined),
+                    Status::Conflict { .. }
+                )
         };
         assert!(refused("/home", SystemAccess::Minimal));
         assert!(refused("/home", SystemAccess::None));
@@ -2163,8 +2397,8 @@ mod tests {
     }
 
     /// When no source names the home directory, sandy cannot check the locations below it, so a
-    /// policy with a writable path is refused with the reason, and one without stays
-    /// enforceable.
+    /// policy with a writable path is indeterminate, with the reason, and one without stays
+    /// enforceable. A conflict that sandy sees anyway comes first.
     #[test]
     fn an_unknown_home_directory_refuses_a_writable_path() {
         let mut host = host(Some(9));
@@ -2172,9 +2406,20 @@ mod tests {
         let plan = plan_for(&policy(), &host);
         assert_eq!(unavailable(&plan), vec![Requirement::FilesystemConfined]);
         match status(&plan, Requirement::FilesystemConfined) {
-            Status::Unavailable { reason } => assert!(reason.contains("home directory")),
+            Status::Indeterminate { reason } => assert!(reason.contains("home directory")),
             other => panic!("{other:?}"),
         }
+        let mut over_the_system = policy();
+        over_the_system
+            .paths
+            .push(rule("/usr", PathAccess::ReadWrite, true));
+        assert!(matches!(
+            status(
+                &plan_for(&over_the_system, &host),
+                Requirement::FilesystemConfined
+            ),
+            Status::Conflict { .. }
+        ));
 
         let mut policy = policy();
         policy
@@ -2217,6 +2462,56 @@ mod tests {
         assert_eq!(unavailable(&plan), vec![]);
     }
 
+    /// A program the kernel could not execute under this configuration is a conflict of the
+    /// policy: a script whose interpreter no read_exec path covers, and a program whose loader
+    /// none covers.
+    #[test]
+    fn a_program_that_cannot_be_executed_is_a_conflict() {
+        let directory =
+            std::env::temp_dir().join(format!("sandy-plan-script-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let interpreter = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let script = directory.join("script");
+        std::fs::write(&script, format!("#!{}\n", interpreter.display())).unwrap();
+        let mut policy = policy();
+        policy.program = Some(script.clone());
+        policy.paths.push(PathRule {
+            path: script.clone(),
+            access: PathAccess::ReadExec,
+            is_dir: false,
+        });
+        match status(
+            &plan_for(&policy, &host(Some(9))),
+            Requirement::FilesystemConfined,
+        ) {
+            Status::Conflict { reason } => assert!(reason.contains("is a script"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+
+        let mut no_system = policy.clone();
+        no_system.program = Some(interpreter.clone());
+        no_system.system = SystemAccess::None;
+        no_system.paths = vec![PathRule {
+            path: interpreter,
+            access: PathAccess::ReadExec,
+            is_dir: false,
+        }];
+        if program_loader(&no_system).is_none() {
+            // A static build names no loader.
+            eprintln!("skipped: this test binary has no ELF loader");
+            return;
+        }
+        match status(
+            &plan_for(&no_system, &host(Some(9))),
+            Requirement::FilesystemConfined,
+        ) {
+            Status::Conflict { reason } => assert!(reason.contains("loader"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
     fn loader_rights(config: &LandlockConfig, path: &str) -> Option<BitFlags<AccessFs>> {
         let rule = config.rules.iter().find(|r| r.path == Path::new(path));
         rule.map(|rule| rule.access)
@@ -2229,8 +2524,16 @@ mod tests {
     fn the_programs_loader_is_granted_only_in_a_system_location() {
         let policy = policy();
         let system = host(Some(9)).system_paths;
-        let config =
-            |loader: &str| landlock_config(&policy, &system, Some(Path::new(loader)), ABI::V9);
+        let identity = PathIdentity::read().unwrap();
+        let config = |loader: &str| {
+            landlock_config(
+                &policy,
+                &system,
+                Some(Path::new(loader)),
+                Some(&identity),
+                ABI::V9,
+            )
+        };
         let problem = |loader: &str, config: &LandlockConfig| {
             loader_problem(Some(Path::new(loader)), &executable_paths(config))
         };
@@ -2257,7 +2560,13 @@ mod tests {
         // Without the system set, sandy adds no path of its own.
         let mut no_system = policy.clone();
         no_system.system = SystemAccess::None;
-        let config = landlock_config(&no_system, &system, Some(Path::new(store)), ABI::V9);
+        let config = landlock_config(
+            &no_system,
+            &system,
+            Some(Path::new(store)),
+            Some(&identity),
+            ABI::V9,
+        );
         assert_eq!(loader_rights(&config, store), None);
         assert!(problem(store, &config).is_some());
     }
@@ -2271,7 +2580,14 @@ mod tests {
             .push(rule("/nix/store/abc", PathAccess::ReadWrite, true));
         let loader = "/nix/store/abc/lib/ld-linux-x86-64.so.2";
         let system = host(Some(9)).system_paths;
-        let config = landlock_config(&policy, &system, Some(Path::new(loader)), ABI::V9);
+        let identity = PathIdentity::read().unwrap();
+        let config = landlock_config(
+            &policy,
+            &system,
+            Some(Path::new(loader)),
+            Some(&identity),
+            ABI::V9,
+        );
         assert_eq!(loader_rights(&config, loader), None);
         let problem = loader_problem(Some(Path::new(loader)), &executable_paths(&config));
         assert!(problem.unwrap().contains(loader));

@@ -700,6 +700,88 @@ fn check_needs_setup_under_the_apparmor_restriction() {
     assert!(stderr.contains(reason), "{stderr}");
 }
 
+/// Runs sandy with `arguments` under a process limit of 0, so that it cannot fork.
+fn without_processes(arguments: &[String]) -> Output {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(sandy_path());
+    command.args(arguments);
+    // SAFETY: setrlimit is async-signal-safe, and the closure calls nothing else.
+    unsafe {
+        command.pre_exec(|| {
+            let none = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            match libc::setrlimit(libc::RLIMIT_NPROC, &none) {
+                0 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        });
+    }
+    command.output().unwrap()
+}
+
+/// A process limit that leaves sandy no fork says nothing about what the host enforces: any
+/// process of the user, also one an earlier run left behind, counts against it. The trial of the
+/// namespaces cannot run, so `check` and `run` fail with status 125 and call the requirement
+/// undecided, never unavailable, which would make sandy take a weaker fallback level. With
+/// `children = "contained"` alone the requirement is undecided too, instead of running with the
+/// process group alone. Control: without the limit both work.
+#[test]
+fn a_process_limit_makes_the_namespaces_undecided() {
+    if !private_network_works() {
+        return;
+    }
+    // SAFETY: getuid has no preconditions.
+    if unsafe { libc::getuid() } == 0 {
+        return skip("unprivileged", "root has no process limit");
+    }
+    let contained = args(&["--children", "contained", "--signals", "isolated"]);
+    for (mode, line) in [
+        (private(), PRIVATE_LINE),
+        (contained, "child processes end with the program"),
+    ] {
+        let mut check = vec!["check".to_string()];
+        check.extend(mode.iter().cloned());
+        let run = run_args(&mode, &[("pid", "-")]);
+        assert_eq!(sandy(&check).status.code(), Some(0), "{mode:?}");
+        assert_eq!(sandy(&run).status.code(), Some(0), "{mode:?}");
+
+        let checked = without_processes(&check);
+        let stdout = String::from_utf8_lossy(&checked.stdout);
+        let stderr = String::from_utf8_lossy(&checked.stderr);
+        assert_eq!(
+            checked.status.code(),
+            Some(EXIT_FAILURE),
+            "{mode:?}\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(!stdout.contains("UNAVAILABLE"), "{mode:?}: {stdout}");
+        let reported = stdout
+            .lines()
+            .find(|reported| reported.contains(line))
+            .unwrap_or_default();
+        assert!(
+            reported.starts_with("UNDECIDED ")
+                && reported.contains("cannot fork the namespace probe"),
+            "{mode:?}: {stdout}"
+        );
+        assert!(
+            stderr.contains("sandy cannot tell now"),
+            "{mode:?}: {stderr}"
+        );
+
+        let ran = without_processes(&run);
+        let stderr = String::from_utf8_lossy(&ran.stderr);
+        assert_eq!(ran.status.code(), Some(EXIT_FAILURE), "{mode:?}: {stderr}");
+        assert!(ran.stdout.is_empty(), "{mode:?}: {ran:?}");
+        assert!(
+            stderr.contains("sandy cannot tell now")
+                && stderr.contains("cannot fork the namespace probe"),
+            "{mode:?}: {stderr}"
+        );
+    }
+}
+
 /// A host can allow user namespaces and still refuse them to sandy, for example inside a sandbox
 /// whose seccomp filter denies `unshare`, as sandy's own does. `plan` cannot see that without a
 /// trial; check makes one and reports the step that fails, for the egress broker too, and run

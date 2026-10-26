@@ -13,49 +13,53 @@ use windows_sys::Win32::Security::SID_AND_ATTRIBUTES;
 use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
 use windows_sys::Win32::System::Services::{
     CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_HANDLE,
-    SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS,
+    SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS, SERVICE_STATUS,
 };
 
 use super::util::{Sid, wide_nul, win32_error};
+use crate::plan::Problem;
+use crate::probe;
 
 /// Whether the Windows Firewall service runs. It turns the AppContainer network rules into
 /// filters of the Windows Filtering Platform; Microsoft does not support stopping it.
-pub fn firewall_running() -> Result<(), String> {
+pub fn firewall_running() -> Result<(), Problem> {
+    probe::firewall(firewall_state())
+}
+
+/// The current state of the Windows Firewall service, or the step that failed and its error.
+fn firewall_state() -> Result<u32, (&'static str, io::Error)> {
     let service = wide_nul("MpsSvc".as_ref());
     let manager = ServiceHandle::open(
         // SAFETY: null machine and database names select the local service database.
         unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CONNECT) },
-        "the service control manager",
+        "open the service control manager",
     )?;
     let firewall = ServiceHandle::open(
         // SAFETY: manager is open and the service name is NUL-terminated.
         unsafe { OpenServiceW(manager.0, service.as_ptr(), SERVICE_QUERY_STATUS) },
-        "the Windows Firewall service (MpsSvc)",
+        "open the Windows Firewall service (MpsSvc)",
     )?;
     // SAFETY: the structure is plain data; zero is a valid value for every field.
     let mut status: SERVICE_STATUS = unsafe { std::mem::zeroed() };
     // SAFETY: firewall is open with SERVICE_QUERY_STATUS and status is writable.
     if unsafe { QueryServiceStatus(firewall.0, &mut status) } == 0 {
-        return Err(format!(
-            "cannot query the Windows Firewall service: {}",
-            io::Error::last_os_error()
+        return Err((
+            "query the Windows Firewall service (MpsSvc)",
+            io::Error::last_os_error(),
         ));
     }
-    if status.dwCurrentState != SERVICE_RUNNING {
-        return Err("the Windows Firewall service (MpsSvc) is not running".into());
-    }
-    Ok(())
+    Ok(status.dwCurrentState)
 }
 
 struct ServiceHandle(SC_HANDLE);
 
 impl ServiceHandle {
-    fn open(handle: SC_HANDLE, what: &str) -> Result<ServiceHandle, String> {
+    fn open(
+        handle: SC_HANDLE,
+        step: &'static str,
+    ) -> Result<ServiceHandle, (&'static str, io::Error)> {
         if handle.is_null() {
-            return Err(format!(
-                "cannot open {what}: {}",
-                io::Error::last_os_error()
-            ));
+            return Err((step, io::Error::last_os_error()));
         }
         Ok(ServiceHandle(handle))
     }
@@ -100,10 +104,12 @@ fn exemptions() -> io::Result<Vec<(Sid, u32)>> {
     failure.map_or(Ok(list), Err)
 }
 
-pub fn is_loopback_exempt(appcontainer: &Sid) -> Result<bool, String> {
+/// The AppContainer SIDs that are exempt from loopback isolation. Any error can pass, so it is
+/// indeterminate.
+pub fn loopback_exemptions() -> Result<Vec<Sid>, Problem> {
     exemptions()
-        .map(|list| list.iter().any(|(sid, _)| sid == appcontainer))
-        .map_err(|error| error.to_string())
+        .map(|list| list.into_iter().map(|(sid, _)| sid).collect())
+        .map_err(|error| Problem::Indeterminate(error.to_string()))
 }
 
 /// Adds or removes the loopback exemption of `appcontainer`. The call replaces the whole list,

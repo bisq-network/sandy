@@ -515,6 +515,94 @@ fn install_copy_lets_a_portable_sandy_hand_over() {
     assert!(String::from_utf8_lossy(&again.stdout).contains("nothing to remove"));
 }
 
+/// Runs `sandy` with `args` where it may hold only one descriptor beyond 0, 1 and 2, or without a
+/// limit.
+fn with_descriptors(sandy: &Path, args: &[&str], limit: Option<libc::rlim_t>) -> Output {
+    let mut command = Command::new(sandy);
+    command.args(args);
+    if let Some(limit) = limit {
+        // SAFETY: setrlimit is async-signal-safe, and the closure calls nothing else.
+        unsafe {
+            command.pre_exec(move || {
+                let limit = libc::rlimit {
+                    rlim_cur: limit,
+                    rlim_max: limit,
+                };
+                match libc::setrlimit(libc::RLIMIT_NOFILE, &limit) {
+                    0 => Ok(()),
+                    _ => Err(std::io::Error::last_os_error()),
+                }
+            });
+        }
+    }
+    command.output().unwrap()
+}
+
+/// Once the copy is installed, a check of it that fails for a reason that can pass is an error
+/// with status 125, in `check` and `run`: running on as the portable sandy would report that the
+/// host needs setup, which is not so, and could make sandy pick a weaker fallback level. Here
+/// sandy may open one file at a time, so it cannot list the loaded profiles and read one of
+/// them. Control: without the limit it hands over.
+#[test]
+fn a_failed_check_of_the_installed_copy_is_an_error() {
+    let _serial = serial();
+    if !root_on_a_restricted_host() {
+        return;
+    }
+    let portable = PathBuf::from(sandy_path()).canonicalize().unwrap();
+    let copy = copy_path();
+    if copy.parent().unwrap().exists() {
+        return skip(
+            "no-installed-copy",
+            "a copy of this version of sandy is installed, and the test leaves it alone",
+        );
+    }
+    let _removal = CopyRemoval {
+        directory_existed: Path::new(COPY_DIRECTORY).exists(),
+    };
+    let setup = sudo([
+        portable.as_os_str(),
+        "setup".as_ref(),
+        "--install-copy".as_ref(),
+    ]);
+    assert!(setup.status.success(), "{}", text(&setup));
+
+    let probe = probe_path();
+    let directory = Path::new(&probe).parent().unwrap().to_str().unwrap();
+    let check = ["check", "--ip", "private"];
+    let run = [
+        "run",
+        "--ip",
+        "private",
+        "--read-exec",
+        directory,
+        "--",
+        &probe,
+        "pid",
+        "-",
+    ];
+    for args in [&check[..], &run[..]] {
+        let handed = with_descriptors(&portable, args, None);
+        assert!(handed.status.success(), "{args:?}: {}", text(&handed));
+        let failed = with_descriptors(&portable, args, Some(4));
+        assert_eq!(
+            failed.status.code(),
+            Some(EXIT_FAILURE),
+            "{args:?}: {}",
+            text(&failed)
+        );
+        assert!(failed.stdout.is_empty(), "{args:?}: {}", text(&failed));
+        let stderr = String::from_utf8_lossy(&failed.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "cannot tell whether to hand over to the installed copy {}",
+                copy.display()
+            )),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
 /// Setup writes and removes only files that carry its marker: a file of someone else at the
 /// profile's path stays, setup refuses with status 3, and the removal has nothing to remove.
 #[test]

@@ -364,8 +364,10 @@ Rules:
    connections it already accepted at most one second to deliver their remaining data, and then
    ends. A program that connects, writes and exits immediately therefore does not lose its data,
    and no relay outlives the program by more than one second, except when the program stopped it
-   (below). Connections still open when that second ends close with a reset, so no peer takes a
-   cut stream for a complete one. With `process.children = "contained"` on Linux and macOS, the
+   (below). On macOS a connection that the relay has not received yet when the program ends can
+   still be lost (docs/macos.md, "Known limitations"). Connections still open when that second
+   ends close with a reset, so no peer takes a cut stream for a complete one. With
+   `process.children = "contained"` on Linux and macOS, the
    relay watches the supervising sandy instead, which ends after the program's process group,
    and also a pipe that only the guard holds, so it ends with the group also while sandy is
    stopped.
@@ -658,18 +660,99 @@ later macOS that closes the ioctls needs no change in sandy to close the rest. E
 has a test that records it, so a platform release that closes one shows up as a failing test,
 and sandy then removes the exception.
 
-The backend reports each requirement as enforced (naming the mechanism) or unavailable (naming the
-reason). `EnforcementPlan::new` treats a requirement without a report as unavailable, so a backend
-cannot weaken the sandbox by omission. `sandy check` prints the plan. `sandy run` starts the
+The backend reports each requirement as enforced (naming the mechanism) or not, with the reason
+in one of four classes (see "Fallback levels" for why the classes matter):
+
+| Status | When | `check` prints |
+|---|---|---|
+| `Unavailable` | a lasting shortfall of the host: the kernel, the platform or the build lacks what the requirement needs, and neither another local user, nor a remote party, nor an earlier run of the program can cause it | `UNAVAILABLE` |
+| `NeedsSetup` | a shortfall that `sandy setup` prepares | `UNAVAILABLE`, naming setup |
+| `Indeterminate` | sandy cannot tell now: a probe failed for a reason that can pass (memory, process or descriptor limits, a timeout, a service that is starting, a read error) | `UNDECIDED` |
+| `Conflict` | the policy contradicts itself or this host's fixed layout: a writable path reaches a startup file, a script's interpreter lies outside `read_exec`, an AppContainer name is missing | `CONFLICT` |
+
+`EnforcementPlan::new` treats a requirement without a report as unavailable, so a backend
+cannot weaken the sandbox by omission, and among several reports for one requirement the worst
+wins: a conflict, then an indeterminate report, then one that setup cannot fix, then one that it
+can. `sandy check` prints the plan; it exits with 0 when every requirement is enforced, 1 or 2
+when one is unavailable, and 125 when one is indeterminate or a conflict. `sandy run` starts the
 program only when every requirement is enforced, and the backend's `run` must fail rather than
 continue if any mechanism fails while it is applied.
 
 `plan` changes nothing on the host, so some reasons for `run` to refuse are invisible to it: a
 port of a relay that another process holds, for example. `check` therefore also calls the
-backend's `verify`, which may touch the host as long as it leaves it as it found it; its reports
-join the plan, where an unavailable report wins. `run` does not call `verify`: it finds out while
-it applies the sandbox, and it stays the authoritative answer, because a trial bind can be stale
-a moment later.
+backend's `verify`, which may touch the host as long as it leaves it as it found it, once it has
+an enforceable plan; any report from it makes `check` fail with status 125. Such a report is
+never `Unavailable`: any local user can hold a port, so it says nothing about the host. `run`
+does not call `verify`: it finds out while it applies the sandbox, and it stays the
+authoritative answer, because a trial bind can be stale a moment later.
+
+## Fallback levels
+
+A policy can list weaker variants of itself after its base, in order (`[[fallback]]`, README.md,
+"Fallback levels"). `check` and `run` take the first level whose plan this host enforces. The
+knowledge of which host supports which hardening then stays in sandy, which knows its own
+probes, instead of in every program that embeds it.
+
+1. **A level is the base plus its own keys**, and only of the keys that choose how strongly the
+   program is isolated: `filesystem.view`, `network.ip`, `network.unix_sockets`,
+   `network.egress`, `process.signals`, `process.children`, `process.end_with_parent`,
+   `linux.path_metadata`, `macos.relays`, `windows.win32k` and `windows.appcontainer_name`.
+   Paths, `system`, the environment, `expose` and `forward` are the same in every level, so the
+   program finds the same files and ports in each, and the path rules (rules 2 to 4 and 8 of
+   README.md), checked once, cover every level: no level's writable path can reach a path of
+   another. `ResolvedPolicy::resolve_levels` resolves the paths once and checks the settings of
+   each level as a policy of its own, on every host, so a level that could never run is an
+   error everywhere.
+2. **A level is skipped only for a lasting shortfall of the host**: its plan is not enforceable,
+   and every report that is not enforced is `Unavailable` or `NeedsSetup`. An `Indeterminate`
+   report or a `Conflict` stops the choice with status 125, also when a weaker level would be
+   enforceable (`sandy_core::select`). Otherwise a passing condition, or another user of the
+   host, would choose how weakly the program runs: a process limit at its end during one
+   `check`, a port someone else holds, a service still starting. The inputs of the first two
+   classes must therefore be ones that only the host's build and its administrator decide.
+3. **`verify` decides nothing.** Its trials touch state that others control (a port), so the
+   level is chosen from `plan` alone, and `check` runs `verify` for the chosen level only and
+   fails on any report from it.
+4. **One detection per invocation.** One backend value plans every level and runs the chosen
+   one, and it detects each host property at most once and keeps the answer, so a probe that
+   fails once cannot fail for the base and pass for the next level, and `run` builds the sandbox
+   from the answers it chose the level by. Detection is lazy: a probe that only a later level
+   needs runs only when sandy gets to that level.
+5. **`check` and `run` agree.** Both choose from `plan` with the same program, so `check` of a
+   policy with levels needs the program. What only `run` checks (the standard streams, the
+   parent of `end_with_parent`) is an error, never a reason to skip a level. Separate processes
+   can still see different hosts, so a program that configures itself per level passes the level
+   `check` chose to `run --level`, which refuses instead of taking another level.
+6. **Nothing weaker than the last level runs**, and `run` never tries another level once the
+   backend's `run` was called: with `children = "contained"` it can fail after the program
+   started.
+7. **Every level needs an AppContainer name of its own** once one names one, checked on every
+   platform. On Windows, levels that shared a name would fight over its machine-wide loopback
+   exemption (setup of a level with `ip = "all"` exempts it, and a level with `ip = "private"`
+   then needs setup on every run), refuse each other at the running-instance lock, and let a
+   weaker level leave data in the profile folder that a stronger one reads.
+8. **An option that sets a key some level sets is an error**, because it would be unclear which
+   levels it changes. Other options apply to the base and so to every level, with the same
+   warnings as for the base.
+9. **The choice is visible.** `check` prints the plan of each level it tried and the level that
+   runs, `check --json` the same as one object, `run` warns on standard error when it runs a
+   level other than `base`, and the status record starts with `level NAME`.
+
+Not part of this: sandy choosing combinations of keys on its own, lists of values per key, and
+running `sandy setup` by itself. A level is what the author of the policy wrote.
+
+### The policy on standard input
+
+`--policy -` reads the policy from standard input until its end, at most 1 MiB, with the same
+parser as a file. A program that ships the policy inside itself then has no policy file to place
+where the sandboxed program cannot write it, none is left behind, and nothing can change it
+between writing and reading. It does not protect against other processes of the same user,
+which can change sandy or the caller just as well. After reading, sandy replaces its standard
+input with the null device, before anything else starts, so the program never reads what the
+caller writes there: a terminal stays readable after the end of input the user typed, so
+reading to the end would not be enough. `--elevate` refuses it, because the elevated sandy does
+not get the caller's standard input. On Linux the hand-over to an installed copy happens before
+sandy reads anything, so the copy reads the policy itself.
 
 ## Process model
 
@@ -903,8 +986,9 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
 - Refused: no Landlock (the reason names the fix), no seccomp, root or any capability, a writable
   path that overlaps the minimal system set (rule 6), a program whose ELF loader no executable
   path covers (the kernel opens it during `execve`), `ip = "private"` and `view = "policy"` where
-  user namespaces are disabled or a trial of them fails (under Ubuntu's AppArmor restriction they
-  need setup), `egress` with them, or where the kernel does not answer the broker's route
+  user namespaces are disabled or the kernel refuses a trial of them (under Ubuntu's AppArmor
+  restriction they need setup; a trial that fails for a reason that can pass, such as a full
+  process table, ends `check` and `run` with status 125), `egress` with them, or where the kernel does not answer the broker's route
   lookups, and `view = "policy"` on a kernel without the fix of Landlock erratum 3.
 
 ### macOS
@@ -1099,9 +1183,9 @@ Details, limitations and sources: `docs/windows.md`.
 |---|---|
 | program's status | `sandy run` started the program |
 | 128 + signal number | Linux and macOS with `process.children = "contained"`, and Linux with `--explain`: a signal ended the program |
-| 125 | sandy failed or refused (invalid policy, unenforceable policy, a socket on a standard stream the policy denies, a pseudo-terminal master on one with `signals = "isolated"`, setup failure); where sandy stays the parent also a failure while it supervises the program |
-| 0 / 1 | `sandy check`: enforceable / not enforceable |
-| 2 | `sandy check`: not enforceable on this host until `sandy setup`, run once with administrator rights, prepares it; nothing else is missing |
+| 125 | sandy failed or refused (invalid policy, unenforceable policy, a socket on a standard stream the policy denies, a pseudo-terminal master on one with `signals = "isolated"`, setup failure); where sandy stays the parent also a failure while it supervises the program; for `check`, an indeterminate or conflicting plan item, or a `verify` finding |
+| 0 / 1 | `sandy check`: the policy, or one of its levels, is enforceable / none is |
+| 2 | `sandy check`: no level is enforceable on this host, but `sandy setup`, run once with administrator rights, would make one so |
 | 0 | `sandy setup` and `sandy setup --remove`: done, or nothing to do |
 | 3 | `sandy setup` and `sandy setup --remove`: not done, and nothing changed: the rights were not given (run without administrator rights and without `--elevate`; with `--elevate`, a dismissed prompt, no authentication agent, not authorized), setup is not allowed for this binary, or on Linux user namespaces are disabled on the host, which setup cannot change |
 
@@ -1109,8 +1193,12 @@ The caller sees sandy's process ID where sandy stays the parent, and 125 means b
 refused" and "the program exited with 125". These are additions, not changes: `--status-fd`
 carries the program's process ID and how it ended on a descriptor of the caller's choosing,
 which sandy makes close-on-exec and keeps out of what the program inherits. The lines are
-`pid N`, then `exited N` or `signaled N`, or `failed` when sandy itself failed. See README.md,
-"The status record". No exit status changes meaning, because callers parse the documented ones.
+`level NAME` for a policy with fallback levels, `pid N`, then `exited N` or `signaled N`, or
+`failed` when sandy itself failed. See README.md, "The status record". No exit status changes
+meaning, because callers parse the documented ones. One deliberate exception came with fallback
+levels in 2.2.0: `check` used to exit with 1, and for some Windows relay errors with 2, when a
+probe failed for a reason that can pass or a relay port was busy; it now exits with 125, which
+tells a caller to try again later instead of using a weaker policy.
 
 Status 2 of `check` lets a calling program tell "this host needs preparing" from "this host
 cannot do it" without parsing text: it can ask the user for administrator rights, run

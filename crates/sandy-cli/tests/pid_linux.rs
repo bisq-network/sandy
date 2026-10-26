@@ -358,6 +358,66 @@ fn check_tries_the_pid_namespace_where_the_run_needs_one() {
     }
 }
 
+/// Below Landlock ABI 6 only the PID namespace isolates signals. Under Ubuntu's AppArmor
+/// restriction an unconfined sandy gets none until `sandy setup` installs its profile, so
+/// signal isolation needs setup there and `check` exits with status 2, as for the private
+/// network, while `contained` keeps its process group. `sandy-abi-cap` shows ABI 4 on a newer
+/// kernel.
+#[test]
+fn isolated_signals_need_setup_below_abi_6_under_the_apparmor_restriction() {
+    let read = |path: &str| {
+        fs::read_to_string(path)
+            .map(|value| value.trim().to_string())
+            .unwrap_or_default()
+    };
+    if read("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") != "1"
+        || read("/proc/self/attr/apparmor/current") != "unconfined"
+    {
+        return skip(
+            "apparmor-userns-restriction",
+            "this host does not restrict the user namespaces of an unconfined sandy",
+        );
+    }
+    let copy = format!(
+        "/usr/local/libexec/sandy/{}/sandy",
+        env!("CARGO_PKG_VERSION")
+    );
+    if fs::metadata(&copy).is_ok() {
+        return skip(
+            "no-installed-copy",
+            "sandy hands over to the copy that setup installed, which gets the namespaces",
+        );
+    }
+    let Some(cap) = common::abi_cap_path() else {
+        return skip("abi-cap", "sandy-abi-cap is not next to the other binaries");
+    };
+    let output = Command::new(cap)
+        .arg("4")
+        .arg(sandy_path())
+        .arg("check")
+        .args(contained())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("signals limited to the sandbox"))
+        .unwrap_or_default();
+    assert!(
+        line.starts_with("UNAVAILABLE ")
+            && line.contains("no PID namespace")
+            && line.contains("`sandy setup`"),
+        "{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("enforced") && line.contains("whose leader is a guard")),
+        "{stdout}"
+    );
+}
+
 /// Runs sandy with `arguments` where `unshare` and `clone` fail with EPERM whenever they ask for a
 /// new PID namespace, and every other call works.
 fn without_pid_namespaces(arguments: &[String]) -> std::process::Output {

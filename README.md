@@ -16,7 +16,7 @@ sandy run \
   -- /srv/app/bin/server --port 8080
 ```
 
-Version 2.1.0. Policies use format `version = 1`.
+Version 2.2.0. Policies use format `version = 1`.
 
 ## Contents
 
@@ -84,12 +84,13 @@ cargo build --release --target x86_64-unknown-linux-musl -p sandy-cli --bin sand
 
 Release archives for each platform are built by the `release` workflow (see
 [Building and testing](#building-and-testing)). Sizes, measured for 1.x except the first row,
-which is 2.1.0 (the namespaces, the view and the egress broker made the Linux binary larger; the
-other rows will grow too, and the release workflow gives their current size):
+which is 2.2.0 (the namespaces, the view and the egress broker of 2.1.0 and the fallback levels
+of 2.2.0 made the Linux binary larger; the other rows will grow too, and the release workflow
+gives their current size):
 
 | Target | Binary | Archive |
 |---|---|---|
-| `x86_64-unknown-linux-musl` (static PIE) | 1.5 MiB | 700 KiB |
+| `x86_64-unknown-linux-musl` (static PIE) | 1.6 MiB | 770 KiB |
 | `aarch64-unknown-linux-musl` (static, not position-independent) | 772 KiB | 401 KiB |
 | `aarch64-apple-darwin` | 654 KiB | 318 KiB |
 | `x86_64-apple-darwin` | 713 KiB | 350 KiB |
@@ -100,7 +101,7 @@ other rows will grow too, and the release workflow gives their current size):
 names the workflow, the commit and the run that built it:
 
 ```sh
-gh attestation verify sandy-2.1.0-x86_64-unknown-linux-musl.tar.gz --repo <owner>/sandy
+gh attestation verify sandy-2.2.0-x86_64-unknown-linux-musl.tar.gz --repo <owner>/sandy
 ```
 
 `SHA256SUMS` in the release lists the sum of every archive. It says that the archives belong
@@ -308,7 +309,8 @@ All three exit with status 125, and the program does not start.
 
 ```text
 sandy run [OPTIONS] [--] PROGRAM [ARGS...]   run PROGRAM inside the sandbox
-sandy check [OPTIONS] [[--] PROGRAM]         show how this host enforces the policy
+sandy check [OPTIONS] [[--] PROGRAM]         show how this host enforces the policy (needs
+                                             PROGRAM when the policy has fallback levels)
 sandy setup [OPTIONS]                        prepare the host (needs admin rights on Windows,
                                              and on Linux under Ubuntu's AppArmor restriction)
 sandy setup --remove [OPTIONS]               take back what setup and the runs of the policy
@@ -321,7 +323,14 @@ after the first argument that is not an option) belongs to the program.
 `sandy check` prints one line per requirement: `enforced` with the mechanism, or `UNAVAILABLE`
 with the reason. Pass the program if the policy should include it. A requirement that this
 platform gives only in part is printed as `enforced` too, because `run` starts the program with
-it, and a warning names what stays open.
+it, and a warning names what stays open. Two more kinds of line make `check` exit with status
+125 instead of 1, because they say nothing about what this host can do: `UNDECIDED`, when a
+probe failed for a reason that can pass (out of memory or processes, a timeout, a service that
+is starting) and sandy cannot tell now, and `CONFLICT`, when the policy contradicts itself or
+this host's layout, for example a writable path that reaches a startup file. For a policy with
+[fallback levels](#fallback-levels), `check` prints a `[NAME]` line before the plan of each
+level it tried, and last `level: NAME`, the level that `run` takes, or `level: none`.
+`check --json` prints the same as one JSON object instead (see [Fallback levels](#fallback-levels)).
 
 Four kinds of finding get a `warning:` line on standard error: a setting that gives up part of the
 isolation (`unix_sockets = "all"`, `signals = "any"`, `path_metadata = "allow"`), an option that
@@ -352,6 +361,9 @@ no warnings: its standard error belongs to the program.
   [docs/linux.md](docs/linux.md), "Setup on Ubuntu", also for packaging scripts.
 - **macOS**: nothing to do.
 
+For a policy with fallback levels, `sandy setup` prepares every level in turn, or only the one
+`--level` names.
+
 `sandy setup --elevate` asks for those rights instead of needing them: through `pkexec` on Linux,
 whose authentication agent asks for an administrator's password, and through the UAC prompt on
 Windows. It never runs a file with the rights that someone without them can change: on Linux it
@@ -359,7 +371,7 @@ runs sandy's own file only when only root can change it, and otherwise, with `--
 only system tools and the root-owned copy, which it makes from the image of the running sandy;
 on Windows it asks only when only administrators can change `sandy.exe` and its directories.
 Otherwise it refuses with status 3. Where nothing is to do, it asks for nothing. With
-`--elevate`, `--policy` needs an absolute path.
+`--elevate`, `--policy` needs an absolute path, and cannot be `-`.
 
 `sandy setup --remove`, with the same policy, takes that preparation back, together with what
 the runs of the policy left on the host: on Windows the loopback exemption, the access control
@@ -378,7 +390,9 @@ it does nothing.
 
 | Option | Meaning | Default |
 |---|---|---|
-| `--policy FILE` | Read the policy from a TOML file (at most one). Path options add to it; the other options replace its values. | none |
+| `--policy FILE` | Read the policy from a TOML file (at most one). Path options add to it; the other options replace its values, but not one that a [fallback level](#fallback-levels) sets, which is an error. With `-`, read it from standard input, up to 1 MiB; the program then gets the null device as its standard input. | none |
+| `--level NAME` | Use only this level of the policy: `base` or the name of a fallback level. `run` refuses when this host cannot enforce it, instead of taking another. | |
+| `--json` | `check` only: print the result as one JSON object (see [Fallback levels](#fallback-levels)). | off |
 | `--read PATH` | Allow reading files and listing directories below `PATH`. | |
 | `--read-exec PATH` | Allow reading and executing below `PATH`. | |
 | `--read-write PATH` | Allow reading, creating, changing and deleting below `PATH`. Never executing. | |
@@ -454,17 +468,20 @@ it.
 |---|---|
 | the program's status | `sandy run` started the program |
 | 128 + signal number | Linux and macOS with `children = "contained"`, and Linux with `--explain`: a signal ended the program |
-| 125 | sandy failed or refused: invalid policy, a requirement this host cannot enforce, a socket on a standard stream that the policy denies, a pseudo-terminal master on one with `signals = "isolated"`, a setup error; with `children = "contained"` or `--explain` also a failure while sandy supervises the program |
-| 0 / 1 | `sandy check`: the policy is enforceable / not enforceable |
-| 2 | `sandy check`: not enforceable until `sandy setup`, run once with administrator rights, prepares this host, and nothing else is missing |
+| 125 | sandy failed or refused: invalid policy, a requirement this host cannot enforce, a socket on a standard stream that the policy denies, a pseudo-terminal master on one with `signals = "isolated"`, a setup error; with `children = "contained"` or `--explain` also a failure while sandy supervises the program. For `sandy check`: sandy cannot tell now whether this host enforces the policy (an `UNDECIDED` line, or a relay port that another process holds), or the policy conflicts with this host (a `CONFLICT` line) |
+| 0 / 1 | `sandy check`: the policy, or one of its levels, is enforceable / none is |
+| 2 | `sandy check`: no level is enforceable, but `sandy setup`, run once with administrator rights, would make one so |
 | 0 | `sandy setup`, with or without `--remove`: done, or nothing to do |
 | 3 | `sandy setup`, with or without `--remove`: not done, and nothing changed: the rights were not given (no administrator rights and no `--elevate`; with `--elevate`, a dismissed prompt, no authentication agent, not authorized), setup is not allowed for this binary, or on Linux user namespaces are disabled on this host |
 
 A program that starts sandy can act on these without reading text. On status 2 from `check`, it
 runs `sandy setup --elevate` with the same policy, adding `--install-copy` on Linux when it
-ships sandy outside a root-only path. On 0 it runs `check` again; on 3 it runs its fallback
-policy, one that needs no setup (on Linux, without `ip = "private"`); 125 means setup failed. A
-refusal also names the command that does it without `--elevate`, such as `sudo`.
+ships sandy outside a root-only path. On 0 it runs `check` again; on 3 it does without what
+setup prepares, best with a [fallback level](#fallback-levels) that needs no setup (on Linux,
+without `ip = "private"`), which `check` then selects; 125 means setup failed. A refusal also
+names the command that does it without `--elevate`, such as `sudo`. Status 125 from `check`
+means "try again later or fix the policy", never "use a weaker policy": sandy itself never
+moves to a weaker level for it.
 
 On Windows the program's 32-bit exit code is passed through unchanged.
 
@@ -477,6 +494,7 @@ without changing any exit status. sandy writes short lines to the descriptor, in
 
 | Line | When |
 |---|---|
+| `level NAME` | first, for a policy with fallback levels: the level that runs |
 | `pid N` | the program runs; `N` is its process ID |
 | `exited N` | sandy saw the program exit with status `N` |
 | `signaled N` | sandy saw signal `N` end the program (Linux and macOS with `contained`, Linux with `--explain`) |
@@ -783,6 +801,113 @@ under every policy. Tools that change metadata by path (`install`, `cp -a` on a 
 the user owns. `cp -p`, and `cp -a` on a single file, work under `"deny"`, because they set the
 metadata through the descriptor they wrote.
 
+### Fallback levels
+
+A program that runs on many hosts cannot know which hardening each of them supports: an older
+kernel without the newest Landlock, Ubuntu's restriction of user namespaces, a platform that
+cannot hide paths. A policy can list, after its base, weaker levels in order, and `check` and
+`run` take the first one this host can enforce:
+
+```toml
+version = 1
+
+[filesystem]
+read_exec = ["/opt/example/bin"]
+read_write = ["/var/lib/example"]
+view = "policy"
+
+[network]
+ip = "private"
+egress = { port = 1080 }
+
+[process]
+signals = "isolated"
+end_with_parent = true
+
+[windows]
+appcontainer_name = "example.app"
+
+[[fallback]]
+name = "contained"
+filesystem.view = "all"
+process.children = "contained"
+windows.appcontainer_name = "example.app.contained"
+
+[[fallback]]
+name = "host-network"
+network.ip = "all"
+network.egress = "none"
+filesystem.view = "all"
+process.signals = "any"
+process.end_with_parent = false
+windows.appcontainer_name = "example.app.host"
+```
+
+- **Each level is the base plus its own keys.** Levels do not build on each other, so each one
+  reads alone; `host-network` above does not contain the program's children. The base is named
+  `base`; a level name is 1 to 32 characters of `a-z`, `0-9` and `-`.
+- **A level sets only the keys that choose how strongly the program is isolated:**
+  `filesystem.view`, `network.ip`, `network.unix_sockets`, `network.egress` (a table, or `"none"`
+  for no broker), `process.signals`, `process.children`, `process.end_with_parent`,
+  `linux.path_metadata`, `macos.relays`, `windows.win32k` and `windows.appcontainer_name`. The
+  paths, `system`, the environment, `expose` and `forward` are the same in every level, so the
+  program finds the same files and ports in each. Any other key in a level is an error.
+- **Every level is checked as a policy of its own on every host**, so a level that could never
+  run (for example `children = "contained"` with `signals = "any"`) is an error everywhere, not
+  a surprise on the one host that reaches it.
+- **Every level needs an AppContainer name of its own** once one of them names one, because on
+  Windows levels that shared a name would share its loopback exemption and its profile folder.
+- **A level is skipped only for a lasting shortfall of the host**: a kernel, a platform or a
+  build that lacks what the level needs, or something `sandy setup` would prepare. A probe that
+  fails for a reason that can pass (`UNDECIDED`), a conflict between the policy and the host
+  (`CONFLICT`), a relay port another process holds, a socket on a standard stream: each of these
+  stops sandy with status 125 instead, because a weaker level chosen for it would let a passing
+  condition, or another user of the host, pick how weakly the program runs. The last level is
+  the floor; nothing weaker runs. docs/DESIGN.md, "Fallback levels", has the rules.
+- `run` that takes a level other than `base` says so on standard error, before the program
+  starts: `warning: running fallback level contained: this host cannot enforce level base (...)`.
+  `--level NAME` pins a level: `run` then refuses with status 125 when this host cannot enforce
+  it. A program that configures itself per level, for example writes another configuration file
+  for a level without the egress broker, runs `check` first and then `run --level` with the level
+  `check` named, so a host that changed in between makes `run` refuse rather than start the
+  program with the configuration of another level.
+- An option that sets a key some level sets (`--ip` when a level sets `network.ip`) is an error,
+  because it would be unclear which levels it changes. Other options apply to every level.
+- `check` of a policy with levels needs the program, because whether a level can run can depend
+  on it.
+
+`sandy check --json` prints one JSON object on one line on standard output, and nothing there
+when it exits with status 125:
+
+```json
+{"backend":"linux","selected":"contained","setup_would_help":false,
+ "levels":[{"name":"base","enforceable":false,"needs_setup":false,
+            "enforced":[{"requirement":"filesystem-confined","mechanism":"..."}],
+            "missing":[{"requirement":"signals-isolated","status":"unavailable","reason":"..."}],
+            "warnings":["..."]},
+           {"name":"contained","enforceable":true,"needs_setup":false,
+            "enforced":[...],"missing":[],"warnings":[]}],
+ "warnings":[]}
+```
+
+| Key | Meaning |
+|---|---|
+| `backend` | `linux`, `macos` or `windows` |
+| `selected` | the level `run` takes, or `null` when none is enforceable |
+| `setup_would_help` | no level is enforceable, but `sandy setup` would make one so (exit status 2) |
+| `levels` | the levels `check` planned, in order, up to the selected one |
+| `levels[].name` | `base` or the name of the fallback level |
+| `levels[].enforceable` | the host enforces every requirement of the level |
+| `levels[].needs_setup` | only something `sandy setup` prepares is missing |
+| `levels[].enforced` | each requirement this host enforces, with `requirement` and `mechanism` |
+| `levels[].missing` | each requirement it does not, with `requirement`, `status` (`unavailable` or `needs-setup`) and `reason` |
+| `levels[].warnings` | the `warning:` lines of the level |
+| `warnings` | warnings that concern every level, such as an option that widens the policy file |
+
+The requirement names (`filesystem-confined`, `ip-network-private`, `signals-isolated`, ...)
+and the keys stay stable; the `mechanism`, `reason` and warning texts are for people and can
+change. A policy without levels has one entry in `levels`, named `base`.
+
 ## Platform notes
 
 ### Linux
@@ -945,31 +1070,43 @@ Recommendations:
 1. **Call `sandy check` first** and show its output when the exit status is 1, so users learn
    why the program cannot run on their host. Its standard output has one line per requirement;
    the `warning:` lines on standard error are advice about the policy and do not change the exit
-   status.
-2. **Treat exit status 125 as "not started".** sandy prints the reason on standard error. Two
+   status. `check --json` gives the same to a program (see [Fallback levels](#fallback-levels)).
+2. **Put the weaker variants of the policy into the policy, as fallback levels**, instead of
+   retrying with another policy when `check` fails: sandy knows which hardening each host
+   supports, and it never moves to a weaker level for a reason that can pass. When the program
+   needs to know the level, for example to write its own configuration for it, run
+   `check --json`, configure the program for the `selected` level, and start it with
+   `run --level` and that name.
+3. **Pass the policy on standard input** (`--policy -`) when it ships inside the calling program,
+   for example as a resource: there is then no policy file to place where the program cannot
+   write it, none is left behind, and nothing can change it between writing and reading. It does
+   not protect against other processes of the same user, which can change the caller or sandy
+   just as well. The program then reads the null device on its standard input, so this suits
+   programs that need no input.
+4. **Treat exit status 125 as "not started".** sandy prints the reason on standard error. Two
    exceptions: a program can exit with 125 itself, and with `children = "contained"` or
    `--explain` sandy can fail while it supervises a running program, for example when the relay
    of its ports died (its message is `sandy: run failed: ...`). Pass `--status-fd` when you need to tell these apart, or need the
    program's process ID (see [The status record](#the-status-record)).
-3. **Keep sandy, the policy and the program's binaries out of every writable path.** Use separate
+5. **Keep sandy, the policy and the program's binaries out of every writable path.** Use separate
    directories for binaries (`read_exec`) and data (`read_write`). A program that can rewrite its
    own binary or library directory can escape at the next start.
-4. **Treat everything the program writes as untrusted input**, including files in its data
+6. **Treat everything the program writes as untrusted input**, including files in its data
    directory and everything it sends over exposed ports.
-5. **Do not pass secrets in arguments or the environment** unless the program needs them.
-6. **Run `sandy setup` during installation**, with administrator rights: on Windows, with a
+7. **Do not pass secrets in arguments or the environment** unless the program needs them.
+8. **Run `sandy setup` during installation**, with administrator rights: on Windows, with a
    stable AppContainer name per policy; on Linux, for `ip = "private"` under Ubuntu's AppArmor
    restriction, as in the packaging scripts of [docs/linux.md](docs/linux.md). A program without
    an installer runs `sandy setup --elevate` when `check` exits with 2 (see
    [Exit status](#exit-status)).
-7. **Give the program pipes, files or a terminal on its standard streams.** sandy passes
+9. **Give the program pipes, files or a terminal on its standard streams.** sandy passes
    descriptors 0, 1 and 2 on as it got them, so a socket among them would keep its access; sandy
    refuses to start the program then. The connected Unix stream socket that most runtimes pass
    for a pipe (libuv, and so Node.js) is accepted. With `signals = "isolated"` sandy also refuses
    the master side of a pseudo-terminal, which a terminal emulator or `expect` holds, because
    the program could type Ctrl+C into it and so signal the processes on the other side. Pass
    the slave side, the terminal a program normally runs in, or a pipe.
-8. **Do not give an untrusted program your terminal.** What the program writes to a terminal
+10. **Do not give an untrusted program your terminal.** What the program writes to a terminal
    reaches the terminal emulator, which acts on some escape sequences, for example to set the
    clipboard, and on Linux the program can also change the terminal's modes. These are ordinary
    writes, which no system call filter can tell apart, so sandy cannot stop them. Redirect the

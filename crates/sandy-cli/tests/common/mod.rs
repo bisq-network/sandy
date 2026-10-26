@@ -239,6 +239,12 @@ pub fn appcontainer_loopback_name() -> String {
     format!("sandy.escape-tests.lb.{}", test_tag())
 }
 
+/// The AppContainer name for a fallback level of the current test's policy: every level needs
+/// a name of its own.
+pub fn level_appcontainer_name() -> String {
+    format!("{}.level", appcontainer_name())
+}
+
 /// A short, stable, per-test identifier. libtest names each test's thread after the test, so the
 /// thread name is unique within a binary and the same on every run; the binary name keeps names
 /// from different test binaries apart. Hashed to keep the AppContainer name within its 64
@@ -345,13 +351,18 @@ pub fn appcontainer_sid(container: &str) -> String {
     value
 }
 
-/// Removes this test's AppContainer profiles (the plain and the loopback name, and the egress
-/// broker's of the plain one). Best effort.
+/// Removes this test's AppContainer profiles (the plain, the loopback and the level name, and
+/// the egress broker's of the plain one). Best effort.
 #[cfg(windows)]
 pub fn delete_test_profiles() {
     use windows_sys::Win32::Security::Isolation::DeleteAppContainerProfile;
     let broker = format!("{}.sandy-egress", appcontainer_name());
-    for name in [appcontainer_name(), appcontainer_loopback_name(), broker] {
+    for name in [
+        appcontainer_name(),
+        appcontainer_loopback_name(),
+        broker,
+        level_appcontainer_name(),
+    ] {
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: the name is NUL-terminated.
         unsafe { DeleteAppContainerProfile(wide.as_ptr()) };
@@ -682,6 +693,13 @@ pub fn start_token() -> u64 {
 /// inserted after it.
 #[cfg(unix)]
 pub fn sandy_with_status(args: &[String]) -> (Output, String) {
+    sandy_with_status_under(&[], args)
+}
+
+/// `sandy_with_status` with sandy started through `wrapper`, a program and its arguments that
+/// run sandy with the rest of the command line (such as `sandy-abi-cap`).
+#[cfg(unix)]
+pub fn sandy_with_status_under(wrapper: &[String], args: &[String]) -> (Output, String) {
     use std::io::Read;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::os::unix::process::CommandExt;
@@ -710,7 +728,14 @@ pub fn sandy_with_status(args: &[String]) -> (Output, String) {
         )
     };
     let raw = writer.as_raw_fd();
-    let mut command = Command::new(sandy_path());
+    let mut command = match wrapper.split_first() {
+        Some((program, rest)) => {
+            let mut command = Command::new(program);
+            command.args(rest).arg(sandy_path());
+            command
+        }
+        None => Command::new(sandy_path()),
+    };
     command
         .args(with_status_option(args, CHANNEL.to_string()))
         .stdout(Stdio::piped())

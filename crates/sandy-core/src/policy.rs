@@ -29,6 +29,11 @@ pub struct Policy {
     pub macos: MacosPolicy,
     #[serde(default)]
     pub windows: WindowsPolicy,
+    /// Weaker variants of this policy, strongest first (`[[fallback]]`). `check` and `run` take
+    /// the first of the base and these levels that the host can enforce (DESIGN.md, "Fallback
+    /// levels").
+    #[serde(default)]
+    pub fallback: Vec<Fallback>,
 }
 
 impl Default for Policy {
@@ -42,6 +47,7 @@ impl Default for Policy {
             linux: LinuxPolicy::default(),
             macos: MacosPolicy::default(),
             windows: WindowsPolicy::default(),
+            fallback: Vec::new(),
         }
     }
 }
@@ -53,7 +59,235 @@ impl Policy {
         if policy.version != POLICY_VERSION {
             return Err(PolicyError::UnsupportedVersion(policy.version));
         }
+        policy.check_level_names()?;
         Ok(policy)
+    }
+
+    /// The base and then every fallback level, each as a whole policy without levels: the base
+    /// with the keys that level sets. Levels do not build on each other.
+    pub fn levels(&self) -> Vec<Level> {
+        let mut base = self.clone();
+        base.fallback.clear();
+        let mut levels = vec![Level {
+            name: BASE_LEVEL.to_string(),
+            policy: base.clone(),
+        }];
+        for fallback in &self.fallback {
+            let mut policy = base.clone();
+            fallback.apply(&mut policy);
+            levels.push(Level {
+                name: fallback.name.clone(),
+                policy,
+            });
+        }
+        levels
+    }
+
+    fn check_level_names(&self) -> Result<(), PolicyError> {
+        let mut names = vec![BASE_LEVEL];
+        for fallback in &self.fallback {
+            let name = fallback.name.as_str();
+            let valid = !name.is_empty()
+                && name.len() <= MAX_LEVEL_NAME
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+            if !valid {
+                return Err(PolicyError::InvalidLevelName(name.to_string()));
+            }
+            if names.contains(&name) {
+                return Err(PolicyError::DuplicateLevelName(name.to_string()));
+            }
+            names.push(name);
+        }
+        Ok(())
+    }
+}
+
+/// The name of the policy's own settings among its levels.
+pub const BASE_LEVEL: &str = "base";
+
+/// The longest name a fallback level may have.
+pub const MAX_LEVEL_NAME: usize = 32;
+
+/// One level of a policy, as `Policy::levels` gives it: a whole policy without levels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Level {
+    pub name: String,
+    pub policy: Policy,
+}
+
+/// A fallback level: the base policy with some of its hardening keys replaced. Only the keys
+/// that choose how strongly the program is isolated may differ between levels; its files,
+/// environment and ports stay the same, so the program finds the same things in every level and
+/// the path rules, checked once, cover all of them. Any other key in a level is an error.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fallback {
+    pub name: String,
+    #[serde(default)]
+    pub filesystem: FallbackFilesystem,
+    #[serde(default)]
+    pub network: FallbackNetwork,
+    #[serde(default)]
+    pub process: FallbackProcess,
+    #[serde(default)]
+    pub linux: FallbackLinux,
+    #[serde(default)]
+    pub macos: FallbackMacos,
+    #[serde(default)]
+    pub windows: FallbackWindows,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FallbackFilesystem {
+    pub view: Option<FileView>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FallbackNetwork {
+    pub ip: Option<IpAccess>,
+    pub unix_sockets: Option<NetworkAccess>,
+    /// A broker of its own, or `"none"` for no broker.
+    pub egress: Option<FallbackEgress>,
+}
+
+/// `network.egress` in a fallback level: a broker table as in the base, or the string `"none"`,
+/// which removes the base's broker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackEgress {
+    None,
+    Broker(Egress),
+}
+
+impl<'de> Deserialize<'de> for FallbackEgress {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = FallbackEgress;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an egress table or \"none\"")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<FallbackEgress, E> {
+                match value {
+                    "none" => Ok(FallbackEgress::None),
+                    other => Err(E::invalid_value(serde::de::Unexpected::Str(other), &self)),
+                }
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<FallbackEgress, A::Error> {
+                Egress::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(FallbackEgress::Broker)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FallbackProcess {
+    pub signals: Option<SignalScope>,
+    pub children: Option<ChildProcesses>,
+    pub end_with_parent: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FallbackLinux {
+    pub path_metadata: Option<PathMetadata>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FallbackMacos {
+    pub relays: Option<Relays>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FallbackWindows {
+    pub win32k: Option<Win32k>,
+    pub appcontainer_name: Option<String>,
+}
+
+impl Fallback {
+    /// Whether this level sets `key`, written as in the policy (`network.ip`).
+    pub fn sets(&self, key: &str) -> bool {
+        self.keys().contains(&key)
+    }
+
+    /// The keys this level sets, written as in the policy.
+    pub fn keys(&self) -> Vec<&'static str> {
+        [
+            ("filesystem.view", self.filesystem.view.is_some()),
+            ("network.ip", self.network.ip.is_some()),
+            ("network.unix_sockets", self.network.unix_sockets.is_some()),
+            ("network.egress", self.network.egress.is_some()),
+            ("process.signals", self.process.signals.is_some()),
+            ("process.children", self.process.children.is_some()),
+            (
+                "process.end_with_parent",
+                self.process.end_with_parent.is_some(),
+            ),
+            ("linux.path_metadata", self.linux.path_metadata.is_some()),
+            ("macos.relays", self.macos.relays.is_some()),
+            ("windows.win32k", self.windows.win32k.is_some()),
+            (
+                "windows.appcontainer_name",
+                self.windows.appcontainer_name.is_some(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(key, set)| set.then_some(key))
+        .collect()
+    }
+
+    fn apply(&self, policy: &mut Policy) {
+        if let Some(view) = self.filesystem.view {
+            policy.filesystem.view = view;
+        }
+        if let Some(ip) = self.network.ip {
+            policy.network.ip = ip;
+        }
+        if let Some(unix_sockets) = self.network.unix_sockets {
+            policy.network.unix_sockets = unix_sockets;
+        }
+        match self.network.egress {
+            Some(FallbackEgress::None) => policy.network.egress = None,
+            Some(FallbackEgress::Broker(egress)) => policy.network.egress = Some(egress),
+            None => {}
+        }
+        if let Some(signals) = self.process.signals {
+            policy.process.signals = signals;
+        }
+        if let Some(children) = self.process.children {
+            policy.process.children = children;
+        }
+        if let Some(end_with_parent) = self.process.end_with_parent {
+            policy.process.end_with_parent = end_with_parent;
+        }
+        if let Some(path_metadata) = self.linux.path_metadata {
+            policy.linux.path_metadata = path_metadata;
+        }
+        if let Some(relays) = self.macos.relays {
+            policy.macos.relays = relays;
+        }
+        if let Some(win32k) = self.windows.win32k {
+            policy.windows.win32k = win32k;
+        }
+        if let Some(name) = &self.windows.appcontainer_name {
+            policy.windows.appcontainer_name = Some(name.clone());
+        }
     }
 }
 
@@ -463,6 +697,24 @@ pub enum PolicyError {
     ProgramNotAFile(PathBuf),
     InvalidEnvironmentName(String),
     InvalidEnvironmentValue(String),
+    InvalidLevelName(String),
+    DuplicateLevelName(String),
+    /// Two levels would run in one AppContainer.
+    SharedAppContainerName {
+        first: String,
+        second: String,
+        name: String,
+    },
+    /// One level names an AppContainer and another names none.
+    MissingAppContainerName {
+        level: String,
+        named: String,
+    },
+    /// A level is not valid as a policy of its own.
+    InvalidLevel {
+        level: String,
+        error: Box<PolicyError>,
+    },
 }
 
 impl fmt::Display for PolicyError {
@@ -573,6 +825,33 @@ impl fmt::Display for PolicyError {
             PolicyError::InvalidEnvironmentValue(name) => {
                 write!(f, "invalid value for environment variable {name}")
             }
+            PolicyError::InvalidLevelName(name) => write!(
+                f,
+                "invalid fallback level name {name:?}: use 1 to {MAX_LEVEL_NAME} characters of \
+                 a-z, 0-9 and '-'"
+            ),
+            PolicyError::DuplicateLevelName(name) => write!(
+                f,
+                "fallback level name {name:?} is used twice; every level needs a name of its \
+                 own, and {BASE_LEVEL:?} names the base"
+            ),
+            PolicyError::SharedAppContainerName {
+                first,
+                second,
+                name,
+            } => write!(
+                f,
+                "levels {first} and {second} share the AppContainer name {name:?}; give each \
+                 level a windows.appcontainer_name of its own, because on Windows levels that \
+                 share one share the loopback exemption, the running instance and the profile \
+                 folder"
+            ),
+            PolicyError::MissingAppContainerName { level, named } => write!(
+                f,
+                "level {level} names no AppContainer while level {named} does; give each level a \
+                 windows.appcontainer_name of its own"
+            ),
+            PolicyError::InvalidLevel { level, error } => write!(f, "level {level}: {error}"),
         }
     }
 }
@@ -583,6 +862,7 @@ impl std::error::Error for PolicyError {
             PolicyError::PathNotFound { source, .. } | PolicyError::Unreadable { source, .. } => {
                 Some(source)
             }
+            PolicyError::InvalidLevel { error, .. } => Some(error.as_ref()),
             _ => None,
         }
     }
@@ -731,6 +1011,179 @@ mod tests {
             assert!(
                 matches!(Policy::from_toml(bad), Err(PolicyError::Parse(_))),
                 "{bad}"
+            );
+        }
+    }
+
+    const LEVELS: &str = r#"
+        version = 1
+        [filesystem]
+        read = ["/a"]
+        view = "policy"
+        [network]
+        ip = "private"
+        egress = { port = 1080 }
+        [process]
+        signals = "isolated"
+        end_with_parent = true
+
+        [[fallback]]
+        name = "contained"
+        filesystem.view = "all"
+        process.children = "contained"
+
+        [[fallback]]
+        name = "host-network"
+        network.ip = "all"
+        network.egress = "none"
+        filesystem.view = "all"
+        process.signals = "any"
+        process.end_with_parent = false
+    "#;
+
+    /// Each level is the base plus its own keys; levels do not build on each other, and they
+    /// keep their order.
+    #[test]
+    fn a_level_is_the_base_with_its_own_keys() {
+        let policy = Policy::from_toml(LEVELS).unwrap();
+        let levels = policy.levels();
+        let names: Vec<&str> = levels.iter().map(|level| level.name.as_str()).collect();
+        assert_eq!(names, ["base", "contained", "host-network"]);
+        assert!(levels.iter().all(|level| level.policy.fallback.is_empty()));
+
+        let base = &levels[0].policy;
+        let mut expected = policy.clone();
+        expected.fallback.clear();
+        assert_eq!(base, &expected);
+
+        let contained = &levels[1].policy;
+        assert_eq!(contained.filesystem.view, FileView::All);
+        assert_eq!(contained.process.children, ChildProcesses::Contained);
+        assert_eq!(contained.network.ip, IpAccess::Private);
+        assert_eq!(contained.network.egress, base.network.egress);
+        assert!(contained.process.end_with_parent);
+
+        let host = &levels[2].policy;
+        assert_eq!(host.network.ip, IpAccess::All);
+        assert_eq!(host.network.egress, None);
+        assert_eq!(host.process.signals, SignalScope::Any);
+        assert!(!host.process.end_with_parent);
+        // Not inherited from "contained".
+        assert_eq!(host.process.children, ChildProcesses::Allowed);
+        assert_eq!(host.filesystem.read, base.filesystem.read);
+    }
+
+    #[test]
+    fn a_level_sets_every_hardening_key() {
+        let policy = Policy::from_toml(
+            r#"
+            version = 1
+            [[fallback]]
+            name = "all-keys"
+            filesystem.view = "policy"
+            network.ip = "client"
+            network.unix_sockets = "all"
+            network.egress = { port = 1, reach = "public-and-local" }
+            process.signals = "isolated"
+            process.children = "none"
+            process.end_with_parent = true
+            linux.path_metadata = "allow"
+            macos.relays = "ipv4"
+            windows.win32k = "deny"
+            windows.appcontainer_name = "example-level"
+            "#,
+        )
+        .unwrap();
+        let fallback = &policy.fallback[0];
+        assert_eq!(fallback.keys().len(), 11, "{:?}", fallback.keys());
+        assert!(fallback.sets("network.egress"));
+        let level = &policy.levels()[1].policy;
+        assert_eq!(level.filesystem.view, FileView::Policy);
+        assert_eq!(level.network.ip, IpAccess::Client);
+        assert_eq!(level.network.unix_sockets, NetworkAccess::All);
+        assert_eq!(
+            level.network.egress,
+            Some(Egress {
+                port: 1,
+                reach: EgressReach::PublicAndLocal
+            })
+        );
+        assert_eq!(level.process.signals, SignalScope::Isolated);
+        assert_eq!(level.process.children, ChildProcesses::None);
+        assert!(level.process.end_with_parent);
+        assert_eq!(level.linux.path_metadata, PathMetadata::Allow);
+        assert_eq!(level.macos.relays, Relays::Ipv4);
+        assert_eq!(level.windows.win32k, Win32k::Deny);
+        assert_eq!(
+            level.windows.appcontainer_name.as_deref(),
+            Some("example-level")
+        );
+        let none = Policy::from_toml("version = 1\n[[fallback]]\nname = \"a\"").unwrap();
+        assert!(none.fallback[0].keys().is_empty());
+        assert_eq!(none.levels()[1].policy, none.levels()[0].policy);
+    }
+
+    /// Paths, `system`, the environment and the relays are the same in every level, so a level
+    /// that sets one is an error, as is a misspelled key.
+    #[test]
+    fn a_level_sets_no_other_key() {
+        for key in [
+            "filesystem.read = [\"/a\"]",
+            "filesystem.read_exec = [\"/a\"]",
+            "filesystem.read_write = [\"/a\"]",
+            "filesystem.system = \"none\"",
+            "network.expose = []",
+            "network.forward = []",
+            "environment.pass = [\"A\"]",
+            "environment.set = { A = \"b\" }",
+            "version = 1",
+            "fallback = []",
+            "network.ipp = \"all\"",
+            "network.egress = \"public\"",
+            "network.egress = { port = 1, host = \"x\" }",
+            "process.end_with_parent = \"yes\"",
+        ] {
+            let text = format!("version = 1\n[[fallback]]\nname = \"a\"\n{key}");
+            assert!(
+                matches!(Policy::from_toml(&text), Err(PolicyError::Parse(_))),
+                "{key}"
+            );
+        }
+        let nameless = "version = 1\n[[fallback]]\nnetwork.ip = \"all\"";
+        assert!(matches!(
+            Policy::from_toml(nameless),
+            Err(PolicyError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn level_names_are_short_distinct_and_simple() {
+        let named = |names: &[&str]| {
+            let mut text = String::from("version = 1\n");
+            for name in names {
+                text.push_str(&format!("[[fallback]]\nname = {name:?}\n"));
+            }
+            Policy::from_toml(&text)
+        };
+        assert!(named(&["a", "b-2", &"x".repeat(MAX_LEVEL_NAME)]).is_ok());
+        for bad in [
+            "",
+            "A",
+            "a b",
+            "a_b",
+            "a.b",
+            "\u{e9}",
+            &"x".repeat(MAX_LEVEL_NAME + 1),
+        ] {
+            assert!(
+                matches!(named(&[bad]), Err(PolicyError::InvalidLevelName(_))),
+                "{bad:?}"
+            );
+        }
+        for names in [&["base"][..], &["a", "a"]] {
+            assert!(
+                matches!(named(names), Err(PolicyError::DuplicateLevelName(_))),
+                "{names:?}"
             );
         }
     }

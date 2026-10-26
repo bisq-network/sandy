@@ -9,15 +9,18 @@ parent a_parent_that_ended_before_sandy_ran_is_refused orphan-detection-without-
 # it, and the refusal of a program whose loader is not granted cannot be shown with it.
 review_linux_conformance a_program_whose_loader_is_not_granted_is_refused dynamic-program
 # Only Ubuntu 23.10 and newer restrict the user namespaces of unconfined processes with AppArmor,
-# which makes `check --ip private` and `check --view policy` exit with status 2.
+# which makes `check --ip private`, `check --view policy` and, below Landlock ABI 6,
+# `check --children contained --signals isolated` exit with status 2.
 private_linux check_needs_setup_under_the_apparmor_restriction apparmor-userns-restriction
 view_linux check_needs_setup_under_the_apparmor_restriction apparmor-userns-restriction
+pid_linux isolated_signals_need_setup_below_abi_6_under_the_apparmor_restriction apparmor-userns-restriction
 # The test of egress reach = "public-and-local" needs another host of the local network, which
 # SANDY_TEST_LOCAL_PEER names; a plain run does not set it.
 private_linux public_and_local_reaches_a_host_of_the_local_network local-network-peer
 # sandy setup changes the host only where Ubuntu's AppArmor restriction applies, and only with
 # root's rights, which the setup tests take with sudo -n; this host restricts nothing and asks
 # sudo for a password.
+setup_linux a_failed_check_of_the_installed_copy_is_an_error passwordless-sudo
 setup_linux elevate_without_an_authentication_agent_is_not_done apparmor-userns-restriction
 setup_linux elevate_installs_a_copy_that_only_root_can_change passwordless-sudo
 setup_linux install_copy_lets_a_portable_sandy_hand_over passwordless-sudo

@@ -1,5 +1,7 @@
 //! The checks behind `Backend::verify`: they touch the host, which `plan` must not do, so they
-//! run only for `sandy check`.
+//! run only for `sandy check`. What they find can change a moment later, and others than an
+//! administrator can cause it, so every report here is `Status::Indeterminate`: it makes `check`
+//! fail, and it never makes sandy try another fallback level.
 
 use std::net::{SocketAddr, TcpListener};
 
@@ -27,7 +29,7 @@ pub fn relay_listeners(policy: &ResolvedPolicy) -> Vec<PlanItem> {
             let error = TcpListener::bind(address).err()?;
             Some(format!("cannot listen on {address}: {error}"))
         })?;
-        Some(PlanItem::unavailable(requirement, busy))
+        Some(PlanItem::indeterminate(requirement, busy))
     })
     .collect()
 }
@@ -62,7 +64,10 @@ mod tests {
         let items = relay_listeners(&policy(expose.clone(), Vec::new()));
         assert_eq!(items.len(), 1, "{items:?}");
         assert_eq!(items[0].requirement, Requirement::ExposedPortsRelayed);
-        assert!(format!("{:?}", items[0].status).contains(&busy.to_string()));
+        assert!(matches!(
+            &items[0].status,
+            crate::plan::Status::Indeterminate { reason } if reason.contains(&busy.to_string())
+        ));
 
         let items = relay_listeners(&policy(Vec::new(), forward));
         assert_eq!(items.len(), 1, "{items:?}");

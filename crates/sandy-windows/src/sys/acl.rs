@@ -1,6 +1,7 @@
 //! File grants for the AppContainer: one access control entry (ACE) per policy path, for a
 //! capability that names the path's object and access level (see `name::grant_capability_name`).
 
+use std::cell::OnceCell;
 use std::fs;
 use std::mem::size_of;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -8,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 
 use sandy_core::{PathAccess, PathRule, SandboxError};
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, GetLastError, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::Authorization::{
     ACCESS_MODE, EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS,
     SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID,
@@ -40,12 +41,14 @@ use crate::access::{
     has_explicit_ace, map_generic, may_grant,
 };
 use crate::name::{FileIdentity, grant_capability_name};
+use crate::plan::Problem;
+use crate::probe::Ungrantable;
 
 /// Makes sure the AppContainer can use `rule.path` at `rule.access` and returns the capability
 /// the target must hold for it. `held` are the other SIDs the program's token will carry (see
 /// `check_writable`). Changes nothing when the grant is already in place.
 pub fn grant(appcontainer: &str, rule: &PathRule, held: &[Sid]) -> Result<Sid, SandboxError> {
-    check_writable(rule, held).map_err(SandboxError::new)?;
+    check_writable(rule, held).map_err(|problem| SandboxError::new(problem.to_string()))?;
     let path = wide_nul(rule.path.as_os_str());
     let capability = grant_capability(appcontainer, rule, &path)?;
     if !lacks_grant(rule, &capability, &Dacl::read(&path, &rule.path)?)? {
@@ -88,27 +91,37 @@ pub fn grant(appcontainer: &str, rule: &PathRule, held: &[Sid]) -> Result<Sid, S
 /// identity of the object it is granted on, so it can only appear on that object, and a file
 /// that is both writable and executable through a second name is the link question of
 /// "Links and identity". Changes nothing.
-pub fn check_writable(rule: &PathRule, held: &[Sid]) -> Result<(), String> {
+///
+/// What the permissions say is how their owner laid out the path, a conflict with the policy; a
+/// list that sandy cannot read can pass, so that is indeterminate.
+pub fn check_writable(rule: &PathRule, held: &[Sid]) -> Result<(), Problem> {
     if rule.access != PathAccess::ReadWrite {
         return Ok(());
     }
+    let unreadable = |error: SandboxError| Problem::Indeterminate(error.to_string());
     let path = wide_nul(rule.path.as_os_str());
-    let aces = Dacl::read(&path, &rule.path)
-        .and_then(|dacl| dacl.aces(&rule.path))
-        .map_err(|error| error.to_string())?;
+    let dacl = Dacl::read(&path, &rule.path).map_err(unreadable)?;
+    if dacl.acl.is_null() {
+        return Err(Problem::Conflict(format!(
+            "writable path {} has no access control list, so everyone, every AppContainer among \
+             them, may execute files there",
+            rule.path.display()
+        )));
+    }
+    let aces = dacl.aces(&rule.path).map_err(unreadable)?;
     if aces.has_unknown_types {
-        return Err(format!(
+        return Err(Problem::Conflict(format!(
             "the permissions of writable path {} contain entries that sandy cannot evaluate, so \
              it cannot tell whether AppContainers may execute files there",
             rule.path.display()
-        ));
+        )));
     }
     match executable_by(&aces.entries(), &executors(rule, held), rule.is_dir) {
-        Some(who) => Err(format!(
+        Some(who) => Err(Problem::Conflict(format!(
             "{who} may execute files in writable path {}, so the program could write a program \
              there and run it",
             rule.path.display()
-        )),
+        ))),
         None => Ok(()),
     }
 }
@@ -177,16 +190,65 @@ pub fn revoke(appcontainer: &str, rule: &PathRule) -> Result<(), SandboxError> {
 
 /// Whether `grant` would succeed for `rule`: the grant is in place, or the current user may
 /// change the DACL. Changes nothing.
-pub fn grantable(appcontainer: &str, rule: &PathRule) -> Result<(), String> {
-    let path = wide_nul(rule.path.as_os_str());
-    let in_place = grant_capability(appcontainer, rule, &path)
-        .and_then(|capability| {
-            lacks_grant(rule, &capability, &Dacl::read(&path, &rule.path)?).map(|lacks| !lacks)
+pub fn grantable(appcontainer: &str, rule: &PathRule) -> Result<(), Ungrantable> {
+    GrantTarget::read(rule.clone())?.grantable(appcontainer)
+}
+
+/// What decides whether sandy may give an AppContainer access to the object of a rule: the
+/// object's identity, its DACL and, once a grant is missing, whether the current user may change
+/// that DACL. Read once, so that every AppContainer name is asked about the same answers.
+pub struct GrantTarget {
+    rule: PathRule,
+    path: Vec<u16>,
+    identity: FileIdentity,
+    dacl: Dacl,
+    /// The Win32 error of opening the object for `WRITE_DAC`, `Ok` when it opened.
+    may_change: OnceCell<Result<(), i32>>,
+}
+
+impl GrantTarget {
+    pub fn read(rule: PathRule) -> Result<GrantTarget, Ungrantable> {
+        let unreadable = |error: SandboxError| Ungrantable::Unreadable(error.to_string());
+        let path = wide_nul(rule.path.as_os_str());
+        let identity = file_identity(&path, &rule.path).map_err(unreadable)?;
+        let dacl = Dacl::read(&path, &rule.path).map_err(unreadable)?;
+        if dacl.acl.is_null() {
+            return Err(Ungrantable::NoAcl);
+        }
+        Ok(GrantTarget {
+            rule,
+            path,
+            identity,
+            dacl,
+            may_change: OnceCell::new(),
         })
-        .map_err(|error| error.to_string())?;
-    if in_place {
-        return Ok(());
     }
+
+    pub fn rule(&self) -> &PathRule {
+        &self.rule
+    }
+
+    /// Whether `grant` would succeed for `appcontainer`: the grant is in place, or the current
+    /// user may change the DACL. Changes nothing.
+    pub fn grantable(&self, appcontainer: &str) -> Result<(), Ungrantable> {
+        let unreadable = |error: SandboxError| Ungrantable::Unreadable(error.to_string());
+        let capability = capability_sid(&grant_capability_name(
+            appcontainer,
+            self.rule.access,
+            self.identity,
+        ))
+        .map_err(unreadable)?;
+        if !lacks_grant(&self.rule, &capability, &self.dacl).map_err(unreadable)? {
+            return Ok(());
+        }
+        let may_change = self.may_change.get_or_init(|| may_change_dacl(&self.path));
+        may_change.map_err(|code| Ungrantable::Denied(std::io::Error::from_raw_os_error(code)))
+    }
+}
+
+/// Whether the current user may change the DACL of `path`, or the Win32 error that says no:
+/// opening it for `WRITE_DAC` checks the right and changes nothing.
+fn may_change_dacl(path: &[u16]) -> Result<(), i32> {
     // SAFETY: path is NUL-terminated; opening for WRITE_DAC only checks the right.
     let handle = unsafe {
         CreateFileW(
@@ -200,10 +262,8 @@ pub fn grantable(appcontainer: &str, rule: &PathRule) -> Result<(), String> {
         )
     };
     if handle == INVALID_HANDLE_VALUE {
-        return Err(format!(
-            "the grant is missing, and the current user may not change the permissions: {}",
-            std::io::Error::last_os_error()
-        ));
+        // SAFETY: GetLastError has no preconditions.
+        return Err(unsafe { GetLastError() } as i32);
     }
     // SAFETY: CreateFileW succeeded, so the handle is new; dropping it closes it.
     drop(unsafe { OwnedHandle::from_raw_handle(handle) });
@@ -792,4 +852,98 @@ fn set_access(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::access::FILE_GENERIC_EXECUTE;
+
+    /// A new, empty directory below the temporary directory.
+    fn directory(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sandy-acl-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn writable(path: &Path) -> PathRule {
+        PathRule {
+            path: path.to_path_buf(),
+            access: PathAccess::ReadWrite,
+            is_dir: true,
+        }
+    }
+
+    /// Gives `path` a NULL DACL: everyone has full access.
+    fn remove_dacl(path: &Path) {
+        let wide = wide_nul(path.as_os_str());
+        // SAFETY: wide is NUL-terminated; a null DACL with DACL_SECURITY_INFORMATION sets a NULL
+        // DACL.
+        let error = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null(),
+                ptr::null(),
+            )
+        };
+        assert_eq!(error, 0, "cannot remove the DACL of {}", path.display());
+    }
+
+    /// What the permissions of a writable path say is how its owner laid it out, a conflict with
+    /// the policy; permissions that sandy cannot read are indeterminate, because the read can
+    /// pass.
+    #[test]
+    fn writable_path_permissions_conflict_and_unreadable_ones_are_indeterminate() {
+        let plain = directory("plain");
+        assert_eq!(check_writable(&writable(&plain), &[]), Ok(()));
+        assert!(grantable("example.app", &writable(&plain)).is_ok());
+
+        let executable = directory("executable");
+        let wide = wide_nul(executable.as_os_str());
+        let any_package = Sid::from_bytes(ALL_APPLICATION_PACKAGES).unwrap();
+        set_access(
+            &wide,
+            &executable,
+            &Dacl::read(&wide, &executable).unwrap(),
+            &any_package,
+            SET_ACCESS,
+            FILE_GENERIC_EXECUTE,
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+        )
+        .unwrap();
+        assert!(matches!(
+            check_writable(&writable(&executable), &[]),
+            Err(Problem::Conflict(reason)) if reason.contains("ALL APPLICATION PACKAGES")
+        ));
+
+        let open = directory("open");
+        remove_dacl(&open);
+        assert!(matches!(
+            check_writable(&writable(&open), &[]),
+            Err(Problem::Conflict(reason)) if reason.contains("no access control list")
+        ));
+        assert!(matches!(
+            grantable("example.app", &writable(&open)),
+            Err(Ungrantable::NoAcl)
+        ));
+
+        let missing = plain.join("missing");
+        assert!(matches!(
+            check_writable(&writable(&missing), &[]),
+            Err(Problem::Indeterminate(_))
+        ));
+        assert!(matches!(
+            grantable("example.app", &writable(&missing)),
+            Err(Ungrantable::Unreadable(_))
+        ));
+
+        for dir in [plain, executable, open] {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
 }

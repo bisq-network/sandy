@@ -14,7 +14,7 @@ machine, which is a known open gap (see "Other users of the machine" and limitat
 
 ## Requirements and mechanisms
 
-| Requirement | Mechanism | Unavailable when |
+| Requirement | Mechanism | Not enforced when |
 |---|---|---|
 | `FilesystemConfined` | One capability per policy path, with an access control entry (ACE) on the path | `system = "none"` |
 | `MetadataConfined` | No `WRITE_DAC`, `WRITE_OWNER`, `FILE_WRITE_ATTRIBUTES` or `FILE_WRITE_EA` outside read-write paths | never |
@@ -37,8 +37,8 @@ machine, which is a known open gap (see "Other users of the machine" and limitat
 | `Win32kDenied` | `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY` with `PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON` for the program and the relays, read back with `GetProcessMitigationPolicy` before they run (only with `windows.win32k = "deny"`) | Windows refuses to set or report the mitigation |
 
 Every requirement also needs `windows.appcontainer_name` (or `--appcontainer NAME`). Without it,
-or with an invalid name, the plan reports the requirements that need the AppContainer as
-unavailable. A name has at most 64 characters from `A-Z a-z 0-9 - _ .` and space
+or with an invalid name, the plan reports the requirements that need the AppContainer as a
+conflict of the policy (see "What check reports"). A name has at most 64 characters from `A-Z a-z 0-9 - _ .` and space
 [CreateAppContainerProfile]. sandy refuses three shapes beyond that:
 
 - a name that starts or ends with a space, or ends with a period. Windows drops those from a
@@ -51,6 +51,46 @@ unavailable. A name has at most 64 characters from `A-Z a-z 0-9 - _ .` and space
   identity of that package: sandy would change the permissions of its folder and share its
   sandbox. The check is on the shape, so it also refuses a family name of a package that is not
   installed.
+
+### What check reports
+
+sandy moves to a weaker fallback level of a policy only for a lasting shortfall of the host, one
+that no other local user, no remote party and no earlier run of the program can cause
+([DESIGN.md](DESIGN.md)). Each reason why the plan does not enforce a requirement on Windows is
+in one of four classes:
+
+- **Unavailable**, a lasting shortfall: a build before 1809; a build without the fix for
+  CVE-2021-41338 whose update revision sandy read; no `DeriveCapabilitySidsFromName`; Winsock
+  without AF_UNIX (`WSAEAFNOSUPPORT`); socket paths longer than 107 bytes; a stopped firewall
+  service; a job with UI restrictions that sandy runs in; `system = "none"`;
+  `filesystem.view = "policy"`.
+- **Needs setup** (`check` exits with 2): an AppContainer exempt from loopback isolation that the
+  policy needs without, and a grant on `sandy.exe` that the current user may not add.
+- **Conflict** (`CONFLICT`, status 125), the same for every level: no AppContainer name or an
+  invalid one; a name too long for the egress broker's suffix; a policy path on a share or a
+  mapped drive; `sandy.exe` in a read-write path; a writable path that overlaps a system
+  directory or a trusted location, or whose permissions let an AppContainer execute files there,
+  are missing (NULL DACL) or hold entries sandy cannot evaluate; a policy path whose grant the
+  current user may not add.
+- **Indeterminate** (`UNDECIDED`, status 125), a probe that failed for a reason that can pass:
+  a firewall service that is starting, stopping or cannot be queried; loopback exemptions, the
+  update revision of an affected build, the job sandy runs in, a known folder, or a file ID or
+  the permissions of a path that sandy cannot read; an error of a trial AF_UNIX socket or of
+  `WSAStartup` other than `WSAEAFNOSUPPORT`; an error reading the grant on `sandy.exe` other than
+  the one above; an overlap with a protected location that sandy only assumes because it cannot
+  read the identity of a directory on the way.
+
+For the policy it found enforceable, `check` then makes the trials of `Backend::verify`: it binds
+the listeners of exposed and forwarded ports and the egress port (the forward relay binds the
+last two inside the AppContainer, which shares the host's ports), tries the nesting of sandy's
+job and, with `windows.win32k = "deny"`, the win32k lockdown. Whatever they find makes `check`
+fail with status 125 and never selects another level: any local user can hold a port
+(`check_and_run_fail_on_a_held_forward_or_egress_port`).
+
+sandy reads each property of the host once per invocation and keeps the answer, so every level
+it plans and the run of the selected one see the same host; `run` checks the plan it was
+selected with and does not probe again. Another user's process in an AppContainer of the same
+name stays a warning (see "Other users of the machine"): any local user controls it.
 
 ## The AppContainer
 
@@ -87,7 +127,7 @@ access anywhere.
 
 No writable path may overlap this set (rule 6 in `DESIGN.md`), and none may be a place where the
 program could write a file that it may then execute (rule 3). The plan reports
-`FilesystemConfined` unavailable, and `grant` refuses, when a `read_write` path:
+`FilesystemConfined` as a conflict of the policy, and `grant` refuses, when a `read_write` path:
 
 - contains or lies inside the Windows directory (`GetSystemWindowsDirectoryW`) or a program files
   directory (`FOLDERID_ProgramFiles`, `FOLDERID_ProgramFilesX86`);
@@ -99,7 +139,10 @@ program could write a file that it may then execute (rule 3). The plan reports
   `C:\Program Files` inherits exactly such an entry;
 - has entries of a type the evaluator does not know, because then it cannot tell. An entry with
   a condition (`ACCESS_ALLOWED_CALLBACK_ACE_TYPE`) is known but its condition is not read, so it
-  counts as granting here and never as a grant sandy may skip.
+  counts as granting here and never as a grant sandy may skip;
+- has no DACL at all, which lets everyone execute files there.
+
+Permissions that sandy cannot read are indeterminate instead.
 
 The grant capabilities are not on that list. A grant capability is derived from the identity of
 the object it is granted on, so it can appear on that object and nowhere else; a file that is
@@ -244,8 +287,10 @@ DACL, everyone has full access) also makes the run fail; adding an ACE would tak
 access away.
 
 `sandy check` asks the same question for every policy path (`acl::grantable`, which opens the
-path for `WRITE_DAC` and changes nothing) and reports FilesystemConfined as unavailable with the
-path and the reason, so it does not report as enforced what `run` then refuses. A path whose
+path for `WRITE_DAC` and changes nothing) and reports FilesystemConfined as a conflict of the
+policy with the path, naming the path and the reason, so it does not report as enforced what
+`run` then refuses. Another error of that open, or of reading the path's identity or DACL, is
+indeterminate. A path whose
 entry is already in place needs no change and passes. The owner of a file holds `WRITE_DAC`
 whatever the DACL says, unless an OWNER RIGHTS entry (`S-1-3-4`) replaces the owner's rights,
 so only such paths and paths the user does not own can fail this way
@@ -260,7 +305,8 @@ file identity" in [DESIGN.md](DESIGN.md)). On Windows the identity of a file is 
 number of its volume and its file ID (`FILE_ID_INFO`, or `BY_HANDLE_FILE_INFORMATION` on a file
 system without 128-bit file IDs), read with the object opened for its attributes only. An object
 whose identity sandy cannot read counts as the one it is compared with, so the check refuses
-instead of passing it. The warning for a directory on `PATH` follows the spellings instead, the
+instead of passing it; `check` reports such an overlap as indeterminate, and only one it sees as
+a conflict. The warning for a directory on `PATH` follows the spellings instead, the
 one given and the canonical one, so it names only an overlap sandy sees. Such an object is, for
 example, a directory behind a junction that a less trusted process made: an elevated process
 does not follow it (`ERROR_UNTRUSTED_MOUNT_POINT`), and package managers of the user make such
@@ -325,7 +371,8 @@ directory.
 sandy refuses a policy path that resolves to a network share, at every access level:
 `\\server\share\...`, an administrative share such as `\\localhost\C$\...`, and a mapped
 network drive, which `canonicalize` turns into the path of its share (`\\?\UNC\...`).
-`FilesystemConfined` is then unavailable, and the message asks for the local path instead.
+`FilesystemConfined` is then a conflict of the policy, and the message asks for the local path
+instead.
 
 Such a grant never worked for the program. Measured on Windows 11, a program in its AppContainer
 got "Network access is denied" (`ERROR_NETWORK_ACCESS_DENIED`, 65) when it read a file or listed
@@ -501,8 +548,10 @@ With `ip = "none"` and `ip = "private"` the program gets no network capabilities
 `privateNetworkClientServer` [Capabilities]. With `ip = "client"` it gets `internetClient` alone.
 Windows Firewall enforces these rules through the Windows Filtering Platform. The plan reports
 `IpNetworkDenied`, `IpNetworkPrivate` and `InboundIpDenied` as unavailable when the firewall
-service (`MpsSvc`) does not run: whether isolation holds without it is not documented, and
-Microsoft does not support stopping it.
+service (`MpsSvc`) is stopped: whether isolation holds without it is not documented, and
+Microsoft does not support stopping it. A service that is starting or stopping, or one sandy
+cannot open or query, is indeterminate, so a restart of the service never makes sandy pick a
+level with more network access.
 
 Turning the firewall profiles off is a different matter, and an ordinary one: a third-party
 firewall registered with Security Center, or a group policy, turns the Defender Firewall
@@ -871,10 +920,12 @@ policy paths.
 The grant on `sandy.exe` needs the right to change its DACL. A user who cannot change the DACL
 of an installed `sandy.exe`, for example under `C:\Program Files`, can let an administrator run
 `sandy setup` with the same policy, including `--expose`, once; the grant is per AppContainer
-name. Without the grant, the plan reports `ExposedPortsRelayed` as unavailable. The plan also
-refuses when `sandy.exe` lies in a read-write path: the program could replace the file that the
-relays execute (writable-and-executable rule), and sandy must stay out of the program's reach in
-any case.
+name. Without the grant, when the current user may not add it, the plan reports
+`ExposedPortsRelayed` as needing setup. A `sandy.exe` without DACL, or one whose identity or DACL
+sandy cannot read, is indeterminate: setup does not fix it. The plan also reports a conflict when
+`sandy.exe` lies in a read-write path: the program could replace the file that the relays
+execute (writable-and-executable rule), and sandy must stay out of the program's reach in any
+case.
 
 ### Forwarded ports
 
@@ -905,7 +956,8 @@ Like the exposed-port relay, the forward relay runs in the program's AppContaine
 can open and control it. That gives the program no more than `to`, which `network.forward`
 grants anyway, plus read and execute access to `sandy.exe`. The socket path must fit into the
 107 bytes of `sun_path` (UTF-8); the plan checks the longest path under the directory and reports
-`ForwardedPortsRelayed` as unavailable otherwise. sandy removes the directory when the run ends;
+`ForwardedPortsRelayed` as unavailable otherwise, and so when Winsock has no AF_UNIX
+(`WSAEAFNOSUPPORT`). Any other error of the trial socket is indeterminate. sandy removes the directory when the run ends;
 Windows deletes a socket file also while its socket still listens.
 
 ### How the relays end
@@ -1139,8 +1191,8 @@ bug-prone attack surface, and a command-line program needs none of it. The defau
 which changes nothing. The relays get the mitigation too, because the program can open them
 (they run in its AppContainer) and would otherwise make the calls through them. sandy reads the
 mitigation back with `GetProcessMitigationPolicy` before it lets each process run and refuses the
-run if Windows did not apply it; `check` reports the requirement as enforced, or unavailable if
-the mitigation cannot be set or read.
+run if Windows did not apply it; `check` reports the requirement as enforced, and fails with
+status 125 when its trial cannot set or read the mitigation.
 
 The key costs the program every library that needs win32k. **Many console programs load
 `user32.dll`, whose initializer calls win32k, so they end at startup** with
@@ -1228,14 +1280,17 @@ every platform answers.
   CVE-2021-41338, a bypass of the AppContainer firewall rules. The plan refuses builds without
   it: 17763 before .2237, 18362 (never fixed), 18363 before .1854, 19041 to 19043 before .1288,
   20348 before .288 and 22000 before .258 [CVE-2021-41338]. The table lives in
-  `crates/sandy-windows/src/version.rs`.
+  `crates/sandy-windows/src/version.rs`. An affected build whose update revision (`UBR`) sandy
+  cannot read is indeterminate.
 - **Expected to work, not tested:** Windows 10 1809 (LTSC 2019), 21H2 (LTSC 2021) and 22H2.
 - **Tested:** Windows 11 build 26200 (VM, all tests), Windows Server 2022 and Windows Server
   2025 (GitHub Actions; all tests except the four that need AppContainer child processes, see
   limitation 11).
 - **Nested jobs:** when sandy runs inside a job with UI restrictions, Windows refuses to put the
   program into sandy's own job (`ERROR_NOT_SUPPORTED`, measured on Windows 11), and the plan
-  reports `NoPrivilegeEscalation` and `SignalsIsolated` as unavailable. Inside a job without UI
+  reports `NoPrivilegeEscalation` and `SignalsIsolated` as unavailable; a job sandy cannot query
+  is indeterminate. Every policy has `NoPrivilegeEscalation`, so a job problem refuses every
+  fallback level. Inside a job without UI
   restrictions, with or without breakaway, the jobs nest. sandy never breaks away from the outer
   job. Microsoft documents a stricter rule ("neither job sets UI limits") [Nested jobs], which
   the measurements on Windows 11, Server 2022 and Server 2025 do not show; Windows 10 is
@@ -1248,8 +1303,9 @@ every platform answers.
   with the program's UI restrictions, starts a suspended process of `sandy.exe`, which joins
   sandy's job chain as the program would, assigns it to that job and terminates it again before
   it runs an instruction. The trial runs only for the case nothing else can answer, an immediate
-  job without UI restrictions, so outside a job `check` touches nothing. `run` does not try: it
-  finds out when it assigns the program.
+  job without UI restrictions, so outside a job `check` touches nothing. A failed trial makes
+  `check` fail with status 125, like every finding of `verify`. `run` does not try: it finds out
+  when it assigns the program.
 
 ## Diagnostic mode
 
@@ -1354,9 +1410,9 @@ about a path is worse than none, so the backend answers nothing and sandy refuse
 
 Host: Windows 11 build 26200 (VM), binaries built for `x86_64-pc-windows-gnu`. The tests run in
 an elevated SSH session and without administrator rights. Latest elevated run, every test
-passing: `sandy_core` 88, `sandy_relay` 43, `sandy_windows` 102, `sandy` 20, `escape` 27,
-`escape_windows` 88, `expose` 5, `forward` 3, `children` 5, `parent` 5, `check` 11, `runner` 3,
-`review_windows` 12, `setup` 3. `crossuser_windows` skips without `SANDY_TEST_OTHER_USER` and
+passing: `sandy_core` 104, `sandy_relay` 43, `sandy_windows` 117, `sandy` 26, `escape` 27,
+`escape_windows` 90, `expose` 5, `forward` 3, `children` 5, `parent` 5, `check` 13, `levels` 7,
+`runner` 3, `review_windows` 12, `setup` 3. `crossuser_windows` skips without `SANDY_TEST_OTHER_USER` and
 `SANDY_TEST_OTHER_PASSWORD` (see "Other users of the machine"). The
 COM check of `review_windows` is skipped there: the SSH session is session 0, where `ole32.dll`
 does not load in an AppContainer (limitation 13), so a denial would not be the COM boundary.

@@ -2,6 +2,7 @@
 //! platform backend. All enforcement lives in the backends.
 
 mod args;
+mod report;
 mod status;
 mod stdio;
 
@@ -9,11 +10,12 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use args::{Command, Invocation, Mode};
+use args::{Command, Invocation, Mode, PolicySource};
 use sandy_core::streams::{CreatableSocket, StandardStream};
 use sandy_core::{
-    Backend, EnforcementPlan, ParentProcess, Policy, ResolvedPolicy, SetupOptions, SetupOutcome,
-    StatusReport, TargetCommand, target_environment,
+    Backend, EnforcementPlan, Outcome, ParentProcess, Policy, ResolvedLevel, ResolvedPolicy,
+    Selection, SetupOptions, SetupOutcome, StatusReport, TargetCommand, select, setup_levels,
+    target_environment,
 };
 
 const EXIT_FAILURE: u8 = 125;
@@ -67,14 +69,18 @@ fn main() -> ExitCode {
         Command::Forward { listen, socket } => forward(listen, &socket),
         Command::Broker { listener, reach } => broker(listener, reach),
         Command::Sandbox(invocation) => {
-            if matches!(invocation.mode, Mode::Run | Mode::Check) {
-                hand_over(&started_as, handed_parent.or(parent_at_start));
-            }
+            let handed_over = match invocation.mode {
+                Mode::Run | Mode::Check => {
+                    hand_over(&started_as, handed_parent.or(parent_at_start))
+                }
+                _ => Ok(()),
+            };
             let context = Context {
                 parent_at_start,
                 handed_parent,
                 started_as,
                 arguments,
+                handed_over,
             };
             match execute(*invocation, &context) {
                 Ok(code) => code,
@@ -96,6 +102,9 @@ struct Context {
     started_as: Vec<PathBuf>,
     /// sandy's arguments, without the program name.
     arguments: Vec<OsString>,
+    /// `Err` with the reason when the hand-over to the installed copy failed (`hand_over`). It
+    /// is reported once the status channel is open, so a caller that reads it learns of it too.
+    handed_over: Result<(), String>,
 }
 
 /// Reads and removes `PARENT_AT_START_VARIABLE`, before any thread starts. A value that is not
@@ -139,15 +148,22 @@ fn take_started_as() -> Vec<PathBuf> {
 /// --install-copy`), replaces this process with that copy, with the same arguments, environment
 /// and descriptors, before sandy opens anything. The copy checks the names this sandy was
 /// started under as its own (`STARTED_AS_VARIABLE`), because the next start runs this file
-/// again. Returns when there is no such copy, or when the names cannot be passed intact; this
-/// sandy then runs on as itself.
+/// again. Returns `Ok` when there is no such copy; this sandy then runs on as itself. Returns
+/// `Err` when the copy is installed and sandy cannot tell whether to hand over, or cannot hand
+/// over: running on as itself would report that the host needs setup, which is not so.
 #[cfg(target_os = "linux")]
-fn hand_over(started_as: &[PathBuf], parent_at_start: Option<u32>) {
+fn hand_over(started_as: &[PathBuf], parent_at_start: Option<u32>) -> Result<(), String> {
     use std::ffi::CString;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
-    let Some(copy) = sandy_linux::hand_over_target() else {
-        return;
+    let Some(copy) = sandy_linux::hand_over_target()? else {
+        return Ok(());
+    };
+    let failed = |reason: &str| {
+        format!(
+            "cannot hand over to the installed copy {}: {reason}",
+            copy.display()
+        )
     };
     let mut names = started_as.to_vec();
     if let Ok(path) = std::env::current_exe() {
@@ -161,11 +177,13 @@ fn hand_over(started_as: &[PathBuf], parent_at_start: Option<u32>) {
     // A name that holds the separator would arrive as two other names, and its own check would
     // be lost.
     let Ok(joined) = std::env::join_paths(&names) else {
-        return;
+        return Err(failed(
+            "a name sandy was started under holds ':', which cannot be passed to the copy",
+        ));
     };
     let c_string = |bytes: Vec<u8>| CString::new(bytes).ok();
-    let Some(program) = c_string(copy.into_os_string().into_vec()) else {
-        return;
+    let Some(program) = c_string(copy.as_os_str().as_bytes().to_vec()) else {
+        return Err(failed("its path holds a NUL byte"));
     };
     let arguments: Option<Vec<CString>> = std::env::args_os()
         .map(|arg| c_string(arg.into_vec()))
@@ -187,7 +205,7 @@ fn hand_over(started_as: &[PathBuf], parent_at_start: Option<u32>) {
         .map(|entry| c_string(entry.as_bytes().to_vec()))
         .collect();
     let (Some(arguments), Some(environment)) = (arguments, environment) else {
-        return;
+        return Err(failed("an argument or a variable holds a NUL byte"));
     };
     let pointers = |strings: &[CString]| {
         strings
@@ -205,10 +223,13 @@ fn hand_over(started_as: &[PathBuf], parent_at_start: Option<u32>) {
             pointers(&environment).as_ptr(),
         )
     };
+    Err(failed(&std::io::Error::last_os_error().to_string()))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn hand_over(_started_as: &[PathBuf], _parent_at_start: Option<u32>) {}
+fn hand_over(_started_as: &[PathBuf], _parent_at_start: Option<u32>) -> Result<(), String> {
+    Ok(())
+}
 
 fn relay(listener: u64, target: std::net::SocketAddr) -> ExitCode {
     // SAFETY: a backend starts this command only with a listening socket it passed to this
@@ -420,28 +441,46 @@ fn execute(invocation: Invocation, context: &Context) -> Result<ExitCode, String
 }
 
 fn sandbox(
-    invocation: Invocation,
+    mut invocation: Invocation,
     context: &Context,
     status: &StatusReport,
 ) -> Result<ExitCode, String> {
-    let mut policy = match &invocation.policy_file {
-        Some(path) => {
-            let text = std::fs::read_to_string(path)
-                .map_err(|error| format!("cannot read policy {}: {error}", path.display()))?;
-            Policy::from_toml(&text).map_err(|error| error.to_string())?
-        }
-        None => Policy::default(),
-    };
-    let weakened = invocation
-        .overrides
-        .apply(&mut policy, invocation.policy_file.is_some());
-    let resolved = ResolvedPolicy::resolve(&policy, invocation.program.as_deref())
+    context.handed_over.clone()?;
+    let mut policy = load_policy(invocation.policy.as_ref())?;
+    let weakened = std::mem::take(&mut invocation.overrides)
+        .apply(&mut policy, invocation.policy.is_some())?;
+    let has_levels = !policy.fallback.is_empty();
+    if has_levels && invocation.mode == Mode::Check && invocation.program.is_none() {
+        return Err(
+            "check of a policy with fallback levels needs the PROGRAM: which level run takes can \
+             depend on it, and check must decide as run does"
+                .to_string(),
+        );
+    }
+    let mut levels = ResolvedPolicy::resolve_levels(&policy, invocation.program.as_deref())
         .map_err(|error| error.to_string())?;
-    // Checked in every mode, so that check reports what run would refuse.
+    if let Some(name) = &invocation.level {
+        let index = levels
+            .iter()
+            .position(|level| level.name == *name)
+            .ok_or_else(|| {
+                let names: Vec<&str> = levels.iter().map(|level| level.name.as_str()).collect();
+                format!(
+                    "the policy has no level {name:?}; its levels are {}",
+                    names.join(", ")
+                )
+            })?;
+        levels = vec![levels.swap_remove(index)];
+    }
+    // The paths, the program and the environment are the same in every level, so the checks
+    // of the invocation hold for all of them. The parent is checked for any level that ends
+    // with it, also when another level is chosen: checked in every mode, so that check reports
+    // what run would refuse.
+    let ends_with_parent = levels.iter().any(|level| level.policy.end_with_parent);
     if let Some(reason) = parent_ended_during_hand_over(
         context.handed_parent,
         context.parent_at_start,
-        resolved.end_with_parent,
+        ends_with_parent,
     ) {
         return Err(reason);
     }
@@ -449,13 +488,13 @@ fn sandbox(
         invocation.parent_pid,
         invocation.parent_start,
         context.parent_at_start,
-        resolved.end_with_parent,
+        ends_with_parent,
     )?;
-    refuse_writable_trusted_files(
-        &resolved,
-        invocation.policy_file.as_deref(),
-        &context.started_as,
-    )?;
+    let policy_file = match &invocation.policy {
+        Some(PolicySource::File(path)) => Some(path.as_path()),
+        _ => None,
+    };
+    refuse_writable_trusted_files(&levels[0].policy, policy_file, &context.started_as)?;
     let backend = platform_backend();
     if invocation.explain && !backend.can_explain() {
         return Err(format!(
@@ -465,110 +504,271 @@ fn sandbox(
             backend.name()
         ));
     }
-    let mut reported = backend.plan(&resolved);
-    if invocation.mode == Mode::Check {
-        reported.extend(backend.verify(&resolved));
-    }
-    let plan = EnforcementPlan::new(&resolved.requirements(), reported);
 
-    match invocation.mode {
-        Mode::Check => {
-            print!("backend: {}\n{plan}", backend.name());
-            if !invocation.explain_paths.is_empty() {
-                let answers = backend
-                    .explain_paths(&resolved, &invocation.explain_paths)
-                    .ok_or_else(|| {
-                        format!(
-                            "--explain-path is not available on this host: the {} backend cannot \
-                             say which rule decides a path (see the platform documentation)",
-                            backend.name()
-                        )
-                    })?;
-                for answer in answers {
-                    println!("{answer}");
-                }
-            }
-            // On standard error and with a prefix of their own, so that a caller which reads the
-            // one line per requirement that check prints keeps working (see README.md).
-            for warning in resolved.warnings(home_directory().as_deref()) {
-                eprintln!("{WARNING_PREFIX}{warning}");
-            }
-            for warning in backend.notes(&resolved) {
-                eprintln!("{WARNING_PREFIX}{warning}");
-            }
-            for warning in weakened {
-                eprintln!("{WARNING_PREFIX}{warning}");
-            }
-            if plan.is_enforceable() {
-                Ok(ExitCode::SUCCESS)
-            } else if plan.needs_only_setup() {
-                Ok(ExitCode::from(EXIT_NEEDS_SETUP))
-            } else {
-                Ok(ExitCode::from(EXIT_NOT_ENFORCEABLE))
+    if matches!(invocation.mode, Mode::Setup | Mode::Remove) {
+        return setup(&invocation, context, backend.as_ref(), &levels);
+    }
+    // One backend value for every level: it detects each host property once, so a passing
+    // probe failure cannot hit one level and not the next.
+    let selection = select(levels.len(), |index| {
+        let policy = &levels[index].policy;
+        EnforcementPlan::new(&policy.requirements(), backend.plan(policy))
+    });
+    if invocation.mode == Mode::Check {
+        return check(
+            &invocation,
+            backend.as_ref(),
+            &levels,
+            &selection,
+            has_levels,
+            &weakened,
+        );
+    }
+
+    let index = match selection.outcome {
+        Outcome::Selected(index) => index,
+        _ => return Err(refusal(&levels, &selection, has_levels)),
+    };
+    let resolved = &levels[index].policy;
+    if has_levels {
+        if index > 0 {
+            eprintln!(
+                "{WARNING_PREFIX}running fallback level {}: {}",
+                levels[index].name,
+                skipped(&levels, &selection.plans[..index])
+            );
+        }
+        status.level(&levels[index].name);
+    }
+    refuse_unsafe_standard_streams(resolved, backend.ip_also_allows())?;
+    let program = resolved
+        .program
+        .clone()
+        .ok_or_else(|| "run needs a PROGRAM".to_string())?;
+    let arg0 = invocation
+        .program
+        .clone()
+        .map(|p| p.into_os_string())
+        .unwrap_or_else(|| program.clone().into_os_string());
+    let command = TargetCommand {
+        program,
+        arg0,
+        args: invocation.args,
+        env: target_environment(&resolved.environment, std::env::vars_os()),
+        cwd: invocation.cwd,
+        parent,
+        explain: invocation.explain,
+    };
+    let code = backend
+        .run(resolved, &command, status)
+        // Also after the program started: with children = "contained" on Linux and macOS, sandy
+        // supervises it and can fail while it runs. Never a reason to try another level.
+        .map_err(|error| format!("run failed: {error}"))?;
+    // Exit codes on Windows are 32 bits wide; ExitCode only carries 8.
+    std::process::exit(code)
+}
+
+/// The policy the invocation names, or the empty one.
+fn load_policy(source: Option<&PolicySource>) -> Result<Policy, String> {
+    let text = match source {
+        None => return Ok(Policy::default()),
+        Some(PolicySource::File(path)) => std::fs::read_to_string(path)
+            .map_err(|error| format!("cannot read policy {}: {error}", path.display()))?,
+        Some(PolicySource::Input) => stdio::take_policy_input()?,
+    };
+    Policy::from_toml(&text).map_err(|error| error.to_string())
+}
+
+/// `sandy check`: the plan of each level tried and which one runs, with warnings on standard
+/// error, or the JSON object of `--json` on standard output.
+fn check(
+    invocation: &Invocation,
+    backend: &dyn Backend,
+    levels: &[ResolvedLevel],
+    selection: &Selection,
+    has_levels: bool,
+    weakened: &[String],
+) -> Result<ExitCode, String> {
+    // The level the answers are about: the one that runs, the one that stopped the choice, or
+    // the base when none is enforceable.
+    let shown = match selection.outcome {
+        Outcome::Selected(index) | Outcome::Stopped(index) => index,
+        Outcome::NoneEnforceable { .. } => 0,
+    };
+    let warnings = |level: &ResolvedLevel| -> Vec<String> {
+        let mut warnings = level.policy.warnings(home_directory().as_deref());
+        warnings.extend(backend.notes(&level.policy));
+        warnings
+    };
+    if !invocation.json {
+        if has_levels {
+            print!(
+                "backend: {}\n{}",
+                backend.name(),
+                report::levels_text(levels, selection)
+            );
+        } else {
+            print!("backend: {}\n{}", backend.name(), selection.plans[0]);
+        }
+        if !invocation.explain_paths.is_empty() {
+            let answers = backend
+                .explain_paths(&levels[shown].policy, &invocation.explain_paths)
+                .ok_or_else(|| {
+                    format!(
+                        "--explain-path is not available on this host: the {} backend cannot \
+                         say which rule decides a path (see the platform documentation)",
+                        backend.name()
+                    )
+                })?;
+            for answer in answers {
+                println!("{answer}");
             }
         }
-        Mode::Setup | Mode::Remove => {
-            let remove = invocation.mode == Mode::Remove;
-            let options = SetupOptions {
-                install_copy: invocation.install_copy,
-            };
-            let outcome = if invocation.elevate {
-                let arguments = args::without_elevate(&context.arguments)?;
-                backend.elevate(&resolved, remove, options, &arguments)
-            } else if remove {
-                backend.remove(&resolved, options)
-            } else {
-                backend.setup(&resolved, options)
-            };
-            let command = if remove { "setup --remove" } else { "setup" };
-            // An empty message comes from an elevated sandy that has already written its own.
-            match outcome.map_err(|error| format!("{command} failed: {error}"))? {
-                SetupOutcome::Done(message) => {
-                    if !message.is_empty() {
-                        println!("sandy {command}: {message}");
-                    }
-                    Ok(ExitCode::SUCCESS)
-                }
-                SetupOutcome::Refused(message) => {
-                    if !message.is_empty() {
-                        eprintln!("sandy: {command} not done: {message}");
-                    }
-                    Ok(ExitCode::from(EXIT_SETUP_NOT_DONE))
-                }
-            }
-        }
-        Mode::Run => {
-            if !plan.is_enforceable() {
-                return Err(refusal(&plan));
-            }
-            refuse_unsafe_standard_streams(&resolved, backend.ip_also_allows())?;
-            let program = resolved
-                .program
-                .clone()
-                .ok_or_else(|| "run needs a PROGRAM".to_string())?;
-            let arg0 = invocation
-                .program
-                .clone()
-                .map(|p| p.into_os_string())
-                .unwrap_or_else(|| program.clone().into_os_string());
-            let command = TargetCommand {
-                program,
-                arg0,
-                args: invocation.args,
-                env: target_environment(&resolved.environment, std::env::vars_os()),
-                cwd: invocation.cwd,
-                parent,
-                explain: invocation.explain,
-            };
-            let code = backend
-                .run(&resolved, &command, status)
-                // Also after the program started: with children = "contained" on Linux and
-                // macOS, sandy supervises it and can fail while it runs.
-                .map_err(|error| format!("run failed: {error}"))?;
-            // Exit codes on Windows are 32 bits wide; ExitCode only carries 8.
-            std::process::exit(code)
+        // On standard error and with a prefix of their own, so that a caller which reads the
+        // one line per requirement that check prints keeps working (see README.md).
+        for warning in warnings(&levels[shown]).iter().chain(weakened) {
+            eprintln!("{WARNING_PREFIX}{warning}");
         }
     }
+    let code = match selection.outcome {
+        Outcome::Stopped(index) => {
+            return Err(stopped(&levels[index], &selection.plans[index], has_levels));
+        }
+        Outcome::NoneEnforceable { setup_helps: true } => ExitCode::from(EXIT_NEEDS_SETUP),
+        Outcome::NoneEnforceable { setup_helps: false } => ExitCode::from(EXIT_NOT_ENFORCEABLE),
+        Outcome::Selected(index) => {
+            let busy: Vec<_> = backend
+                .verify(&levels[index].policy)
+                .into_iter()
+                .filter(|item| !item.is_enforced())
+                .collect();
+            if !busy.is_empty() {
+                let level = if has_levels {
+                    format!("level {}: ", levels[index].name)
+                } else {
+                    String::new()
+                };
+                return Err(list(
+                    &format!("{level}this host enforces the policy, but run would fail now:"),
+                    &busy,
+                ));
+            }
+            ExitCode::SUCCESS
+        }
+    };
+    if invocation.json {
+        let level_warnings: Vec<Vec<String>> = levels
+            .iter()
+            .take(selection.plans.len())
+            .map(warnings)
+            .collect();
+        println!(
+            "{}",
+            report::json(backend.name(), levels, selection, &level_warnings, weakened)
+        );
+    }
+    Ok(code)
+}
+
+/// `sandy setup` and `sandy setup --remove`, for every level the invocation has.
+fn setup(
+    invocation: &Invocation,
+    context: &Context,
+    backend: &dyn Backend,
+    levels: &[ResolvedLevel],
+) -> Result<ExitCode, String> {
+    let remove = invocation.mode == Mode::Remove;
+    let options = SetupOptions {
+        install_copy: invocation.install_copy,
+    };
+    let outcome = if invocation.elevate {
+        let arguments = args::without_elevate(&context.arguments)?;
+        backend.elevate(levels, remove, options, &arguments)
+    } else {
+        setup_levels(levels, |policy| {
+            if remove {
+                backend.remove(policy, options)
+            } else {
+                backend.setup(policy, options)
+            }
+        })
+    };
+    let command = if remove { "setup --remove" } else { "setup" };
+    // An empty message comes from an elevated sandy that has already written its own.
+    match outcome.map_err(|error| format!("{command} failed: {error}"))? {
+        SetupOutcome::Done(message) => {
+            if !message.is_empty() {
+                println!("sandy {command}: {message}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        SetupOutcome::Refused(message) => {
+            if !message.is_empty() {
+                eprintln!("sandy: {command} not done: {message}");
+            }
+            Ok(ExitCode::from(EXIT_SETUP_NOT_DONE))
+        }
+    }
+}
+
+/// Why `run` refuses when no level runs.
+fn refusal(levels: &[ResolvedLevel], selection: &Selection, has_levels: bool) -> String {
+    if let Outcome::Stopped(index) = selection.outcome {
+        return format!(
+            "refusing to start the program; {}",
+            stopped(&levels[index], &selection.plans[index], has_levels)
+        );
+    }
+    if !has_levels {
+        let missing: Vec<_> = selection.plans[0].unavailable().cloned().collect();
+        return list(
+            "refusing to start the program; this host cannot enforce the policy:",
+            &missing,
+        );
+    }
+    let mut message =
+        String::from("refusing to start the program; this host enforces no level of the policy:");
+    for (level, plan) in levels.iter().zip(&selection.plans) {
+        let missing: Vec<_> = plan.unavailable().cloned().collect();
+        message.push_str("\n  ");
+        message.push_str(&list(&format!("level {}:", level.name), &missing).replace('\n', "\n  "));
+    }
+    message
+}
+
+/// Why the choice stopped at `level`, whose plan has a final report.
+fn stopped(level: &ResolvedLevel, plan: &EnforcementPlan, has_levels: bool) -> String {
+    if has_levels {
+        format!("level {}: {}", level.name, final_failure(plan))
+    } else {
+        final_failure(plan)
+    }
+}
+
+/// Why the levels before the one that runs were skipped, for the warning of `run`.
+fn skipped(levels: &[ResolvedLevel], plans: &[EnforcementPlan]) -> String {
+    let reasons: Vec<String> = levels
+        .iter()
+        .zip(plans)
+        .map(|(level, plan)| {
+            let missing: Vec<String> = plan
+                .unavailable()
+                .map(|item| {
+                    format!(
+                        "{}: {}",
+                        item.requirement.description(),
+                        item.status.reason().unwrap_or_default()
+                    )
+                })
+                .collect();
+            format!(
+                "this host cannot enforce level {} ({})",
+                level.name,
+                missing.join("; ")
+            )
+        })
+        .collect();
+    reasons.join(", and ")
 }
 
 /// The user's home directory, for the warning about a writable path that holds it. The variable
@@ -686,19 +886,37 @@ fn executed_paths() -> Vec<std::path::PathBuf> {
     Vec::new()
 }
 
-fn refusal(plan: &EnforcementPlan) -> String {
-    let mut message =
-        String::from("refusing to start the program; this host cannot enforce the policy:");
-    for item in plan.unavailable() {
+/// Why a plan with a final report (`Status::is_final`) ends the run or check with status 125.
+/// The final reports come first, then the other requirements that are not enforced, so a lasting
+/// shortfall of the host is not lost behind them.
+fn final_failure(plan: &EnforcementPlan) -> String {
+    let mut reports: Vec<_> = plan.final_reports().cloned().collect();
+    reports.extend(plan.unavailable().filter(|item| !item.status.is_final()).cloned());
+    let headline = if reports
+        .iter()
+        .any(|item| matches!(item.status, sandy_core::Status::Conflict { .. }))
+    {
+        "the policy cannot be enforced as written on this host:"
+    } else {
+        "sandy cannot tell now whether this host enforces the policy:"
+    };
+    list(headline, &reports)
+}
+
+/// `headline` and one line per report.
+fn list(headline: &str, items: &[sandy_core::PlanItem]) -> String {
+    let mut message = String::from(headline);
+    for item in items {
+        let description = item.requirement.description();
         match &item.status {
-            sandy_core::Status::Unavailable { reason } => message.push_str(&format!(
-                "\n  - {}: {reason}",
-                item.requirement.description()
-            )),
+            sandy_core::Status::Unavailable { reason }
+            | sandy_core::Status::Indeterminate { reason }
+            | sandy_core::Status::Conflict { reason } => {
+                message.push_str(&format!("\n  - {description}: {reason}"))
+            }
             sandy_core::Status::NeedsSetup { reason } => message.push_str(&format!(
-                "\n  - {}: {reason}; `sandy setup`, run once with administrator rights, \
-                 prepares this host",
-                item.requirement.description()
+                "\n  - {description}: {reason}; `sandy setup`, run once with administrator \
+                 rights, prepares this host"
             )),
             sandy_core::Status::Enforced { .. } => {}
         }
@@ -708,17 +926,17 @@ fn refusal(plan: &EnforcementPlan) -> String {
 
 #[cfg(target_os = "linux")]
 fn platform_backend() -> Box<dyn Backend> {
-    Box::new(sandy_linux::LinuxBackend)
+    Box::new(sandy_linux::LinuxBackend::new())
 }
 
 #[cfg(target_os = "macos")]
 fn platform_backend() -> Box<dyn Backend> {
-    Box::new(sandy_macos::MacosBackend)
+    Box::new(sandy_macos::MacosBackend::new())
 }
 
 #[cfg(windows)]
 fn platform_backend() -> Box<dyn Backend> {
-    Box::new(sandy_windows::WindowsBackend)
+    Box::new(sandy_windows::WindowsBackend::new())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]

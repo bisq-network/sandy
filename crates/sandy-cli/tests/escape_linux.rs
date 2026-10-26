@@ -22,9 +22,6 @@ use common::linux::*;
 use common::unix::*;
 use common::*;
 
-/// What `check` returns when this host cannot enforce a requirement of the policy.
-const EXIT_NOT_ENFORCEABLE: i32 = 1;
-
 fn args(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| value.to_string()).collect()
 }
@@ -1712,6 +1709,14 @@ fn the_resolver_directory_is_granted_with_ip() {
     probe_inside(&[], &[("read", other)])[0].assert_blocked();
 }
 
+/// The plan line of a conflict of the policy with this host, empty when there is none.
+fn conflict(stdout: &str) -> &str {
+    stdout
+        .lines()
+        .find(|line| line.starts_with("CONFLICT "))
+        .unwrap_or_default()
+}
+
 /// `check` with the environment the trusted locations are read from: a home directory and a PATH
 /// of the test's own, so the result does not depend on the account that runs the suite.
 fn check_with_environment(home: &str, path: &str, writable: &str) -> Output {
@@ -1725,7 +1730,8 @@ fn check_with_environment(home: &str, path: &str, writable: &str) -> Output {
 
 /// A writable path that holds the home directory lets the program change shell startup files and
 /// autostart entries, which run outside the sandbox at the next login (README rule 8). sandy
-/// refuses such a policy; a directory below the home directory stays writable.
+/// refuses such a policy as a conflict, which no weaker fallback level resolves, with status
+/// 125; a directory below the home directory stays writable.
 #[test]
 fn refuses_a_writable_path_over_the_home_directory() {
     let fixture = Fixture::new("trusted-home");
@@ -1734,12 +1740,11 @@ fn refuses_a_writable_path_over_the_home_directory() {
 
     let refused = check(&fixture.arg("home"));
     let stdout = String::from_utf8_lossy(&refused.stdout);
-    assert_eq!(
-        refused.status.code(),
-        Some(EXIT_NOT_ENFORCEABLE),
+    assert_eq!(refused.status.code(), Some(EXIT_FAILURE), "{stdout}");
+    assert!(
+        conflict(&stdout).contains("runs outside the sandbox"),
         "{stdout}"
     );
-    assert!(stdout.contains("runs outside the sandbox"), "{stdout}");
 
     let allowed = check(&fixture.arg("home/data"));
     assert_eq!(
@@ -1766,10 +1771,13 @@ fn assert_refused_beside_an_accepted_path(fixture: &Fixture, cases: &[(&str, &st
         let stdout = String::from_utf8_lossy(&refused.stdout);
         assert_eq!(
             refused.status.code(),
-            Some(EXIT_NOT_ENFORCEABLE),
+            Some(EXIT_FAILURE),
             "{location}: {stdout}"
         );
-        assert!(stdout.contains("runs outside the sandbox"), "{stdout}");
+        assert!(
+            conflict(&stdout).contains("runs outside the sandbox"),
+            "{stdout}"
+        );
 
         let allowed = check(beside);
         assert_eq!(
@@ -1907,12 +1915,11 @@ fn refuses_a_writable_path_that_holds_a_directory_on_path_and_a_startup_file() {
         &fixture.arg("home"),
     );
     let stdout = String::from_utf8_lossy(&refused.stdout);
-    assert_eq!(
-        refused.status.code(),
-        Some(EXIT_NOT_ENFORCEABLE),
+    assert_eq!(refused.status.code(), Some(EXIT_FAILURE), "{stdout}");
+    assert!(
+        conflict(&stdout).contains("runs outside the sandbox"),
         "{stdout}"
     );
-    assert!(stdout.contains("runs outside the sandbox"), "{stdout}");
     // The directory on PATH is warned about as well, so the refusal did win over a warning.
     let stderr = String::from_utf8_lossy(&refused.stderr);
     let names_it =
@@ -2001,12 +2008,12 @@ fn refuses_a_writable_path_when_no_source_names_the_home_directory() {
         }
     };
     let stdout = String::from_utf8_lossy(&refused.stdout);
-    assert_eq!(
-        refused.status.code(),
-        Some(EXIT_NOT_ENFORCEABLE),
-        "{stdout}"
-    );
-    assert!(stdout.contains("start sandy with HOME set"), "{stdout}");
+    assert_eq!(refused.status.code(), Some(EXIT_FAILURE), "{stdout}");
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("start sandy with HOME set"))
+        .unwrap_or_default();
+    assert!(line.starts_with("UNDECIDED "), "{stdout}");
 
     for (access, home) in [
         ("--read", None),
@@ -2159,7 +2166,7 @@ fn refuses_a_writable_alias_of_a_system_set_directory() {
         return;
     };
     assert_eq!(codes[1], 0, "the control alias was refused: {codes:?}");
-    assert_eq!(codes[0], EXIT_NOT_ENFORCEABLE, "{codes:?}");
+    assert_eq!(codes[0], EXIT_FAILURE, "{codes:?}");
 }
 
 /// sandy grants execute on the loader the program names in its header, but never when the loader
@@ -2199,7 +2206,7 @@ fn refuses_a_loader_in_an_alias_of_a_writable_path() {
         return;
     };
     assert_eq!(codes[1], 0, "the control run was refused: {codes:?}");
-    assert_eq!(codes[0], EXIT_NOT_ENFORCEABLE, "{codes:?}");
+    assert_eq!(codes[0], EXIT_FAILURE, "{codes:?}");
 }
 
 /// Runs the probe in the sandbox under `sandy-abi-cap`, so that sandy sees Landlock ABI `abi`.

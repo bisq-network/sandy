@@ -159,10 +159,24 @@ pub struct ResolvedPolicy {
     pub windows: WindowsPolicy,
 }
 
-impl ResolvedPolicy {
-    /// Validates `policy` and resolves its paths. `program` is the target executable; it gets
-    /// read and execute access to the file itself.
-    pub fn resolve(policy: &Policy, program: Option<&Path>) -> Result<Self, PolicyError> {
+/// One level of a policy, resolved (`ResolvedPolicy::resolve_levels`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLevel {
+    pub name: String,
+    pub policy: ResolvedPolicy,
+}
+
+/// What resolving the policy paths and the program gives, which every level shares.
+struct ResolvedPaths {
+    paths: Vec<PathRule>,
+    program: Option<PathBuf>,
+    links: Vec<PathBuf>,
+}
+
+impl ResolvedPaths {
+    /// Resolves the paths of `policy` and the program, and checks the rules that concern only
+    /// paths. The program gets read and execute access to the file itself.
+    fn resolve(policy: &Policy, program: Option<&Path>) -> Result<Self, PolicyError> {
         let filesystem = &policy.filesystem;
         let mut rules = Vec::new();
         let mut traversals = Vec::new();
@@ -202,27 +216,82 @@ impl ResolvedPolicy {
         check_not_resolved_through_writable(&paths, &traversals, &mounts)?;
         check_no_writable_second_name(&paths, &mounts)?;
         validate_environment(&policy.environment)?;
+        validate_relay_addresses(&policy.network.expose, &policy.network.forward)?;
+        Ok(ResolvedPaths {
+            paths,
+            program: program_path,
+            links,
+        })
+    }
+}
+
+impl ResolvedPolicy {
+    /// Validates `policy` and resolves its paths. `program` is the target executable; it gets
+    /// read and execute access to the file itself. This is the base of the policy only; a
+    /// caller that honours fallback levels uses `resolve_levels`.
+    pub fn resolve(policy: &Policy, program: Option<&Path>) -> Result<Self, PolicyError> {
+        let paths = ResolvedPaths::resolve(policy, program)?;
+        ResolvedPolicy::with_settings(&paths, policy)
+    }
+
+    /// Resolves the base of `policy` and every fallback level, in order. The paths are the same
+    /// in every level, so they are resolved and checked once and every level shares the result.
+    /// Each level's settings are validated as a policy of their own, so a broken level is an
+    /// error on every host and not only on the one that reaches it.
+    pub fn resolve_levels(
+        policy: &Policy,
+        program: Option<&Path>,
+    ) -> Result<Vec<ResolvedLevel>, PolicyError> {
+        let paths = ResolvedPaths::resolve(policy, program)?;
+        let levels = policy.levels();
+        let several = levels.len() > 1;
+        if several {
+            check_appcontainer_names(&levels)?;
+        }
+        levels
+            .into_iter()
+            .map(|level| {
+                let resolved =
+                    ResolvedPolicy::with_settings(&paths, &level.policy).map_err(|error| {
+                        if several {
+                            PolicyError::InvalidLevel {
+                                level: level.name.clone(),
+                                error: Box::new(error),
+                            }
+                        } else {
+                            error
+                        }
+                    })?;
+                Ok(ResolvedLevel {
+                    name: level.name,
+                    policy: resolved,
+                })
+            })
+            .collect()
+    }
+
+    /// Checks the settings of `policy` and joins them with its resolved paths.
+    fn with_settings(paths: &ResolvedPaths, policy: &Policy) -> Result<Self, PolicyError> {
         validate_expose(&policy.network.expose, policy.network.ip)?;
         validate_children(&policy.process, policy.network.unix_sockets)?;
         if policy.process.end_with_parent && policy.process.signals != SignalScope::Isolated {
             return Err(PolicyError::EndWithParentNeedsIsolatedSignals);
         }
         validate_forward(&policy.network.forward, policy.network.ip)?;
-        validate_relay_addresses(&policy.network.expose, &policy.network.forward)?;
         validate_egress(&policy.network)?;
         validate_relays(&policy.network, policy.macos.relays)?;
 
         Ok(ResolvedPolicy {
-            paths,
-            program: program_path,
-            links,
-            system: filesystem.system,
+            paths: paths.paths.clone(),
+            program: paths.program.clone(),
+            links: paths.links.clone(),
+            system: policy.filesystem.system,
             ip: policy.network.ip,
             unix_sockets: policy.network.unix_sockets,
             expose: policy.network.expose.clone(),
             forward: policy.network.forward.clone(),
             egress: policy.network.egress,
-            view: filesystem.view,
+            view: policy.filesystem.view,
             signals: policy.process.signals,
             children: policy.process.children,
             end_with_parent: policy.process.end_with_parent,
@@ -441,6 +510,18 @@ impl ResolvedPolicy {
         identity: &PathIdentity,
     ) -> Option<(&'policy PathRule, &'protected ProtectedPath)> {
         self.writable_conflicts(protected, identity, Unknown::Overlaps)
+            .next()
+    }
+
+    /// `writable_conflict` without the overlaps that sandy only assumes because it cannot read
+    /// the identity of a file on the way. A backend reports these as a conflict of the policy,
+    /// and an overlap that only `writable_conflict` finds as an answer it cannot give now.
+    pub fn known_writable_conflict<'policy, 'protected>(
+        &'policy self,
+        protected: &'protected [ProtectedPath],
+        identity: &PathIdentity,
+    ) -> Option<(&'policy PathRule, &'protected ProtectedPath)> {
+        self.writable_conflicts(protected, identity, Unknown::Spelling)
             .next()
     }
 
@@ -1532,6 +1613,40 @@ fn validate_children(
     Ok(())
 }
 
+/// On Windows each level of a policy runs in an AppContainer of its own: levels that shared
+/// one would share the machine-wide loopback exemption (setup of a level with `ip = "all"`
+/// exempts the name, and a level with `ip = "private"` then needs setup again), the running
+/// instance, and the profile folder, where a weaker level could leave data that a stronger one
+/// reads. AppContainer names ignore case. The rule is checked on every platform, so a policy is
+/// valid or not the same everywhere.
+fn check_appcontainer_names(levels: &[crate::policy::Level]) -> Result<(), PolicyError> {
+    let named = levels
+        .iter()
+        .find(|level| level.policy.windows.appcontainer_name.is_some());
+    let Some(named) = named else {
+        return Ok(());
+    };
+    let mut seen: Vec<(String, &str)> = Vec::new();
+    for level in levels {
+        let Some(name) = &level.policy.windows.appcontainer_name else {
+            return Err(PolicyError::MissingAppContainerName {
+                level: level.name.clone(),
+                named: named.name.clone(),
+            });
+        };
+        let folded = name.to_ascii_lowercase();
+        if let Some((_, first)) = seen.iter().find(|(seen, _)| *seen == folded) {
+            return Err(PolicyError::SharedAppContainerName {
+                first: first.to_string(),
+                second: level.name.clone(),
+                name: name.clone(),
+            });
+        }
+        seen.push((folded, &level.name));
+    }
+    Ok(())
+}
+
 fn validate_environment(environment: &EnvironmentPolicy) -> Result<(), PolicyError> {
     let names = environment.pass.iter().chain(environment.set.keys());
     for name in names {
@@ -1580,6 +1695,99 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "mklink /J failed");
+    }
+
+    fn levels_of(text: &str) -> Result<Vec<ResolvedLevel>, PolicyError> {
+        ResolvedPolicy::resolve_levels(&Policy::from_toml(text).unwrap(), None)
+    }
+
+    /// The levels share the base's resolved paths, and each level is the base's resolution
+    /// with its own settings.
+    #[test]
+    fn levels_share_the_resolved_paths() {
+        let dir = temp_dir();
+        let text = format!(
+            "version = 1\n[filesystem]\nread = [{:?}]\nread_write = [{:?}]\n\
+             [[fallback]]\nname = \"open\"\nnetwork.ip = \"all\"\n",
+            plain(&dir.join("..")),
+            plain(&temp_dir()),
+        );
+        let levels = levels_of(&text).unwrap();
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels[0].name, "base");
+        assert_eq!(levels[1].name, "open");
+        assert_eq!(levels[0].policy.paths, levels[1].policy.paths);
+        let base = ResolvedPolicy::resolve(&Policy::from_toml(&text).unwrap(), None).unwrap();
+        assert_eq!(levels[0].policy, base);
+        assert_eq!(levels[1].policy.ip, IpAccess::All);
+        let mut open = base.clone();
+        open.ip = IpAccess::All;
+        assert_eq!(levels[1].policy, open);
+    }
+
+    /// A level that is not valid as a policy is an error on every host, named after the level;
+    /// without levels the error reads as before.
+    #[test]
+    fn every_level_is_validated() {
+        let broken = "version = 1\n[process]\nsignals = \"isolated\"\n\
+                      [[fallback]]\nname = \"weak\"\nprocess.children = \"contained\"\n\
+                      process.signals = \"any\"\n";
+        let error = levels_of(broken).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                PolicyError::InvalidLevel { level, error }
+                    if level == "weak"
+                        && matches!(**error, PolicyError::ContainedChildrenNeedIsolatedSignals)
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().starts_with("level weak: "), "{error}");
+        // The base alone is fine.
+        assert!(ResolvedPolicy::resolve(&Policy::from_toml(broken).unwrap(), None).is_ok());
+
+        let alone = "version = 1\n[process]\nchildren = \"contained\"\n";
+        assert!(matches!(
+            levels_of(alone),
+            Err(PolicyError::ContainedChildrenNeedIsolatedSignals)
+        ));
+    }
+
+    /// Every level needs an AppContainer name of its own once any level names one, ignoring
+    /// case, on every platform.
+    #[test]
+    fn levels_need_appcontainer_names_of_their_own() {
+        let policy = |base: Option<&str>, level: Option<&str>| {
+            let mut text = String::from("version = 1\n");
+            if let Some(name) = base {
+                text.push_str(&format!("[windows]\nappcontainer_name = {name:?}\n"));
+            }
+            text.push_str("[[fallback]]\nname = \"weak\"\nnetwork.ip = \"all\"\n");
+            if let Some(name) = level {
+                text.push_str(&format!("windows.appcontainer_name = {name:?}\n"));
+            }
+            levels_of(&text)
+        };
+        assert!(policy(None, None).is_ok());
+        assert!(policy(Some("app"), Some("app-weak")).is_ok());
+        for (base, level) in [(Some("app"), None), (Some("app"), Some("APP"))] {
+            assert!(
+                matches!(
+                    policy(base, level),
+                    Err(PolicyError::SharedAppContainerName { ref first, ref second, .. })
+                        if first == "base" && second == "weak"
+                ),
+                "{base:?} {level:?}"
+            );
+        }
+        assert!(matches!(
+            policy(None, Some("app")),
+            Err(PolicyError::MissingAppContainerName { ref level, ref named })
+                if level == "base" && named == "weak"
+        ));
+        // Without levels nothing is compared.
+        let alone = Policy::from_toml("version = 1\n[windows]\nappcontainer_name = \"a\"");
+        assert!(ResolvedPolicy::resolve_levels(&alone.unwrap(), None).is_ok());
     }
 
     fn policy_with(read: &[&Path], read_exec: &[&Path], read_write: &[&Path]) -> Policy {
@@ -2824,6 +3032,17 @@ mod tests {
         // A refusal counts what sandy cannot tell apart as an overlap.
         let refused = writable_conflict(&data, &[ProtectedPath::entry(&unreadable)]);
         assert_eq!(refused.is_some(), cfg!(windows), "{refused:?}");
+        // `known_writable_conflict` leaves it out and keeps a real overlap, so a backend can tell
+        // a conflict of the policy from an answer it cannot give now.
+        let resolved = ResolvedPolicy::resolve(&policy_with(&[], &[], &[&data]), None).unwrap();
+        let identity = PathIdentity::read().unwrap();
+        let known = |directory: &Path| {
+            resolved
+                .known_writable_conflict(&[ProtectedPath::entry(directory)], &identity)
+                .is_some()
+        };
+        assert!(!known(&unreadable));
+        assert!(known(&data.join("bin")));
     }
 
     /// A writable path that holds a directory on PATH is warned about, not refused (rule 12),

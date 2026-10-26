@@ -46,7 +46,7 @@ pub fn windows_version() -> Result<WindowsVersion, String> {
 
 /// The update build revision (UBR) that cumulative updates raise. Windows documents no API for
 /// it; the registry value is what `winver` shows.
-fn update_revision() -> Option<u32> {
+fn update_revision() -> Result<u32, String> {
     let key = wide_nul(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion".as_ref());
     let name = wide_nul("UBR".as_ref());
     let mut value = 0u32;
@@ -63,7 +63,13 @@ fn update_revision() -> Option<u32> {
             &mut size,
         )
     };
-    (error == 0).then_some(value)
+    if error != 0 {
+        return Err(format!(
+            "cannot read UBR in HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion: {}",
+            io::Error::from_raw_os_error(error as i32)
+        ));
+    }
+    Ok(value)
 }
 
 /// The UI restrictions of the job sandy runs in, or `None` outside a job. For nested jobs this
@@ -107,11 +113,11 @@ pub fn outer_job_ui() -> Result<Option<u32>, String> {
 /// failed with status 125).
 ///
 /// The trial creates a process and ends it again, so only `verify` calls it. The process starts
-/// suspended and is terminated before it runs an instruction. `Ok` when there is nothing to try:
-/// outside a job there is no chain, and an immediate job with UI restrictions is in the plan
-/// already.
-pub fn job_nests() -> Result<(), String> {
-    if !matches!(outer_job_ui(), Ok(Some(0))) {
+/// suspended and is terminated before it runs an instruction. `Ok` when there is nothing to try,
+/// by the answer of `outer_job_ui` that the plan read (`outer`): outside a job there is no chain,
+/// and an immediate job with UI restrictions is in the plan already.
+pub fn job_nests<E>(outer: &Result<Option<u32>, E>) -> Result<(), String> {
+    if !matches!(outer, Ok(Some(0))) {
         return Ok(());
     }
     let job = ui_restricted_job()?;

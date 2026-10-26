@@ -5,21 +5,20 @@ use std::path::Path;
 
 use sandy_core::{
     ChildProcesses, FileView, IpAccess, NetworkAccess, PathAccess, PathIdentity, PlanItem,
-    ProtectedPath, Relays, Requirement, ResolvedPolicy, SignalScope, SystemAccess,
+    ProtectedPath, Relays, Requirement, ResolvedPolicy, SignalScope, Status, SystemAccess,
 };
 
 use crate::system::{self, SystemAccess as Grant};
-use crate::trust;
 
-/// What the host offers. `MacosBackend` detects it; tests use fixed values.
+/// What the host offers. `MacosBackend` detects it (`detect::Detected`); tests use fixed values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostCapabilities {
     /// `Ok` when the Seatbelt functions could be loaded, otherwise the reason.
     pub seatbelt: Result<(), String>,
     /// `Ok` when the Seatbelt compiler of this host accepts the generated profiles (the
-    /// program's, and the relay's and the watcher's when the policy needs them), otherwise its
-    /// message.
-    pub profile: Result<(), String>,
+    /// program's, and the relay's and the watcher's when the policy needs them), otherwise why
+    /// not.
+    pub profile: Result<(), ProfileError>,
     /// sandy itself already runs in a Seatbelt sandbox. macOS then refuses another profile.
     pub already_sandboxed: bool,
     /// Why the program would run as x86_64 code through Rosetta, if it would. Rosetta cannot load
@@ -29,8 +28,30 @@ pub struct HostCapabilities {
     /// interpreter no `read_exec` path covers (`executable_paths`).
     pub interpreter: Option<String>,
     /// The locations of this user that programs outside the sandbox read or execute later
-    /// (`trust::locations`), or why sandy cannot name them: no source names the home directory.
+    /// (`trust::locations`), or why sandy cannot name them: no source names the home directory,
+    /// or the password database cannot be read.
     pub trusted_locations: Result<Vec<ProtectedPath>, String>,
+}
+
+/// Why this macOS did not compile a generated profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileError {
+    /// The compiler's message: this macOS lacks an operation or a filter that the profile uses.
+    /// The profile text depends only on the policy, so that lasts until macOS changes.
+    Rejected(String),
+    /// The compiler gave no verdict: the library could not create the parameters or the
+    /// compiled profile and said nothing, as when memory runs out, which can pass.
+    Failed(String),
+}
+
+impl ProfileError {
+    /// The same error with `name` before its message, for a profile other than the program's.
+    pub fn of(self, name: &str) -> ProfileError {
+        match self {
+            ProfileError::Rejected(message) => ProfileError::Rejected(format!("{name}: {message}")),
+            ProfileError::Failed(message) => ProfileError::Failed(format!("{name}: {message}")),
+        }
+    }
 }
 
 /// How many `#!` lines sandy follows when it checks whether the program can be executed. XNU
@@ -50,42 +71,63 @@ pub fn executable_paths(policy: &ResolvedPolicy) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// Reports every requirement of `policy` exactly once, as enforced (with its mechanism) or
-/// unavailable (with the reason).
+/// Reports every requirement of `policy` exactly once, as enforced (with its mechanism) or not
+/// (with the reason). A missing Seatbelt, a sandbox around sandy, code that needs Rosetta and a
+/// profile that this macOS rejects are shortfalls of the host that every later run meets too; a
+/// writable path that reaches what the sandbox must protect and an interpreter that the policy
+/// does not let the program execute are conflicts of the policy; a lookup that failed is
+/// indeterminate (`sandy_core::Status`).
 pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<PlanItem> {
+    let unavailable = |reason| Status::Unavailable { reason };
     let profile = match (
         &host.seatbelt,
         host.already_sandboxed,
         &host.rosetta,
         &host.profile,
     ) {
-        (Err(reason), _, _, _) => Err(format!("Seatbelt is not available: {reason}")),
-        (Ok(()), true, _, _) => Err(
+        (Err(reason), _, _, _) => Err(unavailable(format!("Seatbelt is not available: {reason}"))),
+        (Ok(()), true, _, _) => Err(unavailable(
             "sandy already runs in a Seatbelt sandbox, and macOS refuses a second profile"
                 .to_string(),
-        ),
-        (Ok(()), false, Some(reason), _) => Err(reason.clone()),
-        (Ok(()), false, None, Err(message)) => Err(format!(
-            "this macOS rejects the generated Seatbelt profile: {message}"
         )),
+        (Ok(()), false, Some(reason), _) => Err(unavailable(reason.clone())),
+        (Ok(()), false, None, Err(ProfileError::Rejected(message))) => Err(unavailable(format!(
+            "this macOS rejects the generated Seatbelt profile: {message}"
+        ))),
+        (Ok(()), false, None, Err(ProfileError::Failed(message))) => Err(Status::Indeterminate {
+            reason: format!("cannot compile the generated Seatbelt profile: {message}"),
+        }),
         (Ok(()), false, None, Ok(())) => Ok(()),
     };
-    let conflict = system_conflict(policy)
+    // What ends the selection comes first, so that a shortfall cannot hide it.
+    let filesystem = system_conflict(policy)
         .or_else(|| trust_conflict(policy, &host.trusted_locations))
-        .or_else(|| host.interpreter.clone());
+        .or_else(|| {
+            let reason = host.interpreter.clone()?;
+            Some(Status::Conflict { reason })
+        })
+        .or_else(|| root_directory_missing(policy).map(unavailable));
     policy
         .requirements()
         .into_iter()
-        .map(|requirement| match mechanism(requirement, policy) {
-            _ if requirement == Requirement::FilesystemConfined && conflict.is_some() => {
-                PlanItem::unavailable(requirement, conflict.clone().unwrap_or_default())
+        .map(|requirement| {
+            if let (Requirement::FilesystemConfined, Some(status)) = (requirement, &filesystem) {
+                return PlanItem {
+                    requirement,
+                    status: status.clone(),
+                };
             }
-            Mechanism::Profile(text) => match &profile {
-                Ok(()) => PlanItem::enforced(requirement, format!("Seatbelt profile: {text}")),
-                Err(reason) => PlanItem::unavailable(requirement, reason.clone()),
-            },
-            Mechanism::Exec(text) => PlanItem::enforced(requirement, text),
-            Mechanism::Missing(reason) => PlanItem::unavailable(requirement, reason),
+            match mechanism(requirement, policy) {
+                Mechanism::Profile(text) => match &profile {
+                    Ok(()) => PlanItem::enforced(requirement, format!("Seatbelt profile: {text}")),
+                    Err(status) => PlanItem {
+                        requirement,
+                        status: status.clone(),
+                    },
+                },
+                Mechanism::Exec(text) => PlanItem::enforced(requirement, text),
+                Mechanism::Missing(reason) => PlanItem::unavailable(requirement, reason),
+            }
         })
         .collect()
 }
@@ -100,9 +142,12 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<PlanIte
 ///
 /// The comparison is the one of rules 3 and 4 (`PathIdentity`), so a second name of a directory
 /// of the set, a firmlink spelling for example, counts as that directory.
-fn system_conflict(policy: &ResolvedPolicy) -> Option<String> {
+///
+/// The set is fixed for this macOS, and the policy asks to write it, so this is a conflict of
+/// the policy: no weaker level helps, because every level has the same paths.
+fn system_conflict(policy: &ResolvedPolicy) -> Option<Status> {
     if policy.system == SystemAccess::None {
-        return root_directory_missing(policy);
+        return None;
     }
     let protected: Vec<ProtectedPath> = system::MINIMAL
         .iter()
@@ -124,57 +169,77 @@ fn system_conflict(policy: &ResolvedPolicy) -> Option<String> {
             ProtectedPath::entry(system::DNS_RESOLVER_SOCKET),
         ])
         .collect();
-    let identity = match PathIdentity::read() {
+    let identity = match path_identity() {
         Ok(identity) => identity,
-        Err(error) => return Some(error.to_string()),
+        Err(status) => return Some(status),
     };
     let (rule, entry) = policy.writable_conflict(&protected, &identity)?;
-    Some(format!(
-        "writable path {} overlaps {} of the minimal system set; the program could change code \
-         or configuration that the next start and programs outside the sandbox use",
-        rule.path.display(),
-        entry.path.display()
-    ))
+    Some(Status::Conflict {
+        reason: format!(
+            "writable path {} overlaps {} of the minimal system set; the program could change \
+             code or configuration that the next start and programs outside the sandbox use",
+            rule.path.display(),
+            entry.path.display()
+        ),
+    })
 }
 
 /// The locations of this user that programs outside the sandbox read or execute later (see
 /// `trust`). They are no policy paths, so rules 3 and 4 do not cover them. Unlike the system set
 /// this applies with `system = "none"` as well: the locations belong to the user, not to the set.
+/// A writable path that reaches one is a conflict of the policy, like one over the system set.
 ///
-/// When no source names the home directory, sandy cannot tell whether a writable path reaches
-/// the locations below it, so a policy with a writable path is refused. A policy without one
-/// reaches no location.
+/// When sandy cannot name the home directory, it cannot tell whether a writable path reaches
+/// the locations below it, so a policy with a writable path is indeterminate: the password
+/// database may answer on the next try, and `HOME` names the directory once it is set. A policy
+/// without one reaches no location.
 fn trust_conflict(
     policy: &ResolvedPolicy,
     trusted: &Result<Vec<ProtectedPath>, String>,
-) -> Option<String> {
+) -> Option<Status> {
     let trusted = match trusted {
         Ok(trusted) => trusted,
         Err(reason) => {
             let writable = |rule: &sandy_core::PathRule| rule.access == PathAccess::ReadWrite;
-            return policy.paths.iter().any(writable).then(|| reason.clone());
+            return policy
+                .paths
+                .iter()
+                .any(writable)
+                .then(|| Status::Indeterminate {
+                    reason: reason.clone(),
+                });
         }
     };
-    let identity = match PathIdentity::read() {
+    let identity = match path_identity() {
         Ok(identity) => identity,
-        Err(error) => return Some(error.to_string()),
+        Err(status) => return Some(status),
     };
     let (rule, location) = policy.writable_conflict(trusted, &identity)?;
-    Some(format!(
-        "writable path {} overlaps {}, which programs outside the sandbox read or execute \
-         later; a file the program leaves there runs outside the sandbox",
-        rule.path.display(),
-        location.path.display()
-    ))
+    Some(Status::Conflict {
+        reason: format!(
+            "writable path {} overlaps {}, which programs outside the sandbox read or execute \
+             later; a file the program leaves there runs outside the sandbox",
+            rule.path.display(),
+            location.path.display()
+        ),
+    })
+}
+
+/// What the comparisons with the protected locations need. It cannot fail on macOS; elsewhere a
+/// mount table that cannot be read now says nothing about the host.
+fn path_identity() -> Result<PathIdentity, Status> {
+    PathIdentity::read().map_err(|error| Status::Indeterminate {
+        reason: error.to_string(),
+    })
 }
 
 /// What makes the program behave differently inside the sandbox than outside, beyond the
-/// requirements: a directory on sandy's PATH inside a writable path (rule 12). Before it come
-/// the `shortfalls` of the policy. `sandy check` prints these as warnings; they change nothing
-/// sandy enforces.
-pub fn notes(policy: &ResolvedPolicy) -> Vec<String> {
+/// requirements: a directory on sandy's PATH inside a writable path (rule 12), from the
+/// `path_locations` of `trust`. Before it come the `shortfalls` of the policy. `sandy check`
+/// prints these as warnings; they change nothing sandy enforces.
+pub fn notes(policy: &ResolvedPolicy, path_locations: &[ProtectedPath]) -> Vec<String> {
     let mut notes = shortfalls(policy);
-    notes.extend(policy.path_directory_notes(&trust::path_locations()));
+    notes.extend(policy.path_directory_notes(path_locations));
     notes
 }
 
@@ -349,14 +414,16 @@ fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
     shortfalls
 }
 
-/// Reports every requirement that the Seatbelt profile enforces as unavailable with `reason`. For
-/// `verify`, which learns in a helper process whether the profile can be applied at all.
-pub fn profile_unavailable(policy: &ResolvedPolicy, reason: &str) -> Vec<PlanItem> {
+/// Reports every requirement that the Seatbelt profile enforces as indeterminate with `reason`.
+/// For `verify`, which learns in a helper process whether the profile can be applied at all. Like
+/// every finding of `verify` this decides no level: a process of the same user can stop the
+/// helper, and a process limit can keep it from starting.
+pub fn profile_indeterminate(policy: &ResolvedPolicy, reason: &str) -> Vec<PlanItem> {
     policy
         .requirements()
         .into_iter()
         .filter(|requirement| matches!(mechanism(*requirement, policy), Mechanism::Profile(_)))
-        .map(|requirement| PlanItem::unavailable(requirement, reason))
+        .map(|requirement| PlanItem::indeterminate(requirement, reason))
         .collect()
 }
 
@@ -367,7 +434,8 @@ pub fn profile_unavailable(policy: &ResolvedPolicy, reason: &str) -> Vec<PlanIte
 /// directory itself. Without this, `check` reported such a policy as enforced and the program
 /// then died at its start.
 fn root_directory_missing(policy: &ResolvedPolicy) -> Option<String> {
-    let covered = policy.paths.iter().any(|rule| rule.path == Path::new("/"));
+    let covered = policy.system != SystemAccess::None
+        || policy.paths.iter().any(|rule| rule.path == Path::new("/"));
     (!covered).then(|| {
         "system = \"none\" adds none of the paths that every program on macOS needs to start: \
          dyld opens the root directory to locate the dyld shared cache and maps its own code \
@@ -609,9 +677,22 @@ mod tests {
         assert_eq!(reported, policy.requirements());
     }
 
+    /// The class of a report that is not enforced.
+    fn class(status: &Status) -> &'static str {
+        match status {
+            Status::Enforced { .. } => "enforced",
+            Status::NeedsSetup { .. } => "needs setup",
+            Status::Unavailable { .. } => "unavailable",
+            Status::Indeterminate { .. } => "indeterminate",
+            Status::Conflict { .. } => "conflict",
+        }
+    }
+
+    /// A writable path over the minimal system set conflicts with the fixed layout of macOS:
+    /// every level has the same paths, so a weaker level would not help.
     #[test]
     fn a_writable_path_must_not_overlap_the_system_set() {
-        let unavailable_with = |path: &str, system: SystemAccess| {
+        let refused_with = |path: &str, system: SystemAccess| {
             let mut policy = strictest();
             policy.system = system;
             policy.paths.push(sandy_core::PathRule {
@@ -622,36 +703,36 @@ mod tests {
             plan_for(&policy, &capable())
                 .into_iter()
                 .filter(|item| !item.is_enforced())
-                .map(|item| item.requirement)
+                .map(|item| (item.requirement, class(&item.status)))
                 .collect::<Vec<_>>()
         };
-        let refused = vec![Requirement::FilesystemConfined];
+        let conflict = vec![(Requirement::FilesystemConfined, "conflict")];
         // Contains a tree or a file of the set.
         assert_eq!(
-            unavailable_with("/private/var/db", SystemAccess::Minimal),
-            refused
+            refused_with("/private/var/db", SystemAccess::Minimal),
+            conflict
         );
         assert_eq!(
-            unavailable_with("/private/etc", SystemAccess::Minimal),
-            refused
+            refused_with("/private/etc", SystemAccess::Minimal),
+            conflict
         );
         // Lies inside a tree of the set.
         assert_eq!(
-            unavailable_with("/usr/lib/app", SystemAccess::Minimal),
-            refused
+            refused_with("/usr/lib/app", SystemAccess::Minimal),
+            conflict
         );
         assert_eq!(
-            unavailable_with("/usr/share/locale/x", SystemAccess::Minimal),
-            refused
+            refused_with("/usr/share/locale/x", SystemAccess::Minimal),
+            conflict
         );
         // Not part of the set, or the set itself allows writing.
-        assert!(unavailable_with("/Users/someone/data", SystemAccess::Minimal).is_empty());
-        assert!(unavailable_with("/dev/null", SystemAccess::Minimal).is_empty());
+        assert!(refused_with("/Users/someone/data", SystemAccess::Minimal).is_empty());
+        assert!(refused_with("/dev/null", SystemAccess::Minimal).is_empty());
         // Without the system set there is nothing to overlap, but then no program starts
-        // (`system_none_needs_the_root_directory`).
+        // (`system_none_needs_the_root_directory`), which this macOS cannot change.
         assert_eq!(
-            unavailable_with("/private/var/db", SystemAccess::None),
-            refused
+            refused_with("/private/var/db", SystemAccess::None),
+            vec![(Requirement::FilesystemConfined, "unavailable")]
         );
     }
 
@@ -674,17 +755,24 @@ mod tests {
             });
             trust_conflict(&policy, &Ok(trusted.clone()))
         };
-        // Holds the startup file, holds the home directory, lies inside a protected tree.
-        assert!(conflict("/Users/someone").is_some());
-        assert!(conflict("/Users").is_some());
-        assert!(conflict("/Users/someone/Library/LaunchAgents/sub").is_some());
+        // Holds the startup file, holds the home directory, lies inside a protected tree. Each
+        // is a conflict of the policy, which every level shares.
+        for path in [
+            "/Users/someone",
+            "/Users",
+            "/Users/someone/Library/LaunchAgents/sub",
+        ] {
+            let status = conflict(path);
+            assert_eq!(status.as_ref().map(class), Some("conflict"), "{status:?}");
+        }
         // A directory below the home directory stays writable.
         assert!(conflict("/Users/someone/data").is_none());
     }
 
-    /// When no source names the home directory, sandy cannot check the locations below it, so a
-    /// policy with a writable path is refused with the reason, and one without stays
-    /// enforceable.
+    /// When sandy cannot name the home directory, it cannot check the locations below it, so a
+    /// policy with a writable path is indeterminate, with the reason: a lookup in the password
+    /// database that failed may pass on the next try, and must not make a weaker level run. One
+    /// without a writable path stays enforceable.
     #[test]
     fn an_unknown_home_directory_refuses_a_writable_path() {
         let host = HostCapabilities {
@@ -703,7 +791,9 @@ mod tests {
             is_dir: true,
         });
         let plan = plan_of(&policy);
-        assert!(!plan.is_enforceable(), "{plan}");
+        let reports: Vec<_> = plan.final_reports().collect();
+        assert_eq!(reports.len(), 1, "{plan}");
+        assert_eq!(class(&reports[0].status), "indeterminate", "{plan}");
         assert!(plan.to_string().contains("home directory"), "{plan}");
     }
 
@@ -767,7 +857,7 @@ mod tests {
         let policy = strictest();
         let host = HostCapabilities {
             seatbelt: Err("dlsym(sandbox_init_with_parameters): symbol not found".into()),
-            profile: Err("not compiled".into()),
+            profile: Err(ProfileError::Failed("not compiled".into())),
             already_sandboxed: false,
             rosetta: None,
             interpreter: None,
@@ -793,7 +883,9 @@ mod tests {
         let policy = strictest();
         let host = HostCapabilities {
             seatbelt: Ok(()),
-            profile: Err("unbound variable: file-test-existence".into()),
+            profile: Err(ProfileError::Rejected(
+                "unbound variable: file-test-existence".into(),
+            )),
             already_sandboxed: false,
             rosetta: None,
             interpreter: None,
@@ -872,13 +964,13 @@ mod tests {
             "{mechanism}"
         );
         let udp = |policy: &ResolvedPolicy| {
-            notes(policy)
+            notes(policy, &[])
                 .iter()
                 .any(|note| note.starts_with("ip = \"client\" keeps datagrams out only in part"))
         };
         assert!(udp(&client));
         assert!(
-            notes(&client)
+            notes(&client, &[])
                 .iter()
                 .any(|note| note.contains("SIGIO and SIGURG"))
         );
@@ -1004,7 +1096,7 @@ mod tests {
     #[test]
     fn warns_where_a_private_network_reaches_other_addresses() {
         let count = |policy: &ResolvedPolicy, start: &str| {
-            notes(policy)
+            notes(policy, &[])
                 .iter()
                 .filter(|note| note.starts_with(start))
                 .count()
@@ -1019,7 +1111,7 @@ mod tests {
         assert_eq!(count(&private, scoped), 1);
         assert_eq!(count(&private, broker), 1);
         let held_note = |policy: &ResolvedPolicy| {
-            notes(policy)
+            notes(policy, &[])
                 .into_iter()
                 .find(|note| note.starts_with(held))
                 .unwrap()
@@ -1065,7 +1157,7 @@ mod tests {
     #[test]
     fn ipv4_relays_close_the_link_local_route_and_name_the_cost() {
         let notes_starting = |policy: &ResolvedPolicy, start: &str| -> Vec<String> {
-            notes(policy)
+            notes(policy, &[])
                 .into_iter()
                 .filter(|note| note.starts_with(start))
                 .collect()
@@ -1132,7 +1224,7 @@ mod tests {
         let warned = |view, unix_sockets| {
             let mut policy = policy(IpAccess::None, unix_sockets, SignalScope::Isolated);
             policy.view = view;
-            notes(&policy)
+            notes(&policy, &[])
                 .iter()
                 .filter(|note| note.starts_with("view = \"policy\" hides paths"))
                 .count()
@@ -1147,7 +1239,7 @@ mod tests {
     fn warns_that_unix_sockets_all_shows_which_paths_exist() {
         let warned = |unix_sockets| {
             let policy = policy(IpAccess::None, unix_sockets, SignalScope::Isolated);
-            notes(&policy)
+            notes(&policy, &[])
                 .iter()
                 .filter(|note| note.starts_with("unix_sockets = \"all\" lets the program tell"))
                 .count()
@@ -1180,7 +1272,9 @@ mod tests {
 
     /// XNU executes the interpreter of a script, so a script whose interpreter no `read_exec`
     /// path covers cannot start. The plan reports it instead of letting the `execve` fail with
-    /// the profile already applied.
+    /// the profile already applied, as a conflict between the program and the policy: whoever
+    /// can change a link on the way to the interpreter must not make sandy pick a level whose
+    /// `read_exec` paths cover the new target.
     #[test]
     fn a_script_without_an_executable_interpreter_refuses() {
         let policy = strictest();
@@ -1197,9 +1291,39 @@ mod tests {
             .unwrap();
         assert_eq!(
             filesystem.status,
-            Status::Unavailable {
+            Status::Conflict {
                 reason: host.interpreter.clone().unwrap()
             }
+        );
+        assert_eq!(plan.final_reports().count(), 1, "{plan}");
+    }
+
+    /// The trial apply of `verify` never decides a level: whatever stops its helper, every
+    /// requirement of the profile is reported indeterminate, and only those.
+    #[test]
+    fn a_failed_trial_is_indeterminate_for_every_profile_requirement() {
+        let mut policy = private_network();
+        policy.children = ChildProcesses::Contained;
+        let items = profile_indeterminate(&policy, "the trial sandbox did not report");
+        let profile: Vec<Requirement> = plan_for(&policy, &capable())
+            .into_iter()
+            .filter(|item| {
+                matches!(&item.status, Status::Enforced { mechanism } if mechanism.starts_with("Seatbelt profile"))
+            })
+            .map(|item| item.requirement)
+            .collect();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.requirement)
+                .collect::<Vec<_>>(),
+            profile
+        );
+        assert!(
+            items
+                .iter()
+                .all(|item| class(&item.status) == "indeterminate"),
+            "{items:?}"
         );
     }
 

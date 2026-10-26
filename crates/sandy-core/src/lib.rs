@@ -10,22 +10,25 @@ mod env;
 mod plan;
 mod policy;
 mod resolve;
+mod selection;
 pub mod streams;
 pub mod trust;
 pub mod verify;
 
 pub use backend::{
     Backend, ParentProcess, SandboxError, SetupOptions, SetupOutcome, StatusReport, TargetCommand,
+    setup_levels,
 };
 pub use env::target_environment;
 pub use plan::{EnforcementPlan, PlanItem, Requirement, Status};
 pub use policy::{
-    ChildProcesses, Egress, EgressReach, EnvironmentPolicy, ExposedPort, FileView,
-    FilesystemPolicy, ForwardedPort, IpAccess, LinuxPolicy, MacosPolicy, NetworkAccess,
-    NetworkPolicy, POLICY_VERSION, PathMetadata, Policy, PolicyError, ProcessPolicy, Relays,
-    SignalScope, SystemAccess, Win32k, WindowsPolicy,
+    BASE_LEVEL, ChildProcesses, Egress, EgressReach, EnvironmentPolicy, ExposedPort, Fallback,
+    FallbackEgress, FileView, FilesystemPolicy, ForwardedPort, IpAccess, Level, LinuxPolicy,
+    MAX_LEVEL_NAME, MacosPolicy, NetworkAccess, NetworkPolicy, POLICY_VERSION, PathMetadata,
+    Policy, PolicyError, ProcessPolicy, Relays, SignalScope, SystemAccess, Win32k, WindowsPolicy,
 };
 pub use resolve::{
-    PathAccess, PathIdentity, PathRule, ProtectedPath, ResolvedPolicy, canonical_location,
-    path_directories, shebang,
+    PathAccess, PathIdentity, PathRule, ProtectedPath, ResolvedLevel, ResolvedPolicy,
+    canonical_location, path_directories, shebang,
 };
+pub use selection::{Outcome, Selection, select};

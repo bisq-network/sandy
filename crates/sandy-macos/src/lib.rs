@@ -6,6 +6,7 @@
 //! everywhere. Only the code that calls macOS is limited to macOS.
 
 pub mod binary;
+pub mod detect;
 pub mod plan;
 pub mod profile;
 pub mod system;

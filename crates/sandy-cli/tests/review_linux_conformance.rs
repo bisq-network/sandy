@@ -660,11 +660,12 @@ fn a_program_whose_loader_is_not_granted_is_refused() {
     let probe = probe_path();
     let refused = sandy(["check", "--system", "none", probe.as_str()]);
     let report = String::from_utf8_lossy(&refused.stdout);
-    assert!(
-        report.contains("the kernel executes the loader"),
-        "{report}"
-    );
-    assert_eq!(refused.status.code(), Some(1), "{report}");
+    let line = report
+        .lines()
+        .find(|line| line.contains("the kernel executes the loader"))
+        .unwrap_or_default();
+    assert!(line.starts_with("CONFLICT "), "{report}");
+    assert_eq!(refused.status.code(), Some(EXIT_FAILURE), "{report}");
     // The minimal system set grants the loader, so the same program is enforceable with it.
     let granted = sandy(["check", probe.as_str()]);
     assert!(granted.status.success(), "{granted:?}");

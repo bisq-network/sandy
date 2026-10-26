@@ -153,6 +153,7 @@ pub fn run(
     // What the child needed is the child's now: a copy kept here would hold the helpers'
     // handover and factory sockets open after the child is gone.
     drop(start);
+    close_inherited_descriptors()?;
     // Without a PID namespace the forked child becomes the program; in one it splits itself.
     match split {
         None => group.program = Some(child),
@@ -204,6 +205,34 @@ pub fn run(
             SIGNALED + exited.status
         }
     })
+}
+
+/// Closes the descriptors sandy inherited from its caller, which it does not need while it
+/// supervises the program (here and in `explain::supervise`): every one above 2 without close-on-exec. sandy opens all of its own
+/// close-on-exec, and makes the descriptor of `--status-fd` so when it takes it over, so the ones
+/// without the flag are those the caller left open. The program gets none of them either way
+/// (`launch`), but here they would stay open as long as the program runs: a socket the caller
+/// leaked into sandy would keep its port busy.
+pub(crate) fn close_inherited_descriptors() -> Result<(), SandboxError> {
+    let failed = |error| SandboxError::io("cannot list the inherited descriptors", error);
+    let mut inherited = Vec::new();
+    for entry in std::fs::read_dir("/proc/self/fd").map_err(failed)? {
+        let name = entry.map_err(failed)?.file_name();
+        let fd: RawFd = name
+            .to_str()
+            .and_then(|name| name.parse().ok())
+            .ok_or_else(|| SandboxError::new(format!("unexpected descriptor name {name:?}")))?;
+        // SAFETY: F_GETFD only reads the flags of a descriptor; one that is gone fails.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if fd > 2 && flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+            inherited.push(fd);
+        }
+    }
+    for fd in inherited {
+        // SAFETY: closes a descriptor that sandy inherited and that nothing in it owns.
+        unsafe { libc::close(fd) };
+    }
+    Ok(())
 }
 
 /// The program's process group, and the guard. Dropping it ends the group, so a failure after the

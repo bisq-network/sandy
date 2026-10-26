@@ -24,7 +24,8 @@ use std::process::{Command, Stdio};
 
 use sandy_core::{SandboxError, SetupOptions, SetupOutcome};
 
-use crate::namespace::{self, APPARMOR_RESTRICTION, Missing};
+use crate::host::Missing;
+use crate::namespace::{self, APPARMOR_RESTRICTION};
 
 const APPARMOR_ENABLED: &str = "/sys/module/apparmor/parameters/enabled";
 const PROFILE_DIRECTORY: &str = "/etc/apparmor.d";
@@ -75,41 +76,66 @@ pub fn unrestricted() -> Option<&'static str> {
 /// With `allow_missing`, a path whose end does not exist yet passes when the part that exists
 /// passes: only root can create entries in such a directory.
 pub fn root_only(path: &Path, allow_missing: bool) -> Result<(), String> {
+    check_root_only(path, allow_missing).map_err(|not| match not {
+        NotRootOnly::Refused(reason) | NotRootOnly::Unreadable(reason) => reason,
+    })
+}
+
+/// Why a path fails `root_only`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotRootOnly {
+    /// It, or a directory on the way, does not exist, or someone other than root can change it.
+    Refused(String),
+    /// sandy cannot read what decides it, which can pass.
+    Unreadable(String),
+}
+
+/// `root_only`, with an error that tells a path that fails apart from one sandy cannot read.
+pub fn check_root_only(path: &Path, allow_missing: bool) -> Result<(), NotRootOnly> {
+    let refused = |reason: String| Err(NotRootOnly::Refused(reason));
     if !path.is_absolute() {
-        return Err(format!("{} is not an absolute path", path.display()));
+        return refused(format!("{} is not an absolute path", path.display()));
     }
     let mut current = PathBuf::new();
     for component in path.components() {
         match component {
             Component::RootDir => current.push("/"),
             Component::Normal(name) => current.push(name),
-            _ => return Err(format!("{} is not a plain absolute path", path.display())),
+            _ => return refused(format!("{} is not a plain absolute path", path.display())),
         }
         let metadata = match fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
-            Err(error) if allow_missing && error.kind() == io::ErrorKind::NotFound => {
-                return Ok(());
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if allow_missing {
+                    return Ok(());
+                }
+                return refused(format!("cannot read {}: {error}", current.display()));
             }
-            Err(error) => return Err(format!("cannot read {}: {error}", current.display())),
+            Err(error) => {
+                return Err(NotRootOnly::Unreadable(format!(
+                    "cannot read {}: {error}",
+                    current.display()
+                )));
+            }
         };
         let shown = current.display();
         if metadata.file_type().is_symlink() {
-            return Err(format!("{shown} is a symbolic link"));
+            return refused(format!("{shown} is a symbolic link"));
         }
         if metadata.uid() != 0 {
-            return Err(format!(
+            return refused(format!(
                 "{shown} belongs to user {}, not to root",
                 metadata.uid()
             ));
         }
         if metadata.mode() & 0o022 != 0 {
-            return Err(format!(
+            return refused(format!(
                 "{shown} is writable by its group or by others (mode {:o})",
                 metadata.mode() & 0o7777
             ));
         }
-        if mounted_nosuid(&current)? {
-            return Err(format!(
+        if mounted_nosuid(&current).map_err(NotRootOnly::Unreadable)? {
+            return refused(format!(
                 "{shown} lies on a file system mounted nosuid, whose files the system does not \
                  trust with rights"
             ));
@@ -220,10 +246,23 @@ fn is_literal_path(text: &str) -> bool {
     })
 }
 
-/// The mode of the loaded profile called `name`, `None` when the kernel has none.
+/// The mode of the loaded profile called `name`, `None` when the kernel has none or sandy
+/// cannot read the list.
 pub fn loaded_mode(name: &str) -> Option<String> {
-    let entries = fs::read_dir(POLICY_PROFILES).ok()?;
-    for entry in entries.flatten() {
+    read_loaded_mode(name).ok().flatten()
+}
+
+/// The mode of the loaded profile called `name`, `None` when the kernel has none, and `Err`
+/// when the list of loaded profiles cannot be read.
+pub fn read_loaded_mode(name: &str) -> Result<Option<String>, String> {
+    let entries = match fs::read_dir(POLICY_PROFILES) {
+        Ok(entries) => entries,
+        // No AppArmor file system, so no profile is loaded.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot list {POLICY_PROFILES}: {error}")),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("cannot list {POLICY_PROFILES}: {error}"))?;
         let directory = entry.file_name();
         let number = directory
             .to_str()
@@ -234,11 +273,11 @@ pub fn loaded_mode(name: &str) -> Option<String> {
         }) {
             continue;
         }
-        if read(entry.path().join("name")).as_deref() == Some(name) {
-            return read(entry.path().join("mode"));
+        if read_existing(&entry.path().join("name"))?.as_deref() == Some(name) {
+            return read_existing(&entry.path().join("mode"));
         }
     }
-    None
+    Ok(None)
 }
 
 /// How a step of setup stops early: refused with nothing changed (status 3), or failed (125).
@@ -312,7 +351,7 @@ pub fn disabled(support: &namespace::Support) -> Option<String> {
             "{reason}; setup cannot change that, because an AppArmor profile does not enable \
              them"
         )),
-        Err(Missing::NeedsSetup(_)) | Ok(()) => None,
+        Err(Missing::NeedsSetup(_) | Missing::Indeterminate(_)) | Ok(()) => None,
     }
 }
 
@@ -630,6 +669,16 @@ pub(crate) fn read(path: impl AsRef<Path>) -> Option<String> {
         .map(|value| value.trim().to_string())
 }
 
+/// The trimmed content of `path`, `None` when it does not exist, and `Err` when it cannot be
+/// read.
+pub(crate) fn read_existing(path: &Path) -> Result<Option<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(value) => Ok(Some(value.trim().to_string())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("cannot read {}: {error}", path.display())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,6 +756,25 @@ mod tests {
             None
         );
         assert_eq!(disabled(&Ok(())), None);
+    }
+
+    /// A path whose metadata sandy cannot read is unreadable, not refused, so the hand-over can
+    /// tell it from a copy that someone other than root can change or that is not there.
+    #[test]
+    fn an_unreadable_path_is_not_refused() {
+        let too_long = format!("/usr/{}", "a".repeat(300));
+        assert!(matches!(
+            check_root_only(Path::new(&too_long), false),
+            Err(NotRootOnly::Unreadable(_))
+        ));
+        assert!(matches!(
+            check_root_only(Path::new("/usr/bin/not-a-file-of-sandy"), false),
+            Err(NotRootOnly::Refused(_))
+        ));
+        assert!(matches!(
+            check_root_only(Path::new("/tmp/sandy"), true),
+            Err(NotRootOnly::Refused(_))
+        ));
     }
 
     #[test]

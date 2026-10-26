@@ -165,11 +165,13 @@ const NO_HOME: &str = "cannot find the home directory of this user: HOME is not 
 /// as well, because a user who moves their home with it keeps their files there.
 ///
 /// `Err` with the reason when neither names one, which happens with a static build for a user
-/// that only a directory service knows. Without the home directory sandy cannot tell whether a
-/// writable path reaches the locations below it, so the backends refuse a policy with a writable
-/// path, as they do when they cannot read the mount table.
+/// that only a directory service knows, and when the password database cannot be read, which
+/// with a directory service on the network can pass. Without the home directory sandy cannot
+/// tell whether a writable path reaches the locations below it, so the backends report a policy
+/// with a writable path as `Status::Indeterminate`, as they do when they cannot read the mount
+/// table.
 pub fn home_directories() -> Result<Vec<PathBuf>, String> {
-    homes(passwd_home(), std::env::var_os("HOME"))
+    homes(passwd_home()?, std::env::var_os("HOME"))
 }
 
 fn homes(passwd: Option<PathBuf>, variable: Option<OsString>) -> Result<Vec<PathBuf>, String> {
@@ -185,9 +187,12 @@ fn homes(passwd: Option<PathBuf>, variable: Option<OsString>) -> Result<Vec<Path
     Ok(homes)
 }
 
-/// The home directory the password database names for this user.
+/// The home directory the password database names for this user: `None` when it has no entry
+/// for the user, `Err` when it cannot be read. With a directory service such as LDAP the lookup
+/// can fail for a while, and treating that as "no entry" would quietly drop the home directory
+/// it names from the protected locations.
 #[cfg(unix)]
-fn passwd_home() -> Option<PathBuf> {
+fn passwd_home() -> Result<Option<PathBuf>, String> {
     use std::ffi::CStr;
     use std::os::unix::ffi::OsStrExt;
 
@@ -215,21 +220,34 @@ fn passwd_home() -> Option<PathBuf> {
             buffer.resize(buffer.len() * 2, 0);
             continue;
         }
+        if error != 0 && !no_entry(error) {
+            return Err(format!(
+                "cannot read the password database entry of this user: {}",
+                std::io::Error::from_raw_os_error(error)
+            ));
+        }
         if error != 0 || found.is_null() || entry.pw_dir.is_null() {
-            return None;
+            return Ok(None);
         }
         // SAFETY: on success pw_dir points to a NUL-terminated string inside buffer, which is
         // not changed before it is read here.
         let home = unsafe { CStr::from_ptr(entry.pw_dir) };
         let home = PathBuf::from(OsStr::from_bytes(home.to_bytes()));
-        return home.is_absolute().then_some(home);
+        return Ok(home.is_absolute().then_some(home));
     }
+}
+
+/// The errors with which some C libraries say that the password database has no entry for the
+/// user, as getpwuid_r(3) lists them, instead of returning 0 with no entry.
+#[cfg(unix)]
+fn no_entry(error: libc::c_int) -> bool {
+    [libc::ENOENT, libc::ESRCH, libc::EBADF, libc::EPERM].contains(&error)
 }
 
 /// Windows names the profile folder with an API of its own (`sys::user_profiles`).
 #[cfg(not(unix))]
-fn passwd_home() -> Option<PathBuf> {
-    None
+fn passwd_home() -> Result<Option<PathBuf>, String> {
+    Ok(None)
 }
 
 #[cfg(test)]

@@ -841,8 +841,10 @@ pub fn supervise(
             program_main(report_write, &child_action, &previous, start)
         }
         pid => {
-            // As in `contain::run`: what the child needed is the child's now.
+            // As in `contain::run`: what the child needed is the child's now, and what the
+            // caller left open is not sandy's to keep while the program runs.
             drop(start);
+            crate::contain::close_inherited_descriptors()?;
             pid
         }
     };

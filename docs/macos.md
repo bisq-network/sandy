@@ -38,19 +38,32 @@ checks whether the program would run through Rosetta (see "Known limitations"), 
 profile with `sandbox_compile_string` without applying it. The plan reports every requirement that
 depends on the profile as unavailable when a function is missing, when sandy is already sandboxed
 (macOS ignores a second profile and returns an error, see `sandbox.h`), when the code would run
-through Rosetta, or when this macOS rejects the profile (with the compiler's message).
-`plan_for(policy, &HostCapabilities)` contains this decision and is pure; only the detection does
-I/O.
+through Rosetta, or when this macOS rejects the profile (with the compiler's message). These are
+shortfalls of the host that every later run meets as well. A compile that ends without the
+compiler's message, because the library could not create its parameters or the compiled profile,
+says nothing about this macOS: the plan reports it as undecided (`UNDECIDED`), and `check` and
+`run` fail with status 125. `plan_for(policy, &HostCapabilities)` contains this decision and is
+pure; only the detection does I/O. One sandy detects each of these at most once
+(`detect::Detected`), and every level it plans and its `run` use the same answers; only the
+profiles are compiled for each level, because their text is the level's.
+
+Some policies contradict this Mac's fixed layout: a writable path over the minimal system set or a
+trusted user location, and a script whose interpreter no `read_exec` path covers. The plan reports
+FilesystemConfined as a conflict (`CONFLICT`) for them, and `check` and `run` fail with status 125:
+a link on the way to such a path can be changed by others than an administrator, so another level
+must not run for it.
 
 A profile that compiles can still be refused when it is applied, so `check` also applies it. It
 does that in a helper process (`Backend::verify`), because `check` must leave its own process
 unsandboxed: the helper applies the program's profile and ends right after. It executes nothing,
 because only a `read_exec` path grants `process-exec*` and the profile would refuse the exec. If
-the helper cannot apply the profile, every requirement that the profile enforces is reported as
-unavailable with the message the kernel gave. A missing Seatbelt and a sandbox around sandy are
-already in the plan, so the trial stays silent about them. `check` also binds the listeners of
-exposed and forwarded ports for a moment, so a port another process holds is reported instead of
-making `run` fail.
+the helper cannot apply the profile, or cannot start (a process limit, a timeout), `check` fails
+with status 125 and lists every requirement that the profile enforces with the reason. A missing
+Seatbelt and a sandbox around sandy are already in the plan, so the trial stays silent about them.
+`check` also binds the listeners of exposed and forwarded ports and the ports the relay and the
+broker hold, for a moment: a port another process holds makes `check` fail with status 125, as it
+makes `run` fail. Nothing `check` finds this way is a reason to try another level: any local user
+can hold a port, and any process of sandy's user can stop the helper.
 
 ## Why in-process `sandbox_init_with_parameters` and not `sandbox-exec`
 
@@ -333,7 +346,7 @@ checks that the sysctl names contain only letters, digits, dots and underscores.
 sandbox matches the path after resolving symbolic links. None contains user data: no path below
 `/Users`, `~/Library` or a keychain.
 
-No writable policy path may overlap the set: the plan reports FilesystemConfined as unavailable
+No writable policy path may overlap the set: the plan reports FilesystemConfined as a conflict
 when a writable path contains an entry, or lies inside a directory entry (`ReadTree`,
 `CodeTree`). The resolver files of `ip = "all"` (`/private/etc/hosts` and the mDNSResponder
 socket) count as entries. `/dev/null` and the links `/etc`, `/tmp` and `/var` (only their own
@@ -425,10 +438,14 @@ refused; a program that downloads crates needs `~/.cargo/registry` and `~/.cargo
 location that does not exist counts, because the program could create it, and each counts where
 it lies and where its symbolic links lead.
 
+A writable path that reaches one of these locations is a conflict of the policy:
+FilesystemConfined is reported as `CONFLICT`, and `check` and `run` fail with status 125.
+
 The home directory comes from the password database (`getpwuid_r`) and from `HOME`, because a
-program that starts sandy with a minimal environment sets no `HOME`. When neither names one,
-sandy cannot tell whether a writable path reaches these locations, so it refuses a policy with a
-writable path (FilesystemConfined is unavailable) and says to start sandy with `HOME` set to the
+program that starts sandy with a minimal environment sets no `HOME`. When neither names one, or
+the password database cannot be read (a directory service that does not answer), sandy cannot
+tell whether a writable path reaches these locations, so it refuses a policy with a writable path
+(FilesystemConfined is undecided, status 125) and says to start sandy with `HOME` set to the
 home directory; a policy without a writable path is not affected.
 
 Every absolute directory on sandy's `PATH` is such a location too, and so are the directories the
@@ -602,7 +619,7 @@ The relay is a process of its own, outside the program's sandbox and confined by
    at once, gives the connections it already accepted at most one second to deliver what is
    left, and exits (rule 5 of "Forwarded ports" in `DESIGN.md`), resetting the connections that
    are still open. A program that connects, writes and exits immediately therefore does not lose
-   its data.
+   its data, unless the relay has not received the connection yet (see "Known limitations").
 
 `sandy check` compiles the relay's profile together with the program's.
 
@@ -762,14 +779,16 @@ P at any address at all, because a socket of a different user holds the wildcard
 part is not measured, because the test Mac has no second standard user. A socket that already
 listens on P, at a wildcard address or at an address of the Mac, makes the bind fail, and `run`
 refuses with "cannot hold port P at ADDRESS for ip = "private""; `check` tries the same binds and
-reports the failure for `IpNetworkPrivate`. An address that is not ready, such as a tentative
+fails with status 125, naming the failure for `IpNetworkPrivate` (a held port is no shortfall of
+the host, so no fallback level runs for it). An address that is not ready, such as a tentative
 IPv6 address, takes no bind, so only the wildcard binds hold it, as an address that the Mac gains
 later (below). Without `SO_REUSEADDR`, a
 connection of an earlier run that the relay accepted at 127.0.0.1:P and that waits in
 `TIME_WAIT` would make the bind fail for 30 seconds (measured). The tests are
 `the_relay_holds_the_forwarded_ports_at_every_address`,
-`the_broker_holds_its_port_at_every_address` and
-`a_listener_on_a_forwarded_port_refuses_a_private_network`.
+`the_broker_holds_its_port_at_every_address`,
+`a_listener_on_a_forwarded_port_refuses_a_private_network` and
+`a_listener_on_the_egress_port_fails_check_and_run`.
 
 A forwarded or egress port needs `signals = "isolated"` on macOS. With `signals = "any"` the
 program could kill its relay or its broker, and the port would then be left to whatever binds it
@@ -1024,7 +1043,11 @@ refuses a master on a standard stream instead (see [Inherited descriptors](#inhe
 when sandy itself is killed. sandy then stays the target's parent instead of replacing itself
 (`crates/sandy-macos/src/macos/contain.rs`):
 
-1. sandy catches, with a handler that does nothing, every signal whose action is to ignore it:
+1. sandy closes every descriptor it inherited except 0, 1 and 2 and keeps only its own: the
+   record of `--status-fd` and the helpers' pipe. It waits as long as the target runs, so a
+   socket that its caller let it inherit would otherwise stay open, and its port bound, until the
+   target ends, although neither the target nor a helper gets it. Then sandy catches, with a
+   handler that does nothing, every signal whose action is to ignore it:
    those ignored by default (`SIGCHLD`, `SIGURG`, `SIGIO`, `SIGWINCH`, `SIGINFO`) and those that
    its caller set to be ignored, for example `SIGINT` and `SIGQUIT` after `&` in a script or
    `SIGHUP` under `nohup`. macOS discards a signal on arrival while its action is to ignore it,
@@ -1373,9 +1396,9 @@ none, so the backend answers nothing and sandy refuses the option.
   with `system = "minimal"` alone. Add the paths with `--read`; there is no way to allow Mach
   services.
 - A script needs its interpreter in a `read_exec` path, because the interpreter is executed too.
-  `sandy check` reads the `#!` line of the program and reports FilesystemConfined as unavailable
-  when no `read_exec` path covers the interpreter, so it does not report a policy as enforced
-  that `run` then refuses. The system set grants `file-map-executable` for the dynamic loader but
+  `sandy check` reads the `#!` line of the program and reports FilesystemConfined as a conflict
+  (status 125) when no `read_exec` path covers the interpreter, so it does not report a policy as
+  enforced that `run` then refuses. The system set grants `file-map-executable` for the dynamic loader but
   no `process-exec*`, so only `read_exec` paths execute. sandy follows one `#!` line; XNU follows
   more (measured on macOS 26: a script whose interpreter is a script runs), so sandy never names
   an interpreter the kernel would not reach.
@@ -1413,6 +1436,17 @@ none, so the backend answers nothing and sandy refuses the option.
   only for the plain spelling, so `/System/Volumes/Data/private/tmp/x/file` looks missing
   (measured on macOS 27.0.1; before 2.0.0 the program could use either spelling).
 - sandy cannot run inside another Seatbelt sandbox; `sandy check` reports this.
+- A connection that is still in its handshake when the program ends can be lost, against rule 5
+  of "Forwarded ports" in `DESIGN.md`. Under loopback traffic the program's `connect` can return,
+  and its data be sent, before the connection has reached the listener of the relay or the
+  broker. The end of the program reaches them without that delay, so they close the listener
+  first, and the kernel then resets the connection. Measured on macOS 27.0.1 (Mac mini, M1): a
+  program that connected through a forwarded port, wrote 21 bytes and exited at once lost them
+  in 0 of 300 runs on an otherwise idle loopback, and in 281 of 300 runs while four other
+  connections sent data over loopback as fast as they could and 200 new connections a second
+  were made. In the lost runs that were looked at, the service behind the relay got no
+  connection at all. The broker closes its listener the same way, but was not measured. A program whose last connection must arrive waits
+  for an answer from the other side before it exits.
 - x86_64 code does not run in the sandbox on Apple silicon. Rosetta loads its runtime
   (`libRosettaRuntime`) into every translated process, and the profile does not allow it, so the
   program would abort with "rosetta error: Failed to open libRosettaRuntime" (measured on macOS
@@ -1468,7 +1502,9 @@ macOS only:
   that the plan is enforceable. `macos::holder::tests` checks the holder binds.
 - `crates/sandy-cli/tests/check.rs` checks that `check` reports what `run` refuses: a busy relay
   port, a script whose interpreter is not executable, `system = "none"`, and that the trial that
-  applies the profile does not refuse a policy that runs.
+  applies the profile does not refuse a policy that runs. A process limit that keeps the trial's
+  helper from starting makes `check` and `run` fail with status 125 and reports nothing as
+  unavailable (`a_process_limit_fails_check_and_run_without_a_shortfall`).
 - `crates/sandy-cli/tests/escape.rs` and `escape_macos.rs` run the probe inside the sandbox, with a
   control run outside for every denial. The `open`, `osascript` and `launchctl` tests need a
   logged-in GUI session.

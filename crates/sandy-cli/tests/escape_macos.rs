@@ -517,7 +517,7 @@ fn writable_roots_cannot_be_deleted_or_replaced() {
 /// program that would be confined only by the outer profile.
 #[test]
 fn sandy_refuses_to_run_inside_a_sandbox() {
-    let fixture = Fixture::new("macos-nested");
+    let fixture = home_fixture("nested");
     let inner = fixture.path("bin/sandy");
     copy_executable(sandy_path(), &inner);
     let inner = inner.to_str().unwrap().to_string();
@@ -532,8 +532,11 @@ fn sandy_refuses_to_run_inside_a_sandbox() {
     assert!(output.status.success(), "control: {output:?}");
     parse(&output)[0].assert_ok();
 
+    // The inner sandy gets a HOME, as from the user's environment: the password database does
+    // not answer inside the outer sandbox, and without a home directory the inner sandy would
+    // stop for that before it says why it cannot run.
     let mut outer = vec!["run".to_string()];
-    outer.extend(fixture.access_args());
+    outer.extend(home_args(&fixture));
     outer.extend(["--".to_string(), inner]);
     let output = sandy(outer.iter().chain(&inner_run));
     assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
@@ -1478,8 +1481,9 @@ fn a_script_with_an_x86_64_interpreter_is_refused_before_it_starts() {
     );
 }
 
-/// What `check` returns when this host cannot enforce a requirement of the policy.
-const EXIT_NOT_ENFORCEABLE: i32 = 1;
+/// What `check` returns when a writable path of the policy reaches what the sandbox protects:
+/// the policy conflicts with this Mac's fixed layout, so no weaker fallback level runs for it.
+const EXIT_CONFLICT: i32 = EXIT_FAILURE;
 
 /// The minimal system set is compared like the policy paths: /System/Volumes/Data/private/etc
 /// is a second name of /private/etc, which holds entries of the set, so a writable path on it is
@@ -1496,7 +1500,7 @@ fn refuses_a_writable_firmlink_spelling_of_a_system_set_directory() {
     }
     let output = sandy(["check", "--read-write", alias]);
     let report = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(output.status.code(), Some(EXIT_NOT_ENFORCEABLE), "{report}");
+    assert_eq!(output.status.code(), Some(EXIT_CONFLICT), "{report}");
     assert!(report.contains("minimal system set"), "{report}");
 }
 
@@ -1562,11 +1566,7 @@ fn refuses_a_writable_path_over_the_home_directory() {
     for writable in ["home", "home/Library"] {
         let refused = check(&fixture.arg(writable));
         let report = String::from_utf8_lossy(&refused.stdout);
-        assert_eq!(
-            refused.status.code(),
-            Some(EXIT_NOT_ENFORCEABLE),
-            "{report}"
-        );
+        assert_eq!(refused.status.code(), Some(EXIT_CONFLICT), "{report}");
         assert!(report.contains("runs outside the sandbox"), "{report}");
     }
 
@@ -1595,7 +1595,7 @@ fn assert_refused_beside_an_accepted_path(fixture: &Fixture, cases: &[(&str, &st
         let report = String::from_utf8_lossy(&refused.stdout);
         assert_eq!(
             refused.status.code(),
-            Some(EXIT_NOT_ENFORCEABLE),
+            Some(EXIT_CONFLICT),
             "{location}: {report}"
         );
         assert!(report.contains("runs outside the sandbox"), "{report}");
@@ -1729,11 +1729,7 @@ fn refuses_a_writable_path_that_holds_a_directory_on_path_and_a_launch_agent_fol
         &fixture.arg("home"),
     );
     let report = String::from_utf8_lossy(&refused.stdout);
-    assert_eq!(
-        refused.status.code(),
-        Some(EXIT_NOT_ENFORCEABLE),
-        "{report}"
-    );
+    assert_eq!(refused.status.code(), Some(EXIT_CONFLICT), "{report}");
     assert!(report.contains("runs outside the sandbox"), "{report}");
     // The directory on PATH is warned about as well, so the refusal did win over a warning.
     let warnings = String::from_utf8_lossy(&refused.stderr);

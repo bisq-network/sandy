@@ -8,9 +8,11 @@
 
 pub mod access;
 pub mod cmdline;
+pub mod detect;
 pub mod envblock;
 pub mod name;
 pub mod plan;
+pub mod probe;
 pub mod version;
 
 #[cfg(windows)]

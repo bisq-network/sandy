@@ -26,6 +26,8 @@ use crate::access::{
     FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_DATA, INHERIT_ONLY_ACE, OBJECT_INHERIT_ACE,
     SYNCHRONIZE,
 };
+use crate::plan::Problem;
+use crate::probe;
 
 /// What the relays need to connect to a socket file: AF_UNIX connect checks write access to the
 /// file. Granted on the files only (inherit-only), not on the directory, so a relay can neither
@@ -63,19 +65,20 @@ fn base() -> Result<PathBuf, SandboxError> {
 }
 
 /// Why forwarded ports cannot work on this host, if they cannot: AF_UNIX is missing, or the
-/// socket paths would not fit into `sun_path`. Changes nothing.
-pub fn check() -> Result<(), String> {
-    let base = base().map_err(|error| error.to_string())?;
+/// socket paths would not fit into `sun_path`, which is where the user's profile lies. Changes
+/// nothing.
+pub fn check() -> Result<(), Problem> {
+    let base = base().map_err(|error| Problem::Indeterminate(error.to_string()))?;
     let length = base.as_os_str().len() + RUN_SUFFIX_BYTES;
     let fits = base.to_str().is_some() && length <= unix::MAX_PATH_BYTES;
     if !fits {
-        return Err(format!(
+        return Err(Problem::Unavailable(format!(
             "the socket paths below {} would be {length} bytes; AF_UNIX allows at most {}",
             base.display(),
             unix::MAX_PATH_BYTES
-        ));
+        )));
     }
-    unix::available().map_err(|error| format!("AF_UNIX sockets are not available: {error}"))
+    probe::af_unix(unix::available())
 }
 
 impl Forwarding {
