@@ -16,7 +16,7 @@ sandy run \
   -- /srv/app/bin/server --port 8080
 ```
 
-Version 2.2.0. Policies use format `version = 1`.
+Version 2.2.1. Policies use format `version = 1`.
 
 ## Contents
 
@@ -82,31 +82,49 @@ For a fully static Linux binary:
 cargo build --release --target x86_64-unknown-linux-musl -p sandy-cli --bin sandy
 ```
 
-Release archives for each platform are built by the `release` workflow (see
-[Building and testing](#building-and-testing)). Sizes, measured for 1.x except the first row,
-which is 2.2.0 (the namespaces, the view and the egress broker of 2.1.0 and the fallback levels
-of 2.2.0 made the Linux binary larger; the other rows will grow too, and the release workflow
-gives their current size):
+Release archives for each platform are built with `scripts/release-build.sh`, by the `release`
+workflow or by hand (see [Building and testing](#building-and-testing) and below). The sizes of
+the 2.2.1 release:
 
 | Target | Binary | Archive |
 |---|---|---|
-| `x86_64-unknown-linux-musl` (static PIE) | 1.6 MiB | 770 KiB |
-| `aarch64-unknown-linux-musl` (static, not position-independent) | 772 KiB | 401 KiB |
-| `aarch64-apple-darwin` | 654 KiB | 318 KiB |
-| `x86_64-apple-darwin` | 713 KiB | 350 KiB |
-| `x86_64-pc-windows-msvc` (static C runtime) | 734 KiB | 336 KiB |
-| `aarch64-pc-windows-msvc` (built, not tested) | 632 KiB | 308 KiB |
+| `x86_64-unknown-linux-musl` (static PIE) | 1.6 MiB | 806 KiB |
+| `aarch64-unknown-linux-musl` (static, not position-independent) | 1.3 MiB | 744 KiB |
+| `aarch64-apple-darwin` | 963 KiB | 503 KiB |
+| `x86_64-apple-darwin` | 1.1 MiB | 563 KiB |
+| `x86_64-pc-windows-msvc` (static C runtime) | 1.2 MiB | 563 KiB |
+| `aarch64-pc-windows-msvc` (built, not tested) | 1015 KiB | 514 KiB |
 
-**Verifying a download.** Every archive carries a GitHub build provenance attestation, which
-names the workflow, the commit and the run that built it:
+**Verifying a download.** `SHA256SUMS` in the release lists the SHA-256 sum of every archive,
+and `SHA256SUMS.asc` signs it with the project's OpenPGP key, the key that also signs the release
+tags (fingerprint `E850 152C 47E1 3655 DDF3  A62B 4CE3 8D03 67B5 3CC5`):
 
 ```sh
-gh attestation verify sandy-2.2.0-x86_64-unknown-linux-musl.tar.gz --repo <owner>/sandy
+gpg --verify SHA256SUMS.asc SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
 ```
 
-`SHA256SUMS` in the release lists the sum of every archive. It says that the archives belong
-together, not who made them: only a maintainer signature of that file would say that, and there
-is none yet.
+An archive that the release workflow built also carries a GitHub build provenance attestation,
+which names the workflow, the commit and the run that built it
+(`gh attestation verify sandy-2.2.1-x86_64-unknown-linux-musl.tar.gz --repo <owner>/sandy`). The
+archives of 2.2.1 were built outside the workflow, so they have none.
+
+**Building a release binary again.** Every release binary is built with
+`scripts/release-build.sh TARGET` from a checkout of the release tag, so anyone can build it again
+and compare it with the binary in the archive:
+
+```sh
+git checkout v2.2.1
+scripts/release-build.sh x86_64-unknown-linux-musl
+sha256sum target/x86_64-unknown-linux-musl/release/sandy
+```
+
+The script removes from the binary what would tie it to the machine that built it: the directory
+of the checkout and of `CARGO_HOME`, and the time of the build. The Linux binaries are linked with
+the linker of the Rust toolchain, so they depend only on the source and on the toolchain that
+`rust-toolchain.toml` pins. The macOS and Windows binaries also depend on the version of Apple's
+linker and of the Microsoft linker, which the release notes name. The `reproducible` job of the
+release workflow builds every target twice, in two directories, and compares the binaries.
 
 The macOS binaries are not signed or notarized, and `sandy.exe` has no Authenticode signature.
 macOS refuses a copy that a browser downloaded, because it is not notarized, and SmartScreen

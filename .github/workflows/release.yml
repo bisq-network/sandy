@@ -26,8 +26,6 @@ jobs:
           - { target: aarch64-pc-windows-msvc, os: windows-2025 }
     runs-on: ${{ matrix.os }}
     env:
-      # Paths of the build machine must not end up in the binary.
-      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/sandy ${{ contains(matrix.target, 'windows-msvc') && '-C target-feature=+crt-static' || '' }}
       # Whether the signing secrets exist, which gates the two signing steps below; today they
       # do not, so both steps stay skipped. A step's `if` cannot read a secret, so the test is
       # made here, and only its answer is kept: every step sees this block, also the build, which
@@ -47,15 +45,11 @@ jobs:
         run: |
           version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
           test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != v$version"; exit 1; }
+      # The same script builds every release binary outside CI too (README.md, "Verifying a
+      # download"), so a binary can be built again and compared.
       - name: Build
         shell: bash
-        run: |
-          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
-          # The dependencies are compiled from CARGO_HOME, and the locations in their panic
-          # messages keep that path. It cannot be written in the env block above, because that
-          # expands no variables. A prefix that does not match changes nothing.
-          export RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
-          cargo build --release --locked --target ${{ matrix.target }} -p sandy-cli --bin sandy
+        run: scripts/release-build.sh ${{ matrix.target }}
       # Skipped: this project has no Apple Developer ID, so the macOS binaries carry only the
       # linker's ad-hoc signature. To sign and notarize them, join the Apple Developer Program,
       # export the "Developer ID Application" certificate as a PKCS#12 file, and add six
@@ -153,12 +147,22 @@ jobs:
 
   reproducible:
     # The release build removes what would otherwise tie a binary to the machine that made it:
-    # the path prefix of the checkout, the owner and the times in the archive. Nothing checked
-    # that it works. This builds one target twice from two directories and compares the
-    # binaries, so a change that makes the output depend on where it is built is noticed. It
-    # does not gate the release: a difference here is a finding to read, not a reason to keep a
-    # reviewed tag from being packaged.
-    runs-on: ubuntu-24.04
+    # the path prefix of the checkout and of CARGO_HOME, the time of the build, the host's linker
+    # on Linux, and the paths that Apple's linker hashes into the UUID. This builds every target
+    # twice from two directories and compares the binaries, so a change that makes the output
+    # depend on where it is built is noticed. It does not gate the release: a difference here is a
+    # finding to read, not a reason to keep a reviewed tag from being packaged.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-15 }
+          - { target: aarch64-apple-darwin, os: macos-15 }
+          - { target: x86_64-pc-windows-msvc, os: windows-2025 }
+          - { target: aarch64-pc-windows-msvc, os: windows-2025 }
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -168,19 +172,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          target=x86_64-unknown-linux-musl
+          target=${{ matrix.target }}
+          exe=sandy; [[ "$target" == *windows* ]] && exe=sandy.exe
           cp -a first second
           for dir in first second; do
-            (
-              cd "$dir"
-              export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
-              export RUSTFLAGS="--remap-path-prefix=$PWD=/sandy"
-              export RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
-              cargo build --release --locked --target "$target" -p sandy-cli --bin sandy
-            )
+            "$dir/scripts/release-build.sh" "$target"
           done
-          sha256sum first/target/"$target"/release/sandy second/target/"$target"/release/sandy
-          cmp first/target/"$target"/release/sandy second/target/"$target"/release/sandy \
+          sum=sha256sum; command -v sha256sum > /dev/null || sum="shasum -a 256"
+          $sum first/target/"$target"/release/$exe second/target/"$target"/release/$exe
+          cmp first/target/"$target"/release/$exe second/target/"$target"/release/$exe \
             || { echo "the binary depends on the directory it was built in"; exit 1; }
 
   release:

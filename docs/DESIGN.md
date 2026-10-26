@@ -1258,20 +1258,27 @@ directly.
 
 ## Release integrity
 
-The `release` workflow builds every target from a tag with `--locked`, keeps the path of the
-checkout and of `CARGO_HOME` out of the binary, and packs the archives with sorted entries, a
-fixed time and no owner. A second job builds one target in two directories and compares the
-binaries, so a change that ties the output to the machine that built it is noticed.
+Every release binary is built with `scripts/release-build.sh` from a tag, with `--locked`, so a
+binary can be built again and compared, by the `release` workflow and by anyone else. The script
+keeps the path of the checkout and of `CARGO_HOME` out of the binary, links the Linux targets with
+the linker of the pinned Rust toolchain instead of the host's, removes the build directory from
+the object paths that Apple's linker hashes into the UUID of a macOS binary, and has the Microsoft
+linker write no time stamp (`/Brepro`). A Linux binary then depends only on the source and the
+toolchain; a macOS or Windows binary also on the version of the platform's linker, which the
+release notes name. The archives are packed with sorted entries, the time of the commit and no
+owner. A second job builds every target in two directories and compares the binaries, so a change
+that ties the output to the machine that built it is noticed.
 
-Every archive gets a GitHub build provenance attestation, which names the workflow, the commit
-and the run that produced it. The job verifies the attestations before it creates the draft, so a
-release never carries an archive that cannot be checked. A user checks a download with `gh
-attestation verify <archive> --repo <owner>/<repo>`.
+An archive that the workflow built gets a GitHub build provenance attestation, which names the
+workflow, the commit and the run that produced it. The job verifies the attestations before it
+creates the draft, so such a release never carries an archive that cannot be checked. A user
+checks a download with `gh attestation verify <archive> --repo <owner>/<repo>`.
 
-`SHA256SUMS` says that the archives belong together, not who made them. A maintainer signature of
-that file would say it, and there is none yet. The macOS binaries carry only the linker's ad-hoc
-signature, and `sandy.exe` has no Authenticode signature; the workflow holds both steps, skipped
-until the certificates exist.
+`SHA256SUMS` says that the archives belong together; `SHA256SUMS.asc`, the maintainer's signature
+of it with the key that signs the tags, says who published them. That matters most for archives
+built outside the workflow, which have no attestation, as in 2.2.1. The macOS binaries carry only
+the linker's ad-hoc signature, and `sandy.exe` has no Authenticode signature; the workflow holds
+both steps, skipped until the certificates exist.
 
 ## Code layout
 
