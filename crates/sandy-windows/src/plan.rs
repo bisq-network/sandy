@@ -148,6 +148,23 @@ pub fn job_unavailable(policy: &ResolvedPolicy, reason: &str) -> Vec<PlanItem> {
 /// docs/windows.md that explains it. `sandy check` prints these as warnings.
 pub fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
     let mut shortfalls = Vec::new();
+    if policy.windows.appcontainer_name.is_some() {
+        shortfalls.push(
+            "the AppContainer is shared with every user of this machine: its SID, loopback \
+             exemption and the capability SIDs for file grants and relay sockets are derived from \
+             the AppContainer name alone, not from the user. Loopback isolation is per session, \
+             so another process in the same session as this program (for example another service \
+             in session 0) that runs in an AppContainer of the same name reaches its loopback \
+             listeners and its forward and egress relays, and through them the forward targets \
+             and the egress broker's destinations; a process in a different session, which is \
+             where another interactive user runs, does not. Files and AF_UNIX sockets stay closed \
+             to another user even with the shared capability, because Windows also checks that \
+             user's own access. Use an AppContainer name that no other account or session on the \
+             machine will use, on a machine whose other accounts you trust (docs/windows.md, \
+             \"Other users of the machine\")"
+                .to_string(),
+        );
+    }
     if policy.paths.iter().any(|rule| rule.is_dir) {
         shortfalls.push(
             "a grant on Windows follows the file, not the path: a file moved out of a granted \
@@ -1137,6 +1154,26 @@ mod tests {
             Requirement::ForwardedPortsRelayed,
         ));
         assert!(reason.contains("read-write"), "{reason}");
+    }
+
+    #[test]
+    fn warns_that_the_appcontainer_is_shared_with_every_user() {
+        let with_name = shortfalls(&policy());
+        assert!(
+            with_name
+                .iter()
+                .any(|line| line.contains("shared with every user")),
+            "{with_name:?}"
+        );
+        // Without an AppContainer nothing runs, so the warning does not apply.
+        let mut nameless = policy();
+        nameless.windows.appcontainer_name = None;
+        assert!(
+            !shortfalls(&nameless)
+                .iter()
+                .any(|line| line.contains("shared with every user")),
+            "warned although no AppContainer is used"
+        );
     }
 
     #[test]

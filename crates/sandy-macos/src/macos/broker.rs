@@ -75,11 +75,13 @@ fn serve(
     watched: libc::pid_t,
     ready: Ready,
 ) {
-    let queue = match watch_and_confine(ended.as_ref(), profile, seatbelt, watched) {
-        Ok(queue) => queue,
+    let started = Stop::new().and_then(|stop| {
+        watch_and_confine(ended.as_ref(), profile, seatbelt, watched).map(|queue| (stop, queue))
+    });
+    let (stop, queue) = match started {
+        Ok(started) => started,
         Err(error) => ready.fail(&error.to_string()),
     };
-    let stop = Stop::new();
     let request = stop.clone();
     let server = std::thread::Builder::new()
         .name("broker".into())

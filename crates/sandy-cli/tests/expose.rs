@@ -4,22 +4,13 @@
 mod common;
 
 use std::io::Read;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::*;
 
 const WAIT: Duration = Duration::from_secs(20);
-
-/// Two loopback ports that were free a moment ago. The first stays bound while the second is
-/// chosen, so the two are never the same port, which two separate choices can be.
-fn free_ports() -> (u16, u16) {
-    let port = |listener: &TcpListener| listener.local_addr().unwrap().port();
-    let first = TcpListener::bind("127.0.0.1:0").unwrap();
-    let second = TcpListener::bind("127.0.0.1:0").unwrap();
-    (port(&first), port(&second))
-}
 
 /// Starts the probe in the sandbox; it accepts one connection on `inner` while sandy relays
 /// `outer` to it.
@@ -58,7 +49,7 @@ fn connect_until_accepted(server: &mut Child, outer: u16) {
 #[test]
 fn exposed_port_reaches_the_program() {
     let fixture = Fixture::new("expose");
-    let (inner, outer) = free_ports();
+    let (inner, outer) = (free_port(), free_port());
     let mut server = start_server(&fixture, inner, outer);
     connect_until_accepted(&mut server, outer);
     let output = server.wait_with_output().unwrap();
@@ -71,7 +62,7 @@ fn exposed_port_reaches_the_program() {
 #[test]
 fn relay_ends_with_the_program() {
     let fixture = Fixture::new("expose-end");
-    let (inner, outer) = free_ports();
+    let (inner, outer) = (free_port(), free_port());
     let mut server = start_server(&fixture, inner, outer);
     connect_until_accepted(&mut server, outer);
     server.wait().unwrap();
@@ -90,7 +81,7 @@ fn relay_ends_with_the_program() {
 fn expose_without_ip_is_refused() {
     let fixture = Fixture::new("expose-noip");
     let mut sandbox_args = fixture.access_args();
-    let (inner, outer) = free_ports();
+    let (inner, outer) = (free_port(), free_port());
     sandbox_args.extend(["--expose".to_string(), format!("127.0.0.1:{outer}={inner}")]);
     let output = sandy(run_args(&sandbox_args, &[("env", "PATH")]));
     assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
@@ -105,7 +96,7 @@ fn expose_without_ip_is_refused() {
 fn expose_with_ip_client_is_refused() {
     let fixture = Fixture::new("expose-client");
     let mut sandbox_args = fixture.access_args();
-    let (inner, outer) = free_ports();
+    let (inner, outer) = (free_port(), free_port());
     sandbox_args.extend([
         "--ip".to_string(),
         "client".to_string(),
@@ -137,7 +128,7 @@ fn an_exposed_port_relays_many_connections_at_once() {
     // can take it before sandy binds it. That is the test's own race, not a refusal to enforce
     // the policy, so it picks another pair instead of failing. Anything else sandy says fails.
     let (server, outer) = loop {
-        let (inner, outer) = free_ports();
+        let (inner, outer) = (free_port(), free_port());
         let mut sandbox_args = fixture.access_args();
         sandbox_args.extend([
             "--ip".to_string(),

@@ -227,15 +227,21 @@ fn relay(listener: u64, target: std::net::SocketAddr) -> ExitCode {
 /// closes it when the program ends; the relay then ends by rule 5 (see `serve_until`).
 #[cfg(windows)]
 fn serve_relay(listener: std::net::TcpListener, target: std::net::SocketAddr) -> ExitCode {
-    if let Err(error) = listener.set_nonblocking(false) {
-        eprintln!("sandy: relay failed: {error}");
-        return ExitCode::from(EXIT_FAILURE);
-    }
+    let stop = match listener
+        .set_nonblocking(false)
+        .and_then(|()| stop_at_end_of_input())
+    {
+        Ok(stop) => stop,
+        Err(error) => {
+            eprintln!("sandy: relay failed: {error}");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
     sandy_relay::serve_until(
         listener,
         |listener| listener.accept().map(|(client, _)| client),
         move || sandy_relay::connect(target),
-        &stop_at_end_of_input(),
+        &stop,
         sandy_relay::DRAIN,
     );
     ExitCode::SUCCESS
@@ -256,10 +262,10 @@ fn serve_relay(listener: std::net::TcpListener, target: std::net::SocketAddr) ->
 /// backend that starts a relay holds the other end of that pipe; it closes it when the program
 /// ends, and its own exit closes it too.
 #[cfg(windows)]
-fn stop_at_end_of_input() -> sandy_relay::Stop {
+fn stop_at_end_of_input() -> std::io::Result<sandy_relay::Stop> {
     use std::io::Read;
 
-    let stop = sandy_relay::Stop::new();
+    let stop = sandy_relay::Stop::new()?;
     let request = stop.clone();
     std::thread::spawn(move || {
         let mut buffer = [0u8; 64];
@@ -267,7 +273,7 @@ fn stop_at_end_of_input() -> sandy_relay::Stop {
         while matches!(input.read(&mut buffer), Ok(read) if read > 0) {}
         request.request();
     });
-    stop
+    Ok(stop)
 }
 
 /// The line the forward relay writes to standard output once it listens. The backend that starts
@@ -288,6 +294,13 @@ fn forward(listen: std::net::SocketAddr, socket: &std::path::Path) -> ExitCode {
             return ExitCode::from(EXIT_FAILURE);
         }
     };
+    let stop = match stop_at_end_of_input() {
+        Ok(stop) => stop,
+        Err(error) => {
+            eprintln!("sandy: forward relay failed: {error}");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
     let mut stdout = std::io::stdout().lock();
     if writeln!(stdout, "{FORWARD_READY}")
         .and_then(|()| stdout.flush())
@@ -300,7 +313,7 @@ fn forward(listen: std::net::SocketAddr, socket: &std::path::Path) -> ExitCode {
         listener,
         |listener| listener.accept().map(|(client, _)| client),
         move || sandy_relay::unix::connect_to(&socket),
-        &stop_at_end_of_input(),
+        &stop,
         sandy_relay::DRAIN,
     );
     ExitCode::SUCCESS
@@ -322,10 +335,13 @@ fn forward(_listen: std::net::SocketAddr, _socket: &std::path::Path) -> ExitCode
 fn broker(listener: u64, reach: sandy_core::EgressReach) -> ExitCode {
     // The inherited socket came from another process, so this one must start Winsock before it
     // uses it, or `accept` fails with WSANOTINITIALISED (`sandy_relay::unix`).
-    if let Err(error) = sandy_relay::unix::available() {
-        eprintln!("sandy: broker failed: {error}");
-        return ExitCode::from(EXIT_FAILURE);
-    }
+    let stop = match sandy_relay::unix::available().and_then(|()| stop_at_end_of_input()) {
+        Ok(stop) => stop,
+        Err(error) => {
+            eprintln!("sandy: broker failed: {error}");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
     // SAFETY: a backend starts this command only with a listening AF_UNIX socket it passed to
     // this process and that nothing else here owns.
     let listener = unsafe { sandy_relay::unix::Listener::from_inherited(listener) };
@@ -334,7 +350,7 @@ fn broker(listener: u64, reach: sandy_core::EgressReach) -> ExitCode {
         |listener| listener.accept(),
         reach,
         sandy_windows::WindowsHost,
-        &stop_at_end_of_input(),
+        &stop,
         sandy_relay::DRAIN,
     );
     ExitCode::SUCCESS

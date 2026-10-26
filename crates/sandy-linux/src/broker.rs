@@ -12,18 +12,20 @@
 //!    descriptors.
 //! 3. The broker raises its descriptor limit, creates its watchdog under `signals = "any"`,
 //!    closes every descriptor except the netlink socket, the pidfd, the guard's pipe with
-//!    `contained`, the inbox and the readiness pipe, and confines itself: no_new_privs; Landlock
-//!    with every file right and TCP bind handled and no rule, so it opens no file and binds no
-//!    port, and TCP connect unhandled, because the check decides where it connects; the signal
-//!    and abstract socket scopes; and its own seccomp filter (`filter::broker`).
+//!    `contained`, the inbox, the readiness pipe and the pipe of its stop request
+//!    (`sandy_relay::Stop`), and confines itself: no_new_privs; Landlock with every file right
+//!    and TCP bind handled and no rule, so it opens no file and binds no port, and TCP connect
+//!    unhandled, because the check decides where it connects; the signal and abstract socket
+//!    scopes; and its own seccomp filter (`filter::broker`).
 //! 4. It reports that it is ready and waits for the listener, which the process that becomes the
 //!    program binds inside the namespace after `Namespaces::enter`, while it watches the ends
 //!    below.
 //! 5. It serves the listener until the program ends (the pidfd), and with `contained` until the
 //!    guard's pipe ends. Then it ends as the relay does (rule 5 of "Forwarded ports"): it takes
 //!    the connections the backlog holds, closes the listener, gives the accepted connections at
-//!    most one second and resets the rest. A thread watches the ends, requests the stop and keeps
-//!    the watchdog armed, so a broker the program stopped dies within two seconds.
+//!    most one second and resets the rest. A thread watches the ends, requests the stop, which
+//!    wakes the serve loop at once, and keeps the watchdog armed, so a broker the program stopped
+//!    dies within two seconds.
 //!
 //! The relay leaves its backlog alone after the program stopped it, because a connection that
 //! waited there may have been made after the program ended, and it would reach whatever holds the
@@ -115,9 +117,17 @@ fn broker_main(broker: Broker, ready: Ready, config: &BrokerConfig) {
         program,
         ended,
     } = broker;
+    // Made before the confinement, whose filter allows no new pipe.
+    let stop = match Stop::new() {
+        Ok(stop) => stop,
+        Err(error) => ready.fail(&format!(
+            "the egress broker cannot make the pipe that stops it: {error}"
+        )),
+    };
     let mut keep = vec![routes.fd(), inbox.fd(), program.as_raw_fd(), ready.fd()];
     keep.extend(helper::STANDARD_DESCRIPTORS);
     keep.extend(ended.as_ref().map(AsRawFd::as_raw_fd));
+    keep.extend(stop.descriptors());
     let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         sandy_relay::broker::raise_descriptor_limit().map_err(|error| {
             SandboxError::io("cannot raise the egress broker's descriptor limit", error)
@@ -161,7 +171,6 @@ fn broker_main(broker: Broker, ready: Ready, config: &BrokerConfig) {
     if listener.set_nonblocking(true).is_err() {
         return;
     }
-    let stop = Stop::new();
     let request = stop.clone();
     let watching = thread::Builder::new().spawn(move || {
         // A failed poll leaves the broker blind to the end of the program, so it ends too.

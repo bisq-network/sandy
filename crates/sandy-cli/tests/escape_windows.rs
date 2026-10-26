@@ -1208,14 +1208,6 @@ fn the_nesting_trial_starts_sandy_from_a_path_with_a_space() {
     assert_eq!(code, 0, "{output}");
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// Connects to `port` until `sandy` listens there.
 fn connect_when_listening(sandy: &mut Child, port: u16) -> TcpStream {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1696,6 +1688,56 @@ fn a_killed_run_leaves_no_program_behind() {
         "the program outlived sandy"
     );
     delete_profile(name);
+}
+
+/// When the program ends, sandy ends the processes it left behind and waits until they are gone,
+/// so none of them outlives sandy: ending a job only starts the termination of its processes.
+/// Control: the process runs while the program does.
+#[test]
+fn a_process_the_program_left_behind_ends_before_sandy_exits() {
+    use std::io::{BufRead, BufReader};
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+
+    if appcontainer_children_blocked() {
+        return;
+    }
+    let fixture = Fixture::new("left-behind");
+    let child = format!("{}\u{1f}sleep\u{1f}60000", probe_path());
+    let mut run = Command::new(sandy_path())
+        .args(run_args(
+            &fixture.access_args(),
+            &[("start", &child), ("read-line", "-")],
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Kept open until the run ends, so that the program can write its other results.
+    let mut stdout = BufReader::new(run.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    let started = parse_line(line.trim_end());
+    started.assert_ok();
+    let pid: u32 = started.detail.parse().unwrap();
+    // SAFETY: OpenProcess takes no pointers; the handle is checked before use.
+    let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    assert!(!raw.is_null(), "cannot open process {pid}");
+    // SAFETY: raw is a new process handle that nothing else owns.
+    let left_behind = unsafe { OwnedHandle::from_raw_handle(raw) };
+    assert!(
+        !ends_within(&left_behind, Duration::ZERO),
+        "control: the process the program started did not run"
+    );
+    writeln!(run.stdin.take().unwrap(), "end").unwrap();
+    let output = run.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        ends_within(&left_behind, Duration::ZERO),
+        "a process the program left behind outlived sandy"
+    );
+    drop(stdout);
 }
 
 /// Whether `process` ends within `wait`.
@@ -3082,18 +3124,8 @@ fn win32k_lockdown_reaches_the_program_its_children_and_its_console_host() {
 #[test]
 fn the_relays_run_with_the_win32k_lockdown() {
     let fixture = Fixture::new("win32k-relays");
-    let free_port = || {
-        TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    };
     for (deny, flags) in [(true, "0x1"), (false, "0x0")] {
-        let held = TcpListener::bind("127.0.0.1:0").unwrap();
-        let inner = held.local_addr().unwrap().port();
-        let outer = free_port();
-        drop(held);
+        let (inner, outer) = (free_port(), free_port());
         let mut sandbox_args = fixture.access_args();
         sandbox_args.extend(args(&["--ip", "all", "--expose"]));
         sandbox_args.push(format!("127.0.0.1:{outer}={inner}"));
@@ -3759,8 +3791,8 @@ fn egress_refuses_a_name() {
     assert_eq!(line.detail, "reply 8", "{line:?}");
 }
 
-/// The broker is in the program's relay job, so it ends with the program. Its process is a
-/// `sandy.exe` child of the run, like the relays.
+/// The broker is in the program's relay job, so it ends with the program, and sandy waits until
+/// it is gone before it exits. Its process is a `sandy.exe` child of the run, like the relays.
 #[test]
 fn the_egress_broker_ends_with_the_program() {
     let fixture = Fixture::new("egress-end");
@@ -3788,10 +3820,25 @@ fn the_egress_broker_ends_with_the_program() {
     assert!(output.status.success(), "{output:?}");
     for child in &children {
         assert!(
-            ends_within(child, END_TIMEOUT),
-            "a broker outlived the program"
+            ends_within(child, Duration::ZERO),
+            "the egress relay or the broker outlived sandy"
         );
     }
+}
+
+/// Rule 5 of "Forwarded ports": the egress port is free as soon as the run has ended, because
+/// sandy ends its relays before it exits, so a run that starts right after gets the port.
+#[test]
+fn the_egress_port_is_free_as_soon_as_the_run_ends() {
+    let fixture = Fixture::new("egress-free");
+    let port = free_port();
+    let args = egress_args(&fixture, port, "public");
+    let line = through_broker(&args, port, "example.com:80");
+    assert_eq!(line.detail, "reply 8", "{line:?}");
+    let freed = TcpListener::bind(("127.0.0.1", port)).map(drop);
+    assert!(freed.is_ok(), "{freed:?}");
+    let line = through_broker(&args, port, "example.com:80");
+    assert_eq!(line.detail, "reply 8", "the next run: {line:?}");
 }
 
 /// The runs of one policy share the broker's AppContainer, so its profile stays when a run ends,

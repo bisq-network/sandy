@@ -9,7 +9,8 @@ Status: the shared escape tests (`crates/sandy-cli/tests/escape.rs`) and the Win
 tests (`escape_windows.rs`) pass on Windows 11 build 26200, both elevated and with a filtered
 (non-elevated) token; see "Verified on Windows 11". Statements that no test checks come from the
 cited sources. Wine does not implement AppContainers, so Wine runs prove nothing about
-isolation.
+isolation. The escape tests run as one user; the AppContainer is shared across the users of a
+machine, which is a known open gap (see "Other users of the machine" and limitation 19).
 
 ## Requirements and mechanisms
 
@@ -22,7 +23,7 @@ isolation.
 | `InheritedHandlesClosed` | `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` with the three standard handles | never |
 | `EnvironmentControlled` | Environment block built from the policy, plus `SystemRoot` and `LOCALAPPDATA` | never |
 | `IpNetworkDenied` | No network capabilities, no loopback exemption | AppContainer exempt from loopback isolation; firewall service not running; no fix for CVE-2021-41338 |
-| `IpNetworkPrivate` | No network capabilities, no loopback exemption; the program's processes and the relays reach each other over loopback (see "Private network") | AppContainer exempt from loopback isolation; firewall service not running; no fix for CVE-2021-41338 |
+| `IpNetworkPrivate` | No network capabilities, no loopback exemption; the program's processes and the relays reach each other over loopback (see "Private network"); the loopback is shared by same-session processes in a same-named AppContainer (a warning, not a plan item, see "Other users of the machine") | AppContainer exempt from loopback isolation; firewall service not running; no fix for CVE-2021-41338 |
 | `EgressBrokered` | `sandy __broker` in an AppContainer of its own with the `internetClient` capability, reached from the program over AF_UNIX; `sandy_core::destination` limits where it connects (see "Egress broker") | the program's or the broker's AppContainer exempt from loopback isolation; firewall service not running; no fix for CVE-2021-41338; the broker's AppContainer name would exceed 64 characters; as for `ForwardedPortsRelayed`, with a grant on `sandy.exe` for the broker's AppContainer too |
 | `PathsHidden` | None: Windows cannot hide paths from an AppContainer without administrator rights (see "What the program can see") | always |
 | `InboundIpDenied` | The `internetClient` capability only; loopback isolation | firewall service not running; no fix for CVE-2021-41338 |
@@ -564,7 +565,9 @@ accept layer, so a blocked connection times out instead of failing at once [Proj
 The exemption is bound to the AppContainer SID and does not need any network capability: an
 exempt AppContainer can reach `127.0.0.1` with no capabilities at all [Project Zero 2021]. The
 plan therefore refuses `ip = "none"` and `ip = "private"` for an exempt AppContainer. Use
-separate AppContainer names for policies with and without IP networking.
+separate AppContainer names for policies with and without IP networking. The SID is the same for
+every user of the machine, so the exemption list, which is machine-wide, is shared across users
+(see "Other users of the machine").
 
 ### Private network
 
@@ -689,8 +692,8 @@ destination check were wrong. The escape tests `egress_reaches_an_allowed_public
 `egress_under_public_refuses_this_machine_and_the_local_network`,
 `egress_under_public_and_local_allows_the_gateway_but_not_this_machine` (which also refuses the
 broadcast address of the gateway's subnet), `egress_refuses_a_name`,
-`the_egress_broker_ends_with_the_program` and `the_broker_appcontainer_cannot_reach_this_machine`
-cover it.
+`the_egress_broker_ends_with_the_program`, `the_egress_port_is_free_as_soon_as_the_run_ends` and
+`the_broker_appcontainer_cannot_reach_this_machine` cover it.
 
 ### Local servers in the sandbox
 
@@ -713,8 +716,9 @@ when their policies differ (for example one with `ip = "all"`). Processes in one
 also open each other's processes. A program with a weaker policy could therefore take over a
 program with a stronger policy that runs at the same time in the same AppContainer.
 
-sandy enforces one policy per AppContainer at a time
-(`crates/sandy-windows/src/sys/singleton.rs`):
+sandy enforces one policy per AppContainer at a time for the runs of one user
+(`crates/sandy-windows/src/sys/singleton.rs`); the state is per user, so it does not coordinate
+two users who share an AppContainer name (see "Other users of the machine"):
 
 - The identity is the AppContainer SID, not the name from the policy. Windows derives the SID
   from the name without regard to case, and so do the capability names and the profile folder,
@@ -753,6 +757,84 @@ sandy enforces one policy per AppContainer at a time
 
 Use one AppContainer name per policy anyway: file grants and the loopback exemption belong to the
 AppContainer, and two policies that share one cannot run at the same time.
+
+### Other users of the machine
+
+An AppContainer SID is derived from the AppContainer name alone
+(`DeriveAppContainerSidFromAppContainerName`), so it is the same for every user of the machine,
+and so are the capability SIDs sandy derives for the file grants and the relay sockets, which name
+the AppContainer but no user. The loopback exemption is a machine-wide list keyed on that SID. The
+singleton state that keeps one policy per AppContainer (above) lives under each user's
+`%LOCALAPPDATA%`, so it coordinates only the runs of one user.
+
+Loopback isolation is per Terminal Services session, not only per AppContainer SID. The intra-
+AppContainer loopback that `expose`, `forward` and `egress` rely on permits traffic only between
+processes of one session; a connection to a loopback listener from another session is dropped and
+times out, as a connection from outside the AppContainer is, even when both sides share the
+AppContainer SID. Another interactive user of the machine runs in a session of their own, so the
+network guarantees hold against them: their process in an AppContainer of the same name reaches
+nothing of the program's over loopback.
+
+The exception is two processes in the same session, for example two services in session 0, whose
+same-named AppContainers do reach each other's loopback. A process in the program's session, in an
+AppContainer of the same name, reaches the program's loopback listeners under `ip = "private"` and
+`ip = "all"`, connects to its `forward` and `egress` relay listeners, and through them reaches the
+forward targets and whatever the egress broker's `reach` allows, the public internet included
+(`IpNetworkPrivate`, `ForwardedPortsRelayed`, `EgressBrokered`). The `expose` listeners are outside
+the AppContainer, on `listen`, so every local process reaches them in any case; that is what
+`expose` is for.
+
+Files and AF_UNIX sockets stay closed to another user in any session. For a process in an
+AppContainer, Windows grants access only when two checks pass: the DACL check with the process's
+user and groups, and the check with its AppContainer SID and capabilities. Another user that
+derives the same capability SID still needs access of its own, so a `read_write` directory or a
+`forward` socket under the first user's profile stays closed to it, and a granted path it can open
+outside any sandbox gives it nothing new (`FilesystemConfined`, `UnixSocketsDenied`).
+
+A held port cannot be taken over either: while the program listens on `127.0.0.1:port` inside the
+AppContainer (a program listener or a `forward` or `egress` inner listener), another user's same-
+named AppContainer that binds the same `127.0.0.1:port` fails with `WSAEADDRINUSE`, and with
+`SO_REUSEADDR` is refused with `WSAEACCES` (the owner's socket is exclusive). A bind of the
+wildcard `0.0.0.0:port` succeeds, as it does for any second process, but Windows delivers a
+connection to `127.0.0.1:port` to the more specific listener, which is the program's, so it
+captures none of the program's loopback traffic.
+
+Measured on Windows 11 build 26200 on 2026-10-26, binaries built for `x86_64-pc-windows-gnu`, with
+a second standard account (the second user) run through an S4U scheduled task (no password), in
+its own session (session 2) while the program ran in session 0:
+
+- Network: the second user's same-named AppContainer timed out at the program's private loopback
+  listener, at the `forward` relay and at the `egress` relay. To separate user from session, the
+  first user was also run through S4U in a fresh session (session 1) and timed out the same way,
+  while the first user in the program's own session 0, and a `SYSTEM` task in session 0, reached all
+  three; an AppContainer of a different name timed out in session 0 as the control. So the session,
+  not the user, decides loopback.
+- Files and sockets: the second user, carrying the capability named in the ACE of a file under the
+  first user's profile, was denied reading it (access denied) and denied connecting to the `forward`
+  socket (`WSAEACCES`); a granted file on a world-readable path it read, because it may read that
+  path anyway, not through the capability.
+- Port takeover: the second user's same-named AppContainer could not rebind the held
+  `127.0.0.1:port` (`WSAEADDRINUSE`, and `WSAEACCES` with `SO_REUSEADDR`); the wildcard bind
+  succeeded but captured no loopback connection.
+
+The residual gap is the same-session case. `sandy check` and `sandy run` warn about it ("the
+AppContainer is shared with every user of this machine"). Until it is fixed, use an
+`appcontainer_name` that no other account or session on the machine uses, and only on a machine
+whose other accounts you trust.
+
+Adding a hash of the user's SID to the name would not fix it: user SIDs are not secret, so another
+user computes the same name. Candidate fixes, not decided:
+
+- A random part in the name, per user, kept where only that user can read it. Another user can no
+  longer derive the SID from the name, but `NtCreateLowBoxToken` takes an AppContainer SID, not a
+  name (Chromium's sandbox creates its own), so this holds only while the SID does not leak, for
+  example through a DACL other users can read or the machine-wide loopback exemption list. It
+  also shortens the name a user may choose (the 64 character limit, and 51 with `egress`), makes
+  the loopback exemption a per-user `sandy setup` step, and leaves the profiles, scratch data and
+  grants of earlier versions' bare names behind, where `sandy setup --remove` does not find them.
+- A peer check on sandy's own relay and broker listeners: on accept, find the process that owns
+  the connecting endpoint and accept only one that runs in the program's job. It needs no secret
+  and covers `forward` and `egress`, but not the program's own listeners.
 
 ### Exposed ports
 
@@ -830,19 +912,33 @@ Windows deletes a socket file also while its socket still listens.
 
 The relays follow docs/DESIGN.md "Forwarded ports" rule 5. When the program exits:
 
-1. sandy ends the program's job at once, so the processes the program left behind end and
-   nothing in the sandbox can make a new connection.
+1. sandy ends the program's job at once and waits until the processes the program left behind
+   are gone, so nothing in the sandbox can make a new connection.
 2. sandy closes each relay's standard input. The relay then stops waiting for connections,
    still accepts those that already wait in its listen backlog (their handshake is complete, so
    the client counts them as made), closes its listener, waits up to one second for the accepted
    connections to finish, and ends. It checks for the stop at least every 50 ms, so it never has
    to close its listener under a thread that waits in `accept`.
-3. One second after the program's end, sandy ends the relay job, stops its own forward sockets
-   the same way and removes the socket directory.
+3. One second after the program's end, sandy ends the relay job and waits until the relays and
+   the broker are gone, stops its own forward sockets the same way and removes the socket
+   directory.
+
+`TerminateJobObject` only starts the termination of a job's processes. Without the waits, a
+relay was still there up to 2.7 ms after sandy had exited, in 12 of 60 runs of
+`forward_relay_ends_with_the_program` (measured on Windows 11). Windows stops counting a process
+in its job before it closes the process's handles, its sockets among them, and signals it, so
+sandy waits on handles of the job's processes, opened before it ends the job: with the job's
+count alone, a process the program left behind was still there right after sandy in 10 of 60
+runs of `a_process_the_program_left_behind_ends_before_sandy_exits`. If a process is still there
+three seconds after the end, sandy says so on standard error and exits anyway. The same wait
+follows the end of the program's job when sandy's parent ends (`process.end_with_parent`).
 
 A program that connects, sends and exits at once therefore does not lose its data
-(`forward_relay_delivers_data_sent_just_before_exit`), and a relay takes no new connection after
-the program's end (`relay_stops_listening_as_soon_as_the_program_ends`).
+(`forward_relay_delivers_data_sent_just_before_exit`), a relay takes no new connection after the
+program's end (`relay_stops_listening_as_soon_as_the_program_ends`), and no relay, broker or
+process of the program outlives sandy (`forward_relay_ends_with_the_program`,
+`the_egress_broker_ends_with_the_program`,
+`a_process_the_program_left_behind_ends_before_sandy_exits`).
 
 ### The setup step
 
@@ -1244,14 +1340,24 @@ about a path is worse than none, so the backend answers nothing and sandy refuse
     `a_lock_on_a_readable_file_holds_off_other_processes`.
 18. `filesystem.view = "policy"` is unavailable: Windows cannot hide paths from an AppContainer
     without administrator rights (see "What the program can see").
+19. The AppContainer is shared with every user of the machine: its SID, loopback exemption and
+    capability SIDs are derived from the AppContainer name, not the user. Loopback isolation is
+    per session, so another interactive user, who runs in a session of their own, reaches nothing
+    of the program's over loopback; only a process in the program's own session (for example a
+    service in session 0) in a same-named AppContainer reaches its private loopback and its
+    `forward` and `egress` relays and their targets. Files and sockets stay closed to another user
+    even with the shared capability, because Windows checks the user too, and a held port cannot
+    be rebound. `sandy check` and `sandy run` warn about it. The residual gap is the same-session
+    case; not fixed, see "Other users of the machine".
 
 ## Verified on Windows 11
 
 Host: Windows 11 build 26200 (VM), binaries built for `x86_64-pc-windows-gnu`. The tests run in
 an elevated SSH session and without administrator rights. Latest elevated run, every test
-passing: `sandy_core` 88, `sandy_relay` 43, `sandy_windows` 101, `sandy` 20, `escape` 27,
+passing: `sandy_core` 88, `sandy_relay` 43, `sandy_windows` 102, `sandy` 20, `escape` 27,
 `escape_windows` 88, `expose` 5, `forward` 3, `children` 5, `parent` 5, `check` 11, `runner` 3,
-`review_windows` 12, `setup` 3. The
+`review_windows` 12, `setup` 3. `crossuser_windows` skips without `SANDY_TEST_OTHER_USER` and
+`SANDY_TEST_OTHER_PASSWORD` (see "Other users of the machine"). The
 COM check of `review_windows` is skipped there: the SSH session is session 0, where `ole32.dll`
 does not load in an AppContainer (limitation 13), so a denial would not be the COM boundary.
 Earlier non-administrator runs used a scheduled task with `/RL LIMITED` (medium integrity,

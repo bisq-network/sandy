@@ -945,7 +945,8 @@ the egress port at another address of the Mac. The tests are
 `public_and_local_reaches_the_local_network_but_not_this_mac` (it runs only when
 `SANDY_TEST_LOCAL_PEER` names a host of the local network, so the suite sends nothing there by
 itself),
-`the_broker_connects_to_a_public_address`, `the_broker_ends_with_the_program` and
+`the_broker_connects_to_a_public_address`, `the_broker_ends_with_the_program`,
+`the_broker_frees_its_port_as_soon_as_the_program_ends` and
 `a_dead_broker_ends_a_contained_program`.
 
 What stays open, an exception of DESIGN.md: macOS cannot tell the broker which user holds the

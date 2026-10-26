@@ -205,7 +205,7 @@ mod tests {
     ) -> (SocketAddr, Stop, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let stop = Stop::new();
+        let stop = Stop::new().unwrap();
         let request = stop.clone();
         let broker = Broker {
             reach,
@@ -555,7 +555,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("s");
         let listener = crate::unix::Listener::bind(&path).unwrap();
-        let stop = Stop::new();
+        let stop = Stop::new().unwrap();
         let request = stop.clone();
         let broker = Broker {
             reach: EgressReach::PublicAndLocal,
@@ -622,7 +622,10 @@ mod tests {
         all.extend(b"late");
         client.write_all(&all).unwrap();
         client.shutdown(Shutdown::Write).unwrap();
-        let stop = Stop::new();
+        let stop = Stop::new().unwrap();
+        // Only once the backlog holds it: on macOS the connect can return before the listener
+        // has the connection.
+        while !crate::pending(crate::raw_listener(&listener), &stop, false).unwrap() {}
         stop.request();
         let broker = Broker {
             reach: EgressReach::PublicAndLocal,
@@ -656,23 +659,59 @@ mod tests {
         );
     }
 
-    /// A client that never finishes its handshake delays the end by at most the drain time.
+    /// Rule 5: a stop request closes the listener at once. Here it comes while the serve loop
+    /// waits again after a connection, where a loop that looked for a stop every 50 ms would
+    /// keep the listener almost that long.
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_request_closes_the_listener_at_once() {
+        let (address, stop, server) = start(EgressReach::Public, TestHost::default(), None);
+        drop(TcpStream::connect(address).unwrap());
+        thread::sleep(Duration::from_millis(5));
+        let started = Instant::now();
+        stop.request();
+        server.join().unwrap();
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_millis(25), "{elapsed:?}");
+        assert!(TcpStream::connect(address).is_err());
+    }
+
+    /// A client that was accepted and never finishes its handshake delays the end by at most the
+    /// drain time.
     #[test]
     fn the_drain_is_bounded() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let stop = Stop::new();
-        stop.request();
+        let address = listener.local_addr().unwrap();
+        let stop = Stop::new().unwrap();
+        let request = stop.clone();
         let drain = Duration::from_millis(300);
+        let (accepted, was_accepted) = mpsc::channel();
+        let server = thread::spawn(move || {
+            serve(
+                listener,
+                move |listener| {
+                    let client = listener.accept().map(|(client, _)| client);
+                    if client.is_ok() {
+                        let _ = accepted.send(());
+                    }
+                    client
+                },
+                EgressReach::Public,
+                TestHost::default(),
+                &request,
+                drain,
+            );
+        });
+        let _client = TcpStream::connect(address).unwrap();
+        // The stop comes after the accept: on macOS the connect can return before the listener
+        // has the connection, by milliseconds under loopback traffic, and a broker that is
+        // already stopping does not wait for one.
+        was_accepted
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the broker accepts the client");
         let started = Instant::now();
-        serve(
-            listener,
-            |listener| listener.accept().map(|(client, _)| client),
-            EgressReach::Public,
-            TestHost::default(),
-            &stop,
-            drain,
-        );
+        stop.request();
+        server.join().unwrap();
         let elapsed = started.elapsed();
         assert!(
             elapsed >= drain && elapsed < Duration::from_secs(3),

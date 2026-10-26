@@ -6,7 +6,7 @@
 mod common;
 
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
@@ -254,8 +254,48 @@ fn the_namespace_ends_when_sandy_and_the_guard_are_killed() {
     BufReader::new(reader).read_line(&mut first).unwrap();
     let program: u32 = first.trim().strip_prefix("pid ").unwrap().parse().unwrap();
     let sandy = child.id();
-    // The guard is sandy's child that leads a group of its own and is not in the namespace.
-    let guard = children_of(sandy)
+    kill_process(guard_of(sandy, program));
+    kill_process(sandy);
+    let _ = child.wait();
+    assert!(
+        ends_soon(program, END_TIMEOUT),
+        "the program outlived sandy and the guard"
+    );
+}
+
+/// A guard that ends while the program runs, here through SIGKILL, ends the run: sandy ends the
+/// namespace and fails, and names the guard of the PID namespace, not of a process group.
+#[test]
+fn a_guard_that_ends_while_the_program_runs_ends_the_run() {
+    if !pid_namespace_works() {
+        return;
+    }
+    let (reader, child) = spawn_with_status(&contained(), &[("sleep", "30000")]);
+    let mut record = BufReader::new(reader);
+    let mut first = String::new();
+    record.read_line(&mut first).unwrap();
+    let program: u32 = first.trim().strip_prefix("pid ").unwrap().parse().unwrap();
+    kill_process(guard_of(child.id(), program));
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("the guard of the program's PID namespace ended unexpectedly"),
+        "{stderr}"
+    );
+    let mut rest = String::new();
+    record.read_to_string(&mut rest).unwrap();
+    assert_eq!(rest, "failed\n");
+    assert!(
+        ends_soon(program, END_TIMEOUT),
+        "the program outlived its guard"
+    );
+}
+
+/// The guard of the run whose program is `program`: sandy's child that leads a group of its own
+/// and is not in the namespace.
+fn guard_of(sandy: u32, program: u32) -> u32 {
+    children_of(sandy)
         .into_iter()
         .find(|&pid| {
             let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
@@ -266,14 +306,7 @@ fn the_namespace_ends_when_sandy_and_the_guard_are_killed() {
             let live = !status.lines().any(|line| line.starts_with("State:\tZ"));
             single && live && pid != program
         })
-        .expect("no guard");
-    kill_process(guard);
-    kill_process(sandy);
-    let _ = child.wait();
-    assert!(
-        ends_soon(program, END_TIMEOUT),
-        "the program outlived sandy and the guard"
-    );
+        .expect("no guard")
 }
 
 /// A host can give sandy user and network namespaces and still refuse it a PID namespace, as one
@@ -417,7 +450,8 @@ fn children_of(parent: u32) -> Vec<u32> {
         .collect()
 }
 
-/// Starts sandy with `--status-fd 3` and returns the read end of the record and the child.
+/// Starts sandy with `--status-fd 3` and returns the read end of the record and the child, whose
+/// standard error is a pipe.
 fn spawn_with_status(
     sandbox_args: &[String],
     actions: &[(&str, &str)],
@@ -440,7 +474,7 @@ fn spawn_with_status(
     command
         .args(run)
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     // SAFETY: dup2 is async-signal-safe and the closure calls nothing else.
     unsafe {
         command.pre_exec(move || match libc::dup2(raw, 3) {

@@ -26,14 +26,6 @@ const DNS_RESOLVER: &str = "/private/var/run/mDNSResponder";
 /// What the probe's tcp-send action writes.
 const TCP_SEND_PAYLOAD: &[u8] = b"sent just before exit";
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// A loopback service outside the sandbox that counts the connections it accepts.
 fn counting_service() -> (SocketAddr, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -322,16 +314,22 @@ fn the_relay_holds_the_forwarded_ports_at_every_address() {
     next_line(&mut stdout).assert_ok();
     let results: Vec<ProbeLine> = targets.iter().map(|_| next_line(&mut stdout)).collect();
     let output = program.wait_with_output().unwrap();
+    let ended = Instant::now();
     assert!(output.status.success(), "{output:?}");
+    // The relay is a process of its own: it frees the port when it sees the program end, a
+    // moment after the program's exit.
+    let wildcards = ["0.0.0.0:0", "[::]:0"].map(|address| at(address.parse().unwrap(), port));
+    let freed = freed_after(&wildcards, ended, "the relay kept the forwarded port");
+    assert!(
+        freed < FREED_AT_ONCE,
+        "the relay kept the forwarded port {freed:?} after the program ended"
+    );
     for line in &results {
         assert!(
             line.result == "error" && line.detail.contains("timed out"),
             "a connection to {} was answered: {line:?}",
             line.target
         );
-    }
-    for wildcard in ["0.0.0.0", "::"] {
-        TcpListener::bind((wildcard, port)).unwrap();
     }
 }
 
@@ -479,8 +477,9 @@ fn ipv4_relays_are_reached_only_over_ipv4() {
     assert_ne!(loopback, 0, "no lo0");
     let fixture = Fixture::new("private-ipv4");
     let (service, accepted) = counting_service();
-    // Ports of their own for each run: a broker may hold its listener for a moment after the
-    // program of the run before has ended.
+    // Ports of their own for each run: the relay and the broker of the first run free theirs a
+    // moment after its program has ended, as separate processes, so the second run could still
+    // find them taken.
     let run = |relays: &str| {
         let (port, egress) = (free_port(), free_port());
         let forwarded = format!("127.0.0.1:{port}");
@@ -960,6 +959,58 @@ fn the_broker_ends_with_the_program() {
     TcpListener::bind(("0.0.0.0", egress)).unwrap();
 }
 
+/// Rule 5 of "Forwarded ports" holds for the broker as for the relay: when the program ends, its
+/// listener and its holder binds go at once, also while it still drains a connection, so a run
+/// that starts right after can bind the port. The drained connection is a client that never
+/// sends its request.
+#[test]
+fn the_broker_frees_its_port_as_soon_as_the_program_ends() {
+    let fixture = Fixture::new("egress-free");
+    let egress = free_port();
+    let (mut program, mut stdout) = start(
+        &private_egress(&fixture, egress, "public"),
+        &[("read-line", "-")],
+    );
+    wait_for_program(program.id());
+    let broker = relay_of(egress);
+    let held = TcpStream::connect(("127.0.0.1", egress)).unwrap();
+    program.stdin.take().unwrap().write_all(b"\n").unwrap();
+    next_line(&mut stdout).assert_ok();
+    let output = program.wait_with_output().unwrap();
+    let ended = Instant::now();
+    assert!(output.status.success(), "{output:?}");
+    let addresses = ["127.0.0.1", "0.0.0.0", "[::]"]
+        .map(|ip| format!("{ip}:{egress}").parse::<SocketAddr>().unwrap());
+    let freed = freed_after(&addresses, ended, "the broker kept its port");
+    // SAFETY: signal 0 only asks whether the process exists.
+    let draining = unsafe { libc::kill(broker, 0) } == 0;
+    drop(held);
+    assert!(
+        draining,
+        "the broker ended before it drained the held connection"
+    );
+    assert!(
+        freed < FREED_AT_ONCE,
+        "the broker kept its port {freed:?} after the program ended"
+    );
+}
+
+/// How soon after the end of the program its relay or broker has freed its ports.
+const FREED_AT_ONCE: Duration = Duration::from_millis(20);
+
+/// Waits until every one of `addresses` can be bound, at most `WAIT`, and returns how long after
+/// `ended` that was.
+fn freed_after(addresses: &[SocketAddr], ended: Instant, kept: &str) -> Duration {
+    while !addresses
+        .iter()
+        .all(|address| TcpListener::bind(address).is_ok())
+    {
+        assert!(ended.elapsed() < WAIT, "{kept}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    ended.elapsed()
+}
+
 /// With `children = "contained"` the guard watches the broker as it watches the relay: a broker
 /// that dies ends the program, and sandy fails with status 125 and says why.
 #[test]
@@ -968,27 +1019,14 @@ fn a_dead_broker_ends_a_contained_program() {
     let egress = free_port();
     let mut args = private_egress(&fixture, egress, "public");
     args.extend(["--children", "contained"].map(String::from));
-    let (mut program, _stdout) = start(&args, &[("read-line", "-"), ("exit", "7")]);
-    let start = Instant::now();
-    let broker = loop {
-        let output = Command::new("/usr/sbin/lsof")
-            .args([
-                "-nP",
-                &format!("-iTCP@127.0.0.1:{egress}"),
-                "-sTCP:LISTEN",
-                "-t",
-            ])
-            .output()
-            .unwrap();
-        if let Some(pid) = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .find_map(|line| line.trim().parse::<libc::pid_t>().ok())
-        {
-            break pid;
-        }
-        assert!(start.elapsed() < WAIT, "no broker listens on {egress}");
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let (mut program, mut stdout) =
+        start(&args, &[("pid", "-"), ("read-line", "-"), ("exit", "7")]);
+    // sandy binds the listener and forks the broker twice, so until the broker has reported that
+    // it is ready, sandy or the process between the two forks holds the listener too, and a look
+    // then can find that process and kill it instead. The program starts only after the report.
+    next_line(&mut stdout).assert_ok();
+    let broker = relay_of(egress);
+    assert_ne!(broker as u32, program.id(), "the listener is still sandy's");
     // SAFETY: kill has no memory arguments.
     assert_eq!(unsafe { libc::kill(broker, libc::SIGKILL) }, 0);
     let start = Instant::now();

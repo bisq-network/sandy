@@ -111,7 +111,8 @@ impl Forwarding {
         let mut routes = Vec::with_capacity(forward.len());
         for entry in forward {
             let (listener, socket) = forwarding.bind(entry.port)?;
-            let stop = Stop::new();
+            let stop = Stop::new()
+                .map_err(|error| SandboxError::io("cannot make a forward server's stop", error))?;
             let request = stop.clone();
             let target = entry.to;
             let server = thread::Builder::new()

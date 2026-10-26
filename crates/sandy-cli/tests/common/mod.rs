@@ -791,6 +791,57 @@ fn with_status_option(args: &[String], channel: String) -> Vec<String> {
     with_option
 }
 
+/// The ports `free_port` hands out. By default every supported system picks the port of a bind
+/// to port 0 and of an outgoing connection above them (Linux from 32768, macOS and Windows from
+/// 49152), so no socket on the host takes one of them unless it names it.
+const TEST_PORTS: std::ops::Range<u16> = 20000..32768;
+
+/// A port of 127.0.0.1 that is free now and that no other call in this test binary returns
+/// before all of `TEST_PORTS` have been handed out.
+///
+/// sandy binds the port only later, and the tests run in parallel. A port that the system
+/// picked for a bind to port 0 it can pick again meanwhile: for a service that another test
+/// binds, for the local end of a connection, or for a second such call. These ports come from
+/// `TEST_PORTS` instead, one after the other from a random start in each test binary, so two
+/// binaries that run at the same time rarely meet, and a port that is bound now is passed over.
+pub fn free_port() -> u16 {
+    use std::hash::BuildHasher;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT: std::sync::OnceLock<AtomicUsize> = std::sync::OnceLock::new();
+    let count = usize::from(TEST_PORTS.end - TEST_PORTS.start);
+    let next = NEXT.get_or_init(|| {
+        let start = std::collections::hash_map::RandomState::new().hash_one(std::process::id());
+        AtomicUsize::new(start as usize % count)
+    });
+    for _ in 0..count {
+        let port = TEST_PORTS.start + (next.fetch_add(1, Ordering::Relaxed) % count) as u16;
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() && !still_listening(port) {
+            return port;
+        }
+    }
+    panic!("no port of {TEST_PORTS:?} is free at 127.0.0.1");
+}
+
+/// Whether something listens at 127.0.0.1:`port` after `free_port` closed its own listener
+/// there. On macOS the standard library marks a new socket close-on-exec only after it has made
+/// it, so a process that another test starts in that moment inherits the socket, and the socket
+/// listens on in that process; a sandy that waits for its program held such a port for its
+/// whole run (measured on macOS 27, where 2 of about 460 processes started next to a loop of
+/// binds inherited a listener). A connection finds that copy; a copy of the connection itself
+/// holds no port of the range.
+#[cfg(target_os = "macos")]
+fn still_listening(port: u16) -> bool {
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&address, Duration::from_secs(1)).is_ok()
+}
+
+/// Linux and Windows make a socket that a child cannot inherit in one call.
+#[cfg(not(target_os = "macos"))]
+fn still_listening(_port: u16) -> bool {
+    false
+}
+
 /// How long a process may take to end after sandy has ended it.
 pub const END_TIMEOUT: Duration = Duration::from_secs(10);
 

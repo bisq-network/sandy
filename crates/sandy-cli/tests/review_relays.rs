@@ -28,14 +28,6 @@ use std::time::{Duration, Instant};
 use common::unix::live_members;
 use common::*;
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// A loopback service outside the sandbox that accepts connections and holds them open, so a
 /// relayed connection stays alive until the relay itself ends it.
 fn holding_service() -> (u16, mpsc::Sender<()>) {

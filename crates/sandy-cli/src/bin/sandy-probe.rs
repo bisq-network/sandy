@@ -192,6 +192,9 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
         "icmp-echo" => windows_actions::icmp_echo(target),
         "junction" => windows_actions::junction(target),
         "symbolic-link" => windows_actions::symbolic_link(target),
+        "appcontainer-run" => windows_actions::appcontainer_run(target),
+        "tcp-listen-bind" => windows_actions::tcp_listen_reuse(target, false),
+        "tcp-listen-reuse" => windows_actions::tcp_listen_reuse(target, true),
         // Connects to the AF_UNIX socket whose path the file `target` holds; the test writes the
         // path there while the program runs.
         "afunix-connect-file" => {
@@ -3124,6 +3127,355 @@ mod windows_actions {
             std::net::Ipv4Addr::from(echo.Address.to_ne_bytes())
         ))
     }
+
+    /// Cross-user conformance probe (`tests/crossuser_windows.rs`). An AppContainer SID is derived
+    /// from the name alone, so a process another user starts in a profile of the same name gets
+    /// the same SID. This creates such a profile for the current user, runs a child `sandy-probe`
+    /// in it, and gives the child a chosen set of capability SIDs, so a second user can measure
+    /// what the shared SID (and a capability a first user's run put on an object) reaches of that
+    /// first user's sandboxed run.
+    ///
+    /// Target: `NAME <US> CAPS <US> ACTION <US> TARGET`. CAPS is a comma-separated list of SDDL
+    /// capability SID strings, empty for none: the well-known network capabilities (`S-1-15-3-1`
+    /// internetClient, `S-1-15-3-2` internetClientServer, `S-1-15-3-3` privateNetworkClientServer)
+    /// or a `sandy.grant...`/relay capability SID read off an object with `icacls`. The child
+    /// prints its own `ACTION<TAB>TARGET<TAB>RESULT<TAB>DETAIL` line on the inherited standard
+    /// output; this prints `appcontainer-run<TAB>NAME<TAB>ok|error<TAB>DETAIL` after it.
+    /// Binds and listens on an IPv4 address, optionally with `SO_REUSEADDR`. Used by the
+    /// port-takeover check: another user tries to bind an address and port a first user's run
+    /// already holds inside the same-named AppContainer. Reports `ok` with the bound address, or
+    /// the Winsock error (10048 `WSAEADDRINUSE`, 10013 `WSAEACCES`).
+    pub fn tcp_listen_reuse(target: &str, reuse: bool) -> io::Result<String> {
+        use std::mem::size_of;
+        use std::net::SocketAddrV4;
+
+        use windows_sys::Win32::Networking::WinSock::{
+            AF_INET, IN_ADDR, IN_ADDR_0, SO_REUSEADDR, SOCK_STREAM, SOCKADDR_IN, SOL_SOCKET, bind,
+            htons, listen, setsockopt,
+        };
+
+        let address: SocketAddrV4 = target
+            .parse()
+            .map_err(|_| invalid("expected an IPv4 ADDRESS:PORT"))?;
+        // SAFETY: WSADATA is plain data; WSAStartup fills it.
+        let mut data: WSADATA = unsafe { std::mem::zeroed() };
+        // SAFETY: data is a valid out pointer.
+        if unsafe { WSAStartup(0x0202, &mut data) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let last = || {
+            // SAFETY: WSAGetLastError has no preconditions.
+            io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
+        };
+        // SAFETY: socket has no memory safety preconditions.
+        let handle = unsafe { socket(i32::from(AF_INET), SOCK_STREAM, 0) };
+        if handle == INVALID_SOCKET {
+            return Err(last());
+        }
+        let outcome = (|| {
+            if reuse {
+                let on: u32 = 1;
+                // SAFETY: handle is a valid socket; on is a u32 whose size is passed.
+                let set = unsafe {
+                    setsockopt(
+                        handle,
+                        SOL_SOCKET,
+                        SO_REUSEADDR,
+                        (&on as *const u32).cast(),
+                        size_of::<u32>() as i32,
+                    )
+                };
+                if set != 0 {
+                    return Err(last());
+                }
+            }
+            let sockaddr = SOCKADDR_IN {
+                sin_family: AF_INET,
+                // SAFETY: htons byte-swaps a u16.
+                sin_port: unsafe { htons(address.port()) },
+                sin_addr: IN_ADDR {
+                    S_un: IN_ADDR_0 {
+                        S_addr: u32::from_ne_bytes(address.ip().octets()),
+                    },
+                },
+                sin_zero: [0; 8],
+            };
+            // SAFETY: sockaddr is a SOCKADDR_IN and its size is passed.
+            let bound = unsafe {
+                bind(
+                    handle,
+                    (&sockaddr as *const SOCKADDR_IN).cast(),
+                    size_of::<SOCKADDR_IN>() as i32,
+                )
+            };
+            if bound != 0 {
+                return Err(last());
+            }
+            // SAFETY: handle is a bound socket.
+            if unsafe { listen(handle, 1) } != 0 {
+                return Err(last());
+            }
+            Ok(format!("listening on {address}"))
+        })();
+        // SAFETY: handle is an open socket, closed exactly once.
+        unsafe { closesocket(handle) };
+        outcome
+    }
+
+    pub fn appcontainer_run(target: &str) -> io::Result<String> {
+        use std::mem::size_of;
+        use std::os::windows::ffi::OsStrExt;
+
+        use windows_sys::Win32::Foundation::{
+            DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ALREADY_EXISTS, INVALID_HANDLE_VALUE,
+            LocalFree,
+        };
+        use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+        use windows_sys::Win32::Security::Isolation::{
+            CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+        };
+        use windows_sys::Win32::Security::{
+            FreeSid, PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
+        };
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
+        use windows_sys::Win32::System::Threading::{
+            CreateProcessW, DETACHED_PROCESS, DeleteProcThreadAttributeList,
+            EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess,
+            InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+            STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+        };
+
+        // Split into four fields; the fourth keeps any further US, so an inner action whose own
+        // target holds one (socks5-connect) passes through unchanged.
+        let fields: Vec<&str> = target.splitn(4, '\u{1f}').collect();
+        let [name, caps, action, inner] = fields.as_slice() else {
+            return Err(invalid(
+                "appcontainer-run needs NAME\u{1f}CAPS\u{1f}ACTION\u{1f}TARGET",
+            ));
+        };
+
+        // Register the profile for the current user (the same SID as any other user's profile of
+        // the name) so a process can be created in it, and derive the SID for the token.
+        let name_w = wide(name);
+        let description = wide("sandy cross-user probe");
+        let mut profile: PSID = ptr::null_mut();
+        // SAFETY: the strings are NUL-terminated, no capabilities are passed, profile is a valid
+        // out pointer.
+        let hr = unsafe {
+            CreateAppContainerProfile(
+                name_w.as_ptr(),
+                name_w.as_ptr(),
+                description.as_ptr(),
+                ptr::null(),
+                0,
+                &mut profile,
+            )
+        };
+        const ALREADY_EXISTS: i32 = (0x8007_0000u32 | ERROR_ALREADY_EXISTS) as i32;
+        if hr >= 0 {
+            // SAFETY: on success the function allocated a SID that must be freed.
+            unsafe { FreeSid(profile) };
+        } else if hr != ALREADY_EXISTS {
+            return Err(io::Error::other(format!(
+                "cannot create the AppContainer profile {name:?}: {hr:#010x}"
+            )));
+        }
+        let mut app_sid: PSID = ptr::null_mut();
+        // SAFETY: name_w is NUL-terminated and app_sid is a valid out pointer.
+        let hr =
+            unsafe { DeriveAppContainerSidFromAppContainerName(name_w.as_ptr(), &mut app_sid) };
+        if hr < 0 {
+            return Err(io::Error::other(format!(
+                "cannot derive the AppContainer SID of {name:?}: {hr:#010x}"
+            )));
+        }
+
+        // Convert each capability SID string. The pointers stay valid until after CreateProcessW.
+        let mut cap_sids: Vec<PSID> = Vec::new();
+        let free_all = |cap_sids: &[PSID], app_sid: PSID| {
+            for &sid in cap_sids {
+                // SAFETY: each SID was allocated by ConvertStringSidToSidW with LocalAlloc.
+                unsafe { LocalFree(sid.cast()) };
+            }
+            // SAFETY: app_sid came from DeriveAppContainerSidFromAppContainerName.
+            unsafe { FreeSid(app_sid) };
+        };
+        for cap in caps.split(',').filter(|c| !c.is_empty()) {
+            let cap_w = wide(cap);
+            let mut psid: PSID = ptr::null_mut();
+            // SAFETY: cap_w is NUL-terminated and psid is a valid out pointer.
+            if unsafe { ConvertStringSidToSidW(cap_w.as_ptr(), &mut psid) } == 0 {
+                free_all(&cap_sids, app_sid);
+                return Err(io::Error::other(format!("invalid capability SID {cap:?}")));
+            }
+            cap_sids.push(psid);
+        }
+        let mut attributes: Vec<SID_AND_ATTRIBUTES> = cap_sids
+            .iter()
+            .map(|&sid| SID_AND_ATTRIBUTES {
+                Sid: sid,
+                Attributes: SE_GROUP_ENABLED as u32,
+            })
+            .collect();
+        let security = SECURITY_CAPABILITIES {
+            AppContainerSid: app_sid,
+            Capabilities: if attributes.is_empty() {
+                ptr::null_mut()
+            } else {
+                attributes.as_mut_ptr()
+            },
+            CapabilityCount: attributes.len() as u32,
+            Reserved: 0,
+        };
+
+        // One attribute: the security capabilities that make the child an AppContainer process.
+        let mut size = 0usize;
+        // SAFETY: a null list with a size pointer only queries the required size.
+        unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut size) };
+        let mut list: Vec<usize> = vec![0; size.div_ceil(size_of::<usize>())];
+        let attr_list =
+            list.as_mut_ptr().cast::<core::ffi::c_void>() as LPPROC_THREAD_ATTRIBUTE_LIST;
+        // SAFETY: the buffer is at least `size` bytes and pointer-aligned.
+        if unsafe { InitializeProcThreadAttributeList(attr_list, 1, 0, &mut size) } == 0 {
+            free_all(&cap_sids, app_sid);
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the list is initialized; security outlives the CreateProcessW call below.
+        let set = unsafe {
+            UpdateProcThreadAttribute(
+                attr_list,
+                0,
+                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                (&security as *const SECURITY_CAPABILITIES).cast(),
+                size_of::<SECURITY_CAPABILITIES>(),
+                ptr::null_mut(),
+                ptr::null(),
+            )
+        };
+        if set == 0 {
+            let error = io::Error::last_os_error();
+            // SAFETY: the list was initialized above.
+            unsafe { DeleteProcThreadAttributeList(attr_list) };
+            free_all(&cap_sids, app_sid);
+            return Err(error);
+        }
+
+        // The child inherits this process's standard output, so its one result line comes
+        // through. The standard handles must be inheritable; duplicate them so and close the
+        // copies after.
+        let mut to_close: Vec<HANDLE> = Vec::new();
+        let mut std_handle = |which| {
+            // SAFETY: GetStdHandle has no preconditions.
+            let handle = unsafe { GetStdHandle(which) };
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                return handle;
+            }
+            let mut copy: HANDLE = ptr::null_mut();
+            // SAFETY: the current-process pseudo handle is valid and copy is a valid out pointer.
+            let ok = unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    handle,
+                    GetCurrentProcess(),
+                    &mut copy,
+                    0,
+                    TRUE,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            };
+            if ok == 0 {
+                handle
+            } else {
+                to_close.push(copy);
+                copy
+            }
+        };
+        let stdin_handle = std_handle(STD_INPUT_HANDLE);
+        let stdout_handle = std_handle(STD_OUTPUT_HANDLE);
+        let stderr_handle = std_handle(STD_ERROR_HANDLE);
+        let close_std = |to_close: &[HANDLE]| {
+            for &handle in to_close {
+                // SAFETY: each handle is a fresh duplicate owned here.
+                unsafe { CloseHandle(handle) };
+            }
+        };
+
+        let exe = std::env::current_exe()?;
+        let program: Vec<u16> = exe.as_os_str().encode_wide().collect();
+        let args = [
+            action.encode_utf16().collect::<Vec<u16>>(),
+            inner.encode_utf16().collect::<Vec<u16>>(),
+        ];
+        let mut command_line = match sandy_windows::cmdline::command_line(&program, &args) {
+            Ok(line) => line,
+            Err(error) => {
+                // SAFETY: the list was initialized above.
+                unsafe { DeleteProcThreadAttributeList(attr_list) };
+                close_std(&to_close);
+                free_all(&cap_sids, app_sid);
+                return Err(io::Error::other(error.to_string()));
+            }
+        };
+        let application: Vec<u16> = exe
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        // SAFETY: the structure is plain data; zero is a valid value for every field.
+        let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+        startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = stdin_handle;
+        startup.StartupInfo.hStdOutput = stdout_handle;
+        startup.StartupInfo.hStdError = stderr_handle;
+        startup.lpAttributeList = attr_list;
+        // SAFETY: the structure is plain data; zero is a valid value for every field.
+        let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: application and command_line are NUL-terminated, command_line is writable, the
+        // inherited environment holds the LOCALAPPDATA and SystemRoot an AppContainer needs, and
+        // startup and the values it points to outlive the call.
+        let ok = unsafe {
+            CreateProcessW(
+                application.as_ptr(),
+                command_line.as_mut_ptr(),
+                ptr::null(),
+                ptr::null(),
+                TRUE,
+                EXTENDED_STARTUPINFO_PRESENT | DETACHED_PROCESS,
+                ptr::null(),
+                ptr::null(),
+                &startup.StartupInfo,
+                &mut info,
+            )
+        };
+        // SAFETY: the list was initialized above.
+        unsafe { DeleteProcThreadAttributeList(attr_list) };
+        if ok == 0 {
+            let error = io::Error::last_os_error();
+            close_std(&to_close);
+            free_all(&cap_sids, app_sid);
+            return Err(error);
+        }
+        let (process, thread) = (info.hProcess, info.hThread);
+        // SAFETY: process is a valid handle; wait at most 90 seconds for the child.
+        unsafe { WaitForSingleObject(process, 90_000) };
+        let mut code = 0u32;
+        // SAFETY: process is a valid handle and code is a valid out pointer.
+        unsafe { GetExitCodeProcess(process, &mut code) };
+        // SAFETY: both handles are valid and closed exactly once.
+        unsafe {
+            CloseHandle(thread);
+            CloseHandle(process);
+        }
+        close_std(&to_close);
+        free_all(&cap_sids, app_sid);
+        Ok(format!("child exit {code}"))
+    }
 }
 
 #[cfg(not(windows))]
@@ -3215,6 +3567,14 @@ mod windows_actions {
     }
 
     pub fn icmp_echo(_target: &str) -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn appcontainer_run(_target: &str) -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn tcp_listen_reuse(_target: &str, _reuse: bool) -> io::Result<String> {
         unsupported()
     }
 }

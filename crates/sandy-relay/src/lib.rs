@@ -149,25 +149,53 @@ where
 }
 
 /// A request to stop a server that `serve_until` or `broker::serve` runs. Clones share the
-/// request.
-#[derive(Debug, Clone, Default)]
-pub struct Stop(Arc<AtomicBool>);
+/// request. On Unix the request also writes to a pipe that the server polls next to its
+/// listener, so the server closes the listener at once (docs/DESIGN.md, "Forwarded ports", rule
+/// 5). `WSAPoll` waits on sockets only, so a Windows server looks for the request every
+/// `STOP_CHECK`.
+#[derive(Debug, Clone)]
+pub struct Stop(Arc<StopState>);
+
+#[derive(Debug)]
+struct StopState {
+    requested: AtomicBool,
+    #[cfg(unix)]
+    wake: (io::PipeReader, io::PipeWriter),
+}
 
 impl Stop {
-    pub fn new() -> Stop {
-        Stop::default()
+    /// Fails on Unix when this process cannot make a pipe.
+    pub fn new() -> io::Result<Stop> {
+        Ok(Stop(Arc::new(StopState {
+            requested: AtomicBool::new(false),
+            #[cfg(unix)]
+            wake: io::pipe()?,
+        })))
     }
 
     pub fn request(&self) {
-        self.0.store(true, Ordering::Release);
+        // Only the first request writes, so the pipe holds at most one byte and the write
+        // neither blocks nor fails.
+        if !self.0.requested.swap(true, Ordering::AcqRel) {
+            #[cfg(unix)]
+            let _ = (&self.0.wake.1).write(&[0]);
+        }
     }
 
     pub fn is_requested(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.requested.load(Ordering::Acquire)
+    }
+
+    /// The pipe's descriptors, which a process that closes all others must keep.
+    #[cfg(unix)]
+    pub fn descriptors(&self) -> [std::os::fd::RawFd; 2] {
+        use std::os::fd::AsRawFd;
+        [self.0.wake.0.as_raw_fd(), self.0.wake.1.as_raw_fd()]
     }
 }
 
-/// How long `serve_until` waits for a connection before it checks for a stop request again.
+/// How long a Windows server waits for a connection before it checks for a stop request again.
+#[cfg(windows)]
 const STOP_CHECK: Duration = Duration::from_millis(50);
 
 /// Serves like `serve_with` until `stop` is requested, then ends the way docs/DESIGN.md rule 5
@@ -192,7 +220,8 @@ where
 }
 
 /// The loop of `serve_until`, which `broker::serve` shares: it hands each accepted connection to
-/// `connections` until `stop` is requested, then ends as `serve_until` describes.
+/// `connections` until `stop` is requested, then ends as `serve_until` describes. On Unix the
+/// request wakes it at once (`Stop`).
 fn serve_connections_until<L, A, H>(
     listener: L,
     mut accept: A,
@@ -210,8 +239,7 @@ fn serve_connections_until<L, A, H>(
             deadline = Some(Instant::now() + drain);
         }
         let stopping = deadline.is_some();
-        let wait = if stopping { Duration::ZERO } else { STOP_CHECK };
-        match pending(raw_listener(&listener), wait) {
+        match pending(raw_listener(&listener), stop, stopping) {
             Ok(true) => match accept(&listener) {
                 Ok(client) => {
                     if !connections.start(client) {
@@ -250,20 +278,23 @@ fn raw_listener(listener: &impl AsRawListener) -> RawSocket {
     listener.as_raw_socket()
 }
 
-/// Whether a connection waits on the listening `socket`, waiting at most `wait`.
+/// Whether a connection waits on the listening `socket`. It waits for one, or for `stop` to be
+/// requested, unless the server is `stopping`.
 #[cfg(unix)]
-fn pending(socket: RawSocket, wait: Duration) -> io::Result<bool> {
-    let mut entry = libc::pollfd {
-        fd: socket,
+fn pending(socket: RawSocket, stop: &Stop, stopping: bool) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let readable = |fd| libc::pollfd {
+        fd,
         events: libc::POLLIN,
         revents: 0,
     };
-    let millis = libc::c_int::try_from(wait.as_millis()).unwrap_or(libc::c_int::MAX);
+    let mut entries = [readable(socket), readable(stop.0.wake.0.as_raw_fd())];
+    let millis = if stopping { 0 } else { -1 };
     loop {
-        // SAFETY: entry is one valid pollfd and the count is 1.
-        let ready = unsafe { libc::poll(&mut entry, 1, millis) };
+        // SAFETY: entries holds two valid pollfd entries.
+        let ready = unsafe { libc::poll(entries.as_mut_ptr(), 2, millis) };
         if ready >= 0 {
-            return Ok(ready > 0);
+            return Ok(entries[0].revents != 0);
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
@@ -272,9 +303,10 @@ fn pending(socket: RawSocket, wait: Duration) -> io::Result<bool> {
     }
 }
 
-/// Whether a connection waits on the listening `socket`, waiting at most `wait`.
+/// Whether a connection waits on the listening `socket`. It waits at most `STOP_CHECK` for one,
+/// unless the server is `stopping`.
 #[cfg(windows)]
-fn pending(socket: RawSocket, wait: Duration) -> io::Result<bool> {
+fn pending(socket: RawSocket, _stop: &Stop, stopping: bool) -> io::Result<bool> {
     use windows_sys::Win32::Networking::WinSock::{
         POLLRDNORM, SOCKET, SOCKET_ERROR, WSAGetLastError, WSAPOLLFD, WSAPoll,
     };
@@ -283,6 +315,7 @@ fn pending(socket: RawSocket, wait: Duration) -> io::Result<bool> {
         events: POLLRDNORM,
         revents: 0,
     };
+    let wait = if stopping { Duration::ZERO } else { STOP_CHECK };
     let millis = i32::try_from(wait.as_millis()).unwrap_or(i32::MAX);
     // SAFETY: entry is one valid WSAPOLLFD and the count is 1.
     let ready = unsafe { WSAPoll(&mut entry, 1, millis) };
@@ -1044,7 +1077,7 @@ mod tests {
         let client = TcpStream::connect(address).unwrap();
         (&client).write_all(b"late").unwrap();
         client.shutdown(Shutdown::Write).unwrap();
-        let stop = Stop::new();
+        let stop = Stop::new().unwrap();
         stop.request();
         serve_until(
             listener,
@@ -1063,7 +1096,7 @@ mod tests {
     #[test]
     fn a_stop_request_ends_an_idle_server_promptly() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let stop = Stop::new();
+        let stop = Stop::new().unwrap();
         let request = stop.clone();
         let started = std::time::Instant::now();
         thread::spawn(move || {
@@ -1099,7 +1132,7 @@ mod tests {
         });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let stop = Stop::new();
+        let stop = Stop::new().unwrap();
         stop.request();
         let drain = Duration::from_millis(300);
         let started = std::time::Instant::now();

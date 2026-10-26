@@ -1257,27 +1257,18 @@ fn writable_names(
 ///
 /// Entries that disappear while the walk runs are skipped, and so are directories this user may
 /// not list: the program runs as the same user, so it cannot list them either, and a name it
-/// cannot reach cannot carry a grant. `EINVAL` counts as unlistable too, because a directory of
-/// a process that is going away reports it (`/proc/<pid>/net` with `--read-write /proc`). Any
-/// other error ends the walk, because a tree sandy cannot read is a tree it cannot clear.
+/// cannot reach cannot carry a grant (`skipped`). Any other error ends the walk, because a tree
+/// sandy cannot read is a tree it cannot clear.
 fn for_each_linked_file(
     root: &Path,
     visit: &mut impl FnMut(&Path, FileId) -> ControlFlow<()>,
 ) -> std::io::Result<()> {
-    use std::io::ErrorKind;
-
-    let gone = |error: &std::io::Error| {
-        matches!(
-            error.kind(),
-            ErrorKind::NotFound | ErrorKind::PermissionDenied | ErrorKind::InvalidInput
-        )
-    };
     let mut entered = std::collections::HashSet::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(path) = pending.pop() {
         let entry = match entry(&path) {
             Ok(entry) => entry,
-            Err(error) if gone(&error) => continue,
+            Err(error) if skipped(&error) => continue,
             Err(error) => return Err(error),
         };
         if !entry.is_dir {
@@ -1291,18 +1282,35 @@ fn for_each_linked_file(
         }
         let entries = match std::fs::read_dir(&path) {
             Ok(entries) => entries,
-            Err(error) if gone(&error) => continue,
+            Err(error) if skipped(&error) => continue,
             Err(error) => return Err(error),
         };
         for entry in entries {
             match entry {
                 Ok(entry) => pending.push(entry.path()),
-                Err(error) if gone(&error) => continue,
+                Err(error) if skipped(&error) => continue,
                 Err(error) => return Err(error),
             }
         }
     }
     Ok(())
+}
+
+/// Whether the walk of `for_each_linked_file` skips an entry that failed with `error`. With
+/// `--read-write /proc` the entries of a process that is going away fail with `EINVAL` (the
+/// listing of `/proc/<pid>/net`) or `ESRCH` (`/proc/<pid>/ns` and the files in
+/// `/proc/<pid>/net`, measured on Linux 7.2), and the program cannot reach them either.
+fn skipped(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return true;
+    }
+    matches!(
+        error.kind(),
+        ErrorKind::NotFound | ErrorKind::PermissionDenied | ErrorKind::InvalidInput
+    )
 }
 
 /// Exposed ports listen on loopback only, so a relay never makes the target reachable from other
@@ -2487,6 +2495,17 @@ mod tests {
         std::thread::spawn(move || send.send(shebang(&pipe)));
         let result = receive.recv_timeout(std::time::Duration::from_secs(5));
         assert_eq!(result, Ok(None));
+    }
+
+    /// What the walk skips: a name that is gone, a directory this user may not list, and the
+    /// entries of a process that is going away. Anything else ends the walk.
+    #[cfg(unix)]
+    #[test]
+    fn the_walk_skips_the_entries_of_a_process_that_is_going_away() {
+        for code in [libc::ENOENT, libc::EACCES, libc::EINVAL, libc::ESRCH] {
+            assert!(skipped(&std::io::Error::from_raw_os_error(code)), "{code}");
+        }
+        assert!(!skipped(&std::io::Error::from_raw_os_error(libc::EIO)));
     }
 
     /// Rule 3 by identity: one file under two names, one of them writable.

@@ -412,8 +412,8 @@ port the check allows.
 3. The broker raises its soft limit of open descriptors so that
    `sandy_relay::broker::MAX_CONNECTIONS` (1000) connections fit, creates its watchdog under
    `signals = "any"`, closes every descriptor except the netlink socket, the pidfd, the guard's
-   pipe with `contained`, its side of the socket pair and the readiness pipe, and confines
-   itself:
+   pipe with `contained`, its side of the socket pair, the readiness pipe and the pipe of its
+   stop request (see step 5), and confines itself:
    - no_new_privs;
    - Landlock with every file system right of the ABI handled and no rule, so it opens, creates
      and executes no file; from ABI 4 TCP bind handled with no rule, and TCP connect not handled,
@@ -444,13 +444,15 @@ port the check allows.
    `net.ipv4.nexthop_compat_mode` is 0, does not say whether it has a gateway and is left out,
    so the network of an on-link route of that form is not the local network. A thread polls
    the pidfd and the guard's pipe, keeps the watchdog armed, and asks the serve loop to stop
-   when either ends.
+   when either ends. It asks through a pipe that the loop polls next to its listener, so the
+   listener closes at once; the pipe is made before the filter, which allows no new one.
 
 Its lifetime follows rule 5 of "Forwarded ports":
 
 - When the program ends (with `contained`: when the guard's pipe or sandy ends), the broker takes
-  the connections its backlog holds, closes its listener, gives the accepted connections at most
-  one second, and resets the rest.
+  the connections its backlog holds, closes its listener at once, gives the accepted connections
+  at most one second, and resets the rest
+  (`the_broker_closes_its_listener_as_soon_as_the_program_ends`).
 - With `signals = "any"` the program can stop the broker. Its watchdog then kills it two seconds
   after the watching thread last ran, as the relay's does
   (`a_stopped_broker_ends_with_the_program`). With `signals = "isolated"` it has no watchdog, for
@@ -1142,8 +1144,16 @@ restriction `contained` keeps that mechanism too, without needing setup.
    PID 2 and leads a process group of its own, out of sandy's. It writes both process IDs to the
    guard and to sandy and ends. sandy is the child subreaper, so both become its children: it
    waits for the program, forwards signals to it and follows its stops for job control as in
-   steps 5 and 6. The program, not PID 1, gets those signals: a PID 1 ignores every signal it has
-   no handler for, so a `SIGTERM` to it would be lost.
+   steps 5 and 6. The kernel re-parents them only at the end of the child's exit, after it has
+   closed the child's descriptors, so sandy reaps the child before it watches them, and kills
+   and reaps it before it ends them after a failure. Until then `waitid` reports nothing of the
+   two: a program that has already exited would look as if it still ran, and the guard, which
+   ends with it, as if it had ended first
+   (`a_program_that_exits_before_it_is_sandys_child_is_reported`); and after a failed start a
+   wait for the init would last for ever, because the init ends only once sandy has reaped the
+   program (`a_failed_start_in_the_namespace_leaves_no_process_behind`). The program, not PID 1,
+   gets those signals: a PID 1 ignores every signal it has no handler for, so a `SIGTERM` to it
+   would be lost.
 2. The init closes every descriptor but a pidfd of sandy and the pipe from the forked child, sets
    every signal to its default action and `SIGCHLD` to ignored, drops its capabilities and makes
    itself undumpable. Once the pipe has ended it opens a pidfd for PID 2 and ends when the program
@@ -1154,8 +1164,10 @@ restriction `contained` keeps that mechanism too, without needing setup.
    (`the_program_runs_as_pid_2_below_an_init_of_sandy`).
 3. When the init ends, the kernel ends every process of the namespace. The guard watches the
    program and sandy as in step 3 and then kills the init through a pidfd; sandy kills the
-   program's group and the init when the program ends. The init watches sandy itself as well, so
-   the namespace also ends when sandy and the guard are both killed with `SIGKILL`
+   program's group and the init when the program ends. A guard that ends while the program runs
+   ends the run as in step 5, and sandy's error names the guard of the PID namespace
+   (`a_guard_that_ends_while_the_program_runs_ends_the_run`). The init watches sandy itself as
+   well, so the namespace also ends when sandy and the guard are both killed with `SIGKILL`
    (`the_namespace_ends_when_sandy_and_the_guard_are_killed`).
 4. Processes outside the namespace have no process ID in it, so `kill`, `pidfd_open`,
    `F_SETOWN`, `setpriority`, `ioprio_set` and `sched_setaffinity` reach none of them (`ESRCH`,

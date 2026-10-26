@@ -299,8 +299,10 @@ write the other changes what programs read.
   executable and the policy file. It walks the writable trees first, because a file with more
   than one name is rare there, and the executable trees only when it found one. A directory
   the user may not list is skipped: the program runs as the same user and cannot list it
-  either. On Windows a file lists its own names (`FindFirstFileNameW`), so sandy asks the
-  files themselves and walks the writable trees only for a `read_exec` directory.
+  either. So is an entry that disappears during the walk, such as one of a process that ends
+  meanwhile below a writable `/proc`. On Windows a file lists its own names
+  (`FindFirstFileNameW`), so sandy asks the files themselves and walks the writable trees only
+  for a `read_exec` directory.
 - **What stays open.** A hard link between a writable path and a file that no rule names, or
   that only a `read` rule names, is allowed: the program can change that file through the
   writable name. Refusing it would stop the package managers that fill a project from a shared

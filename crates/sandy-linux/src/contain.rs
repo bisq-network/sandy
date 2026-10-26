@@ -44,8 +44,9 @@
 //!   first the init, which becomes PID 1, then the program, which becomes PID 2 and leads a
 //!   process group of its own. The child tells the guard and sandy both process IDs and ends; as
 //!   child subreaper sandy becomes the parent of both, so it follows the program's stops for job
-//!   control as before. The program, not PID 1, gets the signals sandy forwards: a PID 1 ignores
-//!   every signal it has no handler for.
+//!   control as before. The kernel re-parents them only at the end of the child's exit, so sandy
+//!   reaps the child before it supervises or ends them (`Group::reap_split`). The program, not
+//!   PID 1, gets the signals sandy forwards: a PID 1 ignores every signal it has no handler for.
 //! - The init (`init_main`) reaps the namespace's orphans and ends when the program or sandy ends,
 //!   through pidfds of both. The guard watches the program and sandy as before and kills the init
 //!   through a pidfd, which ends the namespace.
@@ -119,7 +120,7 @@ pub fn run(
     };
     // SAFETY: sandy is single-threaded (checked above), so the child may run any code. It leaves
     // only through execve or `_exit`, never by returning into sandy's code.
-    match unsafe { libc::fork() } {
+    let child = match unsafe { libc::fork() } {
         -1 => {
             return Err(SandboxError::io(
                 "cannot fork the program",
@@ -147,14 +148,15 @@ pub fn run(
                 start,
             )
         }
-        // Without a PID namespace the forked child becomes the program.
-        pid if split.is_none() => {
-            // What the child needed is the child's now: a copy kept here would hold the
-            // helpers' handover and factory sockets open after the child is gone.
-            drop(start);
-            group.program = Some(pid);
-        }
-        _ => drop(start),
+        child => child,
+    };
+    // What the child needed is the child's now: a copy kept here would hold the helpers'
+    // handover and factory sockets open after the child is gone.
+    drop(start);
+    // Without a PID namespace the forked child becomes the program; in one it splits itself.
+    match split {
+        None => group.program = Some(child),
+        Some(_) => group.split = Some(child),
     }
     drop(report_write);
     // Before the report is read: the execve that ends the report pipe is a watched call and
@@ -178,6 +180,7 @@ pub fn run(
     if !message.is_empty() {
         return Err(SandboxError::new(String::from_utf8_lossy(&message)));
     }
+    group.reap_split();
     let Some(program) = group.program else {
         return Err(SandboxError::new(
             "the program's process ended before it reported its process ID",
@@ -215,6 +218,9 @@ struct Group {
     program: Option<libc::pid_t>,
     /// The init of the program's PID namespace, whose end ends every process in it.
     init: Option<libc::pid_t>,
+    /// In a PID namespace, the forked child that splits itself into the init and the program,
+    /// until sandy has reaped it (`reap_split`).
+    split: Option<libc::pid_t>,
     /// sandy's controlling terminal, if one of its standard descriptors is that terminal.
     terminal: Option<RawFd>,
     /// sandy gave the terminal to the program's group, and should give it again after a stop.
@@ -270,6 +276,7 @@ impl Group {
             group: guard,
             program: None,
             init: None,
+            split: None,
             terminal: controlling_terminal(),
             program_has_terminal: false,
             to_guard,
@@ -362,11 +369,15 @@ impl Group {
                 // waitid reports them first. They are not reaped before the group is killed.
                 return match program_exited()? {
                     Some(exited) => Ok(Some(exited)),
-                    None if child.pid == self.guard => Err(SandboxError::new(
-                        "the guard of the program's process group ended unexpectedly",
+                    None if child.pid != self.guard => Err(SandboxError::new(
+                        "the init of the program's PID namespace ended unexpectedly",
+                    )),
+                    // In a PID namespace the guard ends the namespace, not a group.
+                    None if self.init.is_some() => Err(SandboxError::new(
+                        "the guard of the program's PID namespace ended unexpectedly",
                     )),
                     None => Err(SandboxError::new(
-                        "the init of the program's PID namespace ended unexpectedly",
+                        "the guard of the program's process group ended unexpectedly",
                     )),
                 };
             }
@@ -448,7 +459,8 @@ impl Group {
         }
     }
 
-    /// Kills the group, the guard, the program and the init, and reaps them.
+    /// Kills the group, the guard, the program, the init and the child that splits itself, and
+    /// reaps them.
     fn end(&mut self) {
         if self.ended {
             return;
@@ -456,15 +468,17 @@ impl Group {
         self.ended = true;
         self.take_terminal();
         // SAFETY: kill takes process and group IDs. sandy has reaped none of the guard, the
-        // program and the init, so these IDs still belong to them. The guard and the program are
-        // killed by ID as well, in case either never joined the group.
+        // program and the init, nor the child that splits itself while `split` names it, so
+        // these IDs still belong to them. The guard and the program are killed by ID as well, in
+        // case either never joined the group.
         unsafe {
             libc::kill(-self.group, libc::SIGKILL);
             libc::kill(self.guard, libc::SIGKILL);
-            for process in [self.program, self.init].into_iter().flatten() {
+            for process in [self.program, self.init, self.split].into_iter().flatten() {
                 libc::kill(process, libc::SIGKILL);
             }
         }
+        self.reap_split();
         // Every process the program started is in the group, and a member whose parent ends is
         // re-parented to sandy before that parent can be reaped, so ECHILD means the group is
         // gone. In a PID namespace they are re-parented to the init instead, and the kernel ends
@@ -483,6 +497,21 @@ impl Group {
         for process in outside.into_iter().filter(|_| self.group != self.guard) {
             // SAFETY: waits for a child killed above; the status is not needed.
             while unsafe { libc::waitpid(process, ptr::null_mut(), 0) } < 0
+                && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+            {}
+        }
+    }
+
+    /// Reaps the child that splits itself into the init and the program. It ends once it has
+    /// reported them, but the kernel makes them sandy's children only at the end of its exit,
+    /// after it has closed the child's descriptors, which ends the report. Until then waitid
+    /// reports nothing of them: a program that has already exited looks like one that still
+    /// runs, and a wait for the init can last for ever, because the init ends only once sandy has
+    /// reaped the program.
+    fn reap_split(&mut self) {
+        if let Some(split) = self.split.take() {
+            // SAFETY: waits for the child that `run` forked; the status is not needed.
+            while unsafe { libc::waitpid(split, ptr::null_mut(), 0) } < 0
                 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
             {}
         }
@@ -718,6 +747,8 @@ impl Split<'_> {
                 error,
             ));
         }
+        #[cfg(test)]
+        tests::end_slowly(program);
         // SAFETY: ends this process without running sandy's cleanup; its children are re-parented
         // to sandy, and the init sees its pipe end.
         unsafe { libc::_exit(0) }
@@ -929,4 +960,139 @@ pub(crate) fn default_child_action() -> Result<libc::sigaction, SandboxError> {
 fn controlling_terminal() -> Option<RawFd> {
     // SAFETY: tcgetpgrp takes a descriptor.
     (0..=2).find(|&fd| unsafe { libc::tcgetpgrp(fd) } > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use super::*;
+    use crate::namespace::{self, Namespaces, Purpose};
+
+    /// Makes the process that split itself end as late as a loaded host can: the kernel closes a
+    /// process's descriptors early in its exit and re-parents its children only at the end, and
+    /// the scheduler can preempt it in between.
+    static END_SLOWLY: AtomicBool = AtomicBool::new(false);
+
+    /// Runs in `Split::run` just before the process ends. With `END_SLOWLY` it closes its
+    /// descriptors, which ends sandy's report, and stays until the program, still its child, has
+    /// exited and the guard has had the time to see that and end too.
+    pub(super) fn end_slowly(program: libc::pid_t) {
+        if !END_SLOWLY.load(Ordering::Relaxed) {
+            return;
+        }
+        let _ = close_descriptors_except(&[]);
+        // SAFETY: siginfo_t is plain data; waitid writes into it and leaves the program unreaped.
+        unsafe {
+            let mut info: libc::siginfo_t = mem::zeroed();
+            libc::waitid(
+                libc::P_PID,
+                program as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    /// Runs `run` with a PID namespace in a forked child, which has the one thread that `run`
+    /// needs and becomes the subreaper, with the split ending slowly. After the split the program
+    /// does `program`. Returns what `run` returned and whether it left a child behind, or `None`
+    /// where this host gives sandy no PID namespace.
+    fn run_with_a_slow_split(program: fn() -> SandboxError) -> Option<String> {
+        let namespaces = Namespaces {
+            network: false,
+            mount: false,
+            pid: true,
+        };
+        if namespace::support(&Purpose::Processes).is_err() || namespace::probe(namespaces).is_err()
+        {
+            eprintln!("skipped: this host gives sandy no PID namespace");
+            return None;
+        }
+        END_SLOWLY.store(true, Ordering::Relaxed);
+        let (mut outcome, outcome_write) = pipe("the test's pipe").unwrap();
+        // SAFETY: the child only runs `run` and leaves through `_exit`.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            drop(outcome);
+            let start = |split: Option<&Split>| {
+                let split = split.expect("a PID namespace was asked for");
+                match namespaces.enter().and_then(|()| split.run()) {
+                    Ok(()) => program(),
+                    Err(error) => error,
+                }
+            };
+            let ran = match run(start, None, Vec::new(), &StatusReport::none(), None, true) {
+                Ok(status) => format!("exit status {status}"),
+                Err(error) => error.to_string(),
+            };
+            // SAFETY: with WNOHANG waitpid only looks for a child; it fails once there is none.
+            let left = unsafe { libc::waitpid(-1, ptr::null_mut(), libc::WNOHANG) } != -1;
+            let text = format!("{ran}; a child left: {left}");
+            let _ = (&outcome_write).write_all(text.as_bytes());
+            // SAFETY: ends the child without running the test harness's cleanup.
+            unsafe { libc::_exit(0) };
+        }
+        drop(outcome_write);
+        let mut ready = libc::pollfd {
+            fd: outcome.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: polls one open descriptor; the outcome comes long before the limit.
+        let answered = unsafe { libc::poll(&mut ready, 1, 20_000) } == 1;
+        let mut text = String::from("run did not return within 20 seconds");
+        if answered {
+            text.clear();
+            let _ = outcome.read_to_string(&mut text);
+        } else {
+            // SAFETY: ends the child forked above, which hangs.
+            unsafe { libc::kill(child, libc::SIGKILL) };
+        }
+        // SAFETY: waits for the child forked above.
+        unsafe { libc::waitpid(child, ptr::null_mut(), 0) };
+        Some(text)
+    }
+
+    /// A program that exits while the process that split itself is still ending is not sandy's
+    /// child yet, and the guard has already ended with the program. sandy reports how the program
+    /// ended instead of a guard that ended first.
+    #[test]
+    fn a_program_that_exits_before_it_is_sandys_child_is_reported() {
+        if !crate::alone::in_own_process() {
+            return;
+        }
+        let Some(outcome) = run_with_a_slow_split(|| {
+            // SAFETY: restoring the default action and raising a signal only change this
+            // process's signal state.
+            unsafe {
+                libc::signal(libc::SIGTERM, libc::SIG_DFL);
+                libc::raise(libc::SIGTERM);
+            }
+            SandboxError::new("SIGTERM did not end the program")
+        }) else {
+            return;
+        };
+        let status = SIGNALED + libc::SIGTERM;
+        assert_eq!(
+            outcome,
+            format!("exit status {status}; a child left: false")
+        );
+    }
+
+    /// A start that fails after the split ends the run before the process that split itself has
+    /// ended. sandy still ends and reaps the init and the program, which become its children only
+    /// later; a wait for the init before that waited for ever.
+    #[test]
+    fn a_failed_start_in_the_namespace_leaves_no_process_behind() {
+        if !crate::alone::in_own_process() {
+            return;
+        }
+        let Some(outcome) = run_with_a_slow_split(|| SandboxError::new("the start failed")) else {
+            return;
+        };
+        assert_eq!(outcome, "the start failed; a child left: false");
+    }
 }

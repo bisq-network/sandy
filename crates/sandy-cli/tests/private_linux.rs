@@ -75,14 +75,6 @@ fn launch_modes() -> Vec<Vec<String>> {
     modes
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// The address the host would send from to reach other machines, which is one of its own
 /// non-loopback addresses. A UDP connect only looks up the route and sends nothing.
 fn host_address() -> Option<IpAddr> {
@@ -1086,28 +1078,39 @@ fn the_broker_refuses_names_with_reply_8() {
     }
 }
 
-/// The process outside the sandbox that holds the listener on 127.0.0.1:`port` of the network
-/// namespace of process `pid`, which sees that namespace in `/proc/PID/net/tcp`. The broker is
-/// the only one: sandy keeps no copy of the listener it hands over.
-fn listener_holder(pid: u32, port: u16) -> Option<u32> {
+/// The inode of a socket at 127.0.0.1:`port` in `state` (`0A` listens, `01` is connected) in
+/// the network namespace of process `pid`, which sees that namespace in `/proc/PID/net/tcp`.
+fn socket_at(pid: u32, port: u16, state: &str) -> Option<String> {
     let local = format!("0100007F:{port:04X}");
     let table = std::fs::read_to_string(format!("/proc/{pid}/net/tcp")).ok()?;
-    let inode = table.lines().skip(1).find_map(|line| {
+    table.lines().skip(1).find_map(|line| {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        let listening = fields.get(1) == Some(&local.as_str()) && fields.get(3) == Some(&"0A");
-        listening.then(|| fields.get(9).map(|inode| inode.to_string()))?
-    })?;
+        let found = fields.get(1) == Some(&local.as_str()) && fields.get(3) == Some(&state);
+        found.then(|| fields.get(9).map(|inode| inode.to_string()))?
+    })
+}
+
+/// Whether process `holder` has a descriptor of the socket with `inode`.
+fn holds(holder: u32, inode: &str) -> bool {
     let socket = format!("socket:[{inode}]");
+    std::fs::read_dir(format!("/proc/{holder}/fd")).is_ok_and(|mut descriptors| {
+        descriptors.any(|fd| {
+            fd.and_then(|fd| std::fs::read_link(fd.path()))
+                .is_ok_and(|link| link.as_os_str() == socket.as_str())
+        })
+    })
+}
+
+/// The process outside the sandbox that holds the listener on 127.0.0.1:`port` of the network
+/// namespace of process `pid`. The broker is the only one: sandy keeps no copy of the listener
+/// it hands over.
+fn listener_holder(pid: u32, port: u16) -> Option<u32> {
+    let inode = socket_at(pid, port, "0A")?;
     let holders: Vec<u32> = std::fs::read_dir("/proc")
         .ok()?
         .filter_map(|entry| {
             let holder: u32 = entry.ok()?.file_name().to_str()?.parse().ok()?;
-            let mut descriptors = std::fs::read_dir(format!("/proc/{holder}/fd")).ok()?;
-            let holds = descriptors.any(|fd| {
-                fd.and_then(|fd| std::fs::read_link(fd.path()))
-                    .is_ok_and(|link| link.as_os_str() == socket.as_str())
-            });
-            holds.then_some(holder)
+            holds(holder, &inode).then_some(holder)
         })
         .collect();
     match holders[..] {
@@ -1132,6 +1135,72 @@ fn broker_of(pid: u32, port: u16, run: &mut Child) -> u32 {
         thread::sleep(Duration::from_millis(20));
     }
 }
+
+/// Rule 5 of "Forwarded ports" holds for the broker as for the relay: when the program ends, the
+/// broker closes its listener at once, also while it still drains a connection. The connection
+/// comes from a process of sandy's user that entered the namespace and never sends its request.
+/// The port itself is in the sandbox's namespace, so a run that starts right after has a port
+/// of its own whatever the broker of this run still holds.
+#[test]
+fn the_broker_closes_its_listener_as_soon_as_the_program_ends() {
+    if !private_network_works() {
+        return;
+    }
+    if Command::new("nsenter").arg("--version").output().is_err() {
+        return skip("nsenter", "nsenter of util-linux is not installed");
+    }
+    let port = free_port();
+    let mut run = Command::new(sandy_path())
+        .args(run_args(&egress(port, "public"), &[("read-line", "-")]))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // In the exec model the program keeps sandy's process ID.
+    let broker = broker_of(run.id(), port, &mut run);
+    let listener = socket_at(run.id(), port, "0A").unwrap();
+    let address = format!("127.0.0.1:{port}");
+    let client = [nsenter(run.id()), vec![probe_path()]].concat();
+    let mut client = Command::new(&client[0])
+        .args(&client[1..])
+        .args(probe_args(&[("tcp-connect-read", &address)]))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + WAIT;
+    while socket_at(run.id(), port, "01").is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the client never reached the broker"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    writeln!(run.stdin.take().unwrap(), "end").unwrap();
+    let output = run.wait_with_output().unwrap();
+    let ended = Instant::now();
+    assert!(output.status.success(), "{output:?}");
+    while holds(broker, &listener) {
+        assert!(ended.elapsed() < WAIT, "the broker kept its listener");
+        thread::sleep(Duration::from_millis(1));
+    }
+    let closed = ended.elapsed();
+    let draining = is_running(broker);
+    let _ = client.kill();
+    let _ = client.wait();
+    assert!(
+        draining,
+        "the broker ended before it drained the held connection"
+    );
+    assert!(
+        closed < CLOSED_AT_ONCE,
+        "the broker kept its listener {closed:?} after the program ended"
+    );
+}
+
+/// How soon after the end of the program its broker has closed its listener.
+const CLOSED_AT_ONCE: Duration = Duration::from_millis(20);
 
 /// With `children = "contained"` the guard watches the broker as it watches the relay, and ends
 /// the program when the broker is gone; sandy exits with status 125 and says why. Control: while

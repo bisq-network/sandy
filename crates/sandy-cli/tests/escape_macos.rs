@@ -591,14 +591,6 @@ unsafe extern "C" {
 /// `sandbox_check` filter type for a path argument.
 const SANDBOX_FILTER_PATH: c_int = 1;
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// The probe as a server on `inner` in the sandbox, with sandy relaying `outer` to it.
 fn start_exposed_server(fixture: &Fixture, inner: u16, outer: u16) -> Child {
     start_exposed_server_with(fixture, inner, outer, &[])

@@ -16,9 +16,9 @@ use std::time::{Duration, Instant};
 
 use sandy_core::{SandboxError, StatusReport};
 use windows_sys::Win32::Foundation::{
-    DUPLICATE_SAME_ACCESS, DuplicateHandle, FALSE, GENERIC_READ, GENERIC_WRITE, HANDLE,
-    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, STATUS_CONTROL_C_EXIT, SetHandleInformation, TRUE,
-    WAIT_OBJECT_0,
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_MORE_DATA, FALSE, GENERIC_READ, GENERIC_WRITE,
+    HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, STATUS_CONTROL_C_EXIT, SetHandleInformation,
+    TRUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::{
     SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
@@ -31,13 +31,15 @@ use windows_sys::Win32::System::Console::{
     STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
     JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES, JOB_OBJECT_UILIMIT_READCLIPBOARD,
     JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS, JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
     JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, SetInformationJobObject,
+    JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList, JobObjectBasicUIRestrictions,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
     TerminateJobObject,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
@@ -45,12 +47,12 @@ use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
     DETACHED_PROCESS, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
     GetCurrentProcess, GetExitCodeProcess, GetProcessId, GetProcessMitigationPolicy, INFINITE,
-    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
     PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    PROCESS_INFORMATION, ProcessSystemCallDisablePolicy, ResumeThread, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForMultipleObjects,
-    WaitForSingleObject,
+    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    ProcessSystemCallDisablePolicy, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    TerminateProcess, UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
 };
 
 use super::util::{Sid, last_error, wide_nul};
@@ -143,6 +145,10 @@ pub struct Ended {
 const RELAY_READY: &str = "ready";
 /// How long a relay may take to report that it listens.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long sandy waits for the processes of a job it ended (`end_job`).
+const END_WAIT: Duration = Duration::from_secs(3);
+/// How often `end_job` looks whether the job still counts a process.
+const END_POLL: Duration = Duration::from_millis(1);
 
 /// Everything `CreateProcessW` needs for one process.
 pub struct Process<'a> {
@@ -234,9 +240,9 @@ fn start_and_wait(
     status.exited(code as i32);
     // Processes the program left behind would die when sandy exits and the job closes. Ending
     // them now also closes their copies of the output pipes, so the console relays finish, and
-    // nothing in the sandbox can make a new connection while the relays drain.
-    // SAFETY: job is a valid job handle.
-    unsafe { TerminateJobObject(job.as_raw_handle(), code) };
+    // once they have ended nothing in the sandbox can make a new connection while the relays
+    // drain.
+    report_end(end_job(job, code), "processes the program left behind");
     if let Some(relay_job) = relay_job {
         end_relays(running, &relay_job, deadline, code);
     }
@@ -270,10 +276,12 @@ fn wait_for_program(
         }
     };
     if waited == WAIT_OBJECT_0 + 1 {
-        // SAFETY: job is a valid job handle.
-        if unsafe { TerminateJobObject(job.as_raw_handle(), PARENT_ENDED) } == 0 {
+        match end_job(job, PARENT_ENDED) {
             // The caller closes the job then, and kill-on-close ends the program.
-            return Err(last_error("cannot end the program's job"));
+            Err(NotEnded::Refused(error)) => {
+                return Err(SandboxError::io("cannot end the program's job", error));
+            }
+            ended => report_end(ended, "the program and the processes it started"),
         }
         // SAFETY: process is a valid process handle.
         unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) };
@@ -354,7 +362,8 @@ fn wait_until_ready(output: OwnedHandle) -> Result<(), SandboxError> {
 }
 
 /// Ends the relays by the lifetime rule: closing their input tells them to take no new
-/// connection and to let accepted ones finish; at `deadline` sandy ends whatever still runs.
+/// connection and to let accepted ones finish; at `deadline` sandy ends whatever still runs, and
+/// waits until it is gone, so no relay outlives sandy and their ports are free when it exits.
 fn end_relays(running: Vec<RunningRelay>, relay_job: &OwnedHandle, deadline: Instant, code: u32) {
     let mut processes = Vec::with_capacity(running.len());
     for relay in running {
@@ -362,13 +371,154 @@ fn end_relays(running: Vec<RunningRelay>, relay_job: &OwnedHandle, deadline: Ins
         processes.push(relay.process);
     }
     for process in &processes {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let millis = u32::try_from(left.as_millis()).unwrap_or(u32::MAX);
-        // SAFETY: process is a valid process handle; a timeout only limits the wait.
-        unsafe { WaitForSingleObject(process.as_raw_handle(), millis) };
+        ended_by(process, deadline);
     }
-    // SAFETY: relay_job is a valid job handle.
-    unsafe { TerminateJobObject(relay_job.as_raw_handle(), code) };
+    report_end(end_job(relay_job, code), "the relays");
+}
+
+/// Why `end_job` cannot say that every process of a job is gone.
+#[derive(Debug)]
+enum NotEnded {
+    /// The job could not be ended.
+    Refused(io::Error),
+    /// The job was ended, but a process was still there after `END_WAIT`, or sandy could not
+    /// look.
+    Unconfirmed(Option<io::Error>),
+}
+
+/// Ends `job` with `code` and waits, at most `END_WAIT`, until its processes are gone:
+/// `TerminateJobObject` only starts their termination. Windows stops counting a process in its
+/// job before it has closed the process's handles, its sockets among them, and signals it
+/// (measured on Windows 11), so the wait is on handles of the processes, opened before the end.
+/// The job's count covers a process that joined it after that.
+fn end_job(job: &OwnedHandle, code: u32) -> Result<(), NotEnded> {
+    let processes = job_processes(job);
+    // SAFETY: job is a valid job handle.
+    if unsafe { TerminateJobObject(job.as_raw_handle(), code) } == 0 {
+        return Err(NotEnded::Refused(io::Error::last_os_error()));
+    }
+    let limit = Instant::now() + END_WAIT;
+    let processes = processes.map_err(|error| NotEnded::Unconfirmed(Some(error)))?;
+    let left = processes
+        .iter()
+        .filter(|process| !ended_by(process, limit))
+        .count();
+    match job_ended_by(job, limit) {
+        Ok(true) if left == 0 => Ok(()),
+        Ok(_) => Err(NotEnded::Unconfirmed(None)),
+        Err(error) => Err(NotEnded::Unconfirmed(Some(error))),
+    }
+}
+
+/// Says on standard error when `end_job` could not confirm that `what` has ended. sandy exits
+/// anyway: a hang would be worse than a process that ends a moment after it.
+fn report_end(ended: Result<(), NotEnded>, what: &str) {
+    match ended {
+        Ok(()) => {}
+        Err(NotEnded::Refused(error)) => eprintln!("sandy: cannot end {what}: {error}"),
+        Err(NotEnded::Unconfirmed(None)) => eprintln!(
+            "sandy: {what} did not end within {} seconds after sandy ended them",
+            END_WAIT.as_secs()
+        ),
+        Err(NotEnded::Unconfirmed(Some(error))) => {
+            eprintln!("sandy: cannot tell whether {what} have ended: {error}")
+        }
+    }
+}
+
+/// Handles of the processes in `job`, to wait for them. A process that ends before sandy opens
+/// it is left out, and so is one that took the ID of a process of the job meanwhile.
+fn job_processes(job: &OwnedHandle) -> io::Result<Vec<OwnedHandle>> {
+    let header = std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList);
+    let mut capacity = 64;
+    for _ in 0..8 {
+        // usize words, so that the list is aligned like the structure.
+        let mut buffer = vec![0usize; header / size_of::<usize>() + capacity];
+        // SAFETY: job is a valid job handle; buffer is writable for the size passed.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectBasicProcessIdList,
+                buffer.as_mut_ptr().cast(),
+                size_of_val(buffer.as_slice()) as u32,
+                ptr::null_mut(),
+            )
+        };
+        // SAFETY: buffer is aligned for the structure and holds at least its header.
+        let list = unsafe { &*buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
+        let (assigned, listed) = (
+            list.NumberOfAssignedProcesses,
+            list.NumberOfProcessIdsInList,
+        );
+        if ok == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_MORE_DATA as i32) {
+                return Err(error);
+            }
+        }
+        if ok == 0 || listed < assigned {
+            capacity = (assigned as usize).max(2 * capacity) + 16;
+            continue;
+        }
+        let start = header / size_of::<usize>();
+        let ids = &buffer[start..start + listed as usize];
+        return Ok(ids.iter().filter_map(|&id| open_in_job(id, job)).collect());
+    }
+    Err(io::Error::other("the job's list of processes kept growing"))
+}
+
+/// A handle of process `id` to wait for it, if that process is in `job`.
+fn open_in_job(id: usize, job: &OwnedHandle) -> Option<OwnedHandle> {
+    let access = PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
+    // SAFETY: OpenProcess takes no pointers; the handle is checked before use.
+    let raw = unsafe { OpenProcess(access, FALSE, u32::try_from(id).ok()?) };
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: raw is a new process handle that nothing else owns.
+    let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut in_job = FALSE;
+    // SAFETY: both handles are valid; in_job is writable.
+    let ok = unsafe { IsProcessInJob(process.as_raw_handle(), job.as_raw_handle(), &mut in_job) };
+    (ok != 0 && in_job != 0).then_some(process)
+}
+
+/// Whether `process` has ended by `limit`. Windows signals a process once it has closed its
+/// handles, its sockets among them.
+fn ended_by(process: &OwnedHandle, limit: Instant) -> bool {
+    let left = limit.saturating_duration_since(Instant::now());
+    let millis = u32::try_from(left.as_millis()).unwrap_or(u32::MAX);
+    // SAFETY: process is a valid process handle; a timeout only limits the wait.
+    let waited = unsafe { WaitForSingleObject(process.as_raw_handle(), millis) };
+    waited == WAIT_OBJECT_0
+}
+
+/// Whether `job` counts no active process any more by `limit`.
+fn job_ended_by(job: &OwnedHandle, limit: Instant) -> io::Result<bool> {
+    loop {
+        // SAFETY: the structure is plain data; zero is a valid value for every field.
+        let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: job is a valid job handle; info is a writable structure of the size passed.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectBasicAccountingInformation,
+                (&raw mut info).cast(),
+                size_of_val(&info) as u32,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if info.ActiveProcesses == 0 {
+            return Ok(true);
+        }
+        if Instant::now() >= limit {
+            return Ok(false);
+        }
+        std::thread::sleep(END_POLL);
+    }
 }
 
 /// Kills the job on Ctrl+C and Ctrl+Break. The target has its own console (see `start`), so the

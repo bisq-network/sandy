@@ -13,14 +13,6 @@ const WAIT: Duration = Duration::from_secs(20);
 #[cfg(target_os = "linux")]
 const HALF_SECOND: Duration = Duration::from_millis(500);
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// A loopback service outside the sandbox. The thread reports whether a connection arrived
 /// before the deadline.
 fn outside_service() -> (String, JoinHandle<bool>) {
