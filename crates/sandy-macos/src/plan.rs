@@ -5,7 +5,7 @@ use std::path::Path;
 
 use sandy_core::{
     ChildProcesses, FileView, IpAccess, NetworkAccess, PathAccess, PathIdentity, PlanItem,
-    ProtectedPath, Requirement, ResolvedPolicy, SignalScope, SystemAccess,
+    ProtectedPath, Relays, Requirement, ResolvedPolicy, SignalScope, SystemAccess,
 };
 
 use crate::system::{self, SystemAccess as Grant};
@@ -233,6 +233,7 @@ fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
         );
     }
     let held = !policy.forward.is_empty() || policy.egress.is_some();
+    let ipv4 = policy.macos.relays == Relays::Ipv4;
     if policy.ip == IpAccess::Private && held {
         // The guard ends a contained program with its helpers.
         let ended = if contained {
@@ -241,25 +242,46 @@ fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
             ", and once the relay or the broker has ended, also when something outside the \
              sandbox ends it, any process that binds the port does"
         };
+        let (addresses, gained) = if ipv4 {
+            (
+                "each of its IPv4 addresses",
+                "a new VPN or local network address",
+            )
+        } else {
+            ("each of them", "a new temporary IPv6 or VPN address")
+        };
         shortfalls.push(format!(
             "ip = \"private\" keeps the program off this Mac's other addresses only in part on \
              macOS: Seatbelt's localhost matches every address of this Mac, so the program may \
-             connect to its forwarded and egress ports at each of them; the relay and the \
+             connect to its forwarded and egress ports at {addresses}; the relay and the \
              broker hold those ports at every address the Mac had when they started, but a \
              process of sandy's own user that listens on one at an address the Mac gains later, \
-             such as a new temporary IPv6 or VPN address, receives the program's connections \
-             there{ended} (docs/macos.md, \"The private network\")"
-        ));
-        shortfalls.push(
-            "ip = \"private\" keeps the program off the local network only in part on macOS: \
-             Seatbelt's localhost matches an IPv6 link-local address of this Mac with any \
-             interface as its scope, so the program may connect to its forwarded and egress \
-             ports at a link-local address that is this Mac's on one link and another host's \
-             on another, such as fe80::1, which every Mac has on its loopback and many routers \
-             use, and no socket of sandy's can hold an address of another host (docs/macos.md, \
+             such as {gained}, receives the program's connections there{ended} (docs/macos.md, \
              \"The private network\")"
-                .to_string(),
-        );
+        ));
+        if ipv4 {
+            shortfalls.push(
+                "macos.relays = \"ipv4\" lets the program reach its forwarded and egress ports \
+                 only from IPv4 sockets on macOS: an IPv6 socket gets EPERM there, also one that \
+                 connects to 127.0.0.1 as ::ffff:127.0.0.1, which is how Java and .NET connect to \
+                 an IPv4 address by default, so start Java with \
+                 -Djava.net.preferIPv4Stack=true and .NET with DOTNET_SYSTEM_NET_DISABLEIPV6=1 \
+                 (docs/macos.md, \"The private network\")"
+                    .to_string(),
+            );
+        } else {
+            shortfalls.push(
+                "ip = \"private\" keeps the program off the local network only in part on \
+                 macOS: Seatbelt's localhost matches an IPv6 link-local address of this Mac with \
+                 any interface as its scope, so the program may connect to its forwarded and \
+                 egress ports at a link-local address that is this Mac's on one link and another \
+                 host's on another, such as fe80::1, which every Mac has on its loopback and many \
+                 routers use, and no socket of sandy's can hold an address of another host; \
+                 macos.relays = \"ipv4\" closes this, at the cost of IPv6 sockets to those ports \
+                 (docs/macos.md, \"The private network\")"
+                    .to_string(),
+            );
+        }
     }
     if policy.egress.is_some() {
         shortfalls.push(
@@ -465,21 +487,30 @@ fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
                      (docs/macos.md, \"The private network\")",
                 );
             }
-            if policy.unix_sockets == NetworkAccess::All {
-                "TCP only: network-outbound only to the forwarded and egress ports, network-bind \
-                 and network-inbound only on the exposed ports, both at every address of this \
-                 Mac, which is what Seatbelt's localhost matches; the relay and the broker bind \
-                 their ports without listening at the wildcard addresses and at every current \
-                 address of this Mac; no UDP, no NECP calls; the name resolver (mDNSResponder) \
-                 stays reachable like every Unix socket (unix_sockets = \"all\")"
+            let ports = match policy.macos.relays {
+                Relays::DualStack => {
+                    "network-outbound only to the forwarded and egress ports, network-bind and \
+                     network-inbound only on the exposed ports, both at every address of this \
+                     Mac"
+                }
+                Relays::Ipv4 => {
+                    "network-outbound only to the forwarded and egress ports at every IPv4 \
+                     address of this Mac, network-bind and network-inbound only on the exposed \
+                     ports at every address of this Mac"
+                }
+            };
+            let resolver = if policy.unix_sockets == NetworkAccess::All {
+                "the name resolver (mDNSResponder) stays reachable like every Unix socket \
+                 (unix_sockets = \"all\")"
             } else {
-                "TCP only: network-outbound only to the forwarded and egress ports, network-bind \
-                 and network-inbound only on the exposed ports, both at every address of this \
-                 Mac, which is what Seatbelt's localhost matches; the relay and the broker bind \
-                 their ports without listening at the wildcard addresses and at every current \
-                 address of this Mac; no UDP, no NECP calls; names resolve only from /etc/hosts, \
-                 the name resolver (mDNSResponder) is unreachable"
-            }
+                "names resolve only from /etc/hosts, the name resolver (mDNSResponder) is \
+                 unreachable"
+            };
+            return Mechanism::Profile(format!(
+                "TCP only: {ports}, which is what Seatbelt's localhost matches; the relay and the \
+                 broker bind their ports without listening at the wildcard addresses and at \
+                 every current address of this Mac; no UDP, no NECP calls; {resolver}"
+            ));
         }
         Requirement::PathsHidden => {
             if policy.unix_sockets == NetworkAccess::All {
@@ -502,6 +533,11 @@ fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
              own profile: accept on its port, TCP out, no connection to an address of this Mac \
              (localhost denied), the routing sysctl, no files, no Mach services; it ends when \
              the target ends (kqueue NOTE_EXIT)"
+        }
+        Requirement::RelaysIpv4Only => {
+            "network-outbound to the forwarded and egress ports only from IPv4 sockets (tcp4), \
+             so the program cannot connect to them at an IPv6 address, also not at a link-local \
+             address of this Mac at the scope of another link"
         }
         Requirement::Win32kDenied => {
             return Mechanism::Exec(
@@ -545,6 +581,7 @@ mod tests {
             end_with_parent: false,
             path_metadata: PathMetadata::Deny,
             environment: EnvironmentPolicy::default(),
+            macos: sandy_core::MacosPolicy::default(),
             windows: WindowsPolicy::default(),
         }
     }
@@ -1020,6 +1057,74 @@ mod tests {
             count(&all, exposed) + count(&all, held) + count(&all, scoped),
             0
         );
+    }
+
+    /// `macos.relays = "ipv4"` is the profile's. It takes the link-local route out of the
+    /// warnings, which name what the program pays instead: its IPv6 sockets to the forwarded
+    /// and egress ports. Without such ports there is nothing to pay.
+    #[test]
+    fn ipv4_relays_close_the_link_local_route_and_name_the_cost() {
+        let notes_starting = |policy: &ResolvedPolicy, start: &str| -> Vec<String> {
+            notes(policy)
+                .into_iter()
+                .filter(|note| note.starts_with(start))
+                .collect()
+        };
+        let scoped = "ip = \"private\" keeps the program off the local network only in part";
+        let cost = "macos.relays = \"ipv4\" lets the program reach its forwarded and egress \
+                    ports only from IPv4 sockets";
+        let held = "ip = \"private\" keeps the program off this Mac's other addresses";
+
+        let dual_stack = private_network();
+        let scoped_note = notes_starting(&dual_stack, scoped);
+        assert_eq!(scoped_note.len(), 1);
+        assert!(
+            scoped_note[0].contains("macos.relays = \"ipv4\" closes this"),
+            "{scoped_note:?}"
+        );
+        assert!(notes_starting(&dual_stack, cost).is_empty());
+
+        let mut ipv4 = private_network();
+        ipv4.macos.relays = Relays::Ipv4;
+        let Status::Enforced { mechanism } = status_of(&ipv4, Requirement::RelaysIpv4Only) else {
+            panic!("not enforced");
+        };
+        assert!(
+            mechanism.starts_with(
+                "Seatbelt profile: network-outbound to the forwarded and egress ports only from \
+                 IPv4 sockets (tcp4)"
+            ),
+            "{mechanism}"
+        );
+        let private = format!("{:?}", status_of(&ipv4, Requirement::IpNetworkPrivate));
+        assert!(private.contains("at every IPv4 address"), "{private}");
+        let plan = EnforcementPlan::new(&ipv4.requirements(), plan_for(&ipv4, &capable()));
+        assert!(plan.is_enforceable(), "{plan}");
+        assert!(notes_starting(&ipv4, scoped).is_empty());
+        let cost_note = notes_starting(&ipv4, cost);
+        assert_eq!(cost_note.len(), 1);
+        for advice in [
+            "::ffff:127.0.0.1",
+            "-Djava.net.preferIPv4Stack=true",
+            "DOTNET_SYSTEM_NET_DISABLEIPV6=1",
+        ] {
+            assert!(cost_note[0].contains(advice), "{cost_note:?}");
+        }
+        let held_note = notes_starting(&ipv4, held);
+        assert_eq!(held_note.len(), 1);
+        assert!(
+            held_note[0].contains("each of its IPv4 addresses") && !held_note[0].contains("IPv6"),
+            "{held_note:?}"
+        );
+
+        let mut alone = ipv4;
+        alone.forward.clear();
+        alone.egress = None;
+        assert!(notes_starting(&alone, cost).is_empty());
+        assert!(matches!(
+            status_of(&alone, Requirement::RelaysIpv4Only),
+            Status::Enforced { .. }
+        ));
     }
 
     #[test]

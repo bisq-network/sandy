@@ -381,6 +381,7 @@ mod tests {
             end_with_parent: false,
             path_metadata: PathMetadata::Deny,
             environment: EnvironmentPolicy::default(),
+            macos: sandy_core::MacosPolicy::default(),
             windows: WindowsPolicy::default(),
         };
         let mut policies = Vec::new();
@@ -428,6 +429,21 @@ mod tests {
                 reach: sandy_core::EgressReach::Public,
             }),
             view: sandy_core::FileView::Policy,
+            ..base.clone()
+        });
+        policies.push(ResolvedPolicy {
+            ip: IpAccess::Private,
+            forward: vec![sandy_core::ForwardedPort {
+                port: 18081,
+                to: "127.0.0.1:8081".parse().unwrap(),
+            }],
+            egress: Some(sandy_core::Egress {
+                port: 1080,
+                reach: sandy_core::EgressReach::Public,
+            }),
+            macos: sandy_core::MacosPolicy {
+                relays: sandy_core::Relays::Ipv4,
+            },
             ..base.clone()
         });
         policies.push(ResolvedPolicy {

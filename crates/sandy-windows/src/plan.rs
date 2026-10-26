@@ -360,6 +360,11 @@ fn contained(
              it; job UI restrictions and low integrity block window messages"
         )),
         Requirement::Win32kDenied => enforced(WIN32K_LOCKDOWN.to_string()),
+        Requirement::RelaysIpv4Only => enforced(format!(
+            "nothing to restrict: the relays and the egress broker take the program's \
+             connections at 127.0.0.1 in AppContainer {name:?}, which reaches no other address \
+             without network capabilities"
+        )),
         Requirement::EgressBrokered => match (
             &host.firewall,
             &host.loopback_exempt,
@@ -853,6 +858,34 @@ mod tests {
         policy.windows.appcontainer_name = None;
         assert!(matches!(
             status(&policy, &host(), Requirement::Win32kDenied),
+            Status::Unavailable { .. }
+        ));
+    }
+
+    /// `macos.relays = "ipv4"` asks for a requirement that the AppContainer gives without a
+    /// mechanism, because it reaches no address but loopback; like every requirement it needs
+    /// the AppContainer.
+    #[test]
+    fn ipv4_relays_need_nothing_on_windows() {
+        let mut policy = policy();
+        policy.ip = IpAccess::Private;
+        assert!(
+            !plan_for(&policy, &host())
+                .iter()
+                .any(|item| item.requirement == Requirement::RelaysIpv4Only)
+        );
+        policy.macos.relays = sandy_core::Relays::Ipv4;
+        match status(&policy, &host(), Requirement::RelaysIpv4Only) {
+            Status::Enforced { mechanism } => {
+                assert!(mechanism.starts_with("nothing to restrict"), "{mechanism}")
+            }
+            Status::Unavailable { reason } | Status::NeedsSetup { reason } => {
+                panic!("unavailable: {reason}")
+            }
+        }
+        policy.windows.appcontainer_name = None;
+        assert!(matches!(
+            status(&policy, &host(), Requirement::RelaysIpv4Only),
             Status::Unavailable { .. }
         ));
     }

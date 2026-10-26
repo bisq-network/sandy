@@ -125,6 +125,9 @@ const VIEW: &str = "a user and a mount namespace of the sandbox's own, created b
 const ERRATUM_3: u64 = 1 << 2;
 const NO_WIN32K: &str =
     "nothing to deny: win32k is the GUI part of the Windows kernel, and Linux has none";
+const NO_IPV6_RELAY_ROUTE: &str = "nothing to restrict: the relays and the egress broker listen \
+    at 127.0.0.1 in the sandbox's own network namespace, and no address of that namespace leads \
+    out of it";
 
 /// How many `#!` lines sandy follows when it checks whether the program can be executed. The
 /// kernel follows more (measured on Linux 7.2: a chain of five scripts runs, six fails with
@@ -585,6 +588,7 @@ fn plan_item(
             Ok(()) => enforced(FILTER_METADATA.to_string()),
         },
         Requirement::Win32kDenied => enforced(NO_WIN32K.to_string()),
+        Requirement::RelaysIpv4Only => enforced(NO_IPV6_RELAY_ROUTE.to_string()),
         Requirement::IpNetworkPrivate => match (&host.user_namespaces, &host.seccomp) {
             (Err(Missing::Unavailable(reason)), _) | (_, Err(reason)) => unavailable(reason),
             (Err(Missing::NeedsSetup(reason)), _) => PlanItem::needs_setup(requirement, reason),
@@ -1108,6 +1112,7 @@ mod tests {
             end_with_parent: false,
             path_metadata: PathMetadata::Deny,
             environment: EnvironmentPolicy::default(),
+            macos: sandy_core::MacosPolicy::default(),
             windows: WindowsPolicy::default(),
         }
     }
@@ -1380,6 +1385,33 @@ mod tests {
                 reason: "no seccomp".to_string()
             }
         );
+    }
+
+    /// `macos.relays = "ipv4"` asks for a requirement that the network namespace gives without
+    /// a mechanism, because no address in it leads out. Nothing else of the plan changes.
+    #[test]
+    fn ipv4_relays_need_nothing_on_linux() {
+        let mut policy = policy();
+        policy.ip = IpAccess::Private;
+        policy.forward = vec![ForwardedPort {
+            port: 18082,
+            to: "127.0.0.1:8082".parse().unwrap(),
+        }];
+        let plain = plan_for(&policy, &host(Some(9)));
+        assert!(
+            plain
+                .items
+                .iter()
+                .all(|item| item.requirement != Requirement::RelaysIpv4Only)
+        );
+        policy.macos.relays = sandy_core::Relays::Ipv4;
+        let plan = plan_for(&policy, &host(Some(9)));
+        assert_eq!(unavailable(&plan), vec![]);
+        let Status::Enforced { mechanism } = status(&plan, Requirement::RelaysIpv4Only) else {
+            panic!("{plan:?}");
+        };
+        assert!(mechanism.starts_with("nothing to restrict"), "{mechanism}");
+        assert_eq!(plan.sandbox, plain.sandbox);
     }
 
     /// The egress broker serves a listener in the sandbox's network namespace, so it is

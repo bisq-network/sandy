@@ -27,6 +27,11 @@ pub enum Requirement {
     /// Connections out leave only through the egress broker, which connects only to the
     /// destinations of the policy's `reach` and never to the host itself.
     EgressBrokered,
+    /// The target reaches its forwarded ports and the egress broker over IPv4 only, so no IPv6
+    /// address, such as a link-local address of the host at the scope of another link, takes
+    /// its connections to those ports out of the sandbox. Platforms whose private network has
+    /// no such route give this without a mechanism.
+    RelaysIpv4Only,
     /// Paths outside the policy paths and the system set look missing to the target.
     PathsHidden,
     /// The target can connect out over IPv4 and IPv6, loopback included, but cannot listen for
@@ -79,6 +84,7 @@ impl Requirement {
             Requirement::IpNetworkDenied => "IP networking denied",
             Requirement::IpNetworkPrivate => "IP networking limited to the sandbox's own loopback",
             Requirement::EgressBrokered => "connections out only through the egress broker",
+            Requirement::RelaysIpv4Only => "forwarded and egress ports reached over IPv4 only",
             Requirement::PathsHidden => "paths outside the policy hidden",
             Requirement::InboundIpDenied => "no inbound IP connections",
             Requirement::UnixSocketsDenied => "Unix sockets outside writable paths denied",

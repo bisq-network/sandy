@@ -398,6 +398,7 @@ it does nothing.
 | `--forward PORT=ADDRESS` | Relay the program's connections to its loopback `PORT` to the loopback `ADDRESS` outside the sandbox. Needs `--ip private`, `client` or `all`. | |
 | `--egress PORT[=REACH]` | A SOCKS5 broker on the program's `127.0.0.1:PORT` that connects out only to `REACH`: `public` or `public-and-local`, never to this host. Needs `--ip private`. | `public` |
 | `--linux-path-metadata deny\|allow` | On Linux, whether `chmod`, `chown`, `utimensat` and `setxattr` by path are allowed. | `deny` |
+| `--macos-relays dual-stack\|ipv4` | On macOS, how the program reaches its forwarded and egress ports. `ipv4` closes a route to hosts of the local network through IPv6 link-local addresses and denies IPv6 sockets to those ports, so Java needs `-Djava.net.preferIPv4Stack=true`. `ipv4` needs `--ip private`. See [macOS](#macos). | `dual-stack` |
 | `--pass-env NAME` | Copy the variable `NAME` into the program's environment, if it is set. | |
 | `--set-env NAME=VALUE` | Set a variable in the program's environment. Overrides `--pass-env`. | |
 | `--appcontainer NAME` | The AppContainer name (Windows; required there). | |
@@ -521,14 +522,17 @@ set = { HOME = "/path" }        # fixed values; override pass
 [linux]
 path_metadata = "deny"          # "deny" | "allow"
 
+[macos]
+relays = "dual-stack"           # "dual-stack" | "ipv4"; ipv4: forwarded and egress ports over IPv4
+
 [windows]
 appcontainer_name = "example.app"
 win32k = "allow"                # "allow" | "deny"; deny blocks win32k system calls
 ```
 
 The block names every key; it is not a policy that runs as written, because `expose` needs
-`ip = "all"` or `"private"`, `forward` needs any `ip` but `"none"`, `egress` needs
-`ip = "private"`, and one path cannot be both `read_exec` and `read_write`. Unknown keys are errors, so a misspelled key never becomes a silent default.
+`ip = "all"` or `"private"`, `forward` needs any `ip` but `"none"`, `egress` and
+`relays = "ipv4"` need `ip = "private"`, and one path cannot be both `read_exec` and `read_write`. Unknown keys are errors, so a misspelled key never becomes a silent default.
 
 ### Rules
 
@@ -860,6 +864,13 @@ metadata through the descriptor they wrote.
   gains while sandy runs, and the program can connect to those ports at a link-local address of
   the Mac on another link, where another host may have it, such as a router at `fe80::1`;
   `sandy check` warns about each.
+- `macos.relays = "ipv4"` (`--macos-relays ipv4`) closes that link-local route: the program then
+  reaches its forwarded and egress ports from IPv4 sockets only. An IPv6 socket gets "Operation
+  not permitted" there, also one that connects to 127.0.0.1 as `::ffff:127.0.0.1`, which is how
+  Java and .NET connect to an IPv4 address by default; start Java with
+  `-Djava.net.preferIPv4Stack=true` and .NET with `DOTNET_SYSTEM_NET_DISABLEIPV6=1`. With the key
+  sandy refuses a forward to an IPv6 address, and without `ip = "private"` it refuses the key.
+  On Linux and Windows the key changes nothing but these refusals.
 - The system writes the crash report of a program that sandy runs to
   `/Library/Logs/DiagnosticReports`, which administrators can read and standard users cannot,
   instead of the user's `~/Library/Logs/DiagnosticReports`.

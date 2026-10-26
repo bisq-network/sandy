@@ -26,6 +26,8 @@ pub struct Policy {
     #[serde(default)]
     pub linux: LinuxPolicy,
     #[serde(default)]
+    pub macos: MacosPolicy,
+    #[serde(default)]
     pub windows: WindowsPolicy,
 }
 
@@ -38,6 +40,7 @@ impl Default for Policy {
             process: ProcessPolicy::default(),
             environment: EnvironmentPolicy::default(),
             linux: LinuxPolicy::default(),
+            macos: MacosPolicy::default(),
             windows: WindowsPolicy::default(),
         }
     }
@@ -348,6 +351,40 @@ pub enum PathMetadata {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct MacosPolicy {
+    #[serde(default)]
+    pub relays: Relays,
+}
+
+/// How the target reaches its forwarded ports and the egress broker under `ip = "private"`.
+///
+/// A Seatbelt rule can name a port only at every address of the Mac, and for an IPv6 link-local
+/// address it ignores the scope, so with `dual-stack` the program can connect to those ports at a
+/// link-local address of the Mac on another link, where another host may have it (docs/macos.md,
+/// "The private network"). `ipv4` allows the ports over IPv4 only, which closes that route and
+/// costs the program its IPv6 sockets there: one that connects to 127.0.0.1 as
+/// `::ffff:127.0.0.1`, as Java and .NET do by default, is denied. Other platforms have no such
+/// route, so there the requirement holds without a mechanism.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Relays {
+    #[default]
+    DualStack,
+    Ipv4,
+}
+
+impl Relays {
+    /// The value as the policy writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Relays::DualStack => "dual-stack",
+            Relays::Ipv4 => "ipv4",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WindowsPolicy {
     /// Stable name of the AppContainer profile. Required on Windows. Access grants and the
     /// loopback exemption are bound to this name.
@@ -420,6 +457,7 @@ pub enum PolicyError {
         reason: &'static str,
     },
     ChildrenNeedUnixSocketsDenied(ChildProcesses),
+    Ipv4RelaysNeedPrivateNetwork,
     ContainedChildrenNeedIsolatedSignals,
     EndWithParentNeedsIsolatedSignals,
     ProgramNotAFile(PathBuf),
@@ -516,6 +554,11 @@ impl fmt::Display for PolicyError {
             PolicyError::InvalidEgress { egress, reason } => {
                 write!(f, "invalid egress port {}: {reason}", egress.port)
             }
+            PolicyError::Ipv4RelaysNeedPrivateNetwork => f.write_str(
+                "macos.relays = \"ipv4\" needs ip = \"private\": it closes a route of the private \
+                 network on macOS, and with any other value the program either has no network or \
+                 reaches every address without the relays",
+            ),
             PolicyError::InvalidExpose { expose, reason } => write!(
                 f,
                 "invalid expose {} -> port {}: {reason}",
@@ -559,6 +602,7 @@ mod tests {
         assert_eq!(policy.linux.path_metadata, PathMetadata::Deny);
         assert_eq!(policy.process.children, ChildProcesses::Allowed);
         assert_eq!(policy.windows.win32k, Win32k::Allow);
+        assert_eq!(policy.macos.relays, Relays::DualStack);
         assert_eq!(policy.filesystem.view, FileView::All);
         assert_eq!(policy.network.egress, None);
     }
@@ -586,6 +630,8 @@ mod tests {
             set = { HOME = "/c" }
             [linux]
             path_metadata = "allow"
+            [macos]
+            relays = "ipv4"
             [windows]
             appcontainer_name = "example"
             win32k = "deny"
@@ -621,6 +667,7 @@ mod tests {
         assert_eq!(policy.process.children, ChildProcesses::None);
         assert_eq!(policy.environment.set["HOME"], "/c");
         assert_eq!(policy.linux.path_metadata, PathMetadata::Allow);
+        assert_eq!(policy.macos.relays, Relays::Ipv4);
         assert_eq!(policy.windows.appcontainer_name.as_deref(), Some("example"));
         assert_eq!(policy.windows.win32k, Win32k::Deny);
     }
@@ -664,6 +711,22 @@ mod tests {
             "version = 1\n[network]\negress = { port = 1, reach = \"local\" }",
             "version = 1\n[network]\negress = { port = 1, host = \"x\" }",
             "version = 1\n[filesystem]\nview = \"none\"",
+        ] {
+            assert!(
+                matches!(Policy::from_toml(bad), Err(PolicyError::Parse(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn relays_take_dual_stack_and_ipv4_only() {
+        let policy = Policy::from_toml("version = 1\n[macos]\nrelays = \"dual-stack\"").unwrap();
+        assert_eq!(policy.macos.relays, Relays::DualStack);
+        for bad in [
+            "version = 1\n[macos]\nrelays = \"ipv6\"",
+            "version = 1\n[macos]\nrelays = \"dual_stack\"",
+            "version = 1\n[macos]\nrelay = \"ipv4\"",
         ] {
             assert!(
                 matches!(Policy::from_toml(bad), Err(PolicyError::Parse(_))),

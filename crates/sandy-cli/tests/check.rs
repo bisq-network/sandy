@@ -268,6 +268,102 @@ fn check_reports_the_win32k_requirement() {
     );
 }
 
+/// `macos.relays = "ipv4"` is a requirement on every platform, like `windows.win32k`: macOS
+/// enforces it in the profile, and the platforms whose private network has no route out through
+/// an IPv6 address report it as given. Without the key nothing is required, and an option that
+/// allows IPv6 sockets again over a file that denies them is named. The key needs a private
+/// network, and a forward to an IPv6 address, whose port the program would reach at [::1], is
+/// refused with it, by check and by run.
+#[test]
+fn check_reports_the_ipv4_relays_requirement() {
+    const LINE: &str = "enforced     forwarded and egress ports reached over IPv4 only: ";
+    let fixture = Fixture::new("check-relays");
+    let policy = fixture.path("ro/policy.toml");
+    fs::write(
+        &policy,
+        "version = 1\n[network]\nip = \"private\"\n[macos]\nrelays = \"ipv4\"\n",
+    )
+    .unwrap();
+    let policy = policy.to_str().unwrap();
+    let check = |args: &[&str]| {
+        let mut all = vec!["check".to_string()];
+        all.extend(platform_args());
+        all.extend(args.iter().map(|arg| arg.to_string()));
+        sandy(&all)
+    };
+
+    // Whether the private network itself is enforceable depends on the host; this requirement
+    // is not.
+    let output = check(&["--policy", policy]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.lines().any(|line| line.starts_with(LINE)),
+        "{stdout}"
+    );
+
+    // Control: the default asks for nothing.
+    let output = check(&["--ip", "private"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("over IPv4 only"), "{stdout}");
+
+    let output = check(&["--policy", policy, "--macos-relays", "dual-stack"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("over IPv4 only"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        warns(
+            &stderr,
+            "--macos-relays dual-stack replaces relays = \"ipv4\" from the policy file"
+        ),
+        "{stderr}"
+    );
+
+    let ipv6_forward = "18081=[::1]:8081";
+    for (args, refusal) in [
+        (
+            &["--policy", policy, "--ip", "client"][..],
+            "macos.relays = \"ipv4\" needs ip = \"private\"",
+        ),
+        (
+            &["--policy", policy, "--forward", ipv6_forward],
+            "to must be an IPv4 address with macos.relays = \"ipv4\"",
+        ),
+    ] {
+        let output = check(args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(EXIT_FAILURE),
+            "{args:?}: {stderr}"
+        );
+        assert!(stderr.contains(refusal), "{args:?}: {stderr}");
+    }
+    let run = sandy(run_args(
+        &[
+            "--policy".to_string(),
+            policy.to_string(),
+            "--forward".to_string(),
+            ipv6_forward.to_string(),
+        ],
+        &[("pid", "")],
+    ));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(EXIT_FAILURE), "{stderr}");
+    assert!(stderr.contains("to must be an IPv4 address"), "{stderr}");
+
+    // Control: the same forward with dual-stack relays is a policy that check plans.
+    let output = check(&[
+        "--policy",
+        policy,
+        "--forward",
+        ipv6_forward,
+        "--macos-relays",
+        "dual-stack",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("forwarded ports relayed"), "{stdout}");
+}
+
 /// Runs `sandy check` with `args` and returns its standard error.
 fn check_warnings(args: &[&str]) -> String {
     let mut all = vec!["check".to_string()];
@@ -477,8 +573,9 @@ fn check_warns_that_a_stopped_relay_has_no_time_limit() {
 /// Seatbelt's `localhost` is every address of the Mac, so a private network lets the program
 /// listen on its exposed ports at every address, and reach its forwarded and egress ports at
 /// addresses the Mac gains later; check names both, and that every local user reaches the
-/// egress broker (docs/macos.md, "The private network"). The control: a private network without
-/// relays.
+/// egress broker (docs/macos.md, "The private network"). With `macos.relays = "ipv4"` it names
+/// what the program pays instead of the link-local route. The control: a private network
+/// without relays.
 #[cfg(target_os = "macos")]
 #[test]
 fn check_reports_a_private_network_and_warns_where_it_reaches_other_addresses() {
@@ -518,6 +615,29 @@ fn check_reports_a_private_network_and_warns_where_it_reaches_other_addresses() 
             "enforced     connections out only through the egress broker: Seatbelt profile: "
         )),
         "{stdout}"
+    );
+
+    check.extend(["--macos-relays", "ipv4"]);
+    let output = sandy(&check);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.lines().any(|line| line.starts_with(
+            "enforced     forwarded and egress ports reached over IPv4 only: Seatbelt profile: \
+             network-outbound to the forwarded and egress ports only from IPv4 sockets (tcp4)"
+        )),
+        "{stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!warns(&stderr, scoped), "{stderr}");
+    assert!(warns(&stderr, forwarded), "{stderr}");
+    assert!(
+        warns(
+            &stderr,
+            "macos.relays = \"ipv4\" lets the program reach its forwarded and egress ports only \
+             from IPv4 sockets"
+        ),
+        "{stderr}"
     );
 
     let stderr = check_warnings(&["--ip", "private"]);

@@ -136,6 +136,8 @@ fn fingerprint(policy: &ResolvedPolicy) -> Vec<u8> {
             out.extend(egress.port.to_le_bytes());
         }
     }
+    // `macos.relays` is left out: it changes nothing in this sandbox, and its one effect here,
+    // refusing a forward to an IPv6 address, shows in the forwarded ports below.
 
     // `paths` is sorted by path when the policy is resolved, so the order is deterministic.
     out.extend((policy.paths.len() as u32).to_le_bytes());
@@ -246,5 +248,16 @@ mod tests {
         for (index, print) in prints.iter().enumerate() {
             assert!(!prints[index + 1..].contains(print), "value {index}");
         }
+    }
+
+    /// `macos.relays` confines nothing on Windows, so runs that differ only in it may share the
+    /// AppContainer.
+    #[test]
+    fn macos_relays_leave_the_fingerprint_alone() {
+        let mut private = policy();
+        private.ip = sandy_core::IpAccess::Private;
+        let mut ipv4 = private.clone();
+        ipv4.macos.relays = sandy_core::Relays::Ipv4;
+        assert_eq!(fingerprint(&private), fingerprint(&ipv4));
     }
 }

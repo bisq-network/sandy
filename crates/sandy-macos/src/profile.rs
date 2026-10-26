@@ -6,7 +6,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use sandy_core::{
-    ChildProcesses, IpAccess, NetworkAccess, PathAccess, ResolvedPolicy, SignalScope, SystemAccess,
+    ChildProcesses, IpAccess, NetworkAccess, PathAccess, Relays, ResolvedPolicy, SignalScope,
+    SystemAccess,
 };
 
 use crate::system::{self, SystemAccess as Grant};
@@ -440,6 +441,17 @@ fn network_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
                  address. No UDP, and names resolve only from /etc/hosts, which getaddrinfo reads\n\
                  itself when mDNSResponder is out of reach.",
             );
+            let family = match policy.macos.relays {
+                Relays::DualStack => "tcp",
+                Relays::Ipv4 => {
+                    writer.comment(
+                        "relays = \"ipv4\": out over IPv4 only. localhost ignores the scope of an IPv6\n\
+                         link-local address, so tcp would let the program reach a host of another\n\
+                         link that has a link-local address of this Mac.",
+                    );
+                    "tcp4"
+                }
+            };
             let out: BTreeSet<u16> = policy
                 .forward
                 .iter()
@@ -448,7 +460,7 @@ fn network_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
                 .collect();
             let filters: Vec<String> = out
                 .iter()
-                .map(|port| format!("(remote tcp \"localhost:{port}\")"))
+                .map(|port| format!("(remote {family} \"localhost:{port}\")"))
                 .collect();
             writer.rule("allow", &["network-outbound"], &filters);
             let exposed: BTreeSet<u16> = policy.expose.iter().map(|entry| entry.port).collect();
@@ -695,6 +707,7 @@ mod tests {
             end_with_parent: false,
             path_metadata: PathMetadata::Deny,
             environment: EnvironmentPolicy::default(),
+            macos: sandy_core::MacosPolicy::default(),
             windows: WindowsPolicy::default(),
         }
     }
@@ -1541,6 +1554,41 @@ mod tests {
         assert!(profile.text.contains(&format!(
             "(allow file-read* file-test-existence\n  {hosts})"
         )));
+    }
+
+    /// With `macos.relays = "ipv4"` the program reaches its forwarded and egress ports from
+    /// IPv4 sockets only, and its exposed ports keep both families.
+    #[test]
+    fn ipv4_relays_allow_the_forwarded_and_egress_ports_over_ipv4_only() {
+        let mut policy = typical("/srv");
+        policy.ip = IpAccess::Private;
+        policy.forward = vec![sandy_core::ForwardedPort {
+            port: 18081,
+            to: "127.0.0.1:8081".parse().unwrap(),
+        }];
+        policy.expose = vec![sandy_core::ExposedPort {
+            listen: "[::1]:18090".parse().unwrap(),
+            port: 8080,
+        }];
+        policy.egress = Some(sandy_core::Egress {
+            port: 1080,
+            reach: sandy_core::EgressReach::Public,
+        });
+        policy.macos.relays = Relays::Ipv4;
+        let profile = generate(&policy);
+        let network: Vec<&str> = profile
+            .text
+            .split("\n(allow network-")
+            .skip(1)
+            .map(|rule| &rule[..rule.find("))").unwrap() + 2])
+            .collect();
+        assert_eq!(
+            network,
+            [
+                "outbound\n  (remote tcp4 \"localhost:1080\")\n  (remote tcp4 \"localhost:18081\"))",
+                "bind network-inbound\n  (local tcp \"localhost:8080\"))",
+            ]
+        );
     }
 
     /// The broker accepts on its port, connects out over TCP, never to this Mac (the deny after

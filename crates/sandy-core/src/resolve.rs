@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use crate::plan::Requirement;
 use crate::policy::{
     ChildProcesses, Egress, EnvironmentPolicy, ExposedPort, FileView, ForwardedPort, IpAccess,
-    NetworkAccess, NetworkPolicy, PathMetadata, Policy, PolicyError, ProcessPolicy, SignalScope,
-    SystemAccess, Win32k, WindowsPolicy,
+    MacosPolicy, NetworkAccess, NetworkPolicy, PathMetadata, Policy, PolicyError, ProcessPolicy,
+    Relays, SignalScope, SystemAccess, Win32k, WindowsPolicy,
 };
 
 #[cfg(windows)]
@@ -155,6 +155,7 @@ pub struct ResolvedPolicy {
     pub end_with_parent: bool,
     pub path_metadata: PathMetadata,
     pub environment: EnvironmentPolicy,
+    pub macos: MacosPolicy,
     pub windows: WindowsPolicy,
 }
 
@@ -209,6 +210,7 @@ impl ResolvedPolicy {
         validate_forward(&policy.network.forward, policy.network.ip)?;
         validate_relay_addresses(&policy.network.expose, &policy.network.forward)?;
         validate_egress(&policy.network)?;
+        validate_relays(&policy.network, policy.macos.relays)?;
 
         Ok(ResolvedPolicy {
             paths,
@@ -226,6 +228,7 @@ impl ResolvedPolicy {
             end_with_parent: policy.process.end_with_parent,
             path_metadata: policy.linux.path_metadata,
             environment: policy.environment.clone(),
+            macos: policy.macos.clone(),
             windows: policy.windows.clone(),
         })
     }
@@ -248,6 +251,9 @@ impl ResolvedPolicy {
         }
         if self.egress.is_some() {
             requirements.push(Requirement::EgressBrokered);
+        }
+        if self.macos.relays == Relays::Ipv4 {
+            requirements.push(Requirement::RelaysIpv4Only);
         }
         if self.view == FileView::Policy {
             requirements.push(Requirement::PathsHidden);
@@ -1479,6 +1485,25 @@ fn validate_egress(network: &NetworkPolicy) -> Result<(), PolicyError> {
     Ok(())
 }
 
+/// `macos.relays = "ipv4"` closes a route of the private network on macOS, so it needs one. A
+/// forward to an IPv6 address listens on [::1] for the program, which it could then not reach.
+fn validate_relays(network: &NetworkPolicy, relays: Relays) -> Result<(), PolicyError> {
+    if relays == Relays::DualStack {
+        return Ok(());
+    }
+    if network.ip != IpAccess::Private {
+        return Err(PolicyError::Ipv4RelaysNeedPrivateNetwork);
+    }
+    match network.forward.iter().find(|forward| forward.to.is_ipv6()) {
+        Some(forward) => Err(PolicyError::InvalidForward {
+            forward: *forward,
+            reason: "to must be an IPv4 address with macos.relays = \"ipv4\": the program \
+                     would reach this port at [::1], over IPv6",
+        }),
+        None => Ok(()),
+    }
+}
+
 /// Both `none` and `contained` promise that nothing the program starts outlives it. Through a
 /// Unix socket the program could ask a service of the user (for example the systemd user manager
 /// over D-Bus) to start a process that is not its child. With `contained`, a program that can
@@ -2166,6 +2191,65 @@ mod tests {
             .unwrap()
             .requirements();
         assert!(requirements.contains(&Requirement::Win32kDenied));
+    }
+
+    /// `macos.relays` is opt-in like `windows.win32k`: the default asks for nothing, `ipv4` for
+    /// the requirement, which every platform reports. It closes a route of the private network,
+    /// so it needs one, and it refuses a forward to an IPv6 address, whose port the program would
+    /// reach at [::1]. A private network without forwarded or egress ports takes it, so that a
+    /// policy file can set it for the options to add them, and an exposed port keeps both
+    /// families, because the program listens there.
+    #[test]
+    fn ipv4_relays_need_a_private_network_and_ipv4_forwards() {
+        let with_relays = |relays, ip, to: &str| {
+            let mut policy = with_forward(ip, &[forward(18081, to)]);
+            policy.macos.relays = relays;
+            policy
+        };
+        let requirements = |policy: &Policy| {
+            ResolvedPolicy::resolve(policy, None)
+                .unwrap()
+                .requirements()
+        };
+        let mut private = with_relays(Relays::Ipv4, IpAccess::Private, "127.0.0.1:8081");
+        private.network.egress = Some(Egress {
+            port: 1080,
+            reach: crate::policy::EgressReach::Public,
+        });
+        assert!(requirements(&private).contains(&Requirement::RelaysIpv4Only));
+        private.macos.relays = Relays::DualStack;
+        assert!(!requirements(&private).contains(&Requirement::RelaysIpv4Only));
+
+        let ipv6 = with_relays(Relays::DualStack, IpAccess::Private, "[::1]:8081");
+        assert!(ResolvedPolicy::resolve(&ipv6, None).is_ok());
+        let ipv6 = with_relays(Relays::Ipv4, IpAccess::Private, "[::1]:8081");
+        let error = ResolvedPolicy::resolve(&ipv6, None).unwrap_err();
+        assert!(
+            matches!(error, PolicyError::InvalidForward { .. })
+                && error
+                    .to_string()
+                    .contains("to must be an IPv4 address with macos.relays = \"ipv4\""),
+            "{error}"
+        );
+
+        let mut refused: Vec<Policy> = [IpAccess::Client, IpAccess::All]
+            .into_iter()
+            .map(|ip| with_relays(Relays::Ipv4, ip, "127.0.0.1:8081"))
+            .collect();
+        let mut none = Policy::default();
+        none.macos.relays = Relays::Ipv4;
+        refused.push(none);
+        for policy in refused {
+            let error = ResolvedPolicy::resolve(&policy, None).unwrap_err();
+            assert!(
+                matches!(error, PolicyError::Ipv4RelaysNeedPrivateNetwork),
+                "{error}"
+            );
+        }
+
+        let mut bare = with_expose(IpAccess::Private, &[expose("[::1]:18080", 8080)]);
+        bare.macos.relays = Relays::Ipv4;
+        assert!(requirements(&bare).contains(&Requirement::RelaysIpv4Only));
     }
 
     /// The program can replace an entry inside a writable path between two starts, so a policy

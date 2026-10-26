@@ -407,14 +407,14 @@ fn a_held_port_refuses_signals_any() {
     probe_inside(&exposed, &[("pid", "")])[0].assert_ok();
 }
 
-/// The exceptions row for `ip = "private"` with `forward` or `egress` on macOS: Seatbelt's
-/// `localhost` matches an IPv6 link-local address of this Mac with any interface as its scope, so
-/// the program may connect to its forwarded port at an address that is this Mac's on one link and
-/// may be another host's on another, where nothing of sandy's can hold it. The test asks with
-/// loopback as the scope, where no such address exists, so nothing leaves this Mac: the profile
-/// lets the connect through, and it times out on lo0. Control: a link-local address that is not
-/// this Mac's is denied at the same scope. When the first connect is denied, the route is closed
-/// and that part of the row has to go.
+/// The exceptions row for `ip = "private"` with `forward` or `egress` on macOS, without
+/// `macos.relays = "ipv4"`: Seatbelt's `localhost` matches an IPv6 link-local address of this
+/// Mac with any interface as its scope, so the program may connect to its forwarded port at an
+/// address that is this Mac's on one link and may be another host's on another, where nothing of
+/// sandy's can hold it. The test asks with loopback as the scope, where no such address exists,
+/// so nothing leaves this Mac: the profile lets the connect through, and it times out on lo0.
+/// Control: a link-local address that is not this Mac's is denied at the same scope. When the
+/// first connect is denied, the route is closed and that part of the row has to go.
 #[test]
 fn a_link_local_address_of_this_mac_matches_at_every_scope() {
     let Some(others) = other_addresses() else {
@@ -452,6 +452,79 @@ fn a_link_local_address_of_this_mac_matches_at_every_scope() {
          is stale: {:?}",
         inside[0]
     );
+}
+
+/// With `macos.relays = "ipv4"` the profile allows the forwarded and egress ports for IPv4
+/// sockets only, which closes the route that
+/// `a_link_local_address_of_this_mac_matches_at_every_scope` records: the connect to this Mac's
+/// link-local address at the scope of lo0 is denied. So is every other IPv6 form, ::1 and
+/// ::ffff:127.0.0.1 included, which is how Java and .NET connect to an IPv4 address by default,
+/// while the relay and the broker still serve over IPv4. Control: with `dual-stack` the same
+/// connects pass the profile, ::ffff:127.0.0.1 reaches the relay and the broker, and the others
+/// find a holder or nothing and go unanswered.
+#[test]
+fn ipv4_relays_are_reached_only_over_ipv4() {
+    let Some(others) = other_addresses() else {
+        return skip_without_addresses();
+    };
+    let Some(SocketAddr::V6(own)) = others.iter().copied().find(|address| kind(address) == 1)
+    else {
+        return skip(
+            "ipv6-link-local",
+            "this Mac has no IPv6 link-local address outside loopback",
+        );
+    };
+    // SAFETY: the name is a C string.
+    let loopback = unsafe { libc::if_nametoindex(c"lo0".as_ptr()) };
+    assert_ne!(loopback, 0, "no lo0");
+    let fixture = Fixture::new("private-ipv4");
+    let (service, accepted) = counting_service();
+    // Ports of their own for each run: a broker may hold its listener for a moment after the
+    // program of the run before has ended.
+    let run = |relays: &str| {
+        let (port, egress) = (free_port(), free_port());
+        let forwarded = format!("127.0.0.1:{port}");
+        let refused = through(egress, "127.0.0.1:1");
+        let mapped = format!("[::ffff:127.0.0.1]:{port}");
+        let mapped_broker = format!("[::ffff:127.0.0.1]:{egress}");
+        let ipv6_loopback = format!("[::1]:{port}");
+        let scoped = SocketAddrV6::new(*own.ip(), port, 0, loopback).to_string();
+        let actions = [
+            ("tcp-connect", forwarded.as_str()),
+            ("socks5-connect", refused.as_str()),
+            ("tcp-connect", mapped.as_str()),
+            ("tcp-connect", mapped_broker.as_str()),
+            ("tcp-connect", ipv6_loopback.as_str()),
+            ("tcp-connect", scoped.as_str()),
+        ];
+        let mut args = private_forward(&fixture, port, service);
+        args.extend(["--egress", &egress.to_string(), "--macos-relays", relays].map(String::from));
+        probe_inside(&args, &actions)
+    };
+
+    let ipv4 = run("ipv4");
+    ipv4[0].assert_ok();
+    assert_eq!(reply_of(&ipv4[1]), 2, "{ipv4:?}");
+    for line in &ipv4[2..] {
+        assert_eq!(line.result, "denied", "{line:?}");
+    }
+    let start = Instant::now();
+    while accepted.load(Ordering::SeqCst) == 0 {
+        assert!(start.elapsed() < WAIT, "the forwarded service saw nothing");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let dual_stack = run("dual-stack");
+    dual_stack[0].assert_ok();
+    assert_eq!(reply_of(&dual_stack[1]), 2, "{dual_stack:?}");
+    dual_stack[2].assert_ok();
+    dual_stack[3].assert_ok();
+    for line in &dual_stack[4..] {
+        assert!(
+            line.result == "error" && line.detail.contains("timed out"),
+            "{line:?}"
+        );
+    }
 }
 
 /// Under `signals = "isolated"` the program cannot stop or end its relay or its broker, which is

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use lexopt::prelude::*;
 use sandy_core::{
     ChildProcesses, Egress, EgressReach, ExposedPort, FileView, ForwardedPort, IpAccess,
-    NetworkAccess, PathMetadata, Policy, SignalScope, SystemAccess, Win32k,
+    NetworkAccess, PathMetadata, Policy, Relays, SignalScope, SystemAccess, Win32k,
 };
 
 pub const USAGE: &str = "\
@@ -61,6 +61,10 @@ Options (they extend the policy file):
                              this host (needs --ip private)
   --linux-path-metadata deny|allow
                              metadata changes by path on Linux (default: deny)
+  --macos-relays dual-stack|ipv4
+                             how the program reaches its forwarded and egress ports on macOS;
+                             ipv4 closes a route to hosts of the local network and denies IPv6
+                             sockets there (ipv4 needs --ip private; default: dual-stack)
   --pass-env NAME            copy variable NAME into the program environment (repeatable)
   --set-env NAME=VALUE       set a variable in the program environment (repeatable)
   --appcontainer NAME        AppContainer profile name (Windows)
@@ -108,6 +112,7 @@ pub struct Overrides {
     children: Option<ChildProcesses>,
     end_with_parent: bool,
     path_metadata: Option<PathMetadata>,
+    relays: Option<Relays>,
     win32k: Option<Win32k>,
     pass_env: Vec<String>,
     set_env: Vec<(String, String)>,
@@ -204,6 +209,12 @@ impl Overrides {
                 note("--linux-path-metadata", "allow", "path_metadata", "deny");
             }
             policy.linux.path_metadata = path_metadata;
+        }
+        if let Some(relays) = self.relays {
+            if relays == Relays::DualStack && policy.macos.relays == Relays::Ipv4 {
+                note("--macos-relays", "dual-stack", "relays", "ipv4");
+            }
+            policy.macos.relays = relays;
         }
         policy.environment.pass.extend(self.pass_env);
         policy.environment.set.extend(self.set_env);
@@ -447,6 +458,13 @@ where
                     }
                 })
             }
+            Long("macos-relays") => {
+                overrides.relays = Some(match parser.value()?.string()?.as_str() {
+                    "dual-stack" => Relays::DualStack,
+                    "ipv4" => Relays::Ipv4,
+                    other => return Err(format!("invalid --macos-relays value {other:?}").into()),
+                })
+            }
             Long("pass-env") => overrides.pass_env.push(parser.value()?.string()?),
             Long("set-env") => {
                 let assignment = parser.value()?.string()?;
@@ -624,6 +642,8 @@ mod tests {
             "name",
             "--windows-win32k",
             "deny",
+            "--macos-relays",
+            "ipv4",
             "--expose",
             "127.0.0.1:18080=8080",
             "--forward",
@@ -645,6 +665,7 @@ mod tests {
         assert_eq!(policy.environment.set["A"], "b=c");
         assert_eq!(policy.windows.appcontainer_name.as_deref(), Some("name"));
         assert_eq!(policy.windows.win32k, Win32k::Deny);
+        assert_eq!(policy.macos.relays, Relays::Ipv4);
         assert_eq!(
             policy.network.forward,
             vec![ForwardedPort {
@@ -817,6 +838,35 @@ mod tests {
         );
         assert!(weakened(Win32k::Allow, "deny").is_empty());
         assert!(parse_strs(&["check", "--windows-win32k", "none"]).is_err());
+    }
+
+    /// `--macos-relays dual-stack` gives the program back the IPv6 sockets, and the route, that
+    /// a file with `relays = "ipv4"` takes.
+    #[test]
+    fn dual_stack_relays_over_a_file_with_ipv4_relays_are_named() {
+        let weakened = |file: Relays, option: &str| {
+            let mut policy = Policy::default();
+            policy.macos.relays = file;
+            let notes = invocation(&["check", "--macos-relays", option])
+                .overrides
+                .apply(&mut policy, true);
+            assert_eq!(policy.macos.relays.name(), option);
+            notes
+        };
+        assert_eq!(
+            weakened(Relays::Ipv4, "dual-stack"),
+            vec![
+                "--macos-relays dual-stack replaces relays = \"ipv4\" from the policy file and \
+                 allows more than the file does"
+                    .to_string()
+            ]
+        );
+        assert!(weakened(Relays::DualStack, "ipv4").is_empty());
+        assert!(weakened(Relays::Ipv4, "ipv4").is_empty());
+        assert!(matches!(
+            parse_strs(&["check", "--macos-relays", "ipv6"]),
+            Err(message) if message.contains("invalid --macos-relays value \"ipv6\"")
+        ));
     }
 
     #[test]

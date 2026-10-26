@@ -83,6 +83,10 @@ set = { HOME = "/var/lib/app" }
 [linux]
 path_metadata = "deny"        # "deny" | "allow"; chmod, chown, utimensat, setxattr by path
 
+[macos]
+relays = "dual-stack"         # "dual-stack" | "ipv4"; ipv4: the program reaches its forwarded
+                              # and egress ports over IPv4 only; needs ip = "private"
+
 [windows]
 appcontainer_name = "example.app"  # required on Windows
 win32k = "allow"              # "allow" | "deny"; deny blocks win32k (GUI kernel) system calls
@@ -474,6 +478,11 @@ Rules:
    fixed handshake, and ends with the program as the relay does (rule 5 of "Forwarded ports").
    A flaw in its parser would give what `ip = "client"` gives a program today, minus datagrams
    (on Windows with datagrams, docs/windows.md).
+8. `macos.relays = "ipv4"` (the default is `"dual-stack"`) lets the program reach its forwarded
+   ports and the egress broker over IPv4 only. On macOS that closes a route of the exceptions
+   table and costs the program its IPv6 sockets to those ports (docs/macos.md, "The private
+   network"); elsewhere the private network has no such route. It needs `ip = "private"`, and it
+   refuses a forward whose `to` is IPv6, because the program would reach that port at [::1].
 
 ## Egress broker
 
@@ -567,6 +576,7 @@ Rules:
 | `IpNetworkDenied` | `network.ip = "none"` |
 | `IpNetworkPrivate` | `network.ip = "private"` |
 | `EgressBrokered` | `network.egress` is set |
+| `RelaysIpv4Only` | `macos.relays = "ipv4"` |
 | `PathsHidden` | `filesystem.view = "policy"` |
 | `InboundIpDenied` | `network.ip = "client"` |
 | `UnixSocketsDenied` | `network.unix_sockets = "none"` |
@@ -587,12 +597,15 @@ the program's private AppContainer folder (docs/windows.md).
 (On Linux with `ip = "all"` or `ip = "client"` a socket pair can still take a free abstract name;
 see `docs/linux.md`.)
 
-`MetadataConfined` and `Win32kDenied` come from a platform section of the policy
-(`linux.path_metadata`, `windows.win32k`) but are requirements like any other: every backend
-reports them. A platform without the mechanism the key names reports the requirement as enforced
-with nothing to do, because it has no such route to begin with. `Win32kDenied` (from
-`windows.win32k = "deny"`) is enforced on Linux and macOS, whose kernels have no win32k, and on
-Windows by a process mitigation that disables the win32k system calls (docs/windows.md, "Win32k").
+`MetadataConfined`, `RelaysIpv4Only` and `Win32kDenied` come from a platform section of the
+policy (`linux.path_metadata`, `macos.relays`, `windows.win32k`) but are requirements like any
+other: every backend reports them. A platform without the mechanism the key names reports the
+requirement as enforced with nothing to do, because it has no such route to begin with.
+`Win32kDenied` (from `windows.win32k = "deny"`) is enforced on Linux and macOS, whose kernels
+have no win32k, and on Windows by a process mitigation that disables the win32k system calls
+(docs/windows.md, "Win32k"). `RelaysIpv4Only` (from `macos.relays = "ipv4"`) is enforced on
+macOS by `tcp4` rules in the profile, and on Linux and Windows, whose private network has no
+address that leads out, with nothing to do.
 A platform key is never silently ignored off its platform; it maps to a requirement each backend
 answers.
 
@@ -624,7 +637,8 @@ exceptions:
 | macOS | `forward` | every local user reaches the forwarded service |
 | macOS | `expose` or `forward` with `signals = "any"` | a stopped relay has no time limit |
 | macOS | `ip = "private"` with `expose` | the program can listen on its exposed ports at every address of the Mac, where every local process and other hosts reach it without the relay |
-| macOS | `ip = "private"` with `forward` or `egress` | a process of sandy's own user that listens on a forwarded or egress port at an address the Mac gains while sandy runs receives the program's connections there, and once the relay or the broker has ended, without `children = "contained"`, any process that binds the port does; a host on another link of the Mac whose IPv6 link-local address equals one of the Mac's, such as `fe80::1`, receives the program's connections to those port numbers there |
+| macOS | `ip = "private"` with `forward` or `egress` | a process of sandy's own user that listens on a forwarded or egress port at an address the Mac gains while sandy runs receives the program's connections there, and once the relay or the broker has ended, without `children = "contained"`, any process that binds the port does |
+| macOS | `ip = "private"` with `forward` or `egress`, without `macos.relays = "ipv4"` | a host on another link of the Mac whose IPv6 link-local address equals one of the Mac's, such as `fe80::1`, receives the program's connections to those port numbers there |
 | macOS | `egress` | every local user reaches the broker and connects out through it, as sandy's user, to the destinations of `reach` |
 | macOS | `view = "policy"` | the names in the root directory, with their metadata through a bulk listing that asks for the type; the directories above each policy path; the volume and mount point that `statfs` names for a policy path |
 | Windows | a directory in the policy | a file moved out of a granted directory keeps its grant |
@@ -632,7 +646,8 @@ exceptions:
 
 `children = "contained"` on macOS gets a warning as well, although it gives its full
 guarantee: it denies `posix_spawn`, which many runtimes start processes with, and that cost is
-easy to miss.
+easy to miss. So does `macos.relays = "ipv4"` with a forwarded or egress port: it denies IPv6
+sockets there, which Java and .NET use for IPv4 addresses by default.
 
 Within an exception sandy still closes every route it can. When a platform leaves one way to an
 effect open, sandy denies the other ways it can deny, unless that breaks common programs: macOS
@@ -926,7 +941,8 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   addresses and at every current address of the Mac, and a connection to one at another address
   meets a socket of sandy's that never answers; a socket that already holds such an address
   makes `run` refuse. Forwarded and egress ports need `signals = "isolated"`. The program's own
-  processes cannot use loopback among themselves.
+  processes cannot use loopback among themselves. With `macos.relays = "ipv4"` the rules for the
+  forwarded and egress ports are `tcp4`, for IPv4 sockets only.
 - The egress broker is a helper process of its own, forked twice like the relay and watched like
   it, with its own profile: accept on its port, TCP out with every address of the Mac denied
   after that allow, the routing sysctl for `getifaddrs` and the routing table, no files, no Mach

@@ -21,9 +21,9 @@ pub use env::target_environment;
 pub use plan::{EnforcementPlan, PlanItem, Requirement, Status};
 pub use policy::{
     ChildProcesses, Egress, EgressReach, EnvironmentPolicy, ExposedPort, FileView,
-    FilesystemPolicy, ForwardedPort, IpAccess, LinuxPolicy, NetworkAccess, NetworkPolicy,
-    POLICY_VERSION, PathMetadata, Policy, PolicyError, ProcessPolicy, SignalScope, SystemAccess,
-    Win32k, WindowsPolicy,
+    FilesystemPolicy, ForwardedPort, IpAccess, LinuxPolicy, MacosPolicy, NetworkAccess,
+    NetworkPolicy, POLICY_VERSION, PathMetadata, Policy, PolicyError, ProcessPolicy, Relays,
+    SignalScope, SystemAccess, Win32k, WindowsPolicy,
 };
 pub use resolve::{
     PathAccess, PathIdentity, PathRule, ProtectedPath, ResolvedPolicy, canonical_location,
