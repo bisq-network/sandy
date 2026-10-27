@@ -110,6 +110,11 @@ pub struct HostCapabilities {
     /// Whether `children = "contained"` gets a PID namespace here, or why not. Only read for a
     /// policy whose run would use one (`Detected::for_policy`).
     pub pid_namespace: namespace::Support,
+    /// Whether the kernel names the owner of the other end of a loopback connection
+    /// (`inet_diag`), which the relay of a forwarded port asks to refuse other users wherever
+    /// the program has no private network. Only probed for a policy that needs it
+    /// (`Detected::for_policy`).
+    pub peer_lookup: Result<(), Missing>,
     /// The candidates of the minimal system set that exist on this host.
     pub system_paths: Vec<SystemPath>,
     /// Where every candidate of the minimal system set is or would be, also missing ones.
@@ -133,6 +138,7 @@ impl HostCapabilities {
             process_group: Ok(()),
             user_namespaces: Ok(()),
             pid_namespace: Ok(()),
+            peer_lookup: Ok(()),
             seccomp: seccomp_support(),
             no_new_privs: no_new_privs_support(),
             unprivileged: unprivileged(),
@@ -154,6 +160,8 @@ pub(crate) trait Probes: std::fmt::Debug {
     fn namespace_facts(&self) -> namespace::HostFacts;
     /// A trial of `namespaces` in a forked child (`namespace::probe`).
     fn trial(&self, namespaces: Namespaces) -> Result<(), TrialFailure>;
+    /// Whether the kernel names the owner of a loopback connection (`PeerCheck::probe`).
+    fn peer_lookup(&self) -> Result<(), Missing>;
 }
 
 /// The probes of this host.
@@ -176,6 +184,10 @@ impl Probes for ThisHost {
     fn trial(&self, namespaces: Namespaces) -> Result<(), TrialFailure> {
         namespace::probe(namespaces)
     }
+
+    fn peer_lookup(&self) -> Result<(), Missing> {
+        crate::peer::PeerCheck::probe()
+    }
 }
 
 /// What one backend value has found out about this host. Each property is detected at most
@@ -191,6 +203,7 @@ pub(crate) struct Detected {
     process_group: OnceCell<Support>,
     namespace_facts: OnceCell<namespace::HostFacts>,
     trials: RefCell<BTreeMap<Namespaces, Result<(), TrialFailure>>>,
+    peer_lookup: OnceCell<Result<(), Missing>>,
 }
 
 impl Detected {
@@ -201,6 +214,7 @@ impl Detected {
             process_group: OnceCell::new(),
             namespace_facts: OnceCell::new(),
             trials: RefCell::new(BTreeMap::new()),
+            peer_lookup: OnceCell::new(),
         }
     }
 
@@ -235,6 +249,12 @@ impl Detected {
             }
         } else if pid {
             host.pid_namespace = self.pid_namespace();
+        }
+        if !policy.forward.is_empty() && !private {
+            host.peer_lookup = self
+                .peer_lookup
+                .get_or_init(|| self.probes.peer_lookup())
+                .clone();
         }
         host
     }
@@ -525,6 +545,8 @@ pub(crate) struct Recording {
     pub(crate) trial: Result<(), TrialFailure>,
     /// What the host says about user namespaces.
     pub(crate) facts: namespace::HostFacts,
+    /// What the lookup of a loopback connection's owner answers.
+    pub(crate) peer_lookup: Result<(), Missing>,
 }
 
 #[cfg(test)]
@@ -534,6 +556,7 @@ impl Recording {
             ran: Default::default(),
             trial: Ok(()),
             facts: namespace::HostFacts::default(),
+            peer_lookup: Ok(()),
         }
     }
 
@@ -566,6 +589,11 @@ impl Probes for Recording {
     fn trial(&self, namespaces: Namespaces) -> Result<(), TrialFailure> {
         self.record(format!("trial {namespaces:?}"));
         self.trial.clone()
+    }
+
+    fn peer_lookup(&self) -> Result<(), Missing> {
+        self.record("peer lookup".to_string());
+        self.peer_lookup.clone()
     }
 }
 
@@ -613,6 +641,39 @@ mod tests {
             probes.ran()[4..],
             ["trial Namespaces { network: true, mount: false, pid: true }"]
         );
+    }
+
+    /// The owner lookup runs once, and only for a policy whose relay asks it: one with a
+    /// forwarded port outside the private network, where nothing else keeps other users from
+    /// the forward's listeners.
+    #[test]
+    fn only_a_forward_outside_the_private_network_looks_up_owners() {
+        let probes = Recording::new();
+        let detected = Detected::new(Box::new(probes.clone()));
+        let forward = "forward = [{ port = 18082, to = \"127.0.0.1:8082\" }]";
+        let lookups = || {
+            probes
+                .ran()
+                .iter()
+                .filter(|probe| *probe == "peer lookup")
+                .count()
+        };
+        detected.for_policy(&resolved("[network]\nip = \"client\""));
+        detected.for_policy(&resolved(&format!(
+            "[network]\nip = \"private\"\n{forward}"
+        )));
+        assert_eq!(lookups(), 0, "{:?}", probes.ran());
+        let client =
+            detected.for_policy(&resolved(&format!("[network]\nip = \"client\"\n{forward}")));
+        detected.for_policy(&resolved(&format!("[network]\nip = \"all\"\n{forward}")));
+        assert_eq!(lookups(), 1, "{:?}", probes.ran());
+        assert_eq!(client.peer_lookup, Ok(()));
+    }
+
+    /// The owner lookup works on this host, as the relay finds it.
+    #[test]
+    fn this_kernel_names_the_owner_of_a_loopback_connection() {
+        crate::peer::PeerCheck::probe().unwrap();
     }
 
     /// A trial that fails for a reason that can pass makes the namespaces indeterminate, also

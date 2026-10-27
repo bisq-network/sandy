@@ -623,7 +623,12 @@ fn plan_item(
                 (Err(reason), _, _) | (_, Err(reason), _) | (_, _, Err(reason)) => {
                     unavailable(reason)
                 }
-                _ => enforced(relay_mechanism(abi, policy.ip == IpAccess::Private)),
+                _ => match &host.peer_lookup {
+                    Err(missing) if requirement == Requirement::ForwardedPortsRelayed => {
+                        missing.item(requirement)
+                    }
+                    _ => enforced(relay_mechanism(abi, policy.ip == IpAccess::Private)),
+                },
             }
         }
         Requirement::MetadataConfined => match &host.seccomp {
@@ -1170,6 +1175,7 @@ mod tests {
             process_group: Ok(()),
             user_namespaces: Ok(()),
             pid_namespace: Ok(()),
+            peer_lookup: Ok(()),
             seccomp: Ok(()),
             no_new_privs: Ok(()),
             unprivileged: Ok(()),
@@ -1178,6 +1184,48 @@ mod tests {
             system_paths: existing,
             trusted_locations: Ok(vec![sandy_core::ProtectedPath::entry("/home/someone")]),
             path_locations: vec![sandy_core::ProtectedPath::entry("/data/bin")],
+        }
+    }
+
+    /// Outside the private network the relay of a forwarded port needs the owner lookup: a
+    /// kernel that cannot answer makes the forward unavailable, and a lookup that failed for a
+    /// reason that can pass leaves it undecided. The exposed ports do not need it.
+    #[test]
+    fn a_forward_outside_the_private_network_needs_the_owner_lookup() {
+        let mut policy = policy();
+        policy.ip = IpAccess::All;
+        policy.expose = vec![ExposedPort {
+            listen: "127.0.0.1:18080".parse().unwrap(),
+            port: 8080,
+        }];
+        policy.forward = vec![ForwardedPort {
+            port: 18082,
+            to: "127.0.0.1:8082".parse().unwrap(),
+        }];
+        for (missing, expected) in [
+            (
+                Missing::Unavailable("no inet_diag".to_string()),
+                Status::Unavailable {
+                    reason: "no inet_diag".to_string(),
+                },
+            ),
+            (
+                Missing::Indeterminate("EMFILE".to_string()),
+                Status::Indeterminate {
+                    reason: "EMFILE".to_string(),
+                },
+            ),
+        ] {
+            let host = HostCapabilities {
+                peer_lookup: Err(missing),
+                ..host(Some(9))
+            };
+            let plan = plan_for(&policy, &host);
+            assert_eq!(status(&plan, Requirement::ForwardedPortsRelayed), &expected);
+            assert!(matches!(
+                status(&plan, Requirement::ExposedPortsRelayed),
+                Status::Enforced { .. }
+            ));
         }
     }
 

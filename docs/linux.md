@@ -22,7 +22,9 @@ The research behind the design is in [research/linux-mechanisms.md](research/lin
 `sandy run` first prepares everything that can fail on bad input:
 
 1. Detect the host: the Landlock ABI, seccomp support, no_new_privs, user IDs and capabilities,
-   and which paths of the minimal system set exist. Detection only reads state.
+   and which paths of the minimal system set exist. Detection only reads state, except for the
+   trials a policy needs: its namespaces in a forked child, and for a forwarded port outside the
+   private network, the owner lookup on a loopback connection of sandy's own.
 2. Plan: `plan_for` turns the policy and the host capabilities into the plan items and the
    exact configuration to apply. If any requirement is unavailable, sandy refuses. The plan also
    records the device and inode of every path a Landlock rule names.
@@ -259,7 +261,11 @@ reached an IPv4 port, which is how Java connects by default, is answered in IPv6
 IPv4-mapped addresses; the comparison reads them as the IPv4 addresses they map, because they
 name the same connection. Every failure closes the connection, and sandy checks the lookup on a
 connection of its own before it starts the relay, so a kernel without `inet_diag` refuses the
-run instead of refusing every connection later.
+run instead of refusing every connection later. `check` makes the same test for such a policy:
+where the kernel cannot answer, or a filter around sandy denies the netlink socket, the
+forwarded ports are unavailable, which a fallback level may answer; where the test fails for a
+reason that can pass, such as no free descriptor or another process that connected to the
+test's listener first, they are undecided, and sandy stops with status 125.
 
 One answer names nobody, and this is the residual of the check. The owner the kernel reports comes
 from the socket's file, so closing the socket takes it away: from the close onwards the answer

@@ -49,6 +49,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use sandy_core::SandboxError;
 
+use crate::host::Missing;
+
 /// `SOCK_DIAG_BY_FAMILY`, the only netlink message the relay sends.
 const SOCK_DIAG_BY_FAMILY: u16 = 20;
 /// `INET_DIAG_NOCOOKIE`: match the socket by its addresses, not by a cookie of an earlier answer.
@@ -56,6 +58,16 @@ const NO_COOKIE: [u32; 2] = [u32::MAX, u32::MAX];
 /// Every TCP state, so that the lookup also finds the socket of a peer that has closed its side
 /// already, which is the normal case for a program that connects, writes and exits.
 const ALL_STATES: u32 = u32::MAX;
+/// Errors of `socket` that say the kernel, or a sandbox around sandy, gives no such socket for
+/// good: one without the protocol, and the refusals of a filter.
+const NO_SOCKET: [i32; 6] = [
+    libc::EAFNOSUPPORT,
+    libc::EPROTONOSUPPORT,
+    libc::EPERM,
+    libc::EACCES,
+    libc::ENOSYS,
+    libc::EINVAL,
+];
 /// Who the socket on the other end of a connection belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Owner {
@@ -79,6 +91,18 @@ impl PeerCheck {
     /// process. sandy calls this before it starts the relay, so a kernel without `inet_diag`
     /// refuses the run instead of silently refusing every connection later.
     pub(crate) fn open() -> Result<PeerCheck, SandboxError> {
+        PeerCheck::tested().map_err(|missing| SandboxError::new(missing.reason()))
+    }
+
+    /// What `open` would find, for `check` (`HostCapabilities::peer_lookup`): a kernel or a
+    /// sandbox around sandy that cannot answer is a lasting shortfall, a trial that fails for a
+    /// reason that can pass is not. Another local user can make the trial fail, by connecting to
+    /// its listener first, so that failure must never make sandy take a weaker level.
+    pub(crate) fn probe() -> Result<(), Missing> {
+        PeerCheck::tested().map(drop)
+    }
+
+    fn tested() -> Result<PeerCheck, Missing> {
         // SAFETY: socket takes no pointers and returns a new descriptor.
         let fd = unsafe {
             libc::socket(
@@ -88,10 +112,14 @@ impl PeerCheck {
             )
         };
         if fd < 0 {
-            return Err(SandboxError::io(
-                "cannot open a netlink socket to check who connects to a forwarded port",
-                io::Error::last_os_error(),
-            ));
+            let error = io::Error::last_os_error();
+            let reason = format!(
+                "cannot open a netlink socket to check who connects to a forwarded port: {error}"
+            );
+            return Err(match error.raw_os_error() {
+                Some(errno) if NO_SOCKET.contains(&errno) => Missing::Unavailable(reason),
+                _ => Missing::Indeterminate(reason),
+            });
         }
         let check = PeerCheck {
             // SAFETY: the descriptor was just created and nothing else owns it.
@@ -186,19 +214,30 @@ impl PeerCheck {
     }
 
     /// Checks the lookup on a connection of this process, which must report this user.
-    fn self_test(&self) -> Result<(), SandboxError> {
-        let failed = |error| SandboxError::io("cannot check who owns a loopback connection", error);
+    fn self_test(&self) -> Result<(), Missing> {
+        let failed = |error| {
+            Missing::Indeterminate(format!(
+                "cannot check who owns a loopback connection: {error}"
+            ))
+        };
         let listener = TcpListener::bind("127.0.0.1:0").map_err(failed)?;
         let address = listener.local_addr().map_err(failed)?;
         let client = TcpStream::connect(address).map_err(failed)?;
         let (accepted, peer) = listener.accept().map_err(failed)?;
         let local = accepted.local_addr().map_err(failed)?;
+        if peer != client.local_addr().map_err(failed)? {
+            return Err(Missing::Indeterminate(format!(
+                "cannot check who owns a loopback connection: another process connected to the \
+                 listener of the check at {address} first"
+            )));
+        }
         let ours = self.owner(peer, local) == Owner::Us;
         drop((client, accepted, listener));
         if !ours {
-            return Err(SandboxError::new(
+            return Err(Missing::Unavailable(
                 "this kernel does not report who owns a loopback connection, so a forwarded port \
-                 cannot refuse other users (it needs inet_diag with TCP support)",
+                 cannot refuse other users (it needs inet_diag with TCP support)"
+                    .to_string(),
             ));
         }
         Ok(())
