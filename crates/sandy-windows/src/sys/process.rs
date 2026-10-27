@@ -2,15 +2,13 @@
 //! waits for the target, and ends the relays by the lifetime rule (docs/DESIGN.md, "Forwarded
 //! ports", rule 5).
 
-use std::ffi::c_void;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::{size_of, size_of_val};
 use std::net::TcpListener;
 use std::os::windows::io::{AsRawHandle, AsRawSocket, FromRawHandle, OwnedHandle};
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::mpsc;
+use std::sync::{Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -163,8 +161,31 @@ pub struct Process<'a> {
     pub capabilities: &'a [Sid],
 }
 
-/// The job that `on_console_control` terminates. Only a raw handle fits into a static.
-static CONSOLE_JOB: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+/// The job that `on_console_control` terminates, as a raw handle, or 0. Only a raw handle fits
+/// into a static. The handler holds the lock while it uses the handle, so `run` cannot close the
+/// job in between: a handler that Windows starts as the run ends finds 0 or a job still open.
+static CONSOLE_JOB: Mutex<usize> = Mutex::new(0);
+
+fn console_job() -> MutexGuard<'static, usize> {
+    CONSOLE_JOB.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Names the job to `on_console_control` until it is dropped, which waits for a handler that is
+/// using it. Declared after the job, so that it is dropped first.
+struct ConsoleJob;
+
+impl ConsoleJob {
+    fn name(job: &OwnedHandle) -> ConsoleJob {
+        *console_job() = job.as_raw_handle() as usize;
+        ConsoleJob
+    }
+}
+
+impl Drop for ConsoleJob {
+    fn drop(&mut self) {
+        *console_job() = 0;
+    }
+}
 
 pub fn run(launch: Launch<'_>, status: &StatusReport) -> Result<Ended, SandboxError> {
     // With an active-process limit of 1 the job admits the program and refuses every process
@@ -173,16 +194,13 @@ pub fn run(launch: Launch<'_>, status: &StatusReport) -> Result<Ended, SandboxEr
     let job = create_job(launch.deny_children.then_some(1))?;
     let stdio = StandardHandles::prepare()?;
 
-    CONSOLE_JOB.store(job.as_raw_handle(), Ordering::SeqCst);
+    let _named = ConsoleJob::name(&job);
     // SAFETY: on_console_control has the signature of a HandlerRoutine and stays valid for the
     // life of the process.
     if unsafe { SetConsoleCtrlHandler(Some(on_console_control), TRUE) } == 0 {
         return Err(last_error("cannot install the console control handler"));
     }
-
-    let result = start_and_wait(launch, &job, stdio, status);
-    CONSOLE_JOB.store(ptr::null_mut(), Ordering::SeqCst);
-    result
+    start_and_wait(launch, &job, stdio, status)
 }
 
 fn start_and_wait(
@@ -526,11 +544,13 @@ fn job_ended_by(job: &OwnedHandle, limit: Instant) -> io::Result<bool> {
 /// console of sandy does not reach it. The exit status is the one a console program gets when
 /// Ctrl+C ends it.
 unsafe extern "system" fn on_console_control(event: u32) -> windows_sys::core::BOOL {
-    let job = CONSOLE_JOB.load(Ordering::SeqCst);
-    if !job.is_null() {
-        // SAFETY: CONSOLE_JOB holds a job handle while `run` waits, and null otherwise.
-        unsafe { TerminateJobObject(job, STATUS_CONTROL_C_EXIT as u32) };
+    let job = console_job();
+    if *job != 0 {
+        // SAFETY: CONSOLE_JOB holds a job handle while `run` waits, and 0 otherwise; the lock
+        // keeps `run` from closing it before the call returns.
+        unsafe { TerminateJobObject(*job as HANDLE, STATUS_CONTROL_C_EXIT as u32) };
     }
+    drop(job);
     if event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT {
         TRUE
     } else {
