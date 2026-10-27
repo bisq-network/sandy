@@ -1120,8 +1120,8 @@ Details, limitations and sources: `docs/windows.md`.
   connect layer, and the DNS Client service resolves no name for it.
 - `network.egress`: `sandy __broker` runs in an AppContainer of its own (the program's name plus
   a reserved suffix, so no program shares it) with the `internetClient` capability, and
-  `privateNetworkClientServer` for `reach = "public-and-local"`. The program reaches it through a
-  `sandy __forward` relay over an AF_UNIX socket that sandy binds and the broker inherits; the
+  `privateNetworkClientServer` for `reach = "public-and-local"`. The program reaches it through
+  the relay, `sandy __relay`, over an AF_UNIX socket that sandy binds and the broker inherits; the
   broker is in the relay job, so it ends with the program. `sandy_core::destination` limits
   where it connects, and the broker's own loopback isolation also keeps it off this machine; the
   plan refuses a broker AppContainer with the loopback exemption, which `sandy setup` removes.
@@ -1147,16 +1147,16 @@ Details, limitations and sources: `docs/windows.md`.
 - Job object with kill-on-close, no breakaway and all UI restrictions. The program is created
   suspended and assigned before it runs. Inside an outer job with UI restrictions Windows cannot
   nest this job, so the plan refuses; sandy never breaks away from an outer job.
-- `network.expose`: sandy binds the listening socket outside the AppContainer and starts
-  `sandy.exe __relay` in the program's AppContainer and a job of its own before the program. The
-  relay has no network capability and only read and execute on `sandy.exe`; the program can
-  control the relay, which gives it nothing beyond the exposed listener. The plan refuses when
-  `sandy.exe` cannot be granted or lies in a read-write path; `sandy setup` with the policy adds
-  the grant.
-- `network.forward`: `sandy.exe __forward` in the program's AppContainer and the relay job
-  creates the program's listener itself and passes each connection over an AF_UNIX socket that
-  only the relays may open to sandy, which connects to the target. No loopback exemption is
-  needed. The plan also refuses when AF_UNIX is missing or the socket paths exceed 107 bytes.
+- `network.expose`: sandy binds the listening sockets outside the AppContainer and starts one
+  `sandy.exe __relay` for all exposed and forwarded ports in the program's AppContainer and a job
+  of its own before the program. The relay has no network capability and only read and execute
+  on `sandy.exe`; the program can control the relay, which gives it nothing beyond the exposed
+  listeners. The plan refuses when `sandy.exe` cannot be granted or lies in a read-write path;
+  `sandy setup` with the policy adds the grant.
+- `network.forward`: the same relay creates the program's listeners itself and passes each
+  connection over an AF_UNIX socket that only the relays may open to sandy, which connects to the
+  target. No loopback exemption is needed. The plan also refuses when AF_UNIX is missing or the
+  socket paths exceed 107 bytes.
 - `process.children = "none"`: the program's job has an active-process limit of 1, which the
   program cannot change; its console host is not counted. The relays always run without a
   console and with `PROCESS_CREATION_CHILD_PROCESS_RESTRICTED`, so the program cannot start
@@ -1274,9 +1274,9 @@ workflow, the commit and the run that produced it. The job verifies the attestat
 creates the draft, so such a release never carries an archive that cannot be checked. A user
 checks a download with `gh attestation verify <archive> --repo <owner>/<repo>`.
 
-`SHA256SUMS` says that the archives belong together; `SHA256SUMS.asc`, the maintainer's signature
-of it with the key that signs the tags, says who published them. That matters most for archives
-built outside the workflow, which have no attestation, as in 2.2.1 and 2.2.2. The macOS binaries
+`SHA256SUMS` says that the archives belong together; `SHA256SUMS.asc`, the maintainer's signature of
+it with the key that signs the tags, says who published them. That matters most for archives built
+outside the workflow, which have no attestation, as in 2.2.1, 2.2.2 and 2.3.0. The macOS binaries
 carry only the linker's ad-hoc signature, and `sandy.exe` has no Authenticode signature; the
 workflow holds both steps, skipped until the certificates exist.
 

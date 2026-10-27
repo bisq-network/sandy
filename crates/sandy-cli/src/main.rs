@@ -65,8 +65,11 @@ fn main() -> ExitCode {
             println!("sandy {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Command::Relay { listener, target } => relay(listener, target),
-        Command::Forward { listen, socket } => forward(listen, &socket),
+        Command::Relay {
+            exposed,
+            sockets,
+            forwarded,
+        } => relay(exposed, sockets, forwarded),
         Command::Broker { listener, reach } => broker(listener, reach),
         Command::Sandbox(invocation) => {
             let handed_over = match invocation.mode {
@@ -231,47 +234,130 @@ fn hand_over(_started_as: &[PathBuf], _parent_at_start: Option<u32>) -> Result<(
     Ok(())
 }
 
-fn relay(listener: u64, target: std::net::SocketAddr) -> ExitCode {
-    // SAFETY: a backend starts this command only with a listening socket it passed to this
-    // process and that nothing else here owns.
-    let listener = match unsafe { sandy_relay::inherited_listener(listener) } {
-        Ok(listener) => listener,
-        Err(error) => {
-            eprintln!("sandy: relay failed: {error}");
-            return ExitCode::from(EXIT_FAILURE);
+/// How the relay reaches the other side of one port.
+type Connect = Box<dyn Fn() -> std::io::Result<std::net::TcpStream> + Send + Sync>;
+
+/// One relay serves every exposed and forwarded port that it is given.
+fn relay(
+    exposed: Vec<(u64, std::net::SocketAddr)>,
+    sockets: Option<std::path::PathBuf>,
+    forwarded: Vec<std::net::SocketAddr>,
+) -> ExitCode {
+    let mut handles: Vec<u64> = exposed.iter().map(|(listener, _)| *listener).collect();
+    handles.sort_unstable();
+    handles.dedup();
+    if handles.len() != exposed.len() {
+        eprintln!("sandy: relay failed: a socket is named twice");
+        return ExitCode::from(EXIT_FAILURE);
+    }
+    let mut routes: Vec<(std::net::TcpListener, Connect)> = Vec::new();
+    for (listener, target) in exposed {
+        // SAFETY: a backend starts this command only with listening sockets it passed to this
+        // process and that nothing else here owns, and each is named once (checked above).
+        let listener = unsafe { sandy_relay::inherited_listener(listener) }
+            .and_then(|listener| listener.set_nonblocking(false).map(|()| listener));
+        match listener {
+            Ok(listener) => routes.push((listener, Box::new(move || sandy_relay::connect(target)))),
+            Err(error) => {
+                eprintln!("sandy: relay failed: {error}");
+                return ExitCode::from(EXIT_FAILURE);
+            }
         }
-    };
-    serve_relay(listener, target)
+    }
+    if let Err(message) = forward_routes(sockets, forwarded, &mut routes) {
+        eprintln!("sandy: {message}");
+        return ExitCode::from(EXIT_FAILURE);
+    }
+    serve_relay(routes)
 }
+
+/// The routes of the forwarded ports: the relay listens on each address inside the sandbox and
+/// passes every connection to the socket named after its port in `sockets`.
+#[cfg(windows)]
+fn forward_routes(
+    sockets: Option<std::path::PathBuf>,
+    forwarded: Vec<std::net::SocketAddr>,
+    routes: &mut Vec<(std::net::TcpListener, Connect)>,
+) -> Result<(), String> {
+    let Some(directory) = sockets else {
+        return Ok(());
+    };
+    for listen in forwarded {
+        let listener = std::net::TcpListener::bind(listen)
+            .map_err(|error| format!("relay cannot listen on {listen}: {error}"))?;
+        let socket = sandy_relay::unix::socket_path(&directory, listen.port());
+        routes.push((
+            listener,
+            Box::new(move || sandy_relay::unix::connect_to(&socket)),
+        ));
+    }
+    Ok(())
+}
+
+/// Only the Windows backend relays forwarded ports through a separate sandy process.
+#[cfg(not(windows))]
+fn forward_routes(
+    _sockets: Option<std::path::PathBuf>,
+    forwarded: Vec<std::net::SocketAddr>,
+    _routes: &mut Vec<(std::net::TcpListener, Connect)>,
+) -> Result<(), String> {
+    if forwarded.is_empty() {
+        Ok(())
+    } else {
+        Err("the relay serves forwarded ports only on Windows".to_string())
+    }
+}
+
+/// The line the relay writes to standard output once it listens. The backend that starts it
+/// waits for this line before it starts the program, so the program's first connection to a
+/// forwarded port does not race the relay. It matches the Windows backend.
+#[cfg(windows)]
+const RELAY_READY: &str = "ready";
 
 /// On Windows the backend keeps the relay's standard input open while the program runs and
 /// closes it when the program ends; the relay then ends by rule 5 (see `serve_until`).
 #[cfg(windows)]
-fn serve_relay(listener: std::net::TcpListener, target: std::net::SocketAddr) -> ExitCode {
-    let stop = match listener
-        .set_nonblocking(false)
-        .and_then(|()| stop_at_end_of_input())
-    {
+fn serve_relay(routes: Vec<(std::net::TcpListener, Connect)>) -> ExitCode {
+    use std::io::Write;
+
+    let stop = match stop_at_end_of_input() {
         Ok(stop) => stop,
         Err(error) => {
             eprintln!("sandy: relay failed: {error}");
             return ExitCode::from(EXIT_FAILURE);
         }
     };
+    let mut stdout = std::io::stdout().lock();
+    if writeln!(stdout, "{RELAY_READY}")
+        .and_then(|()| stdout.flush())
+        .is_err()
+    {
+        return ExitCode::from(EXIT_FAILURE);
+    }
+    drop(stdout);
     sandy_relay::serve_until(
-        listener,
+        routes,
         |listener| listener.accept().map(|(client, _)| client),
-        move || sandy_relay::connect(target),
         &stop,
         sandy_relay::DRAIN,
     );
     ExitCode::SUCCESS
 }
 
+/// No Unix backend starts the relay as a process of its own; started by hand, it serves until it
+/// is ended.
 #[cfg(not(windows))]
-fn serve_relay(listener: std::net::TcpListener, target: std::net::SocketAddr) -> ExitCode {
-    match sandy_relay::serve(listener, target) {
-        Ok(()) => ExitCode::SUCCESS,
+fn serve_relay(routes: Vec<(std::net::TcpListener, Connect)>) -> ExitCode {
+    match sandy_relay::Stop::new() {
+        Ok(never) => {
+            sandy_relay::serve_until(
+                routes,
+                |listener| listener.accept().map(|(client, _)| client),
+                &never,
+                sandy_relay::DRAIN,
+            );
+            ExitCode::SUCCESS
+        }
         Err(error) => {
             eprintln!("sandy: relay failed: {error}");
             ExitCode::from(EXIT_FAILURE)
@@ -297,58 +383,8 @@ fn stop_at_end_of_input() -> std::io::Result<sandy_relay::Stop> {
     Ok(stop)
 }
 
-/// The line the forward relay writes to standard output once it listens. The backend that starts
-/// it waits for this line before it starts the program, so the program's first connection does
-/// not race the relay. It matches the Windows backend.
-#[cfg(windows)]
-const FORWARD_READY: &str = "ready";
-
-#[cfg(windows)]
-fn forward(listen: std::net::SocketAddr, socket: &std::path::Path) -> ExitCode {
-    use std::io::Write;
-    use std::net::TcpListener;
-
-    let listener = match TcpListener::bind(listen) {
-        Ok(listener) => listener,
-        Err(error) => {
-            eprintln!("sandy: forward relay cannot listen on {listen}: {error}");
-            return ExitCode::from(EXIT_FAILURE);
-        }
-    };
-    let stop = match stop_at_end_of_input() {
-        Ok(stop) => stop,
-        Err(error) => {
-            eprintln!("sandy: forward relay failed: {error}");
-            return ExitCode::from(EXIT_FAILURE);
-        }
-    };
-    let mut stdout = std::io::stdout().lock();
-    if writeln!(stdout, "{FORWARD_READY}")
-        .and_then(|()| stdout.flush())
-        .is_err()
-    {
-        return ExitCode::from(EXIT_FAILURE);
-    }
-    let socket = socket.to_path_buf();
-    sandy_relay::serve_until(
-        listener,
-        |listener| listener.accept().map(|(client, _)| client),
-        move || sandy_relay::unix::connect_to(&socket),
-        &stop,
-        sandy_relay::DRAIN,
-    );
-    ExitCode::SUCCESS
-}
-
-/// Only the Windows backend starts the forward relay as a separate sandy process.
-#[cfg(not(windows))]
-fn forward(_listen: std::net::SocketAddr, _socket: &std::path::Path) -> ExitCode {
-    eprintln!("sandy: {} is used only on Windows", args::FORWARD_COMMAND);
-    ExitCode::from(EXIT_FAILURE)
-}
-
 /// The egress broker (`network.egress`). The Windows backend starts it as a separate sandy
-/// process in a sandbox of its own, with the AF_UNIX listener that the forward relay inside the
+/// process in a sandbox of its own, with the AF_UNIX listener that the relay inside the
 /// program's AppContainer passes the program's connections to. It serves SOCKS5 on that listener
 /// and connects out to the destinations `reach` allows, asking the Windows host which addresses
 /// are its own. It ends like a relay when sandy closes its standard input.

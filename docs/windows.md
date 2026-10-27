@@ -29,11 +29,11 @@ machine, which is a known open gap (see "Other users of the machine" and limitat
 | `InboundIpDenied` | The `internetClient` capability only; loopback isolation | firewall service not running; no fix for CVE-2021-41338 |
 | `UnixSocketsDenied` | No write access to socket files outside read-write paths | no AppContainer |
 | `SignalsIsolated` | Own console; AppContainer access checks; job UI restrictions | no AppContainer |
-| `ExposedPortsRelayed` | Listening socket created outside the AppContainer; `sandy __relay` in the program's AppContainer and a job of its own | no AppContainer; outer job with UI restrictions; sandy cannot grant read and execute on `sandy.exe`; `sandy.exe` lies in a read-write path |
+| `ExposedPortsRelayed` | Listening socket created outside the AppContainer; `sandy __relay`, one process for all exposed and forwarded ports, in the program's AppContainer and a job of its own | no AppContainer; outer job with UI restrictions; sandy cannot grant read and execute on `sandy.exe`; `sandy.exe` lies in a read-write path |
 | `ChildProcessesDenied` | The program's job admits one active process (`JOB_OBJECT_LIMIT_ACTIVE_PROCESS` = 1); the relays run without a console and with `PROCESS_CREATION_CHILD_PROCESS_RESTRICTED` | outer job with UI restrictions; no AppContainer |
 | `EndsWithParent` | sandy finds its parent in a process snapshot, checks its creation time, waits for it next to the program, and ends the program's job when it ends | outer job with UI restrictions; no AppContainer |
 | `ChildProcessesContained` | Every child joins the program's job, which allows no breakaway; sandy ends the job when the program exits, and kill-on-close ends it when sandy dies | outer job with UI restrictions; no AppContainer |
-| `ForwardedPortsRelayed` | `sandy __forward` in the program's AppContainer and a job of its own listens on the program's port and passes each connection over an AF_UNIX socket to sandy, which connects to the target; no loopback exemption | as for `ExposedPortsRelayed`; AF_UNIX missing; socket paths longer than 107 bytes |
+| `ForwardedPortsRelayed` | `sandy __relay` in the program's AppContainer and a job of its own listens on the program's ports and passes each connection over an AF_UNIX socket to sandy, which connects to the target; no loopback exemption | as for `ExposedPortsRelayed`; AF_UNIX missing; socket paths longer than 107 bytes |
 | `Win32kDenied` | `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY` with `PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON` for the program and the relays, read back with `GetProcessMitigationPolicy` before they run (only with `windows.win32k = "deny"`) | Windows refuses to set or report the mitigation |
 
 Every requirement also needs `windows.appcontainer_name` (or `--appcontainer NAME`). Without it,
@@ -81,8 +81,8 @@ in one of four classes:
   read the identity of a directory on the way.
 
 For the policy it found enforceable, `check` then makes the trials of `Backend::verify`: it binds
-the listeners of exposed and forwarded ports and the egress port (the forward relay binds the
-last two inside the AppContainer, which shares the host's ports), tries the nesting of sandy's
+the listeners of exposed and forwarded ports and the egress port (the relay binds the last two
+inside the AppContainer, which shares the host's ports), tries the nesting of sandy's
 job and, with `windows.win32k = "deny"`, the win32k lockdown. Whatever they find makes `check`
 fail with status 125 and never selects another level: any local user can hold a port
 (`check_and_run_fail_on_a_held_forward_or_egress_port`).
@@ -699,7 +699,7 @@ sandy runs the broker as `sandy __broker` in an AppContainer of its own, alongsi
    `"public-and-local"` connections in from hosts of a private network, which
    `privateNetworkClientServer` admits to a socket the broker listens on, although it listens on
    none.
-3. The program reaches the broker through a `sandy __forward` relay in the program's own
+3. The program reaches the broker through the `sandy __relay` in the program's own
    AppContainer, exactly as a forwarded port: the relay listens on `127.0.0.1:<egress port>`
    inside the sandbox and passes each connection over an AF_UNIX socket. sandy binds that socket
    outside the AppContainers and hands the listening handle to the broker, which inherits it and
@@ -891,18 +891,20 @@ For each entry of `network.expose`, sandy relays connections from `listen` to th
 port:
 
 1. sandy binds a TCP socket to `listen` outside the AppContainer and makes it inheritable.
-2. Before the program, sandy starts `sandy.exe __relay <handle> <target>` in the program's
-   AppContainer and in a job of its own (the relay job: kill-on-close, the same limits as the
-   program's job), created suspended and assigned to that job like the program, but without a
-   console and unable to create processes (see "Child processes"). The handle list holds only
-   the socket, a pipe as standard input (sandy keeps the other end), the NUL device as standard
-   output and the program's standard error. The environment holds only `SystemRoot` and
+2. Before the program, sandy starts one relay for all exposed and forwarded ports,
+   `sandy.exe __relay --expose <handle> <target>`, with one `--expose` per port and the
+   forwarded ports after them (see "Forwarded ports"), in the program's AppContainer and in a
+   job of its own (the relay job: kill-on-close, the same limits as the program's job), created
+   suspended and assigned to that job like the program, but without a console and unable to
+   create processes (see "Child processes"). The handle list holds only the sockets, a pipe as
+   standard input (sandy keeps the other end), a pipe as standard output for the line that says
+   it listens, and the program's standard error. The environment holds only `SystemRoot` and
    `LOCALAPPDATA`.
 3. The relay's token has no network capability and one file capability: read and execute on
    `sandy.exe`, granted with the same ACE mechanism as policy paths.
-4. sandy closes its own handle of the socket, starts the program and waits only for the
-   program. The relay ends as "How the relays end" describes. If sandy dies, kill-on-close ends
-   it.
+4. sandy closes its own handles of the sockets, starts the program once the relay says that it
+   listens, and waits only for the program. The relay ends as "How the relays end" describes. If
+   sandy dies, kill-on-close ends it.
 
 The relay accepts on the socket because a socket keeps the security context of the process that
 created it. It reaches the program over loopback because both run in the same AppContainer. It
@@ -937,13 +939,12 @@ to `port` on its own loopback address, without the loopback exemption:
    open the files in it with read and write data access. `%LOCALAPPDATA%` grants nothing to
    AppContainers, so the program, which does not hold that capability, cannot open them.
 2. sandy binds one AF_UNIX socket per port in that directory, named after the port, and serves
-   each on a thread: it connects every accepted connection to `to` over TCP.
-3. Before the program, sandy starts `sandy.exe __forward <listen> <socket>` in the program's
-   AppContainer and the relay job, like an exposed-port relay but without a socket: the relay
-   creates the program's listener on `listen` itself and writes "ready" to its standard output
-   (a pipe to sandy) once it listens. sandy starts the program only after that line, so the
-   program's first connection cannot come too early.
-4. The relay passes each connection it accepts to the AF_UNIX socket.
+   them all on one thread: it connects every accepted connection to its port's `to` over TCP.
+3. The relay of the exposed ports also gets `--sockets <directory>` and one `--forward <listen>`
+   per port. It creates the program's listener on each `listen` itself and writes "ready" to its
+   standard output (a pipe to sandy) once all of them listen. sandy starts the program only
+   after that line, so the program's first connection cannot come too early.
+4. The relay passes each connection it accepts to the AF_UNIX socket named after its port.
 
 Why this works: a listener that sandy creates outside the AppContainer is outside it, and the
 program's connection to it is blocked like any connection to a loopback listener outside. A
@@ -952,13 +953,25 @@ processes in one AppContainer reach each other over loopback. AF_UNIX is not sub
 isolation; AppContainer processes can connect to an AF_UNIX socket outside when they may write
 its file (`unix_sockets_in_writable_paths_are_reachable`).
 
-Like the exposed-port relay, the forward relay runs in the program's AppContainer, so the program
-can open and control it. That gives the program no more than `to`, which `network.forward`
+For the forwarded ports too, the relay runs in the program's AppContainer, so the program can
+open and control it. That gives the program no more than `to`, which `network.forward`
 grants anyway, plus read and execute access to `sandy.exe`. The socket path must fit into the
 107 bytes of `sun_path` (UTF-8); the plan checks the longest path under the directory and reports
 `ForwardedPortsRelayed` as unavailable otherwise, and so when Winsock has no AF_UNIX
 (`WSAEAFNOSUPPORT`). Any other error of the trial socket is indeterminate. sandy removes the directory when the run ends;
 Windows deletes a socket file also while its socket still listens.
+
+One relay serves every exposed and forwarded port, with one poll for all its listeners, as on Linux
+and macOS, so many ports cost one process. A process per port took about 1 MiB of memory, 7 ms of
+start time and part of a CPU core while idle for each port: 1 GiB, 7 seconds and half a core with
+1024 forwarded ports (measured on Windows 11). Each listener keeps its own connection limit, and one
+whose `accept` fails pauses alone, so the clients of one port cannot slow down another. The poll
+wakes only for a connection or the end of the run, so an idle relay costs no CPU, however many ports
+it serves. With 1024 forwarded ports, Windows Search and other system processes used about a third
+of a core in the first seconds of a run; 45 seconds after the start every process together was back
+at the idle level of a run without ports (measured on Windows 11). The relay's command line must fit
+into the 32767 characters that Windows allows, which holds about 1200 forwarded ports; sandy refuses
+a run with more.
 
 ### How the relays end
 
@@ -967,10 +980,13 @@ The relays follow docs/DESIGN.md "Forwarded ports" rule 5. When the program exit
 1. sandy ends the program's job at once and waits until the processes the program left behind
    are gone, so nothing in the sandbox can make a new connection.
 2. sandy closes each relay's standard input. The relay then stops waiting for connections,
-   still accepts those that already wait in its listen backlog (their handshake is complete, so
-   the client counts them as made), closes its listener, waits up to one second for the accepted
-   connections to finish, and ends. It checks for the stop at least every 50 ms, so it never has
-   to close its listener under a thread that waits in `accept`.
+   still accepts those that already wait in its listen backlogs (their handshake is complete, so
+   the client counts them as made), closes its listeners, waits up to one second for the
+   accepted connections to finish, and ends. The end of the input wakes its poll at once
+   through a connected pair of loopback sockets, which stands in for the pipe of Linux and macOS
+   because `WSAPoll` waits on sockets only, so the relay never has to close a listener under a
+   thread that waits in `accept`. The pair's listener lives only until it has accepted its own
+   other end and drops any other connection, also one from the program.
 3. One second after the program's end, sandy ends the relay job and waits until the relays and
    the broker are gone, stops its own forward sockets the same way and removes the socket
    directory.

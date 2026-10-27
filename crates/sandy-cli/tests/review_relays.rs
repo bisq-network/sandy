@@ -1,7 +1,7 @@
 //! Security review of the port relays (`network.expose` and `network.forward`).
 //!
 //! These tests probe the relay lifetime, the fail-closed behaviour when a relay cannot bind, and
-//! the internal `__relay`/`__forward` commands when an attacker runs them directly on the host.
+//! the internal `__relay` command when an attacker runs it directly on the host.
 //! Each test is gated per platform. The Unix tests run on Linux and macOS, where sandy binds the
 //! relay listeners the same way. Windows forward and expose are covered by `escape_windows.rs`
 //! (`forward_socket_is_reachable_only_by_the_relay`, `relays_reach_only_the_program`,
@@ -109,23 +109,25 @@ fn relay_bind_conflict_fails_closed() {
     panic!("another process took the control's ports ten times in a row");
 }
 
-/// The internal `__relay` and `__forward` commands are not part of the documented interface. A
-/// backend starts them only with a real listening socket (expose) or inside the sandbox
-/// (forward). Run directly by an unsandboxed attacker they must give nothing: no relay is
-/// established, so the caller gains no reach it did not already have as an unsandboxed user.
+/// The internal `__relay` command is not part of the documented interface. A backend starts it
+/// only with real listening sockets (expose) or inside the sandbox (forward). Run directly by an
+/// unsandboxed attacker it must give nothing: no relay is established, so the caller gains no
+/// reach it did not already have as an unsandboxed user.
 #[test]
 fn internal_commands_yield_no_working_relay() {
-    // `__forward` is Windows only; on Unix it refuses.
+    // Forwarded ports are relayed this way on Windows only; on Unix it refuses.
     let output = sandy([
-        "__forward",
+        "__relay",
+        "--sockets",
+        "/tmp/sandy-review-nonexistent",
+        "--forward",
         "127.0.0.1:1",
-        "/tmp/sandy-review-nonexistent.sock",
     ]);
     assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
 
     // `__relay` with a descriptor number that is not an open socket cannot serve. The relay would
     // need a listening socket the caller passed; an arbitrary number yields an error, not a relay.
-    let output = sandy(["__relay", "999999999999", "127.0.0.1:1"]);
+    let output = sandy(["__relay", "--expose", "999999999999", "127.0.0.1:1"]);
     assert_eq!(
         output.status.code(),
         Some(EXIT_FAILURE),

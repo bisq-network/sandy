@@ -44,19 +44,12 @@ const RUN_SUFFIX_BYTES: usize = 1 + 16 + 1 + 5;
 /// sockets do, which lets them open it but not delete it, and they end with the run.
 const LOCK_NAME: &str = "lock";
 
-/// One forwarded port as its relay sees it: the program's address it listens on, and the socket
-/// it passes each connection to.
-pub struct Route {
-    pub listen: SocketAddr,
-    pub socket: PathBuf,
-}
-
-/// The sockets of one run and the threads that serve them.
+/// The sockets of one run and the thread that serves them.
 pub struct Forwarding {
     directory: PathBuf,
     /// Dropped before the directory is removed, because the run itself holds it.
     lock: Option<std::fs::File>,
-    servers: Vec<(Stop, JoinHandle<()>)>,
+    server: Option<(Stop, JoinHandle<()>)>,
 }
 
 /// The directory that holds the socket directories of all runs.
@@ -83,15 +76,16 @@ pub fn check() -> Result<(), Problem> {
 
 impl Forwarding {
     /// Creates the socket directory, lets `relay_capability` open the sockets in it, binds one
-    /// socket per forwarded port and serves each by connecting to its target. When `egress` is
-    /// set, it also binds one socket for the egress broker but does not serve it: the broker
-    /// serves that one in its own sandbox, so the bound listener is handed back with a route for
-    /// the relay inside the program's AppContainer that passes the program's connections to it.
+    /// socket per forwarded port and serves them all on one thread, connecting each connection to
+    /// its port's target. When `egress` is set, it also binds one socket for the egress broker but
+    /// does not serve it: the broker serves that one in its own sandbox, so the bound listener is
+    /// handed back. The addresses are the program's ports that the relay inside the program's
+    /// AppContainer listens on, each passing its connections to the socket named after its port.
     pub fn start(
         forward: &[ForwardedPort],
         egress: Option<SocketAddr>,
         relay_capability: &Sid,
-    ) -> Result<(Forwarding, Vec<Route>, Option<unix::Listener>), SandboxError> {
+    ) -> Result<(Forwarding, Vec<SocketAddr>, Option<unix::Listener>), SandboxError> {
         let base = base()?;
         std::fs::create_dir_all(&base).map_err(|error| {
             SandboxError::io(format!("cannot create {}", base.display()), error)
@@ -102,7 +96,7 @@ impl Forwarding {
         let mut forwarding = Forwarding {
             directory,
             lock: Some(lock),
-            servers: Vec::new(),
+            server: None,
         };
         // Set before the sockets exist, so that each socket file inherits the entry.
         acl::allow(
@@ -111,62 +105,67 @@ impl Forwarding {
             SOCKET_ACCESS,
             OBJECT_INHERIT_ACE | INHERIT_ONLY_ACE,
         )?;
+        let mut listens = Vec::with_capacity(forward.len() + 1);
         let mut routes = Vec::with_capacity(forward.len());
         for entry in forward {
-            let (listener, socket) = forwarding.bind(entry.port)?;
-            let stop = Stop::new()
-                .map_err(|error| SandboxError::io("cannot make a forward server's stop", error))?;
-            let request = stop.clone();
+            let listener = forwarding.bind(entry.port)?;
             let target = entry.to;
+            routes.push((listener, move || sandy_relay::connect(target)));
+            listens.push(entry.listen());
+        }
+        // Bound before the server starts, so a failure leaves no thread behind.
+        let egress_listener = match egress {
+            None => None,
+            Some(listen) => {
+                let listener = forwarding.bind(listen.port())?;
+                listens.push(listen);
+                Some(listener)
+            }
+        };
+        if !routes.is_empty() {
+            let stop = Stop::new().map_err(|error| {
+                SandboxError::io("cannot make the forward server's stop", error)
+            })?;
+            let request = stop.clone();
             let server = thread::Builder::new()
                 .spawn(move || {
                     sandy_relay::serve_until(
-                        listener,
+                        routes,
                         |listener| listener.accept(),
-                        move || sandy_relay::connect(target),
                         &request,
                         sandy_relay::DRAIN,
                     )
                 })
-                .map_err(|error| SandboxError::io("cannot start a forward server", error))?;
-            forwarding.servers.push((stop, server));
-            routes.push(Route {
-                listen: entry.listen(),
-                socket,
-            });
+                .map_err(|error| SandboxError::io("cannot start the forward server", error))?;
+            forwarding.server = Some((stop, server));
         }
-        let egress_listener = match egress {
-            None => None,
-            Some(listen) => {
-                let (listener, socket) = forwarding.bind(listen.port())?;
-                routes.push(Route { listen, socket });
-                Some(listener)
-            }
-        };
-        Ok((forwarding, routes, egress_listener))
+        Ok((forwarding, listens, egress_listener))
+    }
+
+    /// The directory of the run's sockets, which the relay inside the program's AppContainer is
+    /// told.
+    pub fn directory(&self) -> &Path {
+        &self.directory
     }
 
     /// Binds one AF_UNIX socket named after `port` in the run directory. The relay inside the
     /// program's AppContainer connects to it; the entry it inherits from the directory is all it
     /// needs.
-    fn bind(&self, port: u16) -> Result<(unix::Listener, PathBuf), SandboxError> {
-        let socket = self.directory.join(port.to_string());
-        let listener = unix::Listener::bind(&socket).map_err(|error| {
+    fn bind(&self, port: u16) -> Result<unix::Listener, SandboxError> {
+        let socket = unix::socket_path(&self.directory, port);
+        unix::Listener::bind(&socket).map_err(|error| {
             SandboxError::io(format!("cannot listen on {}", socket.display()), error)
-        })?;
-        Ok((listener, socket))
+        })
     }
 
     /// Stops taking connections, lets accepted ones finish until `deadline`, and removes the
     /// sockets. Connections still open at the deadline end with sandy.
     pub fn stop(self, deadline: Instant) {
-        for (stop, _) in &self.servers {
+        if let Some((stop, server)) = &self.server {
             stop.request();
-        }
-        while self.servers.iter().any(|(_, server)| !server.is_finished())
-            && Instant::now() < deadline
-        {
-            thread::sleep(Duration::from_millis(10));
+            while !server.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
         }
         // Dropping self removes the directory.
     }

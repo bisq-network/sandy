@@ -1891,6 +1891,76 @@ fn forward_works_without_the_loopback_exemption() {
     assert!(accepts_within(&outside, Duration::from_secs(3)));
 }
 
+/// One relay serves every exposed and forwarded port of a run, so their number costs no process
+/// each: with two exposed and three forwarded ports the run has one `sandy.exe` child, and the
+/// program reaches each service outside through its own port.
+#[test]
+fn one_relay_serves_every_exposed_and_forwarded_port() {
+    let fixture = Fixture::new("forward-many");
+    let services: Vec<_> = (0..3).map(|_| one_shot_service()).collect();
+    let inners: Vec<u16> = services.iter().map(|_| free_port()).collect();
+    let mut sandbox_args = fixture.access_args();
+    sandbox_args.extend(args(&[
+        "--appcontainer",
+        &appcontainer_name(),
+        "--ip",
+        "all",
+    ]));
+    for (inner, (service, _)) in inners.iter().zip(&services) {
+        sandbox_args.extend(args(&[
+            "--forward",
+            &format!("{inner}=127.0.0.1:{service}"),
+        ]));
+    }
+    for _ in 0..2 {
+        let exposed = format!("127.0.0.1:{}={}", free_port(), free_port());
+        sandbox_args.extend(args(&["--expose", &exposed]));
+    }
+    let addresses: Vec<String> = inners
+        .iter()
+        .map(|inner| format!("127.0.0.1:{inner}"))
+        .collect();
+    let mut actions = vec![("sleep", "1500")];
+    actions.extend(
+        addresses
+            .iter()
+            .map(|address| ("tcp-connect", address.as_str())),
+    );
+    let run = Command::new(sandy_path())
+        .args(run_args(&sandbox_args, &actions))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // sandy starts the program only once the relay listens, so the relay runs during the sleep.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let relays = loop {
+        let relays = relay_processes(run.id());
+        if !relays.is_empty() {
+            break relays;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no relay process of sandy {}",
+            run.id()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(relays.len(), 1, "one relay for all ports");
+    let output = run.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let lines = parse(&output);
+    for line in &lines[1..] {
+        line.assert_ok();
+    }
+    for (service, received) in services {
+        assert!(
+            received.join().unwrap().is_some(),
+            "the service on port {service} saw no connection"
+        );
+    }
+}
+
 /// The drain of the relay lifetime rule: a program that connects through a forwarded port, writes
 /// and exits at once does not lose its data. Without the exemption, as above.
 #[test]
@@ -3101,9 +3171,10 @@ fn win32k_lockdown_reaches_the_program_its_children_and_its_console_host() {
     }
 }
 
-/// The relays run in the program's AppContainer, where the program can open them, so they start
-/// with win32k system calls disabled too, and still relay. The program reads the flag of every
-/// relay it can query; without the key the flag is clear.
+/// The relay runs in the program's AppContainer, where the program can open it, so it starts with
+/// win32k system calls disabled too, and still relays. The program reads the flag of every relay
+/// it can query: one, which serves the exposed and the forwarded port. Without the key the flag is
+/// clear.
 #[test]
 fn the_relays_run_with_the_win32k_lockdown() {
     let fixture = Fixture::new("win32k-relays");
@@ -3141,7 +3212,7 @@ fn the_relays_run_with_the_win32k_lockdown() {
         let lines = parse(&output);
         lines[0].assert_ok();
         let relays: Vec<&str> = lines[0].detail.split(' ').collect();
-        assert_eq!(relays.len(), 2, "{lines:?}");
+        assert_eq!(relays.len(), 1, "{lines:?}");
         assert!(
             relays
                 .iter()
@@ -3792,7 +3863,7 @@ fn the_egress_broker_ends_with_the_program() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let children = loop {
         let children = relay_processes(run.id());
-        // The egress forward relay and the broker are both sandy.exe children.
+        // The relay and the broker are both sandy.exe children.
         if children.len() >= 2 {
             break children;
         }

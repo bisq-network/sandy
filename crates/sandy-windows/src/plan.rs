@@ -446,9 +446,10 @@ fn mechanism(
         Requirement::ExposedPortsRelayed => {
             let sandy = relay(policy, host)?;
             Ok(format!(
-                "`sandy __relay` in AppContainer {name:?} and a job of its own, on a listening \
-                 socket that sandy creates outside the AppContainer; the relay has no network \
-                 capability and only read and execute access to {}; {RELAY_END}",
+                "`sandy __relay` in AppContainer {name:?} and a job of its own, one process for \
+                 all exposed and forwarded ports, on listening sockets that sandy creates outside \
+                 the AppContainer; the relay has no network capability and only read and execute \
+                 access to {}; {RELAY_END}",
                 sandy.display()
             ))
         }
@@ -456,11 +457,12 @@ fn mechanism(
             let sandy = relay(policy, host);
             all([unit(&sandy), forward_sockets(host)])?;
             Ok(format!(
-                "`sandy __forward` in AppContainer {name:?} and a job of its own listens on the \
-                 program's loopback port and passes each connection over an AF_UNIX socket that \
-                 only the relays may open to sandy outside, which connects to the target; no \
-                 loopback exemption is needed; the relay has no network capability and only read \
-                 and execute access to {}; {RELAY_END}",
+                "`sandy __relay` in AppContainer {name:?} and a job of its own, one process for \
+                 all exposed and forwarded ports, listens on the program's loopback ports and \
+                 passes each connection over an AF_UNIX socket that only the relays may open to \
+                 sandy outside, which connects to the target; no loopback exemption is needed; \
+                 the relay has no network capability and only read and execute access to {}; \
+                 {RELAY_END}",
                 sandy?.display()
             ))
         }
@@ -553,7 +555,7 @@ fn mechanism(
             Ok(format!(
                 "`sandy __broker` in AppContainer {broker:?}, its own sandbox with the \
                  internetClient capability{capabilities}, in the relay job, serves SOCKS5 on an \
-                 AF_UNIX socket that a `sandy __forward` relay in AppContainer {name:?} passes the \
+                 AF_UNIX socket that the `sandy __relay` in AppContainer {name:?} passes the \
                  program's connections to; it connects out only to {reach} destinations \
                  (sandy_core::destination) and never to this host, which its own loopback \
                  isolation also denies at the kernel; the broker has only read and execute \
@@ -1581,7 +1583,7 @@ mod tests {
         assert!(plan(&policy, &host()).is_enforceable());
         match status(&policy, &host(), Requirement::ForwardedPortsRelayed) {
             Status::Enforced { mechanism } => {
-                assert!(mechanism.contains("sandy __forward"), "{mechanism}");
+                assert!(mechanism.contains("sandy __relay"), "{mechanism}");
                 assert!(mechanism.contains("AF_UNIX"), "{mechanism}");
                 assert!(mechanism.contains("no loopback exemption"), "{mechanism}");
             }

@@ -77,8 +77,8 @@ impl Backend for WindowsBackend {
     /// indeterminate (`Backend::verify`).
     fn verify(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
         let mut items = sandy_core::verify::relay_listeners(policy);
-        // The `__forward` relay of the egress broker listens on the program's egress port inside
-        // the AppContainer, which shares the host's ports, like a forwarded port.
+        // The relay listens on the program's egress port inside the AppContainer, which shares the
+        // host's ports, as it does on a forwarded port.
         if let Some(egress) = policy.egress {
             let address = egress.listen();
             if let Err(error) = std::net::TcpListener::bind(address) {
@@ -193,11 +193,63 @@ impl Backend for WindowsBackend {
         let mut forwarding = None;
         if let Some((capability, sandy)) = &relay_capability {
             let capability = std::slice::from_ref(capability);
-            for (listener, target) in relay::listen(&policy.expose)? {
+            // One `sandy __relay` in the program's AppContainer serves every exposed port, on the
+            // listener that sandy creates outside, and every forwarded port, on a listener it
+            // creates inside. The egress broker reaches the program through a forwarded port like
+            // any other, whose socket the broker serves instead of sandy.
+            let exposed = relay::listen(&policy.expose)?;
+            let mut args = vec![wide(relay::RELAY_COMMAND.as_ref())];
+            for (listener, target) in &exposed {
+                args.push(wide("--expose".as_ref()));
+                args.push(wide(listener.as_raw_socket().to_string().as_ref()));
+                args.push(wide(target.to_string().as_ref()));
+            }
+            let egress_listen = policy.egress.map(|egress| egress.listen());
+            let mut egress_listener = None;
+            if !policy.forward.is_empty() || egress_listen.is_some() {
+                let (started, listens, listener) =
+                    forward::Forwarding::start(&policy.forward, egress_listen, &capability[0])?;
+                args.push(wide("--sockets".as_ref()));
+                args.push(wide(started.directory().as_os_str()));
+                for listen in listens {
+                    args.push(wide("--forward".as_ref()));
+                    args.push(wide(listen.to_string().as_ref()));
+                }
+                forwarding = Some(started);
+                egress_listener = listener;
+            }
+            let process = process_for(
+                sandy.as_os_str(),
+                sandy.as_os_str(),
+                &args,
+                &[],
+                None,
+                capability,
+            )
+            .map_err(|error| {
+                SandboxError::new(format!(
+                    "cannot start the relay of {} exposed and {} forwarded ports: {error}",
+                    policy.expose.len(),
+                    policy.forward.len()
+                ))
+            })?;
+            relays.push(process::Relay {
+                process,
+                appcontainer: &container,
+                sockets: exposed
+                    .into_iter()
+                    .map(|(listener, _)| Box::new(listener) as Box<dyn process::InheritedSocket>)
+                    .collect(),
+                reports_ready: true,
+            });
+            // The broker itself: `sandy __broker` in its own AppContainer, serving the egress
+            // AF_UNIX socket it inherits. It is in the relay job, so it ends with the program.
+            if let (Some(broker), Some(listener)) = (&broker, egress_listener) {
+                let reach = policy.egress.expect("egress set with a broker").reach;
                 let args = [
-                    wide(relay::RELAY_COMMAND.as_ref()),
+                    wide(relay::BROKER_COMMAND.as_ref()),
                     wide(listener.as_raw_socket().to_string().as_ref()),
-                    wide(target.to_string().as_ref()),
+                    wide(reach.name().as_ref()),
                 ];
                 relays.push(process::Relay {
                     process: process_for(
@@ -206,63 +258,12 @@ impl Backend for WindowsBackend {
                         &args,
                         &[],
                         None,
-                        capability,
+                        &broker.capabilities,
                     )?,
-                    appcontainer: &container,
-                    socket: Some(Box::new(listener)),
+                    appcontainer: &broker.container,
+                    sockets: vec![Box::new(listener)],
                     reports_ready: false,
                 });
-            }
-            // The egress broker reaches the program through a forward relay like any other, whose
-            // target is the broker's AF_UNIX socket instead of a loopback service.
-            let egress_listen = policy.egress.map(|egress| egress.listen());
-            if !policy.forward.is_empty() || egress_listen.is_some() {
-                let (started, routes, egress_listener) =
-                    forward::Forwarding::start(&policy.forward, egress_listen, &capability[0])?;
-                forwarding = Some(started);
-                for route in routes {
-                    let args = [
-                        wide(relay::FORWARD_COMMAND.as_ref()),
-                        wide(route.listen.to_string().as_ref()),
-                        wide(route.socket.as_os_str()),
-                    ];
-                    relays.push(process::Relay {
-                        process: process_for(
-                            sandy.as_os_str(),
-                            sandy.as_os_str(),
-                            &args,
-                            &[],
-                            None,
-                            capability,
-                        )?,
-                        appcontainer: &container,
-                        socket: None,
-                        reports_ready: true,
-                    });
-                }
-                // The broker itself: `sandy __broker` in its own AppContainer, serving the egress
-                // AF_UNIX socket it inherits. It is in the relay job, so it ends with the program.
-                if let (Some(broker), Some(listener)) = (&broker, egress_listener) {
-                    let reach = policy.egress.expect("egress set with a broker").reach;
-                    let args = [
-                        wide(relay::BROKER_COMMAND.as_ref()),
-                        wide(listener.as_raw_socket().to_string().as_ref()),
-                        wide(reach.name().as_ref()),
-                    ];
-                    relays.push(process::Relay {
-                        process: process_for(
-                            sandy.as_os_str(),
-                            sandy.as_os_str(),
-                            &args,
-                            &[],
-                            None,
-                            &broker.capabilities,
-                        )?,
-                        appcontainer: &broker.container,
-                        socket: Some(Box::new(listener)),
-                        reports_ready: false,
-                    });
-                }
             }
         }
 

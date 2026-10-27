@@ -61,7 +61,7 @@ use super::util::{Sid, last_error, wide_nul};
 pub struct Launch<'a> {
     pub appcontainer: &'a Sid,
     pub program: Process<'a>,
-    /// One relay per exposed or forwarded port.
+    /// The relay of the exposed and forwarded ports, and the egress broker.
     pub relays: Vec<Relay<'a>>,
     /// `process.children = "none"`: the program's job admits no process besides the program.
     pub deny_children: bool,
@@ -118,19 +118,20 @@ impl InheritedSocket for sandy_relay::unix::Listener {
     }
 }
 
-/// A relay process: `sandy __relay` for an exposed port, `sandy __forward` for a forwarded port,
-/// or `sandy __broker` for the egress broker. Its standard input is a pipe that sandy closes when
-/// the program ends; the relay then stops taking connections and ends within `sandy_relay::DRAIN`.
-/// The broker runs in a sandbox of its own, so each relay names the AppContainer it belongs to.
+/// A relay process: `sandy __relay` for the exposed and forwarded ports, or `sandy __broker` for
+/// the egress broker. Its standard input is a pipe that sandy closes when the program ends; the
+/// relay then stops taking connections and ends within `sandy_relay::DRAIN`. The broker runs in a
+/// sandbox of its own, so each relay names the AppContainer it belongs to.
 pub struct Relay<'a> {
     pub process: Process<'a>,
-    /// The AppContainer the relay runs in: the program's for `__relay` and `__forward`, the
-    /// broker's own for `__broker`.
+    /// The AppContainer the relay runs in: the program's for `__relay`, the broker's own for
+    /// `__broker`.
     pub appcontainer: &'a Sid,
-    /// The listening socket an exposed-port relay or the broker receives.
-    pub socket: Option<Box<dyn InheritedSocket>>,
+    /// The listening sockets the relay receives: those of the exposed ports for `__relay`, the
+    /// egress socket for `__broker`.
+    pub sockets: Vec<Box<dyn InheritedSocket>>,
     /// The relay writes the line "ready" to standard output once it listens, and the program
-    /// starts only after that. A forwarded-port relay creates its listener itself.
+    /// starts only after that. `__relay` creates the listeners of forwarded ports itself.
     pub reports_ready: bool,
 }
 
@@ -141,7 +142,7 @@ pub struct Ended {
     pub deadline: Instant,
 }
 
-/// The line a forwarded-port relay writes once it listens. It matches the sandy command line.
+/// The line the relay writes once it listens. It matches the sandy command line.
 const RELAY_READY: &str = "ready";
 /// How long a relay may take to report that it listens.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -319,20 +320,20 @@ fn start_relay(
         output.as_raw_handle(),
         stdio.child[2].as_raw_handle(),
     ];
-    let socket = relay.socket.as_ref().map(|socket| socket.raw());
+    let sockets: Vec<HANDLE> = relay.sockets.iter().map(|socket| socket.raw()).collect();
     let process = start(
         &mut relay.process,
         relay.appcontainer,
         relay_job,
         relay_stdio,
-        socket.as_slice(),
+        &sockets,
         Role::Relay,
         deny_win32k,
     )?;
     // The relay holds its own handles now. Without sandy's copies, the relay sees the end of its
     // input when sandy closes `input`, and clients of an exposed port are refused once the relay
     // closes its socket.
-    drop((input_read, output, relay.socket));
+    drop((input_read, output, relay.sockets));
     if let Some(ready_read) = ready_read {
         wait_until_ready(ready_read)?;
     }
@@ -352,10 +353,10 @@ fn wait_until_ready(output: OwnedHandle) -> Result<(), SandboxError> {
     match receiver.recv_timeout(READY_TIMEOUT) {
         Ok(Ok(line)) if line.trim_end() == RELAY_READY => Ok(()),
         Ok(_) => Err(SandboxError::new(
-            "a forwarded-port relay ended before it listened; its error is on standard error",
+            "the relay ended before it listened; its error is on standard error",
         )),
         Err(_) => Err(SandboxError::new(format!(
-            "a forwarded-port relay did not listen within {} seconds",
+            "the relay did not listen within {} seconds",
             READY_TIMEOUT.as_secs()
         ))),
     }

@@ -1,10 +1,11 @@
-//! The relays of `network.expose` and `network.forward`. For `expose`: Windows drops every
-//! inbound loopback connection into an AppContainer, so sandy listens outside the AppContainer
-//! and starts `sandy __relay` inside it.
+//! The relay of `network.expose` and `network.forward`: one `sandy __relay` inside the program's
+//! AppContainer serves every exposed and forwarded port of a run. For `expose`: Windows drops
+//! every inbound loopback connection into an AppContainer, so sandy listens outside the
+//! AppContainer and the relay accepts on those sockets.
 //! A socket created outside the AppContainer keeps the security context of its creator and
 //! accepts outside connections; the relay reaches the program over loopback because both run in
-//! the same AppContainer. For `forward`, the relay `sandy __forward` creates the program's
-//! listener inside the AppContainer itself (see `forward`).
+//! the same AppContainer. For `forward`, the relay creates the program's listener inside the
+//! AppContainer itself (see `forward`).
 
 use std::net::{SocketAddr, TcpListener};
 use std::os::windows::io::AsRawSocket;
@@ -18,11 +19,8 @@ use super::util::last_error;
 use crate::plan::Problem;
 use crate::probe::{self, Ungrantable};
 
-/// The internal command of the sandy command line that runs a relay.
+/// The internal command of the sandy command line that runs the relay.
 pub const RELAY_COMMAND: &str = "__relay";
-
-/// The internal command of the sandy command line that runs a forward relay.
-pub const FORWARD_COMMAND: &str = "__forward";
 
 /// The internal command of the sandy command line that runs the egress broker.
 pub const BROKER_COMMAND: &str = "__broker";
@@ -69,7 +67,7 @@ fn grant_problem(sandy: &Path, problem: Ungrantable) -> Problem {
 }
 
 /// One listening socket per exposed port, created outside the AppContainer and inheritable, with
-/// the program's address that its relay connects to.
+/// the program's address that the relay connects to.
 pub fn listen(expose: &[ExposedPort]) -> Result<Vec<(TcpListener, SocketAddr)>, SandboxError> {
     expose
         .iter()

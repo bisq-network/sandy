@@ -149,10 +149,10 @@ where
 }
 
 /// A request to stop a server that `serve_until` or `broker::serve` runs. Clones share the
-/// request. On Unix the request also writes to a pipe that the server polls next to its
-/// listener, so the server closes the listener at once (docs/DESIGN.md, "Forwarded ports", rule
-/// 5). `WSAPoll` waits on sockets only, so a Windows server looks for the request every
-/// `STOP_CHECK`.
+/// request. The request also writes to a wake channel that the server polls next to its
+/// listeners, so the server closes them at once (docs/DESIGN.md, "Forwarded ports", rule 5) and
+/// never wakes before: a pipe on Unix, and on Windows, where `WSAPoll` waits on sockets only, a
+/// connected pair of loopback sockets (`wake_pair`).
 #[derive(Debug, Clone)]
 pub struct Stop(Arc<StopState>);
 
@@ -161,23 +161,26 @@ struct StopState {
     requested: AtomicBool,
     #[cfg(unix)]
     wake: (io::PipeReader, io::PipeWriter),
+    #[cfg(windows)]
+    wake: (TcpStream, TcpStream),
 }
 
 impl Stop {
-    /// Fails on Unix when this process cannot make a pipe.
+    /// Fails when this process cannot make the wake channel.
     pub fn new() -> io::Result<Stop> {
         Ok(Stop(Arc::new(StopState {
             requested: AtomicBool::new(false),
             #[cfg(unix)]
             wake: io::pipe()?,
+            #[cfg(windows)]
+            wake: wake_pair()?,
         })))
     }
 
     pub fn request(&self) {
-        // Only the first request writes, so the pipe holds at most one byte and the write
+        // Only the first request writes, so the channel holds at most one byte and the write
         // neither blocks nor fails.
         if !self.0.requested.swap(true, Ordering::AcqRel) {
-            #[cfg(unix)]
             let _ = (&self.0.wake.1).write(&[0]);
         }
     }
@@ -194,38 +197,67 @@ impl Stop {
     }
 }
 
-/// How long a Windows server waits for a connection before it checks for a stop request again.
+/// The wake channel of a `Stop` on Windows: a TCP connection over loopback, read end first. The
+/// listener lives only until it has accepted the connection from the write end, and it drops any
+/// other, so no other process, also none in the same AppContainer, holds an end. A process in an
+/// AppContainer may connect to its own loopback listener.
 #[cfg(windows)]
-const STOP_CHECK: Duration = Duration::from_millis(50);
+fn wake_pair() -> io::Result<(TcpStream, TcpStream)> {
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let write = TcpStream::connect(listener.local_addr()?)?;
+    let own = write.local_addr()?;
+    loop {
+        let (read, peer) = listener.accept()?;
+        if peer == own {
+            return Ok((read, write));
+        }
+    }
+}
 
-/// Serves like `serve_with` until `stop` is requested, then ends the way docs/DESIGN.md rule 5
-/// asks:
-/// 1. It still accepts the connections that are waiting in the listen backlog. Their handshake
+/// Serves every listener of `routes` like `serve_with`, each with its own `connect` and its own
+/// `MAX_CONNECTIONS`, until `stop` is requested, then ends the way docs/DESIGN.md rule 5 asks:
+/// 1. It still accepts the connections that are waiting in the listen backlogs. Their handshake
 ///    completed, so the client already counts them as made; a program that connects, writes and
 ///    exits would otherwise lose its data.
-/// 2. It closes the listener, so no later connection is taken.
+/// 2. It closes the listeners, so no later connection is taken.
 /// 3. It waits up to `drain` for the accepted connections to finish, then returns. Connections
 ///    still open after that end with the process, with a reset (`abort_all`).
 ///
-/// It never blocks in `accept` without a pending connection, so the stop takes effect within
-/// `STOP_CHECK` without closing the listener under another thread.
-#[cfg(windows)]
-pub fn serve_until<L, A, C>(listener: L, accept: A, connect: C, stop: &Stop, drain: Duration)
+/// One poll covers all listeners, so one thread serves any number of them. It never blocks in
+/// `accept` without a pending connection, and the stop wakes it at once, so the stop takes effect
+/// without closing a listener under another thread. It wakes only for a connection, a stop or the
+/// end of a pause, so an idle server costs no CPU. A listener whose accept fails pauses for
+/// `ACCEPT_ERROR_PAUSE`, so a lasting error does not spin, while the others go on: clients of one
+/// port cannot slow down another.
+pub fn serve_until<L, A, C>(routes: Vec<(L, C)>, accept: A, stop: &Stop, drain: Duration)
 where
     L: AsRawListener,
     A: FnMut(&L) -> io::Result<TcpStream>,
     C: Fn() -> io::Result<TcpStream> + Send + Sync + 'static,
 {
-    serve_connections_until(listener, accept, &relayed(connect), stop, drain);
+    let servers = routes
+        .into_iter()
+        .map(|(listener, connect)| (listener, relayed(connect)))
+        .collect();
+    serve_connections_until(servers, accept, stop, drain);
 }
 
-/// The loop of `serve_until`, which `broker::serve` shares: it hands each accepted connection to
-/// `connections` until `stop` is requested, then ends as `serve_until` describes. On Unix the
-/// request wakes it at once (`Stop`).
+/// Where a listener of `serve_connections_until` is.
+#[derive(Debug, Clone, Copy)]
+enum Listening {
+    Open,
+    /// Its accept failed; it is polled again from this time.
+    Paused(Instant),
+    /// Its accept failed after the stop request, so the rest of its backlog is given up.
+    Done,
+}
+
+/// The loop of `serve_until`, which `broker::serve` shares: it hands each connection accepted on
+/// a listener to that listener's `Connections` until `stop` is requested, then ends as
+/// `serve_until` describes. The request wakes it at once (`Stop`).
 fn serve_connections_until<L, A, H>(
-    listener: L,
+    servers: Vec<(L, Connections<H>)>,
     mut accept: A,
-    connections: &Connections<H>,
     stop: &Stop,
     drain: Duration,
 ) where
@@ -233,24 +265,65 @@ fn serve_connections_until<L, A, H>(
     A: FnMut(&L) -> io::Result<TcpStream>,
     H: Fn(TcpStream) + Send + Sync + 'static,
 {
+    let (listeners, connections): (Vec<L>, Vec<Connections<H>>) = servers.into_iter().unzip();
+    let mut states = vec![Listening::Open; listeners.len()];
     let mut deadline: Option<Instant> = None;
     loop {
         if deadline.is_none() && stop.is_requested() {
             deadline = Some(Instant::now() + drain);
+            // A paused listener still has its backlog taken; another failure gives it up.
+            for state in &mut states {
+                if let Listening::Paused(_) = state {
+                    *state = Listening::Open;
+                }
+            }
         }
         let stopping = deadline.is_some();
-        match pending(raw_listener(&listener), stop, stopping) {
-            Ok(true) => match accept(&listener) {
-                Ok(client) => {
-                    if !connections.start(client) {
-                        thread::sleep(ACCEPT_ERROR_PAUSE);
+        let now = Instant::now();
+        let mut resume: Option<Instant> = None;
+        let mut polled = Vec::with_capacity(listeners.len());
+        for (index, state) in states.iter_mut().enumerate() {
+            if let Listening::Paused(at) = *state {
+                if at <= now {
+                    *state = Listening::Open;
+                } else {
+                    resume = Some(resume.map_or(at, |earliest| earliest.min(at)));
+                }
+            }
+            if let Listening::Open = state {
+                polled.push(index);
+            }
+        }
+        if stopping && polled.is_empty() {
+            break;
+        }
+        let wait = if stopping {
+            Some(Duration::ZERO)
+        } else {
+            resume.map(|at| at.saturating_duration_since(now))
+        };
+        let sockets: Vec<RawSocket> = polled
+            .iter()
+            .map(|&index| raw_listener(&listeners[index]))
+            .collect();
+        match pending(&sockets, stop, wait) {
+            Ok(ready) if stopping && ready.is_empty() => break,
+            Ok(ready) => {
+                for position in ready {
+                    let index = polled[position];
+                    let served = match accept(&listeners[index]) {
+                        Ok(client) => connections[index].start(client),
+                        Err(_) => false,
+                    };
+                    if !served {
+                        states[index] = if stopping {
+                            Listening::Done
+                        } else {
+                            Listening::Paused(Instant::now() + ACCEPT_ERROR_PAUSE)
+                        };
                     }
                 }
-                Err(_) if stopping => break,
-                Err(_) => thread::sleep(ACCEPT_ERROR_PAUSE),
-            },
-            Ok(false) if stopping => break,
-            Ok(false) => {}
+            }
             Err(_) if stopping => break,
             Err(_) => thread::sleep(ACCEPT_ERROR_PAUSE),
         }
@@ -258,12 +331,13 @@ fn serve_connections_until<L, A, H>(
             break;
         }
     }
-    drop(listener);
+    drop(listeners);
     let deadline = deadline.unwrap_or_else(|| Instant::now() + drain);
-    while connections.active() > 0 && Instant::now() < deadline {
+    let active = || connections.iter().map(Connections::active).sum::<usize>();
+    while active() > 0 && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
-    if connections.active() > 0 {
+    if active() > 0 {
         abort_all();
     }
 }
@@ -278,23 +352,30 @@ fn raw_listener(listener: &impl AsRawListener) -> RawSocket {
     listener.as_raw_socket()
 }
 
-/// Whether a connection waits on the listening `socket`. It waits for one, or for `stop` to be
-/// requested, unless the server is `stopping`.
+/// The positions of the listening `sockets` at which a connection waits. It waits for one, for
+/// `stop` to be requested, or at most `wait`.
 #[cfg(unix)]
-fn pending(socket: RawSocket, stop: &Stop, stopping: bool) -> io::Result<bool> {
+fn pending(sockets: &[RawSocket], stop: &Stop, wait: Option<Duration>) -> io::Result<Vec<usize>> {
     use std::os::fd::AsRawFd;
     let readable = |fd| libc::pollfd {
         fd,
         events: libc::POLLIN,
         revents: 0,
     };
-    let mut entries = [readable(socket), readable(stop.0.wake.0.as_raw_fd())];
-    let millis = if stopping { 0 } else { -1 };
+    let mut entries: Vec<libc::pollfd> = sockets.iter().copied().map(readable).collect();
+    entries.push(readable(stop.0.wake.0.as_raw_fd()));
+    let millis = match wait {
+        None => -1,
+        Some(wait) => libc::c_int::try_from(millis_rounded_up(wait)).unwrap_or(libc::c_int::MAX),
+    };
     loop {
-        // SAFETY: entries holds two valid pollfd entries.
-        let ready = unsafe { libc::poll(entries.as_mut_ptr(), 2, millis) };
+        // SAFETY: entries holds entries.len() valid pollfd entries.
+        let ready =
+            unsafe { libc::poll(entries.as_mut_ptr(), entries.len() as libc::nfds_t, millis) };
         if ready >= 0 {
-            return Ok(entries[0].revents != 0);
+            return Ok(ready_positions(
+                entries[..sockets.len()].iter().map(|entry| entry.revents),
+            ));
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
@@ -303,27 +384,48 @@ fn pending(socket: RawSocket, stop: &Stop, stopping: bool) -> io::Result<bool> {
     }
 }
 
-/// Whether a connection waits on the listening `socket`. It waits at most `STOP_CHECK` for one,
-/// unless the server is `stopping`.
+/// The positions of the listening `sockets` at which a connection waits. It waits for one, for
+/// `stop` to be requested, or at most `wait`.
 #[cfg(windows)]
-fn pending(socket: RawSocket, _stop: &Stop, stopping: bool) -> io::Result<bool> {
+fn pending(sockets: &[RawSocket], stop: &Stop, wait: Option<Duration>) -> io::Result<Vec<usize>> {
+    use std::os::windows::io::AsRawSocket;
     use windows_sys::Win32::Networking::WinSock::{
         POLLRDNORM, SOCKET, SOCKET_ERROR, WSAGetLastError, WSAPOLLFD, WSAPoll,
     };
-    let mut entry = WSAPOLLFD {
+    let readable = |socket: RawSocket| WSAPOLLFD {
         fd: socket as SOCKET,
         events: POLLRDNORM,
         revents: 0,
     };
-    let wait = if stopping { Duration::ZERO } else { STOP_CHECK };
-    let millis = i32::try_from(wait.as_millis()).unwrap_or(i32::MAX);
-    // SAFETY: entry is one valid WSAPOLLFD and the count is 1.
-    let ready = unsafe { WSAPoll(&mut entry, 1, millis) };
+    let mut entries: Vec<WSAPOLLFD> = sockets.iter().copied().map(readable).collect();
+    entries.push(readable(stop.0.wake.0.as_raw_socket()));
+    let millis = match wait {
+        None => -1,
+        Some(wait) => i32::try_from(millis_rounded_up(wait)).unwrap_or(i32::MAX),
+    };
+    // SAFETY: entries holds entries.len() valid WSAPOLLFD entries.
+    let ready = unsafe { WSAPoll(entries.as_mut_ptr(), entries.len() as u32, millis) };
     if ready == SOCKET_ERROR {
         // SAFETY: WSAGetLastError has no preconditions.
         return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
     }
-    Ok(ready > 0)
+    Ok(ready_positions(
+        entries[..sockets.len()].iter().map(|entry| entry.revents),
+    ))
+}
+
+/// A wait in whole milliseconds, rounded up, so a pause that has not quite run out does not end
+/// in a poll that returns at once.
+fn millis_rounded_up(wait: Duration) -> u128 {
+    wait.as_micros().div_ceil(1000)
+}
+
+fn ready_positions(revents: impl Iterator<Item = i16>) -> Vec<usize> {
+    revents
+        .enumerate()
+        .filter(|(_, revents)| *revents != 0)
+        .map(|(position, _)| position)
+        .collect()
 }
 
 /// Relays one accepted connection to `target` in both directions and returns when both are done.
@@ -698,7 +800,7 @@ pub mod unix {
     use std::mem::size_of;
     use std::net::TcpStream;
     use std::os::windows::io::FromRawSocket;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::ptr;
 
     use windows_sys::Win32::Networking::WinSock::{
@@ -709,6 +811,12 @@ pub mod unix {
     /// The longest socket path, in bytes of UTF-8: `sun_path` holds 108 bytes including the
     /// terminating NUL.
     pub const MAX_PATH_BYTES: usize = 107;
+
+    /// The socket of the forwarded port `port` in the socket directory of a run: the backend
+    /// listens on it, and the relay inside the sandbox passes the connections to that port to it.
+    pub fn socket_path(directory: &Path, port: u16) -> PathBuf {
+        directory.join(port.to_string())
+    }
 
     /// A listening AF_UNIX socket, closed on drop.
     #[derive(Debug)]
@@ -847,6 +955,12 @@ mod tests {
     /// A server that answers every request with "echo:" plus the request, after the client
     /// half-closes.
     fn echo_server() -> SocketAddr {
+        tagged_server("echo")
+    }
+
+    /// A server that answers every request with `tag`, a colon and the request, after the client
+    /// half-closes.
+    fn tagged_server(tag: &'static str) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         thread::spawn(move || {
@@ -855,7 +969,7 @@ mod tests {
                 thread::spawn(move || {
                     let mut request = Vec::new();
                     stream.read_to_end(&mut request).unwrap();
-                    stream.write_all(b"echo:").unwrap();
+                    stream.write_all(format!("{tag}:").as_bytes()).unwrap();
                     stream.write_all(&request).unwrap();
                 });
             }
@@ -1065,34 +1179,50 @@ mod tests {
         assert!(unix::connect_to(&path).is_err());
     }
 
-    /// Rule 5: a connection that completed its handshake before the stop, and is still waiting
-    /// in the backlog, is accepted and relayed; afterwards the listener is closed.
-    #[cfg(windows)]
+    fn accept_tcp(listener: &TcpListener) -> io::Result<TcpStream> {
+        listener.accept().map(|(client, _)| client)
+    }
+
+    /// Rule 5: connections that completed their handshake before the stop, and are still waiting
+    /// in the backlogs, are accepted and relayed, on every listener; afterwards the listeners are
+    /// closed.
     #[test]
     fn a_stopped_server_still_relays_connections_already_made() {
         let echo = echo_server();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        // The client connects, sends and half-closes before the server takes any connection.
-        let client = TcpStream::connect(address).unwrap();
-        (&client).write_all(b"late").unwrap();
-        client.shutdown(Shutdown::Write).unwrap();
+        let route = |listener| (listener, move || connect(echo));
+        let listeners: Vec<TcpListener> = (0..2)
+            .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let addresses: Vec<SocketAddr> = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap())
+            .collect();
+        // The clients connect, send and half-close before the server takes any connection.
+        let clients: Vec<TcpStream> = addresses
+            .iter()
+            .map(|address| {
+                let client = TcpStream::connect(address).unwrap();
+                (&client).write_all(b"late").unwrap();
+                client.shutdown(Shutdown::Write).unwrap();
+                client
+            })
+            .collect();
         let stop = Stop::new().unwrap();
         stop.request();
         serve_until(
-            listener,
-            |listener| listener.accept().map(|(client, _)| client),
-            move || connect(echo),
+            listeners.into_iter().map(route).collect(),
+            accept_tcp,
             &stop,
             DRAIN,
         );
-        let mut answer = Vec::new();
-        (&client).read_to_end(&mut answer).unwrap();
-        assert_eq!(answer, b"echo:late");
-        assert!(TcpStream::connect_timeout(&address, Duration::from_secs(2)).is_err());
+        for (client, address) in clients.iter().zip(&addresses) {
+            let mut answer = Vec::new();
+            (&*client).read_to_end(&mut answer).unwrap();
+            assert_eq!(answer, b"echo:late");
+            assert!(TcpStream::connect_timeout(address, Duration::from_secs(2)).is_err());
+        }
     }
 
-    #[cfg(windows)]
     #[test]
     fn a_stop_request_ends_an_idle_server_promptly() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1104,9 +1234,8 @@ mod tests {
             request.request();
         });
         serve_until(
-            listener,
-            |listener| listener.accept().map(|(client, _)| client),
-            || Err(io::Error::other("unused")),
+            vec![(listener, || Err(io::Error::other("unused")))],
+            accept_tcp,
             &stop,
             DRAIN,
         );
@@ -1115,6 +1244,90 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    /// Without a connection the poll waits for the stop and nothing else: no timer wakes it, and
+    /// the stop request does at once.
+    #[test]
+    fn only_a_connection_or_the_stop_wakes_the_poll() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = raw_listener(&listener);
+        let stop = Stop::new().unwrap();
+        let request = stop.clone();
+        let (sender, woke) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(pending(&[socket], &request, None).map(|ready| ready.len()));
+        });
+        assert!(
+            woke.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the poll woke without a connection or a stop"
+        );
+        stop.request();
+        let ready = woke
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the stop woke nothing");
+        assert_eq!(ready.unwrap(), 0);
+        drop(listener);
+    }
+
+    /// One server serves several listeners, each to its own target.
+    #[test]
+    fn each_listener_relays_to_its_own_target() {
+        let tags = ["a", "b", "c"];
+        let (routes, addresses): (Vec<_>, Vec<_>) = tags
+            .iter()
+            .map(|tag| {
+                let target = tagged_server(tag);
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                ((listener, move || connect(target)), address)
+            })
+            .unzip();
+        let stop = Stop::new().unwrap();
+        let request = stop.clone();
+        let server = thread::spawn(move || serve_until(routes, accept_tcp, &request, DRAIN));
+        for (tag, address) in tags.iter().zip(&addresses) {
+            assert_eq!(exchange(*address, b"hi"), format!("{tag}:hi").into_bytes());
+        }
+        stop.request();
+        server.join().unwrap();
+        for address in &addresses {
+            assert!(TcpStream::connect_timeout(address, Duration::from_secs(2)).is_err());
+        }
+    }
+
+    /// A listener whose accept keeps failing pauses alone: the others keep serving at full speed,
+    /// so the clients of one port cannot slow down another.
+    #[test]
+    fn a_failing_listener_does_not_slow_the_others() {
+        let echo = echo_server();
+        let route = |listener| (listener, move || connect(echo));
+        let failing = TcpListener::bind("127.0.0.1:0").unwrap();
+        let failing_address = failing.local_addr().unwrap();
+        // It always has a connection waiting, so every poll reports it.
+        let _waiting = TcpStream::connect(failing_address).unwrap();
+        let working = TcpListener::bind("127.0.0.1:0").unwrap();
+        let working_address = working.local_addr().unwrap();
+        let accept = move |listener: &TcpListener| {
+            if listener.local_addr()? == failing_address {
+                return Err(io::Error::other("refused"));
+            }
+            accept_tcp(listener)
+        };
+        let stop = Stop::new().unwrap();
+        let request = stop.clone();
+        let routes = vec![route(failing), route(working)];
+        let server = thread::spawn(move || serve_until(routes, accept, &request, DRAIN));
+        let rounds = 40;
+        let started = Instant::now();
+        for round in 0..rounds {
+            assert_eq!(exchange(working_address, b"x"), b"echo:x", "round {round}");
+        }
+        let elapsed = started.elapsed();
+        stop.request();
+        server.join().unwrap();
+        // A pause of the whole server per failure would take at least rounds times the pause.
+        assert!(elapsed < ACCEPT_ERROR_PAUSE * rounds / 2, "{elapsed:?}");
     }
 
     /// A connection that never finishes delays the end by at most the drain time.
@@ -1137,9 +1350,8 @@ mod tests {
         let drain = Duration::from_millis(300);
         let started = std::time::Instant::now();
         serve_until(
-            listener,
-            |listener| listener.accept().map(|(client, _)| client),
-            move || connect(target),
+            vec![(listener, move || connect(target))],
+            accept_tcp,
             &stop,
             drain,
         );

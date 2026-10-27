@@ -93,7 +93,7 @@ fn serve_broker<L, A, H, R>(
     let connections = Connections::new(MAX_CONNECTIONS, Some(THREAD_STACK), move |client| {
         let _ = broker.handle(client);
     });
-    serve_connections_until(listener, accept, &connections, stop, drain);
+    serve_connections_until(vec![(listener, connections)], accept, stop, drain);
 }
 
 /// What the broker decides with. `reached_host` is the check after the connect; only tests
@@ -701,7 +701,10 @@ mod tests {
         let stop = Stop::new().unwrap();
         // Only once the backlog holds it: on macOS the connect can return before the listener
         // has the connection.
-        while !crate::pending(crate::raw_listener(&listener), &stop, false).unwrap() {}
+        while crate::pending(&[crate::raw_listener(&listener)], &stop, None)
+            .unwrap()
+            .is_empty()
+        {}
         stop.request();
         let broker = Broker {
             reach: EgressReach::PublicAndLocal,

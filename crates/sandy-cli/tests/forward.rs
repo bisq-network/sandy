@@ -58,6 +58,33 @@ fn forwarded_port_reaches_the_outside_service() {
     }
 }
 
+/// Several forwarded ports in one run: each leads to its own service.
+#[test]
+fn every_forwarded_port_reaches_its_own_service() {
+    let fixture = Fixture::new("forward-several");
+    let services: Vec<_> = (0..3).map(|_| outside_service()).collect();
+    let inners: Vec<u16> = services.iter().map(|_| free_port()).collect();
+    let mut args = fixture.access_args();
+    args.extend(["--ip".to_string(), "all".to_string()]);
+    for (inner, (service, _)) in inners.iter().zip(&services) {
+        args.extend(["--forward".to_string(), format!("{inner}={service}")]);
+    }
+    let addresses: Vec<String> = inners
+        .iter()
+        .map(|inner| format!("127.0.0.1:{inner}"))
+        .collect();
+    let actions: Vec<(&str, &str)> = addresses
+        .iter()
+        .map(|address| ("tcp-connect", address.as_str()))
+        .collect();
+    for line in probe_inside(&args, &actions) {
+        line.assert_ok();
+    }
+    for (service, accepted) in services {
+        assert!(accepted.join().unwrap(), "{service} saw no connection");
+    }
+}
+
 #[test]
 fn forward_without_ip_is_refused() {
     let fixture = Fixture::new("forward-noip");

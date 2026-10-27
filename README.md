@@ -16,7 +16,7 @@ sandy run \
   -- /srv/app/bin/server --port 8080
 ```
 
-Version 2.2.2. Policies use format `version = 1`.
+Version 2.3.0. Policies use format `version = 1`.
 
 ## Contents
 
@@ -106,15 +106,15 @@ sha256sum --check --ignore-missing SHA256SUMS
 
 An archive that the release workflow built also carries a GitHub build provenance attestation,
 which names the workflow, the commit and the run that built it
-(`gh attestation verify sandy-2.2.2-x86_64-unknown-linux-musl.tar.gz --repo <owner>/sandy`). The
-archives of 2.2.1 and 2.2.2 were built outside the workflow, so they have none.
+(`gh attestation verify sandy-2.3.0-x86_64-unknown-linux-musl.tar.gz --repo <owner>/sandy`). The
+archives of 2.2.1, 2.2.2 and 2.3.0 were built outside the workflow, so they have none.
 
 **Building a release binary again.** Every release binary is built with
 `scripts/release-build.sh TARGET` from a checkout of the release tag, so anyone can build it again
 and compare it with the binary in the archive:
 
 ```sh
-git checkout v2.2.2
+git checkout v2.3.0
 scripts/release-build.sh x86_64-unknown-linux-musl
 sha256sum target/x86_64-unknown-linux-musl/release/sandy
 ```
@@ -576,6 +576,11 @@ A policy may be at most 1 MiB long and may nest arrays and inline tables at most
 a longer or deeper one is refused before it is parsed. Real policies are a few KiB and nest a
 few levels. The depth limit is what keeps a malformed policy from overflowing the stack of the
 TOML parser, whose own limit malformed input can get past.
+
+The platforms limit the number of forwarded ports. On Windows one relay serves all exposed and
+forwarded ports, and its command line holds about 1200 forwarded ports. On macOS `ip = "private"`
+holds each forwarded port at every address of the Mac, so the 10240 open files of a process allow
+about 600 on a Mac with 16 addresses. A run beyond the limit fails before the program starts.
 
 ### Rules
 

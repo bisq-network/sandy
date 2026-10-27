@@ -318,17 +318,15 @@ pub enum Command {
     Help,
     Version,
     Sandbox(Box<Invocation>),
-    /// Internal: serve an exposed port. A backend starts sandy this way with a listening socket
-    /// it passed by descriptor or handle number.
+    /// Internal: serve exposed and forwarded ports. A backend starts sandy this way: each exposed
+    /// port with a listening socket it passed by descriptor or handle number and the program's
+    /// address to connect to; each forwarded port, on Windows only, as the address inside the
+    /// sandbox to listen on, whose connections go to the Unix domain socket named after its port
+    /// in the directory `sockets`.
     Relay {
-        listener: u64,
-        target: SocketAddr,
-    },
-    /// Internal: serve a forwarded port. A backend starts sandy this way inside the sandbox; it
-    /// listens on `listen` and passes each connection to the Unix domain socket at `socket`.
-    Forward {
-        listen: SocketAddr,
-        socket: PathBuf,
+        exposed: Vec<(u64, SocketAddr)>,
+        sockets: Option<PathBuf>,
+        forwarded: Vec<SocketAddr>,
     },
     /// Internal: run the egress broker (`network.egress`). A backend starts sandy this way, in a
     /// sandbox of its own, with a listening socket it passed by descriptor or handle number; the
@@ -339,11 +337,9 @@ pub enum Command {
     },
 }
 
-/// The internal command that runs a relay. It is not part of the documented interface.
+/// The internal command that runs a relay. It is not part of the documented interface:
+/// `__relay [--expose LISTENER TARGET]... [--sockets DIRECTORY] [--forward LISTEN]...`
 pub const RELAY_COMMAND: &str = "__relay";
-
-/// The internal command that runs a forward relay. It is not part of the documented interface.
-pub const FORWARD_COMMAND: &str = "__forward";
 
 /// The internal command that runs the egress broker. It is not part of the documented interface.
 pub const BROKER_COMMAND: &str = "__broker";
@@ -383,6 +379,40 @@ pub struct Invocation {
     pub args: Vec<OsString>,
 }
 
+fn parse_relay(parser: &mut lexopt::Parser) -> Result<Command, lexopt::Error> {
+    let mut exposed = Vec::new();
+    let mut sockets = None;
+    let mut forwarded = Vec::new();
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Long("expose") => {
+                let listener = parser.value()?.parse()?;
+                let target = parser.value()?.parse()?;
+                exposed.push((listener, target));
+            }
+            Long("sockets") => {
+                if sockets.is_some() {
+                    return Err("--sockets given twice".into());
+                }
+                sockets = Some(PathBuf::from(parser.value()?));
+            }
+            Long("forward") => forwarded.push(parser.value()?.parse()?),
+            other => return Err(other.unexpected()),
+        }
+    }
+    if exposed.is_empty() && forwarded.is_empty() {
+        return Err("the relay has no port to serve".into());
+    }
+    if forwarded.is_empty() != sockets.is_none() {
+        return Err("--forward and --sockets go together".into());
+    }
+    Ok(Command::Relay {
+        exposed,
+        sockets,
+        forwarded,
+    })
+}
+
 pub fn parse<I>(args: I) -> Result<Command, String>
 where
     I: IntoIterator<Item = OsString>,
@@ -402,16 +432,7 @@ where
             Some("run") => Mode::Run,
             Some("check") => Mode::Check,
             Some("setup") => Mode::Setup,
-            Some(RELAY_COMMAND) => {
-                let listener = parser.value()?.parse()?;
-                let target = parser.value()?.parse()?;
-                return Ok(Command::Relay { listener, target });
-            }
-            Some(FORWARD_COMMAND) => {
-                let listen = parser.value()?.parse()?;
-                let socket = PathBuf::from(parser.value()?);
-                return Ok(Command::Forward { listen, socket });
-            }
+            Some(RELAY_COMMAND) => return parse_relay(&mut parser),
             Some(BROKER_COMMAND) => {
                 let listener = parser.value()?.parse()?;
                 let value = parser.value()?;
@@ -1066,27 +1087,82 @@ mod tests {
 
     #[test]
     fn parses_the_internal_relay_command() {
-        match parse_strs(&[RELAY_COMMAND, "7", "127.0.0.1:8080"]).unwrap() {
-            Command::Relay { listener, target } => {
-                assert_eq!(listener, 7);
-                assert_eq!(target, "127.0.0.1:8080".parse().unwrap());
+        let command = parse_strs(&[
+            RELAY_COMMAND,
+            "--expose",
+            "7",
+            "127.0.0.1:8080",
+            "--expose",
+            "8",
+            "[::1]:8081",
+            "--sockets",
+            r"C:\sockets",
+            "--forward",
+            "127.0.0.1:9090",
+            "--forward",
+            "[::1]:9091",
+        ]);
+        match command.unwrap() {
+            Command::Relay {
+                exposed,
+                sockets,
+                forwarded,
+            } => {
+                assert_eq!(
+                    exposed,
+                    [
+                        (7, "127.0.0.1:8080".parse().unwrap()),
+                        (8, "[::1]:8081".parse().unwrap())
+                    ]
+                );
+                assert_eq!(sockets, Some(PathBuf::from(r"C:\sockets")));
+                assert_eq!(
+                    forwarded,
+                    [
+                        "127.0.0.1:9090".parse::<SocketAddr>().unwrap(),
+                        "[::1]:9091".parse().unwrap()
+                    ]
+                );
             }
             other => panic!("unexpected {other:?}"),
         }
-        assert!(parse_strs(&[RELAY_COMMAND, "x", "127.0.0.1:8080"]).is_err());
+        match parse_strs(&[RELAY_COMMAND, "--expose", "7", "127.0.0.1:8080"]).unwrap() {
+            Command::Relay {
+                exposed,
+                sockets,
+                forwarded,
+            } => {
+                assert_eq!(exposed.len(), 1);
+                assert_eq!(sockets, None);
+                assert!(forwarded.is_empty());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
-    fn parses_the_internal_forward_command() {
-        match parse_strs(&[FORWARD_COMMAND, "127.0.0.1:8081", r"C:\sockets\s"]).unwrap() {
-            Command::Forward { listen, socket } => {
-                assert_eq!(listen, "127.0.0.1:8081".parse().unwrap());
-                assert_eq!(socket, PathBuf::from(r"C:\sockets\s"));
-            }
-            other => panic!("unexpected {other:?}"),
+    fn refuses_a_malformed_internal_relay_command() {
+        for args in [
+            &[RELAY_COMMAND][..],
+            &[RELAY_COMMAND, "--expose", "x", "127.0.0.1:8080"],
+            &[RELAY_COMMAND, "--expose", "7"],
+            &[RELAY_COMMAND, "7", "127.0.0.1:8080"],
+            &[RELAY_COMMAND, "--forward", "127.0.0.1:9090"],
+            &[RELAY_COMMAND, "--sockets", "s", "--forward", "9090"],
+            &[RELAY_COMMAND, "--sockets", "s"],
+            &[
+                RELAY_COMMAND,
+                "--sockets",
+                "s",
+                "--sockets",
+                "t",
+                "--forward",
+                "127.0.0.1:9",
+            ],
+            &["__forward", "127.0.0.1:8081", "socket"],
+        ] {
+            assert!(parse_strs(args).is_err(), "{args:?}");
         }
-        assert!(parse_strs(&[FORWARD_COMMAND, "8081", "socket"]).is_err());
-        assert!(parse_strs(&[FORWARD_COMMAND, "127.0.0.1:8081"]).is_err());
     }
 
     #[test]
