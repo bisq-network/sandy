@@ -187,6 +187,7 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
         "open-thread-right" => windows_actions::open_thread_right(target),
         "list-processes" => windows_actions::list_processes(),
         "session-id" => windows_actions::session_id(),
+        "pipe-create" => windows_actions::pipe_create(target),
         "wts-processes" => windows_actions::wts_processes(),
         "enum-windows" => windows_actions::enum_windows(),
         "icmp-echo" => windows_actions::icmp_echo(target),
@@ -2540,6 +2541,35 @@ mod windows_actions {
         Ok(format!("session={session}"))
     }
 
+    /// Creates the named pipe `\\.\pipe\TARGET` with the default security, as a program does
+    /// that offers a pipe to its own children, and closes it. The detail is `created`.
+    pub fn pipe_create(target: &str) -> io::Result<String> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+        use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, PIPE_TYPE_BYTE};
+
+        let name = wide(&format!(r"\\.\pipe\{target}"));
+        // SAFETY: the name is NUL-terminated; null attributes give the default security.
+        let pipe = unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE,
+                1,
+                0,
+                0,
+                0,
+                ptr::null(),
+            )
+        };
+        if pipe == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the handle was just created and is closed once.
+        unsafe { CloseHandle(pipe) };
+        Ok("created".to_string())
+    }
+
     /// Lists the processes `WTSEnumerateProcessesW` returns for the current server, a route that
     /// does not go through the Toolhelp or NT process list. The detail is `wts=N`.
     pub fn wts_processes() -> io::Result<String> {
@@ -3555,6 +3585,10 @@ mod windows_actions {
     }
 
     pub fn session_id() -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn pipe_create(_target: &str) -> io::Result<String> {
         unsupported()
     }
 

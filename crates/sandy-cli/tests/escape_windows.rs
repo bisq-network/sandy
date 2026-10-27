@@ -4174,3 +4174,40 @@ fn the_broker_appcontainer_cannot_reach_this_machine() {
         }
     }
 }
+
+/// The program cannot create a named pipe in the global namespace, only in the one of its
+/// AppContainer (docs/windows.md, "Unix sockets"). The control creates the same pipe
+/// outside.
+#[test]
+fn a_named_pipe_can_be_created_only_in_the_appcontainer_namespace() {
+    let fixture = Fixture::new("pipe-create");
+    let global = format!("sandy-test-pipe-{}", std::process::id());
+    probe_outside(&[("pipe-create", &global)])[0].assert_ok();
+    let local = format!(r"LOCAL\{global}");
+    let lines = probe_inside(
+        &fixture.access_args(),
+        &[("pipe-create", &global), ("pipe-create", &local)],
+    );
+    lines[0].assert_blocked();
+    assert!(lines[0].detail.contains("os error 5"), "{:?}", lines[0]);
+    lines[1].assert_ok();
+}
+
+/// `check` warns in session 0, where services and SSH sessions run and no window station admits
+/// an AppContainer, and only there.
+#[test]
+fn check_warns_in_session_0() {
+    let session = probe_outside(&[("session-id", ".")]);
+    session[0].assert_ok();
+    let mut args = vec!["check".to_string()];
+    args.extend(platform_args());
+    let output = sandy(&args);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(
+        stderr.contains("sandy runs in session 0"),
+        session[0].detail == "session=0",
+        "{:?}: {stderr}",
+        session[0]
+    );
+}

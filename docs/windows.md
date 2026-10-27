@@ -1078,7 +1078,12 @@ still reaches only sockets it may write, not "every Unix socket the user can rea
 AF_UNIX addresses do not seem to work on current Windows [PostgreSQL].
 
 Named pipes are not Unix sockets, but the same access check protects them: the default DACL of a
-pipe grants nothing to AppContainers [CreateNamedPipeW] [Implementing an AppContainer].
+pipe grants nothing to AppContainers [CreateNamedPipeW] [Implementing an AppContainer]. Nor can
+the program create a pipe in the global namespace: `CreateNamedPipeW` of `\\.\pipe\NAME` fails
+with `ERROR_ACCESS_DENIED`, while `\\.\pipe\LOCAL\NAME`, the namespace of its AppContainer,
+works (measured on Windows 11 with `sandy-probe pipe-create`). A program that hands a pipe of a
+fixed global name to its children therefore fails in the sandbox, unless it can use the `LOCAL\`
+prefix.
 
 ## Processes, privileges and signals
 
@@ -1395,8 +1400,11 @@ about a path is worse than none, so the backend answers nothing and sandy refuse
 13. In a session whose window station does not admit AppContainers, such as an SSH session,
     `user32.dll` cannot initialize in an AppContainer process, and a program that loads it ends
     with `STATUS_DLL_INIT_FAILED` (`0xC0000142`) before its first instruction. Measured on
-    Windows 11 over SSH; the same programs start from an interactive scheduled task. Programs
-    without `user32.dll`, and the relays, are not affected.
+    Windows 11 over SSH, in session 0, where `LoadLibraryW` of `user32.dll` fails inside the
+    sandbox with `ERROR_DLL_INIT_FAILED` and works outside; the same programs start from an
+    interactive scheduled task. Programs without `user32.dll`, and the relays, are not affected.
+    Services and SSH sessions run in session 0, interactive users in sessions of their own, so
+    `sandy check` warns when sandy runs in session 0.
 14. If sandy itself is killed during a run with forwarded ports, its socket directory below
     `%LOCALAPPDATA%\sandy\forward` stays behind until the next run with a forwarded port
     removes it. Its sockets have no listener while it is there, so nobody can connect through

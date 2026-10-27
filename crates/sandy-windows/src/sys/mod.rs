@@ -108,6 +108,7 @@ impl Backend for WindowsBackend {
         notes.extend(crate::plan::notes(policy));
         notes.extend(policy.mach_services_notes("Windows"));
         notes.extend(policy.path_directory_notes(&path_locations()));
+        notes.extend(session_note());
         notes
     }
 
@@ -694,6 +695,25 @@ fn trusted_locations() -> Result<Vec<ProtectedPath>, SandboxError> {
 /// example, so refusing it would turn away the common case (rule 12).
 fn path_locations() -> Vec<ProtectedPath> {
     path_directories(std::env::var_os("PATH").as_deref())
+}
+
+/// The warning for a run in session 0, where services and SSH sessions run. Its window stations
+/// admit no AppContainer, so `user32.dll` cannot initialize in the program (docs/windows.md,
+/// limitation 13). Interactive users have sessions of their own since Windows Vista. A note,
+/// not a requirement: a program without `user32.dll` runs there.
+fn session_note() -> Option<String> {
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+
+    let mut session = u32::MAX;
+    // SAFETY: session is a valid out pointer.
+    let found = unsafe { ProcessIdToSessionId(std::process::id(), &mut session) } != 0;
+    (found && session == 0).then(|| {
+        "sandy runs in session 0, where services and SSH sessions run, and its window stations \
+         admit no AppContainer: a program that loads user32.dll ends there with \
+         STATUS_DLL_INIT_FAILED (0xC0000142) before it runs; run it from a desktop session \
+         (docs/windows.md, \"Known limitations\")"
+            .to_string()
+    })
 }
 
 /// The profile folder of this user, from the known folder and from USERPROFILE. The known
