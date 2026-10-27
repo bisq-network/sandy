@@ -10,12 +10,12 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use args::{Command, Invocation, Mode, PolicySource};
+use args::{Command, Invocation, Mode, PolicySource, StatusTarget};
 use sandy_core::streams::{CreatableSocket, StandardStream};
 use sandy_core::{
-    Backend, EnforcementPlan, Outcome, ParentProcess, Policy, ResolvedLevel, ResolvedPolicy,
-    Selection, SetupOptions, SetupOutcome, StatusReport, TargetCommand, select, setup_levels,
-    target_environment,
+    Backend, EnforcementPlan, Outcome, ParentProcess, Policy, PolicyError, ResolvedLevel,
+    ResolvedPolicy, Selection, SetupOptions, SetupOutcome, StatusReport, TargetCommand, select,
+    setup_levels, target_environment,
 };
 
 const EXIT_FAILURE: u8 = 125;
@@ -466,7 +466,7 @@ fn parent_for(
 /// it, and marks a failure on the way out.
 fn execute(invocation: Invocation, context: &Context) -> Result<ExitCode, String> {
     let status = match invocation.mode {
-        Mode::Run => status::open(invocation.status_fd)?,
+        Mode::Run => status::open(invocation.status.as_ref())?,
         _ => StatusReport::none(),
     };
     let result = sandbox(invocation, context, &status);
@@ -532,6 +532,9 @@ fn sandbox(
         _ => None,
     };
     refuse_writable_trusted_files(&levels[0].policy, policy_file, &context.started_as)?;
+    if let (Mode::Run, Some(StatusTarget::File(path))) = (invocation.mode, &invocation.status) {
+        refuse_writable_status_file(&levels[0].policy, path)?;
+    }
     let backend = platform_backend();
     if invocation.explain && !backend.can_explain() {
         return Err(format!(
@@ -875,6 +878,28 @@ fn refuse_writable_trusted_files(
     resolved
         .check_trusted(&trusted)
         .map_err(|error| error.to_string())
+}
+
+/// A status record the program could write would let it claim that it never ran, or that sandy
+/// refused it. The file exists: `status::open` created it.
+fn refuse_writable_status_file(resolved: &ResolvedPolicy, path: &Path) -> Result<(), String> {
+    match resolved.check_trusted(&[path.to_path_buf()]) {
+        Err(PolicyError::TrustedFileWritable {
+            through, writable, ..
+        }) => {
+            let through = match through == path {
+                true => String::new(),
+                false => format!(" as {}", through.display()),
+            };
+            Err(format!(
+                "--status-file {} is reachable{through} inside writable path {}, so the program \
+                 could write the status record",
+                path.display(),
+                writable.display()
+            ))
+        }
+        result => result.map_err(|error| error.to_string()),
+    }
 }
 
 /// The program inherits standard input, output and error as they are: a socket among them keeps

@@ -425,6 +425,7 @@ it does nothing.
 | `--parent-pid PID` | With `--end-with-parent`: the caller's own process ID. sandy refuses to start if its parent is another process. | |
 | `--parent-start TOKEN` | With `--parent-pid`: when that process started, so sandy can tell the caller from a process that got its ID later. The caller may then start sandy through a wrapper. See [Processes](#processes). | |
 | `--status-fd N` | Report the program's process ID and how it ended on descriptor `N` (on Windows: an inherited handle). `run` only. See [Exit status](#exit-status). | |
+| `--status-file PATH` | The same record in a file sandy creates at the absolute `PATH`, which must not exist yet and must lie outside every writable path. `run` only. See [The status record](#the-status-record). | |
 | `--explain` | Name the paths of the run that the policy does not grant, on standard error. `run` only, Linux only. See [Finding the grants a program needs](#finding-the-grants-a-program-needs). | off |
 | `--explain-path PATH` | Say what the policy allows for `PATH` and which rule decides it. `check` only, Linux only. | |
 | `--children allowed\|none\|contained` | Whether the program may start other processes, and whether they may outlive it. See [Processes](#processes). | `allowed` |
@@ -510,8 +511,9 @@ On Windows the program's 32-bit exit code is passed through unchanged.
 
 The exit status leaves two things open. With `children = "contained"`, with `--explain`, and
 always on Windows, sandy stays the parent, so the caller holds sandy's process ID and not the
-program's; and 125 means both "sandy refused" and "the program exited with 125". `--status-fd N` answers both
-without changing any exit status. sandy writes short lines to the descriptor, in this order:
+program's; and 125 means both "sandy refused" and "the program exited with 125". `--status-fd N`
+answers both without changing any exit status. sandy writes short lines to the descriptor, in
+this order:
 
 | Line | When |
 |---|---|
@@ -522,13 +524,24 @@ without changing any exit status. sandy writes short lines to the descriptor, in
 | `failed` | sandy itself failed or refused; without a `pid` line the program never ran |
 
 In the exec model (Linux and macOS without `contained` and without `--explain`) sandy becomes
-the program, so the record ends after `pid` and the caller's own wait status is the program's. sandy writes that
-line right before it confines itself and replaces itself with the program, so a `failed` line
-after it means that applying the sandbox or the `execve` failed. sandy makes the descriptor close-on-exec, and on Windows it keeps the
-handle out of what the program inherits, so the program never has it. Writing is best effort: a
-caller that closed the read end gets no record, and the program keeps running. An empty record
-with status 125 means that sandy stopped before it took the descriptor, at a usage error for
-example.
+the program, so the record ends after `pid` and the caller's own wait status is the program's.
+sandy writes that line right before it confines itself and replaces itself with the program, so
+a `failed` line after it means that applying the sandbox or the `execve` failed. sandy makes the descriptor
+close-on-exec, and on Windows it keeps the handle out of what the program inherits, so the
+program never has it. Writing is best effort: a caller that closed the read end gets no record,
+and the program keeps running. An empty record with status 125 means that sandy stopped before
+it took the descriptor, at a usage error for example.
+
+A caller that cannot pass a descriptor, such as Java's `ProcessBuilder`, which passes only the
+standard streams, names a file instead: `--status-file PATH`. sandy creates it where it would
+take the descriptor and writes the same record; the caller reads it after sandy has exited and
+removes it. `PATH` must be absolute and must not exist, so sandy follows no link and changes no
+file that someone left there, an earlier run of the program for example; sandy refuses to
+create it otherwise. It refuses the run, after writing `failed`, when the file lies inside a
+writable path of the policy, where the program could write the record itself. On Windows the
+file gets the permissions of its directory, so put it where AppContainers have no access, as
+in the user's own folders. No file with status 125 means that sandy stopped before it created
+it, at a usage error for example.
 
 ## Policy reference
 
@@ -1133,8 +1146,9 @@ Recommendations:
 4. **Treat exit status 125 as "not started".** sandy prints the reason on standard error. Two
    exceptions: a program can exit with 125 itself, and with `children = "contained"` or
    `--explain` sandy can fail while it supervises a running program, for example when the relay
-   of its ports died (its message is `sandy: run failed: ...`). Pass `--status-fd` when you need to tell these apart, or need the
-   program's process ID (see [The status record](#the-status-record)).
+   of its ports died (its message is `sandy: run failed: ...`). Pass `--status-fd` or
+   `--status-file` when you need to tell these apart, or need the program's process ID (see
+   [The status record](#the-status-record)): without a `pid` line the program never ran.
 5. **Keep sandy, the policy and the program's binaries out of every writable path.** Use separate
    directories for binaries (`read_exec`) and data (`read_write`). A program that can rewrite its
    own binary or library directory can escape at the next start.

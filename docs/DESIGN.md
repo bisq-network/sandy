@@ -1194,7 +1194,9 @@ Details, limitations and sources: `docs/windows.md`.
 The caller sees sandy's process ID where sandy stays the parent, and 125 means both "sandy
 refused" and "the program exited with 125". These are additions, not changes: `--status-fd`
 carries the program's process ID and how it ended on a descriptor of the caller's choosing,
-which sandy makes close-on-exec and keeps out of what the program inherits. The lines are
+which sandy makes close-on-exec and keeps out of what the program inherits, and
+`--status-file` writes the same lines into a new file outside every writable path, for a caller
+that can pass no descriptor. The lines are
 `level NAME` for a policy with fallback levels, `pid N`, then `exited N` or `signaled N`, or
 `failed` when sandy itself failed. See README.md, "The status record". No exit status changes
 meaning, because callers parse the documented ones. One deliberate exception came with fallback

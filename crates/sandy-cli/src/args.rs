@@ -51,6 +51,8 @@ Options (they extend the policy file):
                              then start sandy through a wrapper (see the platform docs)
   --status-fd N              report the program's process ID and how it ended on descriptor N
                              (on Windows: an inherited handle); run only
+  --status-file PATH         as --status-fd, into a file sandy creates at PATH, which must not
+                             exist yet, outside every writable path; run only
   --explain                  name the paths of the run that the policy does not grant, on
                              standard error; off by default, it sees not every denial, and it
                              is not available on every platform (run only)
@@ -361,6 +363,16 @@ pub enum PolicySource {
     Input,
 }
 
+/// Where `run` writes the status record (see `sandy_core::StatusReport`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusTarget {
+    /// `--status-fd`: the descriptor, or on Windows the handle, the caller passed. The number is
+    /// checked when `run` takes it over.
+    Inherited(u64),
+    /// `--status-file`: a file sandy creates, which must not exist yet.
+    File(PathBuf),
+}
+
 #[derive(Debug)]
 pub struct Invocation {
     pub mode: Mode,
@@ -373,9 +385,8 @@ pub struct Invocation {
     pub cwd: Option<PathBuf>,
     pub parent_pid: Option<u32>,
     pub parent_start: Option<u64>,
-    /// `--status-fd`: the descriptor, or on Windows the handle, sandy writes the status record
-    /// to. The number is checked when `run` takes it over.
-    pub status_fd: Option<u64>,
+    /// `--status-fd` or `--status-file`: where `run` writes the status record.
+    pub status: Option<StatusTarget>,
     /// `--explain`: the diagnostic mode of `run`.
     pub explain: bool,
     /// `--explain-path`: the paths `check` answers for.
@@ -466,7 +477,7 @@ where
         cwd: None,
         parent_pid: None,
         parent_start: None,
-        status_fd: None,
+        status: None,
         explain: false,
         explain_paths: Vec::new(),
         install_copy: false,
@@ -643,7 +654,15 @@ where
             Long("cwd") => invocation.cwd = Some(parser.value()?.into()),
             Long("parent-pid") => invocation.parent_pid = Some(parser.value()?.parse()?),
             Long("parent-start") => invocation.parent_start = Some(parser.value()?.parse()?),
-            Long("status-fd") => invocation.status_fd = Some(parser.value()?.parse()?),
+            Long(option @ ("status-fd" | "status-file")) => {
+                if invocation.status.is_some() {
+                    return Err("--status-fd and --status-file name one status record".into());
+                }
+                invocation.status = Some(match option {
+                    "status-fd" => StatusTarget::Inherited(parser.value()?.parse()?),
+                    _ => StatusTarget::File(parser.value()?.into()),
+                });
+            }
             Long("explain") => invocation.explain = true,
             Long("explain-path") => invocation.explain_paths.push(parser.value()?.into()),
             Value(program) => {
@@ -730,6 +749,28 @@ mod tests {
 
     fn parse_strs(args: &[&str]) -> Result<Command, String> {
         parse(args.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn a_run_has_one_status_record() {
+        let error = parse_strs(&[
+            "run",
+            "--status-fd",
+            "3",
+            "--status-file",
+            "/run/status",
+            "/bin/prog",
+        ]);
+        assert!(
+            error
+                .unwrap_err()
+                .contains("--status-fd and --status-file name one status record")
+        );
+        let invocation = invocation(&["run", "--status-file", "/run/status", "/bin/prog"]);
+        assert_eq!(
+            invocation.status,
+            Some(StatusTarget::File(PathBuf::from("/run/status")))
+        );
     }
 
     #[test]

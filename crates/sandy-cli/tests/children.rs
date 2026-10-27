@@ -3,6 +3,7 @@
 
 mod common;
 
+use std::fs;
 use std::time::Instant;
 
 use common::*;
@@ -154,6 +155,49 @@ fn the_status_record_tells_a_refusal_from_the_programs_own_exit_125() {
     let (output, record) = sandy_with_status(&refused);
     assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
     assert_eq!(record, "failed\n", "{record}");
+}
+
+/// `--status-file` writes the same record into a file that sandy creates, for a caller that
+/// cannot pass a descriptor. sandy creates the file only where none exists, so it follows no link
+/// that someone left there, and refuses a file the program could write.
+#[test]
+fn the_status_file_holds_the_record() {
+    let fixture = Fixture::new("status-file");
+    let exit = EXIT_FAILURE.to_string();
+    let with_file = |path: &str, actions: &[(&str, &str)]| {
+        let mut args = run_args(&fixture.access_args(), actions);
+        args.splice(1..1, ["--status-file".to_string(), path.to_string()]);
+        sandy(&args)
+    };
+    let path = fixture.arg("status");
+    let output = with_file(&path, &[("exit", &exit)]);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    let record = fs::read_to_string(&path).unwrap();
+    assert!(record.starts_with("pid "), "{record}");
+    assert!(!record.contains("failed"), "{record}");
+
+    let output = with_file(&path, &[("exit", "0")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{stderr}");
+    assert!(stderr.contains("cannot create --status-file"), "{stderr}");
+    assert!(output.stdout.is_empty(), "the program ran: {output:?}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), record);
+
+    let inside = fixture.arg("rw/status");
+    let output = with_file(&inside, &[("exit", "0")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{stderr}");
+    assert!(
+        stderr.contains("so the program could write the status record"),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty(), "the program ran: {output:?}");
+    assert_eq!(fs::read_to_string(&inside).unwrap(), "failed\n");
+
+    let output = with_file("status", &[("exit", "0")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{stderr}");
+    assert!(stderr.contains("needs an absolute path"), "{stderr}");
 }
 
 /// The status descriptor is close-on-exec, so the program never has it. sandy wrote the record
