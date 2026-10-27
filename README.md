@@ -123,8 +123,10 @@ The script removes from the binary what would tie it to the machine that built i
 of the checkout and of `CARGO_HOME`, and the time of the build. The Linux binaries are linked with
 the linker of the Rust toolchain, so they depend only on the source and on the toolchain that
 `rust-toolchain.toml` pins. The macOS and Windows binaries also depend on the version of Apple's
-linker and of the Microsoft linker, which the release notes name. The `reproducible` job of the
-release workflow builds every target twice, in two directories, and compares the binaries.
+linker and of the Microsoft linker, which the release notes name. The script refuses a toolchain
+that rustup did not install from the pinned archives (see "The supply chain checks" below). The
+`reproducible` job of the release workflow builds every target twice, in two directories, and
+compares the binaries.
 
 The macOS binaries are not signed or notarized, and `sandy.exe` has no Authenticode signature.
 macOS refuses a copy that a browser downloaded, because it is not notarized, and SmartScreen
@@ -1225,19 +1227,74 @@ of the file and check that every line that changed is a line you meant to change
 x86_64's, because arm64 has its own system call numbers and its file would have to be written on
 an arm64 Linux host.
 
-### The dependency audit
+### The supply chain checks
 
-`deny.toml` lists every crate that may appear in the tree. The `audit` workflow runs it, and so
-does:
+What goes into a build is pinned in this repository, and the builds check it:
+
+- **Crates.** `Cargo.lock` holds the SHA-256 sum of every crate, and cargo checks each download
+  against it. Every cargo command of CI and of the release build runs with `--locked`, so a lock
+  file that no longer matches `Cargo.toml` fails the command instead of being resolved again.
+- **The crates that may be in the tree.** `deny.toml` lists them. A crate that is not in the list,
+  an advisory, a yanked version, an unexpected license or a source other than crates.io fails
+  `cargo deny`. [docs/DESIGN.md](docs/DESIGN.md) says why `seccompiler` stays although its
+  standalone repository is archived.
+- **Who vouches for each crate version.** `supply-chain/` holds the records of
+  [cargo-vet](https://mozilla.github.io/cargo-vet/). Every crate version of `Cargo.lock` must be
+  covered by an audit imported from Mozilla, Google, the Bytecode Alliance, Zcash or ISRG
+  (`supply-chain/imports.lock` keeps the audits that apply), by an audit of this repository or a
+  trusted publisher (`supply-chain/audits.toml`), or by an exemption (`supply-chain/config.toml`).
+  The notes of each audit of this repository say who reviewed the crate, what they checked and
+  what they found. Today every crate version is covered by audits, with no trusted publishers and
+  no exemptions. A trusted publisher entry, if one is added, names the organizations that trust
+  that publisher for that crate and ends after a year; an exemption is a crate version that nobody
+  audited, and its notes say why sandy uses it anyway. `scripts/check-audits.sh` fails on a crate
+  version without cover, on an entry that nothing needs any more, and on an audit, exemption or
+  trusted publisher without notes.
+- **The toolchain.** `rust-toolchain.toml` pins the Rust release, and `rust-toolchain.sha256` the
+  SHA-256 sum of its channel manifest, which lists the sum of every archive of that release.
+  `scripts/verify-toolchain.sh` downloads the manifest, checks it against the pinned sum, and
+  checks that rustup installed the toolchain in use from archives that the manifest lists. CI
+  runs it before anything is built, and `scripts/release-build.sh` before every release build.
+- **The tools of the checks.** `scripts/install-tool.sh` builds a tool such as cargo-deny from
+  the crate with the sum that the workflow names, so the crates.io index of the day does not
+  decide which code runs.
+
+The `audit` workflow runs these, and so does:
 
 ```sh
-cargo install --locked cargo-deny@0.20.2
+scripts/verify-toolchain.sh
+scripts/install-tool.sh cargo-deny 0.20.2 e528dfcbe739af7ce37a77d3d6df1b29dd6887b1c701d888820c0f16b864f737
 cargo deny --locked check all
+scripts/install-tool.sh cargo-vet 0.10.2 dd93790018205cbbfa161f078ca4631afa8ed57fc8f32482268bcfdf0c0d7499
+scripts/check-audits.sh
 ```
 
-A crate that is not in the list, an advisory, a yanked version, an unexpected license or a source
-other than crates.io fails the check. [docs/DESIGN.md](docs/DESIGN.md) says why `seccompiler`
-stays although its standalone repository is archived.
+**When a dependency changes.** Run `cargo vet`: it fetches the audits of the imported
+organizations again and names every crate version that is still not covered. `cargo vet suggest`
+lists the audits that would cover them, with their size. Then record, for each one, an audit you
+did (`cargo vet certify`), a publisher to trust (`cargo vet trust CRATE PUBLISHER --notes ...`,
+only when the imported organizations trust it for that crate), or an exemption with notes in
+`supply-chain/config.toml`. Finish with `cargo vet prune --no-imports` and
+`scripts/check-audits.sh`, and add a new crate to `deny.toml` as well. Before a trusted publisher
+entry ends, check that the organizations still trust that publisher and move its `end` date,
+which is at most a year away; the weekly run fails once an entry has ended.
+
+**Pinning a new toolchain.** Change `channel` in `rust-toolchain.toml`. Then download the channel
+manifest of that release with its signature, check the signature with the Rust release key, and
+write the sum of the manifest:
+
+```sh
+v=1.98.1
+curl -fsSO https://static.rust-lang.org/dist/channel-rust-$v.toml
+curl -fsSO https://static.rust-lang.org/dist/channel-rust-$v.toml.asc
+gpg --verify channel-rust-$v.toml.asc channel-rust-$v.toml
+sha256sum channel-rust-$v.toml > rust-toolchain.sha256
+```
+
+`gpg` must report a good signature by the primary key
+`108F 6620 5EAE B0AA A8DD  5E1C 85AB 96E6 FA1B E5FE` (Rust Language (Tag and Release Signing Key)
+<rust-key@rust-lang.org>), which `https://static.rust-lang.org/rust-key.gpg.ascii` publishes.
+Write the sum only after that.
 
 ### What CI runs
 
@@ -1245,12 +1302,14 @@ The tests run on Ubuntu 22.04 and 24.04 (x86_64) and 24.04 (arm64), macOS 15, an
 2022 and 2025. On Ubuntu 24.04 they run a second time for the musl target of the Linux release
 on that architecture, because musl and glibc differ in constants that sandy builds its filters
 from. Each runner names the features it must be able to check and, on Linux, the lowest
-Landlock ABI it must report; after the suite, CI compares the skips with the runner's list. The
-`audit` workflow runs `cargo deny`, weekly as well, because an advisory can appear without a
-push. The `release` workflow builds archives for Linux, macOS and Windows on x86_64 and arm64
-when a tag `v<version>` is pushed, attests their build provenance, verifies the attestations, and
-creates a draft release with `SHA256SUMS`. It also builds one target twice from two directories
-and compares the binaries. The arm64 Windows build is compiled but not tested.
+Landlock ABI it must report; after the suite, CI compares the skips with the runner's list. Every
+job that builds checks the toolchain first, with `scripts/verify-toolchain.sh`. The `audit`
+workflow runs `cargo deny` and `scripts/check-audits.sh`, weekly as well, because an advisory can
+appear, and a trusted publisher entry can end, without a push. The `release` workflow builds
+archives for Linux, macOS and Windows on x86_64 and arm64 when a tag `v<version>` is pushed,
+attests their build provenance, verifies the attestations, and creates a draft release with
+`SHA256SUMS`. It also builds one target twice from two directories and compares the binaries. The
+arm64 Windows build is compiled but not tested.
 
 ### Code layout
 

@@ -57,16 +57,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Before anything is built: the toolchain must be the one rust-toolchain.toml pins,
+      # installed from the archives that rust-toolchain.sha256 pins.
+      - name: Verify the toolchain
+        shell: bash
+        run: scripts/verify-toolchain.sh
       - name: Show toolchain
         run: rustc --version && cargo --version
       - name: Check how this runner enforces the default policy
-        run: cargo run ${{ env.TARGET_OPTION }} --bin sandy -- check ${{ runner.os == 'Windows' && '--appcontainer sandy.escape-tests' || '' }}
+        run: cargo run --locked ${{ env.TARGET_OPTION }} --bin sandy -- check ${{ runner.os == 'Windows' && '--appcontainer sandy.escape-tests' || '' }}
       # The skip log is named per step: the runner context, which holds the temporary
       # directory, does not exist in the env block of a job, and the workflow would not load.
       - name: Test
         env:
           SANDY_TEST_SKIP_LOG: ${{ runner.temp }}/sandy-skips.log
-        run: cargo test ${{ env.TARGET_OPTION }} --workspace --all-targets --no-fail-fast
+        run: cargo test --locked ${{ env.TARGET_OPTION }} --workspace --all-targets --no-fail-fast
       - name: Compare the checks this runner skipped with its expected-skip list
         # Also after a failed test: a check that stopped running is what this step looks for. A
         # runner without a list in crates/sandy-cli/tests/expected-skips fails here and prints
@@ -74,7 +79,7 @@ jobs:
         if: ${{ !cancelled() }}
         env:
           SANDY_TEST_SKIP_LOG: ${{ runner.temp }}/sandy-skips.log
-        run: cargo test ${{ env.TARGET_OPTION }} -p sandy-cli --test runner -- --ignored --exact skips_match_the_expected_list --nocapture
+        run: cargo test --locked ${{ env.TARGET_OPTION }} -p sandy-cli --test runner -- --ignored --exact skips_match_the_expected_list --nocapture
       - name: Show sandbox denials (macOS)
         if: failure() && runner.os == 'macOS'
         run: log show --last 10m --style compact --predicate 'sender == "Sandbox" OR eventMessage CONTAINS "Sandbox"' | tail -n 300
@@ -100,8 +105,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Verify the toolchain
+        shell: bash
+        run: scripts/verify-toolchain.sh
       - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
-      - run: cargo clippy --workspace --all-targets --target x86_64-unknown-linux-musl -- -D warnings
-      - run: cargo check --workspace --all-targets --target aarch64-apple-darwin
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-musl -- -D warnings
+      - run: cargo check --locked --workspace --all-targets --target aarch64-apple-darwin

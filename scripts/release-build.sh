@@ -14,6 +14,8 @@ set -eu
 target=${1:?usage: scripts/release-build.sh TARGET}
 cd "$(dirname "$0")/.."
 
+scripts/verify-toolchain.sh
+
 # The time of the commit, for anything that would otherwise record the time of the build. A
 # source archive without the history of the tag gives it as SOURCE_DATE_EPOCH.
 SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}

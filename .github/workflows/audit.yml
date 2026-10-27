@@ -1,8 +1,10 @@
 name: audit
 
 # The dependency audit of deny.toml: advisories, licenses, sources, and the allowlist of crates
-# that may appear in the tree. It runs weekly as well, because an advisory can be published
-# without anything in this repository changing.
+# that may appear in the tree; and the cargo-vet records of supply-chain/, which say who audited
+# or published each crate version and why the rest is exempted. It runs weekly as well, because
+# an advisory can be published, and a trusted publisher entry can expire, without anything in
+# this repository changing.
 
 on:
   push:
@@ -22,8 +24,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Verify the toolchain
+        run: scripts/verify-toolchain.sh
       # Built from crates.io rather than taken from an action, so that nothing but the pinned
-      # toolchain and the lock file of cargo-deny itself decides what runs. The version is
-      # pinned because a new major version of cargo-deny changes what deny.toml means.
-      - run: cargo install --locked cargo-deny@0.20.2
+      # toolchain, the pinned crate and the lock file of cargo-deny itself decides what runs. The
+      # version is pinned because a new major version of cargo-deny changes what deny.toml means.
+      - run: scripts/install-tool.sh cargo-deny 0.20.2 e528dfcbe739af7ce37a77d3d6df1b29dd6887b1c701d888820c0f16b864f737
       - run: cargo deny --locked check all
+
+  vet:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify the toolchain
+        run: scripts/verify-toolchain.sh
+      - run: scripts/install-tool.sh cargo-vet 0.10.2 dd93790018205cbbfa161f078ca4631afa8ed57fc8f32482268bcfdf0c0d7499
+      - run: scripts/check-audits.sh
