@@ -8,6 +8,16 @@ use serde::Deserialize;
 
 pub const POLICY_VERSION: u32 = 1;
 
+/// The longest policy sandy reads, from a file or from standard input. Real policies are a few
+/// KiB; this leaves room for thousands of paths.
+pub const MAX_POLICY_LEN: usize = 1024 * 1024;
+
+/// The deepest nesting of arrays and inline tables a policy may use; a policy needs a few
+/// levels. The TOML parser recurses once per level, and input it rejects can get past its own
+/// limit (its error recovery closes brackets it never opened), so deeper input overflowed the
+/// stack before the parse failed: on a 1 MiB stack, from about 3 KiB of input.
+pub const MAX_POLICY_NESTING: usize = 32;
+
 /// A sandbox policy as written by the user. Everything that is not allowed is denied.
 ///
 /// Unknown fields are rejected, so a misspelled key never turns into a silent default.
@@ -54,6 +64,10 @@ impl Default for Policy {
 
 impl Policy {
     pub fn from_toml(text: &str) -> Result<Policy, PolicyError> {
+        if text.len() > MAX_POLICY_LEN {
+            return Err(PolicyError::TooLong(text.len()));
+        }
+        check_nesting(text)?;
         let policy: Policy =
             toml::from_str(text).map_err(|error| PolicyError::Parse(error.to_string()))?;
         if policy.version != POLICY_VERSION {
@@ -102,6 +116,35 @@ impl Policy {
         }
         Ok(())
     }
+}
+
+/// Refuses a policy nested deeper than `MAX_POLICY_NESTING`, counted on the tokens of the TOML
+/// lexer before the parser sees them, so a bracket inside a string or a comment does not count.
+/// The parser opens a level only on a `[` or `{` and closes it only on the matching `]` or `}`;
+/// this count closes its innermost level only on that same token, so it never has fewer levels
+/// open than the parser.
+fn check_nesting(text: &str) -> Result<(), PolicyError> {
+    use toml_parser::lexer::TokenKind;
+
+    let mut open = Vec::with_capacity(MAX_POLICY_NESTING);
+    for token in toml_parser::Source::new(text).lex() {
+        match token.kind() {
+            TokenKind::LeftSquareBracket | TokenKind::LeftCurlyBracket => {
+                if open.len() == MAX_POLICY_NESTING {
+                    return Err(PolicyError::TooDeep);
+                }
+                open.push(token.kind());
+            }
+            TokenKind::RightSquareBracket if open.last() == Some(&TokenKind::LeftSquareBracket) => {
+                open.pop();
+            }
+            TokenKind::RightCurlyBracket if open.last() == Some(&TokenKind::LeftCurlyBracket) => {
+                open.pop();
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// The name of the policy's own settings among its levels.
@@ -645,6 +688,9 @@ pub enum Win32k {
 
 #[derive(Debug)]
 pub enum PolicyError {
+    /// The length of the text, longer than `MAX_POLICY_LEN`.
+    TooLong(usize),
+    TooDeep,
     Parse(String),
     UnsupportedVersion(u32),
     RelativePath(PathBuf),
@@ -720,6 +766,15 @@ pub enum PolicyError {
 impl fmt::Display for PolicyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            PolicyError::TooLong(len) => write!(
+                f,
+                "the policy is {len} bytes long, more than the {} KiB a policy may have",
+                MAX_POLICY_LEN / 1024
+            ),
+            PolicyError::TooDeep => write!(
+                f,
+                "the policy nests arrays and inline tables deeper than {MAX_POLICY_NESTING} levels"
+            ),
             PolicyError::Parse(message) => write!(f, "invalid policy: {message}"),
             PolicyError::UnsupportedVersion(version) => write!(
                 f,
@@ -871,6 +926,68 @@ impl std::error::Error for PolicyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_policy_nested_deeper_than_the_limit_is_refused() {
+        let nested = |levels| {
+            format!(
+                "version = 1\nx = {}{}",
+                "[".repeat(levels),
+                "]".repeat(levels)
+            )
+        };
+        assert!(matches!(
+            Policy::from_toml(&nested(MAX_POLICY_NESTING + 1)),
+            Err(PolicyError::TooDeep)
+        ));
+        // At the limit the parser decides, and `x` is no key of a policy.
+        assert!(matches!(
+            Policy::from_toml(&nested(MAX_POLICY_NESTING)),
+            Err(PolicyError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn brackets_the_parser_does_not_open_do_not_lower_the_count() {
+        // The parser's error recovery closes a `{}` in the key position of an inline table that
+        // it never opened, which took input past toml's own limit and overflowed the stack.
+        let recovery = format!("a = {{{}b = {}", "{}".repeat(1000), "[".repeat(1100));
+        assert!(matches!(
+            Policy::from_toml(&recovery),
+            Err(PolicyError::TooDeep)
+        ));
+        // A bracket of the other kind closes nothing.
+        let mismatched = format!("a = {}", "[}".repeat(MAX_POLICY_NESTING + 1));
+        assert!(matches!(
+            Policy::from_toml(&mismatched),
+            Err(PolicyError::TooDeep)
+        ));
+    }
+
+    #[test]
+    fn brackets_in_strings_and_comments_do_not_count() {
+        let text = format!(
+            "version = 1\n# {}\n[filesystem]\nread = [\"/a{}\", '/b{}', \"\"\"/c{}\"\"\"]\n",
+            "[".repeat(100),
+            "[".repeat(100),
+            "{".repeat(100),
+            "[".repeat(100),
+        );
+        let policy = Policy::from_toml(&text).unwrap();
+        assert_eq!(policy.filesystem.read.len(), 3);
+    }
+
+    #[test]
+    fn a_policy_longer_than_the_limit_is_refused() {
+        let start = "version = 1\n#";
+        let longest = format!("{start}{}", "x".repeat(MAX_POLICY_LEN - start.len()));
+        assert!(Policy::from_toml(&longest).is_ok());
+        let longer = format!("{longest}x");
+        assert!(matches!(
+            Policy::from_toml(&longer),
+            Err(PolicyError::TooLong(len)) if len == MAX_POLICY_LEN + 1
+        ));
+    }
 
     #[test]
     fn empty_policy_denies_everything_optional() {

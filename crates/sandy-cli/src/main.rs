@@ -7,7 +7,7 @@ mod status;
 mod stdio;
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use args::{Command, Invocation, Mode, PolicySource};
@@ -572,11 +572,32 @@ fn sandbox(
 fn load_policy(source: Option<&PolicySource>) -> Result<Policy, String> {
     let text = match source {
         None => return Ok(Policy::default()),
-        Some(PolicySource::File(path)) => std::fs::read_to_string(path)
-            .map_err(|error| format!("cannot read policy {}: {error}", path.display()))?,
+        Some(PolicySource::File(path)) => read_policy_file(path)?,
         Some(PolicySource::Input) => stdio::take_policy_input()?,
     };
     Policy::from_toml(&text).map_err(|error| error.to_string())
+}
+
+/// Reads a policy file, and stops at more than a policy may hold rather than reading all of a
+/// file that does not end, such as a device.
+fn read_policy_file(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+
+    let cannot = |error: std::io::Error| format!("cannot read policy {}: {error}", path.display());
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(cannot)?
+        .take(sandy_core::MAX_POLICY_LEN as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(cannot)?;
+    if bytes.len() > sandy_core::MAX_POLICY_LEN {
+        return Err(format!(
+            "policy {} is longer than {} KiB",
+            path.display(),
+            sandy_core::MAX_POLICY_LEN / 1024
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| format!("policy {} is not valid UTF-8", path.display()))
 }
 
 /// `sandy check`: the plan of each level tried and which one runs, with warnings on standard
@@ -891,7 +912,11 @@ fn executed_paths() -> Vec<std::path::PathBuf> {
 /// shortfall of the host is not lost behind them.
 fn final_failure(plan: &EnforcementPlan) -> String {
     let mut reports: Vec<_> = plan.final_reports().cloned().collect();
-    reports.extend(plan.unavailable().filter(|item| !item.status.is_final()).cloned());
+    reports.extend(
+        plan.unavailable()
+            .filter(|item| !item.status.is_final())
+            .cloned(),
+    );
     let headline = if reports
         .iter()
         .any(|item| matches!(item.status, sandy_core::Status::Conflict { .. }))

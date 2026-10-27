@@ -744,15 +744,15 @@ running `sandy setup` by itself. A level is what the author of the policy wrote.
 ### The policy on standard input
 
 `--policy -` reads the policy from standard input until its end, at most 1 MiB, with the same
-parser as a file. A program that ships the policy inside itself then has no policy file to place
-where the sandboxed program cannot write it, none is left behind, and nothing can change it
-between writing and reading. It does not protect against other processes of the same user,
-which can change sandy or the caller just as well. After reading, sandy replaces its standard
-input with the null device, before anything else starts, so the program never reads what the
-caller writes there: a terminal stays readable after the end of input the user typed, so
-reading to the end would not be enough. `--elevate` refuses it, because the elevated sandy does
-not get the caller's standard input. On Linux the hand-over to an installed copy happens before
-sandy reads anything, so the copy reads the policy itself.
+parser and limits as a file. A program that ships the policy inside itself then has no policy
+file to place where the sandboxed program cannot write it, none is left behind, and nothing can
+change it between writing and reading. It does not protect against other processes of the same
+user, which can change sandy or the caller just as well. After reading, sandy replaces its
+standard input with the null device, before anything else starts, so the program never reads
+what the caller writes there: a terminal stays readable after the end of input the user typed,
+so reading to the end would not be enough. `--elevate` refuses it, because the elevated sandy
+does not get the caller's standard input. On Linux the hand-over to an installed copy happens
+before sandy reads anything, so the copy reads the policy itself.
 
 ## Process model
 
@@ -1276,9 +1276,9 @@ checks a download with `gh attestation verify <archive> --repo <owner>/<repo>`.
 
 `SHA256SUMS` says that the archives belong together; `SHA256SUMS.asc`, the maintainer's signature
 of it with the key that signs the tags, says who published them. That matters most for archives
-built outside the workflow, which have no attestation, as in 2.2.1. The macOS binaries carry only
-the linker's ad-hoc signature, and `sandy.exe` has no Authenticode signature; the workflow holds
-both steps, skipped until the certificates exist.
+built outside the workflow, which have no attestation, as in 2.2.1 and 2.2.2. The macOS binaries
+carry only the linker's ad-hoc signature, and `sandy.exe` has no Authenticode signature; the
+workflow holds both steps, skipped until the certificates exist.
 
 ## Code layout
 

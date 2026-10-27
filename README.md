@@ -16,7 +16,7 @@ sandy run \
   -- /srv/app/bin/server --port 8080
 ```
 
-Version 2.2.1. Policies use format `version = 1`.
+Version 2.2.2. Policies use format `version = 1`.
 
 ## Contents
 
@@ -106,15 +106,15 @@ sha256sum --check --ignore-missing SHA256SUMS
 
 An archive that the release workflow built also carries a GitHub build provenance attestation,
 which names the workflow, the commit and the run that built it
-(`gh attestation verify sandy-2.2.1-x86_64-unknown-linux-musl.tar.gz --repo <owner>/sandy`). The
-archives of 2.2.1 were built outside the workflow, so they have none.
+(`gh attestation verify sandy-2.2.2-x86_64-unknown-linux-musl.tar.gz --repo <owner>/sandy`). The
+archives of 2.2.1 and 2.2.2 were built outside the workflow, so they have none.
 
 **Building a release binary again.** Every release binary is built with
 `scripts/release-build.sh TARGET` from a checkout of the release tag, so anyone can build it again
 and compare it with the binary in the archive:
 
 ```sh
-git checkout v2.2.1
+git checkout v2.2.2
 scripts/release-build.sh x86_64-unknown-linux-musl
 sha256sum target/x86_64-unknown-linux-musl/release/sandy
 ```
@@ -410,7 +410,7 @@ it does nothing.
 
 | Option | Meaning | Default |
 |---|---|---|
-| `--policy FILE` | Read the policy from a TOML file (at most one). Path options add to it; the other options replace its values, but not one that a [fallback level](#fallback-levels) sets, which is an error. With `-`, read it from standard input, up to 1 MiB; the program then gets the null device as its standard input. | none |
+| `--policy FILE` | Read the policy from a TOML file (at most one). Path options add to it; the other options replace its values, but not one that a [fallback level](#fallback-levels) sets, which is an error. With `-`, read it from standard input; the program then gets the null device as its standard input. A policy may be at most 1 MiB long. | none |
 | `--level NAME` | Use only this level of the policy: `base` or the name of a fallback level. `run` refuses when this host cannot enforce it, instead of taking another. | |
 | `--json` | `check` only: print the result as one JSON object (see [Fallback levels](#fallback-levels)). | off |
 | `--read PATH` | Allow reading files and listing directories below `PATH`. | |
@@ -571,6 +571,11 @@ win32k = "allow"                # "allow" | "deny"; deny blocks win32k system ca
 The block names every key; it is not a policy that runs as written, because `expose` needs
 `ip = "all"` or `"private"`, `forward` needs any `ip` but `"none"`, `egress` and
 `relays = "ipv4"` need `ip = "private"`, and one path cannot be both `read_exec` and `read_write`. Unknown keys are errors, so a misspelled key never becomes a silent default.
+
+A policy may be at most 1 MiB long and may nest arrays and inline tables at most 32 levels deep;
+a longer or deeper one is refused before it is parsed. Real policies are a few KiB and nest a
+few levels. The depth limit is what keeps a malformed policy from overflowing the stack of the
+TOML parser, whose own limit malformed input can get past.
 
 ### Rules
 

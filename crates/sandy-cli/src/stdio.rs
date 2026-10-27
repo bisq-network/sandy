@@ -403,9 +403,6 @@ pub fn terminal_master_on(_stream: StandardStream) -> Result<bool, String> {
     Ok(false)
 }
 
-/// The longest policy `--policy -` reads.
-const MAX_POLICY_INPUT: usize = 1024 * 1024;
-
 /// `--policy -`: reads the policy from standard input until its end, then replaces standard input
 /// with the null device, so the program, which inherits the streams, reads nothing of the
 /// caller's. Done before anything else starts.
@@ -415,13 +412,13 @@ pub fn take_policy_input() -> Result<String, String> {
     let mut bytes = Vec::new();
     std::io::stdin()
         .lock()
-        .take(MAX_POLICY_INPUT as u64 + 1)
+        .take(sandy_core::MAX_POLICY_LEN as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("cannot read the policy from standard input: {error}"))?;
-    if bytes.len() > MAX_POLICY_INPUT {
+    if bytes.len() > sandy_core::MAX_POLICY_LEN {
         return Err(format!(
             "the policy on standard input is longer than {} KiB",
-            MAX_POLICY_INPUT / 1024
+            sandy_core::MAX_POLICY_LEN / 1024
         ));
     }
     let text = String::from_utf8(bytes)

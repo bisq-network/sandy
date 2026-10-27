@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "sandy-cli"
-version = "2.2.1"
+version = "2.2.2"
 dependencies = [
  "lexopt",
  "libc",
@@ -101,17 +101,18 @@ dependencies = [
 
 [[package]]
 name = "sandy-core"
-version = "2.2.1"
+version = "2.2.2"
 dependencies = [
  "libc",
  "serde",
  "toml",
+ "toml_parser",
  "windows-sys",
 ]
 
 [[package]]
 name = "sandy-linux"
-version = "2.2.1"
+version = "2.2.2"
 dependencies = [
  "landlock",
  "libc",
@@ -122,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "sandy-macos"
-version = "2.2.1"
+version = "2.2.2"
 dependencies = [
  "libc",
  "sandy-core",
@@ -131,7 +132,7 @@ dependencies = [
 
 [[package]]
 name = "sandy-relay"
-version = "2.2.1"
+version = "2.2.2"
 dependencies = [
  "libc",
  "sandy-core",
@@ -140,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "sandy-windows"
-version = "2.2.1"
+version = "2.2.2"
 dependencies = [
  "sandy-core",
  "sandy-relay",
