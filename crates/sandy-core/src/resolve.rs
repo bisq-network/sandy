@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use crate::plan::Requirement;
 use crate::policy::{
     ChildProcesses, Egress, EnvironmentPolicy, ExposedPort, FileView, ForwardedPort, IpAccess,
-    MacosPolicy, NetworkAccess, NetworkPolicy, PathMetadata, Policy, PolicyError, ProcessPolicy,
-    Relays, SignalScope, SystemAccess, Win32k, WindowsPolicy,
+    MachService, MacosPolicy, NetworkAccess, NetworkPolicy, PathMetadata, Policy, PolicyError,
+    ProcessPolicy, Relays, SignalScope, SystemAccess, Win32k, WindowsPolicy,
 };
 
 #[cfg(windows)]
@@ -280,6 +280,7 @@ impl ResolvedPolicy {
         validate_forward(&policy.network.forward, policy.network.ip)?;
         validate_egress(&policy.network)?;
         validate_relays(&policy.network, policy.macos.relays)?;
+        validate_mach_services(&policy.network, &policy.macos.mach_services)?;
 
         Ok(ResolvedPolicy {
             paths: paths.paths.clone(),
@@ -543,6 +544,22 @@ impl ResolvedPolicy {
                     .filter(move |location| reaches(location, &rule.path, identity, unknown))
                     .map(move |location| (rule, location))
             })
+    }
+
+    /// Warnings of the backends of platforms without Mach services, `platform`, for each service
+    /// that `macos.mach_services` allows: it allows nothing there, and `check` says so rather
+    /// than ignore the key.
+    pub fn mach_services_notes(&self, platform: &str) -> Vec<String> {
+        self.macos
+            .allowed_mach_services()
+            .map(|service| {
+                format!(
+                    "macos.mach_services allows {} on macOS only; {platform} has no Mach \
+                     services, so it allows nothing here",
+                    service.name()
+                )
+            })
+            .collect()
     }
 
     /// Warnings for the writable paths that reach a directory on `PATH`: sandy's own, or one the
@@ -1593,6 +1610,21 @@ fn validate_relays(network: &NetworkPolicy, relays: Relays) -> Result<(), Policy
     }
 }
 
+/// The trust agent fetches the URLs of the certificates it verifies (CA issuers, OCSP) from
+/// outside the sandbox, so a program could reach any host through it by naming the host in a
+/// certificate. A level that gives the program less than `ip = "client"` would lose that limit.
+fn validate_mach_services(
+    network: &NetworkPolicy,
+    services: &[MachService],
+) -> Result<(), PolicyError> {
+    match services.first() {
+        Some(service) if !matches!(network.ip, IpAccess::Client | IpAccess::All) => {
+            Err(PolicyError::MachServiceNeedsClientNetwork(*service))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Both `none` and `contained` promise that nothing the program starts outlives it. Through a
 /// Unix socket the program could ask a service of the user (for example the systemd user manager
 /// over D-Bus) to start a process that is not its child. With `contained`, a program that can
@@ -1751,6 +1783,48 @@ mod tests {
             levels_of(alone),
             Err(PolicyError::ContainedChildrenNeedIsolatedSignals)
         ));
+    }
+
+    /// The trust agent fetches the URLs that a certificate names from outside the sandbox, so it
+    /// needs a level whose program reaches the network anyway. A fallback level inherits the
+    /// services, so it needs that network too.
+    #[test]
+    fn mach_services_need_client_or_all_network() {
+        let with_services = |ip| {
+            let mut policy = Policy::default();
+            policy.network.ip = ip;
+            policy.macos.mach_services = vec![MachService::TrustdAgent];
+            policy
+        };
+        for ip in [IpAccess::Client, IpAccess::All] {
+            assert!(
+                ResolvedPolicy::resolve(&with_services(ip), None).is_ok(),
+                "{ip:?}"
+            );
+        }
+        for ip in [IpAccess::None, IpAccess::Private] {
+            let error = ResolvedPolicy::resolve(&with_services(ip), None).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    PolicyError::MachServiceNeedsClientNetwork(MachService::TrustdAgent)
+                ),
+                "{error}"
+            );
+        }
+        let weak = "version = 1\n[network]\nip = \"all\"\n[macos]\n\
+                    mach_services = [\"com.apple.trustd.agent\"]\n\
+                    [[fallback]]\nname = \"offline\"\nnetwork.ip = \"none\"\n";
+        let error = levels_of(weak).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                PolicyError::InvalidLevel { level, error }
+                    if level == "offline"
+                        && matches!(**error, PolicyError::MachServiceNeedsClientNetwork(_))
+            ),
+            "{error}"
+        );
     }
 
     /// Every level needs an AppContainer name of its own once any level names one, ignoring

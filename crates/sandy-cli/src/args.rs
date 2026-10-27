@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use lexopt::prelude::*;
 use sandy_core::{
     ChildProcesses, Egress, EgressReach, ExposedPort, FileView, ForwardedPort, IpAccess,
-    NetworkAccess, PathMetadata, Policy, Relays, SignalScope, SystemAccess, Win32k,
+    MachService, NetworkAccess, PathMetadata, Policy, Relays, SignalScope, SystemAccess, Win32k,
 };
 
 pub const USAGE: &str = "\
@@ -71,6 +71,9 @@ Options (they extend the policy file):
                              how the program reaches its forwarded and egress ports on macOS;
                              ipv4 closes a route to hosts of the local network and denies IPv6
                              sockets there (ipv4 needs --ip private; default: dual-stack)
+  --macos-mach-service NAME  let the program look up the Mach service NAME on macOS; sandy
+                             takes only com.apple.trustd.agent, the certificate verifier
+                             (repeatable; needs --ip client or all)
   --pass-env NAME            copy variable NAME into the program environment (repeatable)
   --set-env NAME=VALUE       set a variable in the program environment (repeatable)
   --appcontainer NAME        AppContainer profile name (Windows)
@@ -122,6 +125,7 @@ pub struct Overrides {
     end_with_parent: bool,
     path_metadata: Option<PathMetadata>,
     relays: Option<Relays>,
+    mach_services: Vec<MachService>,
     win32k: Option<Win32k>,
     pass_env: Vec<String>,
     set_env: Vec<(String, String)>,
@@ -277,6 +281,11 @@ impl Overrides {
                 note("--macos-relays", "dual-stack", "relays", "ipv4");
             }
             policy.macos.relays = relays;
+        }
+        for service in self.mach_services {
+            if !policy.macos.mach_services.contains(&service) {
+                policy.macos.mach_services.push(service);
+            }
         }
         policy.environment.pass.extend(self.pass_env);
         policy.environment.set.extend(self.set_env);
@@ -573,6 +582,19 @@ where
                     "ipv4" => Relays::Ipv4,
                     other => return Err(format!("invalid --macos-relays value {other:?}").into()),
                 })
+            }
+            Long("macos-mach-service") => {
+                let name = parser.value()?.string()?;
+                let service = MachService::ALL
+                    .into_iter()
+                    .find(|service| service.name() == name)
+                    .ok_or_else(|| {
+                        format!(
+                            "invalid --macos-mach-service value {name:?}: sandy allows only {}",
+                            MachService::ALL.map(MachService::name).join(", ")
+                        )
+                    })?;
+                overrides.mach_services.push(service);
             }
             Long("pass-env") => overrides.pass_env.push(parser.value()?.string()?),
             Long("set-env") => {
@@ -1083,6 +1105,27 @@ mod tests {
             assert_eq!(policy.process.children, expected);
         }
         assert!(parse_strs(&["check", "--children", "some"]).is_err());
+    }
+
+    /// `--macos-mach-service` adds a service that sandy has assessed, once however often it is
+    /// given, and refuses any other name.
+    #[test]
+    fn mach_services_on_the_command_line() {
+        let invocation = invocation(&[
+            "check",
+            "--macos-mach-service",
+            "com.apple.trustd.agent",
+            "--macos-mach-service",
+            "com.apple.trustd.agent",
+        ]);
+        let mut policy = Policy::default();
+        invocation.overrides.apply(&mut policy, true).unwrap();
+        assert_eq!(policy.macos.mach_services, [MachService::TrustdAgent]);
+        let error = parse_strs(&["check", "--macos-mach-service", "com.apple.trustd"]).unwrap_err();
+        assert!(
+            error.contains("sandy allows only com.apple.trustd.agent"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -106,6 +106,7 @@ impl Backend for WindowsBackend {
     fn notes(&self, policy: &ResolvedPolicy) -> Vec<String> {
         let mut notes = crate::plan::shortfalls(policy);
         notes.extend(crate::plan::notes(policy));
+        notes.extend(policy.mach_services_notes("Windows"));
         notes.extend(policy.path_directory_notes(&path_locations()));
         notes
     }

@@ -16,7 +16,7 @@ sandy run \
   -- /srv/app/bin/server --port 8080
 ```
 
-Version 2.3.0. Policies use format `version = 1`.
+Version 2.4.0. Policies use format `version = 1`.
 
 ## Contents
 
@@ -106,15 +106,15 @@ sha256sum --check --ignore-missing SHA256SUMS
 
 An archive that the release workflow built also carries a GitHub build provenance attestation,
 which names the workflow, the commit and the run that built it
-(`gh attestation verify sandy-2.3.0-x86_64-unknown-linux-musl.tar.gz --repo <owner>/sandy`). The
-archives of 2.2.1, 2.2.2 and 2.3.0 were built outside the workflow, so they have none.
+(`gh attestation verify sandy-2.4.0-x86_64-unknown-linux-musl.tar.gz --repo <owner>/sandy`). The
+archives of 2.2.1 to 2.4.0 were built outside the workflow, so they have none.
 
 **Building a release binary again.** Every release binary is built with
 `scripts/release-build.sh TARGET` from a checkout of the release tag, so anyone can build it again
 and compare it with the binary in the archive:
 
 ```sh
-git checkout v2.3.0
+git checkout v2.4.0
 scripts/release-build.sh x86_64-unknown-linux-musl
 sha256sum target/x86_64-unknown-linux-musl/release/sandy
 ```
@@ -432,6 +432,7 @@ it does nothing.
 | `--forward PORT=ADDRESS` | Relay the program's connections to its loopback `PORT` to the loopback `ADDRESS` outside the sandbox. Needs `--ip private`, `client` or `all`. | |
 | `--egress PORT[=REACH]` | A SOCKS5 broker on the program's `127.0.0.1:PORT` that connects out only to `REACH`: `public` or `public-and-local`, never to this host. Needs `--ip private`. | `public` |
 | `--linux-path-metadata deny\|allow` | On Linux, whether `chmod`, `chown`, `utimensat` and `setxattr` by path are allowed. | `deny` |
+| `--macos-mach-service NAME` | On macOS, let the program look up the Mach service `NAME`. sandy takes only `com.apple.trustd.agent`, the certificate verifier of the system. Repeatable; needs `--ip client` or `all`. See [macOS](#macos). | |
 | `--macos-relays dual-stack\|ipv4` | On macOS, how the program reaches its forwarded and egress ports. `ipv4` closes a route to hosts of the local network through IPv6 link-local addresses and denies IPv6 sockets to those ports, so Java needs `-Djava.net.preferIPv4Stack=true`. `ipv4` needs `--ip private`. See [macOS](#macos). | `dual-stack` |
 | `--pass-env NAME` | Copy the variable `NAME` into the program's environment, if it is set. | |
 | `--set-env NAME=VALUE` | Set a variable in the program's environment. Overrides `--pass-env`. | |
@@ -562,6 +563,7 @@ path_metadata = "deny"          # "deny" | "allow"
 
 [macos]
 relays = "dual-stack"           # "dual-stack" | "ipv4"; ipv4: forwarded and egress ports over IPv4
+mach_services = []              # ["com.apple.trustd.agent"]: the certificate verifier
 
 [windows]
 appcontainer_name = "example.app"
@@ -570,7 +572,9 @@ win32k = "allow"                # "allow" | "deny"; deny blocks win32k system ca
 
 The block names every key; it is not a policy that runs as written, because `expose` needs
 `ip = "all"` or `"private"`, `forward` needs any `ip` but `"none"`, `egress` and
-`relays = "ipv4"` need `ip = "private"`, and one path cannot be both `read_exec` and `read_write`. Unknown keys are errors, so a misspelled key never becomes a silent default.
+`relays = "ipv4"` need `ip = "private"`, `mach_services` needs `ip = "client"` or `"all"`, and one
+path cannot be both `read_exec` and `read_write`. Unknown keys are errors, so a misspelled key
+never becomes a silent default.
 
 A policy may be at most 1 MiB long and may nest arrays and inline tables at most 32 levels deep;
 a longer or deeper one is refused before it is parsed. Real policies are a few KiB and nest a
@@ -880,8 +884,9 @@ windows.appcontainer_name = "example.app.host"
   `filesystem.view`, `network.ip`, `network.unix_sockets`, `network.egress` (a table, or `"none"`
   for no broker), `process.signals`, `process.children`, `process.end_with_parent`,
   `linux.path_metadata`, `macos.relays`, `windows.win32k` and `windows.appcontainer_name`. The
-  paths, `system`, the environment, `expose` and `forward` are the same in every level, so the
-  program finds the same files and ports in each. Any other key in a level is an error.
+  paths, `system`, the environment, `expose`, `forward` and `macos.mach_services` are the same in
+  every level, so the program finds the same files and ports in each. Any other key in a level is an
+  error.
 - **Every level is checked as a policy of its own on every host**, so a level that could never
   run (for example `children = "contained"` with `signals = "any"`) is an error everywhere, not
   a surprise on the one host that reaches it.
@@ -1001,7 +1006,15 @@ change. A policy without levels has one entry in `levels`, named `base`.
 - `system = "none"` cannot start any program on macOS, because every program needs the dynamic
   loader and the system library cache. sandy refuses it there unless a policy path covers "/".
 - No Mach services are reachable from the sandbox, so programs that need them (for example to open
-  other apps, use the pasteboard or read preferences) do not work.
+  other apps, use the pasteboard or read preferences) do not work. The one exception a policy can
+  make is the certificate verifier: `mach_services = ["com.apple.trustd.agent"]` under `[macos]`
+  (`--macos-mach-service com.apple.trustd.agent`) lets programs verify TLS servers through the
+  system, as Go programs and every program that uses Security.framework do; without it they fail
+  with `OSStatus -26276`. It needs `ip = "client"` or `"all"`, because the verifier fetches the URLs
+  that a certificate names from outside the sandbox. `sandy check` warns what else the service
+  gives the program; it cannot make a certificate trusted (docs/macos.md, "Mach services and other
+  IPC"). sandy refuses every other service name, and Linux and Windows say that the key allows
+  nothing there.
 - Every path outside the policy looks missing: calls answer "No such file or directory", not
   "Operation not permitted". With `unix_sockets = "all"`, `access`, `statfs` and `chdir` still
   tell whether a path exists, because reaching a socket needs that check. A program that saves

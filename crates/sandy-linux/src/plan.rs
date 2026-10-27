@@ -276,6 +276,7 @@ pub fn notes(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
                 .to_string(),
         );
     }
+    notes.extend(policy.mach_services_notes("Linux"));
     notes.extend(policy.path_directory_notes(&host.path_locations));
     let Some(rules) = landlock_for(policy, host).map(|landlock| landlock.rules) else {
         // Without Landlock the policy is refused anyway, and there are no rules to compare with.

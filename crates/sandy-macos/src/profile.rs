@@ -49,9 +49,23 @@ pub fn generate(policy: &ResolvedPolicy) -> Profile {
     ancestor_rules(&mut writer);
     link_rules(&mut writer);
     protection_rules(&mut writer, policy);
+    mach_service_rules(&mut writer, policy);
     Profile {
         text: writer.text,
         parameters: writer.parameters,
+    }
+}
+
+/// The Mach services of `macos.mach_services`, after the rules that deny every service, so that
+/// these names alone are allowed. Only the target's profile has them, not the relay's or the
+/// watcher's.
+fn mach_service_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
+    for service in policy.macos.allowed_mach_services() {
+        writer.comment("A Mach service that macos.mach_services allows (docs/macos.md).");
+        writer.line(&format!(
+            "(allow mach-lookup (global-name \"{}\"))",
+            service.name()
+        ));
     }
 }
 
@@ -680,7 +694,7 @@ fn hardening_rules(writer: &mut Writer) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sandy_core::{EnvironmentPolicy, PathMetadata, PathRule, WindowsPolicy};
+    use sandy_core::{EnvironmentPolicy, MachService, PathMetadata, PathRule, WindowsPolicy};
 
     fn rule(path: &str, access: PathAccess, is_dir: bool) -> PathRule {
         PathRule {
@@ -1292,6 +1306,28 @@ mod tests {
             .collect();
         assert!(!values.contains(&Path::new("/dev/null")));
         assert!(!values.contains(&Path::new("/usr/lib")));
+    }
+
+    /// `macos.mach_services` allows exactly the named service, after the rule that denies every
+    /// service, so that the allowance is the last word for that name and for no other.
+    #[test]
+    fn allows_only_the_named_mach_service() {
+        let mut policy = typical("/srv");
+        policy.ip = IpAccess::All;
+        policy.macos.mach_services = vec![MachService::TrustdAgent, MachService::TrustdAgent];
+        let text = generate(&policy).text;
+        let allowances: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("(allow mach"))
+            .collect();
+        assert_eq!(
+            allowances,
+            ["(allow mach-lookup (global-name \"com.apple.trustd.agent\"))"]
+        );
+        let deny = text
+            .find("(deny mach-lookup (xpc-service-name-prefix \"\"))")
+            .unwrap();
+        assert!(text.find(allowances[0]).unwrap() > deny);
     }
 
     #[test]

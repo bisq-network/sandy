@@ -4,8 +4,9 @@
 use std::path::Path;
 
 use sandy_core::{
-    ChildProcesses, FileView, IpAccess, NetworkAccess, PathAccess, PathIdentity, PlanItem,
-    ProtectedPath, Relays, Requirement, ResolvedPolicy, SignalScope, Status, SystemAccess,
+    ChildProcesses, FileView, IpAccess, MachService, NetworkAccess, PathAccess, PathIdentity,
+    PlanItem, ProtectedPath, Relays, Requirement, ResolvedPolicy, SignalScope, Status,
+    SystemAccess,
 };
 
 use crate::system::{self, SystemAccess as Grant};
@@ -239,8 +240,35 @@ fn path_identity() -> Result<PathIdentity, Status> {
 /// prints these as warnings; they change nothing sandy enforces.
 pub fn notes(policy: &ResolvedPolicy, path_locations: &[ProtectedPath]) -> Vec<String> {
     let mut notes = shortfalls(policy);
+    notes.extend(mach_service_notes(policy));
     notes.extend(policy.path_directory_notes(path_locations));
     notes
+}
+
+/// What each service of `macos.mach_services` lets the program do besides its purpose, as
+/// assessed from the published source of the service (docs/macos.md, "Mach services and other
+/// IPC").
+fn mach_service_notes(policy: &ResolvedPolicy) -> Vec<String> {
+    policy
+        .macos
+        .allowed_mach_services()
+        .map(|service| match service {
+            MachService::TrustdAgent => format!(
+                "macos.mach_services allows {}, the trust agent of this user, which verifies \
+                 certificates for the program. Through it the program can also have the agent \
+                 fetch the CA issuer and OCSP URLs that a certificate names, from outside the \
+                 sandbox (ip = \"client\" or \"all\" reaches those hosts anyway), flush this \
+                 user's OCSP and CA issuer caches, read the trust settings of this user and of \
+                 the administrator, and learn whether a keychain of the user holds the issuer of \
+                 a certificate it sends. It cannot make a certificate trusted: trust settings \
+                 change only with an authorization from the user, through a service that stays \
+                 denied, and the trust store only for a program signed with the entitlement \
+                 modify-anchor-certificates, so keep such programs out of read_exec paths \
+                 (docs/macos.md, \"Mach services and other IPC\")",
+                service.name()
+            ),
+        })
+        .collect()
 }
 
 /// What the policy asks for and macOS gives only in part, although the plan reports it as
@@ -454,27 +482,45 @@ enum Mechanism {
     Missing(&'static str),
 }
 
+/// The Mach services that `macos.mach_services` allows, as the mechanisms name them: empty when
+/// it allows none.
+fn mach_exceptions(policy: &ResolvedPolicy) -> String {
+    let names: Vec<&str> = policy
+        .macos
+        .allowed_mach_services()
+        .map(MachService::name)
+        .collect();
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!(" except {} (macos.mach_services)", names.join(", "))
+    }
+}
+
 fn mechanism(requirement: Requirement, policy: &ResolvedPolicy) -> Mechanism {
     let contained = policy.children == ChildProcesses::Contained;
     let text = match requirement {
         Requirement::FilesystemConfined => {
-            if policy.unix_sockets == NetworkAccess::All {
-                "deny by default; read, write and execute only policy paths and the system set; \
-                 paths outside the policy answer ENOENT except to existence checks, which Unix \
-                 sockets need (unix_sockets = \"all\"); no Mach or XPC services \
-                 (LaunchServices, Apple events, launchd, pasteboard); policy paths cannot be \
-                 replaced"
+            let hidden = if policy.unix_sockets == NetworkAccess::All {
+                "paths outside the policy answer ENOENT except to existence checks, which Unix \
+                 sockets need (unix_sockets = \"all\")"
             } else {
+                "paths outside the policy answer ENOENT"
+            };
+            return Mechanism::Profile(format!(
                 "deny by default; read, write and execute only policy paths and the system set; \
-                 paths outside the policy answer ENOENT; no Mach or XPC services \
-                 (LaunchServices, Apple events, launchd, pasteboard); policy paths cannot be \
-                 replaced"
-            }
+                 {hidden}; no Mach or XPC services (LaunchServices, Apple events, launchd, \
+                 pasteboard){}; policy paths cannot be replaced",
+                mach_exceptions(policy)
+            ));
         }
         Requirement::NoPrivilegeEscalation => {
-            "only policy paths execute; setuid and setgid files never do (process-exec* denied \
-             by file mode, and Sandbox.kext refuses them in any sandbox); no Mach services \
-             (authorization, privileged helpers, launchd jobs)"
+            return Mechanism::Profile(format!(
+                "only policy paths execute; setuid and setgid files never do (process-exec* \
+                 denied by file mode, and Sandbox.kext refuses them in any sandbox); no Mach \
+                 services (authorization, privileged helpers, launchd jobs){}",
+                mach_exceptions(policy)
+            ));
         }
         Requirement::ProcessMemoryIsolated => {
             "no task ports of other processes (mach-priv*, mach-task-name, mach-task-read, \
@@ -825,6 +871,56 @@ mod tests {
         let policy = strictest();
         let plan = EnforcementPlan::new(&policy.requirements(), plan_for(&policy, &capable()));
         assert!(plan.is_enforceable(), "{plan}");
+    }
+
+    /// An allowed Mach service is named where the plan says that no service is reachable, and
+    /// `check` warns what else the service gives the program.
+    #[test]
+    fn allowed_mach_services_are_named_in_the_plan_and_warned_about() {
+        let mut policy = strictest();
+        policy.ip = IpAccess::All;
+        let mechanism = |policy: &ResolvedPolicy, requirement| {
+            format!(
+                "{:?}",
+                plan_for(policy, &capable())
+                    .into_iter()
+                    .find(|item| item.requirement == requirement)
+                    .unwrap()
+                    .status
+            )
+        };
+        for requirement in [
+            Requirement::FilesystemConfined,
+            Requirement::NoPrivilegeEscalation,
+        ] {
+            assert!(!mechanism(&policy, requirement).contains("except"));
+        }
+        assert!(mach_service_notes(&policy).is_empty());
+        policy.macos.mach_services = vec![MachService::TrustdAgent];
+        for requirement in [
+            Requirement::FilesystemConfined,
+            Requirement::NoPrivilegeEscalation,
+        ] {
+            assert!(
+                mechanism(&policy, requirement)
+                    .contains("except com.apple.trustd.agent (macos.mach_services)"),
+                "{requirement:?}"
+            );
+        }
+        let notes = mach_service_notes(&policy);
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].contains("cannot make a certificate trusted"),
+            "{}",
+            notes[0]
+        );
+        assert_eq!(
+            policy.mach_services_notes("Linux"),
+            [
+                "macos.mach_services allows com.apple.trustd.agent on macOS only; Linux has no \
+              Mach services, so it allows nothing here"
+            ]
+        );
     }
 
     #[test]

@@ -1233,6 +1233,52 @@ Other IPC that the profile does not allow: POSIX and System V shared memory and 
 Consequences: `getpwuid` and similar directory lookups fail (no `opendirectoryd`), system logging
 through `os_log` is dropped, and CoreFoundation preferences work only in direct mode.
 
+### Services a policy can allow
+
+`macos.mach_services` (`--macos-mach-service`) allows Mach services by name, after the rules that
+deny every service, so each named service and no other becomes reachable. Only the target's
+profile gets them, not the relay's or the watcher's. sandy takes only names it has assessed and
+refuses every other name like an unknown key; each allowed service is named in the mechanisms of
+`FilesystemConfined` and `NoPrivilegeEscalation`, and `check` warns what else it gives the
+program. Like the paths, the services are the same in every level. On Linux and Windows the key
+allows nothing, and `check` says so.
+
+**`com.apple.trustd.agent`, the certificate verifier.** Security.framework verifies certificates
+in trustd: Go's `crypto/x509` (and so every Go program that makes TLS connections), and every
+program that calls `SecTrustEvaluateWithError`, cannot verify a server without it and fails with
+`x509: OSStatus -26276` (`errSecInternalComponent`). Measured on macOS 27 with a Go program that
+verifies a real certificate chain: it fails under sandy, and under a profile that only denies
+`mach-lookup`; allowing `com.apple.trustd.agent` alone makes it pass, while `com.apple.trustd`,
+`com.apple.SecurityServer` and `com.apple.ocspd` alone do not. With the agent the verification
+still refuses a chain for another host name and a self-signed certificate.
+
+What else the agent does for a client, assessed from its published source (Security-61901.120.67,
+`trust/trustd/`; the agent and the system trustd are one program that answers the same requests):
+
+- **It fetches URLs that the client names.** To build a chain it fetches the CA issuer URLs of
+  the certificates (http only, no redirects) and, when asked for revocation, their OCSP URLs, from
+  its own process, which its own sandbox lets reach the network. A program could send data to any
+  host through a certificate it makes up. So sandy takes the service only with `ip = "client"` or
+  `"all"`, where the program reaches those hosts directly anyway; with `ip = "none"`, `"private"`
+  or an egress broker it would get around them, and a level that sets them is refused.
+- **It flushes caches.** Any client can flush the user's OCSP and CA issuer caches, which makes the
+  next verifications fetch again. It makes no certificate trusted.
+- **It answers some reads.** It returns the trust settings of the user and of the administrator,
+  and it looks up the issuers of a certificate in the user's keychains, so a client can learn
+  whether a keychain holds a given certificate, without reading the keychain.
+- **It changes trust only with an authorization or an entitlement.** User and administrator trust
+  settings change only with an authorization that the client gets from authd, which asks the user
+  for a password and stays denied in the sandbox, and that trustd checks again. The trust store,
+  certificate transparency exceptions, revocation additions and connection pins change only for a
+  client whose code signature carries the entitlement `modify-anchor-certificates`. The program
+  can only execute files of `read_exec` paths, which it cannot write, so it can claim no entitlement
+  that the files there were not signed with. No program in `/usr/bin`, `/usr/sbin`,
+  `/usr/libexec`, `/System/Library/CoreServices` and the Utilities folders of macOS 27 carries it
+  (measured with `codesign -d --entitlements`). Keep programs with it out of `read_exec` paths.
+- **It parses what the client sends.** Every program that verifies a certificate passes it to
+  trustd, so the agent's parsers are reached by any TLS client of the Mac already; no published
+  vulnerability names trustd's request interface.
+
 ## Privilege escalation
 
 A setuid or setgid program can only run if it is executable under the policy. The system set is
@@ -1393,8 +1439,8 @@ none, so the backend answers nothing and sandy refuses the option.
   policy unless a policy path covers "/", which is the only way a policy can bring those paths
   itself (measured: `run --system none --read / -- /usr/bin/true` works).
 - A program that needs a framework resource, ICU data, a Mach service or user lookups does not work
-  with `system = "minimal"` alone. Add the paths with `--read`; there is no way to allow Mach
-  services.
+  with `system = "minimal"` alone. Add the paths with `--read`; the only Mach service a policy can
+  allow is the certificate verifier (see "Services a policy can allow").
 - A script needs its interpreter in a `read_exec` path, because the interpreter is executed too.
   `sandy check` reads the `#!` line of the program and reports FilesystemConfined as a conflict
   (status 125) when no `read_exec` path covers the interpreter, so it does not report a policy as

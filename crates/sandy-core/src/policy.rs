@@ -631,6 +631,43 @@ pub enum PathMetadata {
 pub struct MacosPolicy {
     #[serde(default)]
     pub relays: Relays,
+    /// Mach services the target may look up. Every other service stays denied, and only names
+    /// that sandy has assessed parse (`MachService`). Like the paths, they are the same in every
+    /// level.
+    #[serde(default)]
+    pub mach_services: Vec<MachService>,
+}
+
+/// A Mach service that a policy may allow on macOS. sandy denies every service by default
+/// (docs/macos.md, "Mach services and other IPC"); each one here was assessed for what it lets a
+/// program do, and an unknown name is refused like an unknown key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+pub enum MachService {
+    /// The trust agent of the user, which verifies certificates for the system's TLS stack: Go
+    /// programs and every program that uses Security.framework need it to verify a server.
+    #[serde(rename = "com.apple.trustd.agent")]
+    TrustdAgent,
+}
+
+impl MacosPolicy {
+    /// The allowed Mach services, each once, in the order of `MachService::ALL`.
+    pub fn allowed_mach_services(&self) -> impl Iterator<Item = MachService> + '_ {
+        MachService::ALL
+            .into_iter()
+            .filter(|service| self.mach_services.contains(service))
+    }
+}
+
+impl MachService {
+    /// Every service a policy may allow.
+    pub const ALL: [MachService; 1] = [MachService::TrustdAgent];
+
+    /// The name of the service as launchd knows it and the policy writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            MachService::TrustdAgent => "com.apple.trustd.agent",
+        }
+    }
 }
 
 /// How the target reaches its forwarded ports and the egress broker under `ip = "private"`.
@@ -738,6 +775,9 @@ pub enum PolicyError {
     },
     ChildrenNeedUnixSocketsDenied(ChildProcesses),
     Ipv4RelaysNeedPrivateNetwork,
+    /// A service that reaches the network for the target needs a level whose target reaches it
+    /// anyway.
+    MachServiceNeedsClientNetwork(MachService),
     ContainedChildrenNeedIsolatedSignals,
     EndWithParentNeedsIsolatedSignals,
     ProgramNotAFile(PathBuf),
@@ -865,6 +905,14 @@ impl fmt::Display for PolicyError {
                 "macos.relays = \"ipv4\" needs ip = \"private\": it closes a route of the private \
                  network on macOS, and with any other value the program either has no network or \
                  reaches every address without the relays",
+            ),
+            PolicyError::MachServiceNeedsClientNetwork(service) => write!(
+                f,
+                "macos.mach_services = [\"{}\"] needs ip = \"client\" or \"all\" in every level: \
+                 the service fetches the certificate URLs that the program names, from outside the \
+                 sandbox, so with less network the program would reach through it what the level \
+                 denies",
+                service.name()
             ),
             PolicyError::InvalidExpose { expose, reason } => write!(
                 f,
@@ -1124,6 +1172,40 @@ mod tests {
             "version = 1\n[macos]\nrelays = \"ipv6\"",
             "version = 1\n[macos]\nrelays = \"dual_stack\"",
             "version = 1\n[macos]\nrelay = \"ipv4\"",
+        ] {
+            assert!(
+                matches!(Policy::from_toml(bad), Err(PolicyError::Parse(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    /// Only services that sandy assessed parse, and only in the base: like the paths, they are
+    /// the same in every level. A name given twice counts once.
+    #[test]
+    fn mach_services_take_known_names_only() {
+        let policy = Policy::from_toml(
+            "version = 1\n[macos]\nmach_services = [\"com.apple.trustd.agent\", \
+             \"com.apple.trustd.agent\"]",
+        )
+        .unwrap();
+        assert_eq!(
+            policy.macos.allowed_mach_services().collect::<Vec<_>>(),
+            [MachService::TrustdAgent]
+        );
+        assert_eq!(MachService::TrustdAgent.name(), "com.apple.trustd.agent");
+        assert!(
+            Policy::default()
+                .macos
+                .allowed_mach_services()
+                .next()
+                .is_none()
+        );
+        for bad in [
+            "version = 1\n[macos]\nmach_services = [\"com.apple.trustd\"]",
+            "version = 1\n[macos]\nmach_services = [\"com.apple.pasteboard.1\"]",
+            "version = 1\n[macos]\nmach_services = \"com.apple.trustd.agent\"",
+            "version = 1\n[[fallback]]\nname = \"x\"\nmacos.mach_services = [\"com.apple.trustd.agent\"]",
         ] {
             assert!(
                 matches!(Policy::from_toml(bad), Err(PolicyError::Parse(_))),

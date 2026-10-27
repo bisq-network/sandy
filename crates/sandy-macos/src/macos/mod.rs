@@ -434,6 +434,7 @@ mod tests {
             }),
             macos: sandy_core::MacosPolicy {
                 relays: sandy_core::Relays::Ipv4,
+                ..Default::default()
             },
             ..base.clone()
         });

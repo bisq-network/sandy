@@ -3636,6 +3636,7 @@ mod macos {
         "getsid",
         "getpriority",
         "necp-open",
+        "mach-lookup",
     ];
 
     pub fn perform(action: &str, target: &str) -> io::Result<String> {
@@ -3675,6 +3676,7 @@ mod macos {
                 unsafe { libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t) }
             }),
             "necp-open" => necp_open(),
+            "mach-lookup" => mach_lookup(target),
             "rename" => {
                 let (from, to) = super::pair(target)?;
                 fs::rename(from, to).map(|()| String::new())
@@ -3957,6 +3959,31 @@ mod macos {
             return Err(error);
         }
         Ok(value.to_string())
+    }
+
+    /// Looks up the Mach service `target` with bootstrap_look_up, as a client of the service
+    /// does before it sends a message. The send right stays with the probe until it exits.
+    fn mach_lookup(target: &str) -> io::Result<String> {
+        /// `BOOTSTRAP_NOT_PRIVILEGED`, which a lookup that the sandbox denies may answer.
+        const NOT_PRIVILEGED: i32 = 1100;
+        unsafe extern "C" {
+            static bootstrap_port: u32;
+            fn bootstrap_look_up(bp: u32, service_name: *const c_char, sp: *mut u32) -> i32;
+        }
+        let name = CString::new(target)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name with NUL"))?;
+        let mut port = 0u32;
+        // SAFETY: bootstrap_port is the task's bootstrap port, set before main; name is
+        // NUL-terminated and port is a writable mach_port_t.
+        let code = unsafe { bootstrap_look_up(bootstrap_port, name.as_ptr(), &mut port) };
+        match code {
+            0 => Ok(String::new()),
+            NOT_PRIVILEGED => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("bootstrap_look_up: {code}"),
+            )),
+            _ => Err(io::Error::other(format!("bootstrap_look_up: {code}"))),
+        }
     }
 
     /// necp_open(2), the descriptor Network.framework asks NECP through. The descriptor is

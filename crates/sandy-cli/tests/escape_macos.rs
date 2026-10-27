@@ -184,6 +184,35 @@ fn open_cannot_start_applications() {
     );
 }
 
+/// `macos.mach_services` opens exactly the services it names: with the trust agent allowed the
+/// program finds it, and the system trust daemon and the security server stay denied; without
+/// the key all three are denied. The control looks them up outside the sandbox.
+#[test]
+fn mach_services_allow_only_the_named_service() {
+    let fixture = Fixture::new("mach-services");
+    let lookups = [
+        ("mach-lookup", "com.apple.trustd.agent"),
+        ("mach-lookup", "com.apple.trustd"),
+        ("mach-lookup", "com.apple.SecurityServer"),
+    ];
+    for line in probe_outside(&lookups) {
+        line.assert_ok();
+    }
+    let mut args = fixture.access_args();
+    args.extend(["--ip".to_string(), "all".to_string()]);
+    for line in probe_inside(&args, &lookups) {
+        line.assert_blocked();
+    }
+    args.extend([
+        "--macos-mach-service".to_string(),
+        "com.apple.trustd.agent".to_string(),
+    ]);
+    let lines = probe_inside(&args, &lookups);
+    lines[0].assert_ok();
+    lines[1].assert_blocked();
+    lines[2].assert_blocked();
+}
+
 /// Apple events need LaunchServices to find and start the receiver and Mach services to deliver
 /// the event. The receiver here is a marker app, because sending events to Terminal needs an
 /// Automation consent that a CI runner cannot give.

@@ -1001,7 +1001,9 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   `posix_spawn` with `POSIX_SPAWN_SETEXEC` replaces sandy with the target, like `execve`.
   `POSIX_SPAWN_CLOEXEC_DEFAULT` makes the kernel close every descriptor except 0, 1 and 2.
 - No Mach or XPC service. This closes LaunchServices, Apple events, launchd jobs and the
-  pasteboard, through which another process could act for the target.
+  pasteboard, through which another process could act for the target. `macos.mach_services` can
+  allow services that sandy has assessed, so far only the certificate verifier
+  (`com.apple.trustd.agent`), with `ip = "client"` or `"all"` (docs/macos.md).
 - Setuid and setgid files never execute. The root of a writable path cannot be deleted or
   replaced, so the target cannot redirect the next run with a symbolic link.
 - Outside the policy every path answers `ENOENT`, as a path that does not exist, to every call,
@@ -1276,9 +1278,9 @@ checks a download with `gh attestation verify <archive> --repo <owner>/<repo>`.
 
 `SHA256SUMS` says that the archives belong together; `SHA256SUMS.asc`, the maintainer's signature of
 it with the key that signs the tags, says who published them. That matters most for archives built
-outside the workflow, which have no attestation, as in 2.2.1, 2.2.2 and 2.3.0. The macOS binaries
-carry only the linker's ad-hoc signature, and `sandy.exe` has no Authenticode signature; the
-workflow holds both steps, skipped until the certificates exist.
+outside the workflow, which have no attestation, as in 2.2.1 to 2.4.0. The macOS binaries carry only
+the linker's ad-hoc signature, and `sandy.exe` has no Authenticode signature; the workflow holds
+both steps, skipped until the certificates exist.
 
 ## Code layout
 
