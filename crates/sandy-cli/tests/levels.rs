@@ -235,6 +235,76 @@ fn a_pinned_level_is_never_replaced() {
     parse(&output)[0].assert_ok();
 }
 
+/// The parent options belong to the policy, not to the level that runs: a caller that runs
+/// `check` with `--parent-pid` and then `run --level` with the level `check` named, as the
+/// README recommends, passes the same options to both, also for a level that does not end with
+/// its parent, which then ignores them.
+#[test]
+fn a_pinned_level_takes_the_parent_options_of_the_policy() {
+    let fixture = Fixture::new("levels-parent");
+    #[cfg(windows)]
+    let (base_name, level_name) = (
+        format!(
+            "[windows]\nappcontainer_name = \"{}\"\n",
+            appcontainer_name()
+        ),
+        format!(
+            "windows.appcontainer_name = \"{}\"\n",
+            level_appcontainer_name()
+        ),
+    );
+    #[cfg(unix)]
+    let (base_name, level_name) = (String::new(), String::new());
+    let natural = Natural {
+        text: format!(
+            "[process]\nsignals = \"isolated\"\nend_with_parent = true\n{base_name}\
+             [[fallback]]\nname = \"weaker\"\nprocess.signals = \"any\"\n\
+             process.end_with_parent = false\n{level_name}"
+        ),
+        wrapper: Vec::new(),
+    };
+    let policy = policy(&fixture, &natural);
+    let probe = probe_path();
+    let parent = std::process::id().to_string();
+
+    let output = sandy_as(
+        &natural,
+        &strings(&[
+            "check",
+            "--policy",
+            &policy,
+            "--level",
+            "weaker",
+            "--parent-pid",
+            &parent,
+            "--",
+            &probe,
+        ]),
+    );
+    let stdout = text(&output.stdout);
+    assert!(output.status.success(), "{stdout}{}", text(&output.stderr));
+    assert_eq!(stdout.lines().last(), Some("level: weaker"), "{stdout}");
+
+    let output = sandy_as(
+        &natural,
+        &strings(&[
+            "run",
+            "--policy",
+            &policy,
+            "--level",
+            "weaker",
+            "--parent-pid",
+            &parent,
+            "--",
+            &probe,
+            "read",
+            &fixture.arg("ro/file"),
+        ]),
+    );
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    parse(&output)[0].assert_ok();
+}
+
 /// A policy without levels reads and reports as before 2.2.0: no level lines, no level in the
 /// status record.
 #[test]

@@ -495,6 +495,12 @@ fn sandbox(
     }
     let mut levels = ResolvedPolicy::resolve_levels(&policy, invocation.program.as_deref())
         .map_err(|error| error.to_string())?;
+    // The paths, the program and the environment are the same in every level, so the checks
+    // of the invocation hold for all of them. The parent is checked for any level that ends
+    // with it, also when another level is chosen or pinned with --level: checked in every mode,
+    // so that check reports what run would refuse, and run --level takes the options that check
+    // took. A level that does not end with its parent ignores it.
+    let ends_with_parent = levels.iter().any(|level| level.policy.end_with_parent);
     if let Some(name) = &invocation.level {
         let index = levels
             .iter()
@@ -508,11 +514,6 @@ fn sandbox(
             })?;
         levels = vec![levels.swap_remove(index)];
     }
-    // The paths, the program and the environment are the same in every level, so the checks
-    // of the invocation hold for all of them. The parent is checked for any level that ends
-    // with it, also when another level is chosen: checked in every mode, so that check reports
-    // what run would refuse.
-    let ends_with_parent = levels.iter().any(|level| level.policy.end_with_parent);
     if let Some(reason) = parent_ended_during_hand_over(
         context.handed_parent,
         context.parent_at_start,

@@ -905,7 +905,9 @@ windows.appcontainer_name = "example.app.host"
   it. A program that configures itself per level, for example writes another configuration file
   for a level without the egress broker, runs `check` first and then `run --level` with the level
   `check` named, so a host that changed in between makes `run` refuse rather than start the
-  program with the configuration of another level.
+  program with the configuration of another level. `--parent-pid` and `--parent-start` belong to
+  the policy: `check` and `run` take them, also with `--level`, when any level ends with its
+  parent, and a level that does not ignores them, so both commands get the same options.
 - An option that sets a key some level sets (`--ip` when a level sets `network.ip`) is an error,
   because it would be unclear which levels it changes. Other options apply to every level.
 - `check` of a policy with levels needs the program, because whether a level can run can depend
@@ -987,15 +989,16 @@ change. A policy without levels has one entry in `levels`, named `base`.
   `--ip client`, sandy grants systemd-resolved's directory, so name resolution keeps working when
   the network changes. Where `/etc/resolv.conf` is a plain file or leads elsewhere, a long-running
   program needs a restart after the system replaces it ([docs/linux.md](docs/linux.md)).
-- **Tested** on Fedora 44 (kernel 7.2), Ubuntu 22.04 (6.8), Ubuntu 25.10 (6.17) and the GitHub
-  Ubuntu 22.04, 24.04 and 24.04-arm runners. The code paths of older Landlock ABIs are tested on
-  a newer kernel with the test harness `sandy-abi-cap`, which lowers the ABI sandy reads (see
-  [docs/linux.md](docs/linux.md)).
+- **Tested** on Fedora 44 (kernel 7.2), Ubuntu 22.04 (6.8) and Ubuntu 25.10 (6.17), on x86_64.
+  The GitHub Ubuntu 22.04, 24.04 and 24.04-arm runners last ran the suite for 1.x (see
+  [What CI runs](#what-ci-runs)); no arm64 Linux host ran it since. The code paths of older
+  Landlock ABIs are tested on a newer kernel with the test harness `sandy-abi-cap`, which lowers
+  the ABI sandy reads (see [docs/linux.md](docs/linux.md)).
 - Details, the exact system set and all limitations: [docs/linux.md](docs/linux.md).
 
 ### macOS
 
-- **Tested** on macOS 15 (arm64) through GitHub Actions, and on macOS 26 and 27 (arm64).
+- **Tested** on macOS 26 and 27 (arm64). The GitHub macOS 15 runner last ran the suite for 1.x.
 - **Not through Rosetta:** x86_64 code cannot run in the sandbox on Apple silicon, because Rosetta
   cannot load its runtime there. sandy refuses a program without arm64 code on Apple silicon,
   and for a script the interpreter of its `#!` line, which is what the kernel loads. Its x86_64
@@ -1050,8 +1053,9 @@ change. A policy without levels has one entry in `levels`, named `base`.
 ### Windows
 
 - **Versions.** Windows 10 1809 or newer, or Windows Server 2019 or newer, with the fix for
-  CVE-2021-41338 (an AppContainer firewall bypass). Tested on Windows 11 and on Windows Server
-  2022 and 2025; Windows 10 is expected to work but is not tested.
+  CVE-2021-41338 (an AppContainer firewall bypass). Tested on Windows 11; the GitHub Windows
+  Server 2022 and 2025 runners last ran the suite for 1.x. Windows 10 is expected to work but is
+  not tested.
 - **AppContainer name.** Every run needs `--appcontainer NAME` or `windows.appcontainer_name`.
   The name identifies the AppContainer profile; file grants and the loopback exemption belong to
   it. Use one name per policy. sandy refuses to start a second program under a name while another
@@ -1175,7 +1179,7 @@ sandy does not protect:
 
 - secrets the program itself holds, and the data in its `read_write` paths,
 - network traffic the program may send with `ip = "client"` or `ip = "all"`,
-- the terminal the program writes to (recommendation 8 above),
+- the terminal the program writes to (recommendation 10 above),
 - the availability of the machine (CPU, memory, disk use), and of files the program may read: a
   lock it holds on such a file stalls programs outside that lock the same file, and on Windows
   also those that read or write it,
@@ -1333,6 +1337,13 @@ archives for Linux, macOS and Windows on x86_64 and arm64 when a tag `v<version>
 attests their build provenance, verifies the attestations, and creates a draft release with
 `SHA256SUMS`. It also builds one target twice from two directories and compares the binaries. The
 arm64 Windows build is compiled but not tested.
+
+CI has not run since the 1.x releases, and the releases with binaries, from 2.2.1 on, were
+built by hand; each release's notes say where its tests ran and how its binaries were built.
+Expected-skip lists exist only for the hosts the suite ran on since then, not for the runners
+above, so the comparison step fails on each runner until its list is committed: the failure
+prints the skips of the run, which become `crates/sandy-cli/tests/expected-skips/<runner>.txt`
+once checked.
 
 ### Code layout
 
