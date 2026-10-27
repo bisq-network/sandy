@@ -1248,9 +1248,9 @@ it, pinned by the lock file, for these reasons:
 - The system call numbers are sandy's own, taken from `libc::SYS_*`, so a stale table in
   seccompiler cannot reach the filters.
 - `compiled_programs_match_the_snapshot` in `crates/sandy-linux/src/filter.rs` pins the compiled
-  programs against `crates/sandy-linux/snapshots/x86_64.txt`, and the interpreter tests beside it
-  check what those programs decide. A version of seccompiler that compiles the same rules
-  differently is a diff to read, not a silent change.
+  programs against `crates/sandy-linux/snapshots/x86_64.txt` and `aarch64.txt`, and the
+  interpreter tests beside it check what those programs decide. A version of seccompiler that
+  compiles the same rules differently is a diff to read, not a silent change.
 
 No advisory against seccompiler exists today, so `deny.toml` has nothing to silence. If one
 appears, the answer is a decision and not a quiet `ignore` entry: either replace the crate, or
@@ -1280,7 +1280,7 @@ checks a download with `gh attestation verify <archive> --repo <owner>/<repo>`.
 
 `SHA256SUMS` says that the archives belong together; `SHA256SUMS.asc`, the maintainer's signature of
 it with the key that signs the tags, says who published them. That matters most for archives built
-outside the workflow, which have no attestation, as in 2.2.1 to 2.4.0. The macOS binaries carry only
+outside the workflow, which have no attestation, as in 2.2.1 to 2.4.1. The macOS binaries carry only
 the linker's ad-hoc signature, and `sandy.exe` has no Authenticode signature; the workflow holds
 both steps, skipped until the certificates exist.
 

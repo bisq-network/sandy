@@ -1680,18 +1680,29 @@ mod tests {
         }
     }
 
-    /// The golden snapshot of the compiled programs. x86_64 only: arm64 has its own system
-    /// call numbers, so its snapshot would have to be written on an arm64 Linux host.
-    #[cfg(target_arch = "x86_64")]
+    /// The golden snapshot of the compiled programs, one per architecture: each has its own
+    /// system call numbers, so its file is written on a Linux host of that architecture.
     mod snapshot {
         use super::*;
 
         /// The pidfd of the program in the watcher's snapshot, which its rules compare against.
         const WATCHED_PROGRAM: i32 = 4;
 
+        /// The committed snapshot of this architecture and where it is.
+        #[cfg(target_arch = "x86_64")]
+        const COMMITTED: (&str, &str) = (
+            include_str!("../snapshots/x86_64.txt"),
+            "crates/sandy-linux/snapshots/x86_64.txt",
+        );
+        #[cfg(target_arch = "aarch64")]
+        const COMMITTED: (&str, &str) = (
+            include_str!("../snapshots/aarch64.txt"),
+            "crates/sandy-linux/snapshots/aarch64.txt",
+        );
+
         /// Repeated at the top of the snapshot file, so the file says what it is.
         const SNAPSHOT_HEADER: &str = "\
-# The compiled seccomp programs of sandy's configurations on x86_64, written by
+# The compiled seccomp programs of sandy's configurations on ARCH, written by
 # compiled_programs_match_the_snapshot in crates/sandy-linux/src/filter.rs.
 #
 # Every section names one program, how many instructions it has, a checksum of them, and the
@@ -1774,7 +1785,7 @@ mod tests {
             let relay = relay().unwrap();
             let factory = factory().unwrap();
             let broker = broker().unwrap();
-            let mut out = SNAPSHOT_HEADER.to_string();
+            let mut out = SNAPSHOT_HEADER.replacen("ARCH", std::env::consts::ARCH, 1);
             for (name, filters) in [
                 ("strict", &strict),
                 ("open", &open),
@@ -1814,7 +1825,7 @@ mod tests {
         /// its diff and check that every line that changed is one you meant to change.
         #[test]
         fn compiled_programs_match_the_snapshot() {
-            let expected = include_str!("../snapshots/x86_64.txt");
+            let (expected, file) = COMMITTED;
             let actual = snapshot();
             // Trailing whitespace only: an editor that adds or drops the last newline is no change.
             if actual.trim_end() == expected.trim_end() {
@@ -1830,9 +1841,9 @@ mod tests {
                 .expect("the texts differ, so one of their lines differs");
             let end = "<end of file>";
             panic!(
-                "the compiled programs differ from crates/sandy-linux/snapshots/x86_64.txt, from \
-                 line {}:\n  committed: {}\n  now:       {}\n\nWrite the text below to that file \
-                 and review its diff. Every difference must be one you meant to make.\n{actual}",
+                "the compiled programs differ from {file}, from line {}:\n  committed: {}\n  \
+                 now:       {}\n\nWrite the text below to that file and review its diff. Every \
+                 difference must be one you meant to make.\n{actual}",
                 index + 1,
                 committed.get(index).unwrap_or(&end),
                 now.get(index).unwrap_or(&end)

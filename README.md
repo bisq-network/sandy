@@ -16,7 +16,7 @@ sandy run \
   -- /srv/app/bin/server --port 8080
 ```
 
-Version 2.4.0. Policies use format `version = 1`.
+Version 2.4.1. Policies use format `version = 1`.
 
 ## Contents
 
@@ -89,11 +89,18 @@ the 2.2.1 release:
 | Target | Binary | Archive |
 |---|---|---|
 | `x86_64-unknown-linux-musl` (static PIE) | 1.6 MiB | 806 KiB |
-| `aarch64-unknown-linux-musl` (static, not position-independent) | 1.3 MiB | 744 KiB |
+| `aarch64-unknown-linux-musl` (static, not position-independent; see below) | 1.3 MiB | 744 KiB |
 | `aarch64-apple-darwin` | 963 KiB | 503 KiB |
 | `x86_64-apple-darwin` | 1.1 MiB | 563 KiB |
 | `x86_64-pc-windows-msvc` (static C runtime) | 1.2 MiB | 563 KiB |
 | `aarch64-pc-windows-msvc` (built, not tested) | 1015 KiB | 514 KiB |
+
+The arm64 Linux binary loads at the same address in every run, so its own code and data get no
+address randomization; its stack, heap and the program it starts still do. Rust 1.98 builds
+static executables for `aarch64-unknown-linux-musl` only that way: linking with `-pie` keeps the
+start file of a fixed address, which does not relocate the image, and such a binary crashes at
+once (measured on Debian 13 for arm64). The helpers that run sandy's code during a run, the
+relays, the egress broker and the watchers, are confined by Landlock and seccomp of their own.
 
 **Verifying a download.** `SHA256SUMS` in the release lists the SHA-256 sum of every archive,
 and `SHA256SUMS.asc` signs it with the project's OpenPGP key, the key that also signs the release
@@ -106,15 +113,15 @@ sha256sum --check --ignore-missing SHA256SUMS
 
 An archive that the release workflow built also carries a GitHub build provenance attestation,
 which names the workflow, the commit and the run that built it
-(`gh attestation verify sandy-2.4.0-x86_64-unknown-linux-musl.tar.gz --repo <owner>/sandy`). The
-archives of 2.2.1 to 2.4.0 were built outside the workflow, so they have none.
+(`gh attestation verify sandy-2.4.1-x86_64-unknown-linux-musl.tar.gz --repo <owner>/sandy`). The
+archives of 2.2.1 to 2.4.1 were built outside the workflow, so they have none.
 
 **Building a release binary again.** Every release binary is built with
 `scripts/release-build.sh TARGET` from a checkout of the release tag, so anyone can build it again
 and compare it with the binary in the archive:
 
 ```sh
-git checkout v2.4.0
+git checkout v2.4.1
 scripts/release-build.sh x86_64-unknown-linux-musl
 sha256sum target/x86_64-unknown-linux-musl/release/sandy
 ```
@@ -1258,15 +1265,16 @@ example, has no loader to check (`fedora-44-x86_64-unknown-linux-musl.txt`).
 ### The snapshot of the compiled seccomp filters
 
 `compiled_programs_match_the_snapshot` in `crates/sandy-linux/src/filter.rs` compares the
-compiled Linux BPF programs with `crates/sandy-linux/snapshots/x86_64.txt`. Each section of that
-file names one program, its instruction count, a checksum of its instructions, and the action it
+compiled Linux BPF programs with the snapshot of the architecture,
+`crates/sandy-linux/snapshots/x86_64.txt` or `aarch64.txt`. Each section of that file names one
+program, its instruction count, a checksum of its instructions, and the action it
 returns for every system call number. A change to a rule, to the reviewed system call table or to
 seccompiler's code generation makes the test fail.
 
 Update it deliberately. The failure prints the new text; write it to the file, then read the diff
-of the file and check that every line that changed is a line you meant to change. The snapshot is
-x86_64's, because arm64 has its own system call numbers and its file would have to be written on
-an arm64 Linux host.
+of the file and check that every line that changed is a line you meant to change. Each
+architecture has its own system call numbers, so its file is written on a Linux host of that
+architecture.
 
 ### The supply chain checks
 
