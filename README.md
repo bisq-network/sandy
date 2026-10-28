@@ -139,7 +139,9 @@ linker and of the Microsoft linker, which the release notes name. The script ref
 that rustup did not install from the pinned archives (see "The supply chain checks" below). The
 `reproducible` job of the release workflow builds every target twice, in two directories, and
 compares the binaries; both builds run on one runner, so the job does not show a dependence on
-the host.
+the host. The `verify-release` workflow, started by hand with the tag of a published release,
+builds every binary of the release again on runners like the hosts that built it, and compares
+each archive with the binary built again and the files of the tag.
 
 The script links both Linux binaries as static position-independent executables, which the
 kernel loads at a random address. rustc does that by itself for `x86_64-unknown-linux-musl`. For
@@ -1382,10 +1384,14 @@ runner's list. Every job that builds checks the toolchain first, with
 `scripts/verify-toolchain.sh`. The `audit` workflow runs `cargo deny` and
 `scripts/check-audits.sh`, weekly as well, because an advisory can appear, and a trusted
 publisher entry can end, without a push. The `release` workflow builds archives for Linux, macOS
-and Windows on x86_64 and arm64 when a tag `v<version>` is pushed, starts each binary that its
-runner can run (`sandy --version`), attests their build provenance, verifies the attestations,
+and Windows on x86_64 and arm64 when a tag `v<version>` is pushed, both of a platform on one
+runner of the host that built the earlier releases, names the linker of the macOS and Windows
+binaries, starts each binary that its runner can run (`sandy --version`) and the arm64 Linux
+binary on an arm64 runner, attests their build provenance, verifies the attestations,
 and creates a draft release with `SHA256SUMS`. It also builds one target twice from two
-directories and compares the binaries. The arm64 Windows build is compiled but not tested.
+directories and compares the binaries. The arm64 Windows build is compiled but not tested. The
+`verify-release` workflow builds a published release again and compares it with its archives
+(see "Building a release binary again").
 
 CI has not run since the 1.x releases, and the releases with binaries, from 2.2.1 on, were
 built by hand; each release's notes say where its tests ran and how its binaries were built.

@@ -1274,7 +1274,10 @@ linker write no time stamp (`/Brepro`). A Linux binary then depends only on the 
 toolchain; a macOS or Windows binary also on the version of the platform's linker, which the
 release notes name. The archives are packed with sorted entries, the time of the commit and no
 owner. A second job builds every target in two directories and compares the binaries, so a change
-that ties the output to the machine that built it is noticed.
+that ties the output to the machine that built it is noticed. The `verify-release` workflow, run
+by hand, checks a published release, also one built outside the workflow: it builds every binary
+again from the tag, on runners like the hosts that built the release, and compares each archive
+with that binary and the files of the tag.
 
 An archive that the workflow built gets a GitHub build provenance attestation, which names the
 workflow, the commit and the run that produced it. The job verifies the attestations before it
