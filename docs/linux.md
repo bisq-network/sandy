@@ -699,9 +699,10 @@ exception of "Metadata through open files" does not apply in the view
   still takes writes to `/dev/null`. The system set grants all of them but `full`, which the view
   shows but Landlock denies. With a terminal on a standard stream, `/dev` also gets `tty` and a
   devpts instance of its own at `/dev/pts` (`newinstance,ptmxmode=0666,mode=620`), with
-  `/dev/ptmx` a link to `pts/ptmx`, or the host's node there when the policy grants
-  `/dev/ptmx`. Opening `/dev/tty` still needs a grant (`--read-write /dev/tty`), as without the
-  view (`a_terminal_works_when_one_is_attached`). Without a terminal there is no `/dev/tty`
+  `/dev/ptmx` a link to `pts/ptmx`, or the host's `/dev/ptmx` there when the policy grants it.
+  A policy that grants `/dev/pts` gets the host's devpts there, mounted over the view's own.
+  Opening `/dev/tty` still needs a grant (`--read-write /dev/tty`), as without the view
+  (`a_terminal_works_when_one_is_attached`). Without a terminal there is no `/dev/tty`
   (`dev_holds_the_minimal_devices`). Other devices are bound only when the policy grants them.
 - **`/proc`** exists only when the policy grants a path of it, and holds what the policy grants,
   bound from the host's `/proc` (measured: binds of procfs and sysfs files and directories work in
@@ -744,11 +745,15 @@ exception of "Metadata through open files" does not apply in the view
   which a writable path cannot be.
 - `/proc` is read-only, and holds only the granted paths.
 - A program started in a directory the view does not hold starts in `/`.
-- The program cannot create a pseudo-terminal, also when the policy grants `/dev/ptmx` and
-  `/dev/pts`: the host's `ptmx`, bound alone, finds no devpts next to it (`ENOENT`), and the
-  devpts instance of the view lies outside every Landlock rule
-  (`a_pty_grant_starts_in_the_view_and_makes_no_pty`). Terminal emulators, `script`, `expect`
-  and programs that run others in a pseudo-terminal need `view = "all"`.
+- Where `/dev/ptmx` is a device node of its own, as on most hosts, the program cannot create a
+  pseudo-terminal, also when the policy grants `/dev/ptmx` and `/dev/pts`: the host's `ptmx`,
+  bound alone, finds no devpts next to it (`ENOENT`), and the devpts instance of the view lies
+  outside every Landlock rule. Terminal emulators, `script`, `expect` and programs that run
+  others in a pseudo-terminal need `view = "all"` there. Where `/dev/ptmx` is the `ptmx` of the
+  devpts at `/dev/pts`, a bind mount or a link (see "Pseudo-terminals"), the same grants make
+  one in the host's devpts, as without the view
+  (`a_pty_grant_in_the_view_makes_a_pty_only_where_ptmx_is_in_the_devpts`,
+  `a_pty_grant_makes_a_pseudo_terminal_in_every_ptmx_layout`).
 - `ttyname` of a terminal on a standard stream finds no name: the name the host gives it lies in
   the host's devpts, and the view's `/dev/pts` is another instance.
 - `/dev/fd`, `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and `/dev/shm` exist only when granted.
@@ -1469,6 +1474,47 @@ kernel; no test host gives an unprivileged process a virtual console, so the eff
 console is taken from the kernel's console code and was not measured. Cost: `loadkeys`, `setfont`,
 `chvt`, `kbd_mode -s` and `setleds` fail with `EPERM` on a text console; the bash, Python, git,
 curl, nano, less, `stty` and `reset` runs of the measurement used none of these calls.
+
+### Pseudo-terminals
+
+A program that makes a pseudo-terminal, as a terminal emulator, `script` and `expect` do, needs
+`--read-write /dev/ptmx --read-write /dev/pts`. glibc's `openpty` opens the master through
+`/dev/ptmx` and the slave with `TIOCGPTPEER`, which the kernel opens through the devpts mount
+that holds the master; Landlock checks both opens. Hosts lay the two paths out in one of three
+ways, and the same grants work in each, also with `ip = "private"` and
+`children = "contained"` (`a_pty_grant_makes_a_pseudo_terminal_in_every_ptmx_layout`, which
+builds the other two layouts in a mount namespace):
+
+- `/dev/ptmx` a device node of its own on the devtmpfs at `/dev`, as on most hosts. The kernel
+  finds the devpts in the `pts` directory beside it.
+- `/dev/ptmx` a bind mount of `/dev/pts/ptmx` on a tmpfs at `/dev`, as in LXC containers.
+- `/dev/ptmx` a symbolic link to `pts/ptmx`, as the container runtimes runc and crun make it for
+  Docker and Podman (measured in Docker).
+
+In the last two `/dev/ptmx` is the `ptmx` of the devpts at `/dev/pts`, so it lies inside the
+writable path `/dev/pts`, which rule 3 of README.md refuses for other file systems. A devpts may
+hold policy paths: only the kernel adds and removes its entries, as pseudo-terminals open and
+close, and its directory has no operation that creates, links, renames or removes a name
+(measured on Linux 7.2 as the owner of a devpts instance with every capability of its user
+namespace: `mkdir`, `symlink`, `link`, `mknod`, `mkfifo`, `rename` and `unlink` fail with `EPERM`,
+creating a file with `EACCES`). The program cannot replace anything there, which is what the rule
+guards against. sandy knows a devpts by `statfs` (`on_devpts` in `resolve.rs`), and still
+refuses an executable path inside a writable devpts (rule 2 of README.md).
+
+Neither grant alone is enough in every layout. Landlock follows the path a call takes, mounts
+included: a bind mount at `/dev/ptmx` is reached through `/dev`, not through `/dev/pts`, so
+`/dev/pts` alone denies opening it, while a link leads into `/dev/pts`, where that grant covers
+it. `/dev/ptmx` alone opens the master but not the slave (`TIOCGPTPEER` gives `EACCES`).
+
+A writable `/dev/pts` reaches the terminals of the user there too, not only the ones the program
+makes: it can open a terminal of the user by its path, write to it and read what is typed into
+it (measured with the terminal sandy was started in: the opens for reading and for writing and
+the write succeed). A read grant of `/dev/pts`, or of `/dev` or `/` above it, is enough to read
+what is typed (measured: with `--read /dev/pts` and with `--read /dev`, `head` in the sandbox read
+a line typed into another pseudo-terminal of the user; without either it cannot open it). The
+filter still denies `TIOCSTI`. `sandy check` warns about every policy path that holds `/dev/pts`.
+Grant it only to a program that runs others in pseudo-terminals. With `view = "policy"` a program
+gets a pseudo-terminal only in the last two layouts (see "File system view").
 
 ### Access mode 3
 
@@ -2237,7 +2283,9 @@ rights of both, so the resolver compares files before it builds the rules.
   its own device number, so two subvolumes are compared as two file systems, as the kernel
   reports them. sandy picks the mount by the longest mount point that is a prefix of the path
   and lies on the same file system; a mount that a later mount over one of its parents hides is
-  the one case where that can pick the wrong one.
+  the one case where that can pick the wrong one. A bind mount of `/dev/pts/ptmx` at
+  `/dev/ptmx` lies inside `/dev/pts` this way, which a writable devpts allows (see
+  "Pseudo-terminals").
 - **Hard links.** `read_exec` files, the program file, sandy's own executable and the policy
   file must have no second name inside a writable path. sandy checks `st_nlink` first and then
   walks the writable trees, which costs one `lstat` per file there; it walks the `read_exec`

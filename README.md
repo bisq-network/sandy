@@ -16,7 +16,7 @@ sandy run \
   -- /srv/app/bin/server --port 8080
 ```
 
-Version 2.4.1. Policies use format `version = 1`.
+Version 2.5.0. Policies use format `version = 1`.
 
 ## Contents
 
@@ -98,8 +98,8 @@ the 2.2.1 release:
 The arm64 Linux binaries up to 2.4.1 load at the same address in every run, so their own code
 and data get no address randomization; their stack, heap and the program they start still do.
 The helpers that run sandy's code during a run, the relays, the egress broker and the watchers,
-are confined by Landlock and seccomp of their own. The current `scripts/release-build.sh` links
-the arm64 binary as a static PIE like the x86_64 one (see "Building a release binary again").
+are confined by Landlock and seccomp of their own. From 2.5.0 on, the arm64 binary is a static
+PIE like the x86_64 one (see "Building a release binary again").
 
 **Verifying a download.** `SHA256SUMS` in the release lists the SHA-256 sum of every archive,
 and `SHA256SUMS.asc` signs it with the project's OpenPGP key, the key that also signs the release
@@ -112,15 +112,15 @@ sha256sum --check --ignore-missing SHA256SUMS
 
 An archive that the release workflow built also carries a GitHub build provenance attestation,
 which names the workflow, the commit and the run that built it
-(`gh attestation verify sandy-2.4.1-x86_64-unknown-linux-musl.tar.gz --repo <owner>/sandy`). The
-archives of 2.2.1 to 2.4.1 were built outside the workflow, so they have none.
+(`gh attestation verify sandy-2.5.0-x86_64-unknown-linux-musl.tar.gz --repo <owner>/sandy`). The
+archives of 2.2.1 to 2.5.0 were built outside the workflow, so they have none.
 
 **Building a release binary again.** Every release binary is built with
 `scripts/release-build.sh TARGET` from a checkout of the release tag, so anyone can build it again
 and compare it with the binary in the archive:
 
 ```sh
-git checkout v2.4.1
+git checkout v2.5.0
 scripts/release-build.sh x86_64-unknown-linux-musl
 sha256sum target/x86_64-unknown-linux-musl/release/sandy
 ```
@@ -130,7 +130,7 @@ of the checkout and of `CARGO_HOME`, and the time of the build. It cannot remove
 runs the toolchain, the `host:` line of `rustc -vV`: cargo mixes the host into the metadata of
 the build scripts and procedural macros and passes that on to every crate that uses them. In the
 Linux binaries this changes the order of the functions, though not their size: the Linux
-binaries of every release from 2.2.1 to 2.4.1 match a build on `x86_64-unknown-linux-gnu`, and
+binaries of every release from 2.2.1 to 2.5.0 match a build on `x86_64-unknown-linux-gnu`, and
 a build on arm64 Linux gives other bytes. So a binary built again matches only on a host of the
 triple that built the release. Apart from the host, the Linux binaries are linked with the linker
 of the Rust toolchain, so they depend only on the source and on the toolchain that
@@ -634,7 +634,10 @@ about 600 on a Mac with 16 addresses. A run beyond the limit fails before the pr
    reached through a symbolic link (on Windows also a junction) inside one. The program could
    replace it with a symbolic link, and the next start would follow the link. sandy's own
    executable and the policy file get the same check: a `read_write` path must not contain
-   them, lead to them through a link or an alias, or hold a second name of them.
+   them, lead to them through a link or an alias, or hold a second name of them. On Linux a
+   writable devpts (`/dev/pts`) may hold policy paths: only the kernel adds and removes its
+   entries, so nothing there can be replaced. A pseudo-terminal needs `/dev/ptmx` and
+   `/dev/pts`, and on some hosts `/dev/ptmx` is the `ptmx` of `/dev/pts` itself.
 4. **The program file** gets read and execute access automatically. It must not lie inside a
    `read_write` path, and must have no second name in one.
 5. **The minimal system set** (`system = "minimal"`) adds, read-only, what programs need to start:
@@ -1018,6 +1021,12 @@ change. A policy without levels has one entry in `levels`, named `base`.
   warns about what the view still shows: the host's file systems through `statfs`, the
   directories above granted paths, link counts, and with `/proc` the mount tables, also the
   host's ([docs/linux.md](docs/linux.md), "File system view").
+- **Pseudo-terminals.** A program that makes them, such as `script` or `expect`, needs
+  `--read-write /dev/ptmx --read-write /dev/pts`, which also lets it open your terminals in
+  `/dev/pts`, read what you type in them and write to them; a read grant of `/dev/pts` or `/dev`
+  lets it read what you type. `sandy check` warns about both. With `view = "policy"` it gets one
+  only where `/dev/ptmx` is a bind mount of or a link to `/dev/pts/ptmx`
+  ([docs/linux.md](docs/linux.md), "Pseudo-terminals").
 - **Name resolution across network changes.** A Landlock rule binds a file, so a file the
   system replaces by rename is lost to a program that is already running. With `--ip all` or
   `--ip client`, sandy grants systemd-resolved's directory, so name resolution keeps working when

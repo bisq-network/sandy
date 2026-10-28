@@ -452,6 +452,24 @@ impl ResolvedPolicy {
                 }
             }
         }
+        // The terminals of the user's sessions are in the devpts at /dev/pts. A grant of one
+        // terminal or of /dev/ptmx names only that file.
+        let pts = Path::new("/dev/pts");
+        if on_devpts(pts) {
+            for rule in self.paths.iter().filter(|rule| pts.starts_with(&rule.path)) {
+                let write = if rule.access == PathAccess::ReadWrite {
+                    " and write to them"
+                } else {
+                    ""
+                };
+                warnings.push(format!(
+                    "the path {} holds /dev/pts, so the program can open the other terminals this \
+                     user has open, read what is typed in them{write} (docs/linux.md, \
+                     \"Pseudo-terminals\")",
+                    rule.path.display()
+                ));
+            }
+        }
         warnings
     }
 
@@ -1037,6 +1055,47 @@ fn same_physical_location(_inner: &Path, _outer: &Path, _mounts: &Mounts) -> boo
     false
 }
 
+/// `DEVPTS_SUPER_MAGIC` of linux/magic.h. The magic numbers have 32 bits; `f_type` is wider and
+/// signed or not depending on the C library.
+#[cfg(target_os = "linux")]
+const DEVPTS_SUPER_MAGIC: u32 = 0x1cd1;
+
+/// Whether `path` lies on a devpts, the file system of the pseudo-terminals. No process can
+/// create, rename, link or remove a name there, so nothing there can be replaced: only the kernel
+/// adds and removes its entries, as pseudo-terminals open and close, and its directory has no
+/// operation that changes a name, not even for root. It holds the `ptmx` that `/dev/ptmx` is a
+/// bind mount of or a link to on some hosts, as in LXC and in containers, and the terminals of
+/// the user.
+#[cfg(target_os = "linux")]
+fn on_devpts(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(name) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut status = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: statfs takes a NUL-terminated path and fills the struct it points to.
+    if unsafe { libc::statfs(name.as_ptr(), status.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: statfs succeeded, so it filled the struct.
+    let status = unsafe { status.assume_init() };
+    status.f_type as u32 == DEVPTS_SUPER_MAGIC
+}
+
+#[cfg(not(target_os = "linux"))]
+fn on_devpts(_path: &Path) -> bool {
+    false
+}
+
+/// The writable paths in which the program could replace a policy path or an entry on the way to
+/// one, which rule 4 guards against: all but those on a devpts, whose names no process can change.
+fn replaceable(rules: &[PathRule]) -> impl Iterator<Item = &PathRule> {
+    rules
+        .iter()
+        .filter(|rule| rule.access == PathAccess::ReadWrite && !on_devpts(&rule.path))
+}
+
 /// How a writable and an executable path lead to one file, for the error message: both lead to
 /// the same place in the file system, through nesting or an alias of a directory.
 const OVERLAPS: &str = "overlaps";
@@ -1087,10 +1146,10 @@ fn check_writable_not_executable(rules: &[PathRule], mounts: &Mounts) -> Result<
 
 /// sandy resolves symbolic links in policy paths at every start. A policy path inside a writable
 /// path could be replaced with a symbolic link by the target, and the next start would then grant
-/// access to wherever that link points.
+/// access to wherever that link points. A writable path whose names no process can change
+/// (`on_devpts`) may hold policy paths.
 fn check_nothing_inside_writable(rules: &[PathRule], mounts: &Mounts) -> Result<(), PolicyError> {
-    let writable = rules.iter().filter(|r| r.access == PathAccess::ReadWrite);
-    for w in writable {
+    for w in replaceable(rules) {
         let nested = rules
             .iter()
             .find(|r| r.path != w.path && is_within(&r.path, &w.path, mounts));
@@ -1112,8 +1171,7 @@ fn check_not_resolved_through_writable(
     traversals: &[Traversal],
     mounts: &Mounts,
 ) -> Result<(), PolicyError> {
-    let writable = rules.iter().filter(|r| r.access == PathAccess::ReadWrite);
-    for w in writable {
+    for w in replaceable(rules) {
         for traversal in traversals {
             let inside = traversal
                 .entries
@@ -2893,6 +2951,62 @@ mod tests {
                 == Path::new("/")),
             Some(PathBuf::from("/odd name/alias/t"))
         );
+    }
+
+    /// No process can create, rename, link or remove a name in a devpts, so the program cannot
+    /// replace a path there, and rule 4 allows a policy path inside a writable devpts, also one
+    /// resolved through a link into it, as `/dev/ptmx` is in a container. A directory of an
+    /// ordinary file system stays refused (`rejects_paths_inside_a_writable_path`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accepts_paths_inside_a_writable_devpts() {
+        let (pts, ptmx) = (Path::new("/dev/pts"), Path::new("/dev/pts/ptmx"));
+        assert!(on_devpts(pts), "no devpts at /dev/pts on this host");
+        let dir = temp_dir();
+        assert!(!on_devpts(&dir));
+        let link = dir.join("ptmx");
+        std::os::unix::fs::symlink(ptmx, &link).unwrap();
+        for policy in [
+            policy_with(&[], &[], &[pts, ptmx]),
+            policy_with(&[&link], &[], &[pts]),
+        ] {
+            let resolved = ResolvedPolicy::resolve(&policy, None);
+            assert!(resolved.is_ok(), "{resolved:?}");
+        }
+    }
+
+    /// A grant of /dev/pts or of a directory above it reaches the user's other terminals, which
+    /// check names; a grant of one terminal or of the ptmx names only that file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn warns_about_a_grant_that_reaches_the_terminals() {
+        let (dev, pts, ptmx) = (
+            Path::new("/dev"),
+            Path::new("/dev/pts"),
+            Path::new("/dev/pts/ptmx"),
+        );
+        let warnings = |policy: &Policy| {
+            ResolvedPolicy::resolve(policy, None)
+                .unwrap()
+                .warnings(None)
+                .into_iter()
+                .filter(|warning| warning.contains("other terminals this user has open"))
+                .collect::<Vec<_>>()
+        };
+        let read = warnings(&policy_with(&[pts], &[], &[]));
+        assert!(read.len() == 1 && !read[0].contains("write"), "{read:?}");
+        let parent = warnings(&policy_with(&[dev], &[], &[]));
+        assert!(
+            parent.len() == 1 && parent[0].contains("/dev "),
+            "{parent:?}"
+        );
+        let written = warnings(&policy_with(&[], &[], &[pts]));
+        assert!(
+            written.len() == 1 && written[0].contains("write to them"),
+            "{written:?}"
+        );
+        assert!(warnings(&policy_with(&[], &[], &[ptmx])).is_empty());
+        assert!(warnings(&policy_with(&[], &[], &[&temp_dir()])).is_empty());
     }
 
     #[test]

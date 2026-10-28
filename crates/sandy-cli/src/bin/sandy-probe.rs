@@ -723,6 +723,7 @@ mod linux {
     pub const ACTIONS: &[&str] = &[
         "open",
         "open-ioctl-only",
+        "openpty",
         "fchmod-readonly",
         "status-field",
         "read-fd",
@@ -812,6 +813,7 @@ mod linux {
             "enable-verity" => enable_verity(target),
             "open" => fs::File::open(target).map(|_| String::new()),
             "open-ioctl-only" => open_ioctl_only(target),
+            "openpty" => openpty(target),
             // Opens `target` for reading and writing in place of standard input, so that the
             // actions that take descriptor 0 act on it.
             "open-stdin" => {
@@ -1466,6 +1468,37 @@ mod linux {
         let fd = check(unsafe { libc::open(path.as_ptr(), IOCTL_ONLY | libc::O_CLOEXEC) })?;
         close(fd);
         Ok(String::new())
+    }
+
+    /// Makes a pseudo-terminal as glibc's `openpty` does, with `target` as the `ptmx`: opens the
+    /// master, unlocks it and opens the slave with `TIOCGPTPEER`, which the kernel opens through
+    /// the devpts mount of the master, as a path would be. A failure names its step.
+    fn openpty(target: &str) -> io::Result<String> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let step = |name: &str, result: libc::c_int| {
+            check(result).map_err(|error| io::Error::new(error.kind(), format!("{name}: {error}")))
+        };
+        let master = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(target)?;
+        let unlock: libc::c_int = 0;
+        // SAFETY: TIOCSPTLCK reads an int through the pointer.
+        let unlocked = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSPTLCK, &unlock) };
+        step("TIOCSPTLCK", unlocked)?;
+        let mut number: libc::c_uint = 0;
+        // SAFETY: TIOCGPTN writes an unsigned int through the pointer.
+        let named = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGPTN, &mut number) };
+        step("TIOCGPTN", named)?;
+        let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+        // SAFETY: TIOCGPTPEER takes open flags and returns a new descriptor.
+        let peer = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGPTPEER, flags) };
+        // SAFETY: the descriptor was just returned and is owned here.
+        drop(unsafe { OwnedFd::from_raw_fd(step("TIOCGPTPEER", peer)?) });
+        Ok(format!("pts {number}"))
     }
 
     /// Opens with openat2, the call GNU tar uses for the directories of an archive.

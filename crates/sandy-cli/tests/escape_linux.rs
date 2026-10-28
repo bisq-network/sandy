@@ -2219,6 +2219,71 @@ fn refuses_a_loader_in_an_alias_of_a_writable_path() {
     assert_eq!(codes[0], EXIT_FAILURE, "{codes:?}");
 }
 
+/// A policy that grants `/dev/ptmx` and `/dev/pts` makes a pseudo-terminal in each layout a host
+/// gives them: `/dev/ptmx` a device node of its own (most hosts), a bind mount of
+/// `/dev/pts/ptmx` (LXC) and a link to `pts/ptmx` (container runtimes). In the last two
+/// `/dev/ptmx` lies inside the writable devpts, which README rule 3 allows because no process can
+/// change a name there, and the view makes one too (docs/linux.md, "Pseudo-terminals"). Each
+/// layout is built in a mount namespace with a devpts instance of its own, mounted as the runtimes
+/// mount it. Control: with `/dev/pts` alone the bound `ptmx` is denied, because Landlock follows
+/// its path through `/dev`, while the link leads into `/dev/pts`.
+#[test]
+fn a_pty_grant_makes_a_pseudo_terminal_in_every_ptmx_layout() {
+    if open_pty().is_none() {
+        return skip("pty", "cannot open a pseudo-terminal");
+    }
+    let actions = [("openpty", "/dev/ptmx")];
+    probe_inside(
+        &args(&["--read-write", "/dev/ptmx", "--read-write", "/dev/pts"]),
+        &actions,
+    )[0]
+    .assert_ok();
+
+    let fixture = Fixture::new("ptmx-layouts");
+    fs::create_dir_all(fixture.path("dev")).unwrap();
+    let dev = fixture.arg("dev");
+    let devpts = "mount -t devpts -o newinstance,ptmxmode=0666,mode=620 devpts";
+    let pty = |options: &str| {
+        format!(
+            "{} run {options} -- {} openpty /dev/ptmx | grep -q \"^openpty./dev/ptmx.ok\"",
+            sandy_path(),
+            probe_path()
+        )
+    };
+    let bind = format!(
+        "{devpts} /dev/pts || exit 97\n\
+         mount --bind /dev/pts/ptmx /dev/ptmx || exit 97\n"
+    );
+    let link = format!(
+        "mount -t tmpfs -o mode=755 tmpfs {dev} || exit 97\n\
+         for node in null zero full random urandom; do\n\
+           : > {dev}/$node && mount --bind /dev/$node {dev}/$node || exit 97\n\
+         done\n\
+         mkdir {dev}/pts && {devpts} {dev}/pts || exit 97\n\
+         ln -s pts/ptmx {dev}/ptmx && mount --move {dev} /dev || exit 97\n"
+    );
+    for (layout, setup, pts_alone) in [("bind", bind, 1), ("link", link, 0)] {
+        let script = format!(
+            "{setup}exec unshare --user --map-user=1000 --map-group=1000 sh -c '\
+               {}; echo both=$?; {}; echo pts=$?; \
+               {} check --view policy >/dev/null; echo viewable=$?; {}; echo view=$?'\n",
+            pty("--read-write /dev/ptmx --read-write /dev/pts"),
+            pty("--read-write /dev/pts"),
+            sandy_path(),
+            pty("--view policy --read-write /dev/ptmx --read-write /dev/pts"),
+        );
+        let names = ["both", "pts", "viewable", "view"];
+        let Some(codes) = namespace_exit_codes(&script, &names) else {
+            return;
+        };
+        assert_eq!(codes[..2], [0, pts_alone], "{layout}: {codes:?}");
+        if codes[2] != 0 {
+            return skip("user-namespaces", "this host gives sandy no view");
+        }
+        assert_eq!(codes[3], 0, "{layout}: {codes:?}");
+    }
+}
+
 /// Runs the probe in the sandbox under `sandy-abi-cap`, so that sandy sees Landlock ABI `abi`.
 fn probe_capped(
     cap: &str,

@@ -125,7 +125,10 @@ Rules:
    link and widen its access at the next start. For the same reason the integrator must keep the
    parent directories of policy paths out of the program's reach. Rules 3 and 4 compare files,
    not only paths, so one directory reachable under two paths counts as one (see "Links and file
-   identity").
+   identity"). The exception is a writable path on a file system where no process can create,
+   link, rename or remove a name, so nothing there can be replaced: on Linux a devpts, which
+   holds `/dev/ptmx` on hosts where that is a bind mount of or a link to `/dev/pts/ptmx`
+   (docs/linux.md, "Pseudo-terminals"). Rule 3 still applies there.
 5. The program file itself gets read and execute access automatically.
 6. `system = "minimal"` adds a backend-defined read-only set of system paths that programs need to
    start: shared libraries, loader configuration, time zone data, random devices. Each backend
@@ -1280,7 +1283,7 @@ checks a download with `gh attestation verify <archive> --repo <owner>/<repo>`.
 
 `SHA256SUMS` says that the archives belong together; `SHA256SUMS.asc`, the maintainer's signature of
 it with the key that signs the tags, says who published them. That matters most for archives built
-outside the workflow, which have no attestation, as in 2.2.1 to 2.4.1. The macOS binaries carry only
+outside the workflow, which have no attestation, as in 2.2.1 to 2.5.0. The macOS binaries carry only
 the linker's ad-hoc signature, and `sandy.exe` has no Authenticode signature; the workflow holds
 both steps, skipped until the certificates exist.
 

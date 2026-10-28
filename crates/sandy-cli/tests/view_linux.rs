@@ -7,7 +7,7 @@ mod common;
 
 use std::fs;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -294,11 +294,14 @@ fn a_terminal_works_when_one_is_attached() {
 }
 
 /// A policy that grants `/dev/ptmx` and `/dev/pts` starts in the view, with a terminal as without
-/// one, but makes no pseudo-terminal there: the host's `ptmx` bound alone finds no devpts next to
-/// it, and the private devpts of the view is outside every Landlock rule (docs/linux.md, "File
-/// system view"). Control: without the view the same grants make one.
+/// one. Where `/dev/ptmx` is a device node of its own it makes no pseudo-terminal there: the
+/// host's `ptmx` bound alone finds no devpts next to it, and the private devpts of the view is
+/// outside every Landlock rule. Where `/dev/ptmx` is the `ptmx` of the devpts at `/dev/pts`, a
+/// bind mount or a link, the view holds that devpts and makes one (docs/linux.md, "File system
+/// view"); `a_pty_grant_makes_a_pseudo_terminal_in_every_ptmx_layout` builds both layouts on any
+/// host. Control: without the view the same grants make one.
 #[test]
-fn a_pty_grant_starts_in_the_view_and_makes_no_pty() {
+fn a_pty_grant_in_the_view_makes_a_pty_only_where_ptmx_is_in_the_devpts() {
     if !view_works() {
         return;
     }
@@ -306,21 +309,26 @@ fn a_pty_grant_starts_in_the_view_and_makes_no_pty() {
         return skip("pty", "cannot open a pseudo-terminal");
     };
     let grants = args(&["--read-write", "/dev/ptmx", "--read-write", "/dev/pts"]);
-    let actions = [("open", "/dev/ptmx")];
+    let actions = [("openpty", "/dev/ptmx")];
     probe_inside(&grants, &actions)[0].assert_ok();
+    let identity = |path: &str| fs::metadata(path).ok().map(|file| (file.dev(), file.ino()));
+    let in_devpts =
+        identity("/dev/ptmx").is_some() && identity("/dev/ptmx") == identity("/dev/pts/ptmx");
+    let check = |line: &ProbeLine| {
+        if in_devpts {
+            line.assert_ok();
+        } else {
+            assert!(has_errno(line, libc::ENOENT), "{line:?}");
+        }
+    };
     let view = with_view(grants);
-    let without_terminal = probe_inside(&view, &actions);
-    assert!(
-        has_errno(&without_terminal[0], libc::ENOENT),
-        "{without_terminal:?}"
-    );
+    check(&probe_inside(&view, &actions)[0]);
     let mut command = Command::new(sandy_path());
     command.args(run_args(&view, &actions));
     with_terminal(&pty)(&mut command);
     let output = command.stderr(Stdio::piped()).output().unwrap();
     assert!(output.status.success(), "{output:?}");
-    let lines = parse(&output);
-    assert!(has_errno(&lines[0], libc::ENOENT), "{lines:?}");
+    check(&parse(&output)[0]);
 }
 
 /// `ip = "client"` keeps the resolver configuration of the system set: `/etc/resolv.conf` is
