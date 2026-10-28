@@ -51,6 +51,11 @@ jobs:
       # The cargo option for an entry that names a target, else nothing. CARGO_BUILD_TARGET
       # would not do: cargo refuses it empty.
       TARGET_OPTION: ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+      # The arm64 Linux release binary is a static PIE that scripts/release-build.sh links
+      # through scripts/link-static-pie.sh. Only a build for that target reads these two, so its
+      # entry links every binary the same way, and the suite runs code linked as the release.
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: ${{ github.workspace }}/scripts/link-static-pie.sh
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C linker-flavor=ld.lld
     steps:
       # The token of the job stays out of .git/config, where the build scripts of the
       # dependencies could read it: no step here pushes or fetches.

@@ -33,6 +33,11 @@ if command -v cygpath > /dev/null 2>&1; then
 fi
 flags="--remap-path-prefix=$root=/sandy --remap-path-prefix=$cargo_home=/cargo"
 case "$target" in
+  aarch64-unknown-linux-musl)
+    # rust-lld as below, through a script that links a static position-independent executable,
+    # which rustc links by itself only for x86_64 (see the script).
+    flags="$flags -C linker=$root/scripts/link-static-pie.sh -C linker-flavor=ld.lld"
+    ;;
   *-linux-musl)
     # The linker of the Rust toolchain instead of the host's cc, whose version would change the
     # binary. The musl targets link their C runtime from the toolchain too.

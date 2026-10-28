@@ -89,18 +89,17 @@ the 2.2.1 release:
 | Target | Binary | Archive |
 |---|---|---|
 | `x86_64-unknown-linux-musl` (static PIE) | 1.6 MiB | 806 KiB |
-| `aarch64-unknown-linux-musl` (static, not position-independent; see below) | 1.3 MiB | 744 KiB |
+| `aarch64-unknown-linux-musl` (static; see below) | 1.3 MiB | 744 KiB |
 | `aarch64-apple-darwin` | 963 KiB | 503 KiB |
 | `x86_64-apple-darwin` | 1.1 MiB | 563 KiB |
 | `x86_64-pc-windows-msvc` (static C runtime) | 1.2 MiB | 563 KiB |
 | `aarch64-pc-windows-msvc` (built, not tested) | 1015 KiB | 514 KiB |
 
-The arm64 Linux binary loads at the same address in every run, so its own code and data get no
-address randomization; its stack, heap and the program it starts still do. Rust 1.98 builds
-static executables for `aarch64-unknown-linux-musl` only that way: linking with `-pie` keeps the
-start file of a fixed address, which does not relocate the image, and such a binary crashes at
-once (measured on Debian 13 for arm64). The helpers that run sandy's code during a run, the
-relays, the egress broker and the watchers, are confined by Landlock and seccomp of their own.
+The arm64 Linux binaries up to 2.4.1 load at the same address in every run, so their own code
+and data get no address randomization; their stack, heap and the program they start still do.
+The helpers that run sandy's code during a run, the relays, the egress broker and the watchers,
+are confined by Landlock and seccomp of their own. The current `scripts/release-build.sh` links
+the arm64 binary as a static PIE like the x86_64 one (see "Building a release binary again").
 
 **Verifying a download.** `SHA256SUMS` in the release lists the SHA-256 sum of every archive,
 and `SHA256SUMS.asc` signs it with the project's OpenPGP key, the key that also signs the release
@@ -141,6 +140,14 @@ that rustup did not install from the pinned archives (see "The supply chain chec
 `reproducible` job of the release workflow builds every target twice, in two directories, and
 compares the binaries; both builds run on one runner, so the job does not show a dependence on
 the host.
+
+The script links both Linux binaries as static position-independent executables, which the
+kernel loads at a random address. rustc does that by itself for `x86_64-unknown-linux-musl`. For
+`aarch64-unknown-linux-musl` it links a fixed address, and adding `-pie` alone does not help: the
+link keeps `crt1.o`, the start file of a fixed address, which does not relocate the image, and
+such a binary crashes at once (measured on Debian 13 for arm64). So the script links that binary
+through `scripts/link-static-pie.sh`, which makes rustc's link the same as for x86_64, with
+`rcrt1.o`, the start file of a static PIE, which relocates the image before musl starts.
 
 The macOS binaries are not signed or notarized, and `sandy.exe` has no Authenticode signature.
 macOS refuses a copy that a browser downloaded, because it is not notarized, and SmartScreen
@@ -1359,15 +1366,17 @@ Write the sum only after that.
 The tests run on Ubuntu 22.04 and 24.04 (x86_64) and 24.04 (arm64), macOS 15, and Windows Server
 2022 and 2025. On Ubuntu 24.04 they run a second time for the musl target of the Linux release
 on that architecture, because musl and glibc differ in constants that sandy builds its filters
-from. Each runner names the features it must be able to check and, on Linux, the lowest
-Landlock ABI it must report; after the suite, CI compares the skips with the runner's list. Every
-job that builds checks the toolchain first, with `scripts/verify-toolchain.sh`. The `audit`
-workflow runs `cargo deny` and `scripts/check-audits.sh`, weekly as well, because an advisory can
-appear, and a trusted publisher entry can end, without a push. The `release` workflow builds
-archives for Linux, macOS and Windows on x86_64 and arm64 when a tag `v<version>` is pushed,
-attests their build provenance, verifies the attestations, and creates a draft release with
-`SHA256SUMS`. It also builds one target twice from two directories and compares the binaries. The
-arm64 Windows build is compiled but not tested.
+from; on arm64 that run links its binaries as the release does, as static PIEs through
+`scripts/link-static-pie.sh`. Each runner names the features it must be able to check and, on
+Linux, the lowest Landlock ABI it must report; after the suite, CI compares the skips with the
+runner's list. Every job that builds checks the toolchain first, with
+`scripts/verify-toolchain.sh`. The `audit` workflow runs `cargo deny` and
+`scripts/check-audits.sh`, weekly as well, because an advisory can appear, and a trusted
+publisher entry can end, without a push. The `release` workflow builds archives for Linux, macOS
+and Windows on x86_64 and arm64 when a tag `v<version>` is pushed, starts each binary that its
+runner can run (`sandy --version`), attests their build provenance, verifies the attestations,
+and creates a draft release with `SHA256SUMS`. It also builds one target twice from two
+directories and compares the binaries. The arm64 Windows build is compiled but not tested.
 
 CI has not run since the 1.x releases, and the releases with binaries, from 2.2.1 on, were
 built by hand; each release's notes say where its tests ran and how its binaries were built.

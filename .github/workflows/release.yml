@@ -113,6 +113,16 @@ jobs:
             "target/${{ matrix.target }}/release/sandy.exe"
           if ($LASTEXITCODE -ne 0) { throw "signtool failed" }
           Remove-Item $pfx
+      # No other step runs the binary that is packaged, and the tests run a debug build. A link
+      # that leaves the image without its relocations, for example, crashes before main. Not
+      # started: the arm64 Windows binary, which this x64 runner cannot run, and the x86_64 macOS
+      # binary, which this arm64 runner could run only through Rosetta.
+      - name: Start the binary
+        if: ${{ matrix.target != 'aarch64-pc-windows-msvc' && matrix.target != 'x86_64-apple-darwin' }}
+        shell: bash
+        run: |
+          exe=sandy; [[ "${{ matrix.target }}" == *windows* ]] && exe=sandy.exe
+          "target/${{ matrix.target }}/release/$exe" --version
       - name: Package
         shell: bash
         run: |
