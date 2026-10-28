@@ -127,13 +127,20 @@ sha256sum target/x86_64-unknown-linux-musl/release/sandy
 ```
 
 The script removes from the binary what would tie it to the machine that built it: the directory
-of the checkout and of `CARGO_HOME`, and the time of the build. The Linux binaries are linked with
-the linker of the Rust toolchain, so they depend only on the source and on the toolchain that
+of the checkout and of `CARGO_HOME`, and the time of the build. It cannot remove the host that
+runs the toolchain, the `host:` line of `rustc -vV`: cargo mixes the host into the metadata of
+the build scripts and procedural macros and passes that on to every crate that uses them. In the
+Linux binaries this changes the order of the functions, though not their size: the Linux
+binaries of every release from 2.2.1 to 2.4.1 match a build on `x86_64-unknown-linux-gnu`, and
+a build on arm64 Linux gives other bytes. So a binary built again matches only on a host of the
+triple that built the release. Apart from the host, the Linux binaries are linked with the linker
+of the Rust toolchain, so they depend only on the source and on the toolchain that
 `rust-toolchain.toml` pins. The macOS and Windows binaries also depend on the version of Apple's
 linker and of the Microsoft linker, which the release notes name. The script refuses a toolchain
 that rustup did not install from the pinned archives (see "The supply chain checks" below). The
 `reproducible` job of the release workflow builds every target twice, in two directories, and
-compares the binaries.
+compares the binaries; both builds run on one runner, so the job does not show a dependence on
+the host.
 
 The macOS binaries are not signed or notarized, and `sandy.exe` has no Authenticode signature.
 macOS refuses a copy that a browser downloaded, because it is not notarized, and SmartScreen
@@ -1166,7 +1173,9 @@ Recommendations:
    stable AppContainer name per policy; on Linux, for `ip = "private"` under Ubuntu's AppArmor
    restriction, as in the packaging scripts of [docs/linux.md](docs/linux.md). A program without
    an installer runs `sandy setup --elevate` when `check` exits with 2 (see
-   [Exit status](#exit-status)).
+   [Exit status](#exit-status)). The program's uninstaller runs `sandy setup --remove` with the
+   same policy; on Windows as the user who ran the program, because the AppContainer profile
+   belongs to that user (docs/windows.md, "Removing the changes", also for the removal by hand).
 9. **Give the program pipes, files or a terminal on its standard streams.** sandy passes
    descriptors 0, 1 and 2 on as it got them, so a socket among them would keep its access; sandy
    refuses to start the program then. The connected Unix stream socket that most runtimes pass
@@ -1202,8 +1211,8 @@ sandy does not protect:
 - network traffic the program may send with `ip = "client"` or `ip = "all"`,
 - the terminal the program writes to (recommendation 10 above),
 - the availability of the machine (CPU, memory, disk use), and of files the program may read: a
-  lock it holds on such a file stalls programs outside that lock the same file, and on Windows
-  also those that read or write it,
+  lock it holds on such a file stalls the programs outside the sandbox that lock the same file,
+  and on Windows also those that read or write it,
 - against bugs in the operating system kernel.
 
 What remains visible from inside the sandbox differs by platform; for example, on Linux the

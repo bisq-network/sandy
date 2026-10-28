@@ -6,9 +6,10 @@
 #   scripts/release-build.sh TARGET
 #
 # The output is target/TARGET/release/sandy (sandy.exe on Windows). It depends on the source, the
-# Rust toolchain of rust-toolchain.toml, and on macOS and Windows on the version of the platform's
-# linker, which the release notes name. It does not depend on the directory of the checkout, the
-# location of CARGO_HOME, the time of the build or the linker of a Linux host.
+# Rust toolchain of rust-toolchain.toml, the host triple that runs it (README.md, "Building a
+# release binary again"), and on macOS and Windows on the version of the platform's linker, which
+# the release notes name. It does not depend on the directory of the checkout, the location of
+# CARGO_HOME, the time of the build or the linker of a Linux host.
 set -eu
 
 target=${1:?usage: scripts/release-build.sh TARGET}

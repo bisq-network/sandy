@@ -559,17 +559,22 @@ fn the_program_keeps_its_exit_status_when_the_caller_ignores_sigchld() {
 
 /// The watcher thread confines itself with a seccomp filter of its own, because it parses bytes
 /// the program controls outside the sandbox, and sandy's main thread, which forwards signals and
-/// waits for the program, has none (docs/linux.md, "Diagnostic mode"). The kernel shows the mode
-/// of every thread in its status file: 2 for a filter.
+/// waits for the program, has none (docs/linux.md, "Diagnostic mode"). The kernel shows the number
+/// of filters of every thread in its status file. Both threads also have the filters this test
+/// runs under, which sandy inherits, so the watcher has exactly one more than the main thread.
 #[test]
 fn the_watcher_thread_confines_itself() {
+    let inherited: u32 = probe_outside(&[("status-field", "Seccomp_filters")])[0]
+        .detail
+        .parse()
+        .unwrap();
     let mut sandy = std::process::Command::new(sandy_path())
         .args(run_args(&args(&["--explain"]), &[("sleep", "3000")]))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    let modes = || -> Vec<String> {
+    let filters = || -> Vec<u32> {
         let Ok(tasks) = std::fs::read_dir(format!("/proc/{}/task", sandy.id())) else {
             return Vec::new();
         };
@@ -577,22 +582,30 @@ fn the_watcher_thread_confines_itself() {
             .flatten()
             .filter_map(|task| std::fs::read_to_string(task.path().join("status")).ok())
             .filter_map(|status| {
-                let line = status.lines().find(|line| line.starts_with("Seccomp:"))?;
-                Some(line.trim_start_matches("Seccomp:").trim().to_string())
+                let line = status
+                    .lines()
+                    .find(|line| line.starts_with("Seccomp_filters:"))?;
+                line.trim_start_matches("Seccomp_filters:")
+                    .trim()
+                    .parse()
+                    .ok()
             })
             .collect()
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let mut seen = modes();
-    while seen.iter().filter(|mode| *mode == "2").count() != 1
+    let mut seen = filters();
+    while seen.iter().filter(|&&count| count == inherited + 1).count() != 1
         && std::time::Instant::now() < deadline
     {
         std::thread::sleep(std::time::Duration::from_millis(20));
-        seen = modes();
+        seen = filters();
     }
     kill_process(sandy.id());
     let _ = sandy.wait();
     assert_eq!(seen.len(), 2, "sandy and its watcher: {seen:?}");
-    assert!(seen.contains(&"0".to_string()), "{seen:?}");
-    assert!(seen.contains(&"2".to_string()), "{seen:?}");
+    assert!(seen.contains(&inherited), "{seen:?}, inherited {inherited}");
+    assert!(
+        seen.contains(&(inherited + 1)),
+        "{seen:?}, inherited {inherited}"
+    );
 }

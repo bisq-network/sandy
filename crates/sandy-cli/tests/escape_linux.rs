@@ -73,11 +73,21 @@ fn session_bus_is_unreachable() {
     if !Path::new(&socket).exists() {
         return skip("session-bus", &format!("no socket at {socket}"));
     }
+    // The socket stays when no bus listens on it any more, and then refuses every connection.
+    let control = probe_outside(&[("unix-connect", &socket)]);
+    if control[0].result != "ok" {
+        return skip(
+            "session-bus",
+            &format!(
+                "connecting to {socket} fails outside: {}",
+                control[0].detail
+            ),
+        );
+    }
     let directory = Path::new(&socket).parent().unwrap().to_str().unwrap();
     // Reading the socket's directory is allowed, so only the socket rules stop the connection.
     let readable = args(&["--read", directory]);
-    let lines = controlled(&readable, &[("unix-connect", &socket)]);
-    lines[0].assert_blocked();
+    probe_inside(&readable, &[("unix-connect", &socket)])[0].assert_blocked();
 
     let mut all = readable.clone();
     all.extend(args(&["--unix-sockets", "all"]));

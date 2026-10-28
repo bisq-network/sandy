@@ -92,6 +92,17 @@ it plans and the run of the selected one see the same host; `run` checks the pla
 selected with and does not probe again. Another user's process in an AppContainer of the same
 name stays a warning (see "Other users of the machine"): any local user controls it.
 
+In session 0, where services and SSH sessions run, a program that loads `user32.dll` cannot
+start in the AppContainer (limitation 13), and `check` warns about it: a `warning:` line, and with
+`--json` an entry in the `warnings` of each level it tried. Like every warning, it changes neither
+the level `check` selects nor its exit status, because a program without `user32.dll` runs there,
+and nothing tells `check` whether the program loads it: the trials above start only suspended
+processes of `sandy.exe` outside the AppContainer, which run no instruction. `run` does not warn.
+It starts the program, which then ends with `STATUS_DLL_INIT_FAILED` (`0xC0000142`) before its
+first instruction, and sandy passes that exit code through unchanged. A caller that gets this
+code from a sandboxed program should name the session as the likely cause, or with
+`windows.win32k = "deny"` the lockdown, which ends such a program the same way (see "Win32k").
+
 ## The AppContainer
 
 `sandy run` creates the AppContainer profile of the name for the current user on first use, with
@@ -540,6 +551,28 @@ removes the directories whose lock file it can open exclusively, which only the 
 ended runs are. A directory without a lock file stays, because a run creates the file just after
 its directory (`the_sweep_leaves_a_socket_directory_without_a_lock_file`). sandy 1.3.2 created no
 lock file, so the directories it left behind stay too; they hold no listener and can be deleted.
+
+**At uninstallation.** A program that ships sandy runs `sandy setup --remove` from its
+uninstaller, with the policy it ran with: the removal takes back every level of a policy with
+fallback levels, and needs `--read-exec PROGRAM` when no policy path covers the program. Windows
+deletes only the current user's AppContainer profile [DeleteAppContainerProfile], so run the
+removal as the user who ran the program, with administrator rights. An uninstaller that runs as
+another account, as SYSTEM or as the administrator who approved a standard user's UAC prompt,
+removes the entries on the files and the loopback exemption, which are machine-wide, and leaves
+that user's profile.
+
+When no removal ran, a user removes what stays by hand:
+
+- the entries on the policy paths, on the program file and on `sandy.exe`, with `icacls` as
+  above;
+- the loopback exemption of each AppContainer name of the policy, with
+  `CheckNetIsolation LoopbackExempt -d -n=NAME` as administrator (see "The setup step");
+- the profile of each AppContainer name of the policy, and with an egress broker the profile
+  `NAME.sandy-egress`, with `DeleteAppContainerProfile` as above, which also deletes the folder
+  `%LOCALAPPDATA%\Packages\NAME`;
+- `%LOCALAPPDATA%\sandy`, which holds sandy's lock files and the socket directories of forwarded
+  ports and no grant. Every program of the user that uses sandy shares it, so delete it only
+  while no sandy runs.
 
 ## Network
 
@@ -1404,7 +1437,8 @@ about a path is worse than none, so the backend answers nothing and sandy refuse
     sandbox with `ERROR_DLL_INIT_FAILED` and works outside; the same programs start from an
     interactive scheduled task. Programs without `user32.dll`, and the relays, are not affected.
     Services and SSH sessions run in session 0, interactive users in sessions of their own, so
-    `sandy check` warns when sandy runs in session 0.
+    `sandy check` warns when sandy runs in session 0; the warning does not change its exit
+    status (see "What check reports").
 14. If sandy itself is killed during a run with forwarded ports, its socket directory below
     `%LOCALAPPDATA%\sandy\forward` stays behind until the next run with a forwarded port
     removes it. Its sockets have no listener while it is there, so nobody can connect through
@@ -1591,6 +1625,7 @@ Facts these runs established:
 - [CreateNamedPipeW] https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createnamedpipew
 - [CreateProcessW] https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw
 - [CVE-2021-41338] https://msrc.microsoft.com/update-guide/vulnerability/CVE-2021-41338
+- [DeleteAppContainerProfile] https://learn.microsoft.com/en-us/windows/win32/api/userenv/nf-userenv-deleteappcontainerprofile
 - [Environment] Changing environment variables: https://learn.microsoft.com/en-us/windows/win32/procthread/changing-environment-variables
 - [Forshaw access check] Windows Security Internals, access check implementation: https://github.com/tyranid/windows-security-internals/blob/main/chapter_7/chapter_7_access_check_impl.psm1
 - [Implementing an AppContainer] https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer
