@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/sandy-core",
+    "crates/sandy-linux",
+    "crates/sandy-macos",
+    "crates/sandy-windows",
+    "crates/sandy-cli",
+    "crates/sandy-relay",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+sandy-core = { path = "crates/sandy-core" }
+sandy-linux = { path = "crates/sandy-linux" }
+sandy-macos = { path = "crates/sandy-macos" }
+sandy-windows = { path = "crates/sandy-windows" }
+sandy-relay = { path = "crates/sandy-relay" }
+lexopt = "0.3"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+toml = { version = "1.1", default-features = false, features = ["std", "serde", "parse"] }
+# The lexer under toml, which the policy's nesting is counted on.
+toml_parser = { version = "1.1.5", default-features = false }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

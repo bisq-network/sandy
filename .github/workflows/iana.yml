@@ -1,0 +1,39 @@
+name: iana
+
+# The destination check of the egress broker (crates/sandy-core/src/destination.rs) is pinned by
+# a test to copies of the two IANA special-purpose address registries in crates/sandy-core/data.
+# This compares the copies with what IANA publishes and fails when IANA has changed a registry,
+# so that the copies and the tables are updated together. It runs weekly, because the registries
+# change without anything in this repository changing.
+
+on:
+  schedule:
+    - cron: "41 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compare the copies with the published registries
+        shell: bash
+        run: |
+          set -euo pipefail
+          changed=0
+          for family in ipv4 ipv6; do
+            name="iana-$family-special-registry-1.csv"
+            curl -fsS --proto '=https' --retry 3 -o "$RUNNER_TEMP/$name" \
+              "https://www.iana.org/assignments/iana-$family-special-registry/$name"
+            if ! cmp -s "crates/sandy-core/data/$name" "$RUNNER_TEMP/$name"; then
+              echo "::error::IANA changed $name; update the copy and the tables in destination.rs"
+              diff -u "crates/sandy-core/data/$name" "$RUNNER_TEMP/$name" || true
+              changed=1
+            fi
+          done
+          exit "$changed"

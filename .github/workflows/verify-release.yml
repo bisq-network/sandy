@@ -1,0 +1,174 @@
+name: verify-release
+
+# Run by hand with the tag of a published release, such as v1.0.0: builds every binary of the
+# release again from the tag, the way scripts/release-build.sh builds a release binary, and
+# compares each archive of the release with the binary built again and the files of the tag. The
+# run fails when any archive holds something else.
+#
+# A binary built again matches only on a host of the triple that built the release, and on macOS
+# and Windows only with the linker version that the release notes name (README.md, "Building a
+# release binary again"). The runners below are the ones the release workflow builds on: x86_64
+# Linux for both Linux binaries, an arm64 Mac with the Command Line Tools 27.0 (ld-27037.1), which
+# the macos-26 image has besides its Xcode, for both macOS binaries, and x86_64 Windows for both
+# Windows binaries. Each macOS and Windows build names its linker in the summary of the run, so
+# that a difference there can be told from one in the source.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The tag of the release, such as v1.0.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  assets:
+    # First, so that a release without archives ends the run before the builds take any runner
+    # time. The token is used only in this job, which runs no code of the tag.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download the archives and check them against SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release \
+            --pattern 'sandy-*' --pattern SHA256SUMS
+          cd release
+          sha256sum --check --strict SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: release/
+          if-no-files-found: error
+
+  build:
+    needs: assets
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04 }
+          - { target: x86_64-apple-darwin, os: macos-26 }
+          - { target: aarch64-apple-darwin, os: macos-26 }
+          - { target: x86_64-pc-windows-msvc, os: windows-2025 }
+          - { target: aarch64-pc-windows-msvc, os: windows-2025 }
+    runs-on: ${{ matrix.os }}
+    env:
+      # The image's Command Line Tools instead of its default Xcode, which links with another ld.
+      DEVELOPER_DIR: ${{ contains(matrix.target, 'apple') && '/Library/Developer/CommandLineTools' || '' }}
+    steps:
+      # The token of the job stays out of .git/config, where the build scripts of the
+      # dependencies could read it: no step here pushes or fetches.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+      - name: Name the linker
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            ld=$(ld -v 2>&1 | sed -n 's/.*PROJECT:\(ld-[^ ]*\).*/\1/p')
+            tools=$(pkgutil --pkg-info=com.apple.pkg.CLTools_Executables | sed -n 's/^version: //p')
+            linker="$ld (Command Line Tools $tools, SDK $(xcrun --show-sdk-version))"
+          else
+            # The image has one Visual Studio, and rustc links against the newest Windows SDK.
+            vs=$("/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -latest \
+              -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
+              -property installationPath | tr -d '\r')
+            msvc=$(tr -d '\r\n' < "$(cygpath -u "$vs")/VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt")
+            sdk=$(find "/c/Program Files (x86)/Windows Kits/10/Lib" -mindepth 1 -maxdepth 1 -printf '%f\n' |
+              sort -V | tail -n 1)
+            linker="MSVC $msvc (Windows SDK $sdk)"
+          fi
+          echo "${{ matrix.target }} is linked with $linker" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Build
+        shell: bash
+        run: scripts/release-build.sh ${{ matrix.target }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rebuilt-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/sandy${{ contains(matrix.target, 'windows') && '.exe' || '' }}
+          if-no-files-found: error
+
+  compare:
+    needs: [assets, build]
+    # Also when a build failed, so that the other targets are still compared.
+    if: ${{ !cancelled() && needs.assets.result == 'success' }}
+    runs-on: ubuntu-24.04
+    env:
+      # The targets of the build job.
+      TARGETS: >-
+        x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+        x86_64-apple-darwin aarch64-apple-darwin
+        x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+    steps:
+      # For the files that each archive holds besides the binary. Nothing of the tag runs here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          path: source
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+      - name: Compare the archives with the binaries built again
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version = ' source/Cargo.toml | cut -d'"' -f2)
+          test "v$version" = "$TAG" || { echo "tag $TAG != v$version"; exit 1; }
+          sum() { if [[ -f "$1" ]]; then sha256sum "$1" | cut -d' ' -f1; else echo none; fi; }
+          echo "| Target | Result | SHA-256 in the release | SHA-256 built again |" > summary.md
+          echo "|---|---|---|---|" >> summary.md
+          : > differences.txt
+          failed=0
+          for target in $TARGETS; do
+            exe=sandy; ext=tar.gz
+            [[ "$target" == *windows* ]] && { exe=sandy.exe; ext=zip; }
+            name="sandy-$version-$target"
+            archive="artifacts/release/$name.$ext"
+            rebuilt="artifacts/rebuilt-$target/$exe"
+            work="work/$target"
+            mkdir -p "$work/released" "$work/expected/$name"
+            if [[ -f "$archive" && "$ext" == zip ]]; then
+              unzip -q "$archive" -d "$work/released"
+            elif [[ -f "$archive" ]]; then
+              tar -xzf "$archive" -C "$work/released"
+            fi
+            if [[ ! -f "$archive" ]]; then
+              result="no archive in the release"
+            elif [[ ! -f "$rebuilt" ]]; then
+              result="not built, see its build job"
+            else
+              # What the archive must hold, and nothing else.
+              cp "$rebuilt" source/README.md source/LICENSE-MIT source/LICENSE-APACHE "$work/expected/$name/"
+              if (cd "$work" && diff -rq expected released) >> differences.txt; then
+                result=identical
+              else
+                result=differs
+              fi
+            fi
+            [[ "$result" == identical ]] || failed=1
+            echo "| \`$target\` | $result | \`$(sum "$work/released/$name/$exe")\` | \`$(sum "$rebuilt")\` |" >> summary.md
+          done
+          cat summary.md differences.txt
+          {
+            echo "### $TAG built again from the tag"
+            cat summary.md
+            if [[ -s differences.txt ]]; then
+              echo
+              echo '```'
+              cat differences.txt
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$failed"

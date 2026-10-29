@@ -1,0 +1,66 @@
+[package]
+name = "sandy-cli"
+description = "Run a program inside an operating system sandbox described by a policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+autobins = false
+
+[[bin]]
+name = "sandy"
+path = "src/main.rs"
+
+# Test helper: tries one action per argument pair and prints the result. The escape tests run it
+# inside the sandbox.
+[[bin]]
+name = "sandy-probe"
+path = "src/bin/sandy-probe.rs"
+test = false
+
+# Test helper: runs a program that sees a lower Landlock ABI than the kernel has, so the tests
+# can exercise the code paths of an older kernel. Linux only; elsewhere it refuses to run.
+[[bin]]
+name = "sandy-abi-cap"
+path = "src/bin/sandy-abi-cap.rs"
+test = false
+
+[dependencies]
+sandy-core.workspace = true
+sandy-relay.workspace = true
+lexopt.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sandy-linux.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+sandy-macos.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+sandy-windows.workspace = true
+# For the Windows actions of sandy-probe and the Windows escape tests.
+windows-sys = { version = "0.61", features = [
+    "Wdk_System_SystemInformation",
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true

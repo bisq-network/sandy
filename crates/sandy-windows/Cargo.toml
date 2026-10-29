@@ -1,0 +1,44 @@
+[package]
+name = "sandy-windows"
+description = "Windows backend of sandy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+sandy-core.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+sandy-relay.workspace = true
+windows-sys = { version = "0.61", features = [
+    "Wdk_System_SystemServices",
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WindowsFirewall",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Isolation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_SystemInformation",
+    "Win32_System_Services",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
+
+[lints]
+workspace = true

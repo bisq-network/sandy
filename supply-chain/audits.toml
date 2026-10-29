@@ -1,0 +1,152 @@
+
+# cargo-vet audits file
+
+[[audits.enumflags2]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+version = "0.7.12"
+notes = "Reviewed by AI review agents on behalf of wodoro: every file of the crate, not only its unsafe code. The files are identical to the upstream tag v0.7.12 (commit 332c37f). No build script and no filesystem, network, process or environment access; dependencies are the exact-pinned enumflags2_derive and optional serde. All unsafe code (the from_bits_unchecked constructors, make_bitflags!, transmute_copy in exactly_one and Iter::next) is sound given the invariant that every set bit is a declared variant, which every safe constructor and operator keeps: from_bits_truncate and Not mask with ALL_BITS, so no operation adds undeclared bits, and serde deserialization uses the checked from_bits. An invalid value needs a caller that breaks the documented precondition of the unsafe from_bits_unchecked."
+
+[[audits.enumflags2_derive]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+version = "0.7.12"
+notes = "Reviewed by AI review agents on behalf of wodoro: the whole crate. The files are identical to the upstream tag v0.7.12 (commit 332c37f, directory enumflags_derive). A proc-macro attribute that only parses and re-emits tokens with syn and quote: no build script, no unsafe code of its own, no filesystem, environment, process, network or time access, and output that depends only on its input. It emits the unsafe impl of RawBitFlags only after rejecting non-enums, generics, data-carrying variants, missing, signed, usize and non-integer reprs and more variants than bits; it checks literal discriminants for exactly one bit within the repr, adds a compile-time assertion for every other discriminant, and gives implicit variants unused bits. Gap: #[bitflags(default = X)] does not check that X is a variant, so the enum's author could put undeclared bits in DEFAULT."
+
+[[audits.equivalent]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+delta = "1.0.2 -> 1.0.3"
+notes = "Reviewed by AI review agents on behalf of wodoro: the whole diff and the new code around every changed hunk. The files are identical to the upstream tag v1.0.3 (commit 4ee8813). Only documentation changes (the Equivalent and Comparable doc comments now state their contracts precisely) and version bumps; no code, build script, dependency or unsafe changes, and the crate stays no_std without unsafe code."
+
+[[audits.hashbrown]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+delta = "0.14.0 -> 0.14.2"
+notes = "Reviewed by AI review agents on behalf of wodoro: the whole 0.14.0 to 0.14.2 diff, the new safe HashTable API (src/table.rs, src/rayon/table.rs) in full, and the surrounding code of every changed unsafe site. The files are identical to the upstream tag v0.14.2 (commit 7cd193a). The RawTable refactor moves the allocator out of RawTableInner, drops the Allocator + Clone bound, adds the FullBucketsIndices iterator used by resize, and routes clone, clone_from, shrink_to, drain and into_iter through drop_inner_table; each changed unsafe site keeps the control byte, items and growth_left, and allocation layout invariants. The delta also fixes allocator leaks, a global dealloc in the rayon into_par_iter path and a free-before-allocate ordering in clone_from, and adds no build script, FFI, I/O or required dependency. Unchanged from 0.14.0 and fixed in 0.14.5 (#511): the clone_from_impl panic guard drops bucket 0 uninitialized if the clone of that element panics."
+
+[[audits.indexmap]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+delta = "2.14.0 -> 2.14.2"
+notes = "Reviewed by AI review agents on behalf of wodoro: the whole diff and the new code around every changed hunk. The files are identical to the upstream tag 2.14.2 (commit 41a8708). The unsafe get_disjoint_opt_mut of map/slice.rs moves to map/disjoint.rs, whose two functions check every index against the slice length and against earlier indices before creating any reference from as_mut_ptr, so bad indices return an error or panic first; sound for every input. Other changes add index assertions with the existing panic messages, use plain Eq where the lookup type is the key type, and stop the map and set macros from declaring a const that could shadow a caller's CAP. No other unsafe, build script or dependency changes."
+
+[[audits.landlock]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+version = "0.4.7"
+notes = "Reviewed by AI review agents on behalf of wodoro: every file of the crate, including the compatibility logic (ABI probe, BestEffort, SoftRequirement and HardRequirement, the per-ABI downgrade of handled rights, flags and rules, RulesetStatus and RestrictionStatus) and every error path, not only its unsafe code. The files are identical to the upstream tag v0.4.7 (commit 62fec0f). No build script, network, environment access or file writes; the library opens only caller-supplied paths with O_PATH, fstats them, and makes the three Landlock syscalls and prctl(PR_SET_NO_NEW_PRIVS). The other unsafe code is sound for any input through the safe API, the attribute layouts match the kernel UAPI, FullyEnforced is never reported when the kernel enforces less, and errors fail closed. Soundness bug: Erratum::current() keeps unknown kernel errata bits through BitFlags::from_bits_unchecked, so formatting or iterating its result on a kernel with newer errata is undefined behaviour; only the kernel decides that value. The default BestEffort level drops unsupported features without an error but reports it in RestrictionStatus, and HardRequirement turns every drop into an error."
+
+[[audits.lexopt]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+version = "0.3.2"
+notes = "Reviewed by AI review agents on behalf of wodoro: every file of the crate, not only its unsafe code. The files are identical to the upstream tag v0.3.2 (commit f52c6a6). #![forbid(unsafe_code)]; no FFI, build script, proc macro or dependencies; the only ambient capability is reading argv in Parser::from_env. OsString handling uses only safe std conversions and splits only at ASCII '=' and '-', option values and raw_args() come back unmodified (also non-UTF-8 and unpaired-surrogate arguments), and no panic is reachable from arguments. Error messages print an unknown option name without escaping it."
+
+[[audits.libc]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+version = "0.2.191"
+notes = "Reviewed by AI review agents on behalf of wodoro: every file of the crate, split between two reviewers (the manifests, build.rs, the core modules, src/new, src/unix/mod.rs and src/unix/linux_like; every other platform module). The files are identical to the upstream tag 0.2.191 (commit ccc2ff4). Token-level scanners classified every item of all platform files as an extern declaration, constant, type alias or repr(C) record, and all 800 items with executable code (CMSG_*, FD_*, CPU_*, NLMSG_*, W* and makedev helpers, siginfo accessors, manual trait impls, LFS64 wrappers) were read in full and are sound for valid C-library inputs; src/unix/bsd/apple was read in full. build.rs only runs rustc --version (emcc or freebsd-version on those targets), reads cfg-related environment variables and prints cargo directives; it writes no files and uses no network. Constants and struct layouts for x86_64 and aarch64 Linux (musl and glibc) were compared with kernel and glibc headers, and the macOS layouts, constants and signatures sandy uses with XNU. Caveats on paths sandy does not use: with extra_traits, union PartialEq and Hash read uninitialized bytes; some Rust enums hold C-supplied values (Apple qos_class_t, FreeBSD devstat, PSP); Apple pthread_introspection_hook_install returns a non-nullable fn pointer; Android and Fuchsia CMSG_NXTHDR use pointer offsets from cmsg_len; musl SUN_LEN, ELF*_R_INFO and CPU_ALLOC_SIZE compute wrong values; FD_* and CPU_* abort on out-of-range numbers."
+
+[[audits.proc-macro2]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+delta = "1.0.106 -> 1.0.107"
+notes = "Reviewed by AI review agents on behalf of wodoro: the whole diff and the new code around every changed hunk. The files are identical to the upstream tag 1.0.107 (commit ed8a549). build.rs and src/probe/*.rs are byte-identical to 1.0.106, so the build still runs $RUSTC --version and compiles the probe files into OUT_DIR/probe, then deletes them. The code changes (map_or to is_some_and in the literal parser, an if/else folded after a diverging panic! in invalidate_current_thread_spans) keep behaviour; rust-version rises from 1.68 to 1.71. No unsafe code added or changed."
+
+[[audits.seccompiler]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+version = "0.5.0"
+notes = "Reviewed by AI review agents on behalf of wodoro: every file of the crate, not only its unsafe code. The files are identical to the upstream tag v0.5.0 (commit c3cf77d). No build script; dependencies are libc and, behind the json feature, serde and serde_json. The only unsafe code outside tests is prctl(PR_SET_NO_NEW_PRIVS) and seccomp(SECCOMP_SET_MODE_FILTER) on a repr(C) sock_fprog that borrows the caller's slice; both are sound, and the len as u16 cast can only truncate a hand-built program of more than 65535 instructions. The BPF generation was traced by hand (architecture check to KILL_PROCESS, per-syscall chains, both halves of 64-bit comparisons for every operator, 8-bit jump offsets kept in range with JA helpers, length limit below 4096): no path allows what the rules deny. Caveats: no x32 bit check, Dword compares only the low 32 bits, Errno and Trace data are masked to 16 bits, and the json frontend drops a no-args rule for a syscall that also has an args rule. tools/generate_syscall_tables.sh downloads kernel sources, but cargo never runs it."
+
+[[audits.serde]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+delta = "1.0.228 -> 1.0.229"
+notes = "Reviewed by AI review agents on behalf of wodoro: the whole diff and the new code around every changed hunk. The files are identical to the upstream tag v1.0.229 (commit 7fc3b4c, directory serde). It has the same visitor reborrow change in the docs.rs-only src/core copy and the same build.rs threshold move from Rust 1.61 to 1.71, and feature(never_type) under the unstable feature now applies only to docs.rs builds. build.rs still only runs $RUSTC --version and writes OUT_DIR/private.rs. No unsafe code added or changed."
+
+[[audits.serde_core]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+delta = "1.0.228 -> 1.0.229"
+notes = "Reviewed by AI review agents on behalf of wodoro: the whole diff and the new code around every changed hunk. The files are identical to the upstream tag v1.0.229 (commit 7fc3b4c, directory serde_core). The only code change is in the seq_impl! deserialize_in_place visitor, which now reborrows with &mut *self.0 instead of deref-coercing &mut self.0, with identical behaviour. build.rs still only runs $RUSTC --version and writes OUT_DIR/private.rs, and its no_serde_derive cfg threshold moves from Rust 1.61 to 1.71. No unsafe code added or changed."
+
+[[audits.serde_derive]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+delta = "1.0.228 -> 1.0.229"
+notes = "Reviewed by AI review agents on behalf of wodoro: the whole diff and the new code around every changed hunk. The files are identical to the upstream tag v1.0.229 (commit 7fc3b4c, directory serde_derive). It ports the macro from syn 2 to syn 3 and rewrites iterator chains as loops; field indices, generated identifiers, where-clause predicate order and default stripping are unchanged, and in three places the emitted code replaces ? with an equivalent explicit match on Result. Neither the macro nor its output contains unsafe, and the macro does no filesystem, environment or network access."
+
+[[audits.serde_spanned]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+delta = "1.1.1 -> 1.1.2"
+notes = "Reviewed by AI review agents on behalf of wodoro: the whole diff and the new code around every changed hunk. The files are identical to the upstream tag serde_spanned-v1.1.2 (commit f72038c). No source changes: Cargo.toml anchors its include globs and edits lint tables and release metadata, the Apache license placeholder is filled in, and a README badge changed. No build script, dependency or feature changes; the crate keeps #![forbid(unsafe_code)]."
+
+[[audits.syn]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+version = "2.0.119"
+notes = "Reviewed by AI review agents on behalf of wodoro: every file of the crate, split across three reviewers (the manifests, src/gen, tests and benches; the parsing infrastructure and small modules; the syntax tree modules). The files are identical to the upstream tag 2.0.119 (commit 3295f9e). No build script, FFI, or filesystem, environment, network, process or time access in the library; the only std use is thread::current().id(). The unsafe code (cursor pointer arithmetic in buffer.rs, the lifetime transmutes in parse.rs and discouraged.rs, ThreadBound's Send and Sync, the repr(transparent) span casts in token.rs) was checked against the token buffer's Group and End offset invariant and is sound; a scanner re-derived all 2,143 generated items of src/gen from the type definitions, and literal parsing (escapes, BigInt integers, floats) and every unwrap and unreachable site were traced and are not reachable from parsed input. Caveats: parsing, Drop and printing recurse without a depth limit, so pathological source can overflow the compiler's stack at build time (an abort), and the nightly-only tests and benches download a rust-lang/rust archive without a checksum and unpack it with tar's Entry::unpack, which has no path-traversal guard."
+
+[[audits.syn]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+delta = "2.0.119 -> 3.0.9"
+notes = "Reviewed by AI review agents on behalf of wodoro: the whole 2.0.119 to 3.0.9 diff and the surrounding new code of every hunk that touches unsafe code, the parsing infrastructure or the manifest; the generated src/gen files were also checked with a shape scanner (all 1,435 items fit the expected impl and fn shapes, with no unsafe). The files are identical to the upstream tag 3.0.9 (commit 7c44a55). The only new unsafe is one bump_ignore_group call in the crate-internal Cursor::peek_punct, which runs only on a Punct entry like the existing punct(); Cursor::prev_span became public with an unchanged body whose ptr.sub(1) is bounded by start_of_buffer, which holds for every cursor the safe API can produce. Dependencies, features and build configuration are unchanged, and nothing in src does filesystem, network, process or environment access; most of the change is the 3.0 syntax tree redesign, and its new unwrap, unreachable and assert sites are not reachable from parsed input. The test suite's download of a rust-lang/rust tarball predates this release; the delta only bumps its pinned commit."
+
+[[audits.thiserror]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+version = "2.0.21"
+notes = "Reviewed by AI review agents on behalf of wodoro: every file of the crate, including build.rs, build/probe.rs and all tests. The files are identical to the upstream tag 2.0.21 (commit b1827ee). No unsafe code or FFI; the library is safe helper traits for the derive. The build script writes a fixed private.rs and a temporary probe directory inside OUT_DIR, runs $RUSTC --version, and compiles build/probe.rs to metadata only (through RUSTC_WRAPPER if set) to decide the error_generic_member_access cfg, which RUSTC_BOOTSTRAP can turn on; it uses no network and writes nothing outside OUT_DIR."
+
+[[audits.thiserror-impl]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+version = "2.0.21"
+notes = "Reviewed by AI review agents on behalf of wodoro: every file of the crate. The files are identical to the upstream tag 2.0.21 (commit b1827ee, directory impl). A derive macro that only parses and re-emits tokens, deterministically, with no file, environment, process or network access at compile time. It emits only safe impls of Error (source, and provide for Backtrace fields), Display and From, built from core and thiserror's doc-hidden __private21 helpers, and never unsafe code. Format string rewriting slices only at ASCII positions and leaves the original string on anything it cannot handle, so rustc reports the error; emitted From impls call Backtrace::capture() for types with a Backtrace field."
+
+[[audits.toml]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+version = "1.1.8+spec-1.1.0"
+notes = "Reviewed by AI review agents on behalf of wodoro: every file of the crate (src, examples and manifests), not only its unsafe code. The files are identical to the upstream tag toml-v1.1.8 (commit ceac6e4). #![forbid(unsafe_code)]; no build script, proc macro, FFI, or filesystem, network, process or environment access outside the toml2json example. The table builder that consumes toml_parser's events reports duplicate keys, table redefinition and dotted-key or inline-table mixing as errors, and any reported error fails from_str, so no key is silently overwritten; integer and float conversions are range-checked, and float overflow to infinity is an error. Denial of service, measured with a parser that uses the crate: the recursion limit of 80 that toml sets through toml_parser's RecursionGuard can be bypassed (see the toml_parser audit), and on_array and on_inline_table recurse on the event stream without a bound of their own, so crafted input overflows the stack (an abort, not memory corruption); dotted keys amplify memory about 600 times (a 1 MiB document used 615 MB); and error messages echo the source line and decoded keys, including control characters, verbatim."
+
+[[audits.toml_datetime]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+delta = "1.1.1+spec-1.1.0 -> 1.1.2+spec-1.1.0"
+notes = "Reviewed by AI review agents on behalf of wodoro: the whole diff and the new code around every changed hunk. The files are identical to the upstream tag toml_datetime-v1.1.2 (commit f72038c). No source changes: Cargo.toml anchors its include globs and edits lint tables and release metadata, the Apache license placeholder is filled in, and a README badge changed. No build script, dependency or feature changes; the crate keeps #![forbid(unsafe_code)]."
+
+[[audits.toml_parser]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+version = "1.1.5+spec-1.1.0"
+notes = 'Reviewed by AI review agents on behalf of wodoro: every file of the crate (lexer, parser, decoders, source, error, debug and the manifest), not only its unsafe code. The files are identical to the upstream tag toml_parser-v1.1.5 (commit ceac6e4). No build script, proc macro, FFI or ambient capability; with the unsafe feature off (toml enables only alloc and std) it builds under forbid(unsafe_code), and the cfg(feature = "unsafe") slicing sites were also checked and only cut at ASCII bytes or the end of input. Every slice and index was checked for UTF-8 boundary panics, as were lexer and parser termination, escape decoding, multi-line strings and CR handling, and integer and float syntax; malformed input always produces a reported error. Known denial of service, confirmed by running a parser that uses it: error recovery for a { or [ in key position inside an inline table emits a close event without a matching open, which lowers the recursion guard of the toml crate, so input such as a={{}{}...b=[[[... nests past the limit of 80 and overflows the stack (an abort, not memory corruption).'
+
+[[audits.toml_writer]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+delta = "1.1.1+spec-1.1.0 -> 1.1.3+spec-1.1.0"
+notes = "Reviewed by AI review agents on behalf of wodoro: the whole diff and the new code around every changed hunk. The files are identical to the upstream tag toml_writer-v1.1.3 (commit f72038c). The only code change makes the counters of consecutive quote characters in ValueMetrics::calculate Saturating<u8>, so a string with 256 or more consecutive quotes no longer overflows (a panic in debug builds); output for every other input is unchanged. No unsafe code (#![forbid(unsafe_code)]), build script or dependency changes."
+
+[[audits.unicode-ident]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+delta = "1.0.18 -> 1.0.27"
+notes = "Reviewed by AI review agents on behalf of wodoro: the whole diff and the new code around every changed hunk. The files are identical to the upstream tag 1.0.27 (commit c1ac3af). The tables move from Unicode 16.0.0 to 18.0.0 with a new layout (u128 ASCII masks and base offsets into LEAF); a scanner proved every line of src/tables.rs is a constant, an array header, a hex data row or a comment with matching array lengths, that the two get_unchecked calls reach at most offsets 5215 and 8063 of the 8064-byte LEAF, and that the lookups match the shipped ucd-generate tables for every char. Hand-written changes are limited to is_xid_start, is_xid_continue and a new UNICODE_VERSION constant; there is no build script, and the .fst binaries are used only by tests and benches."
+
+[[audits.windows-sys]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+version = "0.61.2"
+notes = "Reviewed by AI review agents on behalf of wodoro: the manifests, the hand-written core (the s! and w! literal macros, GUID::from_u128, the UTF-8 to UTF-16 const helpers) and the generated modules sandy uses in full, and every generated item with a scanner. The files are identical to upstream windows-rs commit 32c3144, three commits past Release 71 on master that do not touch crates/libs/sys; windows-rs CI regenerates the bindings and fails on any difference. The scanner parsed all 246 generated files (177,851 items) and found every item fits a declaration shape: each of the 20,250 windows_link::link! invocations only names a system DLL, an ABI and a typed signature, and every module is gated by its own Cargo feature. The only unsafe code is 8,925 identical Default impls using core::mem::zeroed, and every target type was proven valid at all zero bytes; there is no build script, proc macro, test or ambient capability, and the imports and constants sandy uses match the SDK. Caveats: BOOLEAN is mapped to Rust bool, SDK alignment attributes are not expressed, and the SCARD_*_READERS constants are mis-encoded."
+
+[[audits.winnow]]
+who = "wodoro <woodencore@proton.me>"
+criteria = "safe-to-deploy"
+version = "1.0.4"
+notes = "Reviewed by AI review agents on behalf of wodoro: every file of the crate, not only its unsafe code, split across three reviewers (lib, parser, error, combinator, macros and the doc modules; stream, token and examples; ascii and binary). The files are identical to the upstream tag v1.0.4 (commit 7539ec0). No build script, proc macro or FFI; the only ambient capabilities (stderr, the COLUMNS variable, a terminal size query) are behind the non-default debug feature. The only unsafe code is get_unchecked in the public unsafe fns next_slice_unchecked and peek_slice_unchecked, which winnow never calls itself, and repr(transparent) transmutes in BStr and Bytes; all other slicing is checked, so a bad offset panics. Number parsers report overflow as an error and preallocation is capped at 64 KiB. Caveats: expression() recurses without a depth limit on prefix and right-associative operators, iterator() and expression() postfix operators have no must-consume guard, and bits::take does not check the bit count against the output width."

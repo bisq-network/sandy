@@ -1,0 +1,291 @@
+name: release
+
+# A tag v<version> builds every platform and creates a DRAFT release with the archives, their
+# SHA-256 sums and a build provenance attestation. A maintainer reviews and publishes it.
+# Running the workflow by hand builds the archives without creating a release.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      # One runner builds both architectures of a platform: x86_64 Linux, an arm64 Mac with the
+      # Command Line Tools, x64 Windows. A binary built again matches only on a host of the same
+      # triple, and on macOS and Windows only with the same linker (README.md, "Building a
+      # release binary again"), so verify-release.yml builds on the same runners.
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04 }
+          - { target: x86_64-apple-darwin, os: macos-26 }
+          - { target: aarch64-apple-darwin, os: macos-26 }
+          - { target: x86_64-pc-windows-msvc, os: windows-2025 }
+          - { target: aarch64-pc-windows-msvc, os: windows-2025 }
+    runs-on: ${{ matrix.os }}
+    env:
+      # The image's Command Line Tools instead of its default Xcode, which links with another ld.
+      DEVELOPER_DIR: ${{ contains(matrix.target, 'apple') && '/Library/Developer/CommandLineTools' || '' }}
+      # Whether the signing secrets exist, which gates the two signing steps below; today they
+      # do not, so both steps stay skipped. A step's `if` cannot read a secret, so the test is
+      # made here, and only its answer is kept: every step sees this block, also the build, which
+      # runs the build scripts and macros of the dependencies. The secrets themselves go only to
+      # the step that signs.
+      APPLE_SIGNING: ${{ secrets.APPLE_SIGNING_IDENTITY != '' }}
+      WINDOWS_SIGNING: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE != '' }}
+    steps:
+      # The token of the job stays out of .git/config, where the build scripts of the
+      # dependencies could read it: no step here pushes or fetches.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check that the tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != v$version"; exit 1; }
+      # For the release notes, which name the linker that the macOS and Windows binaries depend
+      # on. verify-release.yml names it the same way.
+      - name: Name the linker
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            ld=$(ld -v 2>&1 | sed -n 's/.*PROJECT:\(ld-[^ ]*\).*/\1/p')
+            tools=$(pkgutil --pkg-info=com.apple.pkg.CLTools_Executables | sed -n 's/^version: //p')
+            linker="$ld (Command Line Tools $tools, SDK $(xcrun --show-sdk-version))"
+          else
+            # The image has one Visual Studio, and rustc links against the newest Windows SDK.
+            vs=$("/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -latest \
+              -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
+              -property installationPath | tr -d '\r')
+            msvc=$(tr -d '\r\n' < "$(cygpath -u "$vs")/VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt")
+            sdk=$(find "/c/Program Files (x86)/Windows Kits/10/Lib" -mindepth 1 -maxdepth 1 -printf '%f\n' |
+              sort -V | tail -n 1)
+            linker="MSVC $msvc (Windows SDK $sdk)"
+          fi
+          echo "${{ matrix.target }} is linked with $linker" | tee -a "$GITHUB_STEP_SUMMARY"
+      # The same script builds every release binary outside CI too (README.md, "Verifying a
+      # download"), so a binary can be built again and compared.
+      - name: Build
+        shell: bash
+        run: scripts/release-build.sh ${{ matrix.target }}
+      # Skipped: this project has no Apple Developer ID, so the macOS binaries carry only the
+      # linker's ad-hoc signature. To sign and notarize them, join the Apple Developer Program,
+      # export the "Developer ID Application" certificate as a PKCS#12 file, and add six
+      # repository secrets: APPLE_SIGNING_IDENTITY (the certificate's common name),
+      # APPLE_SIGNING_CERTIFICATE (the PKCS#12 file, base64 encoded) with
+      # APPLE_SIGNING_CERTIFICATE_PASSWORD, and an App Store Connect key for notarytool,
+      # APPLE_NOTARY_KEY (base64 encoded) with APPLE_NOTARY_KEY_ID and APPLE_NOTARY_ISSUER.
+      # None of them exists today. Before turning this on, check on a Mac that the hardened
+      # runtime still lets sandy load /usr/lib/libsandbox.1.dylib and exec an unsigned program.
+      # A bare Mach-O cannot be stapled, so Gatekeeper checks the notarization online.
+      - name: Sign and notarize the macOS binary
+        if: ${{ contains(matrix.target, 'apple') && env.APPLE_SIGNING == 'true' }}
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_SIGNING_CERTIFICATE: ${{ secrets.APPLE_SIGNING_CERTIFICATE }}
+          APPLE_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
+          APPLE_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/sandy"
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          security create-keychain -p "" "$keychain"
+          security set-keychain-settings -lut 900 "$keychain"
+          security unlock-keychain -p "" "$keychain"
+          echo "$APPLE_SIGNING_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -T /usr/bin/codesign \
+            -P "$APPLE_SIGNING_CERTIFICATE_PASSWORD"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" "$keychain" > /dev/null
+          security list-keychain -d user -s "$keychain"
+          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$binary"
+          codesign --verify --strict --verbose=2 "$binary"
+          echo "$APPLE_NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          ditto -c -k --keepParent "$binary" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" --wait \
+            --issuer "$APPLE_NOTARY_ISSUER" --key-id "$APPLE_NOTARY_KEY_ID" --key "$RUNNER_TEMP/notary.p8"
+          rm -f "$RUNNER_TEMP/certificate.p12" "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/notarize.zip"
+      # Skipped: this project has no code signing certificate, so Windows SmartScreen warns
+      # about a freshly downloaded sandy.exe and some enterprise policies refuse it. An OV or EV
+      # certificate costs money and today lives in a hardware token or a signing service, so the
+      # step below only fits a certificate that can still be exported as a PKCS#12 file; a
+      # signing service wants its own step instead. The secrets are WINDOWS_SIGNING_CERTIFICATE
+      # (the PKCS#12 file, base64 encoded) and WINDOWS_SIGNING_CERTIFICATE_PASSWORD. Neither
+      # exists today.
+      - name: Sign sandy.exe
+        if: ${{ contains(matrix.target, 'windows') && env.WINDOWS_SIGNING == 'true' }}
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_CERTIFICATE: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE }}
+          WINDOWS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGNING_CERTIFICATE))
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' |
+            Sort-Object FullName | Select-Object -Last 1
+          & $signtool.FullName sign /fd sha256 /td sha256 /tr http://timestamp.digicert.com `
+            /f $pfx /p $env:WINDOWS_SIGNING_CERTIFICATE_PASSWORD `
+            "target/${{ matrix.target }}/release/sandy.exe"
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed" }
+          Remove-Item $pfx
+      # No other step runs the binary that is packaged, and the tests run a debug build. A link
+      # that leaves the image without its relocations, for example, crashes before main. Not
+      # started here: the arm64 Linux binary, which the start job runs on an arm64 runner, the
+      # arm64 Windows binary, which this x64 runner cannot run, and the x86_64 macOS binary, which
+      # this arm64 runner could run only through Rosetta.
+      - name: Start the binary
+        if: >-
+          matrix.target != 'aarch64-unknown-linux-musl' && matrix.target != 'aarch64-pc-windows-msvc'
+          && matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          exe=sandy; [[ "${{ matrix.target }}" == *windows* ]] && exe=sandy.exe
+          "target/${{ matrix.target }}/release/$exe" --version
+      - name: Package
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          name="sandy-$version-${{ matrix.target }}"
+          exe=sandy; [[ "${{ matrix.target }}" == *windows* ]] && exe=sandy.exe
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/$exe" README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          # Every entry carries the time of the commit, not of this build, so that the archive
+          # depends only on what it holds.
+          epoch=$(git log -1 --format=%ct)
+          cd dist
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            # 7-Zip stores the modification time of each file, so the files get the commit's
+            # (GNU touch, from Git for Windows).
+            touch -d "@$epoch" "$name" "$name"/*
+            7z a -tzip -bd "$name.zip" "$name" > /dev/null
+          else
+            # Only GNU tar sorts the entries and sets their time and owner.
+            tar=tar; command -v gtar > /dev/null && tar=gtar
+            $tar --version 2> /dev/null | grep -q GNU || { echo "a reproducible archive needs GNU tar"; exit 1; }
+            $tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner -czf "$name.tar.gz" "$name"
+          fi
+          ls -l "$name"/"$exe" ./*.tar.gz ./*.zip 2> /dev/null || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sandy-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  start:
+    # The arm64 Linux binary is built on x86_64, whose runner cannot run it. This starts the
+    # packaged binary on arm64, for the reason the build job starts the others; its link, a static
+    # PIE through scripts/link-static-pie.sh, is the one link that rustc does not make by itself.
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sandy-aarch64-unknown-linux-musl
+          path: dist
+      - name: Start the binary
+        run: |
+          set -euo pipefail
+          archive=(dist/sandy-*-aarch64-unknown-linux-musl.tar.gz)
+          tar -xzf "${archive[0]}" -C dist
+          "${archive[0]%.tar.gz}/sandy" --version
+
+  reproducible:
+    # The release build removes what would otherwise tie a binary to the machine that made it:
+    # the path prefix of the checkout and of CARGO_HOME, the time of the build, the host's linker
+    # on Linux, and the paths that Apple's linker hashes into the UUID. This builds every target
+    # twice from two directories and compares the binaries, so a change that makes the output
+    # depend on where it is built is noticed. It does not gate the release: a difference here is a
+    # finding to read, not a reason to keep a reviewed tag from being packaged.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04 }
+          - { target: x86_64-apple-darwin, os: macos-26 }
+          - { target: aarch64-apple-darwin, os: macos-26 }
+          - { target: x86_64-pc-windows-msvc, os: windows-2025 }
+          - { target: aarch64-pc-windows-msvc, os: windows-2025 }
+    runs-on: ${{ matrix.os }}
+    env:
+      # As in the build job.
+      DEVELOPER_DIR: ${{ contains(matrix.target, 'apple') && '/Library/Developer/CommandLineTools' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: first
+          persist-credentials: false
+      - name: Build twice and compare
+        shell: bash
+        run: |
+          set -euo pipefail
+          target=${{ matrix.target }}
+          exe=sandy; [[ "$target" == *windows* ]] && exe=sandy.exe
+          cp -a first second
+          for dir in first second; do
+            "$dir/scripts/release-build.sh" "$target"
+          done
+          sum=sha256sum; command -v sha256sum > /dev/null || sum="shasum -a 256"
+          $sum first/target/"$target"/release/$exe second/target/"$target"/release/$exe
+          cmp first/target/"$target"/release/$exe second/target/"$target"/release/$exe \
+            || { echo "the binary depends on the directory it was built in"; exit 1; }
+
+  release:
+    needs: [build, start]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      # For the build provenance attestation below.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Sum the archives
+        shell: bash
+        run: |
+          cd dist
+          sha256sum ./*.tar.gz ./*.zip | sed 's| \./| |' > SHA256SUMS
+          cat SHA256SUMS
+      # Nothing is published if this step or the verification below fails.
+      - name: Attest the build provenance of the archives
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+      - name: Verify the attestations before anything is published
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for archive in dist/*.tar.gz dist/*.zip; do
+            gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
+          done
+      - name: Create a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "sandy $GITHUB_REF_NAME" \
+            --notes "Draft. Every archive carries a build provenance attestation: check one with \`gh attestation verify <archive> --repo $GITHUB_REPOSITORY\`. Verify the archives against SHA256SUMS, then sign SHA256SUMS with the project key and upload the signature as an asset before publishing; a published release takes no further assets. The aarch64 Windows build is cross-compiled and not tested at run time." \
+            ./*.tar.gz ./*.zip SHA256SUMS

@@ -1,0 +1,87 @@
+# The dependency audit CI runs: cargo deny --locked check all.
+#
+# sandy keeps very few dependencies on purpose, so this file is an allowlist rather than a list
+# of exceptions. A crate that enters the tree fails the check until someone reviews it and adds
+# it below, and so does a crate with an advisory, a yanked version, an unexpected license or a
+# source other than crates.io.
+
+# Every target sandy releases, with every feature, so the audit sees a superset of what any
+# build pulls in.
+[graph]
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+]
+all-features = true
+
+[advisories]
+yanked = "deny"
+# Also report crates whose advisory says the project is unmaintained or the code unsound, not
+# only the ones with a vulnerability.
+unmaintained = "all"
+ignore = []
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "Unicode-3.0",
+]
+
+[bans]
+# Only the crates listed here may appear in the tree, at any version.
+allow = [
+    { crate = "sandy-cli" },
+    { crate = "sandy-core" },
+    { crate = "sandy-linux" },
+    { crate = "sandy-macos" },
+    { crate = "sandy-relay" },
+    { crate = "sandy-windows" },
+
+    # Direct dependencies.
+    { crate = "landlock" },
+    { crate = "lexopt" },
+    { crate = "libc" },
+    { crate = "seccompiler" },
+    { crate = "serde" },
+    { crate = "toml" },
+    { crate = "windows-sys" },
+
+    # Pulled in by the direct dependencies.
+    { crate = "enumflags2" },
+    { crate = "enumflags2_derive" },
+    { crate = "equivalent" },
+    { crate = "hashbrown" },
+    { crate = "indexmap" },
+    { crate = "proc-macro2" },
+    { crate = "quote" },
+    { crate = "serde_core" },
+    { crate = "serde_derive" },
+    { crate = "serde_spanned" },
+    { crate = "syn" },
+    { crate = "thiserror" },
+    { crate = "thiserror-impl" },
+    { crate = "toml_datetime" },
+    { crate = "toml_parser" },
+    { crate = "toml_writer" },
+    { crate = "unicode-ident" },
+    { crate = "windows-link" },
+    { crate = "winnow" },
+]
+# A warning, not an error: the derive macros of serde and thiserror use syn 3, and the one of
+# enumflags2, which landlock uses, syn 2. This project cannot choose either; both are build-time
+# only. cargo-deny refuses a crate that is in `allow` and in `skip`, so a duplicate cannot be
+# excused one crate at a time here.
+multiple-versions = "warn"
+wildcards = "deny"
+# sandy's own crates depend on each other by path, which has no version to pin.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

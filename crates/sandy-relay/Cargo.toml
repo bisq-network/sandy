@@ -1,0 +1,20 @@
+[package]
+name = "sandy-relay"
+description = "Byte relay that makes loopback ports of a sandboxed program reachable, and its egress broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+sandy-core.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }

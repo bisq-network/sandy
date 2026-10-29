@@ -1,0 +1,787 @@
+//! The launch sequence of `run`. Everything that can fail on bad input is prepared first. Then the
+//! process restricts itself step by step and replaces itself with the target. With
+//! `process.children = "contained"` a forked child does that, and sandy supervises it (see
+//! `contain`).
+
+use std::collections::BTreeMap;
+use std::ffi::{CString, OsStr};
+use std::io;
+use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
+use std::ptr;
+
+use landlock::{
+    CompatLevel, Compatible, PathBeneath, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr,
+    RulesetError, RulesetStatus,
+};
+use sandy_core::{ParentProcess, SandboxError, StatusReport, TargetCommand};
+
+use crate::explain::{self, Observer};
+use crate::factory;
+use crate::filter::{FilterConfig, Filters, TargetProcess};
+use crate::handover::Handover;
+use crate::host::THREADS_DIR;
+use crate::namespace::{self, Namespaces};
+use crate::plan::{FileIdentity, LandlockConfig, Sandbox};
+use crate::{broker, contain, filter, relay, view, watch};
+
+/// Applies `sandbox` and executes the target. Without `contain`, sandy applies it to itself and
+/// returns only on failure. With `contain`, a forked child does, and sandy returns the exit
+/// status when the target has ended.
+///
+/// Landlock and seccomp restrict the calling thread. sandy verifies right before Landlock that
+/// it has a single thread, the filters are installed with TSYNC, and execve ends every other
+/// thread, so the target runs with exactly the restrictions applied here.
+pub fn launch(
+    sandbox: &Sandbox,
+    command: &TargetCommand,
+    status: &StatusReport,
+) -> Result<i32, SandboxError> {
+    if command.explain && sandbox.end_with_parent && !sandbox.contain {
+        return Err(SandboxError::new(
+            "--explain cannot be used with process.end_with_parent unless \
+             children = \"contained\": sandy stays the program's parent in this mode, and the \
+             SIGKILL that ends a program which outlasts SIGTERM would end sandy alone; only the \
+             guard of \"contained\" ends the program then",
+        ));
+    }
+    if sandbox.view.is_some() {
+        refuse_directories_on_standard_streams()?;
+    }
+    // With `contained`, the relay and the broker also end when the guard has ended the
+    // program's group, and the guard watches them in turn (see `contain::run`).
+    let mut group_ended = None;
+    let mut ended = None;
+    if sandbox.contain && (sandbox.relay.is_some() || sandbox.broker.is_some()) {
+        let (read, write) = crate::helper::pipe("the pipe of the group's end")?;
+        group_ended = Some(write);
+        ended = Some(read);
+    }
+    let ended_for = |name: &str| {
+        ended
+            .as_ref()
+            .map(|ended| ended.try_clone())
+            .transpose()
+            .map_err(|error| SandboxError::io(format!("cannot give {name} the group's end"), error))
+    };
+    let mut helpers = Vec::new();
+    // What the process that enters the namespaces binds and starts there for the helpers
+    // outside. A helper that serves a listener inside adds its handover here.
+    let mut handovers = Vec::new();
+    let mut factory = None;
+    if let Some(relay) = &sandbox.relay {
+        let (started, inside) = relay::start(relay, ended_for("the relay")?)?;
+        handovers.extend(inside.handover);
+        factory = inside.factory;
+        if sandbox.contain {
+            helpers.push(contain::Helper {
+                pidfd: crate::helper::pidfd_open(started, "the relay")?,
+                failure: relay::ENDED_FIRST,
+            });
+        }
+    }
+    if let Some(config) = &sandbox.broker {
+        let (started, handover) = broker::start(config, ended_for("the egress broker")?)?;
+        handovers.push(handover);
+        if sandbox.contain {
+            helpers.push(contain::Helper {
+                pidfd: crate::helper::pidfd_open(started, "the egress broker")?,
+                failure: broker::ENDED_FIRST,
+            });
+        }
+    }
+    drop(ended);
+    if sandbox.end_with_parent {
+        let parent = command.parent.unwrap_or_else(|| ParentProcess {
+            // SAFETY: getppid has no preconditions.
+            id: unsafe { libc::getppid() } as u32,
+            start: None,
+        });
+        watch::start(parent, sandbox.landlock.abi)?;
+    }
+    let ruleset = prepare_ruleset(&sandbox.landlock, &sandbox.identities)?;
+    let binds = prepare_client_binds(sandbox.client_binds)?;
+    // The filter is built again in the forked child, whose process ID it needs, but a policy it
+    // cannot express fails here, before anything starts.
+    build_filters(&sandbox.filter)?;
+    let (mut explain, observer) = match command.explain {
+        true => {
+            let (explain, observer) = explain::prepare(&sandbox.landlock)?;
+            (Some(explain), Some(observer))
+        }
+        false => (None, None),
+    };
+    let exec = Exec::new(command)?;
+    if let Some(cwd) = &command.cwd {
+        std::env::set_current_dir(cwd).map_err(|error| {
+            SandboxError::io(format!("cannot change to {}", cwd.display()), error)
+        })?;
+    }
+    // With `contain` and with `--explain` this runs in the forked child, so the supervising sandy
+    // stays in the host's namespaces, and it drops its copies of the handovers and the factory
+    // after the fork.
+    let start = |split: Option<&contain::Split>| {
+        // Before the namespaces: the file system view hides /proc.
+        let mut threads = match Threads::open() {
+            Ok(threads) => threads,
+            Err(error) => return error,
+        };
+        if let Some(namespaces) = sandbox.namespaces
+            && let Err(error) = enter(namespaces, sandbox, handovers, factory, &mut threads, split)
+        {
+            return error;
+        }
+        match confine(ruleset, binds, &sandbox.filter, observer.as_ref(), &threads) {
+            Ok(()) => exec.execute(),
+            Err(error) => error,
+        }
+    };
+    if sandbox.contain {
+        let pid_namespace = sandbox.namespaces.is_some_and(|namespaces| namespaces.pid);
+        contain::run(
+            start,
+            group_ended,
+            helpers,
+            status,
+            explain.as_mut(),
+            pid_namespace,
+        )
+    } else if let Some(explain) = explain {
+        explain::supervise(|| start(None), explain, status)
+    } else {
+        // In the exec model sandy becomes the program, so its own process ID is the program's.
+        // Reported before the sandbox, because the status channel is closed on execve and the
+        // seccomp filter has no rule for it.
+        status.started(std::process::id());
+        Err(start(None))
+    }
+}
+
+/// Moves this process into `namespaces` and does there what the helpers outside need (steps 2 to
+/// 5 of `namespace`): with a PID namespace it splits off the init and continues as the program
+/// (`contain::Split`), builds the file system view, binds the listeners of `handovers` and hands
+/// them over, and starts the socket factory of the exposed ports after the capabilities are gone,
+/// so it inherits none.
+fn enter(
+    namespaces: Namespaces,
+    sandbox: &Sandbox,
+    handovers: Vec<Handover>,
+    factory: Option<factory::Pending>,
+    threads: &mut Threads,
+    split: Option<&contain::Split>,
+) -> Result<(), SandboxError> {
+    namespaces.enter()?;
+    if let Some(split) = split {
+        split.run()?;
+        // The list named the process that split itself and has ended.
+        *threads = Threads::open()?;
+    }
+    if let Some(view) = &sandbox.view {
+        view::enter(view, &sandbox.identities, terminal_on_standard_streams())?;
+    }
+    for handover in handovers {
+        handover.send()?;
+    }
+    namespace::drop_capabilities()?;
+    if let Some(factory) = factory {
+        factory.start(sandbox.landlock.abi, threads)?;
+    }
+    Ok(())
+}
+
+/// A directory that a standard stream carries was opened in the host's mount namespace, and the
+/// program reaches every path of the host by name through it (`openat`, `fstatat`), the ones the
+/// file system view hides included. No common program is started with a directory as a stream,
+/// so sandy refuses one instead of leaving that open.
+fn refuse_directories_on_standard_streams() -> Result<(), SandboxError> {
+    for (fd, stream) in [
+        (0, "standard input"),
+        (1, "standard output"),
+        (2, "standard error"),
+    ] {
+        // SAFETY: stat is plain data, which fstat fills in for an open descriptor.
+        let mut status: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstat writes into `status`; a closed descriptor fails with EBADF.
+        if unsafe { libc::fstat(fd, &mut status) } == 0
+            && status.st_mode & libc::S_IFMT == libc::S_IFDIR
+        {
+            return Err(SandboxError::new(format!(
+                "{stream} is a directory, through which the program would reach the paths that \
+                 filesystem.view = \"policy\" hides; pass a file or a pipe instead"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether one of the standard streams is a terminal, for which the view adds `/dev/tty` and
+/// `/dev/pts`.
+fn terminal_on_standard_streams() -> bool {
+    // SAFETY: isatty takes a descriptor.
+    (0..=2).any(|fd| unsafe { libc::isatty(fd) } == 1)
+}
+
+/// The filters for this process. The denylist names its process, user and group IDs. Built after
+/// `enter`: until the maps are written, the IDs read as 65534.
+fn build_filters(config: &FilterConfig) -> Result<Filters, SandboxError> {
+    filter::build(config, &this_process()?)
+        .map_err(|error| SandboxError::new(format!("cannot build the seccomp filter: {error}")))
+}
+
+fn this_process() -> Result<TargetProcess, SandboxError> {
+    let (mut real, mut effective, mut saved) = (0, 0, 0);
+    let (mut real_group, mut effective_group, mut saved_group) = (0, 0, 0);
+    // SAFETY: both calls write three IDs through valid pointers.
+    let read = unsafe {
+        libc::getresuid(&mut real, &mut effective, &mut saved) == 0
+            && libc::getresgid(&mut real_group, &mut effective_group, &mut saved_group) == 0
+    };
+    if !read {
+        return Err(SandboxError::io(
+            "cannot read the user and group IDs",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(TargetProcess {
+        pid: std::process::id(),
+        uids: [real, effective, saved],
+        gids: [real_group, effective_group, saved_group],
+    })
+}
+
+/// Restricts this process step by step: descriptors, no_new_privs, Landlock, seccomp. The
+/// observer of the diagnostic mode comes last: from then on every call it watches waits for
+/// sandy's answer.
+fn confine(
+    ruleset: RulesetCreated,
+    binds: Option<OwnedFd>,
+    filter: &FilterConfig,
+    observer: Option<&Observer>,
+    threads: &Threads,
+) -> Result<(), SandboxError> {
+    // Not before: until here sandy writes for itself, the status record of `--status-fd` for
+    // one, and a reader that has gone must not end it, nor make it signal the program.
+    restore_sigpipe()?;
+    let filters = build_filters(filter)?;
+    mark_descriptors_close_on_exec()?;
+    set_no_new_privs()?;
+    threads.ensure_single()?;
+    restrict(ruleset)?;
+    restrict_client_binds(binds)?;
+    filter::install(&filters).map_err(|error| {
+        SandboxError::new(format!("cannot install the seccomp filter: {error}"))
+    })?;
+    match observer {
+        Some(observer) => observer.install(),
+        None => Ok(()),
+    }
+}
+
+fn landlock_error(error: RulesetError) -> SandboxError {
+    SandboxError::new(format!("Landlock: {error}"))
+}
+
+/// Builds the ruleset completely before anything is restricted. With `HardRequirement`, every
+/// right that the kernel does not support is an error instead of being dropped. Each rule binds
+/// the file its path named when sandy planned the run (`open_rule`).
+fn prepare_ruleset(
+    config: &LandlockConfig,
+    identities: &BTreeMap<PathBuf, FileIdentity>,
+) -> Result<RulesetCreated, SandboxError> {
+    let mut ruleset = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(config.handled_fs)
+        .map_err(landlock_error)?;
+    if !config.handled_net.is_empty() {
+        ruleset = ruleset
+            .handle_access(config.handled_net)
+            .map_err(landlock_error)?;
+    }
+    if !config.scopes.is_empty() {
+        ruleset = ruleset.scope(config.scopes).map_err(landlock_error)?;
+    }
+    let mut ruleset = ruleset.create().map_err(landlock_error)?;
+    for rule in &config.rules {
+        let fd = open_rule(&rule.path, identities.get(&rule.path).copied())?;
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(fd, rule.access))
+            .map_err(landlock_error)?;
+    }
+    Ok(ruleset)
+}
+
+/// The ruleset of `Sandbox::client_binds`: it handles `rights` and grants them on port 0 only,
+/// so that a socket binds only to a port the kernel chooses. sandy makes it with the system calls
+/// themselves, because the landlock crate does not know the UDP right of ABI 10, and applies it
+/// as a second Landlock layer right after the first.
+fn prepare_client_binds(rights: u64) -> Result<Option<OwnedFd>, SandboxError> {
+    /// `struct landlock_ruleset_attr` up to `handled_access_net`, which every kernel with
+    /// network rights knows.
+    #[repr(C)]
+    struct RulesetAttr {
+        handled_access_fs: u64,
+        handled_access_net: u64,
+    }
+    /// `struct landlock_net_port_attr`.
+    #[repr(C)]
+    struct NetPortAttr {
+        allowed_access: u64,
+        port: u64,
+    }
+    const LANDLOCK_RULE_NET_PORT: libc::c_int = 2;
+    if rights == 0 {
+        return Ok(None);
+    }
+    let failed = |what: &str| {
+        SandboxError::io(
+            format!("Landlock: cannot {what} the bind rules of ip = \"client\""),
+            io::Error::last_os_error(),
+        )
+    };
+    let attr = RulesetAttr {
+        handled_access_fs: 0,
+        handled_access_net: rights,
+    };
+    // SAFETY: attr is a ruleset attribute of the size passed, and the kernel only reads it.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            &attr as *const RulesetAttr,
+            std::mem::size_of::<RulesetAttr>(),
+            0u32,
+        )
+    };
+    if fd < 0 {
+        return Err(failed("create"));
+    }
+    // SAFETY: the kernel just created the descriptor, close-on-exec, and nothing else owns it.
+    let ruleset = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
+    let port = NetPortAttr {
+        allowed_access: rights,
+        port: 0,
+    };
+    // SAFETY: the ruleset is open and `port` is a rule of type LANDLOCK_RULE_NET_PORT, which the
+    // kernel only reads.
+    let added = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_add_rule,
+            std::os::fd::AsRawFd::as_raw_fd(&ruleset),
+            LANDLOCK_RULE_NET_PORT,
+            &port as *const NetPortAttr,
+            0u32,
+        )
+    };
+    if added != 0 {
+        return Err(failed("add"));
+    }
+    Ok(Some(ruleset))
+}
+
+fn restrict_client_binds(ruleset: Option<OwnedFd>) -> Result<(), SandboxError> {
+    let Some(ruleset) = ruleset else {
+        return Ok(());
+    };
+    // SAFETY: the ruleset is open, and no_new_privs is set, which the call needs.
+    let restricted = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_restrict_self,
+            std::os::fd::AsRawFd::as_raw_fd(&ruleset),
+            0u32,
+        )
+    };
+    if restricted != 0 {
+        return Err(SandboxError::io(
+            "Landlock: cannot apply the bind rules of ip = \"client\"",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+/// Opens the canonical rule path `path` one component at a time without following a symbolic
+/// link, and checks that it is still `planned`, the file sandy planned with. The checks of the
+/// policy look at paths, and Landlock binds the file a descriptor refers to. A process that can
+/// write a parent of a policy path, for example one a previous run left behind, could otherwise
+/// replace the path with a link or with another directory after the checks, and the rule would
+/// grant access where no check looked. A change refuses the run.
+pub(crate) fn open_rule(
+    path: &Path,
+    planned: Option<FileIdentity>,
+) -> Result<OwnedFd, SandboxError> {
+    let changed = |why: &str| {
+        SandboxError::new(format!(
+            "{} changed after sandy checked the policy: {why}",
+            path.display()
+        ))
+    };
+    let open_error = |error| SandboxError::io(format!("cannot open {}", path.display()), error);
+    let mut fd = open_path(None, Path::new("/")).map_err(open_error)?;
+    for component in path.components().skip(1) {
+        let Component::Normal(name) = component else {
+            return Err(SandboxError::new(format!(
+                "{} is not a canonical path",
+                path.display()
+            )));
+        };
+        fd = open_path(Some(&fd), Path::new(name)).map_err(open_error)?;
+        let file = std::fs::File::from(fd);
+        let metadata = file.metadata().map_err(open_error)?;
+        if metadata.file_type().is_symlink() {
+            return Err(changed("a symbolic link lies on its way now"));
+        }
+        fd = OwnedFd::from(file);
+    }
+    let file = std::fs::File::from(fd);
+    let found = identity_of(&file.metadata().map_err(open_error)?);
+    if planned != Some(found) {
+        return Err(changed("it names another file now"));
+    }
+    Ok(OwnedFd::from(file))
+}
+
+/// The identity of the file at the canonical path `path`, read as `open_rule` reads it: through
+/// an O_PATH open, which mounts an automount point where a `stat` would not.
+pub(crate) fn identity(path: &Path) -> Option<FileIdentity> {
+    let file = std::fs::File::from(open_path(None, path).ok()?);
+    Some(identity_of(&file.metadata().ok()?))
+}
+
+fn identity_of(metadata: &std::fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
+/// An O_PATH descriptor for `name`, below the directory `parent` or from the current
+/// directory, without following a symbolic link in `name`.
+pub(crate) fn open_path(parent: Option<&OwnedFd>, name: &Path) -> io::Result<OwnedFd> {
+    use std::os::fd::AsRawFd;
+    let name = CString::new(name.as_os_str().as_bytes())?;
+    let parent = parent.map_or(libc::AT_FDCWD, AsRawFd::as_raw_fd);
+    let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `name` is NUL-terminated and `parent` is a descriptor this process owns or
+    // AT_FDCWD.
+    let fd = unsafe { libc::openat(parent, name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor was just created and nothing else owns it.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Landlock restricts only the calling thread. Another thread would keep running without the
+/// file system rules until execve ends it. sandy starts no threads; this check makes that a
+/// verified fact instead of an assumption. LANDLOCK_RESTRICT_SELF_TSYNC (ABI 8) would cover such
+/// a thread instead, but only on new kernels, and it would hide a thread that should not exist.
+pub(crate) fn ensure_single_thread() -> Result<(), SandboxError> {
+    Threads::open()?.ensure_single()
+}
+
+/// The thread list of this process (`THREADS_DIR`), held open: a file system view hides `/proc`
+/// before the last checks, and the open directory still lists this process's threads.
+pub(crate) struct Threads(OwnedFd);
+
+impl Threads {
+    pub(crate) fn open() -> Result<Threads, SandboxError> {
+        let path = CString::new(THREADS_DIR).expect("no NUL byte in the path");
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+        // SAFETY: open takes a NUL-terminated path and flags and returns a new descriptor or -1.
+        let fd = unsafe { libc::open(path.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(Threads::list_error(io::Error::last_os_error()));
+        }
+        // SAFETY: the descriptor was just created and nothing else owns it.
+        Ok(Threads(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    fn list_error(error: io::Error) -> SandboxError {
+        SandboxError::io(format!("cannot list {THREADS_DIR}"), error)
+    }
+
+    pub(crate) fn ensure_single(&self) -> Result<(), SandboxError> {
+        let threads = self.count().map_err(Threads::list_error)?;
+        if threads != 1 {
+            return Err(SandboxError::new(format!(
+                "sandy has {threads} threads, but Landlock would restrict only one of them"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The entries of the list, read through a new descriptor of the directory, so that every
+    /// count starts at its beginning.
+    fn count(&self) -> io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+        // SAFETY: openat takes the open directory and a NUL-terminated name.
+        let fd = unsafe { libc::openat(self.0.as_raw_fd(), c".".as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fdopendir takes over the descriptor just opened; closedir releases both.
+        let directory = unsafe { libc::fdopendir(fd) };
+        if directory.is_null() {
+            let error = io::Error::last_os_error();
+            // SAFETY: fdopendir failed, so the descriptor is still this function's to close.
+            unsafe { libc::close(fd) };
+            return Err(error);
+        }
+        let mut count = 0;
+        let ended = loop {
+            // SAFETY: readdir reads the next entry of the open directory stream; errno tells its
+            // end from an error.
+            let entry = unsafe {
+                *libc::__errno_location() = 0;
+                libc::readdir(directory)
+            };
+            if entry.is_null() {
+                break io::Error::last_os_error();
+            }
+            // SAFETY: a non-null entry holds a NUL-terminated name.
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if name != c"." && name != c".." {
+                count += 1;
+            }
+        };
+        // SAFETY: closes the stream opened above.
+        unsafe { libc::closedir(directory) };
+        match ended.raw_os_error() {
+            Some(0) | None => Ok(count),
+            _ => Err(ended),
+        }
+    }
+}
+
+pub(crate) fn restrict(ruleset: RulesetCreated) -> Result<(), SandboxError> {
+    let status = ruleset.restrict_self().map_err(landlock_error)?;
+    if status.ruleset != RulesetStatus::FullyEnforced {
+        return Err(SandboxError::new(format!(
+            "Landlock is not fully enforced: {:?}",
+            status.ruleset
+        )));
+    }
+    Ok(())
+}
+
+/// The Rust runtime ignores SIGPIPE, and an ignored signal stays ignored across execve. Programs
+/// expect the default action.
+fn restore_sigpipe() -> Result<(), SandboxError> {
+    // SAFETY: setting the default action of SIGPIPE has no memory safety requirements.
+    if unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) } == libc::SIG_ERR {
+        return Err(SandboxError::io(
+            "cannot restore SIGPIPE",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+/// Marks every descriptor above 2 close-on-exec. Closing them now would also close the Landlock
+/// ruleset that is still needed.
+fn mark_descriptors_close_on_exec() -> Result<(), SandboxError> {
+    // SAFETY: close_range with CLOSE_RANGE_CLOEXEC only changes descriptor flags.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3u32,
+            u32::MAX,
+            libc::CLOSE_RANGE_CLOEXEC,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        // close_range exists since Linux 5.9 and CLOSE_RANGE_CLOEXEC since 5.11.
+        Some(libc::ENOSYS | libc::EINVAL) => mark_listed_descriptors_close_on_exec(),
+        _ => Err(SandboxError::io(
+            "cannot mark descriptors close-on-exec",
+            error,
+        )),
+    }
+}
+
+fn mark_listed_descriptors_close_on_exec() -> Result<(), SandboxError> {
+    let list_error = |error| SandboxError::io("cannot list the open descriptors", error);
+    for entry in std::fs::read_dir("/proc/self/fd").map_err(list_error)? {
+        let name = entry.map_err(list_error)?.file_name();
+        let fd: libc::c_int = name
+            .to_str()
+            .and_then(|name| name.parse().ok())
+            .ok_or_else(|| SandboxError::new(format!("unexpected descriptor name {name:?}")))?;
+        if fd <= 2 {
+            continue;
+        }
+        // SAFETY: F_SETFD only changes the flags of the descriptor.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(SandboxError::io(
+                format!("cannot mark descriptor {fd} close-on-exec"),
+                io::Error::last_os_error(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn set_no_new_privs() -> Result<(), SandboxError> {
+    // SAFETY: PR_SET_NO_NEW_PRIVS only sets a process flag.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(SandboxError::io(
+            "cannot set no_new_privs",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+/// The arguments of execve, built before the sandbox is applied. After the seccomp filter is in
+/// place only the execve call remains.
+struct Exec {
+    program: CString,
+    argv: Vec<*const libc::c_char>,
+    envp: Vec<*const libc::c_char>,
+    // The pointer arrays point into these strings. Moving a CString does not move its buffer.
+    _args: Vec<CString>,
+    _env: Vec<CString>,
+}
+
+impl Exec {
+    fn new(command: &TargetCommand) -> Result<Exec, SandboxError> {
+        let program = c_string(command.program.as_os_str())?;
+        let mut args = vec![c_string(&command.arg0)?];
+        for arg in &command.args {
+            args.push(c_string(arg)?);
+        }
+        let mut env = Vec::with_capacity(command.env.len());
+        for (name, value) in &command.env {
+            let mut entry = name.as_bytes().to_vec();
+            entry.push(b'=');
+            entry.extend_from_slice(value.as_bytes());
+            env.push(c_string(OsStr::from_bytes(&entry))?);
+        }
+        let pointers = |strings: &[CString]| {
+            strings
+                .iter()
+                .map(|string| string.as_ptr())
+                .chain([ptr::null()])
+                .collect()
+        };
+        Ok(Exec {
+            argv: pointers(&args),
+            envp: pointers(&env),
+            program,
+            _args: args,
+            _env: env,
+        })
+    }
+
+    fn execute(&self) -> SandboxError {
+        // SAFETY: every pointer points into a CString owned by `self`, and both arrays end with a
+        // null pointer.
+        unsafe {
+            libc::execve(
+                self.program.as_ptr(),
+                self.argv.as_ptr(),
+                self.envp.as_ptr(),
+            )
+        };
+        let error = io::Error::last_os_error();
+        SandboxError::io(format!("cannot execute {:?}", self.program), error)
+    }
+}
+
+fn c_string(value: &OsStr) -> Result<CString, SandboxError> {
+    CString::new(value.as_bytes())
+        .map_err(|_| SandboxError::new(format!("{value:?} contains a NUL byte")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn a_second_thread_stops_the_launch() {
+        let (stop, wait) = mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || wait.recv());
+        let error = ensure_single_thread().unwrap_err();
+        assert!(error.to_string().contains("threads"), "{error}");
+        drop(stop);
+        let _ = thread.join();
+    }
+
+    /// A directory with `rule/inner` and an unrelated `elsewhere`, canonical like a rule path.
+    fn tree(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("sandy-launch-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("rule/inner")).unwrap();
+        std::fs::create_dir_all(dir.join("elsewhere/inner")).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    /// Opens `target` as a rule after `change` ran between the plan and the launch.
+    fn open_after(name: &str, target: &str, change: impl FnOnce(&Path)) -> Result<(), String> {
+        let dir = tree(name);
+        let path = dir.join(target);
+        let planned = identity(&path);
+        assert!(planned.is_some());
+        change(&dir);
+        let result = open_rule(&path, planned)
+            .map(drop)
+            .map_err(|error| error.to_string());
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    #[test]
+    fn an_unchanged_rule_path_is_opened() {
+        assert_eq!(open_after("same", "rule/inner", |_| {}), Ok(()));
+    }
+
+    #[test]
+    fn a_rule_path_replaced_by_a_link_is_refused() {
+        let error = open_after("link", "rule", |dir| {
+            std::fs::rename(dir.join("rule"), dir.join("moved")).unwrap();
+            std::os::unix::fs::symlink(dir.join("elsewhere"), dir.join("rule")).unwrap();
+        })
+        .unwrap_err();
+        assert!(error.contains("changed after sandy checked"), "{error}");
+    }
+
+    /// A link in a parent of the rule path, with the same names below it.
+    #[test]
+    fn a_link_on_the_way_to_a_rule_path_is_refused() {
+        let error = open_after("parent-link", "rule/inner", |dir| {
+            std::fs::rename(dir.join("rule"), dir.join("moved")).unwrap();
+            std::os::unix::fs::symlink(dir.join("elsewhere"), dir.join("rule")).unwrap();
+        })
+        .unwrap_err();
+        assert!(error.contains("changed after sandy checked"), "{error}");
+    }
+
+    /// The resolver made the path canonical, so a link that is already there when sandy plans
+    /// the run appeared after the checks of the resolver, and the identity sandy recorded is
+    /// the link's target.
+    #[test]
+    fn a_link_that_appeared_before_the_plan_is_refused() {
+        let dir = tree("early-link");
+        std::fs::rename(dir.join("rule"), dir.join("moved")).unwrap();
+        std::os::unix::fs::symlink(dir.join("elsewhere"), dir.join("rule")).unwrap();
+        let path = dir.join("rule/inner");
+        let error = open_rule(&path, identity(&path)).unwrap_err().to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(error.contains("symbolic link"), "{error}");
+    }
+
+    #[test]
+    fn a_rule_path_replaced_by_another_directory_is_refused() {
+        let error = open_after("directory", "rule/inner", |dir| {
+            std::fs::rename(dir.join("rule"), dir.join("moved")).unwrap();
+            std::fs::rename(dir.join("elsewhere"), dir.join("rule")).unwrap();
+        })
+        .unwrap_err();
+        assert!(error.contains("changed after sandy checked"), "{error}");
+    }
+}

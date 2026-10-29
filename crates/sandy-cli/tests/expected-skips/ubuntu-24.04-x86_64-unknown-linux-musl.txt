@@ -1,0 +1,95 @@
+# Expected skips on the GitHub ubuntu-24.04-x86_64-unknown-linux-musl runner, measured in CI: Landlock ABI 8, Ubuntu's
+# AppArmor restriction of unprivileged user namespaces on.
+# The static musl build of the release.
+# There is no /etc/crypto-policies/back-ends, which Fedora and RHEL have.
+review_linux_conformance the_crypto_policy_files_are_readable crypto-policies
+# One sampled call of the denylist fails outside the sandbox already.
+review_linux_conformance denylisted_calls_fail_with_eperm_on_the_kernel denylist-sample
+# A static program has no loader to check.
+review_linux_conformance a_program_whose_loader_is_not_granted_is_refused dynamic-program
+# The runner's file system has no fs-verity.
+review_linux_conformance file_system_ioctls_cannot_change_readable_files fs-verity
+# The runner user may create no ICMP datagram socket outside the sandbox either.
+escape a_raw_ip_socket_on_standard_input_is_refused icmp-datagram-socket
+# UDP bind rules need Landlock ABI 10.
+escape_linux client_binds_follow_the_landlock_abi landlock-abi-10
+# The OpenSSL configuration includes no file that exists.
+review_linux_conformance unreadable_openssl_includes_are_reported openssl-includes
+# Linux re-parents a process whose parent ended to the nearest subreaper, which sandy cannot
+# tell from a caller that is still there. Only --parent-start closes this (docs/linux.md).
+parent a_parent_that_ended_before_sandy_ran_is_refused orphan-detection-without-a-token
+# Under the same restriction a contained program gets no PID namespace; the Landlock signal
+# scope isolates its signals instead.
+pid_linux a_guard_that_ends_while_the_program_runs_ends_the_run pid-namespace
+pid_linux a_proc_grant_keeps_its_host_files_with_contained pid-namespace
+pid_linux a_signal_to_the_programs_group_reaches_only_the_program pid-namespace
+pid_linux check_names_the_pid_namespace_for_isolated_signals_below_abi_6 pid-namespace
+pid_linux check_tries_the_pid_namespace_where_the_run_needs_one pid-namespace
+pid_linux files_of_root_show_the_owner_65534_in_the_pid_namespace pid-namespace
+pid_linux orphans_are_reaped pid-namespace
+pid_linux processes_outside_are_unreachable_by_id pid-namespace
+pid_linux the_init_is_undumpable pid-namespace
+pid_linux the_namespace_ends_when_sandy_and_the_guard_are_killed pid-namespace
+pid_linux the_program_runs_as_pid_2_below_an_init_of_sandy pid-namespace
+pid_linux the_status_record_names_the_program_outside_its_namespace pid-namespace
+# pkexec is not installed.
+setup_linux elevate_installs_a_copy_that_only_root_can_change pkexec
+# Yama stops ptrace and reading /proc/PID/mem outside the sandbox already.
+escape_linux parent_cannot_be_traced ptrace
+escape_linux parent_memory_and_environment_are_unreadable ptrace
+# The runner user may create no raw IP socket outside the sandbox either.
+escape a_raw_ip_socket_on_standard_input_is_refused raw-socket
+# Only an SSH session without a display is known to have no authentication agent.
+setup_linux elevate_without_an_authentication_agent_is_not_done session-without-authentication-agent
+# The tests that build path layouts in an unprivileged mount namespace cannot make one either.
+escape_linux a_master_of_another_devpts_instance_is_refused unshare
+escape_linux a_pty_grant_makes_a_pseudo_terminal_in_every_ptmx_layout unshare
+escape_linux refuses_a_loader_in_an_alias_of_a_writable_path unshare
+escape_linux refuses_a_read_exec_alias_of_a_writable_subdirectory unshare
+escape_linux refuses_a_writable_alias_of_a_system_set_directory unshare
+escape_linux refuses_a_writable_path_when_no_source_names_the_home_directory unshare
+# Ubuntu restricts the user namespaces of unconfined processes with AppArmor, so without
+# `sandy setup` there is no private network and no file system view; check names setup.
+levels a_passing_failure_never_selects_a_weaker_level user-namespaces
+private_linux a_dead_broker_ends_a_contained_program user-namespaces
+private_linux a_dead_socket_factory_ends_a_contained_program user-namespaces
+private_linux a_forwarded_port_reaches_the_service user-namespaces
+private_linux a_process_limit_makes_the_namespaces_undecided user-namespaces
+private_linux a_stopped_broker_ends_with_the_program user-namespaces
+private_linux an_exposed_port_reaches_the_program_and_its_own_port_stays_inside user-namespaces
+private_linux an_inherited_ip_socket_is_refused user-namespaces
+private_linux another_user_cannot_reach_a_forward_port user-namespaces
+private_linux another_user_cannot_reach_the_egress_port user-namespaces
+private_linux check_reports_the_egress_broker user-namespaces
+private_linux check_reports_the_private_network_and_what_stays_open user-namespaces
+private_linux check_tries_the_namespaces_inside_a_sandbox_that_denies_them user-namespaces
+private_linux datagrams_from_outside_do_not_reach_the_program user-namespaces
+private_linux public_and_local_reaches_a_host_of_the_local_network user-namespaces
+private_linux the_broker_closes_its_listener_as_soon_as_the_program_ends user-namespaces
+private_linux the_broker_reaches_a_public_address user-namespaces
+private_linux the_broker_refuses_names_with_reply_8 user-namespaces
+private_linux the_broker_refuses_this_host_with_reply_2 user-namespaces
+private_linux the_program_keeps_its_ids_and_holds_no_capability user-namespaces
+private_linux the_program_reaches_no_abstract_socket_of_the_host user-namespaces
+private_linux the_program_reaches_no_listener_on_the_hosts_loopback user-namespaces
+private_linux the_program_reaches_no_other_address_of_the_host user-namespaces
+view_linux a_directory_on_a_standard_stream_is_refused user-namespaces
+view_linux a_pty_grant_in_the_view_makes_a_pty_only_where_ptmx_is_in_the_devpts user-namespaces
+view_linux a_read_only_descriptor_changes_no_metadata_in_the_view user-namespaces
+view_linux a_rename_between_writable_paths_fails_with_exdev user-namespaces
+view_linux a_terminal_works_when_one_is_attached user-namespaces
+view_linux check_reports_the_view_and_what_stays_visible user-namespaces
+view_linux code_maps_only_from_executable_paths user-namespaces
+view_linux dev_holds_the_minimal_devices user-namespaces
+view_linux dynamic_programs_run_with_the_system_set user-namespaces
+view_linux hidden_paths_look_missing user-namespaces
+view_linux names_resolve_under_client user-namespaces
+view_linux proc_is_bound_read_only user-namespaces
+view_linux the_links_of_a_merged_usr_work user-namespaces
+view_linux the_mount_table_names_the_hosts_devices user-namespaces
+view_linux the_view_leaves_the_file_systems_the_parents_and_link_counts_visible user-namespaces
+view_linux the_view_works_with_a_private_network user-namespaces
+view_linux the_view_works_with_the_process_modes user-namespaces
+# /etc/resolv.conf is a plain file on some machines of this runner, so the check of
+# systemd-resolved's directory runs only on the others (seen on ubuntu-22.04 and ubuntu-24.04).
+? escape_linux the_resolver_directory_is_granted_with_ip resolver-directory

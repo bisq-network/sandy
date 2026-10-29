@@ -1,0 +1,427 @@
+use std::cell::RefCell;
+use std::ffi::OsString;
+use std::fmt;
+use std::fs::File;
+use std::io::{self, Write};
+use std::path::PathBuf;
+
+use crate::plan::PlanItem;
+use crate::resolve::{ResolvedLevel, ResolvedPolicy};
+use crate::streams::CreatableSocket;
+
+/// The program to start inside the sandbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetCommand {
+    /// Canonical absolute path of the executable.
+    pub program: PathBuf,
+    /// The program as the caller named it, passed as `argv[0]`. Multi-call programs choose
+    /// their behavior by this name, which can differ from the resolved `program`.
+    pub arg0: OsString,
+    pub args: Vec<OsString>,
+    /// The complete environment of the target, already filtered by the policy. A backend may
+    /// add variables the platform needs to start any process (documented per backend).
+    pub env: Vec<(OsString, OsString)>,
+    /// Working directory; `None` keeps the current one.
+    pub cwd: Option<PathBuf>,
+    /// For `process.end_with_parent`: the process that started sandy. `None` lets the backend
+    /// find the parent itself.
+    pub parent: Option<ParentProcess>,
+    /// `--explain`: report what the sandbox denied while the program runs. It must change
+    /// nothing the sandbox enforces. A backend that has no sound way to report it refuses the
+    /// run, because silence would read as "nothing was denied".
+    pub explain: bool,
+}
+
+/// For `process.end_with_parent`: the process sandy watches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParentProcess {
+    /// The process ID. On Unix sandy reads it as its first step, or the caller names it with
+    /// `--parent-pid` and sandy checks it then; on Windows only the caller names it.
+    pub id: u32,
+    /// `--parent-start`: the start of the process with that ID, which only the caller itself
+    /// can know, so a process that got the ID after the caller ended is told apart from the
+    /// caller. The form is platform-specific (see the platform docs). Without it a named
+    /// process ID must be sandy's own parent.
+    pub start: Option<u64>,
+}
+
+/// The record of `--status-fd`. sandy stays the parent of the program with
+/// `process.children = "contained"` and on Windows, so its own exit status does not say which
+/// process the program was, and 125 means both "sandy refused" and "the program exited with
+/// 125". A caller that needs to tell these apart reads the record instead. One line per event,
+/// in this order:
+///
+/// - `level NAME` first, when the policy has fallback levels: the level that runs.
+/// - `pid N` once the program runs, with the program's process ID. In the exec model (Linux and
+///   macOS without `contained`) sandy writes it right before it replaces itself with the
+///   program, because afterwards it cannot write any more.
+/// - `exited N` or `signaled N` when sandy saw the program end. The exec model has no such
+///   line: sandy is the program there, and the caller's own wait status is the program's.
+/// - `failed` when sandy itself failed or refused. Without a `pid` line the program never ran.
+///   After one it means that the last step, the `execve`, failed, or, with `contained`, that
+///   sandy ended the run because a process it relies on ended while the program ran: the guard,
+///   the init of the PID namespace, a relay or the broker.
+///
+/// Writing is best effort: a caller that closed the read end gets no record, and the program
+/// keeps running.
+#[derive(Debug)]
+pub struct StatusReport {
+    channel: Option<RefCell<File>>,
+}
+
+impl StatusReport {
+    /// No record: the caller passed no `--status-fd`.
+    pub fn none() -> StatusReport {
+        StatusReport { channel: None }
+    }
+
+    /// Writes the record to `channel`, which the caller must have made close-on-exec, so that
+    /// the program never sees it.
+    pub fn to(channel: File) -> StatusReport {
+        StatusReport {
+            channel: Some(RefCell::new(channel)),
+        }
+    }
+
+    pub fn level(&self, name: &str) {
+        self.write(format_args!("level {name}"));
+    }
+
+    /// The descriptor the record goes to, which a backend that closes the descriptors it
+    /// inherited must keep.
+    #[cfg(unix)]
+    pub fn descriptor(&self) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd;
+
+        Some(self.channel.as_ref()?.borrow().as_raw_fd())
+    }
+
+    pub fn started(&self, pid: u32) {
+        self.write(format_args!("pid {pid}"));
+    }
+
+    pub fn exited(&self, code: i32) {
+        self.write(format_args!("exited {code}"));
+    }
+
+    pub fn signaled(&self, signal: i32) {
+        self.write(format_args!("signaled {signal}"));
+    }
+
+    pub fn failed(&self) {
+        self.write(format_args!("failed"));
+    }
+
+    fn write(&self, line: fmt::Arguments<'_>) {
+        let Some(channel) = &self.channel else {
+            return;
+        };
+        let mut channel = channel.borrow_mut();
+        let _ = writeln!(channel, "{line}");
+        let _ = channel.flush();
+    }
+}
+
+/// One operating system sandbox implementation.
+///
+/// Contract:
+/// - `plan` reports every requirement of `policy.requirements()` as enforced (naming the
+///   mechanism) or not, with the reason. It must not change any state.
+/// - A requirement is `Unavailable` or `NeedsSetup` only for a lasting shortfall of the host:
+///   one that neither another local user, nor a remote party, nor an earlier run of the program
+///   can cause, because sandy then tries the next, weaker fallback level of the policy. A probe
+///   that fails for a reason that can pass (memory, process or descriptor limits, a timeout, a
+///   service that is starting, a read error) is `Indeterminate`, and a policy that contradicts
+///   itself or the host's fixed layout is a `Conflict`; both end the selection with status 125.
+/// - One backend value detects each host property at most once and keeps the answer, so every
+///   level that one invocation plans, the `notes` and `explain_paths` of the selected one, and
+///   its `run`, see the same host. A probe whose answer differs between two levels would let a
+///   passing failure pick the level.
+/// - `verify` adds what `plan` cannot see without touching the host. Only `check` calls it, for
+///   the selected level only, and every report from it that is not enforced makes `check` fail
+///   with status 125: it never makes sandy try another level.
+/// - `run` is called only when the plan is fully enforceable. It applies every mechanism the
+///   plan named. If any step fails, it returns an error and never starts the target with a
+///   weaker sandbox.
+/// - On Unix, `run` replaces the current process with the target and returns only on failure.
+///   Elsewhere it waits for the target and returns its exit code.
+/// - `run` reports the program's process ID to `status` once the program runs, and how it ended
+///   when it waits for the program. It writes nothing else there; `failed` is the caller's.
+pub trait Backend {
+    fn name(&self) -> &'static str;
+
+    fn plan(&self, policy: &ResolvedPolicy) -> Vec<PlanItem>;
+
+    /// Conditions that would make `run` refuse and that `plan` cannot see without touching the
+    /// host, for example a relay port another process holds. `check` calls it once it has
+    /// selected an enforceable level, and fails with status 125 on any report that is not
+    /// enforced, so implementations report `Status::Indeterminate`; `run` does not call it,
+    /// because it finds out while it applies the sandbox. An implementation must leave the host
+    /// as it found it, and its answer can be stale a moment later, so `run` stays the
+    /// authoritative answer.
+    fn verify(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
+        crate::verify::relay_listeners(policy)
+    }
+
+    fn run(
+        &self,
+        policy: &ResolvedPolicy,
+        command: &TargetCommand,
+        status: &StatusReport,
+    ) -> Result<i32, SandboxError>;
+
+    /// What makes the program behave differently inside the sandbox than outside on this host,
+    /// beyond the requirements, for example a configuration file the policy does not cover, and
+    /// what a requirement the policy asks for leaves open on this platform although `plan`
+    /// reports it as enforced (DESIGN.md, "Requirements and the enforcement plan").
+    /// `check` prints these as warnings next to the ones of the policy; they change neither what
+    /// sandy enforces nor the exit status, so a backend reports a fact here instead of refusing
+    /// when the program may well not be affected. Like `verify`, it may read host state and must
+    /// leave the host as it found it.
+    fn notes(&self, _policy: &ResolvedPolicy) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// What `ip = "all"` and `ip = "client"` let the program create on this platform besides
+    /// AF_INET and AF_INET6 sockets. `run` accepts such a socket on a standard stream like an IP
+    /// socket, because the program could create one itself, and refuses every other family (see
+    /// `streams`).
+    fn ip_also_allows(&self) -> &'static [CreatableSocket] {
+        &[]
+    }
+
+    /// Whether this backend can report what the sandbox denied while the program runs
+    /// (`run --explain`). A backend without a sound way to do it says so here, and the CLI
+    /// refuses the option: a diagnostic that reports nothing would read as "nothing was denied".
+    fn can_explain(&self) -> bool {
+        false
+    }
+
+    /// What the sandbox of this policy allows for each of `paths` on this host, and which rule
+    /// decides it (`check --explain-path`). `None` from a backend that cannot answer; the CLI
+    /// then says so instead of printing a guess. Reads host state like `verify`.
+    fn explain_paths(&self, _policy: &ResolvedPolicy, _paths: &[PathBuf]) -> Option<Vec<String>> {
+        None
+    }
+
+    /// One-time host preparation that needs elevated rights, for example on Windows. Must be
+    /// idempotent.
+    fn setup(
+        &self,
+        _policy: &ResolvedPolicy,
+        _options: SetupOptions,
+    ) -> Result<SetupOutcome, SandboxError> {
+        Ok(SetupOutcome::Done(
+            "nothing to do: this platform needs no setup".to_string(),
+        ))
+    }
+
+    /// Takes back what `setup` and the runs of this policy left on the host. Must be
+    /// idempotent, and must touch only what sandy itself created for this policy. A backend
+    /// that leaves nothing behind does nothing here.
+    fn remove(
+        &self,
+        _policy: &ResolvedPolicy,
+        _options: SetupOptions,
+    ) -> Result<SetupOutcome, SandboxError> {
+        Ok(SetupOutcome::Done(
+            "nothing to remove: this platform needs no setup".to_string(),
+        ))
+    }
+
+    /// `setup --elevate` and `setup --remove --elevate`: `setup` or `remove` of every level
+    /// (`setup_levels`) with the rights they need, asked for from the user. `args` are sandy's
+    /// own arguments without `--elevate`, for a backend that runs sandy again with those rights.
+    /// The rights must never run a file that someone without them can change. A process that
+    /// already holds them, and a backend that needs none, runs the step directly.
+    fn elevate(
+        &self,
+        levels: &[ResolvedLevel],
+        remove: bool,
+        options: SetupOptions,
+        _args: &[OsString],
+    ) -> Result<SetupOutcome, SandboxError> {
+        setup_levels(levels, |policy| {
+            if remove {
+                self.remove(policy, options)
+            } else {
+                self.setup(policy, options)
+            }
+        })
+    }
+}
+
+/// `setup` or `setup --remove` of every level of a policy, in order, as one step. A policy
+/// without fallback levels gets the outcome of its base unchanged. With levels it is done when
+/// every level is done, and refused when the first level refuses, before anything changed; a
+/// refusal or failure after a level changed the host is an error, because status 3 promises
+/// that nothing changed.
+pub fn setup_levels(
+    levels: &[ResolvedLevel],
+    mut step: impl FnMut(&ResolvedPolicy) -> Result<SetupOutcome, SandboxError>,
+) -> Result<SetupOutcome, SandboxError> {
+    if let [only] = levels {
+        return step(&only.policy);
+    }
+    let mut messages = Vec::new();
+    for (index, level) in levels.iter().enumerate() {
+        let failure = |reason: String| {
+            let done: Vec<&str> = levels[..index].iter().map(|l| l.name.as_str()).collect();
+            SandboxError::new(format!(
+                "level {}: {reason}; done before it: {}",
+                level.name,
+                done.join(", ")
+            ))
+        };
+        match step(&level.policy) {
+            Ok(SetupOutcome::Done(message)) => {
+                if !message.is_empty() {
+                    messages.push(format!("level {}: {message}", level.name));
+                }
+            }
+            Ok(SetupOutcome::Refused(message)) if index == 0 => {
+                return Ok(SetupOutcome::Refused(format!(
+                    "level {}: {message}",
+                    level.name
+                )));
+            }
+            Ok(SetupOutcome::Refused(message)) => return Err(failure(message)),
+            Err(error) if index == 0 => {
+                return Err(SandboxError::new(format!("level {}: {error}", level.name)));
+            }
+            Err(error) => return Err(failure(error.to_string())),
+        }
+    }
+    Ok(SetupOutcome::Done(messages.join("\n")))
+}
+
+/// What `sandy setup` and `sandy setup --remove` are asked for besides the policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SetupOptions {
+    /// `--install-copy` (Linux): prepare the host for a root-owned copy of sandy that setup
+    /// installs, instead of for the file that runs.
+    pub install_copy: bool,
+}
+
+/// How `setup` and `setup --remove` end when they do not fail. A failure is an error, exit
+/// status 125.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetupOutcome {
+    /// Done, or nothing to do; the message says which. Exit status 0.
+    Done(String),
+    /// Not done, and nothing changed: the user did not give the rights, or setup may not
+    /// prepare this host for this binary. The message says why and what to do instead. Exit
+    /// status 3.
+    Refused(String),
+}
+
+#[derive(Debug)]
+pub struct SandboxError {
+    context: String,
+    source: Option<io::Error>,
+}
+
+impl SandboxError {
+    pub fn new(context: impl Into<String>) -> Self {
+        SandboxError {
+            context: context.into(),
+            source: None,
+        }
+    }
+
+    pub fn io(context: impl Into<String>, source: io::Error) -> Self {
+        SandboxError {
+            context: context.into(),
+            source: Some(source),
+        }
+    }
+}
+
+impl fmt::Display for SandboxError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.source {
+            Some(source) => write!(f, "{}: {source}", self.context),
+            None => f.write_str(&self.context),
+        }
+    }
+}
+
+impl std::error::Error for SandboxError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|e| e as &(dyn std::error::Error + 'static))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::Policy;
+
+    fn levels(count: usize) -> Vec<ResolvedLevel> {
+        let mut text = String::from("version = 1\n");
+        for index in 1..count {
+            text.push_str(&format!("[[fallback]]\nname = \"l{index}\"\n"));
+        }
+        ResolvedPolicy::resolve_levels(&Policy::from_toml(&text).unwrap(), None).unwrap()
+    }
+
+    fn run(
+        count: usize,
+        outcomes: &[Result<SetupOutcome, &str>],
+    ) -> (Result<SetupOutcome, String>, usize) {
+        let mut calls = 0;
+        let result = setup_levels(&levels(count), |_| {
+            calls += 1;
+            outcomes[calls - 1].clone().map_err(SandboxError::new)
+        })
+        .map_err(|error| error.to_string());
+        (result, calls)
+    }
+
+    fn done(message: &str) -> Result<SetupOutcome, &str> {
+        Ok(SetupOutcome::Done(message.to_string()))
+    }
+
+    fn refused(message: &str) -> Result<SetupOutcome, &str> {
+        Ok(SetupOutcome::Refused(message.to_string()))
+    }
+
+    /// Without levels the base's outcome passes unchanged; with levels every level is set up in
+    /// order, and status 3 (refused) stays a promise that nothing changed.
+    #[test]
+    fn setup_of_levels_keeps_the_promise_of_each_status() {
+        assert_eq!(
+            run(1, &[done("ok")]),
+            (Ok(SetupOutcome::Done("ok".into())), 1)
+        );
+        assert_eq!(
+            run(1, &[refused("no")]),
+            (Ok(SetupOutcome::Refused("no".into())), 1)
+        );
+
+        let (result, calls) = run(3, &[done("a"), done(""), done("c")]);
+        assert_eq!(calls, 3);
+        assert_eq!(
+            result,
+            Ok(SetupOutcome::Done("level base: a\nlevel l2: c".into()))
+        );
+
+        let (result, calls) = run(2, &[refused("no rights"), done("x")]);
+        assert_eq!(calls, 1);
+        assert_eq!(
+            result,
+            Ok(SetupOutcome::Refused("level base: no rights".into()))
+        );
+
+        // A refusal or failure after base changed the host is a failure, never status 3.
+        for later in [refused("no"), Err("broken")] {
+            let (result, calls) = run(3, &[done("a"), later, done("c")]);
+            assert_eq!(calls, 2);
+            let error = result.unwrap_err();
+            assert!(error.starts_with("level l1: "), "{error}");
+            assert!(error.ends_with("done before it: base"), "{error}");
+        }
+    }
+}

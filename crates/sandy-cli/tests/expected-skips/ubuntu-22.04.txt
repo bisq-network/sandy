@@ -1,0 +1,76 @@
+# Expected skips on the GitHub ubuntu-22.04 runner, measured in CI: Landlock ABI 4, no
+# AppArmor restriction of user namespaces.
+# Ubuntu 22.04 does not restrict user namespaces with AppArmor, so setup has nothing to do.
+pid_linux isolated_signals_need_setup_below_abi_6_under_the_apparmor_restriction apparmor-userns-restriction
+private_linux check_needs_setup_under_the_apparmor_restriction apparmor-userns-restriction
+setup_linux a_failed_check_of_the_installed_copy_is_an_error apparmor-userns-restriction
+setup_linux elevate_installs_a_copy_that_only_root_can_change apparmor-userns-restriction
+setup_linux elevate_without_an_authentication_agent_is_not_done apparmor-userns-restriction
+setup_linux install_copy_lets_a_portable_sandy_hand_over apparmor-userns-restriction
+setup_linux setup_leaves_a_profile_file_it_did_not_write apparmor-userns-restriction
+setup_linux setup_prepares_a_sandy_that_only_root_can_change apparmor-userns-restriction
+setup_linux setup_refuses_a_sandy_its_user_can_change apparmor-userns-restriction
+view_linux check_needs_setup_under_the_apparmor_restriction apparmor-userns-restriction
+# There is no /etc/crypto-policies/back-ends, which Fedora and RHEL have.
+review_linux_conformance the_crypto_policy_files_are_readable crypto-policies
+# The file system gives no delegations.
+escape_linux leases_and_delegations_are_denied delegations
+# One sampled call of the denylist fails outside the sandbox already.
+review_linux_conformance denylisted_calls_fail_with_eperm_on_the_kernel denylist-sample
+# The runner's file system has no fs-verity.
+review_linux_conformance file_system_ioctls_cannot_change_readable_files fs-verity
+# UDP bind rules need Landlock ABI 10.
+escape_linux client_binds_follow_the_landlock_abi landlock-abi-10
+# Landlock checks device ioctls from ABI 5 on.
+review_linux_conformance device_ioctls_need_a_writable_path landlock-abi-5
+# Landlock ABI 4 has no signal scope, which ABI 6 adds, so isolated signals and contained
+# children are refused or checked only in part.
+check check_reports_contained_children_inside_a_contained_sandbox landlock-abi-6
+children_linux a_program_cannot_raise_the_oom_priority_of_sandys_helpers landlock-abi-6
+escape a_pseudo_terminal_master_on_a_standard_stream_needs_signals_any landlock-abi-6
+escape_linux a_master_of_another_devpts_instance_is_refused landlock-abi-6
+escape_linux a_pseudo_terminal_master_cannot_signal_outside landlock-abi-6
+escape_linux a_terminal_read_stops_the_group_sandy_was_started_in landlock-abi-6
+escape_linux other_jobs_of_the_terminal_cannot_be_stopped landlock-abi-6
+escape_linux signals_to_outside_processes_follow_the_policy landlock-abi-6
+escape_linux terminal_resize_cannot_signal_outside landlock-abi-6
+escape_linux the_terminal_cannot_be_taken_from_the_foreground_job landlock-abi-6
+explain_linux the_mode_is_refused_with_end_with_parent landlock-abi-6
+explain_linux the_mode_works_while_sandy_contains_the_children landlock-abi-6
+parent a_named_parent_can_be_reached_through_a_wrapper landlock-abi-6
+parent a_named_parent_must_be_sandys_parent landlock-abi-6
+parent a_parent_that_ended_before_sandy_ran_is_refused landlock-abi-6
+parent a_program_that_ignores_the_request_is_killed landlock-abi-6
+parent a_signal_to_the_callers_process_group_does_not_end_the_watcher landlock-abi-6
+parent a_stopped_program_cannot_end_the_watcher_through_its_process_group landlock-abi-6
+parent contained_processes_end_with_sandys_parent landlock-abi-6
+parent the_program_ends_with_a_named_parent_behind_a_wrapper landlock-abi-6
+parent the_program_ends_with_sandys_parent landlock-abi-6
+private_linux a_dead_broker_ends_a_contained_program landlock-abi-6
+private_linux a_dead_socket_factory_ends_a_contained_program landlock-abi-6
+private_linux a_forwarded_port_reaches_the_service landlock-abi-6
+private_linux an_exposed_port_reaches_the_program_and_its_own_port_stays_inside landlock-abi-6
+review_linux pidfd_send_signal_respects_signal_isolation landlock-abi-6
+review_linux sigio_signal_respects_signal_isolation landlock-abi-6
+review_linux_conformance the_callers_signal_state_reaches_the_program landlock-abi-6
+review_linux_conformance the_contained_program_is_confined_like_the_exec_model landlock-abi-6
+review_relays a_dead_relay_ends_a_contained_program landlock-abi-6
+review_relays a_dead_relay_ends_a_contained_program_while_sandy_is_stopped landlock-abi-6
+review_relays a_relay_that_ends_with_the_program_is_the_normal_end_of_a_run landlock-abi-6
+review_relays only_signals_any_arms_the_relay_watchdog landlock-abi-6
+# SANDY_TEST_LOCAL_PEER names no host of the local network to reach.
+private_linux public_and_local_reaches_a_host_of_the_local_network local-network-peer
+# The kernel has no statmount and listmount.
+escape_linux mount_and_namespace_listing_is_denied mount-listing-calls
+# The OpenSSL configuration includes no file that exists.
+review_linux_conformance unreadable_openssl_includes_are_reported openssl-includes
+# Yama stops ptrace and reading /proc/PID/mem outside the sandbox already.
+escape_linux parent_cannot_be_traced ptrace
+escape_linux parent_memory_and_environment_are_unreadable ptrace
+# Without Landlock ABI 6 this run cannot isolate signals.
+view_linux the_view_works_with_the_process_modes signal-isolation
+# The user's cgroup does not delegate the cpu controller.
+review_linux_conformance a_cgroup_limit_is_invisible_and_reported user-cpu-controller
+# /etc/resolv.conf is a plain file on some machines of this runner, so the check of
+# systemd-resolved's directory runs only on the others (seen on ubuntu-22.04 and ubuntu-24.04).
+? escape_linux the_resolver_directory_is_granted_with_ip resolver-directory

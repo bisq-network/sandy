@@ -1,0 +1,20 @@
+[package]
+name = "sandy-linux"
+description = "Linux backend of sandy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+sandy-core.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4.7"
+seccompiler = "0.5.0"
+sandy-relay.workspace = true
+libc.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,454 @@
+# The compiled seccomp programs of sandy's configurations on aarch64, written by
+# compiled_programs_match_the_snapshot in crates/sandy-linux/src/filter.rs.
+#
+# Every section names one program, how many instructions it has, a checksum of them, and the
+# action it returns for each system call number with all arguments zero. Rules that look at
+# arguments do not show in that table, because their call is allowed with zero arguments; the
+# checksum covers them, and the tests next to the snapshot check what they decide.
+#
+# A diff here means a filter, the reviewed table or seccompiler's code generation changed.
+
+[strict denylist]
+instructions 1469
+checksum 0xd19d572b962290ee
+0-4 allow
+5-6 EPERM
+7-13 allow
+14-15 EPERM
+16-29 allow
+30 EPERM
+31-38 allow
+39-41 EPERM
+42-50 allow
+51 EPERM
+52 allow
+53-55 EPERM
+56-57 allow
+58 EPERM
+59 allow
+60 EPERM
+61-88 allow
+89 EPERM
+90-103 allow
+104-106 EPERM
+107-111 allow
+112 EPERM
+113-115 allow
+116-117 EPERM
+118-141 allow
+142-147 EPERM
+148 allow
+149 EPERM
+150 allow
+151-152 EPERM
+153 allow
+154 EPERM
+155-156 allow
+157 EPERM
+158 allow
+159 EPERM
+160 allow
+161-162 EPERM
+163-169 allow
+170 EPERM
+171-179 allow
+180-197 EPERM
+198 allow
+199-203 EPERM
+204-216 allow
+217-220 EPERM
+221-223 allow
+224-225 EPERM
+226-240 allow
+241-242 EPERM
+243-264 allow
+265 EPERM
+266-267 allow
+268 EPERM
+269 allow
+270-273 EPERM
+274-279 allow
+280 EPERM
+281 allow
+282 EPERM
+283-293 allow
+294 EPERM
+295-424 allow
+425-433 EPERM
+434-437 allow
+438 EPERM
+439 allow
+440 EPERM
+441 allow
+442-443 EPERM
+444-451 allow
+452 EPERM
+453-456 allow
+457-461 EPERM
+462 allow
+463 EPERM
+464-465 allow
+466-467 EPERM
+468 allow
+469-470 EPERM
+471-511 allow
+
+[strict path xattrs]
+instructions 50
+checksum 0x6d5542dafbffaf96
+0-6 allow
+7-9 ENOTSUP
+10 allow
+11-12 ENOTSUP
+13-15 allow
+16 ENOTSUP
+17-463 allow
+464-465 ENOTSUP
+466-467 allow
+468 ENOTSUP
+469-511 allow
+
+[strict socket families]
+instructions 10
+checksum 0x39a3993b54813249
+0-197 allow
+198 EAFNOSUPPORT
+199-511 allow
+
+[open denylist]
+instructions 1369
+checksum 0xfadef368857ecd6b
+0-29 allow
+30 EPERM
+31-38 allow
+39-41 EPERM
+42-50 allow
+51 EPERM
+52-53 allow
+54-55 EPERM
+56-57 allow
+58 EPERM
+59 allow
+60 EPERM
+61-88 allow
+89 EPERM
+90-103 allow
+104-106 EPERM
+107-111 allow
+112 EPERM
+113-115 allow
+116-117 EPERM
+118-141 allow
+142-147 EPERM
+148 allow
+149 EPERM
+150 allow
+151-152 EPERM
+153-158 allow
+159 EPERM
+160 allow
+161-162 EPERM
+163-169 allow
+170 EPERM
+171-179 allow
+180-197 EPERM
+198 allow
+199 EPERM
+200-216 allow
+217-219 EPERM
+220-223 allow
+224-225 EPERM
+226-240 allow
+241 EPERM
+242-264 allow
+265 EPERM
+266-267 allow
+268 EPERM
+269 allow
+270-273 EPERM
+274-279 allow
+280 EPERM
+281 allow
+282 EPERM
+283-293 allow
+294 EPERM
+295-424 allow
+425-433 EPERM
+434-437 allow
+438 EPERM
+439 allow
+440 EPERM
+441 allow
+442-443 EPERM
+444-456 allow
+457-461 EPERM
+462-466 allow
+467 EPERM
+468-469 allow
+470 EPERM
+471-511 allow
+
+[open socket families]
+instructions 59
+checksum 0x440a08131ed7f4d5
+0-197 allow
+198 EAFNOSUPPORT
+199-511 allow
+
+[watcher denylist]
+instructions 121
+checksum 0xc509fb9258044e3b
+0-56 EPERM
+57 allow
+58-63 EPERM
+64 allow
+65-72 EPERM
+73 allow
+74-92 EPERM
+93-94 allow
+95-112 EPERM
+113 allow
+114-127 EPERM
+128 allow
+129-134 EPERM
+135 allow
+136-138 EPERM
+139 allow
+140-171 EPERM
+172 allow
+173-213 EPERM
+214-215 allow
+216-221 EPERM
+222 allow
+223-225 EPERM
+226 allow
+227-232 EPERM
+233 allow
+234-511 EPERM
+
+[relay denylist]
+instructions 260
+checksum 0x159c3d00c9c6c5d4
+0-24 EPERM
+25 allow
+26-56 EPERM
+57 allow
+58-62 EPERM
+63-66 allow
+67-72 EPERM
+73 allow
+74-92 EPERM
+93-94 allow
+95-97 EPERM
+98-99 allow
+100 EPERM
+101 allow
+102-109 EPERM
+110 allow
+111-112 EPERM
+113 allow
+114 EPERM
+115 allow
+116-122 EPERM
+123-124 allow
+125-127 EPERM
+128 allow
+129-131 EPERM
+132 allow
+133 EPERM
+134-135 allow
+136 EPERM
+137 allow
+138 EPERM
+139 allow
+140-171 EPERM
+172 allow
+173-177 EPERM
+178 allow
+179-201 EPERM
+202-203 allow
+204-205 EPERM
+206-210 allow
+211 EPERM
+212 allow
+213 EPERM
+214-216 allow
+217-221 EPERM
+222 allow
+223-225 EPERM
+226 allow
+227-232 EPERM
+233 allow
+234-241 EPERM
+242 allow
+243-277 EPERM
+278 allow
+279-292 EPERM
+293 allow
+294-434 EPERM
+435 allow
+436-511 EPERM
+
+[factory denylist]
+instructions 107
+checksum 0x3e92c2a9d5aca852
+0-56 EPERM
+57 allow
+58-62 EPERM
+63-64 allow
+65-92 EPERM
+93-94 allow
+95-127 EPERM
+128 allow
+129-134 EPERM
+135 allow
+136-138 EPERM
+139 allow
+140-171 EPERM
+172 allow
+173-210 EPERM
+211 allow
+212-213 EPERM
+214-216 allow
+217-221 EPERM
+222 allow
+223-225 EPERM
+226 allow
+227-232 EPERM
+233 allow
+234-511 EPERM
+
+[broker denylist]
+instructions 245
+checksum 0xf52777be1d123332
+0-56 EPERM
+57 allow
+58-63 EPERM
+64 allow
+65-72 EPERM
+73 allow
+74-92 EPERM
+93-94 allow
+95-97 EPERM
+98-99 allow
+100 EPERM
+101 allow
+102-109 EPERM
+110 allow
+111-112 EPERM
+113 allow
+114 EPERM
+115 allow
+116-122 EPERM
+123-124 allow
+125-127 EPERM
+128 allow
+129-131 EPERM
+132 allow
+133 EPERM
+134-135 allow
+136-138 EPERM
+139 allow
+140-171 EPERM
+172 allow
+173-177 EPERM
+178 allow
+179-201 EPERM
+202-210 allow
+211 EPERM
+212 allow
+213 EPERM
+214-216 allow
+217-221 EPERM
+222 allow
+223-225 EPERM
+226 allow
+227-232 EPERM
+233 allow
+234-241 EPERM
+242 allow
+243-277 EPERM
+278 allow
+279-292 EPERM
+293 allow
+294-434 EPERM
+435 allow
+436-511 EPERM
+
+[allowlist]
+instructions 1620
+checksum 0xd49084e1dd0fa149
+0-243 allow
+244-259 ENOSYS
+260-261 allow
+262 ENOSYS
+263 allow
+264 ENOSYS
+265-294 allow
+295-423 ENOSYS
+424-434 allow
+435 ENOSYS
+436 allow
+437 ENOSYS
+438-471 allow
+472-511 ENOSYS
+
+[observer]
+instructions 13
+checksum 0x9f104dee0a8b94d5
+0-32 allow
+33-36 notify
+37-44 allow
+45 notify
+46-55 allow
+56 notify
+57-220 allow
+221 notify
+222-280 allow
+281 notify
+282-511 allow
+
+[explain watcher]
+instructions 180
+checksum 0x9f7d477a2f3c7e0d
+0-16 kill process
+17 allow
+18-47 kill process
+48 allow
+49-56 kill process
+57 allow
+58-72 kill process
+73 allow
+74-77 kill process
+78-80 allow
+81-92 kill process
+93-94 allow
+95-97 kill process
+98 allow
+99-112 kill process
+113 allow
+114-123 kill process
+124 allow
+125-127 kill process
+128 allow
+129-131 kill process
+132 allow
+133-134 kill process
+135 allow
+136-138 kill process
+139 allow
+140-213 kill process
+214-216 allow
+217-221 kill process
+222 allow
+223-225 kill process
+226 allow
+227-232 kill process
+233 allow
+234-269 kill process
+270 allow
+271-290 kill process
+291 allow
+292-438 kill process
+439 allow
+440-511 kill process

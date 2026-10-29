@@ -1,0 +1,3 @@
+# Byte-for-byte copies of the IANA files, which use CRLF line ends; the scheduled check compares
+# them with what IANA publishes.
+*.csv -text

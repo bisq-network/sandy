@@ -1,0 +1,238 @@
+//! Replaces sandy with the target. posix_spawn with the Apple extension POSIX_SPAWN_SETEXEC
+//! works like execve: the target keeps sandy's process ID. POSIX_SPAWN_CLOEXEC_DEFAULT makes the
+//! kernel close every descriptor that the file actions do not name, so sandy does not have to
+//! find them itself. See posix_spawnattr_setflags(3) and posix_spawn_file_actions_addclose(3).
+
+use std::ffi::{CString, c_char, c_int, c_short};
+use std::io;
+use std::mem::MaybeUninit;
+use std::os::unix::ffi::OsStrExt;
+use std::ptr;
+
+use sandy_core::{SandboxError, TargetCommand};
+
+use super::helper::mark_close_on_exec_above_standard;
+
+unsafe extern "C" {
+    /// Apple extension in <spawn.h>, missing from the libc crate: keeps `fd` open in the new
+    /// image when POSIX_SPAWN_CLOEXEC_DEFAULT is set.
+    fn posix_spawn_file_actions_addinherit_np(
+        actions: *mut libc::posix_spawn_file_actions_t,
+        fd: c_int,
+    ) -> c_int;
+
+    /// <mach/task.h>, missing from the libc crate: sets the handler of the exceptions in `mask`
+    /// for the whole task.
+    fn task_set_exception_ports(
+        task: libc::mach_port_t,
+        mask: u32,
+        handler: libc::mach_port_t,
+        behavior: u32,
+        flavor: i32,
+    ) -> libc::kern_return_t;
+}
+
+/// Every machine-independent exception, as `EXC_MASK_ALL` in <mach/exception_types.h> (0x1bfe on
+/// macOS 26.5), `EXC_MASK_CRASH` (0x400), which is not part of it and which Crashpad's handler
+/// takes, and `EXC_MASK_CORPSE_NOTIFY` (0x2000), whose handler gets the task of a crashed program.
+const EXC_MASK_HANDLED: u32 = 0x1bfe | 0x400 | 0x2000;
+/// `EXCEPTION_DEFAULT` and `THREAD_STATE_NONE`: the behaviour and thread state flavour of a
+/// handler. They are required arguments; with MACH_PORT_NULL as the handler they have no effect.
+const EXCEPTION_DEFAULT: u32 = 1;
+const THREAD_STATE_NONE: i32 = 0;
+
+/// Drops the Mach exception handler ports of sandy's task.
+///
+/// Exception ports are task state, not descriptors: the kernel copies them when it creates a
+/// task and keeps them across `exec`, and the profile's `mach-lookup` denial does not cover a
+/// right that the task already holds. A caller with a crash reporter (Crashpad, Sentry, a
+/// debugger) therefore hands the program a send right to its handler, which the program could
+/// use to send forged exception messages. Measured on macOS 26.5, neither a login over SSH nor
+/// a launchd job has a task handler for `EXC_MASK_CRASH`, so only a caller's own crash reporter
+/// puts one there. Every task has a handler for `EXC_MASK_CORPSE_NOTIFY`: the user's ReportCrash
+/// agent, or a caller's own. Without it the kernel hands a crash to the host's handler, the
+/// ReportCrash daemon that runs as root, which still writes the crash report (docs/macos.md).
+pub fn reset_exception_ports() -> Result<(), SandboxError> {
+    // SAFETY: mach_task_self only reads the task port name that libSystem set up at start; the
+    // libc binding is deprecated in favour of the mach2 crate, which sandy does not depend on.
+    #[allow(deprecated)]
+    let task = unsafe { libc::mach_task_self() };
+    // SAFETY: the call takes a task port, a mask and a port name, and reads no memory.
+    let result = unsafe {
+        task_set_exception_ports(
+            task,
+            EXC_MASK_HANDLED,
+            libc::MACH_PORT_NULL as libc::mach_port_t,
+            EXCEPTION_DEFAULT,
+            THREAD_STATE_NONE,
+        )
+    };
+    if result == libc::KERN_SUCCESS {
+        Ok(())
+    } else {
+        Err(SandboxError::new(format!(
+            "cannot drop the inherited Mach exception ports: task_set_exception_ports \
+             returned {result}"
+        )))
+    }
+}
+
+/// The target, converted to C strings before the sandbox is applied.
+#[derive(Debug)]
+pub struct Target {
+    program: CString,
+    argv: Vec<CString>,
+    envp: Vec<CString>,
+}
+
+impl Target {
+    pub fn new(command: &TargetCommand) -> Result<Target, SandboxError> {
+        let program = c_string(command.program.as_os_str().as_bytes(), "the program path")?;
+        let mut argv = vec![c_string(command.arg0.as_bytes(), "argv[0]")?];
+        for arg in &command.args {
+            argv.push(c_string(arg.as_bytes(), "an argument")?);
+        }
+        let mut envp = Vec::with_capacity(command.env.len());
+        for (name, value) in &command.env {
+            let mut entry = name.as_bytes().to_vec();
+            entry.push(b'=');
+            entry.extend_from_slice(value.as_bytes());
+            envp.push(c_string(&entry, "an environment variable")?);
+        }
+        Ok(Target {
+            program,
+            argv,
+            envp,
+        })
+    }
+
+    /// Replaces the current process image with the target, with exactly the target environment
+    /// and only descriptors 0, 1 and 2. Returns only on failure.
+    pub fn exec(&self) -> io::Error {
+        let argv = null_terminated(&self.argv);
+        let envp = null_terminated(&self.envp);
+        let mut attributes: libc::posix_spawnattr_t = ptr::null_mut();
+        let mut actions: libc::posix_spawn_file_actions_t = ptr::null_mut();
+        // SAFETY: attributes and actions are initialized before use and destroyed on failure.
+        // Every string pointer refers to a NUL-terminated string in self, and both arrays end
+        // with NULL.
+        let result = unsafe {
+            spawn_exec(
+                &mut attributes,
+                &mut actions,
+                self.program.as_ptr(),
+                &argv,
+                &envp,
+            )
+        };
+        // SAFETY: destroying an object that init set up, or a null one after a failed init, is
+        // allowed; the results do not matter on this failure path.
+        unsafe {
+            libc::posix_spawnattr_destroy(&mut attributes);
+            libc::posix_spawn_file_actions_destroy(&mut actions);
+        }
+        match result {
+            Err(error) => error,
+            Ok(()) => io::Error::other("posix_spawn returned without replacing the process"),
+        }
+    }
+}
+
+impl Target {
+    /// Replaces the current process image with the target through execve, with exactly the
+    /// target environment and only descriptors 0, 1 and 2. The forked target of
+    /// `children = "contained"` uses it, because its profile denies posix_spawn. The process must
+    /// run a single thread, so that no descriptor appears between the marking and the exec.
+    /// Returns only on failure.
+    pub fn execve(&self) -> io::Error {
+        if let Err(error) = mark_close_on_exec_above_standard() {
+            return error;
+        }
+        // The Rust runtime of sandy ignores SIGPIPE, and an ignored signal stays ignored across
+        // execve. The target starts with the default action, as after posix_spawn above.
+        // SAFETY: setting the default action of SIGPIPE has no memory safety requirements.
+        if unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) } == libc::SIG_ERR {
+            return io::Error::last_os_error();
+        }
+        let argv = null_terminated(&self.argv);
+        let envp = null_terminated(&self.envp);
+        // SAFETY: every pointer points into a CString owned by `self`, and both arrays end with a
+        // null pointer.
+        unsafe {
+            libc::execve(
+                self.program.as_ptr(),
+                argv.as_ptr().cast(),
+                envp.as_ptr().cast(),
+            )
+        };
+        io::Error::last_os_error()
+    }
+}
+
+/// # Safety
+///
+/// `program` must be a NUL-terminated string. `argv` and `envp` must point to NUL-terminated
+/// strings and end with a null pointer.
+unsafe fn spawn_exec(
+    attributes: &mut libc::posix_spawnattr_t,
+    actions: &mut libc::posix_spawn_file_actions_t,
+    program: *const c_char,
+    argv: &[*mut c_char],
+    envp: &[*mut c_char],
+) -> io::Result<()> {
+    // SAFETY: the caller guarantees the string arguments; the spawn objects are initialized
+    // here before they are used.
+    unsafe {
+        check(libc::posix_spawnattr_init(attributes))?;
+        let flags = libc::POSIX_SPAWN_SETEXEC
+            | libc::POSIX_SPAWN_CLOEXEC_DEFAULT
+            | libc::POSIX_SPAWN_SETSIGDEF;
+        check(libc::posix_spawnattr_setflags(attributes, flags as c_short))?;
+        // The Rust runtime of sandy ignores SIGPIPE. The target starts with the default action,
+        // as it would after std::process::Command.
+        let mut default_signals = MaybeUninit::<libc::sigset_t>::uninit();
+        libc::sigemptyset(default_signals.as_mut_ptr());
+        libc::sigaddset(default_signals.as_mut_ptr(), libc::SIGPIPE);
+        check(libc::posix_spawnattr_setsigdefault(
+            attributes,
+            default_signals.as_ptr(),
+        ))?;
+
+        check(libc::posix_spawn_file_actions_init(actions))?;
+        for fd in 0..=2 {
+            // Inheriting a closed descriptor would make posix_spawn fail.
+            if libc::fcntl(fd, libc::F_GETFD) != -1 {
+                check(posix_spawn_file_actions_addinherit_np(actions, fd))?;
+            }
+        }
+        check(libc::posix_spawn(
+            ptr::null_mut(),
+            program,
+            actions,
+            attributes,
+            argv.as_ptr(),
+            envp.as_ptr(),
+        ))
+    }
+}
+
+/// posix_spawn functions return an error number instead of setting errno.
+fn check(result: c_int) -> io::Result<()> {
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(result))
+    }
+}
+
+fn null_terminated(strings: &[CString]) -> Vec<*mut c_char> {
+    strings
+        .iter()
+        .map(|s| s.as_ptr().cast_mut())
+        .chain(std::iter::once(ptr::null_mut()))
+        .collect()
+}
+
+fn c_string(bytes: &[u8], what: &str) -> Result<CString, SandboxError> {
+    CString::new(bytes).map_err(|_| SandboxError::new(format!("{what} contains a NUL byte")))
+}

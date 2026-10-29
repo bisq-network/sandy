@@ -1,0 +1,1343 @@
+use std::ffi::OsString;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use lexopt::prelude::*;
+use sandy_core::{
+    ChildProcesses, Egress, EgressReach, ExposedPort, FileView, ForwardedPort, IpAccess,
+    MachService, NetworkAccess, PathMetadata, Policy, Relays, SignalScope, SystemAccess, Win32k,
+};
+
+pub const USAGE: &str = "\
+Usage:
+  sandy run [OPTIONS] [--] PROGRAM [ARGS...]   run PROGRAM inside the sandbox
+  sandy check [OPTIONS] [[--] PROGRAM]         show how this host enforces the policy (needs
+                                               PROGRAM when the policy has fallback levels)
+  sandy setup [OPTIONS]                        prepare the host (needs admin rights on Windows,
+                                               and on Linux under Ubuntu's AppArmor restriction)
+  sandy setup --remove [OPTIONS]               take back what setup and the runs of the policy
+                                               left on the host
+
+PROGRAM must be an absolute path. sandy refuses to start it when any restriction of the policy
+cannot be enforced on this host. A policy with [[fallback]] levels runs the first of its levels
+that this host can enforce.
+
+Options (they extend the policy file):
+  --policy FILE              read the policy from a TOML file; with -, from standard input,
+                             which the program then does not get (it reads the null device)
+  --level NAME               use this level of the policy only, base or a [[fallback]] name;
+                             run refuses when this host cannot enforce it
+  --json                     print the result of check as one JSON object (check only)
+  --read PATH                allow reading PATH (repeatable)
+  --read-exec PATH           allow reading and executing PATH (repeatable)
+  --read-write PATH          allow reading and writing PATH (repeatable)
+  --system minimal|none      add the minimal system paths (default: minimal)
+  --view all|policy          policy makes paths outside the policy look missing (default: all)
+  --ip all|client|private|none
+                             IP networking; client connects out but takes no connections;
+                             private keeps the program on a loopback of its own, reached only
+                             through --expose, --forward and --egress (default: none)
+  --unix-sockets all|none    Unix domain sockets (default: none)
+  --signals any|isolated     who the program may signal (default: any)
+  --children allowed|none|contained
+                             whether the program may start other processes; contained ends
+                             them all when the program ends (default: allowed)
+  --end-with-parent          end the program when the process that started sandy ends
+                             (needs --signals isolated)
+  --parent-pid PID           with --end-with-parent: the process ID of the caller; sandy
+                             refuses to start if its parent is another process
+  --parent-start TOKEN       with --parent-pid: when that process started, so sandy can tell
+                             the caller from a process that got its ID later; the caller may
+                             then start sandy through a wrapper (see the platform docs)
+  --status-fd N              report the program's process ID and how it ended on descriptor N
+                             (on Windows: an inherited handle); run only
+  --status-file PATH         as --status-fd, into a file sandy creates at PATH, which must not
+                             exist yet, outside every writable path; run only
+  --explain                  name the paths of the run that the policy does not grant, on
+                             standard error; off by default, it sees not every denial, and it
+                             is not available on every platform (run only)
+  --explain-path PATH        say what the policy allows for PATH and which rule decides it
+                             (repeatable; check only)
+  --expose ADDRESS=PORT      relay connections on the loopback ADDRESS to the program's
+                             loopback PORT, for example 127.0.0.1:18080=8080 (repeatable;
+                             needs --ip all or --ip private)
+  --forward PORT=ADDRESS     relay connections from the program to its loopback PORT to the
+                             loopback ADDRESS outside, for example 18081=127.0.0.1:8081
+                             (repeatable; needs --ip private, client or all)
+  --egress PORT[=REACH]      a SOCKS5 broker on the program's 127.0.0.1:PORT that connects out
+                             only to REACH: public (the default) or public-and-local; never to
+                             this host (needs --ip private)
+  --linux-path-metadata deny|allow
+                             metadata changes by path on Linux (default: deny)
+  --macos-relays dual-stack|ipv4
+                             how the program reaches its forwarded and egress ports on macOS;
+                             ipv4 closes a route to hosts of the local network and denies IPv6
+                             sockets there (ipv4 needs --ip private; default: dual-stack)
+  --macos-mach-service NAME  let the program look up the Mach service NAME on macOS; sandy
+                             takes only com.apple.trustd.agent, the certificate verifier
+                             (repeatable; needs --ip client or all)
+  --pass-env NAME            copy variable NAME into the program environment (repeatable)
+  --set-env NAME=VALUE       set a variable in the program environment (repeatable)
+  --appcontainer NAME        AppContainer profile name (Windows)
+  --windows-win32k allow|deny
+                             the system calls of win32k, the GUI part of the Windows kernel;
+                             deny stops many programs that load user32.dll (default: allow)
+  --cwd DIR                  working directory of the program
+  -h, --help                 show this help
+  -V, --version              show the version
+
+Setup options:
+  --install-copy             on Linux, install a root-owned copy of this sandy in
+                             /usr/local/libexec/sandy/VERSION and prepare the host for it; for
+                             a sandy whose own file is not root-owned
+  --elevate                  ask for the administrator rights setup needs (pkexec on Linux,
+                             UAC on Windows); --policy must then be an absolute path
+
+Setup prepares every level of the policy, or the one --level names.
+
+Exit status: the program's status; 125 when sandy fails or refuses; for check, 0 when the policy
+or one of its levels is enforceable, 1 when none is, 2 when none is but `sandy setup`, run once
+with administrator rights, would make one so, and 125 when sandy cannot tell now or the policy
+conflicts with this host; for setup, 0 when it is done or nothing is to do, 3 when it is not
+done and nothing changed (the rights were not given, setup cannot help on this host, or it is
+not allowed for this binary), and 125 when it failed.
+";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Run,
+    Check,
+    Setup,
+    /// `setup --remove`.
+    Remove,
+}
+
+#[derive(Debug, Default)]
+pub struct Overrides {
+    read: Vec<PathBuf>,
+    read_exec: Vec<PathBuf>,
+    read_write: Vec<PathBuf>,
+    system: Option<SystemAccess>,
+    view: Option<FileView>,
+    ip: Option<IpAccess>,
+    egress: Option<Egress>,
+    unix_sockets: Option<NetworkAccess>,
+    signals: Option<SignalScope>,
+    children: Option<ChildProcesses>,
+    end_with_parent: bool,
+    path_metadata: Option<PathMetadata>,
+    relays: Option<Relays>,
+    mach_services: Vec<MachService>,
+    win32k: Option<Win32k>,
+    pass_env: Vec<String>,
+    set_env: Vec<(String, String)>,
+    appcontainer: Option<String>,
+    expose: Vec<ExposedPort>,
+    forward: Vec<ForwardedPort>,
+}
+
+impl Overrides {
+    /// The policy keys these options set, each with its option.
+    fn keys(&self) -> Vec<(&'static str, &'static str)> {
+        [
+            ("--view", "filesystem.view", self.view.is_some()),
+            ("--ip", "network.ip", self.ip.is_some()),
+            ("--egress", "network.egress", self.egress.is_some()),
+            (
+                "--unix-sockets",
+                "network.unix_sockets",
+                self.unix_sockets.is_some(),
+            ),
+            ("--signals", "process.signals", self.signals.is_some()),
+            ("--children", "process.children", self.children.is_some()),
+            (
+                "--end-with-parent",
+                "process.end_with_parent",
+                self.end_with_parent,
+            ),
+            (
+                "--linux-path-metadata",
+                "linux.path_metadata",
+                self.path_metadata.is_some(),
+            ),
+            ("--macos-relays", "macos.relays", self.relays.is_some()),
+            ("--windows-win32k", "windows.win32k", self.win32k.is_some()),
+            (
+                "--appcontainer",
+                "windows.appcontainer_name",
+                self.appcontainer.is_some(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(option, key, set)| set.then_some((option, key)))
+        .collect()
+    }
+
+    /// Applies the command line options to `policy`. With `from_file`, `policy` comes from a
+    /// policy file, and the result names every option that replaced a stricter value of that
+    /// file: the option still wins, because the caller is trusted (DESIGN.md, "Threat model"),
+    /// but it widens what the program may do without the file saying so. A policy without a file
+    /// is the options themselves, so there is nothing to report.
+    ///
+    /// An option that sets a key some fallback level of the policy sets is refused: it would be
+    /// unclear which levels it changes. The other options apply to the base, and so to every
+    /// level.
+    pub fn apply(self, policy: &mut Policy, from_file: bool) -> Result<Vec<String>, String> {
+        for (option, key) in self.keys() {
+            if let Some(level) = policy.fallback.iter().find(|level| level.sets(key)) {
+                return Err(format!(
+                    "{option} sets {key}, which fallback level {} of the policy sets too, so it \
+                     is unclear which levels it changes; set {key} in the policy instead",
+                    level.name
+                ));
+            }
+        }
+        Ok(self.apply_to_base(policy, from_file))
+    }
+
+    fn apply_to_base(self, policy: &mut Policy, from_file: bool) -> Vec<String> {
+        let mut weakened = Vec::new();
+        let mut note = |option: &str, value: &str, setting: &str, before: &str| {
+            if !from_file {
+                return;
+            }
+            weakened.push(format!(
+                "{option} {value} replaces {setting} = {before:?} from the policy file and allows \
+                 more than the file does"
+            ));
+        };
+        let filesystem = &mut policy.filesystem;
+        filesystem.read.extend(self.read);
+        filesystem.read_exec.extend(self.read_exec);
+        filesystem.read_write.extend(self.read_write);
+        if let Some(system) = self.system {
+            if system == SystemAccess::Minimal && filesystem.system == SystemAccess::None {
+                note("--system", "minimal", "system", "none");
+            }
+            filesystem.system = system;
+        }
+        if let Some(view) = self.view {
+            if view == FileView::All && policy.filesystem.view == FileView::Policy {
+                note("--view", "all", "view", "policy");
+            }
+            policy.filesystem.view = view;
+        }
+        if let Some(ip) = self.ip {
+            if ip_strictness(ip) < ip_strictness(policy.network.ip) {
+                note("--ip", ip.name(), "ip", policy.network.ip.name());
+            }
+            policy.network.ip = ip;
+        }
+        if let Some(egress) = self.egress {
+            let value = format!("{}={}", egress.port, egress.reach.name());
+            match policy.network.egress {
+                None => note("--egress", &value, "egress", "none"),
+                Some(before)
+                    if before.reach == EgressReach::Public
+                        && egress.reach == EgressReach::PublicAndLocal =>
+                {
+                    note("--egress", &value, "egress reach", before.reach.name())
+                }
+                Some(_) => {}
+            }
+            policy.network.egress = Some(egress);
+        }
+        if let Some(unix_sockets) = self.unix_sockets {
+            if unix_sockets == NetworkAccess::All
+                && policy.network.unix_sockets == NetworkAccess::None
+            {
+                note("--unix-sockets", "all", "unix_sockets", "none");
+            }
+            policy.network.unix_sockets = unix_sockets;
+        }
+        if let Some(signals) = self.signals {
+            if signals == SignalScope::Any && policy.process.signals == SignalScope::Isolated {
+                note("--signals", "any", "signals", "isolated");
+            }
+            policy.process.signals = signals;
+        }
+        if let Some(children) = self.children {
+            if strictness(children) < strictness(policy.process.children) {
+                note(
+                    "--children",
+                    children.name(),
+                    "children",
+                    policy.process.children.name(),
+                );
+            }
+            policy.process.children = children;
+        }
+        if self.end_with_parent {
+            policy.process.end_with_parent = true;
+        }
+        if let Some(path_metadata) = self.path_metadata {
+            if path_metadata == PathMetadata::Allow
+                && policy.linux.path_metadata == PathMetadata::Deny
+            {
+                note("--linux-path-metadata", "allow", "path_metadata", "deny");
+            }
+            policy.linux.path_metadata = path_metadata;
+        }
+        if let Some(relays) = self.relays {
+            if relays == Relays::DualStack && policy.macos.relays == Relays::Ipv4 {
+                note("--macos-relays", "dual-stack", "relays", "ipv4");
+            }
+            policy.macos.relays = relays;
+        }
+        for service in self.mach_services {
+            if !policy.macos.mach_services.contains(&service) {
+                policy.macos.mach_services.push(service);
+            }
+        }
+        policy.environment.pass.extend(self.pass_env);
+        policy.environment.set.extend(self.set_env);
+        policy.network.expose.extend(self.expose);
+        policy.network.forward.extend(self.forward);
+        if let Some(name) = self.appcontainer {
+            policy.windows.appcontainer_name = Some(name);
+        }
+        if let Some(win32k) = self.win32k {
+            if win32k == Win32k::Allow && policy.windows.win32k == Win32k::Deny {
+                note("--windows-win32k", "allow", "win32k", "deny");
+            }
+            policy.windows.win32k = win32k;
+        }
+        weakened
+    }
+}
+
+/// How strict a `children` value is, higher is stricter. Only the order matters.
+fn ip_strictness(ip: IpAccess) -> u8 {
+    match ip {
+        IpAccess::All => 0,
+        IpAccess::Client => 1,
+        IpAccess::Private => 2,
+        IpAccess::None => 3,
+    }
+}
+
+fn strictness(children: ChildProcesses) -> u8 {
+    match children {
+        ChildProcesses::Allowed => 0,
+        ChildProcesses::Contained => 1,
+        ChildProcesses::None => 2,
+    }
+}
+
+#[derive(Debug)]
+pub enum Command {
+    Help,
+    Version,
+    Sandbox(Box<Invocation>),
+    /// Internal: serve exposed and forwarded ports. A backend starts sandy this way: each exposed
+    /// port with a listening socket it passed by descriptor or handle number and the program's
+    /// address to connect to; each forwarded port, on Windows only, as the address inside the
+    /// sandbox to listen on, whose connections go to the Unix domain socket named after its port
+    /// in the directory `sockets`.
+    Relay {
+        exposed: Vec<(u64, SocketAddr)>,
+        sockets: Option<PathBuf>,
+        forwarded: Vec<SocketAddr>,
+    },
+    /// Internal: run the egress broker (`network.egress`). A backend starts sandy this way, in a
+    /// sandbox of its own, with a listening socket it passed by descriptor or handle number; the
+    /// broker serves SOCKS5 on it and connects out to the destinations `reach` allows.
+    Broker {
+        listener: u64,
+        reach: EgressReach,
+    },
+}
+
+/// The internal command that runs a relay. It is not part of the documented interface:
+/// `__relay [--expose LISTENER TARGET]... [--sockets DIRECTORY] [--forward LISTEN]...`
+pub const RELAY_COMMAND: &str = "__relay";
+
+/// The internal command that runs the egress broker. It is not part of the documented interface.
+pub const BROKER_COMMAND: &str = "__broker";
+
+/// Where the policy comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicySource {
+    File(PathBuf),
+    /// `--policy -`: standard input, until its end.
+    Input,
+}
+
+/// Where `run` writes the status record (see `sandy_core::StatusReport`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusTarget {
+    /// `--status-fd`: the descriptor, or on Windows the handle, the caller passed. The number is
+    /// checked when `run` takes it over.
+    Inherited(u64),
+    /// `--status-file`: a file sandy creates, which must not exist yet.
+    File(PathBuf),
+}
+
+#[derive(Debug)]
+pub struct Invocation {
+    pub mode: Mode,
+    pub policy: Option<PolicySource>,
+    /// `--level`: the one level to use.
+    pub level: Option<String>,
+    /// `--json` of check.
+    pub json: bool,
+    pub overrides: Overrides,
+    pub cwd: Option<PathBuf>,
+    pub parent_pid: Option<u32>,
+    pub parent_start: Option<u64>,
+    /// `--status-fd` or `--status-file`: where `run` writes the status record.
+    pub status: Option<StatusTarget>,
+    /// `--explain`: the diagnostic mode of `run`.
+    pub explain: bool,
+    /// `--explain-path`: the paths `check` answers for.
+    pub explain_paths: Vec<PathBuf>,
+    /// `--install-copy` of setup.
+    pub install_copy: bool,
+    /// `--elevate` of setup.
+    pub elevate: bool,
+    pub program: Option<PathBuf>,
+    pub args: Vec<OsString>,
+}
+
+fn parse_relay(parser: &mut lexopt::Parser) -> Result<Command, lexopt::Error> {
+    let mut exposed = Vec::new();
+    let mut sockets = None;
+    let mut forwarded = Vec::new();
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Long("expose") => {
+                let listener = parser.value()?.parse()?;
+                let target = parser.value()?.parse()?;
+                exposed.push((listener, target));
+            }
+            Long("sockets") => {
+                if sockets.is_some() {
+                    return Err("--sockets given twice".into());
+                }
+                sockets = Some(PathBuf::from(parser.value()?));
+            }
+            Long("forward") => forwarded.push(parser.value()?.parse()?),
+            other => return Err(other.unexpected()),
+        }
+    }
+    if exposed.is_empty() && forwarded.is_empty() {
+        return Err("the relay has no port to serve".into());
+    }
+    if forwarded.is_empty() != sockets.is_none() {
+        return Err("--forward and --sockets go together".into());
+    }
+    Ok(Command::Relay {
+        exposed,
+        sockets,
+        forwarded,
+    })
+}
+
+pub fn parse<I>(args: I) -> Result<Command, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    parse_inner(args).map_err(|error| error.to_string())
+}
+
+fn parse_inner<I>(args: I) -> Result<Command, lexopt::Error>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut parser = lexopt::Parser::from_args(args);
+    let mode = match parser.next()? {
+        Some(Short('h') | Long("help")) => return Ok(Command::Help),
+        Some(Short('V') | Long("version")) => return Ok(Command::Version),
+        Some(Value(value)) => match value.to_str() {
+            Some("run") => Mode::Run,
+            Some("check") => Mode::Check,
+            Some("setup") => Mode::Setup,
+            Some(RELAY_COMMAND) => return parse_relay(&mut parser),
+            Some(BROKER_COMMAND) => {
+                let listener = parser.value()?.parse()?;
+                let value = parser.value()?;
+                let reach = [EgressReach::Public, EgressReach::PublicAndLocal]
+                    .into_iter()
+                    .find(|reach| value.to_str() == Some(reach.name()))
+                    .ok_or_else(|| format!("unknown egress reach {value:?}"))?;
+                return Ok(Command::Broker { listener, reach });
+            }
+            _ => return Err(format!("unknown command {value:?}").into()),
+        },
+        Some(other) => return Err(other.unexpected()),
+        None => return Err("missing command".into()),
+    };
+
+    let mut invocation = Invocation {
+        mode,
+        policy: None,
+        level: None,
+        json: false,
+        overrides: Overrides::default(),
+        cwd: None,
+        parent_pid: None,
+        parent_start: None,
+        status: None,
+        explain: false,
+        explain_paths: Vec::new(),
+        install_copy: false,
+        elevate: false,
+        program: None,
+        args: Vec::new(),
+    };
+    let overrides = &mut invocation.overrides;
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Short('h') | Long("help") => return Ok(Command::Help),
+            Long("policy") => {
+                if invocation.policy.is_some() {
+                    return Err("--policy given twice".into());
+                }
+                let value = parser.value()?;
+                invocation.policy = Some(if value == "-" {
+                    PolicySource::Input
+                } else {
+                    PolicySource::File(value.into())
+                });
+            }
+            Long("level") => {
+                if invocation.level.is_some() {
+                    return Err("--level given twice".into());
+                }
+                invocation.level = Some(parser.value()?.string()?)
+            }
+            Long("json") => invocation.json = true,
+            Long("read") => overrides.read.push(parser.value()?.into()),
+            Long("read-exec") => overrides.read_exec.push(parser.value()?.into()),
+            Long("read-write") => overrides.read_write.push(parser.value()?.into()),
+            Long("system") => {
+                overrides.system = Some(match parser.value()?.string()?.as_str() {
+                    "minimal" => SystemAccess::Minimal,
+                    "none" => SystemAccess::None,
+                    other => return Err(format!("invalid --system value {other:?}").into()),
+                })
+            }
+            Long("view") => {
+                overrides.view = Some(match parser.value()?.string()?.as_str() {
+                    "all" => FileView::All,
+                    "policy" => FileView::Policy,
+                    other => return Err(format!("invalid --view value {other:?}").into()),
+                })
+            }
+            Long("egress") => {
+                let value = parser.value()?.string()?;
+                let (port, reach) = match value.split_once('=') {
+                    Some((port, reach)) => (port, Some(reach)),
+                    None => (value.as_str(), None),
+                };
+                let port = port
+                    .parse()
+                    .map_err(|_| format!("invalid --egress port {port:?}"))?;
+                let reach = match reach {
+                    None | Some("public") => EgressReach::Public,
+                    Some("public-and-local") => EgressReach::PublicAndLocal,
+                    Some(other) => return Err(format!("invalid --egress reach {other:?}").into()),
+                };
+                overrides.egress = Some(Egress { port, reach });
+            }
+            Long("ip") => {
+                overrides.ip = Some(match parser.value()?.string()?.as_str() {
+                    "all" => IpAccess::All,
+                    "client" => IpAccess::Client,
+                    "private" => IpAccess::Private,
+                    "none" => IpAccess::None,
+                    other => return Err(format!("invalid --ip value {other:?}").into()),
+                })
+            }
+            Long("unix-sockets") => {
+                overrides.unix_sockets = Some(network_access(&mut parser, "--unix-sockets")?)
+            }
+            Long("children") => {
+                overrides.children = Some(match parser.value()?.string()?.as_str() {
+                    "allowed" => ChildProcesses::Allowed,
+                    "none" => ChildProcesses::None,
+                    "contained" => ChildProcesses::Contained,
+                    other => return Err(format!("invalid --children value {other:?}").into()),
+                })
+            }
+            Long("signals") => {
+                overrides.signals = Some(match parser.value()?.string()?.as_str() {
+                    "any" => SignalScope::Any,
+                    "isolated" => SignalScope::Isolated,
+                    other => return Err(format!("invalid --signals value {other:?}").into()),
+                })
+            }
+            Long("end-with-parent") => overrides.end_with_parent = true,
+            Long("remove") if invocation.mode == Mode::Setup => invocation.mode = Mode::Remove,
+            Long("install-copy") => invocation.install_copy = true,
+            Long(ELEVATE_OPTION) => {
+                // Given once, so that `--elevate` among the arguments is this flag and nothing
+                // else (see `without_elevate`).
+                if invocation.elevate {
+                    return Err("--elevate given twice".into());
+                }
+                invocation.elevate = true
+            }
+            Long("linux-path-metadata") => {
+                overrides.path_metadata = Some(match parser.value()?.string()?.as_str() {
+                    "deny" => PathMetadata::Deny,
+                    "allow" => PathMetadata::Allow,
+                    other => {
+                        return Err(format!("invalid --linux-path-metadata value {other:?}").into());
+                    }
+                })
+            }
+            Long("macos-relays") => {
+                overrides.relays = Some(match parser.value()?.string()?.as_str() {
+                    "dual-stack" => Relays::DualStack,
+                    "ipv4" => Relays::Ipv4,
+                    other => return Err(format!("invalid --macos-relays value {other:?}").into()),
+                })
+            }
+            Long("macos-mach-service") => {
+                let name = parser.value()?.string()?;
+                let service = MachService::ALL
+                    .into_iter()
+                    .find(|service| service.name() == name)
+                    .ok_or_else(|| {
+                        format!(
+                            "invalid --macos-mach-service value {name:?}: sandy allows only {}",
+                            MachService::ALL.map(MachService::name).join(", ")
+                        )
+                    })?;
+                overrides.mach_services.push(service);
+            }
+            Long("pass-env") => overrides.pass_env.push(parser.value()?.string()?),
+            Long("set-env") => {
+                let assignment = parser.value()?.string()?;
+                let (name, value) = assignment
+                    .split_once('=')
+                    .ok_or_else(|| format!("--set-env needs NAME=VALUE, got {assignment:?}"))?;
+                overrides
+                    .set_env
+                    .push((name.to_string(), value.to_string()));
+            }
+            Long("appcontainer") => overrides.appcontainer = Some(parser.value()?.string()?),
+            Long("windows-win32k") => {
+                overrides.win32k = Some(match parser.value()?.string()?.as_str() {
+                    "allow" => Win32k::Allow,
+                    "deny" => Win32k::Deny,
+                    other => return Err(format!("invalid --windows-win32k value {other:?}").into()),
+                })
+            }
+            Long("forward") => {
+                let value = parser.value()?.string()?;
+                let (port, to) = value
+                    .split_once('=')
+                    .ok_or_else(|| format!("--forward needs PORT=ADDRESS, got {value:?}"))?;
+                let port = port
+                    .parse()
+                    .map_err(|_| format!("invalid --forward port {port:?}"))?;
+                let to = to
+                    .parse()
+                    .map_err(|_| format!("invalid --forward address {to:?}"))?;
+                overrides.forward.push(ForwardedPort { port, to });
+            }
+            Long("expose") => {
+                let value = parser.value()?.string()?;
+                let (listen, port) = value
+                    .rsplit_once('=')
+                    .ok_or_else(|| format!("--expose needs ADDRESS=PORT, got {value:?}"))?;
+                let listen = listen
+                    .parse()
+                    .map_err(|_| format!("invalid --expose address {listen:?}"))?;
+                let port = port
+                    .parse()
+                    .map_err(|_| format!("invalid --expose port {port:?}"))?;
+                overrides.expose.push(ExposedPort { listen, port });
+            }
+            Long("cwd") => invocation.cwd = Some(parser.value()?.into()),
+            Long("parent-pid") => invocation.parent_pid = Some(parser.value()?.parse()?),
+            Long("parent-start") => invocation.parent_start = Some(parser.value()?.parse()?),
+            Long(option @ ("status-fd" | "status-file")) => {
+                if invocation.status.is_some() {
+                    return Err("--status-fd and --status-file name one status record".into());
+                }
+                invocation.status = Some(match option {
+                    "status-fd" => StatusTarget::Inherited(parser.value()?.parse()?),
+                    _ => StatusTarget::File(parser.value()?.into()),
+                });
+            }
+            Long("explain") => invocation.explain = true,
+            Long("explain-path") => invocation.explain_paths.push(parser.value()?.into()),
+            Value(program) => {
+                invocation.program = Some(program.into());
+                invocation.args = parser.raw_args()?.collect();
+                break;
+            }
+            other => return Err(other.unexpected()),
+        }
+    }
+
+    match (invocation.mode, &invocation.program) {
+        (Mode::Run, None) => return Err("run needs a PROGRAM".into()),
+        (Mode::Setup | Mode::Remove, Some(_)) => return Err("setup takes no PROGRAM".into()),
+        _ => {}
+    }
+    if invocation.explain && invocation.mode != Mode::Run {
+        return Err("--explain belongs to run".into());
+    }
+    if invocation.json && invocation.mode != Mode::Check {
+        return Err("--json belongs to check".into());
+    }
+    if invocation.json && !invocation.explain_paths.is_empty() {
+        return Err("--json and --explain-path cannot be combined".into());
+    }
+    if !invocation.explain_paths.is_empty() && invocation.mode != Mode::Check {
+        return Err("--explain-path belongs to check".into());
+    }
+    let setup = matches!(invocation.mode, Mode::Setup | Mode::Remove);
+    if invocation.install_copy && !setup {
+        return Err("--install-copy belongs to setup".into());
+    }
+    if invocation.elevate && !setup {
+        return Err("--elevate belongs to setup".into());
+    }
+    // The elevated sandy may start in another directory: pkexec starts it in root's home. It
+    // does not get this standard input either.
+    match &invocation.policy {
+        Some(PolicySource::File(path)) if invocation.elevate && !path.is_absolute() => {
+            return Err("with --elevate, --policy needs an absolute path".into());
+        }
+        Some(PolicySource::Input) if invocation.elevate => {
+            return Err(
+                "with --elevate, --policy cannot be -: the elevated sandy does not get this \
+                 standard input; give the path of a policy file"
+                    .into(),
+            );
+        }
+        _ => {}
+    }
+    Ok(Command::Sandbox(Box::new(invocation)))
+}
+
+const ELEVATE_OPTION: &str = "elevate";
+
+/// The arguments sandy was given, without `--elevate`: what the elevated sandy runs with. The
+/// caller has parsed them, so `--elevate` occurs once and as the flag: an option value of that
+/// spelling would make `parse` find the flag a second time, or no option at all.
+pub fn without_elevate(args: &[OsString]) -> Result<Vec<OsString>, String> {
+    let flag = format!("--{ELEVATE_OPTION}");
+    let kept: Vec<OsString> = args.iter().filter(|arg| **arg != *flag).cloned().collect();
+    if args.len() - kept.len() != 1 {
+        return Err(format!(
+            "{flag} must appear exactly once, and not as the value of another option"
+        ));
+    }
+    Ok(kept)
+}
+
+fn network_access(
+    parser: &mut lexopt::Parser,
+    option: &str,
+) -> Result<NetworkAccess, lexopt::Error> {
+    match parser.value()?.string()?.as_str() {
+        "all" => Ok(NetworkAccess::All),
+        "none" => Ok(NetworkAccess::None),
+        other => Err(format!("invalid {option} value {other:?}").into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_strs(args: &[&str]) -> Result<Command, String> {
+        parse(args.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn a_run_has_one_status_record() {
+        let error = parse_strs(&[
+            "run",
+            "--status-fd",
+            "3",
+            "--status-file",
+            "/run/status",
+            "/bin/prog",
+        ]);
+        assert!(
+            error
+                .unwrap_err()
+                .contains("--status-fd and --status-file name one status record")
+        );
+        let invocation = invocation(&["run", "--status-file", "/run/status", "/bin/prog"]);
+        assert_eq!(
+            invocation.status,
+            Some(StatusTarget::File(PathBuf::from("/run/status")))
+        );
+    }
+
+    #[test]
+    fn a_second_policy_file_is_an_error() {
+        let error = parse_strs(&["check", "--policy", "/a.toml", "--policy", "/b.toml"]);
+        assert!(error.unwrap_err().contains("--policy given twice"));
+    }
+
+    fn invocation(args: &[&str]) -> Invocation {
+        match parse_strs(args).unwrap() {
+            Command::Sandbox(invocation) => *invocation,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn program_arguments_are_not_parsed_as_options() {
+        let invocation = invocation(&["run", "--ip", "all", "/bin/prog", "--read", "x"]);
+        assert_eq!(invocation.program, Some(PathBuf::from("/bin/prog")));
+        assert_eq!(
+            invocation.args,
+            vec![OsString::from("--read"), OsString::from("x")]
+        );
+    }
+
+    #[test]
+    fn double_dash_separates_the_program() {
+        let invocation = invocation(&["run", "--", "/bin/prog", "-x"]);
+        assert_eq!(invocation.program, Some(PathBuf::from("/bin/prog")));
+        assert_eq!(invocation.args, vec![OsString::from("-x")]);
+    }
+
+    #[test]
+    fn overrides_extend_the_policy() {
+        let invocation = invocation(&[
+            "check",
+            "--read",
+            "/a",
+            "--read-write",
+            "/b",
+            "--ip",
+            "all",
+            "--signals",
+            "isolated",
+            "--children",
+            "none",
+            "--end-with-parent",
+            "--linux-path-metadata",
+            "allow",
+            "--set-env",
+            "A=b=c",
+            "--appcontainer",
+            "name",
+            "--windows-win32k",
+            "deny",
+            "--macos-relays",
+            "ipv4",
+            "--expose",
+            "127.0.0.1:18080=8080",
+            "--forward",
+            "18081=127.0.0.1:8081",
+        ]);
+        let mut policy = Policy::default();
+        policy.filesystem.read.push("/z".into());
+        invocation.overrides.apply(&mut policy, true).unwrap();
+        assert_eq!(
+            policy.filesystem.read,
+            vec![PathBuf::from("/z"), PathBuf::from("/a")]
+        );
+        assert_eq!(policy.filesystem.read_write, vec![PathBuf::from("/b")]);
+        assert_eq!(policy.network.ip, IpAccess::All);
+        assert_eq!(policy.process.signals, SignalScope::Isolated);
+        assert_eq!(policy.process.children, ChildProcesses::None);
+        assert!(policy.process.end_with_parent);
+        assert_eq!(policy.linux.path_metadata, PathMetadata::Allow);
+        assert_eq!(policy.environment.set["A"], "b=c");
+        assert_eq!(policy.windows.appcontainer_name.as_deref(), Some("name"));
+        assert_eq!(policy.windows.win32k, Win32k::Deny);
+        assert_eq!(policy.macos.relays, Relays::Ipv4);
+        assert_eq!(
+            policy.network.forward,
+            vec![ForwardedPort {
+                port: 18081,
+                to: "127.0.0.1:8081".parse().unwrap()
+            }]
+        );
+        assert_eq!(
+            policy.network.expose,
+            vec![ExposedPort {
+                listen: "127.0.0.1:18080".parse().unwrap(),
+                port: 8080
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_the_view_the_private_network_and_egress() {
+        let parsed = invocation(&[
+            "check", "--view", "policy", "--ip", "private", "--egress", "1080",
+        ]);
+        let mut policy = Policy::default();
+        assert!(
+            parsed
+                .overrides
+                .apply(&mut policy, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(policy.filesystem.view, FileView::Policy);
+        assert_eq!(policy.network.ip, IpAccess::Private);
+        assert_eq!(
+            policy.network.egress,
+            Some(Egress {
+                port: 1080,
+                reach: EgressReach::Public
+            })
+        );
+        let local = invocation(&["check", "--egress", "1080=public-and-local"]);
+        let mut policy = Policy::default();
+        local.overrides.apply(&mut policy, false).unwrap();
+        assert_eq!(
+            policy.network.egress.unwrap().reach,
+            EgressReach::PublicAndLocal
+        );
+        for bad in [
+            &["check", "--view", "none"][..],
+            &["check", "--egress", "x"],
+            &["check", "--egress", "1080=local"],
+            &["check", "--ip", "loopback"],
+        ] {
+            assert!(parse_strs(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// An option that shows more of the file system, or adds or widens the egress broker, over
+    /// a file that does not is named like a wider `--ip`.
+    #[test]
+    fn a_wider_view_or_egress_over_the_file_is_named() {
+        let mut policy = Policy::default();
+        policy.filesystem.view = FileView::Policy;
+        let notes = invocation(&["check", "--view", "all"])
+            .overrides
+            .apply(&mut policy, true)
+            .unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+
+        let mut policy = Policy::default();
+        let notes = invocation(&["check", "--egress", "1080"])
+            .overrides
+            .apply(&mut policy, true)
+            .unwrap();
+        assert_eq!(
+            notes,
+            [
+                "--egress 1080=public replaces egress = \"none\" from the policy file and allows \
+              more than the file does"
+            ]
+        );
+        let notes = invocation(&["check", "--egress", "1080=public-and-local"])
+            .overrides
+            .apply(&mut policy, true)
+            .unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let notes = invocation(&["check", "--egress", "1081=public"])
+            .overrides
+            .apply(&mut policy, true)
+            .unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+
+        let mut policy = Policy::default();
+        policy.network.ip = IpAccess::Private;
+        assert_eq!(
+            invocation(&["check", "--ip", "client"])
+                .overrides
+                .apply(&mut policy, true)
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut policy = Policy::default();
+        assert_eq!(
+            invocation(&["check", "--ip", "private"])
+                .overrides
+                .apply(&mut policy, true)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// `--ip client` widens a file without IP networking and narrows one with `ip = "all"`.
+    #[test]
+    fn a_wider_ip_setting_over_the_file_is_named() {
+        let weakened = |file: IpAccess, option: &str| {
+            let mut policy = Policy::default();
+            policy.network.ip = file;
+            let notes = invocation(&["check", "--ip", option])
+                .overrides
+                .apply(&mut policy, true)
+                .unwrap();
+            assert_eq!(policy.network.ip.name(), option);
+            notes
+        };
+        assert_eq!(
+            weakened(IpAccess::None, "client"),
+            vec![
+                "--ip client replaces ip = \"none\" from the policy file and allows more than the \
+                 file does"
+                    .to_string()
+            ]
+        );
+        assert_eq!(weakened(IpAccess::Client, "all").len(), 1);
+        assert_eq!(weakened(IpAccess::None, "all").len(), 1);
+        assert!(weakened(IpAccess::All, "client").is_empty());
+        assert!(weakened(IpAccess::Client, "none").is_empty());
+        assert!(matches!(
+            parse_strs(&["check", "--ip", "server"]),
+            Err(message) if message.contains("invalid --ip value \"server\"")
+        ));
+    }
+
+    /// `--system minimal` adds the system set to what the program may read, so it widens a file
+    /// that says `system = "none"`. The other way round it narrows the file and says nothing.
+    #[test]
+    fn a_system_set_over_a_file_without_one_is_named() {
+        let weakened = |file: SystemAccess, option: &str, from_file: bool| {
+            let mut policy = Policy::default();
+            policy.filesystem.system = file;
+            invocation(&["check", "--system", option])
+                .overrides
+                .apply(&mut policy, from_file)
+                .unwrap()
+        };
+        assert_eq!(
+            weakened(SystemAccess::None, "minimal", true),
+            vec![
+                "--system minimal replaces system = \"none\" from the policy file and allows more \
+                 than the file does"
+                    .to_string()
+            ]
+        );
+        assert!(weakened(SystemAccess::Minimal, "none", true).is_empty());
+        assert!(weakened(SystemAccess::None, "minimal", false).is_empty());
+    }
+
+    /// `--windows-win32k allow` gives the program back what a file with `win32k = "deny"` takes.
+    #[test]
+    fn win32k_allowed_over_a_file_that_denies_it_is_named() {
+        let weakened = |file: Win32k, option: &str| {
+            let mut policy = Policy::default();
+            policy.windows.win32k = file;
+            invocation(&["check", "--windows-win32k", option])
+                .overrides
+                .apply(&mut policy, true)
+                .unwrap()
+        };
+        assert_eq!(
+            weakened(Win32k::Deny, "allow"),
+            vec![
+                "--windows-win32k allow replaces win32k = \"deny\" from the policy file and \
+                 allows more than the file does"
+                    .to_string()
+            ]
+        );
+        assert!(weakened(Win32k::Allow, "deny").is_empty());
+        assert!(parse_strs(&["check", "--windows-win32k", "none"]).is_err());
+    }
+
+    /// `--macos-relays dual-stack` gives the program back the IPv6 sockets, and the route, that
+    /// a file with `relays = "ipv4"` takes.
+    #[test]
+    fn dual_stack_relays_over_a_file_with_ipv4_relays_are_named() {
+        let weakened = |file: Relays, option: &str| {
+            let mut policy = Policy::default();
+            policy.macos.relays = file;
+            let notes = invocation(&["check", "--macos-relays", option])
+                .overrides
+                .apply(&mut policy, true)
+                .unwrap();
+            assert_eq!(policy.macos.relays.name(), option);
+            notes
+        };
+        assert_eq!(
+            weakened(Relays::Ipv4, "dual-stack"),
+            vec![
+                "--macos-relays dual-stack replaces relays = \"ipv4\" from the policy file and \
+                 allows more than the file does"
+                    .to_string()
+            ]
+        );
+        assert!(weakened(Relays::DualStack, "ipv4").is_empty());
+        assert!(weakened(Relays::Ipv4, "ipv4").is_empty());
+        assert!(matches!(
+            parse_strs(&["check", "--macos-relays", "ipv6"]),
+            Err(message) if message.contains("invalid --macos-relays value \"ipv6\"")
+        ));
+    }
+
+    /// An option that sets a key a fallback level sets is refused, since it would be unclear
+    /// which levels it changes; other options apply to the base and so to every level.
+    #[test]
+    fn an_option_that_a_level_also_sets_is_refused() {
+        let policy = || {
+            Policy::from_toml(
+                "version = 1\n[[fallback]]\nname = \"weak\"\nnetwork.ip = \"all\"\n\
+                 process.end_with_parent = false\n",
+            )
+            .unwrap()
+        };
+        for args in [
+            &["check", "--ip", "none"][..],
+            &["check", "--end-with-parent"],
+        ] {
+            let error = invocation(args)
+                .overrides
+                .apply(&mut policy(), true)
+                .unwrap_err();
+            assert!(error.contains("fallback level weak"), "{args:?}: {error}");
+        }
+        let mut levelled = policy();
+        let notes = invocation(&["check", "--signals", "isolated", "--read", "/a"])
+            .overrides
+            .apply(&mut levelled, true)
+            .unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        let levels = levelled.levels();
+        assert!(levels.iter().all(|level| {
+            level.policy.process.signals == SignalScope::Isolated
+                && level.policy.filesystem.read == [PathBuf::from("/a")]
+        }));
+        assert_eq!(levels[1].policy.network.ip, IpAccess::All);
+    }
+
+    #[test]
+    fn parses_the_policy_source_the_level_and_json() {
+        let parsed = invocation(&["check", "--policy", "-", "--level", "weak", "--json"]);
+        assert_eq!(parsed.policy, Some(PolicySource::Input));
+        assert_eq!(parsed.level.as_deref(), Some("weak"));
+        assert!(parsed.json);
+        let file = invocation(&["run", "--policy", "p.toml", "/bin/true"]);
+        assert_eq!(file.policy, Some(PolicySource::File("p.toml".into())));
+        assert!(file.level.is_none() && !file.json);
+        for (args, error) in [
+            (
+                &["run", "--json", "/bin/true"][..],
+                "--json belongs to check",
+            ),
+            (
+                &["check", "--json", "--explain-path", "/a"],
+                "cannot be combined",
+            ),
+            (&["check", "--level", "a", "--level", "b"], "given twice"),
+            (
+                &["setup", "--elevate", "--policy", "-"],
+                "does not get this standard input",
+            ),
+        ] {
+            let message = parse_strs(args).unwrap_err();
+            assert!(message.contains(error), "{args:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn parses_every_children_value() {
+        for (value, expected) in [
+            ("allowed", ChildProcesses::Allowed),
+            ("none", ChildProcesses::None),
+            ("contained", ChildProcesses::Contained),
+        ] {
+            let invocation = invocation(&["check", "--children", value]);
+            let mut policy = Policy::default();
+            invocation.overrides.apply(&mut policy, true).unwrap();
+            assert_eq!(policy.process.children, expected);
+        }
+        assert!(parse_strs(&["check", "--children", "some"]).is_err());
+    }
+
+    /// `--macos-mach-service` adds a service that sandy has assessed, once however often it is
+    /// given, and refuses any other name.
+    #[test]
+    fn mach_services_on_the_command_line() {
+        let invocation = invocation(&[
+            "check",
+            "--macos-mach-service",
+            "com.apple.trustd.agent",
+            "--macos-mach-service",
+            "com.apple.trustd.agent",
+        ]);
+        let mut policy = Policy::default();
+        invocation.overrides.apply(&mut policy, true).unwrap();
+        assert_eq!(policy.macos.mach_services, [MachService::TrustdAgent]);
+        let error = parse_strs(&["check", "--macos-mach-service", "com.apple.trustd"]).unwrap_err();
+        assert!(
+            error.contains("sandy allows only com.apple.trustd.agent"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parses_the_internal_relay_command() {
+        let command = parse_strs(&[
+            RELAY_COMMAND,
+            "--expose",
+            "7",
+            "127.0.0.1:8080",
+            "--expose",
+            "8",
+            "[::1]:8081",
+            "--sockets",
+            r"C:\sockets",
+            "--forward",
+            "127.0.0.1:9090",
+            "--forward",
+            "[::1]:9091",
+        ]);
+        match command.unwrap() {
+            Command::Relay {
+                exposed,
+                sockets,
+                forwarded,
+            } => {
+                assert_eq!(
+                    exposed,
+                    [
+                        (7, "127.0.0.1:8080".parse().unwrap()),
+                        (8, "[::1]:8081".parse().unwrap())
+                    ]
+                );
+                assert_eq!(sockets, Some(PathBuf::from(r"C:\sockets")));
+                assert_eq!(
+                    forwarded,
+                    [
+                        "127.0.0.1:9090".parse::<SocketAddr>().unwrap(),
+                        "[::1]:9091".parse().unwrap()
+                    ]
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse_strs(&[RELAY_COMMAND, "--expose", "7", "127.0.0.1:8080"]).unwrap() {
+            Command::Relay {
+                exposed,
+                sockets,
+                forwarded,
+            } => {
+                assert_eq!(exposed.len(), 1);
+                assert_eq!(sockets, None);
+                assert!(forwarded.is_empty());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refuses_a_malformed_internal_relay_command() {
+        for args in [
+            &[RELAY_COMMAND][..],
+            &[RELAY_COMMAND, "--expose", "x", "127.0.0.1:8080"],
+            &[RELAY_COMMAND, "--expose", "7"],
+            &[RELAY_COMMAND, "7", "127.0.0.1:8080"],
+            &[RELAY_COMMAND, "--forward", "127.0.0.1:9090"],
+            &[RELAY_COMMAND, "--sockets", "s", "--forward", "9090"],
+            &[RELAY_COMMAND, "--sockets", "s"],
+            &[
+                RELAY_COMMAND,
+                "--sockets",
+                "s",
+                "--sockets",
+                "t",
+                "--forward",
+                "127.0.0.1:9",
+            ],
+            &["__forward", "127.0.0.1:8081", "socket"],
+        ] {
+            assert!(parse_strs(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn parses_the_internal_broker_command() {
+        match parse_strs(&[BROKER_COMMAND, "9", "public"]).unwrap() {
+            Command::Broker { listener, reach } => {
+                assert_eq!(listener, 9);
+                assert_eq!(reach, EgressReach::Public);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse_strs(&[BROKER_COMMAND, "9", "public-and-local"]).unwrap() {
+            Command::Broker { reach, .. } => assert_eq!(reach, EgressReach::PublicAndLocal),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(parse_strs(&[BROKER_COMMAND, "x", "public"]).is_err());
+        assert!(parse_strs(&[BROKER_COMMAND, "9", "local"]).is_err());
+        assert!(parse_strs(&[BROKER_COMMAND, "9"]).is_err());
+    }
+
+    #[test]
+    fn run_needs_a_program() {
+        assert!(parse_strs(&["run", "--ip", "all"]).is_err());
+    }
+
+    #[test]
+    fn setup_takes_install_copy_and_elevate() {
+        let setup = invocation(&["setup", "--install-copy", "--elevate"]);
+        assert_eq!(setup.mode, Mode::Setup);
+        assert!(setup.install_copy && setup.elevate);
+        let remove = invocation(&["setup", "--elevate", "--install-copy", "--remove"]);
+        assert_eq!(remove.mode, Mode::Remove);
+        assert!(remove.install_copy && remove.elevate);
+        let plain = invocation(&["setup"]);
+        assert!(!plain.install_copy && !plain.elevate);
+        for (args, error) in [
+            (
+                &["check", "--install-copy"][..],
+                "--install-copy belongs to setup",
+            ),
+            (
+                &["run", "--elevate", "/bin/true"][..],
+                "--elevate belongs to setup",
+            ),
+            (
+                &["setup", "--elevate", "--elevate"][..],
+                "--elevate given twice",
+            ),
+            (
+                &["setup", "--elevate", "--policy", "policy.toml"][..],
+                "absolute path",
+            ),
+        ] {
+            let message = parse_strs(args).unwrap_err();
+            assert!(message.contains(error), "{args:?}: {message}");
+        }
+        let absolute = if cfg!(windows) {
+            r"C:\policy.toml"
+        } else {
+            "/etc/policy.toml"
+        };
+        assert!(parse_strs(&["setup", "--elevate", "--policy", absolute]).is_ok());
+    }
+
+    /// The elevated sandy runs with the same arguments, less the flag. A value spelled like the
+    /// flag would make the count differ from what `parse` saw, so it is refused instead of
+    /// dropped.
+    #[test]
+    fn the_elevated_arguments_drop_only_the_flag() {
+        let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            without_elevate(&args(&["setup", "--elevate", "--policy", "/p.toml"])).unwrap(),
+            args(&["setup", "--policy", "/p.toml"])
+        );
+        let value_too = args(&["setup", "--appcontainer", "--elevate", "--elevate"]);
+        assert!(matches!(
+            parse(value_too.clone()),
+            Ok(Command::Sandbox(invocation)) if invocation.elevate
+        ));
+        assert!(without_elevate(&value_too).is_err());
+        assert!(without_elevate(&args(&["setup"])).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_values() {
+        assert!(parse_strs(&["check", "--ip", "some"]).is_err());
+        assert!(parse_strs(&["check", "--set-env", "NOVALUE"]).is_err());
+        assert!(parse_strs(&["check", "--expose", "127.0.0.1:18080"]).is_err());
+        assert!(parse_strs(&["check", "--forward", "18081"]).is_err());
+        assert!(parse_strs(&["check", "--forward", "x=127.0.0.1:1"]).is_err());
+        assert!(parse_strs(&["check", "--expose", "localhost:1=2"]).is_err());
+        assert!(parse_strs(&["unknown"]).is_err());
+    }
+}

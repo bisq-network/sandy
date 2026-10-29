@@ -1,0 +1,8 @@
+# Bash on Windows cannot run a script with CRLF line ends, which a checkout with core.autocrlf
+# (the default of Git for Windows) would give it, and the scripts read the sum file line by line.
+*.sh text eol=lf
+rust-toolchain.sha256 text eol=lf
+# The release archives carry these files as the tag holds them, also the ones built on Windows;
+# verify-release.yml compares them with the tag.
+README.md text eol=lf
+LICENSE-* text eol=lf
