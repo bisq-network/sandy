@@ -16,7 +16,7 @@ sandy run \
   -- /srv/app/bin/server --port 8080
 ```
 
-Version 2.5.0. Policies use format `version = 1`.
+Version 1.0.0. Policies use format `version = 1`.
 
 ## Contents
 
@@ -83,23 +83,17 @@ cargo build --release --target x86_64-unknown-linux-musl -p sandy-cli --bin sand
 ```
 
 Release archives for each platform are built with `scripts/release-build.sh`, by the `release`
-workflow or by hand (see [Building and testing](#building-and-testing) and below). The sizes of
-the 2.2.1 release:
+workflow or by hand (see [Building and testing](#building-and-testing) and below). Their sizes,
+measured on a release build:
 
 | Target | Binary | Archive |
 |---|---|---|
-| `x86_64-unknown-linux-musl` (static PIE) | 1.6 MiB | 806 KiB |
-| `aarch64-unknown-linux-musl` (static; see below) | 1.3 MiB | 744 KiB |
-| `aarch64-apple-darwin` | 963 KiB | 503 KiB |
-| `x86_64-apple-darwin` | 1.1 MiB | 563 KiB |
-| `x86_64-pc-windows-msvc` (static C runtime) | 1.2 MiB | 563 KiB |
-| `aarch64-pc-windows-msvc` (built, not tested) | 1015 KiB | 514 KiB |
-
-The arm64 Linux binaries up to 2.4.1 load at the same address in every run, so their own code
-and data get no address randomization; their stack, heap and the program they start still do.
-The helpers that run sandy's code during a run, the relays, the egress broker and the watchers,
-are confined by Landlock and seccomp of their own. From 2.5.0 on, the arm64 binary is a static
-PIE like the x86_64 one (see "Building a release binary again").
+| `x86_64-unknown-linux-musl` (static PIE) | 1.7 MiB | 829 KiB |
+| `aarch64-unknown-linux-musl` (static PIE) | 1.4 MiB | 772 KiB |
+| `aarch64-apple-darwin` | 995 KiB | 524 KiB |
+| `x86_64-apple-darwin` | 1.1 MiB | 584 KiB |
+| `x86_64-pc-windows-msvc` (static C runtime) | 1.2 MiB | 584 KiB |
+| `aarch64-pc-windows-msvc` (built, not tested) | 1.0 MiB | 534 KiB |
 
 **Verifying a download.** `SHA256SUMS` in the release lists the SHA-256 sum of every archive,
 and `SHA256SUMS.asc` signs it with the project's OpenPGP key, the key that also signs the release
@@ -112,15 +106,15 @@ sha256sum --check --ignore-missing SHA256SUMS
 
 An archive that the release workflow built also carries a GitHub build provenance attestation,
 which names the workflow, the commit and the run that built it
-(`gh attestation verify sandy-2.5.0-x86_64-unknown-linux-musl.tar.gz --repo <owner>/sandy`). The
-archives of 2.2.1 to 2.5.0 were built outside the workflow, so they have none.
+(`gh attestation verify sandy-1.0.0-x86_64-unknown-linux-musl.tar.gz --repo bisq-network/sandy`).
+An archive built outside the workflow has none.
 
 **Building a release binary again.** Every release binary is built with
 `scripts/release-build.sh TARGET` from a checkout of the release tag, so anyone can build it again
 and compare it with the binary in the archive:
 
 ```sh
-git checkout v2.5.0
+git checkout v1.0.0
 scripts/release-build.sh x86_64-unknown-linux-musl
 sha256sum target/x86_64-unknown-linux-musl/release/sandy
 ```
@@ -129,11 +123,11 @@ The script removes from the binary what would tie it to the machine that built i
 of the checkout and of `CARGO_HOME`, and the time of the build. It cannot remove the host that
 runs the toolchain, the `host:` line of `rustc -vV`: cargo mixes the host into the metadata of
 the build scripts and procedural macros and passes that on to every crate that uses them. In the
-Linux binaries this changes the order of the functions, though not their size: the Linux
-binaries of every release from 2.2.1 to 2.5.0 match a build on `x86_64-unknown-linux-gnu`, and
-a build on arm64 Linux gives other bytes. So a binary built again matches only on a host of the
-triple that built the release. Apart from the host, the Linux binaries are linked with the linker
-of the Rust toolchain, so they depend only on the source and on the toolchain that
+Linux binaries this changes the order of the functions, though not their size: a build on
+`x86_64-unknown-linux-gnu` and a build on arm64 Linux give other bytes, and the Linux release
+binaries are built on `x86_64-unknown-linux-gnu`. So a binary built again matches only on a host
+of the triple that built the release. Apart from the host, the Linux binaries are linked with the
+linker of the Rust toolchain, so they depend only on the source and on the toolchain that
 `rust-toolchain.toml` pins. The macOS and Windows binaries also depend on the version of Apple's
 linker and of the Microsoft linker, which the release notes name. The script refuses a toolchain
 that rustup did not install from the pinned archives (see "The supply chain checks" below). The
@@ -1035,15 +1029,15 @@ change. A policy without levels has one entry in `levels`, named `base`.
   the network changes. Where `/etc/resolv.conf` is a plain file or leads elsewhere, a long-running
   program needs a restart after the system replaces it ([docs/linux.md](docs/linux.md)).
 - **Tested** on Fedora 44 (kernel 7.2), Ubuntu 22.04 (6.8) and Ubuntu 25.10 (6.17), on x86_64.
-  The GitHub Ubuntu 22.04, 24.04 and 24.04-arm runners last ran the suite for 1.x (see
-  [What CI runs](#what-ci-runs)); no arm64 Linux host ran it since. The code paths of older
-  Landlock ABIs are tested on a newer kernel with the test harness `sandy-abi-cap`, which lowers
-  the ABI sandy reads (see [docs/linux.md](docs/linux.md)).
+  CI runs the suite on the GitHub Ubuntu 22.04, 24.04 and 24.04-arm runners (see
+  [What CI runs](#what-ci-runs)). The code paths of older Landlock ABIs are tested on a newer
+  kernel with the test harness `sandy-abi-cap`, which lowers the ABI sandy reads (see
+  [docs/linux.md](docs/linux.md)).
 - Details, the exact system set and all limitations: [docs/linux.md](docs/linux.md).
 
 ### macOS
 
-- **Tested** on macOS 26 and 27 (arm64). The GitHub macOS 15 runner last ran the suite for 1.x.
+- **Tested** on macOS 26 and 27 (arm64). CI runs the suite on the GitHub macOS 15 runner.
 - **Not through Rosetta:** x86_64 code cannot run in the sandbox on Apple silicon, because Rosetta
   cannot load its runtime there. sandy refuses a program without arm64 code on Apple silicon,
   and for a script the interpreter of its `#!` line, which is what the kernel loads. Its x86_64
@@ -1098,9 +1092,8 @@ change. A policy without levels has one entry in `levels`, named `base`.
 ### Windows
 
 - **Versions.** Windows 10 1809 or newer, or Windows Server 2019 or newer, with the fix for
-  CVE-2021-41338 (an AppContainer firewall bypass). Tested on Windows 11; the GitHub Windows
-  Server 2022 and 2025 runners last ran the suite for 1.x. Windows 10 is expected to work but is
-  not tested.
+  CVE-2021-41338 (an AppContainer firewall bypass). Tested on Windows 11; CI runs the suite on the
+  GitHub Windows Server 2022 and 2025 runners. Windows 10 is expected to work but is not tested.
 - **AppContainer name.** Every run needs `--appcontainer NAME` or `windows.appcontainer_name`.
   The name identifies the AppContainer profile; file grants and the loopback exemption belong to
   it. Use one name per policy. sandy refuses to start a second program under a name while another
@@ -1385,7 +1378,7 @@ runner's list. Every job that builds checks the toolchain first, with
 `scripts/check-audits.sh`, weekly as well, because an advisory can appear, and a trusted
 publisher entry can end, without a push. The `release` workflow builds archives for Linux, macOS
 and Windows on x86_64 and arm64 when a tag `v<version>` is pushed, both of a platform on one
-runner of the host that built the earlier releases, names the linker of the macOS and Windows
+runner, the runners that `verify-release` uses too, names the linker of the macOS and Windows
 binaries, starts each binary that its runner can run (`sandy --version`) and the arm64 Linux
 binary on an arm64 runner, attests their build provenance, verifies the attestations,
 and creates a draft release with `SHA256SUMS`. It also builds one target twice from two
@@ -1393,12 +1386,10 @@ directories and compares the binaries. The arm64 Windows build is compiled but n
 `verify-release` workflow builds a published release again and compares it with its archives
 (see "Building a release binary again").
 
-CI has not run since the 1.x releases, and the releases with binaries, from 2.2.1 on, were
-built by hand; each release's notes say where its tests ran and how its binaries were built.
-Expected-skip lists exist only for the hosts the suite ran on since then, not for the runners
-above, so the comparison step fails on each runner until its list is committed: the failure
-prints the skips of the run, which become `crates/sandy-cli/tests/expected-skips/<runner>.txt`
-once checked.
+Expected-skip lists exist only for the development hosts the suite ran on, not yet for the runners
+above, so the comparison step fails on each runner until its list is committed: the failure prints
+the skips of the run, which become `crates/sandy-cli/tests/expected-skips/<runner>.txt` once
+checked.
 
 ### Code layout
 

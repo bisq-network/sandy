@@ -295,7 +295,7 @@ connections on the host where the spread was widest. Writing before exiting buys
 program can rely on. Kernel 6.8 is Ubuntu 22.04 LTS's kernel, a common deployment target, and
 there this is the difference between a forwarded port that mostly works and one that mostly
 does not. Dropping the program's own connection is the one thing a forwarded port must not do,
-and version 1.3.2 had no check at all, so refusing them was a reliability regression against it.
+so the relay serves a peer the kernel cannot name instead of refusing it.
 
 What this leaves open: another local user can deliver a blind write to the service when its closed
 socket no longer carries its user. On 6.8 that is from the close, so the write usually arrives on
@@ -926,7 +926,7 @@ sandy's label when no other profile attaches to it (the kernel's `domain.c`, "un
 attachment"). So the program and every process it starts run under the profile's label, which
 allows user namespaces, and sandy's seccomp filter is what keeps the program from creating
 them: it denies every namespace call. Measured on Ubuntu 25.10: a program that the copy runs
-reads `sandy-setup.usr.local.libexec.sandy.2.1.0.sandy (unconfined)` as its label, and
+reads `sandy-setup.usr.local.libexec.sandy.<version>.sandy (unconfined)` as its label, and
 `unshare -U` and `unshare -n` fail there with "Operation not permitted". The requirement holds
 through the filter, so this is no exception of `IpNetworkPrivate`.
 
@@ -1264,10 +1264,10 @@ Costs and differences:
 - The PID namespace belongs to a user namespace of sandy's own, also with `contained` alone, so
   inside, files of root and of other users show the owner and group 65534, and so does every
   supplementary group except the user's own in `getgroups`, as in "Private network"
-  (`files_of_root_show_the_owner_65534_in_the_pid_namespace`). Without the namespace, as in
-  sandy 2.0, they show their owners. Processes of the user that runs sandy hold every capability
-  in that namespace, so Yama's `ptrace_scope` 1 no longer keeps them from tracing the program
-  (from the kernel source; not measured), as in "What stays open".
+  (`files_of_root_show_the_owner_65534_in_the_pid_namespace`). Without the namespace they show
+  their owners. Processes of the user that runs sandy hold every capability in that namespace,
+  so Yama's `ptrace_scope` 1 no longer keeps them from tracing the program (from the kernel
+  source; not measured), as in "What stays open".
 - Start time: with `contained` alone, the trial of `plan` adds a fork and an `unshare` to every
   start, and the namespace and the init add another. As the median of 100 runs of
   `sandy run --children contained --signals isolated -- /usr/bin/true` with the release build,

@@ -1310,7 +1310,7 @@ is the threat Linux denies the mode bits for (docs/linux.md, "Setuid and setgid 
 ## The file system view
 
 `filesystem.view = "policy"` asks that every path outside the policy and the system set look
-missing (DESIGN.md, "The file system view"). Every profile has done that since 2.0.0: step 3 of
+missing (DESIGN.md, "The file system view"). Every profile does that: step 3 of
 [The generated profile](#the-generated-profile) answers `ENOENT` to every call on such a path,
 and the plan reports `PathsHidden` as enforced by that rule, so the view changes nothing else
 for a program. With `unix_sockets = "all"` the profile allows the existence check for every path
@@ -1350,9 +1350,8 @@ no privilege, and closing them would break ordinary programs:
   profile allows `file-test-existence` for every path there, because a socket outside the policy
   can be reached no other way (see [Networking](#networking)), so `access`, `statfs` (with the
   device and the directory the volume is mounted on), `chdir` and `getattrlist` with
-  `ATTR_CMN_FULLPATH` answer for every path, as they did under every policy before 2.0.0. With a
-  `/.vol/<dev>/<inode>` path `getattrlist` turns an inode number into a path, the disclosure that
-  the `fsgetpath` denial closed. No path rule can close it here: Seatbelt checks the lookup of a
+  `ATTR_CMN_FULLPATH` answer for every path. With a `/.vol/<dev>/<inode>` path `getattrlist`
+  turns an inode number into a path, the disclosure that the `fsgetpath` denial closed. No path rule can close it here: Seatbelt checks the lookup of a
   `/.vol` path against the file's real path, so a denial of `/.vol` does not reach it (measured
   on macOS 27.0.1). Every other call still answers `ENOENT`, and contents, metadata and listings
   stay unreadable (`unix_sockets_all_reaches_sockets_and_tests_paths_outside_the_policy`).
@@ -1466,8 +1465,8 @@ none, so the backend answers nothing and sandy refuses the option.
   (`writes_to_a_read_path_stay_refused`).
 - `getcwd` fails when the working directory is outside the policy, and so do programs that save
   the working directory before they work: `cp -R` stops with "cp: current working directory: No
-  such file or directory" (measured on macOS 27.0.1; before 2.0.0 it worked). Start such a
-  program in a directory of the policy (`--cwd`).
+  such file or directory" (measured on macOS 27.0.1). Start such a program in a directory of
+  the policy (`--cwd`).
 - `getpriority`, `getpgid` and `getsid` fail with `EPERM`, also when the program asks about
   itself (see the protections of [The generated profile](#the-generated-profile)). After a
   compiler crash, clang and swift do not detect their stale module cache lock and wait until
@@ -1480,7 +1479,7 @@ none, so the backend answers nothing and sandy refuses the option.
   `/private/tmp/x`. Give the path without the prefix, and let the program use that spelling too:
   Seatbelt checks the existence of a path as the program spells it, and the profile grants it
   only for the plain spelling, so `/System/Volumes/Data/private/tmp/x/file` looks missing
-  (measured on macOS 27.0.1; before 2.0.0 the program could use either spelling).
+  (measured on macOS 27.0.1).
 - sandy cannot run inside another Seatbelt sandbox; `sandy check` reports this.
 - A connection that is still in its handshake when the program ends can be lost, against rule 5
   of "Forwarded ports" in `DESIGN.md`. Under loopback traffic the program's `connect` can return,

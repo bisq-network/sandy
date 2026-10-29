@@ -1202,10 +1202,9 @@ which sandy makes close-on-exec and keeps out of what the program inherits, and
 that can pass no descriptor. The lines are
 `level NAME` for a policy with fallback levels, `pid N`, then `exited N` or `signaled N`, or
 `failed` when sandy itself failed. See README.md, "The status record". No exit status changes
-meaning, because callers parse the documented ones. One deliberate exception came with fallback
-levels in 2.2.0: `check` used to exit with 1, and for some Windows relay errors with 2, when a
-probe failed for a reason that can pass or a relay port was busy; it now exits with 125, which
-tells a caller to try again later instead of using a weaker policy.
+meaning, because callers parse the documented ones. When a probe failed for a reason that can
+pass or a relay port is busy, `check` exits with 125, which tells a caller to try again later
+instead of using a weaker policy.
 
 Status 2 of `check` lets a calling program tell "this host needs preparing" from "this host
 cannot do it" without parsing text: it can ask the user for administrator rights, run
@@ -1286,9 +1285,9 @@ checks a download with `gh attestation verify <archive> --repo <owner>/<repo>`.
 
 `SHA256SUMS` says that the archives belong together; `SHA256SUMS.asc`, the maintainer's signature of
 it with the key that signs the tags, says who published them. That matters most for archives built
-outside the workflow, which have no attestation, as in 2.2.1 to 2.5.0. The macOS binaries carry only
-the linker's ad-hoc signature, and `sandy.exe` has no Authenticode signature; the workflow holds
-both steps, skipped until the certificates exist.
+outside the workflow, which have no attestation. The macOS binaries carry only the linker's
+ad-hoc signature, and `sandy.exe` has no Authenticode signature; the workflow holds both steps,
+skipped until the certificates exist.
 
 ## Code layout
 

@@ -1,24 +1,23 @@
 name: verify-release
 
-# Run by hand with the tag of a published release, such as v2.5.0: builds every binary of the
+# Run by hand with the tag of a published release, such as v1.0.0: builds every binary of the
 # release again from the tag, the way scripts/release-build.sh builds a release binary, and
 # compares each archive of the release with the binary built again and the files of the tag. The
 # run fails when any archive holds something else.
 #
 # A binary built again matches only on a host of the triple that built the release, and on macOS
 # and Windows only with the linker version that the release notes name (README.md, "Building a
-# release binary again"). Every release so far was built by hand: both Linux binaries on x86_64
-# Linux, both macOS binaries on an arm64 Mac with the Command Line Tools 27.0 (ld-27037.1), which
-# the macos-26 image has besides its Xcode, and both Windows binaries on x86_64 Windows with MSVC
-# 14.44.35207 and the Windows SDK 10.0.26100.0. The runners below are of those hosts, the same as
-# in the release workflow. Each macOS and Windows build names its linker in the summary of the
-# run, so that a difference there can be told from one in the source.
+# release binary again"). The runners below are the ones the release workflow builds on: x86_64
+# Linux for both Linux binaries, an arm64 Mac with the Command Line Tools 27.0 (ld-27037.1), which
+# the macos-26 image has besides its Xcode, for both macOS binaries, and x86_64 Windows for both
+# Windows binaries. Each macOS and Windows build names its linker in the summary of the run, so
+# that a difference there can be told from one in the source.
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: The tag of the release, such as v2.5.0
+        description: The tag of the release, such as v1.0.0
         required: true
         type: string
 

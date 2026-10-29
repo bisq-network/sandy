@@ -193,9 +193,9 @@ measured on Windows 11; reducing the allow entry is what the check honors, for `
 much as for `FILE_EXECUTE` (measured on build 26200).
 
 The change is idempotent: a run writes only while the entry still carries one of the three
-rights. sandy 1.3.2 removed `FILE_EXECUTE` alone, so the first run of a later version reduces
-such a profile once more. That run also walks the folder and refuses a junction or symbolic link
-below it, because it re-propagates the entry and the program can write there
+rights, so it also reduces an entry that lost `FILE_EXECUTE` alone, or that someone widened again
+from outside. Such a run also walks the folder and refuses a junction or symbolic link below it,
+because it re-propagates the entry and the program can write there
 (`review_windows::reducing_an_old_profile_entry_refuses_a_junction_in_the_folder`).
 
 The folder holds no user data. It is the program's own scratch space, writable in every policy,
@@ -203,10 +203,10 @@ also one with no writable path. `escape_windows` and `review_windows` confirm th
 can write and read it, cannot execute a file in it (`load-library` is denied while `read`
 succeeds), and cannot grant itself execute back.
 
-What the reduction does not repair: a program that ran under sandy 1.3.2 could write an explicit
-entry of its own on a file in the folder, and re-propagation does not remove explicit entries.
-It cannot write new ones afterwards. `sandy setup --remove` deletes the profile and with it any
-entry left there.
+What the reduction does not repair: a program that ran while the entry still carried `WRITE_DAC`
+could write an explicit entry of its own on a file in the folder, and re-propagation does not
+remove explicit entries. It cannot write new ones afterwards. `sandy setup --remove` deletes the
+profile and with it any entry left there.
 
 ## File grants
 
@@ -514,8 +514,8 @@ the win32k system calls that back those functions are gone outright, so a progra
 windows at all. WMI reaches a process list through COM, which also does not load in an AppContainer
 in these sessions (see `com_services_outside_the_sandbox_are_unreachable`), and the COM boundary
 denies the sandbox where COM does load. Both belong on an interactive session to measure, like the
-ConPTY question (see the release notes). Performance-counter data (Perflib through the registry,
-and PDH on top of it) was not measured.
+ConPTY question (see "Processes, privileges and signals"). Performance-counter data (Perflib
+through the registry, and PDH on top of it) was not measured.
 
 ### Removing the changes
 
@@ -549,8 +549,7 @@ The socket directories of forwarded ports clean themselves up: each run holds a 
 its own directory, opened without `FILE_SHARE_DELETE`, and every run with a forwarded port first
 removes the directories whose lock file it can open exclusively, which only the directories of
 ended runs are. A directory without a lock file stays, because a run creates the file just after
-its directory (`the_sweep_leaves_a_socket_directory_without_a_lock_file`). sandy 1.3.2 created no
-lock file, so the directories it left behind stay too; they hold no listener and can be deleted.
+its directory (`the_sweep_leaves_a_socket_directory_without_a_lock_file`).
 
 **At uninstallation.** A program that ships sandy runs `sandy setup --remove` from its
 uninstaller, with the policy it ran with: the removal takes back every level of a policy with
@@ -826,9 +825,6 @@ two users who share an AppContainer name (see "Other users of the machine"):
   blocks later runs. Runs with different policies one after the other stay allowed.
 - A killed sandy frees the AppContainer only together with its program: kill-on-close ends the
   program's job when sandy dies (`a_killed_run_leaves_no_program_behind`).
-- sandy 1.3.2 coordinated through a named kernel object instead. A run of 1.3.2 and a run of a
-  later version do not see each other, so do not run both versions in one AppContainer at the
-  same time.
 - A file and not a named kernel object, because `Local\` is per logon session and in session 0,
   which services and SSH sessions run in, it is shared by every user's session 0 processes:
   another local user could hold sandy's mutex, which sandy waits for without a limit, or create
@@ -1228,11 +1224,11 @@ would signal them without the check that `signals = "isolated"` applies. This co
 measured here. A pseudoconsole does not run in the test VM's non-interactive SSH session: a
 `CreatePseudoConsole` succeeds, but the console host it starts pumps no input or output to a
 child (measured: a `cmd /c echo` attached to a ConPTY produced no output), the same window
-station limitation as limitation 13. The question is open (see the release notes); by the ConPTY
-design the delivery is expected, because a terminal's Ctrl+C reaches a ConPTY child exactly by
-the terminal writing `0x03` to that input pipe. If a measurement on an interactive session
-confirms it, it belongs in the exceptions table with a `check` warning for `signals = "isolated"`,
-because sandy cannot distinguish or refuse the pipe.
+station limitation as limitation 13. The question is open; by the ConPTY design the delivery is
+expected, because a terminal's Ctrl+C reaches a ConPTY child exactly by the terminal writing
+`0x03` to that input pipe. If a measurement on an interactive session confirms it, it belongs in
+the exceptions table with a `check` warning for `signals = "isolated"`, because sandy cannot
+distinguish or refuse the pipe.
 
 ## Win32k
 
@@ -1442,7 +1438,7 @@ about a path is worse than none, so the backend answers nothing and sandy refuse
 14. If sandy itself is killed during a run with forwarded ports, its socket directory below
     `%LOCALAPPDATA%\sandy\forward` stays behind until the next run with a forwarded port
     removes it. Its sockets have no listener while it is there, so nobody can connect through
-    them. A directory that sandy 1.3.2 left behind stays (see "Removing the changes").
+    them.
 15. A policy path on a network share, also through a mapped drive, is refused; name the local
     path (see "Network and share paths").
 16. With `ip = "client"` the program reaches no host of a private or domain network (see

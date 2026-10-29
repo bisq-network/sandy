@@ -16,7 +16,7 @@
 - **Code.** I read `crates/sandy-windows/src/**`, `docs/windows.md`, the Windows section of `docs/DESIGN.md`, the probe and `escape_windows.rs`. No repository file was changed during the research (`git status` was clean).
 - **Build.** I built `cargo build --release --target x86_64-pc-windows-gnu -p sandy-cli --bins` with rustc 1.98.1 into a temporary directory outside the repository. I then dumped the import table of `sandy.exe` with `llvm-readobj --coff-imports`. The build was temporary and is not kept; the commands above reproduce it.
 - **Linking.** windows-sys 0.61.2 links every function through `windows-link` 0.2.1 with `kind = "raw-dylib"`. These are ordinary load-time imports with no delay-loading. So every imported export must exist on the host, or the binary does not load.
-- **CI.** I read the log of CI run 39763844540 on `windows-2022` (Server 2022, build 20348). The log was a temporary download and is not kept; `gh run view 39763844540 -R wodoro/sandy --log` fetches it again while GitHub retains it. The closest earlier evidence is Windows 11 build 26200 and Server 2025.
+- **CI.** I read the log of a CI run on `windows-2022` (Server 2022, build 20348). The log was a temporary download and is not kept. The closest earlier evidence is Windows 11 build 26200 and Server 2025.
 
 ## 1. APIs, flags, attributes, SIDs and undocumented mechanisms
 
