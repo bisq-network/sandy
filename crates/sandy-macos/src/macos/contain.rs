@@ -470,8 +470,10 @@ fn guard_main(
         }
         pid => pid,
     };
-    // The anchor sets its group too. Setting it here as well means the group exists before
-    // sandy learns its ID, whichever process runs first.
+    // Only the guard creates the group, before sandy learns its ID. Of two setpgid calls that
+    // create the same group at once, macOS can fail one with EPERM although the group exists
+    // (measured on the macos-26 runner when the anchor set its group too, in about 1 of 150 runs
+    // of the children_macos tests).
     // SAFETY: setpgid takes process IDs.
     let created = unsafe { libc::setpgid(anchor, anchor) } == 0;
     if !created || to_sandy.write_all(&anchor.to_ne_bytes()).is_err() {
@@ -510,9 +512,6 @@ fn guard_main(
 /// The anchor: leads the program's process group and waits, with every signal blocked as in the
 /// guard, until the group's SIGKILL ends it.
 fn anchor_main() -> ! {
-    // SAFETY: setpgid takes process IDs; the guard sets the same group, so a failure here is
-    // harmless when the guard succeeds, and reported by the guard otherwise.
-    unsafe { libc::setpgid(0, 0) };
     let _ = close_all_except(&[]);
     loop {
         // SAFETY: pause only waits; no unblocked signal can arrive except SIGKILL.

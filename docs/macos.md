@@ -1059,9 +1059,11 @@ when sandy itself is killed. sandy then stays the target's parent instead of rep
    target with status 141. A SIGPIPE sent to sandy is therefore not passed on. The target starts
    with the default action for SIGPIPE.
 2. It forks the guard. The guard starts a process group of its own (it is in neither sandy's job
-   nor the target's group) and forks the anchor, which starts the target's process group and only
-   waits to be killed. The guard keeps two pipes to and from sandy and, with a relay or an egress
-   broker, the write end of their pipe and their process IDs; the anchor keeps no descriptor.
+   nor the target's group), forks the anchor and starts the target's process group with it; the
+   anchor leads that group and only waits to be killed. Only the guard calls `setpgid` for the
+   group: when two calls create the same group at once, macOS can fail one with `EPERM`. The guard
+   keeps two pipes to and from sandy and, with a relay or an egress broker, the write end of their
+   pipe and their process IDs; the anchor keeps no descriptor.
 3. sandy learns the group's ID (the anchor's process ID) from the guard and forks the target into
    that group. Once the target has reported its process ID (step 4), the guard registers the
    target's `NOTE_EXIT` and the pipe from sandy in a kqueue, and also the `NOTE_EXIT` of the
