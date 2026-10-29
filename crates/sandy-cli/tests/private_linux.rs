@@ -421,6 +421,8 @@ fn other_user(probe: &str) -> Option<Vec<String>> {
     ];
     ways.into_iter()
         .map(|way| way.into_iter().map(String::from).collect::<Vec<String>>())
+        // As in forward.rs: unshare with --map-auto can hang where the namespace is refused.
+        .filter(|way| way[0] != "unshare" || common::linux::user_namespace_works())
         .find(|way| {
             Command::new(&way[0])
                 .args(&way[1..])

@@ -458,11 +458,19 @@ fn unreadable_openssl_includes_are_reported() {
 #[test]
 fn a_cgroup_limit_is_invisible_and_reported() {
     let probe = probe_path();
-    let limited = Command::new("systemd-run")
+    let limited = match Command::new("systemd-run")
         .args(["--user", "--scope", "-q", "-p", "MemoryMax=512M"])
         .args(["-p", "CPUQuota=100%", "--", &sandy_path(), "check", &probe])
         .output()
-        .unwrap();
+    {
+        Ok(limited) => limited,
+        Err(error) => {
+            return skip(
+                "user-systemd-scope",
+                &format!("cannot start systemd-run: {error}"),
+            );
+        }
+    };
     if !limited.status.success() {
         return skip(
             "user-systemd-scope",
@@ -792,5 +800,14 @@ fn a_read_only_descriptor_changes_only_the_mode_and_the_times() {
 fn address_randomization_can_be_switched_off() {
     const ADDR_NO_RANDOMIZE: libc::c_long = 0x4_0000;
     let call = format!("{}:{ADDR_NO_RANDOMIZE}", libc::SYS_personality);
-    controlled(&[], &[("raw-syscall", &call)])[0].assert_ok();
+    let actions = [("raw-syscall", call.as_str())];
+    let control = probe_outside(&actions).remove(0);
+    if control.result != "ok" {
+        // Docker's default seccomp profile allows only a few personality values.
+        return skip(
+            "personality-outside",
+            &format!("{} fails outside: {}", control.target, control.detail),
+        );
+    }
+    probe_inside(&[], &actions)[0].assert_ok();
 }

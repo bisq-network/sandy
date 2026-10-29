@@ -291,6 +291,10 @@ fn other_user(probe: &str) -> Option<Vec<String>> {
     ];
     ways.into_iter()
         .map(|way| way.into_iter().map(String::from).collect::<Vec<String>>())
+        // Where the kernel refuses the namespace (Docker's seccomp profile), unshare with
+        // --map-auto leaves its mapping helper waiting forever, and the helper keeps the pipes of
+        // `output` below open, so the namespace is tried alone first.
+        .filter(|way| way[0] != "unshare" || common::linux::user_namespace_works())
         // The other user must be able to run the probe at all, or the test would pass because
         // nothing ever connected.
         .find(|way| {
