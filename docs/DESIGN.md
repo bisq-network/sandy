@@ -1267,8 +1267,8 @@ directly.
 Every release binary is built with `scripts/release-build.sh` from a tag, with `--locked`, so a
 binary can be built again and compared, by the `release` workflow and by anyone else. The script
 keeps the path of the checkout and of `CARGO_HOME` out of the binary, links the Linux targets with
-the linker of the pinned Rust toolchain instead of the host's, removes the build directory from
-the object paths that Apple's linker hashes into the UUID of a macOS binary, and has the Microsoft
+the linker of the pinned Rust toolchain instead of the host's, links a macOS binary without the
+debug map, whose object paths Apple's linker would hash into its UUID, and has the Microsoft
 linker write no time stamp (`/Brepro`). A Linux binary then depends only on the source and the
 toolchain; a macOS or Windows binary also on the version of the platform's linker, which the
 release notes name. The archives are packed with sorted entries, the time of the commit and no
