@@ -287,15 +287,26 @@ impl Group {
 
     /// Reaps every exited child except the program and the guard. Returns the program's state
     /// once it has exited, without reaping it.
+    ///
+    /// macOS can answer these `WEXITED` queries with a child that only stopped: `CLD_STOPPED`
+    /// with SIGTTIN for a program that read the terminal at once (measured on the macOS 15.7.9
+    /// runner, in 3 of 150 runs of the children_macos tests). Such an answer is no exit. The stop
+    /// reaches sandy as SIGCHLD, and `follow_program` handles it.
     fn reap_others(&self, program: libc::pid_t) -> Result<Option<ChildState>, SandboxError> {
         let program_exited = || {
-            waitable(
+            Ok(waitable(
                 libc::P_PID,
                 program as libc::id_t,
                 libc::WEXITED | libc::WNOWAIT,
-            )
+            )?
+            .filter(ChildState::exited))
         };
         while let Some(child) = waitable(libc::P_ALL, 0, libc::WEXITED | libc::WNOWAIT)? {
+            if !child.exited() {
+                // The query answers with that child until it runs again, so ask for the program
+                // by itself.
+                return program_exited();
+            }
             if child.pid == program {
                 return Ok(Some(child));
             }
@@ -742,6 +753,16 @@ struct ChildState {
     code: libc::c_int,
     /// The exit status, or the signal number.
     status: libc::c_int,
+}
+
+impl ChildState {
+    /// Whether the child has ended, not only stopped.
+    fn exited(&self) -> bool {
+        matches!(
+            self.code,
+            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+        )
+    }
 }
 
 /// The state of a child that `flags` select, without blocking. `None` when no child is in that
