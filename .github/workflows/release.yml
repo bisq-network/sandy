@@ -175,7 +175,10 @@ jobs:
             # Only GNU tar sorts the entries and sets their time and owner.
             tar=tar; command -v gtar > /dev/null && tar=gtar
             $tar --version 2> /dev/null | grep -q GNU || { echo "a reproducible archive needs GNU tar"; exit 1; }
-            $tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner -czf "$name.tar.gz" "$name"
+            # Without -n, the gzip of the macOS runner writes the time of the build into the
+            # gzip header. GNU gzip writes 0 there for a pipe, so the Linux archives do not change.
+            $tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner -cf - "$name" |
+              gzip -n > "$name.tar.gz"
           fi
           ls -l "$name"/"$exe" ./*.tar.gz ./*.zip 2> /dev/null || true
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
