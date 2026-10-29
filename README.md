@@ -120,7 +120,7 @@ sha256sum target/x86_64-unknown-linux-musl/release/sandy
 ```
 
 The script removes from the binary what would tie it to the machine that built it: the directory
-of the checkout and of `CARGO_HOME`, and the time of the build. It cannot remove the host that
+of the checkout, `CARGO_HOME` and the toolchain, and the build time. It cannot remove the host that
 runs the toolchain, the `host:` line of `rustc -vV`: cargo mixes the host into the metadata of
 the build scripts and procedural macros and passes that on to every crate that uses them. In the
 Linux binaries this changes the order of the functions, though not their size: a build on

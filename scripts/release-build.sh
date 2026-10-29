@@ -44,10 +44,12 @@ case "$target" in
     flags="$flags -C linker=rust-lld"
     ;;
   *-apple-darwin)
-    # Apple's linker derives the UUID of the binary from the paths of the object files in its
-    # debug map, which strip removes afterwards but the UUID keeps. Without the prefix, the binary
-    # differs with the directory of the checkout.
-    flags="$flags -C link-arg=-Wl,-oso_prefix,$root/"
+    # Apple's linker derives the UUID of the binary from its contents, the debug map included,
+    # which names object files by their path: in the checkout, and in the Rust toolchain for the
+    # members of its libraries, such as compiler_builtins. strip removes the map afterwards but
+    # keeps the UUID. Without -S, which links no debug map, the binaries differ with the directory
+    # of the checkout, and the arm64 one also with that of the toolchain.
+    flags="$flags -C link-arg=-Wl,-S"
     ;;
   *-windows-msvc)
     # The C runtime linked in, so that sandy.exe needs no Visual C++ redistributable, and no

@@ -210,7 +210,7 @@ jobs:
   reproducible:
     # The release build removes what would otherwise tie a binary to the machine that made it:
     # the path prefix of the checkout and of CARGO_HOME, the time of the build, the host's linker
-    # on Linux, and the paths that Apple's linker hashes into the UUID. This builds every target
+    # on Linux, and the debug map Apple's linker hashes into the UUID. This builds every target
     # twice from two directories and compares the binaries, so a change that makes the output
     # depend on where it is built is noticed. It does not gate the release: a difference here is a
     # finding to read, not a reason to keep a reviewed tag from being packaged.
