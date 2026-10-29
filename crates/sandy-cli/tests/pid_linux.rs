@@ -115,7 +115,13 @@ fn a_proc_grant_keeps_its_host_files_with_contained() {
         &[("read", "/proc/meminfo"), ("proc-pids", "/proc")],
     );
     lines[0].assert_ok();
-    assert!(lines[1].detail.split(',').count() > 10, "{lines:?}");
+    // This test's process, which a /proc of the namespace would not list. A count of processes
+    // would not tell: a container has only a few.
+    let own = std::process::id().to_string();
+    assert!(
+        lines[1].detail.split(',').any(|pid| pid == own),
+        "{lines:?}"
+    );
 }
 
 /// The init is undumpable, so its /proc files belong to root: no other process of the user reads

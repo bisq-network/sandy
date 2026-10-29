@@ -2250,18 +2250,22 @@ fn a_pty_grant_makes_a_pseudo_terminal_in_every_ptmx_layout() {
             probe_path()
         )
     };
-    let bind = format!(
-        "{devpts} /dev/pts || exit 97\n\
-         mount --bind /dev/pts/ptmx /dev/ptmx || exit 97\n"
-    );
-    let link = format!(
-        "mount -t tmpfs -o mode=755 tmpfs {dev} || exit 97\n\
-         for node in null zero full random urandom; do\n\
-           : > {dev}/$node && mount --bind /dev/$node {dev}/$node || exit 97\n\
-         done\n\
-         mkdir {dev}/pts && {devpts} {dev}/pts || exit 97\n\
-         ln -s pts/ptmx {dev}/ptmx && mount --move {dev} /dev || exit 97\n"
-    );
+    // Both on a /dev of their own: a bind mount onto the host's /dev/ptmx would land in its
+    // devpts where that is a link already (Docker), and leave the layout a link.
+    let layout = |ptmx: &str| {
+        format!(
+            "mount -t tmpfs -o mode=755 tmpfs {dev} || exit 97\n\
+             for node in null zero full random urandom; do\n\
+               : > {dev}/$node && mount --bind /dev/$node {dev}/$node || exit 97\n\
+             done\n\
+             mkdir {dev}/pts && {devpts} {dev}/pts || exit 97\n\
+             {ptmx} && mount --move {dev} /dev || exit 97\n"
+        )
+    };
+    let bind = layout(&format!(
+        ": > {dev}/ptmx && mount --bind {dev}/pts/ptmx {dev}/ptmx"
+    ));
+    let link = layout(&format!("ln -s pts/ptmx {dev}/ptmx"));
     for (layout, setup, pts_alone) in [("bind", bind, 1), ("link", link, 0)] {
         let script = format!(
             "{setup}exec unshare --user --map-user=1000 --map-group=1000 sh -c '\

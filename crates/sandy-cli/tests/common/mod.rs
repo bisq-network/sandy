@@ -978,6 +978,18 @@ pub mod linux {
         abi.max(0)
     }
 
+    /// Whether this user can create a user namespace here, which Docker's default seccomp
+    /// profile refuses.
+    pub fn user_namespace_works() -> bool {
+        std::process::Command::new("unshare")
+            .args(["--user", "true"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
     /// A process of `/proc`: its ID, parent, group, session, whether it ended, its IDs in each
     /// PID namespace from the host's down (`NSpid`), and its PID namespace.
     struct Process {
