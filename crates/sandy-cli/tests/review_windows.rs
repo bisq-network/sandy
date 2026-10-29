@@ -153,18 +153,18 @@ fn profile_folder_is_a_persistent_writable_but_not_executable_store() {
     delete_profile(C_PERSIST);
 }
 
-/// The entry sandy 1.3.2 left on the profile folder: everything Windows grants there except
+/// A profile folder entry that lost only `FILE_EXECUTE`: everything Windows grants there except
 /// `FILE_EXECUTE`, so still `WRITE_DAC` and `WRITE_OWNER`.
-const MASK_1_3_2: &str = "(OI)(CI)(R,W,D,WDAC,WO,DC)";
+const MASK_WITHOUT_EXECUTE: &str = "(OI)(CI)(R,W,D,WDAC,WO,DC)";
 
 /// The program must not be able to put execute back on a file in its own profile folder. The
 /// folder entry keeps the program out of `WRITE_DAC` and `WRITE_OWNER`, not only out of
 /// `FILE_EXECUTE`: with either of those it could rewrite the file's own permissions and grant
 /// `FILE_EXECUTE` to ALL APPLICATION PACKAGES, which it is a member of.
 ///
-/// Two starting points. A profile sandy creates now, and one reduced the way sandy 1.3.2 did,
-/// which keeps `WRITE_DAC`: the second checks that the run repairs an entry an earlier version
-/// left behind instead of taking it for already reduced.
+/// Two starting points. A profile sandy creates now, and one whose entry lost only
+/// `FILE_EXECUTE`, which keeps `WRITE_DAC`: the second checks that the run repairs a partly
+/// reduced entry instead of taking it for already reduced.
 #[test]
 fn the_program_cannot_grant_itself_execute_in_its_profile_folder() {
     delete_profile(C_REGRANT);
@@ -206,27 +206,27 @@ fn the_program_cannot_grant_itself_execute_in_its_profile_folder() {
     };
     attempt("fresh profile");
 
-    // Put the 1.3.2 entry back from outside the sandbox and check that the next run reduces it
-    // again. Without that, every profile an earlier version created stays re-grantable.
+    // Put that entry back from outside the sandbox and check that the next run reduces it
+    // again. Without that, a profile whose entry someone widened stays re-grantable.
     let restored = Command::new("icacls")
         .args([
             folder.to_str().unwrap(),
             "/grant:r",
-            &format!("*{}:{MASK_1_3_2}", appcontainer_sid(C_REGRANT)),
+            &format!("*{}:{MASK_WITHOUT_EXECUTE}", appcontainer_sid(C_REGRANT)),
         ])
         .output()
         .unwrap();
     assert!(restored.status.success(), "{restored:?}");
-    attempt("profile reduced by 1.3.2");
+    attempt("entry without FILE_EXECUTE only");
 
     delete_profile(C_REGRANT);
 }
 
-/// The run that reduces a profile entry left by sandy 1.3.2 re-propagates it over the folder, which
-/// the program could write, so it first refuses a junction there, as `grant` does for a policy
-/// path. Once the entry is reduced nothing propagates, and the same junction refuses nothing.
+/// The run that reduces a widened profile entry re-propagates it over the folder, which the
+/// program could write, so it first refuses a junction there, as `grant` does for a policy path.
+/// Once the entry is reduced nothing propagates, and the same junction refuses nothing.
 #[test]
-fn reducing_an_old_profile_entry_refuses_a_junction_in_the_folder() {
+fn reducing_a_widened_profile_entry_refuses_a_junction_in_the_folder() {
     delete_profile(C_RELINK);
     let fixture = Fixture::new("relink");
     let temp = profile_temp(C_RELINK);
@@ -255,7 +255,7 @@ fn reducing_an_old_profile_entry_refuses_a_junction_in_the_folder() {
         .args([
             folder.to_str().unwrap(),
             "/grant:r",
-            &format!("*{}:{MASK_1_3_2}", appcontainer_sid(C_RELINK)),
+            &format!("*{}:{MASK_WITHOUT_EXECUTE}", appcontainer_sid(C_RELINK)),
         ])
         .output()
         .unwrap();

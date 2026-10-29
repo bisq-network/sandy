@@ -196,7 +196,7 @@ The change is idempotent: a run writes only while the entry still carries one of
 rights, so it also reduces an entry that lost `FILE_EXECUTE` alone, or that someone widened again
 from outside. Such a run also walks the folder and refuses a junction or symbolic link below it,
 because it re-propagates the entry and the program can write there
-(`review_windows::reducing_an_old_profile_entry_refuses_a_junction_in_the_folder`).
+(`review_windows::reducing_a_widened_profile_entry_refuses_a_junction_in_the_folder`).
 
 The folder holds no user data. It is the program's own scratch space, writable in every policy,
 also one with no writable path. `escape_windows` and `review_windows` confirm that the program

@@ -351,7 +351,8 @@ mod tests {
             FILE_ALL_ACCESS & !PROFILE_DENIED,
             access_mask(PathAccess::ReadWrite)
         );
-        // The 1.3.2 mask, which kept WRITE_DAC and WRITE_OWNER, still needs reducing.
+        // An entry that lost only FILE_EXECUTE keeps WRITE_DAC and WRITE_OWNER, so it still
+        // needs reducing.
         assert_ne!((FILE_ALL_ACCESS & !FILE_EXECUTE) & PROFILE_DENIED, 0);
     }
 

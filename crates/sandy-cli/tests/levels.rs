@@ -305,7 +305,7 @@ fn a_pinned_level_takes_the_parent_options_of_the_policy() {
     parse(&output)[0].assert_ok();
 }
 
-/// A policy without levels reads and reports as before 2.2.0: no level lines, no level in the
+/// A policy without levels reads and reports as a plain policy: no level lines, no level in the
 /// status record.
 #[test]
 fn a_policy_without_levels_has_no_level_lines() {

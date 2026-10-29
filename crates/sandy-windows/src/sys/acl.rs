@@ -294,8 +294,8 @@ pub fn allow(path: &Path, sid: &Sid, mask: u32, flags: u8) -> Result<(), Sandbox
 /// re-propagates the inheritable ACE, so files the program wrote on an earlier run lose the
 /// rights too.
 ///
-/// Idempotent: it writes only while the entry still carries one of those rights. sandy 1.3.2
-/// removed only `FILE_EXECUTE`, so a profile that version left behind is reduced once more here.
+/// Idempotent: it writes only while the entry still carries one of those rights, so it also
+/// reduces an entry that lost only `FILE_EXECUTE`, or that someone widened again.
 pub fn deny_execute_in_profile(appcontainer: &Sid, folder: &Path) -> Result<(), SandboxError> {
     let path = wide_nul(folder.as_os_str());
     if excess_profile_rights(&Dacl::read(&path, folder)?, folder, appcontainer)?.is_none() {

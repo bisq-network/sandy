@@ -160,7 +160,7 @@ mod tests {
             assert!(validate_appcontainer_name(name).is_err(), "{name:?}");
         }
         // A short suffix after an underscore is not a publisher ID, and neither is one with a
-        // letter that the alphabet of publisher IDs lacks; sandy 1.3.2 accepted both.
+        // letter that the alphabet of publisher IDs lacks.
         assert_eq!(validate_appcontainer_name("My App-1_2"), Ok(()));
         assert_eq!(validate_appcontainer_name(".hidden"), Ok(()));
         for name in [

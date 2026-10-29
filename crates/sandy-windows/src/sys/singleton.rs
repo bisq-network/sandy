@@ -82,10 +82,8 @@ fn fingerprint(policy: &ResolvedPolicy) -> Vec<u8> {
     let mut out = vec![
         // Format version. 2 adds forwarded ports and `children`, 3 adds `end_with_parent` and
         // keys the state on the SID, 4 adds `win32k`, 5 adds `ip = "private"`, `egress` and
-        // `view`; a run of another sandy version that reads
-        // this file then never matches by accident and is refused, which is the safe outcome.
-        // sandy 1.3.2 (version 2) kept the state in a named kernel object, which this version
-        // does not read.
+        // `view`; a run of another sandy version that reads this file then never matches by
+        // accident and is refused, which is the safe outcome.
         5u8,
         match policy.system {
             sandy_core::SystemAccess::Minimal => 0,
