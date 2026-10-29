@@ -265,12 +265,9 @@ fn a_status_channel_nobody_reads_changes_nothing() {
         args.splice(1..1, ["--status-fd".to_string(), "3".to_string()]);
         let mut command = std::process::Command::new(sandy_path());
         command.args(args);
-        // SAFETY: dup2 is async-signal-safe and the closure calls nothing else.
+        // SAFETY: inherit_as is async-signal-safe and the closure calls nothing else.
         unsafe {
-            command.pre_exec(move || match libc::dup2(raw, 3) {
-                3 => Ok(()),
-                _ => Err(std::io::Error::last_os_error()),
-            });
+            command.pre_exec(move || inherit_as(raw, 3));
         }
         let output = command.output().unwrap();
         drop(writer);

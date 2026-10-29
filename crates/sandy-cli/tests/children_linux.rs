@@ -358,13 +358,10 @@ fn sandy_closes_what_it_inherited_while_the_program_runs() {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    // SAFETY: dup2 is async-signal-safe; it makes the write end descriptor `INHERITED` of
+    // SAFETY: inherit_as is async-signal-safe; it makes the write end descriptor `INHERITED` of
     // sandy, without close-on-exec.
     unsafe {
-        command.pre_exec(move || match libc::dup2(write_fd, INHERITED) {
-            INHERITED => Ok(()),
-            _ => Err(std::io::Error::last_os_error()),
-        });
+        command.pre_exec(move || inherit_as(write_fd, INHERITED));
     }
     let mut sandy = command.spawn().unwrap();
     drop(write);

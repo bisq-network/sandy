@@ -239,12 +239,9 @@ fn a_status_channel_nobody_reads_changes_nothing() {
         args.splice(1..1, ["--status-fd".to_string(), "3".to_string()]);
         let mut command = Command::new(sandy_path());
         command.args(args);
-        // SAFETY: dup2 is async-signal-safe and the closure calls nothing else.
+        // SAFETY: inherit_as is async-signal-safe and the closure calls nothing else.
         unsafe {
-            command.pre_exec(move || match libc::dup2(raw, 3) {
-                3 => Ok(()),
-                _ => Err(std::io::Error::last_os_error()),
-            });
+            command.pre_exec(move || inherit_as(raw, 3));
         }
         let output = command.output().unwrap();
         drop(writer);
@@ -290,15 +287,10 @@ fn the_program_inherits_only_the_standard_descriptors() {
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // SAFETY: dup2 is async-signal-safe; it makes the pipe's read end descriptor
+        // SAFETY: inherit_as is async-signal-safe; it makes the pipe's read end descriptor
         // `INHERITED` of the child, without close-on-exec.
         unsafe {
-            command.pre_exec(move || {
-                if libc::dup2(read_fd, INHERITED) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+            command.pre_exec(move || inherit_as(read_fd, INHERITED));
         }
         let output = command.output().unwrap();
         assert!(output.status.success(), "{output:?}");
@@ -314,8 +306,12 @@ fn the_program_inherits_only_the_standard_descriptors() {
 /// The supervising sandy closes what it inherited beyond 0, 1 and 2 and keeps only its own
 /// descriptors, such as the status record's. A listening socket that the caller let it inherit
 /// would otherwise stay bound for as long as the program runs, although neither the program nor
-/// the helpers get it (`the_program_inherits_only_the_standard_descriptors`). Control: the port
-/// answers while the caller still holds its own copy, and the record arrives in full.
+/// the helpers get it (`the_program_inherits_only_the_standard_descriptors`). The test asks
+/// `lsof` which processes of the run hold the port, not whether the port answers: macOS sets
+/// close-on-exec on a new socket only after creating it, so a process that another test of this
+/// binary starts in that moment can hold a copy too (the port answered in 1 of 10 runs on the
+/// macos-26 runner while `lsof` found no listener). Control: `lsof` finds the caller's copy, and
+/// the record arrives in full.
 #[test]
 fn sandy_keeps_no_inherited_descriptor_while_the_program_runs() {
     use std::os::fd::AsRawFd;
@@ -324,7 +320,7 @@ fn sandy_keeps_no_inherited_descriptor_while_the_program_runs() {
 
     let fixture = Fixture::new("contained-closed");
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
+    let port = listener.local_addr().unwrap().port();
     let (status_read, status_write) = std::io::pipe().unwrap();
     let (socket, record) = (listener.as_raw_fd(), status_write.as_raw_fd());
     let mut args = run_args(&contained(&fixture), &[("read-line", "-"), ("exit", "7")]);
@@ -334,14 +330,12 @@ fn sandy_keeps_no_inherited_descriptor_while_the_program_runs() {
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null());
-    // SAFETY: dup2 is async-signal-safe; it gives the child both descriptors without
+    // SAFETY: inherit_as is async-signal-safe; it gives the child both descriptors without
     // close-on-exec.
     unsafe {
         command.pre_exec(move || {
-            if libc::dup2(socket, INHERITED) < 0 || libc::dup2(record, STATUS) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
+            inherit_as(socket, INHERITED)?;
+            inherit_as(record, STATUS)
         });
     }
     let mut sandy = command.spawn().unwrap();
@@ -351,24 +345,61 @@ fn sandy_keeps_no_inherited_descriptor_while_the_program_runs() {
     status.read_line(&mut started).unwrap();
     assert!(started.starts_with("pid "), "{started:?}");
 
+    let caller = holders(&[std::process::id()], port);
     assert!(
-        std::net::TcpStream::connect(address).is_ok(),
-        "control: the caller's listener does not answer"
+        caller.contains("LISTEN"),
+        "control: lsof does not find the caller's listener: {caller:?}"
     );
     drop(listener);
-    let refused = std::net::TcpStream::connect(address)
-        .map(drop)
-        .map_err(|error| error.kind());
+    let run = process_tree(sandy.id());
+    let held = holders(&run, port);
     writeln!(sandy.stdin.take().unwrap(), "end").unwrap();
     assert_eq!(sandy.wait().unwrap().code(), Some(7));
     let mut rest = String::new();
     status.read_to_string(&mut rest).unwrap();
-    assert_eq!(
-        refused,
-        Err(std::io::ErrorKind::ConnectionRefused),
-        "sandy kept the listener it inherited while the program ran"
+    assert!(
+        held.is_empty(),
+        "a process of the run ({run:?}) kept the listener sandy inherited:\n{held}"
     );
     assert_eq!(rest, "exited 7\n");
+}
+
+/// `root` and every process below it, from `ps`.
+fn process_tree(root: u32) -> Vec<u32> {
+    let output = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid="])
+        .output()
+        .unwrap();
+    let pairs: Vec<(u32, u32)> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace().map(|field| field.parse().ok());
+            Some((fields.next()??, fields.next()??))
+        })
+        .collect();
+    let mut tree = vec![root];
+    let mut next = 0;
+    while let Some(&parent) = tree.get(next) {
+        tree.extend(
+            pairs
+                .iter()
+                .filter(|(_, ppid)| *ppid == parent)
+                .map(|(pid, _)| *pid),
+        );
+        next += 1;
+    }
+    tree
+}
+
+/// The TCP sockets on `port` that the processes `pids` hold, as `lsof` lists them; empty when
+/// there are none.
+fn holders(pids: &[u32], port: u16) -> String {
+    let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
+    let output = Command::new("lsof")
+        .args(["-nP", "-a", "-p", &pids.join(","), &format!("-iTCP:{port}")])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 #[test]

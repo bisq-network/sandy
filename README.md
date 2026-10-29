@@ -1080,7 +1080,9 @@ change. A policy without levels has one entry in `levels`, named `base`.
   Java and .NET connect to an IPv4 address by default; start Java with
   `-Djava.net.preferIPv4Stack=true` and .NET with `DOTNET_SYSTEM_NET_DISABLEIPV6=1`. With the key
   sandy refuses a forward to an IPv6 address, and without `ip = "private"` it refuses the key.
-  On Linux and Windows the key changes nothing but these refusals.
+  On Linux and Windows the key changes nothing but these refusals. On macOS 15 and 26
+  `::ffff:127.0.0.1` gets "Operation not permitted" at those ports without the key too, so the
+  same Java and .NET settings are needed there ([docs/macos.md](docs/macos.md)).
 - The system writes the crash report of a program that sandy runs to
   `/Library/Logs/DiagnosticReports`, which administrators can read and standard users cannot,
   instead of the user's `~/Library/Logs/DiagnosticReports`.

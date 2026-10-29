@@ -632,6 +632,21 @@ pub fn appcontainer_children_blocked() -> bool {
     blocked
 }
 
+/// Gives the child, between fork and exec, `fd` as descriptor `target` without close-on-exec.
+/// `dup2` changes nothing when `fd` already is `target`, and then keeps the close-on-exec flag
+/// that std sets on every descriptor it opens: a pipe gets that number when another test thread
+/// closes it while the pipe is made (measured on the macos-26 runner: sandy got EBADF for
+/// `--status-fd 3`). Only async-signal-safe calls.
+#[cfg(unix)]
+pub fn inherit_as(fd: libc::c_int, target: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: dup2 and fcntl take descriptors and are async-signal-safe.
+    if unsafe { libc::dup2(fd, target) } < 0 || unsafe { libc::fcntl(target, libc::F_SETFD, 0) } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// When this process started, in the form `--parent-start` takes on this platform: clock ticks
 /// since boot from field 22 of `/proc/self/stat`. This is the recipe a caller follows (see
 /// docs/linux.md).
@@ -646,6 +661,27 @@ pub fn start_token() -> u64 {
         .unwrap()
         .parse()
         .unwrap()
+}
+
+/// The major version of macOS, from `kern.osproductversion`.
+#[cfg(target_os = "macos")]
+pub fn macos_major() -> u32 {
+    let mut buffer = [0u8; 32];
+    let mut size = buffer.len();
+    // SAFETY: the name is a C string, and buffer and size describe a writable buffer.
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"kern.osproductversion".as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+    let version = std::ffi::CStr::from_bytes_until_nul(&buffer).unwrap();
+    let version = version.to_str().unwrap();
+    version.split('.').next().unwrap().parse().unwrap()
 }
 
 /// Microseconds since the epoch, from `PROC_PIDTBSDINFO` (see docs/macos.md).
@@ -740,12 +776,9 @@ pub fn sandy_with_status_under(wrapper: &[String], args: &[String]) -> (Output, 
         .args(with_status_option(args, CHANNEL.to_string()))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // SAFETY: dup2 is async-signal-safe and the closure calls nothing else.
+    // SAFETY: inherit_as is async-signal-safe and the closure calls nothing else.
     unsafe {
-        command.pre_exec(move || match libc::dup2(raw, CHANNEL) {
-            CHANNEL => Ok(()),
-            _ => Err(std::io::Error::last_os_error()),
-        });
+        command.pre_exec(move || inherit_as(raw, CHANNEL));
     }
     let child = command.spawn().unwrap();
     // Only sandy holds the write end now, so the read below ends when sandy exits.

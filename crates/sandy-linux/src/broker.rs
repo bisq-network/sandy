@@ -345,11 +345,16 @@ mod tests {
         canary.set_nonblocking(true).unwrap();
         let [a, b] = canary.local_addr().unwrap().port().to_be_bytes();
         let (mut report, mut report_write) = helper::pipe("the test's pipe").unwrap();
+        // The child waits until the test holds a pidfd for the broker: the broker ends as soon as
+        // the child does, and no pidfd opens for a process that has ended (ESRCH, seen on the
+        // ubuntu-22.04 runner).
+        let (go, mut go_write) = helper::pipe("the test's go pipe").unwrap();
         // SAFETY: the child is a fork of a process with one test thread (`alone`), runs the
         // steps below and leaves through `_exit`.
         let child = unsafe { libc::fork() };
         if child == 0 {
             drop(report);
+            drop(go_write);
             let outcome = (|| {
                 // A port that was free a moment ago can be taken by any process of the host
                 // before the handover binds it again, so the child takes a few tries.
@@ -369,6 +374,7 @@ mod tests {
                     }
                 };
                 report_write.write_all(&pid.to_ne_bytes()).map_err(|_| 2)?;
+                (&go).read_exact(&mut [0u8; 1]).map_err(|_| 2)?;
                 // This host under its loopback name, and a name.
                 let host = [1, 127, 0, 0, 1, a, b];
                 let name = [
@@ -384,9 +390,11 @@ mod tests {
             unsafe { libc::_exit(outcome.err().unwrap_or(0)) };
         }
         drop(report_write);
+        drop(go);
         let mut pid = [0u8; std::mem::size_of::<libc::pid_t>()];
         report.read_exact(&mut pid).unwrap();
         let broker = helper::pidfd_open(libc::pid_t::from_ne_bytes(pid), "the broker").unwrap();
+        go_write.write_all(&[1]).unwrap();
         let mut status = 0;
         // SAFETY: waits for the child created above.
         assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);

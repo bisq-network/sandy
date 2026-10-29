@@ -174,11 +174,28 @@ struct Installed {
     sandy: PathBuf,
 }
 
+/// Where an `Installed` goes: the first of these directories that only root can change, along
+/// its whole path. The GitHub Ubuntu images make /opt writable by everyone (mode 777), and setup
+/// rightly refuses a sandy below it.
+const INSTALL_PARENTS: [&str; 3] = ["/opt", "/usr/local/lib", "/usr/lib"];
+
+fn only_root_can_change(path: &Path) -> bool {
+    path.ancestors().all(|directory| {
+        fs::symlink_metadata(directory)
+            .is_ok_and(|metadata| metadata.uid() == 0 && metadata.mode() & 0o022 == 0)
+    })
+}
+
 impl Installed {
     fn new() -> Installed {
         static COUNT: AtomicUsize = AtomicUsize::new(0);
-        let directory = PathBuf::from(format!(
-            "/opt/sandy-setup-test-{}-{}",
+        let parent = INSTALL_PARENTS
+            .into_iter()
+            .map(Path::new)
+            .find(|parent| only_root_can_change(parent))
+            .expect("none of the install parents can be changed by root alone");
+        let directory = parent.join(format!(
+            "sandy-setup-test-{}-{}",
             std::process::id(),
             COUNT.fetch_add(1, Ordering::Relaxed)
         ));

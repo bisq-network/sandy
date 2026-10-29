@@ -742,14 +742,19 @@ no Mach service, the networking ones included. Names resolve only from `/etc/hos
 network, the unique local and link-local IPv6 addresses, fe80::1%lo0 and the link-local addresses
 of the VPN interfaces, but not 127.0.0.2, which lo0 does not carry, and not the IPv4-mapped form
 of the local network address. So the rules above let the program reach a forwarded or egress
-port, and listen on an exposed port, at every address the Mac has.
+port, and listen on an exposed port, at every address the Mac has. On macOS 15 and 26
+`localhost` does not match ::ffff:127.0.0.1: an IPv6 socket that connects to 127.0.0.1 in that
+form gets `EPERM` under every `localhost` rule, `tcp`, `ip`, `tcp4` and `tcp6` alike (measured on
+the GitHub runners with macOS 15.7.9 and 26.6.2), so there the default `dual-stack` costs that
+form as `ipv4` does (see below).
 
 For an IPv6 link-local address `localhost` ignores the scope: an address of the Mac matches with
 any interface as its scope, also one where the Mac does not have it. Measured on macOS 27.0.1 with
 loopback as the scope, where nothing leaves the Mac: the en1 link-local address at the scope of
 lo0 passed the profile and the connect timed out on lo0, while another link-local address at the
-same scope was denied with `EPERM`. With the scope of another link the connect goes out on that
-link, to whatever host has the address there.
+same scope was denied with `EPERM`; on the macOS 15 runner the connect that passed failed at once
+with `EHOSTUNREACH` instead of timing out. With the scope of another link the connect goes out on
+that link, to whatever host has the address there.
 
 For each forwarded port the relay therefore binds the port with `SO_REUSEADDR` and without
 listening at `0.0.0.0`, at `[::]` (IPv6 only) and at every address that `getifaddrs` lists for
@@ -852,7 +857,9 @@ What the key costs: an IPv6 socket gets `EPERM` at those ports, also one that co
 127.0.0.1 as `::ffff:127.0.0.1`. Java and .NET connect to an IPv4 address that way by default, by
 their documentation (neither is installed on the test Mac): Java needs
 `-Djava.net.preferIPv4Stack=true`, and .NET `DOTNET_SYSTEM_NET_DISABLEIPV6=1`. `sandy check` warns
-about this cost instead of the route. A forward whose `to` is IPv6 listens on [::1] for the
+about this cost instead of the route. On macOS 15 and 26 `::ffff:127.0.0.1` gets `EPERM` under
+`dual-stack` too, as the table's second row would read there, because `localhost` does not match
+it; `check` does not warn about that. A forward whose `to` is IPv6 listens on [::1] for the
 program, which it then cannot reach, so sandy refuses such a forward with the key, and the key
 needs `ip = "private"`, the only value under which the route exists. The exposed ports keep both
 families: the program listens there, and the route is one of connecting. Linux and Windows
@@ -1353,9 +1360,11 @@ no privilege, and closing them would break ordinary programs:
   can be reached no other way (see [Networking](#networking)), so `access`, `statfs` (with the
   device and the directory the volume is mounted on), `chdir` and `getattrlist` with
   `ATTR_CMN_FULLPATH` answer for every path. With a `/.vol/<dev>/<inode>` path `getattrlist`
-  turns an inode number into a path, the disclosure that the `fsgetpath` denial closed. No path rule can close it here: Seatbelt checks the lookup of a
-  `/.vol` path against the file's real path, so a denial of `/.vol` does not reach it (measured
-  on macOS 27.0.1). Every other call still answers `ENOENT`, and contents, metadata and listings
+  turns an inode number into a path, the disclosure that the `fsgetpath` denial closed. No path
+  rule can close it here: Seatbelt checks the lookup of a `/.vol` path against the file's real
+  path, so a denial of `/.vol` does not reach it (measured on macOS 27.0.1 and on the macOS 26.6.2
+  runner; on the macOS 15.7.9 runner the `/.vol` path answers `ENOENT` in the sandbox while it
+  resolves outside). Every other call still answers `ENOENT`, and contents, metadata and listings
   stay unreadable (`unix_sockets_all_reaches_sockets_and_tests_paths_outside_the_policy`).
   `sandy check` warns about it.
   Without `unix_sockets = "all"` every path outside the policy looks missing to every call

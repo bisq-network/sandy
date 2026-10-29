@@ -368,6 +368,27 @@ fn check_reports_a_path_whose_permissions_the_user_cannot_change() {
             .unwrap();
         assert!(changed.status.success(), "{changed:?}");
     }
+    // The change takes the right only where this token holds it as the owner. Where the token
+    // still opens the file for WRITE_DAC without its privileges, sandy may change the list, and
+    // `check` correctly calls the path enforced, so the conflict cannot be built here.
+    let (_, opened) = executable_with_restricted_token(
+        &probe_path(),
+        windows_sys::Win32::Security::DISABLE_MAX_PRIVILEGE,
+        &["write-dac".to_string(), file.clone()],
+    );
+    let opened = parse_line(
+        opened
+            .lines()
+            .find(|line| line.starts_with("write-dac\t"))
+            .unwrap_or_default(),
+    );
+    if opened.result == "ok" {
+        return skip(
+            "write-dac-revocable",
+            "this user still opens the file for WRITE_DAC without privileges after the change, \
+             so no path here lacks the right",
+        );
+    }
     let (code, output) = sandy_without_privileges(&check);
     assert_eq!(code as i32, EXIT_CONFLICT, "{output}");
     assert!(output.contains(&file), "{output}");

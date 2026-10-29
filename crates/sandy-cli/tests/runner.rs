@@ -50,6 +50,35 @@ const EXPECTED_SKIPS: &[(&str, &str)] = &[
         "macos-27-arm",
         include_str!("expected-skips/macos-27-arm.txt"),
     ),
+    ("macos-15", include_str!("expected-skips/macos-15.txt")),
+    (
+        "ubuntu-22.04",
+        include_str!("expected-skips/ubuntu-22.04.txt"),
+    ),
+    (
+        "ubuntu-24.04",
+        include_str!("expected-skips/ubuntu-24.04.txt"),
+    ),
+    (
+        "ubuntu-24.04-x86_64-unknown-linux-musl",
+        include_str!("expected-skips/ubuntu-24.04-x86_64-unknown-linux-musl.txt"),
+    ),
+    (
+        "ubuntu-24.04-arm",
+        include_str!("expected-skips/ubuntu-24.04-arm.txt"),
+    ),
+    (
+        "ubuntu-24.04-arm-aarch64-unknown-linux-musl",
+        include_str!("expected-skips/ubuntu-24.04-arm-aarch64-unknown-linux-musl.txt"),
+    ),
+    (
+        "windows-2022",
+        include_str!("expected-skips/windows-2022.txt"),
+    ),
+    (
+        "windows-2025",
+        include_str!("expected-skips/windows-2025.txt"),
+    ),
 ];
 
 /// Set for the test binary that the self-checks below start, so that one test skips a feature.
@@ -81,10 +110,11 @@ fn skips_match_the_expected_list() {
             list(&happened)
         );
     };
-    let expected = expected_skips(text);
+    let (expected, sometimes) = expected_skips(text);
 
     let mut problems: Vec<String> = happened
         .difference(&expected)
+        .filter(|skip| !sometimes.contains(*skip))
         .map(|skip| format!("not checked, and not expected to be skipped on {runner}: {skip}"))
         .collect();
     problems.extend(
@@ -122,17 +152,25 @@ fn logged_skips(path: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// One `BINARY TEST FEATURE` per line. Blank lines and lines that start with `#` are comments.
-fn expected_skips(text: &str) -> BTreeSet<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|line| {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            assert_eq!(fields.len(), 3, "expected BINARY TEST FEATURE: {line:?}");
-            fields.join(" ")
-        })
-        .collect()
+/// One `BINARY TEST FEATURE` per line: the skips every run must have, and those after `? `,
+/// which happen on some machines of a runner and not on others, so a run may have them or not.
+/// Blank lines and lines that start with `#` are comments.
+fn expected_skips(text: &str) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut always = BTreeSet::new();
+    let mut sometimes = BTreeSet::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (set, entry) = match line.strip_prefix("? ") {
+            Some(entry) => (&mut sometimes, entry),
+            None => (&mut always, line),
+        };
+        let fields: Vec<&str> = entry.split_whitespace().collect();
+        assert_eq!(fields.len(), 3, "expected BINARY TEST FEATURE: {line:?}");
+        set.insert(fields.join(" "));
+    }
+    (always, sometimes)
 }
 
 /// A runner that loses Landlock, or gains an older kernel, would make every check that needs a

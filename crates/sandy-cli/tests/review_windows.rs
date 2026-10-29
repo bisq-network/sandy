@@ -316,6 +316,19 @@ fn com_services_outside_the_sandbox_are_unreachable() {
             );
             continue;
         }
+        // REGDB_E_CLASSNOTREG: the AppContainer does not see the class, so COM never asks the
+        // service, and the failure says nothing about the boundary either.
+        if inside[0].result != "ok" && inside[0].detail.contains("0x80040154") {
+            skip(
+                "com-class-in-appcontainer",
+                &format!(
+                    "the {service} class is not registered for an AppContainer on this host \
+                     ({}), so the denial would not be the COM boundary",
+                    inside[0].detail
+                ),
+            );
+            continue;
+        }
         assert_eq!(inside[0].result, "denied", "{service}: {:?}", inside[0]);
         assert!(
             inside[0].detail.contains(E_ACCESSDENIED),

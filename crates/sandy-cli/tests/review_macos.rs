@@ -801,14 +801,35 @@ fn unix_sockets_all_reaches_sockets_and_tests_paths_outside_the_policy() {
     let inside = probe_inside(&unix, &actions);
     inside[0].assert_ok();
     assert_eq!(inside[1].result, "error", "{inside:?}");
-    for line in &inside[2..6] {
+    // Control: the path by inode answers outside the sandbox. Where it does not, its answer
+    // inside says nothing about the profile.
+    let outside = probe_outside(&actions[5..6]);
+    let resolves = outside[0].result == "ok";
+    if !resolves {
+        skip(
+            "vol-by-inode",
+            &format!(
+                "this host does not resolve {by_inode} outside the sandbox either ({})",
+                outside[0].detail
+            ),
+        );
+    }
+    for line in &inside[2..5] {
         assert_eq!(
             line.result, "ok",
             "existence is hidden with unix_sockets = \"all\" now; the documented limitation \
              is stale: {line:?}"
         );
     }
-    assert!(inside[5].detail.ends_with("/secret/file"), "{inside:?}");
+    // The path by inode answers inside from macOS 26 on (measured on the 26.6.2 runner and on
+    // 27.0.1); macOS 15 hides it (measured on the 15.7.9 runner).
+    if resolves && macos_major() >= 26 {
+        inside[5].assert_ok();
+        assert!(inside[5].detail.ends_with("/secret/file"), "{inside:?}");
+    } else if resolves {
+        assert_eq!(inside[5].result, "error", "{inside:?}");
+        assert!(inside[5].detail.ends_with("(os error 2)"), "{inside:?}");
+    }
     // Every other call still answers like a missing path.
     assert!(inside[6].detail.ends_with("(os error 2)"), "{inside:?}");
 }

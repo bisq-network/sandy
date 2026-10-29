@@ -1,0 +1,24 @@
+# Expected skips on the GitHub windows-2025 runner, measured in CI.
+# AppContainer processes cannot start child processes on the runner (docs/windows.md,
+# limitation 11).
+children children_contained_ends_what_the_program_leaves_behind appcontainer-children
+children children_none_denies_starting_programs appcontainer-children
+escape executes_only_executable_paths appcontainer-children
+escape_windows a_process_the_program_left_behind_ends_before_sandy_exits appcontainer-children
+escape_windows children_none_denies_starting_a_system_program appcontainer-children
+escape_windows win32k_lockdown_reaches_the_program_its_children_and_its_console_host appcontainer-children
+# The Task Scheduler class is not registered for an AppContainer, so COM never asks the
+# service.
+review_windows com_services_outside_the_sandbox_are_unreachable com-class-in-appcontainer
+# No second local account is configured (SANDY_TEST_OTHER_USER).
+crossuser_windows another_user_cannot_reach_the_program_across_sessions cross-user
+# The runner user may create no ICMP datagram socket outside the sandbox either.
+escape a_raw_ip_socket_on_standard_input_is_refused icmp-datagram-socket
+# The runner's gateway answers neither DNS nor ICMP outside the sandbox.
+escape_windows egress_under_public_and_local_allows_the_gateway_but_not_this_machine network-gateway
+escape_windows ip_private_reaches_no_host_of_the_network network-gateway
+# The host makes no connected AF_UNIX pair of some kinds.
+escape a_connected_unix_socket_on_standard_input_still_runs unix-socket-pair
+# The runner user still opens a file for WRITE_DAC without privileges after the change, so
+# no path lacks the right.
+escape_windows check_reports_a_path_whose_permissions_the_user_cannot_change write-dac-revocable

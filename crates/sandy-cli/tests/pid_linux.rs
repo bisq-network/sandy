@@ -535,12 +535,9 @@ fn spawn_with_status(
         .args(run)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    // SAFETY: dup2 is async-signal-safe and the closure calls nothing else.
+    // SAFETY: inherit_as is async-signal-safe and the closure calls nothing else.
     unsafe {
-        command.pre_exec(move || match libc::dup2(raw, 3) {
-            3 => Ok(()),
-            _ => Err(std::io::Error::last_os_error()),
-        });
+        command.pre_exec(move || inherit_as(raw, 3));
     }
     let child = command.spawn().unwrap();
     drop(writer);

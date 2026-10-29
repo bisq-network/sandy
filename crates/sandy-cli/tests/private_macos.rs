@@ -480,7 +480,7 @@ fn a_link_local_address_of_this_mac_matches_at_every_scope() {
     );
     assert_eq!(inside[1].result, "denied", "{:?}", inside[1]);
     assert!(
-        inside[0].result == "error" && inside[0].detail.contains("timed out"),
+        unanswered(&inside[0]),
         "the profile no longer lets the program connect to {own_there}, a link-local address of \
          this Mac at another scope, so that part of the exception for ip = \"private\" on macOS \
          is stale: {:?}",
@@ -494,8 +494,10 @@ fn a_link_local_address_of_this_mac_matches_at_every_scope() {
 /// link-local address at the scope of lo0 is denied. So is every other IPv6 form, ::1 and
 /// ::ffff:127.0.0.1 included, which is how Java and .NET connect to an IPv4 address by default,
 /// while the relay and the broker still serve over IPv4. Control: with `dual-stack` the same
-/// connects pass the profile, ::ffff:127.0.0.1 reaches the relay and the broker, and the others
-/// find a holder or nothing and go unanswered.
+/// connects pass the profile and the others find a holder or nothing and go unanswered.
+/// ::ffff:127.0.0.1 reaches the relay and the broker from macOS 27 on (measured on 27.0.1);
+/// macOS 15 and 26 deny it under both values (measured on the 15.7.9 and 26.6.2 runners), where
+/// Seatbelt's `localhost` does not match the IPv4-mapped form.
 #[test]
 fn ipv4_relays_are_reached_only_over_ipv4() {
     let Some(others) = other_addresses() else {
@@ -552,14 +554,21 @@ fn ipv4_relays_are_reached_only_over_ipv4() {
     let dual_stack = run("dual-stack");
     dual_stack[0].assert_ok();
     assert_eq!(reply_of(&dual_stack[1]), 2, "{dual_stack:?}");
-    dual_stack[2].assert_ok();
-    dual_stack[3].assert_ok();
-    for line in &dual_stack[4..] {
-        assert!(
-            line.result == "error" && line.detail.contains("timed out"),
-            "{line:?}"
-        );
+    let mapped = if macos_major() >= 27 { "ok" } else { "denied" };
+    for line in &dual_stack[2..4] {
+        assert_eq!(line.result, mapped, "{line:?}");
     }
+    for line in &dual_stack[4..] {
+        assert!(unanswered(line), "{line:?}");
+    }
+}
+
+/// A connect that the profile let through and nothing answered: it times out where lo0 drops the
+/// packet (macOS 26 and 27), or fails at once with `EHOSTUNREACH` (the macOS 15 runner). A denial
+/// of the profile is `EPERM` instead.
+fn unanswered(line: &ProbeLine) -> bool {
+    line.result == "error"
+        && (line.detail.contains("timed out") || line.detail.contains("(os error 65)"))
 }
 
 /// Under `signals = "isolated"` the program cannot stop or end its relay or its broker, which is
