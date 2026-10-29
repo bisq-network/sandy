@@ -76,6 +76,18 @@ The binary is `target/release/sandy` (`sandy.exe` on Windows). It has no runtime
 besides the operating system. The pinned Rust toolchain in `rust-toolchain.toml` installs itself
 through rustup.
 
+The rest of this README runs it as `sandy`. Install it into a directory on your `PATH` that lies
+outside every writable path of your policies (see "Where to install sandy" below), for example
+`/usr/local/bin` on Linux and macOS, which macOS does not create by itself:
+
+```sh
+sudo mkdir -p /usr/local/bin
+sudo install -m 755 target/release/sandy /usr/local/bin/sandy
+```
+
+On Windows, copy `sandy.exe` into a new folder under `C:\Program Files` and add that folder to
+the system `PATH`.
+
 For a fully static Linux binary:
 
 ```sh
@@ -83,17 +95,15 @@ cargo build --release --target x86_64-unknown-linux-musl -p sandy-cli --bin sand
 ```
 
 Release archives for each platform are built with `scripts/release-build.sh`, by the `release`
-workflow or by hand (see [Building and testing](#building-and-testing) and below). Their sizes,
-measured on a release build:
+workflow or by hand (see [Building and testing](#building-and-testing) and below), for these
+targets:
 
-| Target | Binary | Archive |
-|---|---|---|
-| `x86_64-unknown-linux-musl` (static PIE) | 1.7 MiB | 829 KiB |
-| `aarch64-unknown-linux-musl` (static PIE) | 1.4 MiB | 772 KiB |
-| `aarch64-apple-darwin` | 995 KiB | 524 KiB |
-| `x86_64-apple-darwin` | 1.1 MiB | 584 KiB |
-| `x86_64-pc-windows-msvc` (static C runtime) | 1.2 MiB | 584 KiB |
-| `aarch64-pc-windows-msvc` (built, not tested) | 1.0 MiB | 534 KiB |
+- `x86_64-unknown-linux-musl` (static PIE)
+- `aarch64-unknown-linux-musl` (static PIE)
+- `aarch64-apple-darwin`
+- `x86_64-apple-darwin`
+- `x86_64-pc-windows-msvc` (static C runtime)
+- `aarch64-pc-windows-msvc` (built, not tested)
 
 **Verifying a download.** `SHA256SUMS` in the release lists the SHA-256 sum of every archive,
 and `SHA256SUMS.asc` signs it with the project's OpenPGP key, the key that also signs the release
