@@ -62,7 +62,7 @@ fn home_args(fixture: &Fixture) -> Vec<String> {
 
 /// An application bundle whose executable writes `marker` and exits. It has no window and no
 /// Dock icon.
-fn marker_app(fixture: &Fixture, name: &str, marker: &Path) -> PathBuf {
+fn marker_app(fixture: &Fixture, name: &str) -> PathBuf {
     let app = fixture.path(&format!("{name}.app"));
     let executables = app.join("Contents/MacOS");
     fs::create_dir_all(&executables).unwrap();
@@ -85,11 +85,7 @@ fn marker_app(fixture: &Fixture, name: &str, marker: &Path) -> PathBuf {
         ),
     )
     .unwrap();
-    let script = executables.join("marker");
-    let marker = marker.to_str().unwrap();
-    assert!(!marker.contains('\''), "{marker}");
-    fs::write(&script, format!("#!/bin/sh\n: > '{marker}'\n")).unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::copy(marker_path(), executables.join("marker")).unwrap();
     app
 }
 
@@ -175,7 +171,7 @@ fn keychain_stand_in_cannot_be_read() {
 fn open_cannot_start_applications() {
     let fixture = home_fixture("open");
     let marker = fixture.path("open-marker");
-    let app = marker_app(&fixture, "SandyOpenMarker", &marker);
+    let app = marker_app(&fixture, "SandyOpenMarker");
     let args = with(home_args(&fixture), &["--read-exec", "/usr/bin/open"]);
     assert_route_closed(
         &args,
@@ -220,7 +216,7 @@ fn mach_services_allow_only_the_named_service() {
 fn osascript_cannot_start_applications() {
     let fixture = home_fixture("osascript");
     let marker = fixture.path("osascript-marker");
-    let app = marker_app(&fixture, "SandyOsascriptMarker", &marker);
+    let app = marker_app(&fixture, "SandyOsascriptMarker");
     let script = format!("tell application {:?} to launch", app.to_str().unwrap());
     let args = with(home_args(&fixture), &["--read-exec", "/usr/bin/osascript"]);
     assert_route_closed(&args, &["/usr/bin/osascript", "-e", &script], &marker);

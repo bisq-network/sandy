@@ -45,6 +45,10 @@ pub fn probe_path() -> String {
     binary("sandy-probe", env!("CARGO_BIN_EXE_sandy-probe"))
 }
 
+pub fn marker_path() -> String {
+    binary("sandy-marker", env!("CARGO_BIN_EXE_sandy-marker"))
+}
+
 /// The harness that runs a program with a lower reported Landlock ABI, `None` when it is not
 /// next to the other binaries (see `SANDY_TEST_BIN_DIR`).
 #[cfg(target_os = "linux")]
