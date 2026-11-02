@@ -119,10 +119,29 @@ which names the workflow, the commit and the run that built it
 (`gh attestation verify sandy-1.0.0-x86_64-unknown-linux-musl.tar.gz --repo bisq-network/sandy`).
 An archive built outside the workflow has none.
 
-**Building a release binary again.** Every release binary is built with
-`scripts/release-build.sh TARGET` from a checkout of the release tag and packed with
-`scripts/release-pack.sh TARGET`, so anyone can build the archive again and compare it with
-`SHA256SUMS`:
+**Building a release binary again.** The simplest check needs only git and Docker, on Linux or
+macOS: `scripts/reproduce.sh` builds and packs all six archives of a tag in a container and
+writes their `SHA256SUMS`, which must equal the one of the release.
+
+```sh
+git clone https://github.com/bisq-network/sandy && cd sandy
+XWIN_ACCEPT_LICENSE=true scripts/reproduce.sh v1.0.0
+diff dist/reproduced/$(git rev-parse v1.0.0^{commit})/SHA256SUMS SHA256SUMS   # the release's file
+```
+
+The container (`scripts/reproduce.Dockerfile`) is an x86_64 Linux host, the triple every release
+archive is built on, emulated by Docker on other hosts. Its inputs are pinned: the Debian image by
+digest, its packages by a dated snapshot of the Debian archive, rustup by its SHA-256 sum, the
+toolchain by `rust-toolchain.toml`. `XWIN_ACCEPT_LICENSE=true` accepts the license of the Visual
+Studio Build Tools, whose libraries the Windows archives are linked against (see below). The source
+goes into the container and the archives come out as tar streams, without a shared directory, so
+the file system of the host does not matter. A full run takes a few minutes on an x86_64 machine
+and longer under emulation. A tag can be checked this way from the first release that has
+`scripts/reproduce.sh`.
+
+Without Docker, on an x86_64 Linux host with rustup, each archive can be built the same way the
+container does it: every release binary is built with `scripts/release-build.sh TARGET` from a
+checkout of the release tag and packed with `scripts/release-pack.sh TARGET`:
 
 ```sh
 git checkout v1.0.0
