@@ -121,6 +121,66 @@ jobs:
             echo "== $f"; head -c 6000 "$f"; echo
           done | tail -n 400
 
+  windows-release-build:
+    # The release links sandy.exe on Linux, with rust-lld as lld-link against the Microsoft
+    # libraries that link/windows-sdk.sha256 pins (scripts/windows-sdk.sh). This builds it that way
+    # for windows-release-test, which runs the suite against it, as the macOS entry of the test
+    # job does with the macOS link.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify the toolchain
+        run: scripts/verify-toolchain.sh
+      - name: Build sandy.exe as the release does
+        env:
+          # Microsoft's libraries come under the license of the Visual Studio Build Tools.
+          XWIN_ACCEPT_LICENSE: true
+        run: scripts/release-build.sh x86_64-pc-windows-msvc
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sandy-release-x86_64-pc-windows-msvc
+          path: target/x86_64-pc-windows-msvc/release/sandy.exe
+          if-no-files-found: error
+
+  windows-release-test:
+    needs: windows-release-build
+    runs-on: windows-2025
+    env:
+      SANDY_TEST_RUNNER: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify the toolchain
+        shell: bash
+        run: scripts/verify-toolchain.sh
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sandy-release-x86_64-pc-windows-msvc
+          path: release-bin
+      - name: Put the release sandy.exe next to the helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --bin sandy-probe
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp release-bin/sandy.exe target/debug/sandy-probe.exe "$RUNNER_TEMP/bin/"
+          echo "SANDY_TEST_BIN_DIR=$RUNNER_TEMP/bin" >> "$GITHUB_ENV"
+      - name: Check how this runner enforces the default policy
+        shell: bash
+        run: '"$SANDY_TEST_BIN_DIR/sandy.exe" check --appcontainer sandy.escape-tests'
+      - name: Test
+        env:
+          SANDY_TEST_SKIP_LOG: ${{ runner.temp }}/sandy-skips.log
+        run: cargo test --locked --workspace --all-targets --no-fail-fast
+      - name: Compare the checks this runner skipped with its expected-skip list
+        if: ${{ !cancelled() }}
+        env:
+          SANDY_TEST_SKIP_LOG: ${{ runner.temp }}/sandy-skips.log
+        run: cargo test --locked -p sandy-cli --test runner -- --ignored --exact skips_match_the_expected_list --nocapture
+
   lint:
     runs-on: ubuntu-24.04
     steps:

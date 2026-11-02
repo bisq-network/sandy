@@ -5,12 +5,11 @@ name: verify-release
 # compares each archive of the release with the binary built again and the files of the tag. The
 # run fails when any archive holds something else.
 #
-# A binary built again matches only on a host of the triple that built the release, and on Windows
-# only with the linker version that the release notes name (README.md, "Building a release binary
-# again"). The runners below are the ones the release workflow builds on: x86_64 Linux for the
-# Linux and the macOS binaries, and x86_64 Windows for both Windows binaries. Each Windows build
-# names its linker in the summary of the run, so that a difference there can be told from one in
-# the source.
+# A binary built again matches only on a host of the triple that built the release (README.md,
+# "Building a release binary again"). The runner below is the one the release workflow builds
+# every binary on, x86_64 Linux. Run the workflow from the tag it checks (gh workflow run
+# verify-release.yml --ref TAG -f tag=TAG), so that its runners and steps are those of the
+# release workflow of that tag.
 
 on:
   workflow_dispatch:
@@ -55,8 +54,8 @@ jobs:
           - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04 }
           - { target: x86_64-apple-darwin, os: ubuntu-24.04 }
           - { target: aarch64-apple-darwin, os: ubuntu-24.04 }
-          - { target: x86_64-pc-windows-msvc, os: windows-2025 }
-          - { target: aarch64-pc-windows-msvc, os: windows-2025 }
+          - { target: x86_64-pc-windows-msvc, os: ubuntu-24.04 }
+          - { target: aarch64-pc-windows-msvc, os: ubuntu-24.04 }
     runs-on: ${{ matrix.os }}
     steps:
       # The token of the job stays out of .git/config, where the build scripts of the
@@ -65,21 +64,11 @@ jobs:
         with:
           ref: refs/tags/${{ inputs.tag }}
           persist-credentials: false
-      - name: Name the linker
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          # The image has one Visual Studio, and rustc links against the newest Windows SDK.
-          vs=$("/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -latest \
-            -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
-            -property installationPath | tr -d '\r')
-          msvc=$(tr -d '\r\n' < "$(cygpath -u "$vs")/VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt")
-          sdk=$(find "/c/Program Files (x86)/Windows Kits/10/Lib" -mindepth 1 -maxdepth 1 -printf '%f\n' |
-            sort -V | tail -n 1)
-          echo "${{ matrix.target }} is linked with MSVC $msvc (Windows SDK $sdk)" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Build
         shell: bash
+        env:
+          # As in release.yml.
+          XWIN_ACCEPT_LICENSE: ${{ contains(matrix.target, 'windows') }}
         run: scripts/release-build.sh ${{ matrix.target }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

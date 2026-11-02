@@ -16,19 +16,19 @@ jobs:
   build:
     strategy:
       fail-fast: false
-      # x86_64 Linux builds the Linux and the macOS binaries, which rust-lld links there against
-      # the libSystem declarations of link/MacOSX.sdk; x64 Windows builds both Windows binaries. A
-      # binary built again matches only on a host of the same triple, and on Windows only with
-      # the same linker (README.md, "Building a release binary again"), so verify-release.yml
-      # builds on the same runners.
+      # x86_64 Linux builds every binary: rust-lld links the macOS ones there against the
+      # libSystem declarations of link/MacOSX.sdk, and the Windows ones, as lld-link, against the
+      # Microsoft libraries that link/windows-sdk.sha256 pins. A binary built again matches only
+      # on a host of the same triple (README.md, "Building a release binary again"), so
+      # verify-release.yml builds on the same runner.
       matrix:
         include:
           - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04 }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04 }
           - { target: x86_64-apple-darwin, os: ubuntu-24.04 }
           - { target: aarch64-apple-darwin, os: ubuntu-24.04 }
-          - { target: x86_64-pc-windows-msvc, os: windows-2025 }
-          - { target: aarch64-pc-windows-msvc, os: windows-2025 }
+          - { target: x86_64-pc-windows-msvc, os: ubuntu-24.04 }
+          - { target: aarch64-pc-windows-msvc, os: ubuntu-24.04 }
     runs-on: ${{ matrix.os }}
     env:
       # Whether the signing secrets exist, which gates the two signing steps below; today they
@@ -50,25 +50,14 @@ jobs:
         run: |
           version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
           test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != v$version"; exit 1; }
-      # For the release notes, which name the linker that the Windows binaries depend on.
-      # verify-release.yml names it the same way.
-      - name: Name the linker
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          # The image has one Visual Studio, and rustc links against the newest Windows SDK.
-          vs=$("/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -latest \
-            -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
-            -property installationPath | tr -d '\r')
-          msvc=$(tr -d '\r\n' < "$(cygpath -u "$vs")/VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt")
-          sdk=$(find "/c/Program Files (x86)/Windows Kits/10/Lib" -mindepth 1 -maxdepth 1 -printf '%f\n' |
-            sort -V | tail -n 1)
-          echo "${{ matrix.target }} is linked with MSVC $msvc (Windows SDK $sdk)" | tee -a "$GITHUB_STEP_SUMMARY"
       # The same script builds every release binary outside CI too (README.md, "Verifying a
       # download"), so a binary can be built again and compared.
       - name: Build
         shell: bash
+        env:
+          # The Windows targets link against Microsoft's libraries, which come under the license
+          # of the Visual Studio Build Tools (scripts/windows-sdk.sh).
+          XWIN_ACCEPT_LICENSE: ${{ contains(matrix.target, 'windows') }}
         run: scripts/release-build.sh ${{ matrix.target }}
       # Skipped: this project has no Apple Developer ID, so the macOS binaries carry only the
       # linker's ad-hoc signature. To sign and notarize them, join the Apple Developer Program,
@@ -117,7 +106,9 @@ jobs:
       # step below only fits a certificate that can still be exported as a PKCS#12 file; a
       # signing service wants its own step instead. The secrets are WINDOWS_SIGNING_CERTIFICATE
       # (the PKCS#12 file, base64 encoded) and WINDOWS_SIGNING_CERTIFICATE_PASSWORD. Neither
-      # exists today.
+      # exists today. The Windows binaries are built on Linux, which has no signtool: before
+      # turning this on, move this step into a job on a Windows runner that signs the binary
+      # before it is packaged.
       - name: Sign sandy.exe
         if: ${{ contains(matrix.target, 'windows') && env.WINDOWS_SIGNING == 'true' }}
         shell: pwsh
@@ -136,12 +127,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "signtool failed" }
           Remove-Item $pfx
       # No other step runs the binary that is packaged, and the tests run a debug build. A link
-      # that leaves the image without its relocations, for example, crashes before main. Not
-      # started here: the arm64 Linux binary and the macOS binaries, which the start job runs on
-      # runners of their own, and the arm64 Windows binary, which this x64 runner cannot run.
+      # that leaves the image without its relocations, for example, crashes before main. The
+      # others are started on runners of their own: the arm64 Linux binary by the start job, the
+      # macOS and Windows binaries by test-macos and test-windows.
       - name: Start the binary
-        if: >-
-          matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'x86_64-pc-windows-msvc'
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         shell: bash
         run: |
           exe=sandy; [[ "${{ matrix.target }}" == *windows* ]] && exe=sandy.exe
@@ -159,8 +149,7 @@ jobs:
           epoch=$(git log -1 --format=%ct)
           cd dist
           if [[ "${{ matrix.target }}" == *windows* ]]; then
-            # 7-Zip stores the modification time of each file, so the files get the commit's
-            # (GNU touch, from Git for Windows).
+            # 7-Zip stores the modification time of each file, so the files get the commit's.
             touch -d "@$epoch" "$name" "$name"/*
             7z a -tzip -bd "$name.zip" "$name" > /dev/null
           else
@@ -185,7 +174,8 @@ jobs:
     # The arm64 Linux binary is built on x86_64, whose runner cannot run it. This starts the
     # packaged binary on arm64, for the reason the build job starts the others; its link, a static
     # PIE through scripts/link-static-pie.sh, is one of the links that rustc does not make by
-    # itself. The macOS binaries, the others built where they cannot run, go through test-macos.
+    # itself. The macOS and Windows binaries, the others built where they cannot run, go through
+    # test-macos and test-windows.
     needs: build
     runs-on: ubuntu-24.04-arm
     steps:
@@ -253,6 +243,60 @@ jobs:
         if: failure()
         run: log show --last 10m --style compact --predicate 'sender == "Sandbox" OR eventMessage CONTAINS "Sandbox"' | tail -n 300
 
+  test-windows:
+    # The Windows binaries are linked on Linux, by rust-lld as lld-link against the Microsoft
+    # libraries that link/windows-sdk.sha256 pins, so no Windows host has run them before this.
+    # This runs the whole suite against each packaged binary on the Windows versions of the
+    # runners, the arm64 one on an arm64 runner. The tests and the helper sandy-probe are built
+    # here from the same commit; SANDY_TEST_BIN_DIR points the suite at the packaged sandy.exe.
+    # Then the skips are compared with the runner's list, as in ci.yml.
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-pc-windows-msvc, os: windows-2025 }
+          - { target: x86_64-pc-windows-msvc, os: windows-2022 }
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm }
+    runs-on: ${{ matrix.os }}
+    env:
+      SANDY_TEST_RUNNER: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify the toolchain
+        shell: bash
+        run: scripts/verify-toolchain.sh
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sandy-${{ matrix.target }}
+          path: dist
+      - name: Put the packaged sandy.exe next to the helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=(dist/sandy-*-${{ matrix.target }}.zip)
+          # Expand-Archive: every Windows image has it, unlike unzip or 7-Zip.
+          pwsh -NoProfile -Command "Expand-Archive -Path '${archive[0]}' -DestinationPath dist"
+          cargo build --locked --bin sandy-probe
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp "${archive[0]%.zip}/sandy.exe" target/debug/sandy-probe.exe "$RUNNER_TEMP/bin/"
+          echo "SANDY_TEST_BIN_DIR=$RUNNER_TEMP/bin" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/bin/sandy.exe" --version
+      - name: Check how this runner enforces the default policy
+        shell: bash
+        run: '"$SANDY_TEST_BIN_DIR/sandy.exe" check --appcontainer sandy.escape-tests'
+      - name: Test
+        env:
+          SANDY_TEST_SKIP_LOG: ${{ runner.temp }}/sandy-skips.log
+        run: cargo test --locked --workspace --all-targets --no-fail-fast
+      - name: Compare the checks this runner skipped with its expected-skip list
+        if: ${{ !cancelled() }}
+        env:
+          SANDY_TEST_SKIP_LOG: ${{ runner.temp }}/sandy-skips.log
+        run: cargo test --locked -p sandy-cli --test runner -- --ignored --exact skips_match_the_expected_list --nocapture
+
   reproducible:
     # The release build removes what would otherwise tie a binary to the machine that made it:
     # the path prefix of the checkout and of CARGO_HOME, the time of the build, the host's linker
@@ -268,8 +312,8 @@ jobs:
           - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04 }
           - { target: x86_64-apple-darwin, os: ubuntu-24.04 }
           - { target: aarch64-apple-darwin, os: ubuntu-24.04 }
-          - { target: x86_64-pc-windows-msvc, os: windows-2025 }
-          - { target: aarch64-pc-windows-msvc, os: windows-2025 }
+          - { target: x86_64-pc-windows-msvc, os: ubuntu-24.04 }
+          - { target: aarch64-pc-windows-msvc, os: ubuntu-24.04 }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -278,6 +322,9 @@ jobs:
           persist-credentials: false
       - name: Build twice and compare
         shell: bash
+        env:
+          # As in the build job.
+          XWIN_ACCEPT_LICENSE: ${{ contains(matrix.target, 'windows') }}
         run: |
           set -euo pipefail
           target=${{ matrix.target }}
@@ -292,7 +339,7 @@ jobs:
             || { echo "the binary depends on the directory it was built in"; exit 1; }
 
   release:
-    needs: [build, start, test-macos]
+    needs: [build, start, test-macos, test-windows]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
