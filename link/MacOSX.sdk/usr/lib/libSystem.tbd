@@ -1,0 +1,50 @@
+--- !tapi-tbd
+# The libSystem that scripts/release-build.sh links the macOS binaries against with rust-lld, in
+# place of the one of Apple's SDK: the symbols sandy uses, each one checked against the SDK by
+# scripts/check-macos-stubs.sh. A link that needs another symbol fails; add it to the list of its
+# architectures. The versions are those that Apple's linker recorded with the macOS 27.0 SDK, the
+# version scripts/release-build.sh records as the SDK.
+tbd-version:     4
+targets:         [ x86_64-macos, arm64-macos ]
+install-name:    '/usr/lib/libSystem.B.dylib'
+current-version: 1359
+exports:
+  - targets:         [ x86_64-macos, arm64-macos ]
+    symbols:         [ _abort, _accept, _bind, _calloc, _CCRandomGenerateBytes, _chdir,
+                       _clock_gettime, _closedir, _connect, _dirfd, _dispatch_release,
+                       _dispatch_semaphore_create, _dispatch_semaphore_signal,
+                       _dispatch_semaphore_wait, _dlerror, _dlopen, _dlsym, _dup, _dup2, dyld_stub_binder,
+                       __dyld_get_image_header, __dyld_get_image_name,
+                       __dyld_get_image_vmaddr_slide, __dyld_image_count, ___error, _execve, __exit,
+                       _exit, _fcntl, _fork, _free, _freeifaddrs, _getcwd, _getenv, _getifaddrs,
+                       _getpeername, _getpgrp, _getpid, _getppid, _getpwuid_r, _getrlimit,
+                       _getsockname, _getsockopt, _getuid, _ioctl, _kevent, _kill, _kqueue, _listen,
+                       _lseek, _mach_task_self_, _malloc, _memcmp, _memcpy, _memmove, _memset,
+                       _mmap, _mprotect, _munmap, _nanosleep, __NSGetArgc, __NSGetArgv,
+                       __NSGetEnviron, __NSGetExecutablePath, _open, _pause, _pipe, _poll,
+                       _posix_memalign, _posix_spawn, _posix_spawnattr_destroy,
+                       _posix_spawnattr_init, _posix_spawnattr_setflags,
+                       _posix_spawnattr_setsigdefault, _posix_spawn_file_actions_addinherit_np,
+                       _posix_spawn_file_actions_destroy, _posix_spawn_file_actions_init,
+                       _proc_pidfdinfo, _proc_pidinfo, _pthread_attr_destroy, _pthread_attr_init,
+                       _pthread_attr_setstacksize, _pthread_create, _pthread_detach,
+                       _pthread_get_stackaddr_np, _pthread_get_stacksize_np, _pthread_join,
+                       _pthread_mutexattr_destroy, _pthread_mutexattr_init,
+                       _pthread_mutexattr_settype, _pthread_mutex_destroy, _pthread_mutex_init,
+                       _pthread_mutex_lock, _pthread_mutex_trylock, _pthread_mutex_unlock,
+                       _pthread_self, _pthread_setname_np, _pthread_threadid_np, _read, _readlink,
+                       _realloc, '_realpath$DARWIN_EXTSN', _recv, _send, _setpgid, _setrlimit,
+                       _setsid, _setsockopt, _shutdown, _sigaction, _sigaddset, _sigaltstack,
+                       _sigdelset, _sigemptyset, _sigfillset, _signal, _sigprocmask, _sigwait,
+                       _socket, _strerror_r, _strlen, _sysconf, _sysctl, _sysctlbyname,
+                       _task_set_exception_ports, _tcgetpgrp, _tcsetpgrp, __tlv_atexit,
+                       __tlv_bootstrap, _unsetenv, __Unwind_Backtrace, __Unwind_GetDataRelBase,
+                       __Unwind_GetIP, __Unwind_GetIPInfo, __Unwind_GetLanguageSpecificData,
+                       __Unwind_GetRegionStart, __Unwind_GetTextRelBase, __Unwind_Resume,
+                       __Unwind_SetGR, __Unwind_SetIP, _waitid, _waitpid, _write, _writev ]
+  - targets:         [ arm64-macos ]
+    symbols:         [ _bzero, _close, _fstat, _lstat, _opendir, _readdir_r, _stat ]
+  - targets:         [ x86_64-macos ]
+    symbols:         [ ___bzero, '_close$NOCANCEL', '_fstat$INODE64', '_lstat$INODE64',
+                       '_opendir$INODE64', '_readdir_r$INODE64', '_stat$INODE64' ]
+...

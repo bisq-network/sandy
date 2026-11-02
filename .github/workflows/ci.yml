@@ -69,6 +69,23 @@ jobs:
         run: scripts/verify-toolchain.sh
       - name: Show toolchain
         run: rustc --version && cargo --version
+      # The release links the macOS binaries with rust-lld against link/MacOSX.sdk, which
+      # declares the symbols of libSystem that sandy uses. This checks each one against the SDK,
+      # and builds sandy that way for the suite, which then runs it instead of the debug build
+      # (SANDY_TEST_BIN_DIR, next to the debug sandy-probe and sandy-marker).
+      - name: Check the libSystem declarations against the SDK (macOS)
+        if: runner.os == 'macOS'
+        run: scripts/check-macos-stubs.sh
+      - name: Build sandy as the release does (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          target=$(rustc -vV | sed -n 's/^host: //p')
+          scripts/release-build.sh "$target"
+          cargo build --locked --bin sandy-probe --bin sandy-marker
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp "target/$target/release/sandy" target/debug/sandy-probe target/debug/sandy-marker "$RUNNER_TEMP/bin/"
+          echo "SANDY_TEST_BIN_DIR=$RUNNER_TEMP/bin" >> "$GITHUB_ENV"
       - name: Check how this runner enforces the default policy
         run: cargo run --locked ${{ env.TARGET_OPTION }} --bin sandy -- check ${{ runner.os == 'Windows' && '--appcontainer sandy.escape-tests' || '' }}
       # The skip log is named per step: the runner context, which holds the temporary

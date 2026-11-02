@@ -16,22 +16,21 @@ jobs:
   build:
     strategy:
       fail-fast: false
-      # One runner builds both architectures of a platform: x86_64 Linux, an arm64 Mac with the
-      # Command Line Tools, x64 Windows. A binary built again matches only on a host of the same
-      # triple, and on macOS and Windows only with the same linker (README.md, "Building a
-      # release binary again"), so verify-release.yml builds on the same runners.
+      # x86_64 Linux builds the Linux and the macOS binaries, which rust-lld links there against
+      # the libSystem declarations of link/MacOSX.sdk; x64 Windows builds both Windows binaries. A
+      # binary built again matches only on a host of the same triple, and on Windows only with
+      # the same linker (README.md, "Building a release binary again"), so verify-release.yml
+      # builds on the same runners.
       matrix:
         include:
           - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04 }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04 }
-          - { target: x86_64-apple-darwin, os: macos-26 }
-          - { target: aarch64-apple-darwin, os: macos-26 }
+          - { target: x86_64-apple-darwin, os: ubuntu-24.04 }
+          - { target: aarch64-apple-darwin, os: ubuntu-24.04 }
           - { target: x86_64-pc-windows-msvc, os: windows-2025 }
           - { target: aarch64-pc-windows-msvc, os: windows-2025 }
     runs-on: ${{ matrix.os }}
     env:
-      # The image's Command Line Tools instead of its default Xcode, which links with another ld.
-      DEVELOPER_DIR: ${{ contains(matrix.target, 'apple') && '/Library/Developer/CommandLineTools' || '' }}
       # Whether the signing secrets exist, which gates the two signing steps below; today they
       # do not, so both steps stay skipped. A step's `if` cannot read a secret, so the test is
       # made here, and only its answer is kept: every step sees this block, also the build, which
@@ -51,28 +50,21 @@ jobs:
         run: |
           version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
           test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != v$version"; exit 1; }
-      # For the release notes, which name the linker that the macOS and Windows binaries depend
-      # on. verify-release.yml names it the same way.
+      # For the release notes, which name the linker that the Windows binaries depend on.
+      # verify-release.yml names it the same way.
       - name: Name the linker
-        if: runner.os != 'Linux'
+        if: runner.os == 'Windows'
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$RUNNER_OS" == macOS ]]; then
-            ld=$(ld -v 2>&1 | sed -n 's/.*PROJECT:\(ld-[^ ]*\).*/\1/p')
-            tools=$(pkgutil --pkg-info=com.apple.pkg.CLTools_Executables | sed -n 's/^version: //p')
-            linker="$ld (Command Line Tools $tools, SDK $(xcrun --show-sdk-version))"
-          else
-            # The image has one Visual Studio, and rustc links against the newest Windows SDK.
-            vs=$("/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -latest \
-              -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
-              -property installationPath | tr -d '\r')
-            msvc=$(tr -d '\r\n' < "$(cygpath -u "$vs")/VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt")
-            sdk=$(find "/c/Program Files (x86)/Windows Kits/10/Lib" -mindepth 1 -maxdepth 1 -printf '%f\n' |
-              sort -V | tail -n 1)
-            linker="MSVC $msvc (Windows SDK $sdk)"
-          fi
-          echo "${{ matrix.target }} is linked with $linker" | tee -a "$GITHUB_STEP_SUMMARY"
+          # The image has one Visual Studio, and rustc links against the newest Windows SDK.
+          vs=$("/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -latest \
+            -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
+            -property installationPath | tr -d '\r')
+          msvc=$(tr -d '\r\n' < "$(cygpath -u "$vs")/VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt")
+          sdk=$(find "/c/Program Files (x86)/Windows Kits/10/Lib" -mindepth 1 -maxdepth 1 -printf '%f\n' |
+            sort -V | tail -n 1)
+          echo "${{ matrix.target }} is linked with MSVC $msvc (Windows SDK $sdk)" | tee -a "$GITHUB_STEP_SUMMARY"
       # The same script builds every release binary outside CI too (README.md, "Verifying a
       # download"), so a binary can be built again and compared.
       - name: Build
@@ -87,7 +79,9 @@ jobs:
       # APPLE_NOTARY_KEY (base64 encoded) with APPLE_NOTARY_KEY_ID and APPLE_NOTARY_ISSUER.
       # None of them exists today. Before turning this on, check on a Mac that the hardened
       # runtime still lets sandy load /usr/lib/libsandbox.1.dylib and exec an unsigned program.
-      # A bare Mach-O cannot be stapled, so Gatekeeper checks the notarization online.
+      # A bare Mach-O cannot be stapled, so Gatekeeper checks the notarization online. The macOS
+      # binaries are built on Linux, which has no codesign or notarytool: before turning this on,
+      # move this step into a job on a macOS runner that signs the binary before it is packaged.
       - name: Sign and notarize the macOS binary
         if: ${{ contains(matrix.target, 'apple') && env.APPLE_SIGNING == 'true' }}
         shell: bash
@@ -143,13 +137,11 @@ jobs:
           Remove-Item $pfx
       # No other step runs the binary that is packaged, and the tests run a debug build. A link
       # that leaves the image without its relocations, for example, crashes before main. Not
-      # started here: the arm64 Linux binary, which the start job runs on an arm64 runner, the
-      # arm64 Windows binary, which this x64 runner cannot run, and the x86_64 macOS binary, which
-      # this arm64 runner could run only through Rosetta.
+      # started here: the arm64 Linux binary and the macOS binaries, which the start job runs on
+      # runners of their own, and the arm64 Windows binary, which this x64 runner cannot run.
       - name: Start the binary
         if: >-
-          matrix.target != 'aarch64-unknown-linux-musl' && matrix.target != 'aarch64-pc-windows-msvc'
-          && matrix.target != 'x86_64-apple-darwin'
+          matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'x86_64-pc-windows-msvc'
         shell: bash
         run: |
           exe=sandy; [[ "${{ matrix.target }}" == *windows* ]] && exe=sandy.exe
@@ -192,7 +184,8 @@ jobs:
   start:
     # The arm64 Linux binary is built on x86_64, whose runner cannot run it. This starts the
     # packaged binary on arm64, for the reason the build job starts the others; its link, a static
-    # PIE through scripts/link-static-pie.sh, is the one link that rustc does not make by itself.
+    # PIE through scripts/link-static-pie.sh, is one of the links that rustc does not make by
+    # itself. The macOS binaries, the others built where they cannot run, go through test-macos.
     needs: build
     runs-on: ubuntu-24.04-arm
     steps:
@@ -207,10 +200,63 @@ jobs:
           tar -xzf "${archive[0]}" -C dist
           "${archive[0]%.tar.gz}/sandy" --version
 
+  test-macos:
+    # The macOS binaries are linked on Linux, by rust-lld against the libSystem declarations of
+    # link/MacOSX.sdk, so no Mac has run them before this. This runs the whole suite against each
+    # packaged binary on the macOS versions of the runners, the x86_64 one on an Intel Mac, since
+    # sandy refuses to run through Rosetta. The tests and the helpers sandy-probe and
+    # sandy-marker are built here from the same commit; SANDY_TEST_BIN_DIR points the suite at
+    # the packaged sandy. Then the skips are compared with the runner's list, as in ci.yml.
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-15 }
+          - { target: aarch64-apple-darwin, os: macos-26 }
+          - { target: x86_64-apple-darwin, os: macos-15-intel }
+    runs-on: ${{ matrix.os }}
+    env:
+      SANDY_TEST_RUNNER: ${{ matrix.os }}
+      SANDY_TEST_REQUIRE: pty
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify the toolchain
+        shell: bash
+        run: scripts/verify-toolchain.sh
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sandy-${{ matrix.target }}
+          path: dist
+      - name: Put the packaged sandy next to the helpers
+        run: |
+          set -euo pipefail
+          archive=(dist/sandy-*-${{ matrix.target }}.tar.gz)
+          tar -xzf "${archive[0]}" -C dist
+          cargo build --locked --bin sandy-probe --bin sandy-marker
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp "${archive[0]%.tar.gz}/sandy" target/debug/sandy-probe target/debug/sandy-marker "$RUNNER_TEMP/bin/"
+          echo "SANDY_TEST_BIN_DIR=$RUNNER_TEMP/bin" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/bin/sandy" --version
+      - name: Test
+        env:
+          SANDY_TEST_SKIP_LOG: ${{ runner.temp }}/sandy-skips.log
+        run: cargo test --locked --workspace --all-targets --no-fail-fast
+      - name: Compare the checks this runner skipped with its expected-skip list
+        if: ${{ !cancelled() }}
+        env:
+          SANDY_TEST_SKIP_LOG: ${{ runner.temp }}/sandy-skips.log
+        run: cargo test --locked -p sandy-cli --test runner -- --ignored --exact skips_match_the_expected_list --nocapture
+      - name: Show sandbox denials
+        if: failure()
+        run: log show --last 10m --style compact --predicate 'sender == "Sandbox" OR eventMessage CONTAINS "Sandbox"' | tail -n 300
+
   reproducible:
     # The release build removes what would otherwise tie a binary to the machine that made it:
     # the path prefix of the checkout and of CARGO_HOME, the time of the build, the host's linker
-    # on Linux, and the debug map Apple's linker hashes into the UUID. This builds every target
+    # and SDK, and the debug map that the macOS link hashes into the UUID. This builds every target
     # twice from two directories and compares the binaries, so a change that makes the output
     # depend on where it is built is noticed. It does not gate the release: a difference here is a
     # finding to read, not a reason to keep a reviewed tag from being packaged.
@@ -220,14 +266,11 @@ jobs:
         include:
           - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04 }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04 }
-          - { target: x86_64-apple-darwin, os: macos-26 }
-          - { target: aarch64-apple-darwin, os: macos-26 }
+          - { target: x86_64-apple-darwin, os: ubuntu-24.04 }
+          - { target: aarch64-apple-darwin, os: ubuntu-24.04 }
           - { target: x86_64-pc-windows-msvc, os: windows-2025 }
           - { target: aarch64-pc-windows-msvc, os: windows-2025 }
     runs-on: ${{ matrix.os }}
-    env:
-      # As in the build job.
-      DEVELOPER_DIR: ${{ contains(matrix.target, 'apple') && '/Library/Developer/CommandLineTools' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -249,7 +292,7 @@ jobs:
             || { echo "the binary depends on the directory it was built in"; exit 1; }
 
   release:
-    needs: [build, start]
+    needs: [build, start, test-macos]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:

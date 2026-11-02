@@ -52,6 +52,11 @@ const EXPECTED_SKIPS: &[(&str, &str)] = &[
     ),
     ("macos-15", include_str!("expected-skips/macos-15.txt")),
     (
+        "macos-15-intel",
+        include_str!("expected-skips/macos-15-intel.txt"),
+    ),
+    ("macos-26", include_str!("expected-skips/macos-26.txt")),
+    (
         "ubuntu-22.04",
         include_str!("expected-skips/ubuntu-22.04.txt"),
     ),
