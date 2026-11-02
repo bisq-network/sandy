@@ -106,8 +106,8 @@ targets:
 - `aarch64-pc-windows-msvc` (static C runtime)
 
 **Verifying a download.** `SHA256SUMS` in the release lists the SHA-256 sum of every archive,
-and `SHA256SUMS.asc` signs it with the project's OpenPGP key, the key that also signs the release
-tags (fingerprint `E850 152C 47E1 3655 DDF3  A62B 4CE3 8D03 67B5 3CC5`):
+and `SHA256SUMS.asc` signs it with the OpenPGP key of the maintainer who publishes the release,
+which the release names:
 
 ```sh
 gpg --verify SHA256SUMS.asc SHA256SUMS
@@ -119,10 +119,44 @@ which names the workflow, the commit and the run that built it
 (`gh attestation verify sandy-1.0.0-x86_64-unknown-linux-musl.tar.gz --repo bisq-network/sandy`).
 An archive built outside the workflow has none.
 
-**Building a release binary again.** Every release binary is built with
-`scripts/release-build.sh TARGET` from a checkout of the release tag and packed with
-`scripts/release-pack.sh TARGET`, so anyone can build the archive again and compare it with
-`SHA256SUMS`:
+**Building a release binary again.** The simplest check needs git, curl, gpg and Docker, on
+Linux or macOS, and one command in a clone of this repository:
+
+```sh
+XWIN_ACCEPT_LICENSE=true scripts/check-release.sh v1.0.0
+```
+
+It checks that `SHA256SUMS.asc` of the release is signed by the release key, whose fingerprint the
+script pins, downloads the six archives, builds them again from the commit of the tag with that
+tag's own `scripts/reproduce.sh`, and prints for each archive whether it matches `SHA256SUMS` and
+the archive built again, then a verdict; it exits with 0 only when every archive is reproduced. Run
+outside a clone, it offers to clone one. It changes neither the clone's tags nor your keyring: the
+tag is fetched into `FETCH_HEAD`, the build runs in a temporary worktree, and the signature is
+checked in a temporary GnuPG home. Should the signing key change before this script does, pass its
+full fingerprint with `--key FINGERPRINT`.
+
+`scripts/reproduce.sh [TAG [DIRECTORY]]` does the build alone: it builds and packs all six archives
+of a tag in a container, with the names and bytes of the ones in the release, and writes them with
+their `SHA256SUMS` to `DIRECTORY`, by default `dist/reproduced/COMMIT/` of the checkout, which git
+ignores:
+
+```sh
+XWIN_ACCEPT_LICENSE=true scripts/reproduce.sh v1.0.0 ~/sandy-v1.0.0
+```
+
+The container (`scripts/reproduce.Dockerfile`) is an x86_64 Linux host, the triple every release
+archive is built on, emulated by Docker on other hosts. Its inputs are pinned: the Debian image by
+digest, its packages by a dated snapshot of the Debian archive, rustup by its SHA-256 sum, the
+toolchain by `rust-toolchain.toml`. `XWIN_ACCEPT_LICENSE=true` accepts the license of the Visual
+Studio Build Tools, whose libraries the Windows archives are linked against (see below). The source
+goes into the container and the archives come out as tar streams, without a shared directory, so
+the file system of the host does not matter. Archives built on x86_64 Linux and on an Apple silicon
+Mac, under emulation, are identical to those of the release workflow. A tag can be checked this way
+from the first release that has these scripts.
+
+Without Docker, on an x86_64 Linux host with rustup, each archive can be built the same way the
+container does it: every release binary is built with `scripts/release-build.sh TARGET` from a
+checkout of the release tag and packed with `scripts/release-pack.sh TARGET`:
 
 ```sh
 git checkout v1.0.0
@@ -1422,7 +1456,8 @@ against the packaged Windows binaries on Windows Server 2025 and 2022 and, for a
 on arm64, attests their build provenance, verifies the attestations, and creates a draft release
 with `SHA256SUMS`. It also builds every target twice from two directories and compares the
 binaries. The `verify-release` workflow builds a published release again and compares it with its archives
-(see "Building a release binary again").
+(see "Building a release binary again"); `scripts/check-release.sh` does the same check outside
+GitHub, in a container on any machine with Docker.
 
 Expected-skip lists exist only for the development hosts the suite ran on, not yet for the runners
 above, so the comparison step fails on each runner until its list is committed: the failure prints
