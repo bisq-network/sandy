@@ -129,31 +129,29 @@ scripts/release-build.sh x86_64-unknown-linux-musl
 sha256sum target/x86_64-unknown-linux-musl/release/sandy
 ```
 
-The script removes from the binary what would tie it to the machine that built it: the directory
-of the checkout, `CARGO_HOME` and the toolchain, and the build time. It cannot remove the host that
-runs the toolchain, the `host:` line of `rustc -vV`: cargo mixes the host into the metadata of
-the build scripts and procedural macros and passes that on to every crate that uses them. In the
-Linux and macOS binaries this changes the order of the functions, though not their size: a build
-on `x86_64-unknown-linux-gnu` and a build on arm64 Linux or an arm64 Mac give other bytes, and the
+The script removes from the binary what would tie it to the machine that built it: the directory of
+the checkout, `CARGO_HOME` and the toolchain, and the build time. It cannot remove the host that
+runs the toolchain, the `host:` line of `rustc -vV`: cargo mixes the host into the metadata of the
+build scripts and procedural macros and passes that on to every crate that uses them. In the Linux
+and macOS binaries this changes the order of the functions, though not their size: a build on
+`x86_64-unknown-linux-gnu` and a build on arm64 Linux or an arm64 Mac give other bytes, and the
 Linux and macOS release binaries are built on `x86_64-unknown-linux-gnu`. So a binary built again
 matches only on a host of the triple that built the release. Apart from the host, the Linux and
 macOS binaries are linked with the linker of the Rust toolchain, so they depend only on the source
 and on the toolchain that `rust-toolchain.toml` pins. The macOS binaries are linked against
 `link/MacOSX.sdk` instead of Apple's SDK: it declares the symbols of libSystem that sandy uses and
 nothing else, and the CI checks each one against Apple's SDK on a Mac
-(`scripts/check-macos-stubs.sh`). A change that calls into libSystem for a symbol not declared
-there fails to link; add the symbol for its architectures. The binaries record SDK 27.0, the
-version the declarations follow, as the SDK they were built against, which decides some behaviour
-of the system libraries. Up to v1.0.0, Apple's linker on a Mac linked them, so check such a tag
-with the `verify-release` workflow of that tag (`gh workflow run verify-release.yml --ref v1.0.0
--f tag=v1.0.0`). The Windows binaries
-also depend on the version of the Microsoft linker, which the release notes name. The script refuses a toolchain
-that rustup did not install from the pinned archives (see "The supply chain checks" below). The
-`reproducible` job of the release workflow builds every target twice, in two directories, and
-compares the binaries; both builds run on one runner, so the job does not show a dependence on
-the host. The `verify-release` workflow, started by hand with the tag of a published release,
-builds every binary of the release again on runners like the hosts that built it, and compares
-each archive with the binary built again and the files of the tag.
+(`scripts/check-macos-stubs.sh`). A change that calls into libSystem for a symbol not declared there
+fails to link; add the symbol for its architectures. The binaries record SDK 27.0, the version the
+declarations follow, as the SDK they were built against, which decides some behaviour of the system
+libraries. The Windows binaries also depend on the version of the Microsoft linker, which the
+release notes name. The script refuses a toolchain that rustup did not install from the pinned
+archives (see "The supply chain checks" below). The `reproducible` job of the release workflow
+builds every target twice, in two directories, and compares the binaries; both builds run on one
+runner, so the job does not show a dependence on the host. The `verify-release` workflow, started by
+hand with the tag of a published release, builds every binary of the release again on runners like
+the hosts that built it, and compares each archive with the binary built again and the files of the
+tag.
 
 The script links both Linux binaries as static position-independent executables, which the
 kernel loads at a random address. rustc does that by itself for `x86_64-unknown-linux-musl`. For

@@ -10,9 +10,7 @@ name: verify-release
 # again"). The runners below are the ones the release workflow builds on: x86_64 Linux for the
 # Linux and the macOS binaries, and x86_64 Windows for both Windows binaries. Each Windows build
 # names its linker in the summary of the run, so that a difference there can be told from one in
-# the source. Run the workflow from the tag it checks (gh workflow run verify-release.yml --ref
-# TAG -f tag=TAG), so that the runners are those that built that tag: up to v1.0.0, an arm64 Mac
-# with Apple's linker built the macOS binaries.
+# the source.
 
 on:
   workflow_dispatch:
