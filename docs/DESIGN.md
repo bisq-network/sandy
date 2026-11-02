@@ -1266,14 +1266,17 @@ directly.
 
 Every release binary is built with `scripts/release-build.sh` from a tag, with `--locked`, so a
 binary can be built again and compared, by the `release` workflow and by anyone else. The script
-keeps the path of the checkout and of `CARGO_HOME` out of the binary, links the Linux and macOS
-targets with the linker of the pinned Rust toolchain instead of the host's, the macOS ones against
-the libSystem declarations of `link/MacOSX.sdk` instead of Apple's SDK and without the debug map,
-whose object paths the linker would hash into the UUID, and has the Microsoft linker write no time
-stamp (`/Brepro`). A Linux or macOS binary then depends only on the source and the toolchain, and
-can be built on any host of the release's triple; a Windows binary also on the version of the
-Microsoft linker, which the release notes name. The declarations are a list of symbol names that
-sandy uses, checked against Apple's SDK on a Mac in CI, so no Apple file is part of the build. The archives are packed with sorted entries, the time of the commit and no
+keeps the path of the checkout and of `CARGO_HOME` out of the binary and links every target with
+the linker of the pinned Rust toolchain instead of the host's: the macOS ones against the
+libSystem declarations of `link/MacOSX.sdk` instead of Apple's SDK and without the debug map,
+whose object paths the linker would hash into the UUID, and the Windows ones against the MSVC C
+runtime and Windows SDK libraries that `link/windows-sdk.sha256` pins, with no time stamp
+(`/Brepro`) and no PDB, from which lld-link would derive the time stamp. A binary then depends
+only on the source, the toolchain and, for Windows, those libraries, and can be built on any host
+of the release's triple. The macOS declarations are a list of symbol names that sandy uses,
+checked against Apple's SDK on a Mac in CI, so no Apple file is part of the build; the Windows
+libraries are Microsoft's, fetched by `scripts/windows-sdk.sh` from Microsoft's servers at each
+build and checked file by file, so none of them is part of the repository either. The archives are packed with sorted entries, the time of the commit and no
 owner. A second job builds every target in two directories and compares the binaries, so a change
 that ties the output to the machine that built it is noticed. The `verify-release` workflow, run
 by hand, checks a published release, also one built outside the workflow: it builds every binary

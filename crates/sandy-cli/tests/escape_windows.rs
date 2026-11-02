@@ -1788,7 +1788,9 @@ fn the_program_cannot_reach_the_coordination_files() {
         &fixture.access_args(),
         &[
             ("read", state.to_str().unwrap()),
-            ("read", lock.to_str().unwrap()),
+            // Opened, not read: every run of this user locks a range of it while it changes
+            // grants, so a read can fail for that alone, outside the sandbox too.
+            ("open", lock.to_str().unwrap()),
             ("list", directory.to_str().unwrap()),
             ("write", &created),
         ],

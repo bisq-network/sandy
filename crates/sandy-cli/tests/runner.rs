@@ -84,6 +84,10 @@ const EXPECTED_SKIPS: &[(&str, &str)] = &[
         "windows-2025",
         include_str!("expected-skips/windows-2025.txt"),
     ),
+    (
+        "windows-11-arm",
+        include_str!("expected-skips/windows-11-arm.txt"),
+    ),
 ];
 
 /// Set for the test binary that the self-checks below start, so that one test skips a feature.
