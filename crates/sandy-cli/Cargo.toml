@@ -19,6 +19,13 @@ name = "sandy-probe"
 path = "src/bin/sandy-probe.rs"
 test = false
 
+# Test helper: the executable of the app bundles that the macOS LaunchServices escape tests start.
+# It creates the file the bundle names. Only escape_macos.rs uses it.
+[[bin]]
+name = "sandy-marker"
+path = "src/bin/sandy-marker.rs"
+test = false
+
 # Test helper: runs a program that sees a lower Landlock ABI than the kernel has, so the tests
 # can exercise the code paths of an older kernel. Linux only; elsewhere it refuses to run.
 [[bin]]

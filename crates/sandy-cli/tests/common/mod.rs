@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 
 pub const EXIT_FAILURE: i32 = 125;
 
-/// Directory that holds `sandy` and `sandy-probe` when the tests run on another host than the
-/// one that built them (for example a test VM). Unset, the paths Cargo built are used.
+/// Directory that holds `sandy`, `sandy-probe` and, for the macOS tests, `sandy-marker` when the
+/// tests run on another host than the one that built them (for example a test VM). Unset, the
+/// paths Cargo built are used.
 const BIN_DIR_VARIABLE: &str = "SANDY_TEST_BIN_DIR";
 
 /// Features that must be checkable on this host, separated by commas, or `all` for every
@@ -43,6 +44,10 @@ pub fn sandy_path() -> String {
 
 pub fn probe_path() -> String {
     binary("sandy-probe", env!("CARGO_BIN_EXE_sandy-probe"))
+}
+
+pub fn marker_path() -> String {
+    binary("sandy-marker", env!("CARGO_BIN_EXE_sandy-marker"))
 }
 
 /// The harness that runs a program with a lower reported Landlock ABI, `None` when it is not
