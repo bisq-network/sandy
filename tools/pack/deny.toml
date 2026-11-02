@@ -1,0 +1,39 @@
+# The dependency audit of the archive packer, which CI runs like the one of sandy:
+# cargo deny --manifest-path tools/pack/Cargo.toml --locked check all. An allowlist, as for sandy:
+# a crate that enters the tree fails the check until someone reviews it and adds it below.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+unmaintained = "all"
+ignore = []
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "MIT",
+]
+
+[bans]
+allow = [
+    { crate = "sandy-pack" },
+
+    # Direct dependencies.
+    { crate = "crc32fast" },
+    { crate = "flate2" },
+
+    # Pulled in by the direct dependencies: the pure Rust deflate of flate2.
+    { crate = "adler2" },
+    { crate = "cfg-if" },
+    { crate = "miniz_oxide" },
+    { crate = "simd-adler32" },
+]
+multiple-versions = "deny"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

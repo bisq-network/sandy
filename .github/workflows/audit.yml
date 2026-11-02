@@ -31,6 +31,8 @@ jobs:
       # version is pinned because a new major version of cargo-deny changes what deny.toml means.
       - run: scripts/install-tool.sh cargo-deny 0.20.2 e528dfcbe739af7ce37a77d3d6df1b29dd6887b1c701d888820c0f16b864f737
       - run: cargo deny --locked check all
+      # The archive packer of the release workflow, a workspace of its own.
+      - run: cargo deny --manifest-path tools/pack/Cargo.toml --locked check all
 
   vet:
     runs-on: ubuntu-24.04
@@ -42,3 +44,4 @@ jobs:
         run: scripts/verify-toolchain.sh
       - run: scripts/install-tool.sh cargo-vet 0.10.2 dd93790018205cbbfa161f078ca4631afa8ed57fc8f32482268bcfdf0c0d7499
       - run: scripts/check-audits.sh
+      - run: scripts/check-audits.sh tools/pack

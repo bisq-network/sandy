@@ -1276,12 +1276,18 @@ only on the source, the toolchain and, for Windows, those libraries, and can be 
 of the release's triple. The macOS declarations are a list of symbol names that sandy uses,
 checked against Apple's SDK on a Mac in CI, so no Apple file is part of the build; the Windows
 libraries are Microsoft's, fetched by `scripts/windows-sdk.sh` from Microsoft's servers at each
-build and checked file by file, so none of them is part of the repository either. The archives are packed with sorted entries, the time of the commit and no
-owner. A second job builds every target in two directories and compares the binaries, so a change
-that ties the output to the machine that built it is noticed. The `verify-release` workflow, run
-by hand, checks a published release, also one built outside the workflow: it builds every binary
-again from the tag, on runners like the hosts that built the release, and compares each archive
-with that binary and the files of the tag.
+build and checked file by file, so none of them is part of the repository either. The archives are
+packed by `tools/pack` (`scripts/release-pack.sh`), not by the archive tools of the host, with
+sorted entries, the time of the commit, owner 0 and permissions from the executable bit only, so an
+archive too can be built again byte for byte. `tools/pack` writes the ustar and zip containers
+itself and takes only the deflate of `flate2` and the CRC of `crc32fast`, crates that the imported
+audits cover, so it adds nothing to sandy's `Cargo.lock` and little to review. A second job builds
+and packs every target in two directories and compares the binaries and the archives, and
+compares the archive with the one packed on another runner, so a change that ties the output to
+the machine that built it is noticed. The `verify-release` workflow, run by hand, checks a
+published release, also one built outside the workflow: it builds and packs every archive again
+from the tag, on a runner like the one that built the release, and compares each archive with the
+one built again, byte for byte.
 
 An archive that the workflow built gets a GitHub build provenance attestation, which names the
 workflow, the commit and the run that produced it. The job verifies the attestations before it

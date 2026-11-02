@@ -120,14 +120,21 @@ which names the workflow, the commit and the run that built it
 An archive built outside the workflow has none.
 
 **Building a release binary again.** Every release binary is built with
-`scripts/release-build.sh TARGET` from a checkout of the release tag, so anyone can build it again
-and compare it with the binary in the archive:
+`scripts/release-build.sh TARGET` from a checkout of the release tag and packed with
+`scripts/release-pack.sh TARGET`, so anyone can build the archive again and compare it with
+`SHA256SUMS`:
 
 ```sh
 git checkout v1.0.0
 scripts/release-build.sh x86_64-unknown-linux-musl
-sha256sum target/x86_64-unknown-linux-musl/release/sandy
+scripts/release-pack.sh x86_64-unknown-linux-musl
+sha256sum dist/sandy-1.0.0-x86_64-unknown-linux-musl.tar.gz
 ```
+
+The archive comes from `tools/pack`, a small program of this repository and a workspace of its
+own, not from the tar, gzip or 7-Zip of the host: sorted entries, the time of the commit on every
+entry, owner 0, permissions 0755 or 0644 from the executable bit only, and the pure Rust deflate
+of `flate2`, so the bytes of the archive depend only on the files in it.
 
 The script removes from the binary what would tie it to the machine that built it: the directory of
 the checkout, `CARGO_HOME` and the toolchain, and the build time. It cannot remove the host that
@@ -152,11 +159,11 @@ every library file against `link/windows-sdk.sha256`. The libraries come under t
 Visual Studio Build Tools, so the script runs only with `XWIN_ACCEPT_LICENSE=true`, and builds them
 on Linux only. The script refuses a toolchain that rustup did not install from the pinned
 archives (see "The supply chain checks" below). The `reproducible` job of the release workflow
-builds every target twice, in two directories, and compares the binaries; both builds run on one
-runner, so the job does not show a dependence on the host. The `verify-release` workflow, started by
-hand with the tag of a published release, builds every binary of the release again on runners like
-the hosts that built it, and compares each archive with the binary built again and the files of the
-tag.
+builds and packs every target twice, in two directories, and compares the binaries and the
+archives, and compares the archive with the one the build job packed on another runner. The
+`verify-release` workflow, started by hand with the tag of a published release, builds and packs
+every archive of the release again on a runner like the one that built it, and compares each
+archive with the one built again, byte for byte.
 
 The script links both Linux binaries as static position-independent executables, which the
 kernel loads at a random address. rustc does that by itself for `x86_64-unknown-linux-musl`. For
@@ -1342,7 +1349,10 @@ What goes into a build is pinned in this repository, and the builds check it:
   that publisher for that crate and ends after a year; an exemption is a crate version that nobody
   audited, and its notes say why sandy uses it anyway. `scripts/check-audits.sh` fails on a crate
   version without cover, on an entry that nothing needs any more, and on an audit, exemption or
-  trusted publisher without notes.
+  trusted publisher without notes. `tools/pack`, which packs the release archives, has its own
+  `Cargo.lock`, `deny.toml` and `supply-chain/`, checked the same way
+  (`scripts/check-audits.sh tools/pack`); its crates, `flate2` with its pure Rust deflate and
+  `crc32fast`, are all covered by imported audits.
 - **The toolchain.** `rust-toolchain.toml` pins the Rust release, and `rust-toolchain.sha256` the
   SHA-256 sum of its channel manifest, which lists the sum of every archive of that release.
   `scripts/verify-toolchain.sh` downloads the manifest, checks it against the pinned sum, and

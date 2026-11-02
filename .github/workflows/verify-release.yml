@@ -1,9 +1,10 @@
 name: verify-release
 
 # Run by hand with the tag of a published release, such as v1.0.0: builds every binary of the
-# release again from the tag, the way scripts/release-build.sh builds a release binary, and
-# compares each archive of the release with the binary built again and the files of the tag. The
-# run fails when any archive holds something else.
+# release again from the tag, the way scripts/release-build.sh builds a release binary, packs it
+# the way scripts/release-pack.sh does, and compares each archive of the release with the archive
+# built again, byte for byte. The run fails when any archive differs; the summary then says
+# whether the files in it differ or only the archive.
 #
 # A binary built again matches only on a host of the triple that built the release (README.md,
 # "Building a release binary again"). The runner below is the one the release workflow builds
@@ -70,10 +71,17 @@ jobs:
           # As in release.yml.
           XWIN_ACCEPT_LICENSE: ${{ contains(matrix.target, 'windows') }}
         run: scripts/release-build.sh ${{ matrix.target }}
+      - name: Pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=$(scripts/release-pack.sh ${{ matrix.target }})
+          mkdir rebuilt
+          cp "$archive" target/${{ matrix.target }}/release/sandy${{ contains(matrix.target, 'windows') && '.exe' || '' }} rebuilt/
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rebuilt-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/sandy${{ contains(matrix.target, 'windows') && '.exe' || '' }}
+          path: rebuilt/
           if-no-files-found: error
 
   compare:
@@ -97,7 +105,7 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
-      - name: Compare the archives with the binaries built again
+      - name: Compare the archives with the ones built again
         env:
           TAG: ${{ inputs.tag }}
         run: |
@@ -114,6 +122,7 @@ jobs:
             [[ "$target" == *windows* ]] && { exe=sandy.exe; ext=zip; }
             name="sandy-$version-$target"
             archive="artifacts/release/$name.$ext"
+            repacked="artifacts/rebuilt-$target/$name.$ext"
             rebuilt="artifacts/rebuilt-$target/$exe"
             work="work/$target"
             mkdir -p "$work/released" "$work/expected/$name"
@@ -124,13 +133,15 @@ jobs:
             fi
             if [[ ! -f "$archive" ]]; then
               result="no archive in the release"
-            elif [[ ! -f "$rebuilt" ]]; then
+            elif [[ ! -f "$rebuilt" || ! -f "$repacked" ]]; then
               result="not built, see its build job"
+            elif cmp -s "$archive" "$repacked"; then
+              result=identical
             else
-              # What the archive must hold, and nothing else.
+              # Which files differ, to tell a difference in a binary from one in the packing.
               cp "$rebuilt" source/README.md source/LICENSE-MIT source/LICENSE-APACHE "$work/expected/$name/"
               if (cd "$work" && diff -rq expected released) >> differences.txt; then
-                result=identical
+                result="same files, other archive bytes"
               else
                 result=differs
               fi

@@ -1,0 +1,20 @@
+# The archive packer of the release workflow, a workspace of its own so that its dependencies stay
+# out of sandy's Cargo.lock. tools/pack/deny.toml and tools/pack/supply-chain hold its audit
+# records, checked like sandy's.
+[package]
+name = "sandy-pack"
+description = "Packs the release archives of sandy with fixed metadata, so that the same files give the same bytes on every host"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+crc32fast = "1.4"
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+
+[workspace]
+
+[lints.rust]
+unsafe_code = "forbid"
