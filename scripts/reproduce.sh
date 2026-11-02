@@ -1,10 +1,12 @@
 #!/bin/sh
 # Builds and packs every release archive of REF (a tag or commit, HEAD by default) in a container,
-# the way the release workflow does, and writes them with their SHA256SUMS to
-# dist/reproduced/COMMIT. Compare that file with the SHA256SUMS of the release: when the release
-# was built from the same commit, every line matches.
+# the way the release workflow does, and writes them with their SHA256SUMS to DIRECTORY, by
+# default dist/reproduced/COMMIT of this checkout, which git ignores. The archives have the names
+# and the bytes of the ones the release of that commit publishes, and SHA256SUMS the form of the
+# release's file, so every line matches when the release was built from the same commit;
+# scripts/check-release.sh does that comparison.
 #
-#   XWIN_ACCEPT_LICENSE=true scripts/reproduce.sh [REF]
+#   XWIN_ACCEPT_LICENSE=true scripts/reproduce.sh [REF [DIRECTORY]]
 #
 # Needs git and Docker; the container is an x86_64 Linux host (scripts/reproduce.Dockerfile), the
 # triple that every release binary is built on, emulated on other hosts. The Windows archives link
@@ -13,6 +15,13 @@
 # holds it, without changes of the working tree.
 set -eu
 
+ref=${1:-HEAD}
+# A directory given relative to where the script was started from.
+out=${2:-}
+case "$out" in
+  "" | /*) ;;
+  *) out=$PWD/$out ;;
+esac
 cd "$(dirname "$0")/.."
 
 fail() {
@@ -20,7 +29,6 @@ fail() {
   exit 1
 }
 
-ref=${1:-HEAD}
 [ "${XWIN_ACCEPT_LICENSE:-}" = true ] ||
   fail "set XWIN_ACCEPT_LICENSE=true to accept the license of the Visual Studio Build Tools"
 commit=$(git rev-parse --verify --quiet "$ref^{commit}") || fail "$ref is not a commit"
@@ -37,9 +45,10 @@ image=sandy-reproduce:$sum
 tar -cf - scripts/reproduce.Dockerfile rust-toolchain.toml |
   docker build --platform linux/amd64 -f scripts/reproduce.Dockerfile -t "$image" - >&2
 
-out=dist/reproduced/$commit
-rm -rf "$out"
+out=${out:-$PWD/dist/reproduced/$commit}
+# Only archives of this run and their sums in it, not those of an earlier one.
 mkdir -p "$out"
+rm -f "$out"/sandy-*.tar.gz "$out"/sandy-*.zip "$out/SHA256SUMS"
 
 # The source goes in and the archives come out as tar streams, without a bind mount: everything is
 # built in the container's own file system, which keeps names that differ only in case apart
@@ -60,9 +69,9 @@ git archive "$commit" |
       tar -c -C dist .
     ' | tar -x -C "$out"
 # A pipe does not pass on the exit status of the container, so the archives are counted.
-[ "$(ls "$out" | grep -c -e '\.tar\.gz$' -e '\.zip$')" = 6 ] ||
+[ "$(ls "$out" | grep -c -e '^sandy-.*\.tar\.gz$' -e '^sandy-.*\.zip$')" = 6 ] ||
   fail "the build in the container did not make all six archives (its output is above)"
 # The form of the release's SHA256SUMS.
-(cd "$out" && $sha256 ./*.tar.gz ./*.zip | sed 's| \./| |' > SHA256SUMS)
+(cd "$out" && $sha256 ./sandy-*.tar.gz ./sandy-*.zip | sed 's| \./| |' > SHA256SUMS)
 cat "$out/SHA256SUMS"
 echo "reproduce: the archives of $commit are in $out" >&2

@@ -135,8 +135,14 @@ tag is fetched into `FETCH_HEAD`, the build runs in a temporary worktree, and th
 checked in a temporary GnuPG home. Should the signing key change before this script does, pass its
 full fingerprint with `--key FINGERPRINT`.
 
-`scripts/reproduce.sh TAG` does the build alone: it builds and packs all six archives of a tag in a
-container and writes their `SHA256SUMS` to `dist/reproduced/COMMIT/`.
+`scripts/reproduce.sh [TAG [DIRECTORY]]` does the build alone: it builds and packs all six archives
+of a tag in a container, with the names and bytes of the ones in the release, and writes them with
+their `SHA256SUMS` to `DIRECTORY`, by default `dist/reproduced/COMMIT/` of the checkout, which git
+ignores:
+
+```sh
+XWIN_ACCEPT_LICENSE=true scripts/reproduce.sh v1.0.0 ~/sandy-v1.0.0
+```
 
 The container (`scripts/reproduce.Dockerfile`) is an x86_64 Linux host, the triple every release
 archive is built on, emulated by Docker on other hosts. Its inputs are pinned: the Debian image by
