@@ -1294,8 +1294,8 @@ workflow, the commit and the run that produced it. The job verifies the attestat
 creates the draft, so such a release never carries an archive that cannot be checked. A user
 checks a download with `gh attestation verify <archive> --repo <owner>/<repo>`.
 
-`SHA256SUMS` says that the archives belong together; `SHA256SUMS.asc`, the maintainer's signature of
-it with the key that signs the tags, says who published them. That matters most for archives built
+`SHA256SUMS` says that the archives belong together; `SHA256SUMS.asc`, the signature of it by the
+maintainer who publishes the releases, says who published them. That matters most for archives built
 outside the workflow, which have no attestation. The macOS binaries carry only the linker's
 ad-hoc signature, and `sandy.exe` has no Authenticode signature; the workflow holds both steps,
 skipped until the certificates exist.

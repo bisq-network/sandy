@@ -106,8 +106,8 @@ targets:
 - `aarch64-pc-windows-msvc` (static C runtime)
 
 **Verifying a download.** `SHA256SUMS` in the release lists the SHA-256 sum of every archive,
-and `SHA256SUMS.asc` signs it with the project's OpenPGP key, the key that also signs the release
-tags (fingerprint `E850 152C 47E1 3655 DDF3  A62B 4CE3 8D03 67B5 3CC5`):
+and `SHA256SUMS.asc` signs it with the OpenPGP key of the maintainer who publishes the release,
+which the release names:
 
 ```sh
 gpg --verify SHA256SUMS.asc SHA256SUMS
@@ -119,15 +119,24 @@ which names the workflow, the commit and the run that built it
 (`gh attestation verify sandy-1.0.0-x86_64-unknown-linux-musl.tar.gz --repo bisq-network/sandy`).
 An archive built outside the workflow has none.
 
-**Building a release binary again.** The simplest check needs only git and Docker, on Linux or
-macOS: `scripts/reproduce.sh` builds and packs all six archives of a tag in a container and
-writes their `SHA256SUMS`, which must equal the one of the release.
+**Building a release binary again.** The simplest check needs git, curl, gpg and Docker, on
+Linux or macOS, and one command in a clone of this repository:
 
 ```sh
-git clone https://github.com/bisq-network/sandy && cd sandy
-XWIN_ACCEPT_LICENSE=true scripts/reproduce.sh v1.0.0
-diff dist/reproduced/$(git rev-parse v1.0.0^{commit})/SHA256SUMS SHA256SUMS   # the release's file
+XWIN_ACCEPT_LICENSE=true scripts/check-release.sh v1.0.0
 ```
+
+It checks that `SHA256SUMS.asc` of the release is signed by the release key, whose fingerprint the
+script pins, downloads the six archives, builds them again from the commit of the tag with that
+tag's own `scripts/reproduce.sh`, and prints for each archive whether it matches `SHA256SUMS` and
+the archive built again, then a verdict; it exits with 0 only when every archive is reproduced. Run
+outside a clone, it offers to clone one. It changes neither the clone's tags nor your keyring: the
+tag is fetched into `FETCH_HEAD`, the build runs in a temporary worktree, and the signature is
+checked in a temporary GnuPG home. Should the signing key change before this script does, pass its
+full fingerprint with `--key FINGERPRINT`.
+
+`scripts/reproduce.sh TAG` does the build alone: it builds and packs all six archives of a tag in a
+container and writes their `SHA256SUMS` to `dist/reproduced/COMMIT/`.
 
 The container (`scripts/reproduce.Dockerfile`) is an x86_64 Linux host, the triple every release
 archive is built on, emulated by Docker on other hosts. Its inputs are pinned: the Debian image by
