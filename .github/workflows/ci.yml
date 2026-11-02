@@ -195,3 +195,7 @@ jobs:
       - run: cargo clippy --locked --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
       - run: cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-musl -- -D warnings
       - run: cargo check --locked --workspace --all-targets --target aarch64-apple-darwin
+      # The archive packer of the release workflow, a workspace of its own.
+      - run: cargo fmt --manifest-path tools/pack/Cargo.toml --check
+      - run: cargo clippy --manifest-path tools/pack/Cargo.toml --locked --all-targets -- -D warnings
+      - run: cargo test --manifest-path tools/pack/Cargo.toml --locked

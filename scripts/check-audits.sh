@@ -3,12 +3,14 @@
 # an imported audit, an audit of this repository, a trusted publisher or an exemption, no entry is
 # left that nothing needs, and every audit, exemption and trusted publisher has notes.
 #
-#   scripts/check-audits.sh
+#   scripts/check-audits.sh [DIRECTORY]
 #
-# It uses the imported audits of supply-chain/imports.lock and fetches no new ones.
+# DIRECTORY is the workspace whose records are checked, sandy's by default; tools/pack keeps its
+# own. It uses the imported audits of supply-chain/imports.lock and fetches no new ones.
 set -eu
 
 cd "$(dirname "$0")/.."
+cd "${1:-.}"
 
 cargo vet --locked
 
