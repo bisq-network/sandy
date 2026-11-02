@@ -1264,7 +1264,8 @@ are in `escape_linux.rs`, `escape_macos.rs` and `escape_windows.rs`; `check.rs` 
 `review_*.rs`.
 
 To run the tests on another machine, build the test executables, copy them together with `sandy`
-and `sandy-probe` into one directory there, and set `SANDY_TEST_BIN_DIR` to that directory:
+and `sandy-probe` (and `sandy-marker` on macOS) into one directory there, and set
+`SANDY_TEST_BIN_DIR` to that directory:
 
 ```sh
 cargo test --no-run --target x86_64-unknown-linux-musl -p sandy-cli

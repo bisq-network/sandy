@@ -60,8 +60,8 @@ fn home_args(fixture: &Fixture) -> Vec<String> {
     )
 }
 
-/// An application bundle whose executable writes `marker` and exits. It has no window and no
-/// Dock icon.
+/// An application bundle whose executable (`sandy-marker`) creates `marker` and exits. It has no
+/// window and no Dock icon.
 fn marker_app(fixture: &Fixture, name: &str, marker: &Path) -> PathBuf {
     let app = fixture.path(&format!("{name}.app"));
     let executables = app.join("Contents/MacOS");
@@ -85,11 +85,10 @@ fn marker_app(fixture: &Fixture, name: &str, marker: &Path) -> PathBuf {
         ),
     )
     .unwrap();
-    let script = executables.join("marker");
-    let marker = marker.to_str().unwrap();
-    assert!(!marker.contains('\''), "{marker}");
-    fs::write(&script, format!("#!/bin/sh\n: > '{marker}'\n")).unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::copy(marker_path(), executables.join("marker")).unwrap();
+    let resources = app.join("Contents/Resources");
+    fs::create_dir_all(&resources).unwrap();
+    fs::write(resources.join("marker"), marker.to_str().unwrap()).unwrap();
     app
 }
 
