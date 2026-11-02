@@ -44,6 +44,9 @@ fn main() {
 
 fn perform(action: &str, target: &str) -> io::Result<String> {
     match action {
+        // Opens for reading and reads nothing: what decides access, without the byte-range locks
+        // another process may hold on the file, which make a read fail but not the open.
+        "open" => fs::File::open(target).map(|_| String::new()),
         "read" => {
             let mut content = Vec::new();
             fs::File::open(target)?.read_to_end(&mut content)?;
@@ -721,7 +724,6 @@ mod linux {
     use std::time::{Duration, Instant};
 
     pub const ACTIONS: &[&str] = &[
-        "open",
         "open-ioctl-only",
         "openpty",
         "fchmod-readonly",
@@ -811,7 +813,6 @@ mod linux {
             "setflags-ro" => setflags_ro(target),
             "fsxattr-ro" => fsxattr_ro(target),
             "enable-verity" => enable_verity(target),
-            "open" => fs::File::open(target).map(|_| String::new()),
             "open-ioctl-only" => open_ioctl_only(target),
             "openpty" => openpty(target),
             // Opens `target` for reading and writing in place of standard input, so that the
