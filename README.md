@@ -150,9 +150,9 @@ digest, its packages by a dated snapshot of the Debian archive, rustup by its SH
 toolchain by `rust-toolchain.toml`. `XWIN_ACCEPT_LICENSE=true` accepts the license of the Visual
 Studio Build Tools, whose libraries the Windows archives are linked against (see below). The source
 goes into the container and the archives come out as tar streams, without a shared directory, so
-the file system of the host does not matter. A full run takes a few minutes on an x86_64 machine
-and longer under emulation. A tag can be checked this way from the first release that has
-`scripts/reproduce.sh`.
+the file system of the host does not matter. Archives built on x86_64 Linux and on an Apple silicon
+Mac, under emulation, are identical to those of the release workflow. A tag can be checked this way
+from the first release that has these scripts.
 
 Without Docker, on an x86_64 Linux host with rustup, each archive can be built the same way the
 container does it: every release binary is built with `scripts/release-build.sh TARGET` from a
@@ -1456,7 +1456,8 @@ against the packaged Windows binaries on Windows Server 2025 and 2022 and, for a
 on arm64, attests their build provenance, verifies the attestations, and creates a draft release
 with `SHA256SUMS`. It also builds every target twice from two directories and compares the
 binaries. The `verify-release` workflow builds a published release again and compares it with its archives
-(see "Building a release binary again").
+(see "Building a release binary again"); `scripts/check-release.sh` does the same check outside
+GitHub, in a container on any machine with Docker.
 
 Expected-skip lists exist only for the development hosts the suite ran on, not yet for the runners
 above, so the comparison step fails on each runner until its list is committed: the failure prints
