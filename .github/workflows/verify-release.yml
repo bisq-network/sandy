@@ -5,13 +5,14 @@ name: verify-release
 # compares each archive of the release with the binary built again and the files of the tag. The
 # run fails when any archive holds something else.
 #
-# A binary built again matches only on a host of the triple that built the release, and on macOS
-# and Windows only with the linker version that the release notes name (README.md, "Building a
-# release binary again"). The runners below are the ones the release workflow builds on: x86_64
-# Linux for both Linux binaries, an arm64 Mac with the Command Line Tools 27.0 (ld-27037.1), which
-# the macos-26 image has besides its Xcode, for both macOS binaries, and x86_64 Windows for both
-# Windows binaries. Each macOS and Windows build names its linker in the summary of the run, so
-# that a difference there can be told from one in the source.
+# A binary built again matches only on a host of the triple that built the release, and on Windows
+# only with the linker version that the release notes name (README.md, "Building a release binary
+# again"). The runners below are the ones the release workflow builds on: x86_64 Linux for the
+# Linux and the macOS binaries, and x86_64 Windows for both Windows binaries. Each Windows build
+# names its linker in the summary of the run, so that a difference there can be told from one in
+# the source. Run the workflow from the tag it checks (gh workflow run verify-release.yml --ref
+# TAG -f tag=TAG), so that the runners are those that built that tag: up to v1.0.0, an arm64 Mac
+# with Apple's linker built the macOS binaries.
 
 on:
   workflow_dispatch:
@@ -54,14 +55,11 @@ jobs:
         include:
           - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04 }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04 }
-          - { target: x86_64-apple-darwin, os: macos-26 }
-          - { target: aarch64-apple-darwin, os: macos-26 }
+          - { target: x86_64-apple-darwin, os: ubuntu-24.04 }
+          - { target: aarch64-apple-darwin, os: ubuntu-24.04 }
           - { target: x86_64-pc-windows-msvc, os: windows-2025 }
           - { target: aarch64-pc-windows-msvc, os: windows-2025 }
     runs-on: ${{ matrix.os }}
-    env:
-      # The image's Command Line Tools instead of its default Xcode, which links with another ld.
-      DEVELOPER_DIR: ${{ contains(matrix.target, 'apple') && '/Library/Developer/CommandLineTools' || '' }}
     steps:
       # The token of the job stays out of .git/config, where the build scripts of the
       # dependencies could read it: no step here pushes or fetches.
@@ -70,25 +68,18 @@ jobs:
           ref: refs/tags/${{ inputs.tag }}
           persist-credentials: false
       - name: Name the linker
-        if: runner.os != 'Linux'
+        if: runner.os == 'Windows'
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$RUNNER_OS" == macOS ]]; then
-            ld=$(ld -v 2>&1 | sed -n 's/.*PROJECT:\(ld-[^ ]*\).*/\1/p')
-            tools=$(pkgutil --pkg-info=com.apple.pkg.CLTools_Executables | sed -n 's/^version: //p')
-            linker="$ld (Command Line Tools $tools, SDK $(xcrun --show-sdk-version))"
-          else
-            # The image has one Visual Studio, and rustc links against the newest Windows SDK.
-            vs=$("/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -latest \
-              -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
-              -property installationPath | tr -d '\r')
-            msvc=$(tr -d '\r\n' < "$(cygpath -u "$vs")/VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt")
-            sdk=$(find "/c/Program Files (x86)/Windows Kits/10/Lib" -mindepth 1 -maxdepth 1 -printf '%f\n' |
-              sort -V | tail -n 1)
-            linker="MSVC $msvc (Windows SDK $sdk)"
-          fi
-          echo "${{ matrix.target }} is linked with $linker" | tee -a "$GITHUB_STEP_SUMMARY"
+          # The image has one Visual Studio, and rustc links against the newest Windows SDK.
+          vs=$("/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -latest \
+            -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
+            -property installationPath | tr -d '\r')
+          msvc=$(tr -d '\r\n' < "$(cygpath -u "$vs")/VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt")
+          sdk=$(find "/c/Program Files (x86)/Windows Kits/10/Lib" -mindepth 1 -maxdepth 1 -printf '%f\n' |
+            sort -V | tail -n 1)
+          echo "${{ matrix.target }} is linked with MSVC $msvc (Windows SDK $sdk)" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Build
         shell: bash
         run: scripts/release-build.sh ${{ matrix.target }}

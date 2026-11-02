@@ -1266,12 +1266,14 @@ directly.
 
 Every release binary is built with `scripts/release-build.sh` from a tag, with `--locked`, so a
 binary can be built again and compared, by the `release` workflow and by anyone else. The script
-keeps the path of the checkout and of `CARGO_HOME` out of the binary, links the Linux targets with
-the linker of the pinned Rust toolchain instead of the host's, links a macOS binary without the
-debug map, whose object paths Apple's linker would hash into its UUID, and has the Microsoft
-linker write no time stamp (`/Brepro`). A Linux binary then depends only on the source and the
-toolchain; a macOS or Windows binary also on the version of the platform's linker, which the
-release notes name. The archives are packed with sorted entries, the time of the commit and no
+keeps the path of the checkout and of `CARGO_HOME` out of the binary, links the Linux and macOS
+targets with the linker of the pinned Rust toolchain instead of the host's, the macOS ones against
+the libSystem declarations of `link/MacOSX.sdk` instead of Apple's SDK and without the debug map,
+whose object paths the linker would hash into the UUID, and has the Microsoft linker write no time
+stamp (`/Brepro`). A Linux or macOS binary then depends only on the source and the toolchain, and
+can be built on any host of the release's triple; a Windows binary also on the version of the
+Microsoft linker, which the release notes name. The declarations are a list of symbol names that
+sandy uses, checked against Apple's SDK on a Mac in CI, so no Apple file is part of the build. The archives are packed with sorted entries, the time of the commit and no
 owner. A second job builds every target in two directories and compares the binaries, so a change
 that ties the output to the machine that built it is noticed. The `verify-release` workflow, run
 by hand, checks a published release, also one built outside the workflow: it builds every binary

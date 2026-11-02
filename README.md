@@ -133,13 +133,21 @@ The script removes from the binary what would tie it to the machine that built i
 of the checkout, `CARGO_HOME` and the toolchain, and the build time. It cannot remove the host that
 runs the toolchain, the `host:` line of `rustc -vV`: cargo mixes the host into the metadata of
 the build scripts and procedural macros and passes that on to every crate that uses them. In the
-Linux binaries this changes the order of the functions, though not their size: a build on
-`x86_64-unknown-linux-gnu` and a build on arm64 Linux give other bytes, and the Linux release
-binaries are built on `x86_64-unknown-linux-gnu`. So a binary built again matches only on a host
-of the triple that built the release. Apart from the host, the Linux binaries are linked with the
-linker of the Rust toolchain, so they depend only on the source and on the toolchain that
-`rust-toolchain.toml` pins. The macOS and Windows binaries also depend on the version of Apple's
-linker and of the Microsoft linker, which the release notes name. The script refuses a toolchain
+Linux and macOS binaries this changes the order of the functions, though not their size: a build
+on `x86_64-unknown-linux-gnu` and a build on arm64 Linux or an arm64 Mac give other bytes, and the
+Linux and macOS release binaries are built on `x86_64-unknown-linux-gnu`. So a binary built again
+matches only on a host of the triple that built the release. Apart from the host, the Linux and
+macOS binaries are linked with the linker of the Rust toolchain, so they depend only on the source
+and on the toolchain that `rust-toolchain.toml` pins. The macOS binaries are linked against
+`link/MacOSX.sdk` instead of Apple's SDK: it declares the symbols of libSystem that sandy uses and
+nothing else, and the CI checks each one against Apple's SDK on a Mac
+(`scripts/check-macos-stubs.sh`). A change that calls into libSystem for a symbol not declared
+there fails to link; add the symbol for its architectures. The binaries record SDK 27.0, the
+version the declarations follow, as the SDK they were built against, which decides some behaviour
+of the system libraries. Up to v1.0.0, Apple's linker on a Mac linked them, so check such a tag
+with the `verify-release` workflow of that tag (`gh workflow run verify-release.yml --ref v1.0.0
+-f tag=v1.0.0`). The Windows binaries
+also depend on the version of the Microsoft linker, which the release notes name. The script refuses a toolchain
 that rustup did not install from the pinned archives (see "The supply chain checks" below). The
 `reproducible` job of the release workflow builds every target twice, in two directories, and
 compares the binaries; both builds run on one runner, so the job does not show a dependence on
@@ -1384,16 +1392,19 @@ The tests run on Ubuntu 22.04 and 24.04 (x86_64) and 24.04 (arm64), macOS 15, an
 2022 and 2025. On Ubuntu 24.04 they run a second time for the musl target of the Linux release
 on that architecture, because musl and glibc differ in constants that sandy builds its filters
 from; on arm64 that run links its binaries as the release does, as static PIEs through
-`scripts/link-static-pie.sh`. Each runner names the features it must be able to check and, on
+`scripts/link-static-pie.sh`. On macOS the suite runs `sandy` as `scripts/release-build.sh`
+links it, after `scripts/check-macos-stubs.sh` has checked the libSystem declarations of
+`link/MacOSX.sdk` against the runner's SDK. Each runner names the features it must be able to check and, on
 Linux, the lowest Landlock ABI it must report; after the suite, CI compares the skips with the
 runner's list. Every job that builds checks the toolchain first, with
 `scripts/verify-toolchain.sh`. The `audit` workflow runs `cargo deny` and
 `scripts/check-audits.sh`, weekly as well, because an advisory can appear, and a trusted
 publisher entry can end, without a push. The `release` workflow builds archives for Linux, macOS
 and Windows on x86_64 and arm64 when a tag `v<version>` is pushed, both of a platform on one
-runner, the runners that `verify-release` uses too, names the linker of the macOS and Windows
-binaries, starts each binary that its runner can run (`sandy --version`) and the arm64 Linux
-binary on an arm64 runner, attests their build provenance, verifies the attestations,
+runner, the runners that `verify-release` uses too (x86_64 Linux builds the macOS binaries),
+names the linker of the Windows binaries, starts each binary that its runner can run
+(`sandy --version`) and the arm64 Linux binary on an arm64 runner, runs the whole suite against
+the packaged macOS binaries on the macOS 15 and 26 runners and, for x86_64, an Intel Mac, attests their build provenance, verifies the attestations,
 and creates a draft release with `SHA256SUMS`. It also builds one target twice from two
 directories and compares the binaries. The arm64 Windows build is compiled but not tested. The
 `verify-release` workflow builds a published release again and compares it with its archives
