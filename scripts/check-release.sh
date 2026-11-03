@@ -5,10 +5,10 @@
 #
 #   XWIN_ACCEPT_LICENSE=true scripts/check-release.sh [--key FINGERPRINT] TAG
 #
-# SHA256SUMS.asc must be signed by the key that signs the releases, F5F1 2A8E 8EC8 DDAD F770  9748
-# 0047 60E7 7F75 3090 (alvasw), or by the key whose full fingerprint --key gives, for a key that
-# changed before this script did. The key is fetched from GitHub and keys.openpgp.org; only its
-# fingerprint decides. The tag only names the commit to build: its signature is not checked.
+# SHA256SUMS.asc must be signed by the key that signs the releases, B493 3191 06CC 3D1F 252E  19CB
+# F806 F422 E222 AA02 (alejandrogarcia83), or by the key whose full fingerprint --key gives, for a
+# key that changed before this script did. The key is fetched from GitHub and keys.openpgp.org;
+# only its fingerprint decides. The tag only names the commit to build: its signature is not checked.
 #
 # Run it in a clone of bisq-network/sandy, or anywhere else, where it offers to clone one into
 # ./sandy. It leaves the clone as it was, apart from the objects of the tag and FETCH_HEAD: the tag
@@ -22,8 +22,8 @@ set -eu
 repo=${SANDY_REPOSITORY:-bisq-network/sandy}
 url=https://github.com/$repo
 # The key that signs SHA256SUMS of the releases (README.md).
-fingerprint=F5F12A8E8EC8DDADF7709748004760E77F753090
-key_urls="https://github.com/alvasw.gpg https://keys.openpgp.org/vks/v1/by-fingerprint/"
+fingerprint=B493319106CC3D1F252E19CBF806F422E222AA02
+key_urls="https://github.com/alejandrogarcia83.gpg https://keys.openpgp.org/vks/v1/by-fingerprint/"
 targets="aarch64-apple-darwin aarch64-unknown-linux-musl x86_64-apple-darwin
 x86_64-unknown-linux-musl aarch64-pc-windows-msvc x86_64-pc-windows-msvc"
 
