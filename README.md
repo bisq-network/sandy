@@ -1469,7 +1469,7 @@ The `audit` workflow runs these, and so does:
 scripts/verify-toolchain.sh
 scripts/install-tool.sh cargo-deny 0.20.2 e528dfcbe739af7ce37a77d3d6df1b29dd6887b1c701d888820c0f16b864f737
 cargo deny --locked check all
-scripts/install-tool.sh cargo-vet 0.10.2 dd93790018205cbbfa161f078ca4631afa8ed57fc8f32482268bcfdf0c0d7499
+scripts/install-tool.sh cargo-vet 0.10.3 173c2501643f10d4b4f1157da393d9dedb9c288f2ec8687c08bd5b71f89478d6
 scripts/check-audits.sh
 ```
 
@@ -1477,8 +1477,12 @@ scripts/check-audits.sh
 opens pull requests only for security updates (`.github/dependabot.yml`). A new crate version, or
 a new crate, comes in one pull request of its own, with the change of `Cargo.lock` in its
 description, and only once the version has been out for a week, unless it fixes a RustSec
-advisory: most malicious versions are found and yanked within days. Review the change with
-`cargo vet diff` (or `cargo vet inspect` for a new crate), and look first at build scripts,
+advisory: most malicious versions are found and yanked within days. Run `cargo fetch --locked`
+on the base branch and on the change, so that cargo has both versions, checked against a
+`Cargo.lock`; cargo-vet reads them from there, and downloads a version that cargo does not have
+without checking its sum. Then review the change with `cargo vet diff --mode=local` (or
+`cargo vet inspect --mode=local` for a new crate): without `--mode=local` both open a web page of
+diff.rs or crates.io rather than the files that cargo builds. Look first at build scripts,
 procedural macros, `unsafe` code and new dependencies. Then run `cargo vet`: it fetches the audits
 of the imported organizations again and names every crate version that is still not covered.
 `cargo vet suggest` lists the audits that would cover them, with their size. Then record, for each one, an audit you

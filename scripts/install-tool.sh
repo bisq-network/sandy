@@ -23,4 +23,6 @@ command -v sha256sum > /dev/null 2>&1 || sum="shasum -a 256"
 echo "$expected  $crate" > "$tmp/pin"
 (cd "$tmp" && $sum --check --status pin) || { echo "install-tool: $crate does not have the sum $expected" >&2; exit 1; }
 tar -xzf "$tmp/$crate" -C "$tmp"
-cargo install --locked --path "$tmp/$name-$version"
+# libz-sys (cargo-vet) with cc 1.6 or later otherwise writes every environment variable of the
+# build into its build output (RUSTSEC-2026-0418); a static build skips the probe that does it.
+LIBZ_SYS_STATIC=1 cargo install --locked --path "$tmp/$name-$version"

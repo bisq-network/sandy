@@ -50,6 +50,6 @@ jobs:
       - uses: ./.github/actions/rustup
       - name: Verify the toolchain
         run: scripts/verify-toolchain.sh
-      - run: scripts/install-tool.sh cargo-vet 0.10.2 dd93790018205cbbfa161f078ca4631afa8ed57fc8f32482268bcfdf0c0d7499
+      - run: scripts/install-tool.sh cargo-vet 0.10.3 173c2501643f10d4b4f1157da393d9dedb9c288f2ec8687c08bd5b71f89478d6
       - run: scripts/check-audits.sh
       - run: scripts/check-audits.sh tools/pack
