@@ -34,6 +34,8 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
           persist-credentials: false
+      # rustup from the pinned rustup-init, not the runner image's (scripts/install-rustup.sh).
+      - uses: ./.github/actions/rustup
       - name: Fetch the libraries
         env:
           # The libraries come under the license of the Visual Studio Build Tools.

@@ -12,6 +12,8 @@
 set -eu
 
 target=${1:?usage: scripts/release-pack.sh TARGET}
+. "$(dirname "$0")/release-env.sh"
+release_env "$0" "$target"
 cd "$(dirname "$0")/.."
 
 version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)

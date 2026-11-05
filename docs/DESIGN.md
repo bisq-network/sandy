@@ -1278,8 +1278,12 @@ checked against Apple's SDK on a Mac in CI, so no Apple file is part of the buil
 libraries are Microsoft's, fetched by `scripts/windows-sdk.sh` from Microsoft's servers at each
 build and checked file by file, so none of them is part of the repository either. The tool that
 fetches them, xwin, is not reviewed, so it runs in a CI job or container of its own whose only
-output is the libraries, and the build checks them against the pinned sums without running it. The archives are
-packed by `tools/pack` (`scripts/release-pack.sh`), not by the archive tools of the host, with
+output is the libraries, and the build checks them against the pinned sums without running it.
+The build itself runs without network: `scripts/release-fetch.sh` fetches the toolchain and the
+crates first, where no code of a crate runs, and the build scripts and procedural macros that run
+during the build then cannot fetch code or send anything out. `scripts/release-env.sh` drops every
+variable of the caller that is not needed, since cargo would take compiler flags and wrappers from
+them. The archives are packed by `tools/pack` (`scripts/release-pack.sh`), not by the archive tools of the host, with
 sorted entries, the time of the commit, owner 0 and permissions from the executable bit only, so an
 archive too can be built again byte for byte. `tools/pack` writes the ustar and zip containers
 itself and takes only the deflate of `flate2` and the CRC of `crc32fast`, crates that the imported
@@ -1294,7 +1298,10 @@ one built again, byte for byte.
 An archive that the workflow built gets a GitHub build provenance attestation, which names the
 workflow, the commit and the run that produced it. The job verifies the attestations before it
 creates the draft, so such a release never carries an archive that cannot be checked. A user
-checks a download with `gh attestation verify <archive> --repo <owner>/<repo>`.
+checks a download with `gh attestation verify`, naming the workflow, the tag and the commit
+(README.md, "Verifying a download"): `--repo` alone accepts an attestation from any workflow,
+branch or commit of the repository. The workflow creates the draft only after the audit gates
+have passed and a reviewer of the `release` environment has approved.
 
 `SHA256SUMS` says that the archives belong together; `SHA256SUMS.asc`, the signature of it by the
 maintainer who publishes the releases, says who published them. That matters most for archives built

@@ -1,0 +1,19 @@
+# Dependabot opens no version updates here (open-pull-requests-limit: 0): a new version of an
+# action or a crate is taken by hand, after review (README.md, "When a dependency changes"). This
+# file only tells Dependabot's security updates, which the repository settings turn on, where the
+# manifests are, so that an advisory against a pinned action or a locked crate of either workspace
+# gets a pull request. That pull request gets the review of any other change.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+  - package-ecosystem: cargo
+    directories:
+      - /
+      - /tools/pack
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0

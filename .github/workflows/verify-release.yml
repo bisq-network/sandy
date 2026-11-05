@@ -35,9 +35,21 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
+          # The release and its SHA256SUMS hold the six archives and nothing else, besides the
+          # signature: an extra archive would be signed as well.
+          version=${TAG#v}
+          archives=$(for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+            x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+            [[ "$target" == *windows* ]] && echo "sandy-$version-$target.zip" || echo "sandy-$version-$target.tar.gz"
+          done | LC_ALL=C sort)
+          assets=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' |
+            grep -vx -e SHA256SUMS -e SHA256SUMS.asc | LC_ALL=C sort)
+          [[ "$assets" == "$archives" ]] || { echo "the release holds other assets than the six archives:"; echo "$assets"; exit 1; }
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release \
             --pattern 'sandy-*' --pattern SHA256SUMS
           cd release
+          [[ "$(awk '{ print $2 }' SHA256SUMS | LC_ALL=C sort)" == "$archives" ]] ||
+            { echo "SHA256SUMS lists other files than the six archives"; exit 1; }
           sha256sum --check --strict SHA256SUMS
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -72,6 +84,8 @@ jobs:
         with:
           ref: refs/tags/${{ inputs.tag }}
           persist-credentials: false
+      # rustup from the pinned rustup-init, not the runner image's (scripts/install-rustup.sh).
+      - uses: ./.github/actions/rustup
       # As in release.yml.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         if: matrix.sdk
@@ -82,14 +96,17 @@ jobs:
         if: matrix.sdk
         shell: bash
         run: scripts/windows-sdk.sh unpack ${{ matrix.sdk }} "$RUNNER_TEMP/windows-sdk-${{ matrix.sdk }}.tar.gz"
+      - name: Fetch what the build needs
+        shell: bash
+        run: scripts/release-fetch.sh
       - name: Build
         shell: bash
-        run: scripts/release-build.sh ${{ matrix.target }}
+        run: scripts/without-network.sh scripts/release-build.sh ${{ matrix.target }}
       - name: Pack
         shell: bash
         run: |
           set -euo pipefail
-          archive=$(scripts/release-pack.sh ${{ matrix.target }})
+          archive=$(scripts/without-network.sh scripts/release-pack.sh ${{ matrix.target }})
           mkdir rebuilt
           cp "$archive" target/${{ matrix.target }}/release/sandy${{ contains(matrix.target, 'windows') && '.exe' || '' }} rebuilt/
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

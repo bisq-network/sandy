@@ -9,7 +9,9 @@
 # Rust toolchain of rust-toolchain.toml, the host triple that runs it (README.md, "Building a
 # release binary again"), and on Windows on the Microsoft libraries that link/windows-sdk.sha256
 # pins. It does not depend on the directory of the checkout, the location of CARGO_HOME, the time
-# of the build or the linker or SDK of the host.
+# of the build or the linker or SDK of the host, nor on the environment of the caller, which
+# scripts/release-env.sh drops. After scripts/release-fetch.sh it runs without network, and the
+# release workflows run it so (scripts/without-network.sh).
 #
 # A Windows target needs those libraries in target/windows-sdk/ARCH first
 # (scripts/windows-sdk.sh fetch or unpack), fetched apart from the build, since the tool that
@@ -19,6 +21,8 @@
 set -eu
 
 target=${1:?usage: scripts/release-build.sh TARGET}
+. "$(dirname "$0")/release-env.sh"
+release_env "$0" "$target"
 cd "$(dirname "$0")/.."
 
 scripts/verify-toolchain.sh

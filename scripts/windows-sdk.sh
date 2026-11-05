@@ -25,7 +25,9 @@
 # part of this repository.
 #
 # Pinning another version: change the manifest or the versions below, run fetch, and put the sums
-# it reports into link/windows-sdk.sha256.
+# it reports into link/windows-sdk.sha256. The manifest carries Microsoft's Authenticode signature;
+# check it once before pinning (osslsigncode verify, or the Visual Studio installer on Windows), since
+# the pin otherwise rests on TLS at the time it was taken.
 set -eu
 
 cd "$(dirname "$0")/.."
