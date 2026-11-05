@@ -8,6 +8,19 @@
 # Built by scripts/reproduce.sh, with a context of this file, rust-toolchain.toml and
 # rustup-init.sha256.
 
+# The Debian image is the root of trust of the packages below: apt checks them with the archive keys
+# it ships. The digest is that of Docker's official debian:trixie-slim (also trixie-20261027-slim,
+# Debian 13.7) as docker-library/official-images published it in commit e38ddc6 (2026-10-27,
+# "Update Debian (#22609)"). That entry builds amd64 from debuerreotype/docker-debian-artifacts,
+# branch dist-amd64, commit 69faaf492e77aff83e4c7fc401017c9d25ecde24 (directory trixie/slim):
+# debuerreotype 0.17 at epoch 1793059200 (2026-10-27T00:00:00Z) from snapshot 20261027T000000Z
+# of the Debian archive, with the rootfs.tar.xz sum
+# e04cf20756205d50b3f392b0208612ddc2a73af00edcf3b02cdfefa608a36500. The OCI index of that commit
+# names the amd64 manifest sha256:1e1a22175fbf1b32157ddaf0219e1db4e5401fab2b94ed285add64d18587cd2d,
+# which is the one in the digest below (docker buildx imagetools inspect shows it, with the commit
+# as org.opencontainers.image.revision). debuerreotype can build that rootfs again from the
+# snapshot and the epoch, which checks the image without trusting Docker Hub. Moving the pin: take
+# the digest that a new official-images commit publishes, and record the same chain for it here.
 FROM --platform=linux/amd64 debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
 
 # The packages as the Debian archive held them at this time. apt checks them against the archive
