@@ -1276,7 +1276,9 @@ only on the source, the toolchain and, for Windows, those libraries, and can be 
 of the release's triple. The macOS declarations are a list of symbol names that sandy uses,
 checked against Apple's SDK on a Mac in CI, so no Apple file is part of the build; the Windows
 libraries are Microsoft's, fetched by `scripts/windows-sdk.sh` from Microsoft's servers at each
-build and checked file by file, so none of them is part of the repository either. The archives are
+build and checked file by file, so none of them is part of the repository either. The tool that
+fetches them, xwin, is not reviewed, so it runs in a CI job or container of its own whose only
+output is the libraries, and the build checks them against the pinned sums without running it. The archives are
 packed by `tools/pack` (`scripts/release-pack.sh`), not by the archive tools of the host, with
 sorted entries, the time of the commit, owner 0 and permissions from the executable bit only, so an
 archive too can be built again byte for byte. `tools/pack` writes the ustar and zip containers

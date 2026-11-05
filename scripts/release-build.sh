@@ -9,8 +9,13 @@
 # Rust toolchain of rust-toolchain.toml, the host triple that runs it (README.md, "Building a
 # release binary again"), and on Windows on the Microsoft libraries that link/windows-sdk.sha256
 # pins. It does not depend on the directory of the checkout, the location of CARGO_HOME, the time
-# of the build or the linker or SDK of the host. A Windows target needs xwin and
-# XWIN_ACCEPT_LICENSE=true (scripts/windows-sdk.sh).
+# of the build or the linker or SDK of the host.
+#
+# A Windows target needs those libraries in target/windows-sdk/ARCH first
+# (scripts/windows-sdk.sh fetch or unpack), fetched apart from the build, since the tool that
+# fetches them is not reviewed. This script only checks them. WINDOWS_SDK_FETCH=true, with
+# XWIN_ACCEPT_LICENSE=true, makes it fetch them itself, on this machine, for a local build; CI
+# refuses it, so that a broken handoff of the libraries fails instead of fetching in the build.
 set -eu
 
 target=${1:?usage: scripts/release-build.sh TARGET}
@@ -67,14 +72,24 @@ case "$target" in
     ;;
   *-windows-msvc)
     # rust-lld as lld-link instead of the Microsoft linker, against the C runtime and Windows SDK
-    # libraries that scripts/windows-sdk.sh fetches and checks against link/windows-sdk.sha256,
+    # libraries that scripts/windows-sdk.sh checks against link/windows-sdk.sha256,
     # instead of those of a Visual Studio installation. The C runtime linked in, so that
     # sandy.exe needs no Visual C++ redistributable, and no time stamp of the link in the image
     # (/Brepro). No PDB either (/DEBUG:NONE): none is shipped, and lld-link derives the time stamp
     # and the PDB GUID of the image from the PDB, which names the object files by their path in
     # the checkout.
     arch=${target%%-*}
-    sdk=$(scripts/windows-sdk.sh "$arch")
+    if [ "${WINDOWS_SDK_FETCH:-}" = true ]; then
+      if [ "${CI:-}" = true ]; then
+        echo "release-build: WINDOWS_SDK_FETCH=true is for local builds; CI fetches the libraries in a job of its own" >&2
+        exit 1
+      fi
+      scripts/windows-sdk.sh fetch "$arch" > /dev/null
+      # The fetch ran unreviewed code here, which could have changed the toolchain since the
+      # check above. This catches a changed manifest or rustc, not every change.
+      scripts/verify-toolchain.sh
+    fi
+    sdk=$(scripts/windows-sdk.sh check "$arch")
     flags="$flags -C linker=rust-lld -C linker-flavor=lld-link"
     flags="$flags -C target-feature=+crt-static -C link-arg=/Brepro -C link-arg=/DEBUG:NONE"
     flags="$flags -L native=$sdk/crt/lib/$arch -L native=$sdk/sdk/lib/um/$arch -L native=$sdk/sdk/lib/ucrt/$arch"

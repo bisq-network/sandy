@@ -149,10 +149,10 @@ archive is built on, emulated by Docker on other hosts. Its inputs are pinned: t
 digest, its packages by a dated snapshot of the Debian archive, rustup by its SHA-256 sum, the
 toolchain by `rust-toolchain.toml`. `XWIN_ACCEPT_LICENSE=true` accepts the license of the Visual
 Studio Build Tools, whose libraries the Windows archives are linked against (see below). The source
-goes into the container and the archives come out as tar streams, without a shared directory, so
-the file system of the host does not matter. Archives built on x86_64 Linux and on an Apple silicon
-Mac, under emulation, are identical to those of the release workflow. A tag can be checked this way
-from the first release that has these scripts.
+goes into the container and the archives come out as tar streams, without a directory shared with
+the host, so the file system of the host does not matter. Archives built on x86_64 Linux and on an
+Apple silicon Mac, under emulation, are identical to those of the release workflow. A tag can be
+checked this way from the first release that has these scripts.
 
 Without Docker, on an x86_64 Linux host with rustup, each archive can be built the same way the
 container does it: every release binary is built with `scripts/release-build.sh TARGET` from a
@@ -187,11 +187,28 @@ nothing else, and the CI checks each one against Apple's SDK on a Mac
 fails to link; add the symbol for its architectures. The binaries record SDK 27.0, the version the
 declarations follow, as the SDK they were built against, which decides some behaviour of the system
 libraries. The Windows binaries are linked against the static C runtime of MSVC and the import
-libraries of the Windows SDK, which `scripts/windows-sdk.sh` fetches with xwin from Microsoft's
-package manifest of Visual Studio 18.11.3 (MSVC 14.51, SDK 10.0.26100): it checks the manifest and
-every library file against `link/windows-sdk.sha256`. The libraries come under the license of the
-Visual Studio Build Tools, so the script runs only with `XWIN_ACCEPT_LICENSE=true`, and builds them
-on Linux only. The script refuses a toolchain that rustup did not install from the pinned
+libraries of the Windows SDK, which `scripts/windows-sdk.sh fetch ARCH` fetches with xwin from
+Microsoft's package manifest of Visual Studio 18.11.3 (MSVC 14.51, SDK 10.0.26100) into
+`target/windows-sdk/ARCH`: it checks the manifest and every library file against
+`link/windows-sdk.sha256`. The libraries come under the license of the Visual Studio Build Tools,
+so fetching them needs `XWIN_ACCEPT_LICENSE=true`, and works on Linux only. xwin and its
+dependencies are not reviewed, so the release build never runs it: `scripts/release-build.sh`
+only checks the libraries against `link/windows-sdk.sha256` (`scripts/windows-sdk.sh check`), and
+the libraries are fetched apart from the build, by a job of their own in CI
+(`.github/workflows/windows-sdk.yml`) and in a container of their own by `scripts/reproduce.sh`,
+whose only output is the library files. To build a Windows target without Docker, fetch the
+libraries first with `XWIN_ACCEPT_LICENSE=true scripts/windows-sdk.sh fetch x86_64` (or
+`aarch64`), best somewhere other than the build, and bring a tar of `crt/lib` and `sdk/lib` from
+there with `scripts/windows-sdk.sh unpack ARCH ARCHIVE`. Or let the build fetch them on the same
+machine, without that isolation:
+
+```sh
+WINDOWS_SDK_FETCH=true XWIN_ACCEPT_LICENSE=true scripts/release-build.sh x86_64-pc-windows-msvc
+```
+
+The build then checks the toolchain again after the fetch. CI refuses `WINDOWS_SDK_FETCH=true`, so
+that a broken handoff of the libraries fails instead of quietly fetching them in the build.
+`scripts/release-build.sh` refuses a toolchain that rustup did not install from the pinned
 archives (see "The supply chain checks" below). The `reproducible` job of the release workflow
 builds and packs every target twice, in two directories, and compares the binaries and the
 archives, and compares the archive with the one the build job packed on another runner. The

@@ -55,11 +55,38 @@ rm -f "$out"/sandy-*.tar.gz "$out"/sandy-*.zip "$out/SHA256SUMS"
 # (scripts/windows-sdk.sh needs that) also where the host's file system does not, as on macOS. The
 # targets are those of the release workflow; HOME and CARGO_HOME are the container's, and the
 # release build keeps their paths out of the binaries.
+#
+# The Windows libraries are fetched by xwin, whose code is not reviewed, so it runs in a container
+# of its own, which ends before the build starts and leaves only the libraries, in a volume. The
+# build mounts the volume read-only and checks every file against link/windows-sdk.sha256. A
+# commit from before this split fetches them in the build container, with xwin.
+if git show "$commit:scripts/windows-sdk.sh" | grep -q 'windows-sdk.sh fetch'; then
+  volume=$(docker volume create)
+  trap 'docker volume rm -f "$volume" > /dev/null' EXIT
+  git archive "$commit" |
+    docker run -i --rm --platform linux/amd64 --user 65534:65534 \
+      -e HOME=/tmp -e CARGO_HOME=/tmp/cargo -e XWIN_ACCEPT_LICENSE=true \
+      -v "$volume:/windows-sdk" "$image" sh -euc '
+        mkdir /tmp/sandy && tar -x -C /tmp/sandy && cd /tmp/sandy
+        for arch in x86_64 aarch64; do
+          sdk=$(scripts/windows-sdk.sh fetch "$arch")
+          mkdir "/windows-sdk/$arch"
+          tar -c -C "$sdk" crt/lib sdk/lib | tar -x -C "/windows-sdk/$arch"
+        done
+      ' >&2
+  set -- -v "$volume:/windows-sdk:ro"
+else
+  set -- -e XWIN_ACCEPT_LICENSE=true
+fi
 git archive "$commit" |
   docker run -i --rm --platform linux/amd64 --user 65534:65534 \
-    -e HOME=/tmp -e CARGO_HOME=/tmp/cargo -e SOURCE_DATE_EPOCH="$epoch" -e XWIN_ACCEPT_LICENSE=true \
+    -e HOME=/tmp -e CARGO_HOME=/tmp/cargo -e SOURCE_DATE_EPOCH="$epoch" "$@" \
     "$image" sh -euc '
       mkdir /tmp/sandy && tar -x -C /tmp/sandy && cd /tmp/sandy
+      if [ -d /windows-sdk/x86_64 ]; then
+        mkdir -p target/windows-sdk
+        ln -s /windows-sdk/x86_64 /windows-sdk/aarch64 target/windows-sdk/
+      fi
       for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
         x86_64-apple-darwin aarch64-apple-darwin \
         x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do

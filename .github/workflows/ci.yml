@@ -121,11 +121,18 @@ jobs:
             echo "== $f"; head -c 6000 "$f"; echo
           done | tail -n 400
 
+  windows-sdk:
+    # As in release.yml: xwin runs on a runner of its own, never where sandy is built.
+    uses: ./.github/workflows/windows-sdk.yml
+    with:
+      arches: '["x86_64"]'
+
   windows-release-build:
     # The release links sandy.exe on Linux, with rust-lld as lld-link against the Microsoft
     # libraries that link/windows-sdk.sha256 pins (scripts/windows-sdk.sh). This builds it that way
     # for windows-release-test, which runs the suite against it, as the macOS entry of the test
     # job does with the macOS link.
+    needs: windows-sdk
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -133,10 +140,13 @@ jobs:
           persist-credentials: false
       - name: Verify the toolchain
         run: scripts/verify-toolchain.sh
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-sdk-x86_64
+          path: ${{ runner.temp }}
+      - name: Unpack the Windows libraries
+        run: scripts/windows-sdk.sh unpack x86_64 "$RUNNER_TEMP/windows-sdk-x86_64.tar.gz"
       - name: Build sandy.exe as the release does
-        env:
-          # Microsoft's libraries come under the license of the Visual Studio Build Tools.
-          XWIN_ACCEPT_LICENSE: true
         run: scripts/release-build.sh x86_64-pc-windows-msvc
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

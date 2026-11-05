@@ -2,7 +2,8 @@
 # binary is built on, with the Rust toolchain of rust-toolchain.toml. Every input is pinned: the
 # Debian image by digest, its packages by a dated snapshot of the Debian archive, rustup-init by
 # its SHA-256 sum. scripts/release-build.sh checks the toolchain against rust-toolchain.sha256
-# before every build, and fetches and checks the Windows libraries itself.
+# before every build and checks the Windows libraries, which another container fetches into
+# /windows-sdk (scripts/reproduce.sh).
 #
 # Built by scripts/reproduce.sh, with a context of this file and rust-toolchain.toml.
 
@@ -45,3 +46,7 @@ RUN curl -fsS --proto '=https' --tlsv1.2 -o /tmp/rustup-init \
  && rm /tmp/rustup-init \
  && cd /usr/local/share/sandy && rustup toolchain install \
  && chmod -R a+rX "$RUSTUP_HOME" "$CARGO_HOME"
+
+# The mount point of the volume that scripts/reproduce.sh passes the Windows libraries in. A new
+# volume takes the owner of the directory it is mounted on, and the containers run as 65534.
+RUN install -d -o 65534 -g 65534 /windows-sdk
