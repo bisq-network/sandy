@@ -174,8 +174,9 @@ XWIN_ACCEPT_LICENSE=true scripts/reproduce.sh v1.0.0 ~/sandy-v1.0.0
 
 The container (`scripts/reproduce.Dockerfile`) is an x86_64 Linux host, the triple every release
 archive is built on, emulated by Docker on other hosts. Its inputs are pinned: the Debian image by
-digest, its packages by a dated snapshot of the Debian archive and the sums of the snapshot's
-signed indexes, rustup by the sum in `rustup-init.sha256`, the toolchain by `rust-toolchain.toml`.
+digest (the Dockerfile records which official-images and debuerreotype commits it comes from), its
+packages by a dated snapshot of the Debian archive and the sums of the snapshot's signed indexes,
+rustup by the sum in `rustup-init.sha256`, the toolchain by `rust-toolchain.toml`.
 `XWIN_ACCEPT_LICENSE=true` accepts the license of the Visual Studio Build Tools, whose libraries
 the Windows archives are linked against (see below). The source goes into the containers and the
 archives come out as tar streams, without a directory shared with the host, so the file system of

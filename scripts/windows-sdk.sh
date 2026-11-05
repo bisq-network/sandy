@@ -25,9 +25,26 @@
 # part of this repository.
 #
 # Pinning another version: change the manifest or the versions below, run fetch, and put the sums
-# it reports into link/windows-sdk.sha256. The manifest carries Microsoft's Authenticode signature;
-# check it once before pinning (osslsigncode verify, or the Visual Studio installer on Windows), since
-# the pin otherwise rests on TLS at the time it was taken.
+# it reports into link/windows-sdk.sha256. Check Microsoft's signature of the manifest first, or the
+# pin rests only on TLS at the time it was taken. The signature is embedded in the manifest's JSON,
+# in a format that Microsoft does not document, so only the Visual Studio Installer checks it. On
+# Windows, run the Build Tools bootstrapper of the channel that names the manifest (Authenticode
+# signed by Microsoft) to make an offline layout:
+#
+#   vs_buildtools.exe --layout DIR --lang en-US ^
+#     --add Microsoft.VisualStudio.Workload.MSBuildTools --quiet --wait
+#
+# Its log in %TEMP% (dd_setup_*.log) must report "ManifestVerifier Result: Success" before it loads
+# the catalog of that version, and DIR\Catalog.json, the manifest it verified, must have the sum
+# that link/windows-sdk.sha256 pins for VisualStudio.vsman.
+#
+# The current pin was checked so on 2026-11-05: the bootstrapper of the stable channel of Visual
+# Studio 18 (which names this manifest for 18.11.3), setup engine 4.11.24, reported
+# "ManifestVerifier Result: Success", loaded the catalog VisualStudio/18.11.3+12328.437, and wrote
+# a Catalog.json with the pinned sum
+# 417b8d3fee577bdb0e192835692446de51b4626526e4b555162fd9c2fca7dff1. The certificate in the
+# manifest's signature is Microsoft Corporation's code signing certificate, issued by Microsoft
+# Code Signing PCA 2024 under Microsoft Root Certificate Authority 2011.
 set -eu
 
 cd "$(dirname "$0")/.."
