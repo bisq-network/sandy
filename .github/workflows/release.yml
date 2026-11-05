@@ -13,6 +13,11 @@ permissions:
   contents: read
 
 jobs:
+  audit:
+    # The dependency gates of audit.yml, so that a draft release exists only for a commit whose
+    # crates pass cargo-deny and cargo-vet.
+    uses: ./.github/workflows/audit.yml
+
   windows-sdk:
     # On a runner of its own, so that xwin never runs where sandy is built
     # (.github/workflows/windows-sdk.yml).
@@ -50,6 +55,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # rustup from the pinned rustup-init, not the runner image's (scripts/install-rustup.sh).
+      - uses: ./.github/actions/rustup
       - name: Check that the tag matches the crate version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -67,11 +74,17 @@ jobs:
         if: matrix.sdk
         shell: bash
         run: scripts/windows-sdk.sh unpack ${{ matrix.sdk }} "$RUNNER_TEMP/windows-sdk-${{ matrix.sdk }}.tar.gz"
+      # The toolchain and the crates, with network; the build and the packing below run without,
+      # so no build script or procedural macro can fetch code or send anything out
+      # (scripts/release-fetch.sh, scripts/without-network.sh).
+      - name: Fetch what the build needs
+        shell: bash
+        run: scripts/release-fetch.sh
       # The same script builds every release binary outside CI too (README.md, "Verifying a
       # download"), so a binary can be built again and compared.
       - name: Build
         shell: bash
-        run: scripts/release-build.sh ${{ matrix.target }}
+        run: scripts/without-network.sh scripts/release-build.sh ${{ matrix.target }}
       # Skipped: this project has no Apple Developer ID, so the macOS binaries carry only the
       # linker's ad-hoc signature. To sign and notarize them, join the Apple Developer Program,
       # export the "Developer ID Application" certificate as a PKCS#12 file, and add six
@@ -155,7 +168,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          archive=$(scripts/release-pack.sh ${{ matrix.target }})
+          archive=$(scripts/without-network.sh scripts/release-pack.sh ${{ matrix.target }})
           ls -l "$archive"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -208,6 +221,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # rustup from the pinned rustup-init, not the runner image's (scripts/install-rustup.sh).
+      - uses: ./.github/actions/rustup
       - name: Verify the toolchain
         shell: bash
         run: scripts/verify-toolchain.sh
@@ -260,6 +275,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # rustup from the pinned rustup-init, not the runner image's (scripts/install-rustup.sh).
+      - uses: ./.github/actions/rustup
       - name: Verify the toolchain
         shell: bash
         run: scripts/verify-toolchain.sh
@@ -318,6 +335,8 @@ jobs:
         with:
           path: first
           persist-credentials: false
+      # rustup from the pinned rustup-init, not the runner image's (scripts/install-rustup.sh).
+      - uses: ./first/.github/actions/rustup
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: sandy-${{ matrix.target }}
@@ -332,6 +351,10 @@ jobs:
         if: matrix.sdk
         shell: bash
         run: first/scripts/windows-sdk.sh unpack ${{ matrix.sdk }} "$RUNNER_TEMP/windows-sdk-${{ matrix.sdk }}.tar.gz"
+      # As in the build job.
+      - name: Fetch what the build needs
+        shell: bash
+        run: first/scripts/release-fetch.sh
       - name: Build twice and compare
         shell: bash
         run: |
@@ -340,14 +363,14 @@ jobs:
           exe=sandy; [[ "$target" == *windows* ]] && exe=sandy.exe
           cp -a first second
           for dir in first second; do
-            "$dir/scripts/release-build.sh" "$target"
+            first/scripts/without-network.sh "$dir/scripts/release-build.sh" "$target"
           done
           sum=sha256sum; command -v sha256sum > /dev/null || sum="shasum -a 256"
           $sum first/target/"$target"/release/$exe second/target/"$target"/release/$exe
           cmp first/target/"$target"/release/$exe second/target/"$target"/release/$exe \
             || { echo "the binary depends on the directory it was built in"; exit 1; }
           for dir in first second; do
-            "$dir/scripts/release-pack.sh" "$target" > /dev/null
+            first/scripts/without-network.sh "$dir/scripts/release-pack.sh" "$target" > /dev/null
           done
           archive=$(cd first/dist && ls)
           $sum first/dist/"$archive" second/dist/"$archive" built/"$archive"
@@ -357,14 +380,23 @@ jobs:
             || { echo "the archive differs from the one the build job packed on another runner"; exit 1; }
 
   release:
-    needs: [build, start, test-macos, test-windows]
+    needs: [audit, build, start, test-macos, test-windows]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
+    # A required reviewer of this environment, set in the repository settings, has to approve the
+    # job before it attests anything or creates the draft.
+    environment: release
     permissions:
       contents: write
       # For the build provenance attestation below.
       id-token: write
       attestations: write
+    env:
+      # The targets of the build job.
+      TARGETS: >-
+        x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+        x86_64-apple-darwin aarch64-apple-darwin
+        x86_64-pc-windows-msvc aarch64-pc-windows-msvc
     steps:
       # The archives only, not the Windows libraries of the windows-sdk job.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -372,6 +404,18 @@ jobs:
           path: dist
           pattern: sandy-*
           merge-multiple: true
+      # Exactly the six archives of this version and nothing else: any job of the run could upload
+      # an artifact, and whatever lies here is summed, attested and released.
+      - name: Check the set of archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          expected=$(for target in $TARGETS; do
+            [[ "$target" == *windows* ]] && echo "sandy-$version-$target.zip" || echo "sandy-$version-$target.tar.gz"
+          done | LC_ALL=C sort)
+          actual=$(cd dist && find . -mindepth 1 | sed 's|^\./||' | LC_ALL=C sort)
+          [[ "$actual" == "$expected" ]] || { echo "dist holds other files than the six archives:"; echo "$actual"; exit 1; }
       - name: Sum the archives
         shell: bash
         run: |
@@ -385,13 +429,21 @@ jobs:
           subject-path: |
             dist/*.tar.gz
             dist/*.zip
+      # The strict form that README.md documents: this workflow, this tag, this commit, a runner of
+      # GitHub. gh before 2.102.0 matched --signer-workflow by prefix and --source-ref ignoring
+      # case.
       - name: Verify the attestations before anything is published
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          version=$(gh --version | sed -n '1s/^gh version \([0-9.]*\).*/\1/p')
+          [ "$(printf '%s\n' 2.102.0 "$version" | sort -V | head -n 1)" = 2.102.0 ] ||
+            { echo "gh $version is older than 2.102.0"; exit 1; }
           for archive in dist/*.tar.gz dist/*.zip; do
-            gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
+            gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "$GITHUB_REF" --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
           done
       - name: Create a draft release
         env:
@@ -400,5 +452,5 @@ jobs:
           cd dist
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
             --title "sandy $GITHUB_REF_NAME" \
-            --notes "Draft. Every archive carries a build provenance attestation: check one with \`gh attestation verify <archive> --repo $GITHUB_REPOSITORY\`. Verify the archives against SHA256SUMS, then sign SHA256SUMS with the project key and upload the signature as an asset before publishing; a published release takes no further assets. The aarch64 Windows build is cross-compiled and not tested at run time." \
+            --notes "Draft of commit $GITHUB_SHA. Every archive carries a build provenance attestation: check one with \`gh attestation verify <archive> --repo $GITHUB_REPOSITORY --signer-workflow $GITHUB_REPOSITORY/.github/workflows/release.yml --source-ref $GITHUB_REF --source-digest $GITHUB_SHA --deny-self-hosted-runners\` (gh 2.102.0 or later). Verify the archives against SHA256SUMS, then sign SHA256SUMS with the project key and upload the signature as an asset before publishing; a published release takes no further assets. The aarch64 Windows build is cross-compiled and not tested at run time." \
             ./*.tar.gz ./*.zip SHA256SUMS

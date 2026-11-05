@@ -64,17 +64,22 @@ program only when every requirement is enforced.
 
 ## Install
 
-There are no published packages yet. Build sandy from source:
+There are no published packages yet. Build sandy from source, from a release tag, with the
+toolchain check and the crates of `Cargo.lock`:
 
 ```sh
-git clone <repository> sandy
+git clone https://github.com/bisq-network/sandy.git sandy
 cd sandy
-cargo build --release -p sandy-cli --bin sandy
+git checkout v1.0.0
+scripts/verify-toolchain.sh          # installs and checks the pinned Rust toolchain
+cargo build --locked --release -p sandy-cli --bin sandy
 ```
 
 The binary is `target/release/sandy` (`sandy.exe` on Windows). It has no runtime dependencies
-besides the operating system. The pinned Rust toolchain in `rust-toolchain.toml` installs itself
-through rustup.
+besides the operating system. `scripts/verify-toolchain.sh` installs the Rust toolchain that
+`rust-toolchain.toml` pins through rustup and checks it before it runs (see "The supply chain
+checks"); `--locked` builds the crate versions of `Cargo.lock` and no others. On Windows, run the
+script in Git Bash.
 
 The rest of this README runs it as `sandy`. Install it into a directory on your `PATH` that lies
 outside every writable path of your policies (see "Where to install sandy" below), for example
@@ -106,18 +111,41 @@ targets:
 - `aarch64-pc-windows-msvc` (static C runtime)
 
 **Verifying a download.** `SHA256SUMS` in the release lists the SHA-256 sum of every archive,
-and `SHA256SUMS.asc` signs it with the OpenPGP key of the maintainer who publishes the release,
-which the release names:
+and `SHA256SUMS.asc` signs it with the release key (see "Release keys" below). `gpg --verify`
+alone reports a good signature for any key in your keyring, so check that the signature is good
+and made by that key:
 
 ```sh
-gpg --verify SHA256SUMS.asc SHA256SUMS
+gpg --keyserver hkps://keys.openpgp.org --recv-keys B493319106CC3D1F252E19CBF806F422E222AA02
+gpg --status-fd 1 --verify SHA256SUMS.asc SHA256SUMS 2> /dev/null | grep -E 'GOODSIG|VALIDSIG'
 sha256sum --check --ignore-missing SHA256SUMS
 ```
 
+The output must hold a `GOODSIG` line (not `EXPKEYSIG` or `REVKEYSIG`) and a `VALIDSIG` line
+that ends with `B493319106CC3D1F252E19CBF806F422E222AA02`. `scripts/check-release.sh` (below)
+makes these checks itself.
+
 An archive that the release workflow built also carries a GitHub build provenance attestation,
-which names the workflow, the commit and the run that built it
-(`gh attestation verify sandy-1.0.0-x86_64-unknown-linux-musl.tar.gz --repo bisq-network/sandy`).
-An archive built outside the workflow has none.
+which names the workflow, the tag and the commit that built it. `--repo` alone accepts an
+attestation from any workflow, branch or commit of the repository, so name all three, with the
+commit of the release, which its notes give, and gh 2.102.0 or later, which matches them exactly:
+
+```sh
+gh attestation verify sandy-1.0.0-x86_64-unknown-linux-musl.tar.gz --repo bisq-network/sandy \
+  --signer-workflow bisq-network/sandy/.github/workflows/release.yml \
+  --source-ref refs/tags/v1.0.0 --source-digest e755aeb1a5dd0ffe9a83845128bfb1a0b8bcd3e8 \
+  --deny-self-hosted-runners
+```
+
+The attestation says where and from what an archive was built, not that its source is good, so it
+does not replace the signature. An archive built outside the workflow has none.
+
+**Release key.** `SHA256SUMS` of a release is signed by
+`B493 3191 06CC 3D1F 252E  19CB F806 F422 E222 AA02` (alejandrogarcia83), after rebuilding every
+archive of the release independently. That signature is what vouches for a release; who pushed
+its tag does not matter. `scripts/check-release.sh` pins this fingerprint and fetches the key from
+GitHub and keys.openpgp.org. A change of the key is a pull request that changes the fingerprint
+in `scripts/check-release.sh` and here together.
 
 **Building a release binary again.** The simplest check needs git, curl, gpg and Docker, on
 Linux or macOS, and one command in a clone of this repository:
@@ -146,24 +174,38 @@ XWIN_ACCEPT_LICENSE=true scripts/reproduce.sh v1.0.0 ~/sandy-v1.0.0
 
 The container (`scripts/reproduce.Dockerfile`) is an x86_64 Linux host, the triple every release
 archive is built on, emulated by Docker on other hosts. Its inputs are pinned: the Debian image by
-digest, its packages by a dated snapshot of the Debian archive, rustup by its SHA-256 sum, the
-toolchain by `rust-toolchain.toml`. `XWIN_ACCEPT_LICENSE=true` accepts the license of the Visual
-Studio Build Tools, whose libraries the Windows archives are linked against (see below). The source
-goes into the container and the archives come out as tar streams, without a directory shared with
-the host, so the file system of the host does not matter. Archives built on x86_64 Linux and on an
-Apple silicon Mac, under emulation, are identical to those of the release workflow. A tag can be
-checked this way from the first release that has these scripts.
+digest, its packages by a dated snapshot of the Debian archive and the sums of the snapshot's
+signed indexes, rustup by the sum in `rustup-init.sha256`, the toolchain by `rust-toolchain.toml`.
+`XWIN_ACCEPT_LICENSE=true` accepts the license of the Visual Studio Build Tools, whose libraries
+the Windows archives are linked against (see below). The source goes into the containers and the
+archives come out as tar streams, without a directory shared with the host, so the file system of
+the host does not matter. What a build needs is fetched first, in containers of its own: the Windows
+libraries by xwin, the crates and the toolchain manifest by `scripts/release-fetch.sh`. The six
+targets are then built in one container without network, which mounts what was fetched read-only,
+and which cannot write the toolchain of the image. So no build script or procedural macro can fetch
+code or send anything out. A local tag
+given as `TAG` is compared with the tag of that name on the remote of bisq-network/sandy, and a
+different one fails. `SANDY_REPRODUCE_NO_CACHE=true` builds the image without Docker's cache,
+as `scripts/check-release.sh` does. Archives built on x86_64 Linux and on an Apple silicon Mac,
+under emulation, are identical to those of the release workflow. A tag can be checked this way
+from the first release that has these scripts.
 
 Without Docker, on an x86_64 Linux host with rustup, each archive can be built the same way the
 container does it: every release binary is built with `scripts/release-build.sh TARGET` from a
-checkout of the release tag and packed with `scripts/release-pack.sh TARGET`:
+checkout of the release tag and packed with `scripts/release-pack.sh TARGET`. Fetch the tag from
+the project's remote first, since a clone can hold a tag of the same name for other code:
 
 ```sh
+git fetch https://github.com/bisq-network/sandy.git tag v1.0.0 --force
 git checkout v1.0.0
 scripts/release-build.sh x86_64-unknown-linux-musl
 scripts/release-pack.sh x86_64-unknown-linux-musl
 sha256sum dist/sandy-1.0.0-x86_64-unknown-linux-musl.tar.gz
 ```
+
+Both scripts run with only the variables a release build may depend on (`scripts/release-env.sh`):
+cargo would otherwise take flags, wrappers and profiles from the environment, and they refuse a
+cargo `config.toml` in `CARGO_HOME` or a parent directory of the checkout for the same reason.
 
 The archive comes from `tools/pack`, a small program of this repository and a workspace of its
 own, not from the tar, gzip or 7-Zip of the host: sorted entries, the time of the commit on every
@@ -1406,9 +1448,16 @@ What goes into a build is pinned in this repository, and the builds check it:
   `crc32fast`, are all covered by imported audits.
 - **The toolchain.** `rust-toolchain.toml` pins the Rust release, and `rust-toolchain.sha256` the
   SHA-256 sum of its channel manifest, which lists the sum of every archive of that release.
-  `scripts/verify-toolchain.sh` downloads the manifest, checks it against the pinned sum, and
-  checks that rustup installed the toolchain in use from archives that the manifest lists. CI
-  runs it before anything is built, and `scripts/release-build.sh` before every release build.
+  `scripts/verify-toolchain.sh` installs the toolchain if it is missing, downloads the manifest,
+  checks it against the pinned sum, and checks that rustup installed the toolchain from archives
+  that the manifest lists, all before the toolchain runs once. CI runs it before anything is
+  built, and `scripts/release-build.sh` before every release build.
+  `scripts/check-toolchain-signature.sh`, which the `audit` workflow runs, checks that the pinned
+  manifest is signed by the Rust release key, `keys/rust-release-key.asc`.
+- **rustup.** CI installs rustup from the `rustup-init` whose sum `rustup-init.sha256` pins
+  (`scripts/install-rustup.sh`), not the rustup of the runner image, and the container of
+  `scripts/reproduce.sh` takes the same pin. rustup publishes no signature, so the pin is the sum
+  as it was when the version was chosen.
 - **The tools of the checks.** `scripts/install-tool.sh` builds a tool such as cargo-deny from
   the crate with the sum that the workflow names, so the crates.io index of the day does not
   decide which code runs.
@@ -1423,9 +1472,15 @@ scripts/install-tool.sh cargo-vet 0.10.2 dd93790018205cbbfa161f078ca4631afa8ed57
 scripts/check-audits.sh
 ```
 
-**When a dependency changes.** Run `cargo vet`: it fetches the audits of the imported
-organizations again and names every crate version that is still not covered. `cargo vet suggest`
-lists the audits that would cover them, with their size. Then record, for each one, an audit you
+**When a dependency changes.** Crates and action pins are updated by hand, after review; Dependabot
+opens pull requests only for security updates (`.github/dependabot.yml`). A new crate version, or
+a new crate, comes in one pull request of its own, with the change of `Cargo.lock` in its
+description, and only once the version has been out for a week, unless it fixes a RustSec
+advisory: most malicious versions are found and yanked within days. Review the change with
+`cargo vet diff` (or `cargo vet inspect` for a new crate), and look first at build scripts,
+procedural macros, `unsafe` code and new dependencies. Then run `cargo vet`: it fetches the audits
+of the imported organizations again and names every crate version that is still not covered.
+`cargo vet suggest` lists the audits that would cover them, with their size. Then record, for each one, an audit you
 did (`cargo vet certify`), a publisher to trust (`cargo vet trust CRATE PUBLISHER --notes ...`,
 only when the imported organizations trust it for that crate), or an exemption with notes in
 `supply-chain/config.toml`. Finish with `cargo vet prune --no-imports` and
@@ -1433,22 +1488,20 @@ only when the imported organizations trust it for that crate), or an exemption w
 entry ends, check that the organizations still trust that publisher and move its `end` date,
 which is at most a year away; the weekly run fails once an entry has ended.
 
-**Pinning a new toolchain.** Change `channel` in `rust-toolchain.toml`. Then download the channel
-manifest of that release with its signature, check the signature with the Rust release key, and
-write the sum of the manifest:
+**Pinning a new toolchain.** Change `channel` in `rust-toolchain.toml`, then let the script
+download the channel manifest of that release with its signature, check the signature with the
+Rust release key and write the sum of the manifest into `rust-toolchain.sha256`:
 
 ```sh
-v=1.98.1
-curl -fsSO https://static.rust-lang.org/dist/channel-rust-$v.toml
-curl -fsSO https://static.rust-lang.org/dist/channel-rust-$v.toml.asc
-gpg --verify channel-rust-$v.toml.asc channel-rust-$v.toml
-sha256sum channel-rust-$v.toml > rust-toolchain.sha256
+scripts/check-toolchain-signature.sh --write
 ```
 
-`gpg` must report a good signature by the primary key
+It accepts only a signature by the key of `keys/rust-release-key.asc`, the primary key
 `108F 6620 5EAE B0AA A8DD  5E1C 85AB 96E6 FA1B E5FE` (Rust Language (Tag and Release Signing Key)
 <rust-key@rust-lang.org>), which `https://static.rust-lang.org/rust-key.gpg.ascii` publishes.
-Write the sum only after that.
+
+**Pinning a new rustup.** Write the sums of the new version's `rustup-init` for the six hosts of
+CI into `rustup-init.sha256`, from the `.sha256` files next to them on static.rust-lang.org.
 
 ### What CI runs
 
@@ -1466,12 +1519,14 @@ runner's list. Every job that builds checks the toolchain first, with
 `scripts/check-audits.sh`, weekly as well, because an advisory can appear, and a trusted
 publisher entry can end, without a push. The `release` workflow builds archives for Linux, macOS
 and Windows on x86_64 and arm64 when a tag `v<version>` is pushed, all of them on x86_64 Linux,
-the runner that `verify-release` uses too, starts the x86_64 Linux binary
+the runner that `verify-release` uses too, and without network after `scripts/release-fetch.sh`
+has fetched what they need (`scripts/without-network.sh`). It starts the x86_64 Linux binary
 (`sandy --version`) and the arm64 Linux binary on an arm64 runner, runs the whole suite against
 the packaged macOS binaries on the macOS 15 and 26 runners and, for x86_64, an Intel Mac, and
 against the packaged Windows binaries on Windows Server 2025 and 2022 and, for arm64, Windows 11
-on arm64, attests their build provenance, verifies the attestations, and creates a draft release
-with `SHA256SUMS`. It also builds every target twice from two directories and compares the
+on arm64, and, once the `audit` workflow has passed for the same commit and a reviewer of the
+`release` environment has approved, checks that it holds exactly the six archives, attests their
+build provenance, verifies the attestations, and creates a draft release with `SHA256SUMS`. It also builds every target twice from two directories and compares the
 binaries. The `verify-release` workflow builds a published release again and compares it with its archives
 (see "Building a release binary again"); `scripts/check-release.sh` does the same check outside
 GitHub, in a container on any machine with Docker.

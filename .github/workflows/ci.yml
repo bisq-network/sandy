@@ -62,6 +62,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # rustup from the pinned rustup-init, not the runner image's (scripts/install-rustup.sh).
+      - uses: ./.github/actions/rustup
       # Before anything is built: the toolchain must be the one rust-toolchain.toml pins,
       # installed from the archives that rust-toolchain.sha256 pins.
       - name: Verify the toolchain
@@ -138,16 +140,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Verify the toolchain
-        run: scripts/verify-toolchain.sh
+      # rustup from the pinned rustup-init, not the runner image's (scripts/install-rustup.sh).
+      - uses: ./.github/actions/rustup
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: windows-sdk-x86_64
           path: ${{ runner.temp }}
       - name: Unpack the Windows libraries
         run: scripts/windows-sdk.sh unpack x86_64 "$RUNNER_TEMP/windows-sdk-x86_64.tar.gz"
+      # As the release does: fetch with network, build without.
+      - name: Fetch what the build needs
+        run: scripts/release-fetch.sh
       - name: Build sandy.exe as the release does
-        run: scripts/release-build.sh x86_64-pc-windows-msvc
+        run: scripts/without-network.sh scripts/release-build.sh x86_64-pc-windows-msvc
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sandy-release-x86_64-pc-windows-msvc
@@ -163,6 +168,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # rustup from the pinned rustup-init, not the runner image's (scripts/install-rustup.sh).
+      - uses: ./.github/actions/rustup
       - name: Verify the toolchain
         shell: bash
         run: scripts/verify-toolchain.sh
@@ -197,6 +204,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # rustup from the pinned rustup-init, not the runner image's (scripts/install-rustup.sh).
+      - uses: ./.github/actions/rustup
       - name: Verify the toolchain
         shell: bash
         run: scripts/verify-toolchain.sh

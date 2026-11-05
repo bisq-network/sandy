@@ -8,7 +8,9 @@
 # SHA256SUMS.asc must be signed by the key that signs the releases, B493 3191 06CC 3D1F 252E  19CB
 # F806 F422 E222 AA02 (alejandrogarcia83), or by the key whose full fingerprint --key gives, for a
 # key that changed before this script did. The key is fetched from GitHub and keys.openpgp.org;
-# only its fingerprint decides. The tag only names the commit to build: its signature is not checked.
+# only its fingerprint decides, and a signature by a key that has expired or was revoked fails.
+# SHA256SUMS must list the six archives and nothing else. The tag only names the commit to build:
+# its signature is not checked.
 #
 # Run it in a clone of bisq-network/sandy, or anywhere else, where it offers to clone one into
 # ./sandy. It leaves the clone as it was, apart from the objects of the tag and FETCH_HEAD: the tag
@@ -100,17 +102,30 @@ done
 [ -f "$work/release/SHA256SUMS.asc" ] || fail "the release $tag has no SHA256SUMS.asc"
 
 # The signature of SHA256SUMS, by the key with that fingerprint and no other. VALIDSIG carries the
-# fingerprint of the primary key last, also for a signing subkey.
+# fingerprint of the primary key last, also for a signing subkey. gpg reports VALIDSIG also for a
+# key that has expired or was revoked, so the signature must be a GOODSIG, and any status of an
+# expired, revoked or bad signature or key fails.
 mkdir -m 700 "$work/gnupg"
 for key_url in $key_urls; do
   case "$key_url" in */by-fingerprint/) key_url=$key_url$fingerprint ;; esac
   curl -fsS --proto '=https' --tlsv1.2 "$key_url" 2> /dev/null |
     GNUPGHOME=$work/gnupg gpg --quiet --import 2> /dev/null || true
 done
-signer=$(GNUPGHOME=$work/gnupg gpg --status-fd 1 --verify "$work/release/SHA256SUMS.asc" \
-  "$work/release/SHA256SUMS" 2> /dev/null | awk '$2 == "VALIDSIG" { print $NF }')
+status=$(GNUPGHOME=$work/gnupg gpg --status-fd 1 --verify "$work/release/SHA256SUMS.asc" \
+  "$work/release/SHA256SUMS" 2> /dev/null || true)
+signer=$(printf '%s\n' "$status" | awk '$2 == "VALIDSIG" { print $NF }')
 [ "$signer" = "$fingerprint" ] || fail "SHA256SUMS of $tag is not signed by the key $fingerprint"
+printf '%s\n' "$status" | grep -q '^\[GNUPG:\] GOODSIG ' ||
+  fail "the signature of SHA256SUMS of $tag is not a good one"
+bad=$(printf '%s\n' "$status" | awk '$2 ~ /^(EXPKEYSIG|REVKEYSIG|EXPSIG|BADSIG|ERRSIG)$/ { print $2; exit }')
+[ -z "$bad" ] || fail "the signature of SHA256SUMS of $tag is not valid: gpg reports $bad"
 say "SHA256SUMS is signed by the key $fingerprint"
+# SHA256SUMS names the six archives and nothing else: an extra entry would be signed as well.
+expected=$(for target in $targets; do
+  case "$target" in *-windows-*) echo "sandy-$version-$target.zip" ;; *) echo "sandy-$version-$target.tar.gz" ;; esac
+done | LC_ALL=C sort)
+listed=$(awk '{ print $2 }' "$work/release/SHA256SUMS" | LC_ALL=C sort)
+[ "$listed" = "$expected" ] || fail "SHA256SUMS of $tag does not list exactly the six archives of $version"
 for target in $targets; do
   case "$target" in *-windows-*) ext=zip ;; *) ext=tar.gz ;; esac
   name=sandy-$version-$target.$ext
@@ -123,7 +138,8 @@ git worktree add --quiet --detach "$worktree" "$commit"
 [ -x "$worktree/scripts/reproduce.sh" ] ||
   fail "$tag has no scripts/reproduce.sh; check it with the verify-release workflow instead"
 say "building every archive of $tag again; this takes a while"
-"$worktree/scripts/reproduce.sh" "$commit" > /dev/null
+# Without Docker's cache, so that no image layer of an earlier build is taken over.
+SANDY_REPRODUCE_NO_CACHE=true "$worktree/scripts/reproduce.sh" "$commit" > /dev/null
 rebuilt=$worktree/dist/reproduced/$commit
 
 # The verdict: each archive against SHA256SUMS and against the one built again.

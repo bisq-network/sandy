@@ -4,13 +4,14 @@ name: audit
 # that may appear in the tree; and the cargo-vet records of supply-chain/, which say who audited
 # or published each crate version and why the rest is exempted. It runs weekly as well, because
 # an advisory can be published, and a trusted publisher entry can expire, without anything in
-# this repository changing.
+# this repository changing. The release workflow calls it too, and needs it to pass.
 
 on:
   push:
   pull_request:
   schedule:
     - cron: "17 6 * * 1"
+  workflow_call:
 
 permissions:
   contents: read
@@ -24,8 +25,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # rustup from the pinned rustup-init, not the runner image's (scripts/install-rustup.sh).
+      - uses: ./.github/actions/rustup
       - name: Verify the toolchain
         run: scripts/verify-toolchain.sh
+      # The pin of the toolchain was taken from a manifest signed by the Rust release key.
+      - name: Check the signature of the pinned toolchain manifest
+        run: scripts/check-toolchain-signature.sh
       # Built from crates.io rather than taken from an action, so that nothing but the pinned
       # toolchain, the pinned crate and the lock file of cargo-deny itself decides what runs. The
       # version is pinned because a new major version of cargo-deny changes what deny.toml means.
@@ -40,6 +46,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # rustup from the pinned rustup-init, not the runner image's (scripts/install-rustup.sh).
+      - uses: ./.github/actions/rustup
       - name: Verify the toolchain
         run: scripts/verify-toolchain.sh
       - run: scripts/install-tool.sh cargo-vet 0.10.2 dd93790018205cbbfa161f078ca4631afa8ed57fc8f32482268bcfdf0c0d7499

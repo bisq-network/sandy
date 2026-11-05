@@ -1,0 +1,20 @@
+name: rustup
+description: >-
+  Installs rustup from the rustup-init that rustup-init.sha256 pins, into the runner's temporary
+  directory, and puts it first on PATH, instead of the rustup of the runner image. The toolchain
+  itself comes from scripts/verify-toolchain.sh.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        home=$RUNNER_TEMP/rust
+        export RUSTUP_HOME=$home/rustup CARGO_HOME=$home/cargo
+        # The checkout this action is part of, which need not be the workspace itself.
+        "$GITHUB_ACTION_PATH/../../../scripts/install-rustup.sh"
+        {
+          echo "RUSTUP_HOME=$RUSTUP_HOME"
+          echo "CARGO_HOME=$CARGO_HOME"
+        } >> "$GITHUB_ENV"
+        echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
