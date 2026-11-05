@@ -41,6 +41,17 @@ jobs:
           - { target: x86_64-pc-windows-msvc, os: ubuntu-24.04, sdk: x86_64 }
           - { target: aarch64-pc-windows-msvc, os: ubuntu-24.04, sdk: aarch64 }
     runs-on: ${{ matrix.os }}
+    # The SHA-256 sum of each packed archive, by target. The release job checks the archives it
+    # downloads against these: an output comes only from this job, while an artifact can come from
+    # any job of the run. Each leg sets only the output of its own target, and an unset output
+    # does not replace the value another leg set.
+    outputs:
+      x86_64-unknown-linux-musl: ${{ steps.package.outputs.x86_64-unknown-linux-musl }}
+      aarch64-unknown-linux-musl: ${{ steps.package.outputs.aarch64-unknown-linux-musl }}
+      x86_64-apple-darwin: ${{ steps.package.outputs.x86_64-apple-darwin }}
+      aarch64-apple-darwin: ${{ steps.package.outputs.aarch64-apple-darwin }}
+      x86_64-pc-windows-msvc: ${{ steps.package.outputs.x86_64-pc-windows-msvc }}
+      aarch64-pc-windows-msvc: ${{ steps.package.outputs.aarch64-pc-windows-msvc }}
     env:
       # Whether the signing secrets exist, which gates the two signing steps below; today they
       # do not, so both steps stay skipped. A step's `if` cannot read a secret, so the test is
@@ -165,11 +176,14 @@ jobs:
       # The archive comes from tools/pack, not from the tar, gzip or 7-Zip of the runner image,
       # so that it can be built again byte for byte (scripts/release-pack.sh).
       - name: Package
+        id: package
         shell: bash
         run: |
           set -euo pipefail
           archive=$(scripts/without-network.sh scripts/release-pack.sh ${{ matrix.target }})
           ls -l "$archive"
+          sum=$(sha256sum "$archive" | cut -d' ' -f1)
+          echo "${{ matrix.target }}=$sum" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sandy-${{ matrix.target }}
@@ -416,6 +430,24 @@ jobs:
           done | LC_ALL=C sort)
           actual=$(cd dist && find . -mindepth 1 | sed 's|^\./||' | LC_ALL=C sort)
           [[ "$actual" == "$expected" ]] || { echo "dist holds other files than the six archives:"; echo "$actual"; exit 1; }
+      # The names say nothing about who uploaded an archive: another job of the run could have
+      # replaced one with a file of the same name. Each archive must have the sum that its build
+      # job reported as an output.
+      - name: Check the archives against the sums of the build job
+        shell: bash
+        env:
+          BUILT: ${{ toJSON(needs.build.outputs) }}
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          for target in $TARGETS; do
+            archive=sandy-$version-$target.tar.gz
+            [[ "$target" == *windows* ]] && archive=sandy-$version-$target.zip
+            expected=$(jq -r --arg target "$target" '.[$target] // ""' <<< "$BUILT")
+            [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || { echo "the build job reported no sum for $target"; exit 1; }
+            actual=$(sha256sum "dist/$archive" | cut -d' ' -f1)
+            [[ "$actual" == "$expected" ]] || { echo "$archive is not the archive the build job packed"; exit 1; }
+          done
       - name: Sum the archives
         shell: bash
         run: |
