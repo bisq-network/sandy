@@ -86,7 +86,7 @@ expected=$(pinned "$arch")
 # so anything else in the tree, which no fetch makes, is refused too.
 check() {
   [ -d "$out/crt/lib" ] && [ -d "$out/sdk/lib" ] ||
-    fail "no $arch libraries in $out; fetch them with scripts/windows-sdk.sh fetch $arch"
+    fail "no $arch libraries in $out; fetch them with scripts/windows-sdk.sh fetch $arch, or set WINDOWS_SDK_FETCH=true for scripts/release-build.sh to do it"
   other=$(cd "$out" && find crt/lib sdk/lib ! -type f ! -type l ! -type d | head -n 1)
   [ -z "$other" ] || fail "$out/$other is neither a file, a link nor a directory"
   actual=$(listing "$out")

@@ -196,10 +196,19 @@ dependencies are not reviewed, so the release build never runs it: `scripts/rele
 only checks the libraries against `link/windows-sdk.sha256` (`scripts/windows-sdk.sh check`), and
 the libraries are fetched apart from the build, by a job of their own in CI
 (`.github/workflows/windows-sdk.yml`) and in a container of their own by `scripts/reproduce.sh`,
-whose only output is the library files. A Windows target built without Docker needs
-`XWIN_ACCEPT_LICENSE=true scripts/windows-sdk.sh fetch x86_64` (or `aarch64`) first, best run
-somewhere other than the build, with `scripts/windows-sdk.sh unpack ARCH ARCHIVE` taking a tar of
-`crt/lib` and `sdk/lib` from there. The script refuses a toolchain that rustup did not install from the pinned
+whose only output is the library files. To build a Windows target without Docker, fetch the
+libraries first with `XWIN_ACCEPT_LICENSE=true scripts/windows-sdk.sh fetch x86_64` (or
+`aarch64`), best somewhere other than the build, and bring a tar of `crt/lib` and `sdk/lib` from
+there with `scripts/windows-sdk.sh unpack ARCH ARCHIVE`. Or let the build fetch them on the same
+machine, without that isolation:
+
+```sh
+WINDOWS_SDK_FETCH=true XWIN_ACCEPT_LICENSE=true scripts/release-build.sh x86_64-pc-windows-msvc
+```
+
+The build then checks the toolchain again after the fetch. CI refuses `WINDOWS_SDK_FETCH=true`, so
+that a broken handoff of the libraries fails instead of quietly fetching them in the build.
+`scripts/release-build.sh` refuses a toolchain that rustup did not install from the pinned
 archives (see "The supply chain checks" below). The `reproducible` job of the release workflow
 builds and packs every target twice, in two directories, and compares the binaries and the
 archives, and compares the archive with the one the build job packed on another runner. The
