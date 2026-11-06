@@ -8,6 +8,7 @@ mod alone;
 mod broker;
 mod cgroup;
 mod contain;
+mod ecryptfs;
 mod elevate;
 mod explain;
 mod factory;

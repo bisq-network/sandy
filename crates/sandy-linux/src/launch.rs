@@ -302,7 +302,7 @@ fn prepare_ruleset(
         ruleset = ruleset.scope(config.scopes).map_err(landlock_error)?;
     }
     let mut ruleset = ruleset.create().map_err(landlock_error)?;
-    for rule in &config.rules {
+    for rule in config.rules.iter().chain(&config.lower) {
         let fd = open_rule(&rule.path, identities.get(&rule.path).copied())?;
         ruleset = ruleset
             .add_rule(PathBeneath::new(fd, rule.access))

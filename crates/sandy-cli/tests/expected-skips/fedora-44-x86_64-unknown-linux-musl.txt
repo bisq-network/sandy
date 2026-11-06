@@ -28,3 +28,5 @@ setup_linux setup_cannot_enable_disabled_user_namespaces passwordless-sudo
 setup_linux setup_leaves_a_profile_file_it_did_not_write passwordless-sudo
 setup_linux setup_prepares_a_sandy_that_only_root_can_change passwordless-sudo
 setup_linux setup_refuses_a_sandy_its_user_can_change passwordless-sudo
+# Mounting eCryptfs needs root, and sudo asks for a password here.
+escape_linux a_directory_on_ecryptfs_can_be_listed_and_its_lower_directory_stays_closed passwordless-sudo

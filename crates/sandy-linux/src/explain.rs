@@ -330,7 +330,12 @@ pub struct Rules {
 impl Rules {
     pub fn of(landlock: &LandlockConfig) -> Rules {
         Rules {
-            rules: landlock.rules.clone(),
+            rules: landlock
+                .rules
+                .iter()
+                .chain(&landlock.lower)
+                .cloned()
+                .collect(),
             handled: landlock.handled_fs,
         }
     }
@@ -429,8 +434,11 @@ pub fn explain_path(landlock: &LandlockConfig, path: &Path) -> String {
 /// others always come with them.
 fn allowed_words(access: BitFlags<AccessFs>) -> String {
     let mut words = Vec::new();
-    if access.contains(AccessFs::ReadFile) || access.contains(AccessFs::ReadDir) {
+    if access.contains(AccessFs::ReadFile) {
         words.push("read");
+    } else if access.contains(AccessFs::ReadDir) {
+        // Only the lower directories of eCryptfs get this right alone.
+        words.push("list");
     }
     if access.contains(AccessFs::WriteFile) {
         words.push("write");
@@ -1457,8 +1465,17 @@ mod tests {
                     READ | AccessFs::WriteFile | AccessFs::MakeReg,
                 ),
             ],
+            lower: vec![rule(
+                "/sandy-explain-test/lower",
+                BitFlags::from(AccessFs::ReadDir),
+            )],
+            unlisted: Vec::new(),
         };
         let answer = |path: &str| explain_path(&landlock, Path::new(path));
+        assert_eq!(
+            answer("/sandy-explain-test/lower/file"),
+            "/sandy-explain-test/lower/file: the rule /sandy-explain-test/lower allows list"
+        );
         assert_eq!(
             answer("/sandy-explain-test/ro/file"),
             "/sandy-explain-test/ro/file: the rule /sandy-explain-test/ro allows read"

@@ -93,6 +93,8 @@ warning_ids! {
     OpensslInclude => "openssl-include",
     /// A cgroup limit the program cannot see.
     CgroupLimit => "cgroup-limit",
+    /// A granted directory on eCryptfs whose lower directory sandy did not find, on Linux.
+    EcryptfsUnlisted => "ecryptfs-unlisted",
     /// A named AppContainer is shared with every user of the machine.
     AppcontainerShared => "appcontainer-shared",
     /// A grant on Windows follows the file, not the path.
