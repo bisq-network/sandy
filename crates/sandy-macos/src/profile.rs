@@ -46,6 +46,7 @@ pub fn generate(policy: &ResolvedPolicy) -> Profile {
     }
     policy_path_rules(&mut writer, policy);
     network_rules(&mut writer, policy);
+    policy_link_rules(&mut writer, policy);
     ancestor_rules(&mut writer);
     link_rules(&mut writer);
     protection_rules(&mut writer, policy);
@@ -548,6 +549,33 @@ fn ancestor_rules(writer: &mut Writer) {
     writer.rule("allow", METADATA, &filters);
 }
 
+/// The symbolic links that the names of the policy paths and the program pass, so that a path
+/// spelled through one, such as a directory reached through a link, works. A lookup through a
+/// link reads the link's own metadata and checks file-test-existence for the path as the program
+/// spelled it; Seatbelt checks the path the link leads to as well, so the rules for the real
+/// paths still decide every access. The program cannot repoint these links: the resolver refuses
+/// a policy path resolved through an entry inside a writable path, and nothing here allows a
+/// write.
+fn policy_link_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
+    if policy.links.is_empty() {
+        return;
+    }
+    writer.comment("Symbolic links on the way to the policy paths: their own metadata.");
+    let filters: Vec<String> = policy
+        .links
+        .iter()
+        .map(|link| literal(writer.grant("PATH_LINK", link)))
+        .collect();
+    writer.rule("allow", METADATA, &filters);
+    writer.comment("Paths spelled through those links.");
+    let filters: Vec<String> = policy
+        .links
+        .iter()
+        .map(|link| subpath(writer.param("PATH_LINK", link)))
+        .collect();
+    writer.rule("allow", &["file-test-existence"], &filters);
+}
+
 /// Paths spelled through a granted link of the system set, such as `/etc/hosts` for
 /// `/private/etc/hosts`. Seatbelt checks file-test-existence for the path as the program spelled
 /// it and again for the path the link leads to, so this grants nothing that the rules for the
@@ -910,6 +938,7 @@ mod tests {
         let mut policy = typical("/srv");
         policy.ip = IpAccess::All;
         policy.unix_sockets = NetworkAccess::All;
+        policy.links = vec![PathBuf::from("/srv/current"), PathBuf::from("/opt/link")];
         let profile = generate(&policy);
         assert!(!profile.text.contains('/'), "{}", profile.text);
         let mut used = references(&profile.text);
@@ -1421,6 +1450,51 @@ mod tests {
         assert_eq!(links(SystemAccess::None, IpAccess::Client), ["/var"]);
         assert!(links(SystemAccess::None, IpAccess::Private).is_empty());
         assert!(links(SystemAccess::None, IpAccess::None).is_empty());
+    }
+
+    /// The links that resolving the policy passed get their own metadata, and paths spelled through
+    /// them get file-test-existence, nothing more: no rule lets the program read a link's
+    /// directory, write a link or replace one. Their directories count as ancestors.
+    #[test]
+    fn policy_links_get_metadata_and_spelled_paths_only() {
+        let mut policy = typical("/srv");
+        policy.system = SystemAccess::None;
+        assert!(
+            !generate(&policy)
+                .parameters
+                .iter()
+                .any(|(name, _)| name.starts_with("PATH_LINK_"))
+        );
+        policy.links = vec![PathBuf::from("/opt/a/link"), PathBuf::from("/srv/current")];
+        let profile = generate(&policy);
+        let names = |path: &str| -> Vec<&str> {
+            profile
+                .parameters
+                .iter()
+                .filter(|(_, value)| value == Path::new(path))
+                .map(|(name, _)| name.as_str())
+                .collect()
+        };
+        assert_eq!(names("/opt/a/link"), ["PATH_LINK_0", "PATH_LINK_2"]);
+        assert_eq!(names("/srv/current"), ["PATH_LINK_1", "PATH_LINK_3"]);
+        assert!(
+            names("/opt/a")
+                .iter()
+                .all(|name| name.starts_with("ANCESTOR_"))
+        );
+        assert!(!names("/opt/a").is_empty());
+        let text = &profile.text;
+        assert!(text.contains(
+            "(allow file-read-metadata file-test-existence\n  \
+             (literal (param \"PATH_LINK_0\"))\n  (literal (param \"PATH_LINK_1\")))\n"
+        ));
+        assert!(text.contains(
+            "(allow file-test-existence\n  (subpath (param \"PATH_LINK_2\"))\n  \
+             (subpath (param \"PATH_LINK_3\")))\n"
+        ));
+        assert_eq!(text.matches("PATH_LINK_").count(), 4);
+        // The protections still come after the link rules.
+        assert!(text.find("PATH_LINK_3").unwrap() < text.find("ANCHOR_0").unwrap());
     }
 
     /// A connect to a Unix socket outside the policy needs file-test-existence for its path, so

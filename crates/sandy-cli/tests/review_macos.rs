@@ -762,6 +762,173 @@ fn paths_through_the_system_links_reach_only_granted_files() {
     assert_looks_missing(&inside[2], &inside[3]);
 }
 
+/// A policy path named through a symbolic link works under that name, as on Linux: the profile
+/// lets the lookup read the link and test the path as the program spells it, for every link a
+/// policy name passes, also each one of a chain with relative targets and a link to a file. The
+/// real path is checked as well, so through such a link the program reaches the granted files
+/// and nothing else, also for the calls that only test existence, and a link the policy does not
+/// pass leads nowhere, also one to a granted file. The program can neither
+/// remove nor rename a link, nor rename a link of its own over it; each of these works outside.
+#[test]
+fn policy_paths_named_through_links_reach_only_granted_files() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new("macos-policy-links");
+    let path = |relative: &str| fixture.path(relative);
+    let arg = |relative: &str| fixture.arg(relative);
+    fs::write(path("ro/other"), b"content").unwrap();
+    fs::create_dir_all(path("ro/otherdir")).unwrap();
+    for dir in ["chained", "lone"] {
+        fs::create_dir_all(path(dir)).unwrap();
+        fs::write(path(dir).join("file"), b"content").unwrap();
+    }
+    symlink(path("ro"), path("ro-link")).unwrap();
+    symlink(path("rw"), path("rw-link")).unwrap();
+    symlink("chain-b", path("chain-a")).unwrap();
+    symlink("chained", path("chain-b")).unwrap();
+    symlink("lone/file", path("file-link")).unwrap();
+    symlink(path("secret"), path("secret-link")).unwrap();
+    // Leads to the granted file too, but no policy name passes it.
+    symlink(path("ro"), path("other-link")).unwrap();
+
+    // Controls: the same changes work outside the sandbox, on links of their own.
+    for spare in ["spare-delete", "spare-rename", "spare-replaced"] {
+        symlink(path("ro"), path(spare)).unwrap();
+    }
+    let pair = |from: &str, to: &str| format!("{}{ARGUMENT_SEPARATOR}{}", arg(from), arg(to));
+    let plant = |link: &str| format!("{}::{}", arg(link), arg("secret"));
+    let outside = [
+        ("delete", arg("spare-delete")),
+        ("rename", pair("spare-rename", "spare-renamed")),
+        ("symlink", plant("rw/evil-outside")),
+        ("rename", pair("rw/evil-outside", "spare-replaced")),
+    ];
+    let outside: Vec<(&str, &str)> = outside.iter().map(|(a, t)| (*a, t.as_str())).collect();
+    for line in probe_outside(&outside) {
+        line.assert_ok();
+    }
+
+    let args: Vec<String> = [
+        "--read",
+        &arg("ro-link/file"),
+        "--read-write",
+        &arg("rw-link"),
+        "--read",
+        &arg("chain-a"),
+        "--read",
+        &arg("file-link"),
+    ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .collect();
+    let full_path = |relative: &str| format!("{}{ARGUMENT_SEPARATOR}fullpath", arg(relative));
+    let granted = [
+        ("read", arg("ro-link/file")),
+        ("read", arg("rw-link/file")),
+        ("write", arg("rw-link/new")),
+        ("read", arg("rw-link/new")),
+        ("read", arg("chain-a/file")),
+        ("read", arg("file-link")),
+        ("symlink", plant("rw/evil")),
+    ];
+    // Each pair: a path through a link that exists but is not granted, and one that does not
+    // exist. Every call that only tests existence is here, so the link is no oracle.
+    let hidden = [
+        ("read", arg("ro-link/other"), arg("ro-link/no-such-file")),
+        ("access", arg("ro-link/other"), arg("ro-link/no-such-file")),
+        (
+            "metadata",
+            arg("ro-link/other"),
+            arg("ro-link/no-such-file"),
+        ),
+        ("statfs", arg("ro-link/other"), arg("ro-link/no-such-file")),
+        (
+            "getattr",
+            full_path("ro-link/other"),
+            full_path("ro-link/no-such-file"),
+        ),
+        ("chdir", arg("ro-link/otherdir"), arg("ro-link/no-such-dir")),
+        (
+            "access",
+            arg("ro-link/otherdir"),
+            arg("ro-link/no-such-dir"),
+        ),
+        (
+            "read",
+            arg("secret-link/file"),
+            arg("secret-link/no-such-file"),
+        ),
+        (
+            "read",
+            arg("other-link/file"),
+            arg("other-link/no-such-file"),
+        ),
+        (
+            "access",
+            arg("other-link/file"),
+            arg("other-link/no-such-file"),
+        ),
+    ];
+    // Creating, linking and moving into a directory through the link that exists but is not
+    // granted, against one that does not exist: a create looks its name up first.
+    let into = |dir: &str| {
+        let entry = |name: &str| arg(&format!("ro-link/{dir}/{name}"));
+        let from = |source: &str, name: &str| {
+            format!("{}{ARGUMENT_SEPARATOR}{}", arg(source), entry(name))
+        };
+        [
+            ("write", entry("new")),
+            ("mkdir", entry("dir")),
+            ("symlink", format!("{}::file", entry("link"))),
+            ("rename", from("rw-link/file", "moved")),
+            ("hardlink", from("ro-link/file", "hard")),
+            ("copy", from("ro-link/file", "copied")),
+        ]
+    };
+    // Control: each create works outside, through the same link; then the tree is put back.
+    let controls = into("otherdir");
+    let controls: Vec<(&str, &str)> = controls.iter().map(|(a, t)| (*a, t.as_str())).collect();
+    for line in probe_outside(&controls) {
+        line.assert_ok();
+    }
+    fs::remove_dir_all(path("ro/otherdir")).unwrap();
+    fs::create_dir_all(path("ro/otherdir")).unwrap();
+    fs::write(path("rw/file"), b"content").unwrap();
+    let creates = into("otherdir")
+        .into_iter()
+        .zip(into("no-such-dir"))
+        .map(|((action, existing), (_, missing))| (action, existing, missing));
+    let hidden: Vec<(&str, String, String)> = hidden.into_iter().chain(creates).collect();
+    // Changes to a policy link, with the errno each must give: EPERM, because no rule allows
+    // a write there, or ENOENT where the other name lies outside the policy and looks missing.
+    let changes = [
+        ("delete", arg("ro-link"), "(os error 1)"),
+        ("rename", pair("ro-link", "moved"), "(os error 2)"),
+        ("rename", pair("rw/evil", "ro-link"), "(os error 1)"),
+    ];
+    let mut actions: Vec<(&str, &str)> = granted.iter().map(|(a, t)| (*a, t.as_str())).collect();
+    for (action, existing, missing) in &hidden {
+        actions.push((action, existing));
+        actions.push((action, missing));
+    }
+    actions.extend(changes.iter().map(|(a, t, _)| (*a, t.as_str())));
+    let inside = probe_inside(&args, &actions);
+    for line in &inside[..granted.len()] {
+        line.assert_ok();
+    }
+    let pairs = &inside[granted.len()..granted.len() + 2 * hidden.len()];
+    for pair in pairs.chunks(2) {
+        assert_looks_missing(&pair[0], &pair[1]);
+    }
+    let changed = &inside[granted.len() + 2 * hidden.len()..];
+    for (line, (_, _, errno)) in changed.iter().zip(&changes) {
+        line.assert_blocked();
+        assert!(line.detail.ends_with(errno), "{line:?}");
+    }
+    assert_eq!(fs::read_link(path("ro-link")).unwrap(), path("ro"));
+    assert_eq!(fs::read_link(path("rw-link")).unwrap(), path("rw"));
+}
+
 /// With `unix_sockets = "all"` the program reaches every Unix socket of the user, also outside
 /// the policy. Seatbelt checks the lookup of the socket's path as file-test-existence before the
 /// kernel knows that the path is a socket, so the profile allows that check for every path. This

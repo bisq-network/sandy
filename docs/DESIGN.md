@@ -1015,7 +1015,9 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
 - Setuid and setgid files never execute. The root of a writable path cannot be deleted or
   replaced, so the target cannot redirect the next run with a symbolic link.
 - Outside the policy every path answers `ENOENT`, as a path that does not exist, to every call,
-  and every other process `ESRCH`; `getpriority`, `getpgid` and `getsid` are denied by number.
+  and every other process `ESRCH`, except for the symbolic links that the policy's names pass:
+  their own metadata and target text, and the metadata of the directories above them, are
+  readable (docs/macos.md, "The generated profile"); `getpriority`, `getpgid` and `getsid` are denied by number.
   Writes to a `read` path keep `EPERM`. With `unix_sockets = "all"`, `access`, `statfs`,
   `chdir` and the path from `getattrlist` answer for every path again, because a connect to a
   socket outside the policy needs that check. `kill(pid, 0)` still tells a live process ID from
