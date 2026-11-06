@@ -35,7 +35,7 @@ use std::ffi::OsString;
 use sandy_core::streams::CreatableSocket;
 use sandy_core::{
     Backend, IpAccess, PlanItem, Requirement, ResolvedLevel, ResolvedPolicy, SandboxError,
-    SetupOptions, SetupOutcome, StatusReport, TargetCommand,
+    SetupOptions, SetupOutcome, StatusReport, TargetCommand, Warning,
 };
 
 use host::{Detected, ThisHost};
@@ -109,7 +109,7 @@ impl Backend for LinuxBackend {
         verified(policy, routes::Routes::open)
     }
 
-    fn notes(&self, policy: &ResolvedPolicy) -> Vec<String> {
+    fn notes(&self, policy: &ResolvedPolicy) -> Vec<Warning> {
         plan::notes(policy, &self.host.common())
     }
 

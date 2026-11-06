@@ -174,10 +174,21 @@ fn run_takes_the_first_level_this_host_enforces() {
     parse(&output)[0].assert_ok();
     assert!(
         stderr.starts_with(
-            "warning: running fallback level weaker: this host cannot enforce level base ("
+            "warning: [fallback-level] running fallback level weaker: this host cannot enforce \
+             level base ("
         ),
         "{stderr}"
     );
+    // The caller that expects the fallback hides the warning, and the program keeps its standard
+    // error to itself.
+    let mut hidden = args.clone();
+    hidden.insert(1, "--hide-warning".to_string());
+    hidden.insert(2, "fallback-level".to_string());
+    let output = sandy_as(&natural, &hidden);
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    parse(&output)[0].assert_ok();
+    assert!(!stderr.contains("warning:"), "{stderr}");
 
     #[cfg(unix)]
     let (output, record) = sandy_with_status_under(&natural.wrapper, &args);

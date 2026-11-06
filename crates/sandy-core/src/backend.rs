@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use crate::plan::PlanItem;
 use crate::resolve::{ResolvedLevel, ResolvedPolicy};
 use crate::streams::CreatableSocket;
+use crate::warning::Warning;
 
 /// The program to start inside the sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,7 +179,7 @@ pub trait Backend {
     /// sandy enforces nor the exit status, so a backend reports a fact here instead of refusing
     /// when the program may well not be affected. Like `verify`, it may read host state and must
     /// leave the host as it found it.
-    fn notes(&self, _policy: &ResolvedPolicy) -> Vec<String> {
+    fn notes(&self, _policy: &ResolvedPolicy) -> Vec<Warning> {
         Vec::new()
     }
 

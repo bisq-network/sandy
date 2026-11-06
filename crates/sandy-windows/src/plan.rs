@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use sandy_core::{
     EgressReach, IpAccess, PathAccess, PlanItem, Requirement, ResolvedPolicy, SystemAccess,
+    Warning, WarningId,
 };
 
 use crate::name::{EGRESS_BROKER_SUFFIX, validate_appcontainer_name};
@@ -300,10 +301,11 @@ pub fn job_indeterminate(policy: &ResolvedPolicy, reason: &str) -> Vec<PlanItem>
 /// What the policy asks for and this backend gives only in part, although the plan reports it
 /// as enforced (DESIGN.md, "Requirements and the enforcement plan"), each with the section of
 /// docs/windows.md that explains it. `sandy check` prints these as warnings.
-pub fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
+pub fn shortfalls(policy: &ResolvedPolicy) -> Vec<Warning> {
     let mut shortfalls = Vec::new();
     if policy.windows.appcontainer_name.is_some() {
-        shortfalls.push(
+        shortfalls.push(Warning::new(
+            WarningId::AppcontainerShared,
             "the AppContainer is shared with every user of this machine: its SID, loopback \
              exemption and the capability SIDs for file grants and relay sockets are derived from \
              the AppContainer name alone, not from the user. Loopback isolation is per session, \
@@ -317,26 +319,28 @@ pub fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
              machine will use, on a machine whose other accounts you trust (docs/windows.md, \
              \"Other users of the machine\")"
                 .to_string(),
-        );
+        ));
     }
     if policy.paths.iter().any(|rule| rule.is_dir) {
-        shortfalls.push(
+        shortfalls.push(Warning::new(
+            WarningId::GrantFollowsFile,
             "a grant on Windows follows the file, not the path: a file moved out of a granted \
              directory on the same volume keeps the access it inherited there, so the program \
              can still open it at its new place by its full path for as long as the directory \
              is in the policy (docs/windows.md, \"Links and identity\")"
                 .to_string(),
-        );
+        ));
     }
     shortfalls
 }
 
 /// What makes the program behave differently inside the sandbox than outside with this policy,
 /// beyond what it denies by design. `sandy check` prints these as warnings.
-pub fn notes(policy: &ResolvedPolicy) -> Vec<String> {
+pub fn notes(policy: &ResolvedPolicy) -> Vec<Warning> {
     let mut notes = Vec::new();
     if policy.ip == IpAccess::Client {
-        notes.push(
+        notes.push(Warning::new(
+            WarningId::IpClientPrivateNetworks,
             "ip = \"client\" reaches no host of a network that Windows counts as private or \
              domain network, such as a printer or a server on the local network: Windows has no \
              capability for connections out into such a network alone, and \
@@ -344,17 +348,18 @@ pub fn notes(policy: &ResolvedPolicy) -> Vec<String> {
              through the DNS Client service, and ip = \"all\" reaches those hosts \
              (docs/windows.md, \"Client networking\")"
                 .to_string(),
-        );
+        ));
     }
     if matches!(policy.ip, IpAccess::None | IpAccess::Private) {
-        notes.push(
+        notes.push(Warning::new(
+            WarningId::LoopbackWithinAppcontainer,
             "the program's own processes in its AppContainer reach each other over loopback, \
              also with ip = \"none\" and ip = \"private\": Windows isolates loopback between the \
              AppContainer and the rest of the machine, not within one AppContainer, so a program \
              that starts helper processes (or a relay of expose, forward or egress) can talk to \
              them on 127.0.0.1 and ::1 (docs/windows.md, \"Private network\")"
                 .to_string(),
-        );
+        ));
     }
     notes
 }
@@ -761,6 +766,19 @@ mod tests {
     };
 
     use super::*;
+
+    /// The texts of the warnings, which the tests compare.
+    fn texts(warnings: Vec<Warning>) -> Vec<String> {
+        warnings.into_iter().map(|warning| warning.text).collect()
+    }
+
+    fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
+        texts(super::shortfalls(policy))
+    }
+
+    fn notes(policy: &ResolvedPolicy) -> Vec<String> {
+        texts(super::notes(policy))
+    }
 
     fn host() -> HostCapabilities {
         HostCapabilities {

@@ -293,11 +293,13 @@ enforced     environment limited to policy: execve with only the policy environm
 enforced     IP networking denied: seccomp socket family allowlist ...
 enforced     Unix sockets outside writable paths denied: seccomp denies AF_UNIX sockets ...
 enforced     metadata of files outside policy paths protected: seccomp denies chmod, chown ...
-warning: signals = "any" lets the program signal every process of this user ...
+warning: [signals-any] signals = "any" lets the program signal every process of this user ...
 ```
 
 Warnings go to standard error, requirements to standard output. Every default policy warns
-about `signals = "any"`, which lets the program signal processes outside the sandbox.
+about `signals = "any"`, which lets the program signal processes outside the sandbox. The name
+in brackets is the warning's ID: `--hide-warning signals-any` leaves that warning out once you
+have accepted it (see [Warnings](#warnings)).
 
 Run a program that may read one directory and write another, without network:
 
@@ -500,7 +502,9 @@ host that makes the program behave differently inside the sandbox (a directory o
 usual `bin` directory inside a writable path, on Linux an OpenSSL include the policy does not cover
 or a cgroup limit the program cannot see). Warnings change neither the exit status nor the one line
 per requirement on standard output, so a caller that reads it is not affected. `sandy run` prints
-no warnings: its standard error belongs to the program.
+only the warning that it takes a fallback level: its standard error belongs to the program. Each
+warning line starts with `warning: [ID]`; see [Warnings](#warnings) for the IDs and how to hide
+them.
 
 `sandy setup` does the one-time host preparation that needs administrator rights:
 
@@ -552,6 +556,9 @@ it does nothing.
 | `--policy FILE` | Read the policy from a TOML file (at most one). Path options add to it; the other options replace its values, but not one that a [fallback level](#fallback-levels) sets, which is an error. With `-`, read it from standard input; the program then gets the null device as its standard input. A policy may be at most 1 MiB long. | none |
 | `--level NAME` | Use only this level of the policy: `base` or the name of a fallback level. `run` refuses when this host cannot enforce it, instead of taking another. | |
 | `--json` | `check` only: print the result as one JSON object (see [Fallback levels](#fallback-levels)). | off |
+| `--hide-warning ID` | Leave out the `warning:` lines with this ID. Repeatable; `run` and `check` only. See [Warnings](#warnings). | |
+| `--no-warnings` | Leave out every `warning:` line. `run` and `check` only. See [Warnings](#warnings). | off |
+| `--show-warning ID` | Print the `warning:` lines with this ID despite `--no-warnings`. Repeatable; `run` and `check` only. See [Warnings](#warnings). | |
 | `--read PATH` | Allow reading files and listing directories below `PATH`. | |
 | `--read-exec PATH` | Allow reading and executing below `PATH`. | |
 | `--read-write PATH` | Allow reading, creating, changing and deleting below `PATH`. Never executing. | |
@@ -581,6 +588,61 @@ it does nothing.
 | `--cwd DIR` | Working directory of the program. | sandy's |
 
 The options that take a path or a variable can be repeated.
+
+### Warnings
+
+Every `warning:` line names its ID in brackets, for example
+`warning: [signals-any] signals = "any" lets ...`. A caller that has read a warning and accepted
+what it says passes `--hide-warning ID` to leave that one out, and still sees every other
+warning, also one that a later release adds. `--no-warnings` leaves out every warning line, for
+a caller that shows sandy's standard error to its users and has checked the warnings itself.
+`--show-warning ID` keeps the warnings with that ID despite `--no-warnings`, so
+`--no-warnings --show-warning fallback-level` prints only the fallback level line. Like
+`--no-warnings` alone, such a list also hides every warning a later release adds. An ID given
+to both `--hide-warning` and `--show-warning` is an error. Hiding changes nothing sandy enforces, and `check --json` keeps every warning with its ID, in
+`warnings` and `warning_ids`.
+
+sandy accepts the ID of every platform on every platform, so one command line serves all of
+them; an ID it does not know is an error. The IDs stay stable; the texts can change between
+releases.
+
+| ID | Platforms | What the warning reports |
+|---|---|---|
+| `unix-sockets-all` | all | `unix_sockets = "all"` gives up most of the isolation |
+| `signals-any` | all | `signals = "any"` lets the program signal every process of this user |
+| `egress-probing` | all | what the egress broker's answers tell the program about this host's addresses |
+| `path-metadata-allow` | all | `path_metadata = "allow"` |
+| `writable-home` | all | a writable path holds the home directory |
+| `terminals-reachable` | Linux | a policy path holds `/dev/pts`, with the other terminals of this user |
+| `writable-path-directory` | all | a writable path reaches a directory on `PATH` |
+| `mach-services-ignored` | Linux, Windows | `macos.mach_services` allows nothing on this platform |
+| `mach-service-reach` | macOS | what an allowed Mach service lets the program do besides its purpose |
+| `option-widens-policy` | all | a command line option replaced a stricter value of the policy file |
+| `fallback-level` | all | `run` takes a fallback level |
+| `ip-client-udp` | Linux, macOS | `ip = "client"` receives datagrams from every sender on a socket that is not connected |
+| `ip-client-unix-listen` | Linux | `ip = "client"` cannot listen on a Unix socket either |
+| `ip-client-private-networks` | Windows | `ip = "client"` reaches no host of a private or domain network |
+| `ip-private-same-user` | Linux | a process of this user can enter the private network namespace |
+| `ip-private-exposed-addresses` | macOS | exposed ports can listen at every address of this Mac |
+| `ip-private-later-addresses` | macOS | an address the Mac gains after the relay started |
+| `ip-private-link-local` | macOS | IPv6 link-local addresses reach other hosts |
+| `relays-ipv4-only` | macOS | `macos.relays = "ipv4"` denies IPv6 sockets to the relayed ports |
+| `loopback-within-appcontainer` | Windows | the program's own processes reach each other over loopback |
+| `signals-isolated-terminal` | Linux, macOS | `signals = "isolated"` and the process group of the terminal |
+| `signals-isolated-sigio` | macOS | `signals = "isolated"` leaves SIGIO and SIGURG open |
+| `forward-other-users` | Linux, macOS | another local user can use a forwarded port |
+| `egress-other-users` | macOS | another local user can use the egress broker |
+| `relay-outlives-program` | macOS | with `signals = "any"` the relay can outlive the program |
+| `path-metadata-open-files` | Linux | `path_metadata = "deny"` and descriptors opened for reading |
+| `unix-sockets-existence` | macOS | `unix_sockets = "all"` tells existing paths from missing ones |
+| `view-holds-root` | Linux | `view = "policy"` with `/` readable hides nothing |
+| `view-partial` | Linux, macOS | what `view = "policy"` leaves visible of the host |
+| `contained-posix-spawn` | macOS | `children = "contained"` denies `posix_spawn` |
+| `openssl-include` | Linux | an OpenSSL include the policy does not let the program read |
+| `cgroup-limit` | Linux | a cgroup limit the program cannot see |
+| `appcontainer-shared` | Windows | a named AppContainer is shared with every user of the machine |
+| `grant-follows-file` | Windows | a grant follows the file, not the path |
+| `session-zero` | Windows | sandy runs in session 0 |
 
 ### Finding the grants a program needs
 
@@ -1055,7 +1117,8 @@ windows.appcontainer_name = "example.app.host"
   condition, or another user of the host, pick how weakly the program runs. The last level is
   the floor; nothing weaker runs. docs/DESIGN.md, "Fallback levels", has the rules.
 - `run` that takes a level other than `base` says so on standard error, before the program
-  starts: `warning: running fallback level contained: this host cannot enforce level base (...)`.
+  starts: `warning: [fallback-level] running fallback level contained: this host cannot enforce
+  level base (...)`. `--hide-warning fallback-level` leaves it out.
   `--level NAME` pins a level: `run` then refuses with status 125 when this host cannot enforce
   it. A program that configures itself per level, for example writes another configuration file
   for a level without the egress broker, runs `check` first and then `run --level` with the level
@@ -1076,10 +1139,10 @@ when it exits with status 125:
  "levels":[{"name":"base","enforceable":false,"needs_setup":false,
             "enforced":[{"requirement":"filesystem-confined","mechanism":"..."}],
             "missing":[{"requirement":"signals-isolated","status":"unavailable","reason":"..."}],
-            "warnings":["..."]},
+            "warnings":["..."],"warning_ids":["signals-any"]},
            {"name":"contained","enforceable":true,"needs_setup":false,
-            "enforced":[...],"missing":[],"warnings":[]}],
- "warnings":[]}
+            "enforced":[...],"missing":[],"warnings":[],"warning_ids":[]}],
+ "warnings":[],"warning_ids":[]}
 ```
 
 | Key | Meaning |
@@ -1093,12 +1156,14 @@ when it exits with status 125:
 | `levels[].needs_setup` | only something `sandy setup` prepares is missing |
 | `levels[].enforced` | each requirement this host enforces, with `requirement` and `mechanism` |
 | `levels[].missing` | each requirement it does not, with `requirement`, `status` (`unavailable` or `needs-setup`) and `reason` |
-| `levels[].warnings` | the `warning:` lines of the level |
+| `levels[].warnings` | the `warning:` lines of the level, without their prefix and ID |
+| `levels[].warning_ids` | the [ID](#warnings) of each warning in `levels[].warnings`, in the same order |
 | `warnings` | warnings that concern every level, such as an option that widens the policy file |
+| `warning_ids` | the ID of each warning in `warnings`, in the same order |
 
-The requirement names (`filesystem-confined`, `ip-network-private`, `signals-isolated`, ...)
-and the keys stay stable; the `mechanism`, `reason` and warning texts are for people and can
-change. A policy without levels has one entry in `levels`, named `base`.
+The requirement names (`filesystem-confined`, `ip-network-private`, `signals-isolated`, ...),
+the keys and the warning IDs stay stable; the `mechanism`, `reason` and warning texts are for
+people and can change. A policy without levels has one entry in `levels`, named `base`.
 
 ## Platform notes
 
@@ -1279,7 +1344,9 @@ Recommendations:
 1. **Call `sandy check` first** and show its output when the exit status is 1, so users learn
    why the program cannot run on their host. Its standard output has one line per requirement;
    the `warning:` lines on standard error are advice about the policy and do not change the exit
-   status. `check --json` gives the same to a program (see [Fallback levels](#fallback-levels)).
+   status. Hide the ones you have accepted with `--hide-warning ID` (see
+   [Warnings](#warnings)). `check --json` gives the same to a program (see
+   [Fallback levels](#fallback-levels)).
 2. **Put the weaker variants of the policy into the policy, as fallback levels**, instead of
    retrying with another policy when `check` fails: sandy knows which hardening each host
    supports, and it never moves to a weaker level for a reason that can pass. When the program

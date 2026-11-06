@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use lexopt::prelude::*;
 use sandy_core::{
     ChildProcesses, Egress, EgressReach, ExposedPort, FileView, ForwardedPort, IpAccess,
-    MachService, NetworkAccess, PathMetadata, Policy, Relays, SignalScope, SystemAccess, Win32k,
+    MachService, NetworkAccess, PathMetadata, Policy, Relays, SignalScope, SystemAccess, Warning,
+    WarningId, Win32k,
 };
 
 pub const USAGE: &str = "\
@@ -58,6 +59,11 @@ Options (they extend the policy file):
                              is not available on every platform (run only)
   --explain-path PATH        say what the policy allows for PATH and which rule decides it
                              (repeatable; check only)
+  --hide-warning ID          leave out the warning lines with this ID, the name in brackets
+                             after \"warning:\" (repeatable; run and check)
+  --no-warnings              leave out every warning line (run and check)
+  --show-warning ID          print the warning lines with this ID despite --no-warnings
+                             (repeatable; run and check)
   --expose ADDRESS=PORT      relay connections on the loopback ADDRESS to the program's
                              loopback PORT, for example 127.0.0.1:18080=8080 (repeatable;
                              needs --ip all or --ip private)
@@ -110,6 +116,34 @@ pub enum Mode {
     Setup,
     /// `setup --remove`.
     Remove,
+}
+
+/// Which `warning:` lines sandy prints: the caller hides the ones it has accepted
+/// (`--hide-warning`) or all (`--no-warnings`), and keeps some of them with `--show-warning`.
+/// `check --json` keeps every warning: a program reads it, not a person.
+#[derive(Debug, Default)]
+pub struct WarningFilter {
+    hide_all: bool,
+    hidden: Vec<WarningId>,
+    shown: Vec<WarningId>,
+}
+
+impl WarningFilter {
+    pub fn shows(&self, warning: &Warning) -> bool {
+        self.shown.contains(&warning.id) || !(self.hide_all || self.hidden.contains(&warning.id))
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.hide_all && self.hidden.is_empty() && self.shown.is_empty()
+    }
+
+    /// An ID both hidden and shown, which leaves unclear what the caller wants.
+    fn contradiction(&self) -> Option<WarningId> {
+        self.hidden
+            .iter()
+            .copied()
+            .find(|id| self.shown.contains(id))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -182,7 +216,7 @@ impl Overrides {
     /// An option that sets a key some fallback level of the policy sets is refused: it would be
     /// unclear which levels it changes. The other options apply to the base, and so to every
     /// level.
-    pub fn apply(self, policy: &mut Policy, from_file: bool) -> Result<Vec<String>, String> {
+    pub fn apply(self, policy: &mut Policy, from_file: bool) -> Result<Vec<Warning>, String> {
         for (option, key) in self.keys() {
             if let Some(level) = policy.fallback.iter().find(|level| level.sets(key)) {
                 return Err(format!(
@@ -195,15 +229,18 @@ impl Overrides {
         Ok(self.apply_to_base(policy, from_file))
     }
 
-    fn apply_to_base(self, policy: &mut Policy, from_file: bool) -> Vec<String> {
+    fn apply_to_base(self, policy: &mut Policy, from_file: bool) -> Vec<Warning> {
         let mut weakened = Vec::new();
         let mut note = |option: &str, value: &str, setting: &str, before: &str| {
             if !from_file {
                 return;
             }
-            weakened.push(format!(
-                "{option} {value} replaces {setting} = {before:?} from the policy file and allows \
-                 more than the file does"
+            weakened.push(Warning::new(
+                WarningId::OptionWidensPolicy,
+                format!(
+                    "{option} {value} replaces {setting} = {before:?} from the policy file and \
+                     allows more than the file does"
+                ),
             ));
         };
         let filesystem = &mut policy.filesystem;
@@ -381,6 +418,7 @@ pub struct Invocation {
     pub level: Option<String>,
     /// `--json` of check.
     pub json: bool,
+    pub warning_filter: WarningFilter,
     pub overrides: Overrides,
     pub cwd: Option<PathBuf>,
     pub parent_pid: Option<u32>,
@@ -473,6 +511,7 @@ where
         policy: None,
         level: None,
         json: false,
+        warning_filter: WarningFilter::default(),
         overrides: Overrides::default(),
         cwd: None,
         parent_pid: None,
@@ -507,6 +546,15 @@ where
                 invocation.level = Some(parser.value()?.string()?)
             }
             Long("json") => invocation.json = true,
+            Long("hide-warning") => {
+                let id = parser.value()?.string()?.parse()?;
+                invocation.warning_filter.hidden.push(id);
+            }
+            Long("show-warning") => {
+                let id = parser.value()?.string()?.parse()?;
+                invocation.warning_filter.shown.push(id);
+            }
+            Long("no-warnings") => invocation.warning_filter.hide_all = true,
             Long("read") => overrides.read.push(parser.value()?.into()),
             Long("read-exec") => overrides.read_exec.push(parser.value()?.into()),
             Long("read-write") => overrides.read_write.push(parser.value()?.into()),
@@ -682,6 +730,15 @@ where
     if invocation.explain && invocation.mode != Mode::Run {
         return Err("--explain belongs to run".into());
     }
+    if !invocation.warning_filter.is_empty() && !matches!(invocation.mode, Mode::Run | Mode::Check)
+    {
+        return Err(
+            "--hide-warning, --show-warning and --no-warnings belong to run and check".into(),
+        );
+    }
+    if let Some(id) = invocation.warning_filter.contradiction() {
+        return Err(format!("--hide-warning and --show-warning both name {id}").into());
+    }
     if invocation.json && invocation.mode != Mode::Check {
         return Err("--json belongs to check".into());
     }
@@ -746,6 +803,18 @@ fn network_access(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The texts of the warnings `apply` returns, which all name an option that widens the
+    /// policy file.
+    fn widened(warnings: Vec<Warning>) -> Vec<String> {
+        warnings
+            .into_iter()
+            .map(|warning| {
+                assert_eq!(warning.id, WarningId::OptionWidensPolicy);
+                warning.text
+            })
+            .collect()
+    }
 
     fn parse_strs(args: &[&str]) -> Result<Command, String> {
         parse(args.iter().map(OsString::from))
@@ -835,7 +904,11 @@ mod tests {
         ]);
         let mut policy = Policy::default();
         policy.filesystem.read.push("/z".into());
-        invocation.overrides.apply(&mut policy, true).unwrap();
+        invocation
+            .overrides
+            .apply(&mut policy, true)
+            .map(widened)
+            .unwrap();
         assert_eq!(
             policy.filesystem.read,
             vec![PathBuf::from("/z"), PathBuf::from("/a")]
@@ -876,6 +949,7 @@ mod tests {
             parsed
                 .overrides
                 .apply(&mut policy, false)
+                .map(widened)
                 .unwrap()
                 .is_empty()
         );
@@ -890,7 +964,11 @@ mod tests {
         );
         let local = invocation(&["check", "--egress", "1080=public-and-local"]);
         let mut policy = Policy::default();
-        local.overrides.apply(&mut policy, false).unwrap();
+        local
+            .overrides
+            .apply(&mut policy, false)
+            .map(widened)
+            .unwrap();
         assert_eq!(
             policy.network.egress.unwrap().reach,
             EgressReach::PublicAndLocal
@@ -914,6 +992,7 @@ mod tests {
         let notes = invocation(&["check", "--view", "all"])
             .overrides
             .apply(&mut policy, true)
+            .map(widened)
             .unwrap();
         assert_eq!(notes.len(), 1, "{notes:?}");
 
@@ -921,6 +1000,7 @@ mod tests {
         let notes = invocation(&["check", "--egress", "1080"])
             .overrides
             .apply(&mut policy, true)
+            .map(widened)
             .unwrap();
         assert_eq!(
             notes,
@@ -932,11 +1012,13 @@ mod tests {
         let notes = invocation(&["check", "--egress", "1080=public-and-local"])
             .overrides
             .apply(&mut policy, true)
+            .map(widened)
             .unwrap();
         assert_eq!(notes.len(), 1, "{notes:?}");
         let notes = invocation(&["check", "--egress", "1081=public"])
             .overrides
             .apply(&mut policy, true)
+            .map(widened)
             .unwrap();
         assert!(notes.is_empty(), "{notes:?}");
 
@@ -946,6 +1028,7 @@ mod tests {
             invocation(&["check", "--ip", "client"])
                 .overrides
                 .apply(&mut policy, true)
+                .map(widened)
                 .unwrap()
                 .len(),
             1
@@ -955,6 +1038,7 @@ mod tests {
             invocation(&["check", "--ip", "private"])
                 .overrides
                 .apply(&mut policy, true)
+                .map(widened)
                 .unwrap()
                 .len(),
             1
@@ -970,6 +1054,7 @@ mod tests {
             let notes = invocation(&["check", "--ip", option])
                 .overrides
                 .apply(&mut policy, true)
+                .map(widened)
                 .unwrap();
             assert_eq!(policy.network.ip.name(), option);
             notes
@@ -1002,6 +1087,7 @@ mod tests {
             invocation(&["check", "--system", option])
                 .overrides
                 .apply(&mut policy, from_file)
+                .map(widened)
                 .unwrap()
         };
         assert_eq!(
@@ -1025,6 +1111,7 @@ mod tests {
             invocation(&["check", "--windows-win32k", option])
                 .overrides
                 .apply(&mut policy, true)
+                .map(widened)
                 .unwrap()
         };
         assert_eq!(
@@ -1049,6 +1136,7 @@ mod tests {
             let notes = invocation(&["check", "--macos-relays", option])
                 .overrides
                 .apply(&mut policy, true)
+                .map(widened)
                 .unwrap();
             assert_eq!(policy.macos.relays.name(), option);
             notes
@@ -1066,6 +1154,72 @@ mod tests {
         assert!(matches!(
             parse_strs(&["check", "--macos-relays", "ipv6"]),
             Err(message) if message.contains("invalid --macos-relays value \"ipv6\"")
+        ));
+    }
+
+    /// Callers learn the IDs from the table in README.md, so it names every one.
+    #[test]
+    fn the_readme_lists_every_warning_id() {
+        let readme = include_str!("../../../README.md");
+        for id in WarningId::ALL {
+            assert!(readme.contains(&format!("| `{id}` |")), "{id}");
+        }
+    }
+
+    #[test]
+    fn hides_the_warnings_named_or_all() {
+        let signals = Warning::new(WarningId::SignalsAny, "s");
+        let fallback = Warning::new(WarningId::FallbackLevel, "f");
+        let shown = invocation(&["check"]).warning_filter;
+        assert!(shown.shows(&signals) && shown.shows(&fallback));
+        let named = invocation(&["run", "--hide-warning", "signals-any", "/bin/true"]);
+        assert!(!named.warning_filter.shows(&signals));
+        assert!(named.warning_filter.shows(&fallback));
+        let all = invocation(&["check", "--no-warnings"]).warning_filter;
+        assert!(!all.shows(&signals) && !all.shows(&fallback));
+        // An ID of another platform is accepted, so one command line serves every platform.
+        invocation(&["check", "--hide-warning", "session-zero"]);
+        assert!(matches!(
+            parse_strs(&["check", "--hide-warning", "signals_any"]),
+            Err(message) if message.contains("unknown warning ID \"signals_any\"")
+        ));
+        for args in [
+            &["setup", "--no-warnings"][..],
+            &["setup", "--hide-warning", "signals-any"],
+            &["setup", "--show-warning", "signals-any"],
+        ] {
+            assert!(
+                matches!(
+                    parse_strs(args),
+                    Err(message) if message.contains("belong to run and check")
+                ),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// `--show-warning` keeps a warning that `--no-warnings` would hide, so a caller can hide
+    /// all but the few it cares about.
+    #[test]
+    fn shows_the_warnings_named_despite_hiding_all() {
+        let signals = Warning::new(WarningId::SignalsAny, "s");
+        let fallback = Warning::new(WarningId::FallbackLevel, "f");
+        let filter = invocation(&["check", "--no-warnings", "--show-warning", "fallback-level"])
+            .warning_filter;
+        assert!(filter.shows(&fallback));
+        assert!(!filter.shows(&signals));
+        // Alone it changes nothing: every warning shows anyway.
+        let alone = invocation(&["check", "--show-warning", "fallback-level"]).warning_filter;
+        assert!(alone.shows(&fallback) && alone.shows(&signals));
+        assert!(matches!(
+            parse_strs(&[
+                "check",
+                "--hide-warning",
+                "signals-any",
+                "--show-warning",
+                "signals-any",
+            ]),
+            Err(message) if message.contains("both name signals-any")
         ));
     }
 
@@ -1142,7 +1296,11 @@ mod tests {
         ] {
             let invocation = invocation(&["check", "--children", value]);
             let mut policy = Policy::default();
-            invocation.overrides.apply(&mut policy, true).unwrap();
+            invocation
+                .overrides
+                .apply(&mut policy, true)
+                .map(widened)
+                .unwrap();
             assert_eq!(policy.process.children, expected);
         }
         assert!(parse_strs(&["check", "--children", "some"]).is_err());
@@ -1160,7 +1318,11 @@ mod tests {
             "com.apple.trustd.agent",
         ]);
         let mut policy = Policy::default();
-        invocation.overrides.apply(&mut policy, true).unwrap();
+        invocation
+            .overrides
+            .apply(&mut policy, true)
+            .map(widened)
+            .unwrap();
         assert_eq!(policy.macos.mach_services, [MachService::TrustdAgent]);
         let error = parse_strs(&["check", "--macos-mach-service", "com.apple.trustd"]).unwrap_err();
         assert!(

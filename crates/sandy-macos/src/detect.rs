@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 
-use sandy_core::{PlanItem, ResolvedPolicy};
+use sandy_core::{PlanItem, ResolvedPolicy, Warning};
 
 use crate::plan::{self, HostCapabilities, ProfileError, SHEBANG_LEVELS, executable_paths};
 use crate::profile::{
@@ -79,7 +79,7 @@ impl<P: Probes> Detected<P> {
         plan::plan_for(policy, &self.capabilities(policy))
     }
 
-    pub fn notes(&self, policy: &ResolvedPolicy) -> Vec<String> {
+    pub fn notes(&self, policy: &ResolvedPolicy) -> Vec<Warning> {
         let homes = self.homes().as_deref().unwrap_or_default();
         plan::notes(policy, &trust::path_locations(homes))
     }

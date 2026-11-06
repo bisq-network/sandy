@@ -225,6 +225,47 @@ fn check_warns_when_an_option_weakens_the_policy_file() {
     assert!(!stderr.contains("replaces"), "{stderr}");
 }
 
+/// Every warning line names its ID, which `--hide-warning` takes to leave out that warning
+/// alone, and `--no-warnings` leaves out every one but those `--show-warning` names. `--json`
+/// keeps them all, with their IDs.
+#[test]
+fn check_hides_the_warnings_the_caller_names() {
+    let args = ["--signals", "any", "--unix-sockets", "all"];
+    let shown = check_warnings(&args);
+    assert!(warns(&shown, "[signals-any] signals = \"any\""), "{shown}");
+    assert!(warns(&shown, "[unix-sockets-all] "), "{shown}");
+
+    let hidden = check_warnings(&[&args[..], &["--hide-warning", "signals-any"]].concat());
+    assert!(!hidden.contains("signals-any"), "{hidden}");
+    assert!(warns(&hidden, "[unix-sockets-all] "), "{hidden}");
+
+    let none = check_warnings(&[&args[..], &["--no-warnings"]].concat());
+    assert!(!none.contains(WARNING), "{none}");
+
+    let kept = check_warnings(
+        &[
+            &args[..],
+            &["--no-warnings", "--show-warning", "signals-any"],
+        ]
+        .concat(),
+    );
+    assert!(warns(&kept, "[signals-any] "), "{kept}");
+    assert!(!kept.contains("unix-sockets-all"), "{kept}");
+
+    let mut all = vec!["check".to_string()];
+    all.extend(platform_args());
+    all.extend(
+        [&args[..], &["--no-warnings", "--json"]]
+            .concat()
+            .iter()
+            .map(|arg| arg.to_string()),
+    );
+    let output = sandy(&all);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"signals-any\""), "{stdout}");
+    assert!(stdout.contains("signals = \\\"any\\\" lets"), "{stdout}");
+}
+
 /// `windows.win32k = "deny"` is a requirement on every platform: Windows enforces it with a
 /// process mitigation, which `check` tries on a suspended process, and the platforms without
 /// win32k report it as given. Without the key nothing is required, and an option that allows

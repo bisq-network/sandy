@@ -14,6 +14,7 @@ mod selection;
 pub mod streams;
 pub mod trust;
 pub mod verify;
+mod warning;
 
 pub use backend::{
     Backend, ParentProcess, SandboxError, SetupOptions, SetupOutcome, StatusReport, TargetCommand,
@@ -33,3 +34,4 @@ pub use resolve::{
     canonical_location, path_directories, shebang,
 };
 pub use selection::{Outcome, Selection, select};
+pub use warning::{Warning, WarningId};

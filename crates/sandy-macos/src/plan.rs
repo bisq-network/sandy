@@ -6,7 +6,7 @@ use std::path::Path;
 use sandy_core::{
     ChildProcesses, FileView, IpAccess, MachService, NetworkAccess, PathAccess, PathIdentity,
     PlanItem, ProtectedPath, Relays, Requirement, ResolvedPolicy, SignalScope, Status,
-    SystemAccess,
+    SystemAccess, Warning, WarningId,
 };
 
 use crate::system::{self, SystemAccess as Grant};
@@ -238,7 +238,7 @@ fn path_identity() -> Result<PathIdentity, Status> {
 /// requirements: a directory on sandy's PATH inside a writable path (rule 12), from the
 /// `path_locations` of `trust`. Before it come the `shortfalls` of the policy. `sandy check`
 /// prints these as warnings; they change nothing sandy enforces.
-pub fn notes(policy: &ResolvedPolicy, path_locations: &[ProtectedPath]) -> Vec<String> {
+pub fn notes(policy: &ResolvedPolicy, path_locations: &[ProtectedPath]) -> Vec<Warning> {
     let mut notes = shortfalls(policy);
     notes.extend(mach_service_notes(policy));
     notes.extend(policy.path_directory_notes(path_locations));
@@ -248,13 +248,15 @@ pub fn notes(policy: &ResolvedPolicy, path_locations: &[ProtectedPath]) -> Vec<S
 /// What each service of `macos.mach_services` lets the program do besides its purpose, as
 /// assessed from the published source of the service (docs/macos.md, "Mach services and other
 /// IPC").
-fn mach_service_notes(policy: &ResolvedPolicy) -> Vec<String> {
+fn mach_service_notes(policy: &ResolvedPolicy) -> Vec<Warning> {
     policy
         .macos
         .allowed_mach_services()
         .map(|service| match service {
-            MachService::TrustdAgent => format!(
-                "macos.mach_services allows {}, the trust agent of this user, which verifies \
+            MachService::TrustdAgent => Warning::new(
+                WarningId::MachServiceReach,
+                format!(
+                    "macos.mach_services allows {}, the trust agent of this user, which verifies \
                  certificates for the program. Through it the program can also have the agent \
                  fetch the CA issuer and OCSP URLs that a certificate names, from outside the \
                  sandbox (ip = \"client\" or \"all\" reaches those hosts anyway), flush this \
@@ -265,7 +267,8 @@ fn mach_service_notes(policy: &ResolvedPolicy) -> Vec<String> {
                  denied, and the trust store only for a program signed with the entitlement \
                  modify-anchor-certificates, so keep such programs out of read_exec paths \
                  (docs/macos.md, \"Mach services and other IPC\")",
-                service.name()
+                    service.name()
+                ),
             ),
         })
         .collect()
@@ -274,7 +277,7 @@ fn mach_service_notes(policy: &ResolvedPolicy) -> Vec<String> {
 /// What the policy asks for and macOS gives only in part, although the plan reports it as
 /// enforced (DESIGN.md, "Requirements and the enforcement plan"), each with the section of
 /// docs/macos.md that explains it.
-fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
+fn shortfalls(policy: &ResolvedPolicy) -> Vec<Warning> {
     let mut shortfalls = Vec::new();
     let contained = policy.children == ChildProcesses::Contained;
     if policy.signals == SignalScope::Isolated {
@@ -284,28 +287,33 @@ fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
         } else {
             "SIGIO"
         };
-        shortfalls.push(format!(
-            "signals = \"isolated\" is enforced only in part on macOS: the program can still \
+        shortfalls.push(Warning::new(
+            WarningId::SignalsIsolatedSigio,
+            format!(
+                "signals = \"isolated\" is enforced only in part on macOS: the program can still \
              have the kernel send {signals} to a process outside the sandbox, including one of \
              another user, by making that process the owner of a socket or a pipe with an ioctl \
              (FIOSETOWN, SIOCSPGRP, TIOCSPGRP) that no profile rule reaches; the macOS kernel \
              sends it with no owner check, so this is outside sandy's reach, and a process that \
              does not handle the signal discards it (docs/macos.md, \"Signals the profile does \
              not cover\")"
+            ),
         ));
         if !contained {
-            shortfalls.push(
+            shortfalls.push(Warning::new(
+                WarningId::SignalsIsolatedTerminal,
                 "signals = \"isolated\" is enforced only in part on macOS: the program can join \
                  the process group of another job of its terminal session (setpgid, or \
                  posix_spawn with POSIX_SPAWN_SETPGROUP) and have the kernel stop that job by \
                  reading from the terminal; children = \"contained\" closes this (docs/macos.md, \
                  \"Signals the profile does not cover\")"
                     .to_string(),
-            );
+            ));
         }
     }
     if policy.ip == IpAccess::Client {
-        shortfalls.push(
+        shortfalls.push(Warning::new(
+            WarningId::IpClientUdp,
             "ip = \"client\" keeps datagrams out only in part on macOS: a UDP socket that is not \
              connected receives datagrams from every sender, not only from the addresses it sent \
              to, at any port the program binds it to; Seatbelt checks each such datagram as \
@@ -313,17 +321,18 @@ fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
              a socket that is not connected (QUIC, DNS and NTP clients) need it, so the profile \
              allows it for UDP (docs/macos.md, \"Networking\")"
                 .to_string(),
-        );
+        ));
     }
     if policy.ip == IpAccess::Private && !policy.expose.is_empty() {
-        shortfalls.push(
+        shortfalls.push(Warning::new(
+            WarningId::IpPrivateExposedAddresses,
             "ip = \"private\" keeps the program's exposed ports off the network only in part on \
              macOS: Seatbelt's localhost matches every address of this Mac, so the program can \
              listen on its exposed ports at the local network address and every other address \
              of this Mac too, where other hosts and every local process reach it without the \
              relay (docs/macos.md, \"The private network\")"
                 .to_string(),
-        );
+        ));
     }
     let held = !policy.forward.is_empty() || policy.egress.is_some();
     let ipv4 = policy.macos.relays == Relays::Ipv4;
@@ -343,17 +352,21 @@ fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
         } else {
             ("each of them", "a new temporary IPv6 or VPN address")
         };
-        shortfalls.push(format!(
-            "ip = \"private\" keeps the program off this Mac's other addresses only in part on \
+        shortfalls.push(Warning::new(
+            WarningId::IpPrivateLaterAddresses,
+            format!(
+                "ip = \"private\" keeps the program off this Mac's other addresses only in part on \
              macOS: Seatbelt's localhost matches every address of this Mac, so the program may \
              connect to its forwarded and egress ports at {addresses}; the relay and the \
              broker hold those ports at every address the Mac had when they started, but a \
              process of sandy's own user that listens on one at an address the Mac gains later, \
              such as {gained}, receives the program's connections there{ended} (docs/macos.md, \
              \"The private network\")"
+            ),
         ));
         if ipv4 {
-            shortfalls.push(
+            shortfalls.push(Warning::new(
+                WarningId::RelaysIpv4Only,
                 "macos.relays = \"ipv4\" lets the program reach its forwarded and egress ports \
                  only from IPv4 sockets on macOS: an IPv6 socket gets EPERM there, also one that \
                  connects to 127.0.0.1 as ::ffff:127.0.0.1, which is how Java and .NET connect to \
@@ -361,9 +374,10 @@ fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
                  -Djava.net.preferIPv4Stack=true and .NET with DOTNET_SYSTEM_NET_DISABLEIPV6=1 \
                  (docs/macos.md, \"The private network\")"
                     .to_string(),
-            );
+            ));
         } else {
-            shortfalls.push(
+            shortfalls.push(Warning::new(
+                WarningId::IpPrivateLinkLocal,
                 "ip = \"private\" keeps the program off the local network only in part on \
                  macOS: Seatbelt's localhost matches an IPv6 link-local address of this Mac with \
                  any interface as its scope, so the program may connect to its forwarded and \
@@ -373,30 +387,33 @@ fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
                  macos.relays = \"ipv4\" closes this, at the cost of IPv6 sockets to those ports \
                  (docs/macos.md, \"The private network\")"
                     .to_string(),
-            );
+            ));
         }
     }
     if policy.egress.is_some() {
-        shortfalls.push(
+        shortfalls.push(Warning::new(
+            WarningId::EgressOtherUsers,
             "the egress broker serves every local user on macOS: macOS cannot tell the broker \
              which user holds the other end of a TCP connection, so another user can connect out \
              through it, as sandy's user, to every destination the policy's reach allows \
              (docs/macos.md, \"The egress broker\")"
                 .to_string(),
-        );
+        ));
     }
     if policy.unix_sockets == NetworkAccess::All {
-        shortfalls.push(
+        shortfalls.push(Warning::new(
+            WarningId::UnixSocketsExistence,
             "unix_sockets = \"all\" lets the program tell existing paths outside the policy \
              from missing ones on macOS: a connect to a socket needs the existence check for \
              every path, so access, statfs, chdir and the path from getattrlist answer again, \
              also by inode number through /.vol (docs/macos.md, \"Information the target can \
              still read\")"
                 .to_string(),
-        );
+        ));
     }
     if policy.view == FileView::Policy && policy.unix_sockets == NetworkAccess::None {
-        shortfalls.push(
+        shortfalls.push(Warning::new(
+            WarningId::ViewPartial,
             "view = \"policy\" hides paths outside the policy only in part on macOS: the names \
              in the root directory stay listable, because dyld reads that directory, and a bulk \
              listing of it (getattrlistbulk) that asks for the type of each entry also returns \
@@ -404,10 +421,11 @@ fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
              which realpath and getcwd need; and statfs of a policy path names its volume and \
              where that is mounted (docs/macos.md, \"The file system view\")"
                 .to_string(),
-        );
+        ));
     }
     if contained {
-        shortfalls.push(
+        shortfalls.push(Warning::new(
+            WarningId::ContainedPosixSpawn,
             "children = \"contained\" denies posix_spawn on macOS, because its flags can move a \
              new process out of the program's process group where no profile rule sees them: \
              programs that start processes with it get EPERM, among them Rust's \
@@ -415,21 +433,23 @@ fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
              libuv programs, and system() and popen(); fork and exec keep working \
              (docs/macos.md, \"Contained child processes\")"
                 .to_string(),
-        );
+        ));
     }
     if !policy.forward.is_empty() {
-        shortfalls.push(
+        shortfalls.push(Warning::new(
+            WarningId::ForwardOtherUsers,
             "a forwarded port serves every local user on macOS: macOS cannot tell the relay \
              which user holds the other end of a TCP connection, so another user can reach the \
              forwarded service through the relay, as sandy's user; forward only to services \
              that authenticate their clients (docs/macos.md, \"Who may connect, and who may \
              stop the relay\")"
                 .to_string(),
-        );
+        ));
     }
     let relayed = !policy.expose.is_empty() || !policy.forward.is_empty();
     if relayed && policy.signals == SignalScope::Any {
-        shortfalls.push(
+        shortfalls.push(Warning::new(
+            WarningId::RelayOutlivesProgram,
             "the relay of exposed and forwarded ports can outlive the program without limit on \
              macOS with signals = \"any\": the program can stop the relay with SIGSTOP, and \
              macOS has no timer that ends a stopped process, so the relay keeps its ports until \
@@ -437,7 +457,7 @@ fn shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
              after the program ended; signals = \"isolated\" keeps the program from stopping \
              it (docs/macos.md, \"Who may connect, and who may stop the relay\")"
                 .to_string(),
-        );
+        ));
     }
     shortfalls
 }
@@ -678,6 +698,14 @@ mod tests {
         WindowsPolicy,
     };
 
+    /// The texts of the warnings, which the tests compare.
+    fn notes(policy: &ResolvedPolicy, path_locations: &[ProtectedPath]) -> Vec<String> {
+        super::notes(policy, path_locations)
+            .into_iter()
+            .map(|warning| warning.text)
+            .collect()
+    }
+
     fn policy(ip: IpAccess, unix_sockets: NetworkAccess, signals: SignalScope) -> ResolvedPolicy {
         ResolvedPolicy {
             paths: Vec::new(),
@@ -909,17 +937,19 @@ mod tests {
         }
         let notes = mach_service_notes(&policy);
         assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, WarningId::MachServiceReach);
         assert!(
-            notes[0].contains("cannot make a certificate trusted"),
+            notes[0].text.contains("cannot make a certificate trusted"),
             "{}",
             notes[0]
         );
         assert_eq!(
             policy.mach_services_notes("Linux"),
-            [
+            [Warning::new(
+                WarningId::MachServicesIgnored,
                 "macos.mach_services allows com.apple.trustd.agent on macOS only; Linux has no \
               Mach services, so it allows nothing here"
-            ]
+            )]
         );
     }
 

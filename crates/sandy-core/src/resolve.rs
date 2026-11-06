@@ -9,6 +9,7 @@ use crate::policy::{
     MachService, MacosPolicy, NetworkAccess, NetworkPolicy, PathMetadata, Policy, PolicyError,
     ProcessPolicy, Relays, SignalScope, SystemAccess, Win32k, WindowsPolicy,
 };
+use crate::warning::{Warning, WarningId};
 
 #[cfg(windows)]
 mod windows;
@@ -394,27 +395,28 @@ impl ResolvedPolicy {
     ///
     /// A plain path comparison is enough here: the rules that must hold whatever the program does
     /// compare file identity instead (`is_within`).
-    pub fn warnings(&self, home: Option<&Path>) -> Vec<String> {
+    pub fn warnings(&self, home: Option<&Path>) -> Vec<Warning> {
         let mut warnings = Vec::new();
         if self.unix_sockets == NetworkAccess::All {
-            warnings.push(
+            warnings.push(Warning::new(
+                WarningId::UnixSocketsAll,
                 "unix_sockets = \"all\" gives up most of the isolation: the program can reach \
                  every local service that listens on a Unix socket, and some of them start \
                  programs or read files outside the policy (on Linux the D-Bus session bus and \
-                 the systemd user manager, on macOS the DNS resolver)"
-                    .to_string(),
-            );
+                 the systemd user manager, on macOS the DNS resolver)",
+            ));
         }
         if self.signals == SignalScope::Any {
-            warnings.push(
+            warnings.push(Warning::new(
+                WarningId::SignalsAny,
                 "signals = \"any\" lets the program signal every process of this user, so it can \
                  stop or kill programs outside the sandbox; signals = \"isolated\" limits signals \
-                 to the sandbox"
-                    .to_string(),
-            );
+                 to the sandbox",
+            ));
         }
         if self.egress.is_some() {
-            warnings.push(
+            warnings.push(Warning::new(
+                WarningId::EgressProbing,
                 "egress: the broker refuses an address of this host with reply 2 and answers \
                  other addresses with the result of its connect, so by trying addresses the \
                  program can tell which belong to this host and, with reach = \"public\", which \
@@ -423,17 +425,16 @@ impl ResolvedPolicy {
                  it, nor a public address that a router maps back to this host; a firewall rule \
                  of this host that redirects outgoing connections takes the broker's \
                  connections to the local service it names, which the broker cannot see \
-                 (docs/DESIGN.md, \"Egress broker\")"
-                    .to_string(),
-            );
+                 (docs/DESIGN.md, \"Egress broker\")",
+            ));
         }
         if self.path_metadata == PathMetadata::Allow {
-            warnings.push(
+            warnings.push(Warning::new(
+                WarningId::PathMetadataAllow,
                 "path_metadata = \"allow\" lets the program change the permissions, owner, \
                  timestamps and extended attributes of every file this user owns on Linux, also \
-                 outside the policy paths"
-                    .to_string(),
-            );
+                 outside the policy paths",
+            ));
         }
         if let Some(home) = home {
             let writable = self
@@ -442,12 +443,15 @@ impl ResolvedPolicy {
                 .filter(|rule| rule.access == PathAccess::ReadWrite);
             for rule in writable {
                 if home.starts_with(&rule.path) {
-                    warnings.push(format!(
-                        "the writable path {} holds the home directory {}, so the program can \
+                    warnings.push(Warning::new(
+                        WarningId::WritableHome,
+                        format!(
+                            "the writable path {} holds the home directory {}, so the program can \
                          change shell startup files, autostart entries and the configuration of \
                          other programs, and what it writes there runs outside the sandbox",
-                        rule.path.display(),
-                        home.display()
+                            rule.path.display(),
+                            home.display()
+                        ),
                     ));
                 }
             }
@@ -462,11 +466,14 @@ impl ResolvedPolicy {
                 } else {
                     ""
                 };
-                warnings.push(format!(
+                warnings.push(Warning::new(
+                    WarningId::TerminalsReachable,
+                    format!(
                     "the path {} holds /dev/pts, so the program can open the other terminals this \
                      user has open, read what is typed in them{write} (docs/linux.md, \
                      \"Pseudo-terminals\")",
                     rule.path.display()
+                ),
                 ));
             }
         }
@@ -567,14 +574,17 @@ impl ResolvedPolicy {
     /// Warnings of the backends of platforms without Mach services, `platform`, for each service
     /// that `macos.mach_services` allows: it allows nothing there, and `check` says so rather
     /// than ignore the key.
-    pub fn mach_services_notes(&self, platform: &str) -> Vec<String> {
+    pub fn mach_services_notes(&self, platform: &str) -> Vec<Warning> {
         self.macos
             .allowed_mach_services()
             .map(|service| {
-                format!(
-                    "macos.mach_services allows {} on macOS only; {platform} has no Mach \
-                     services, so it allows nothing here",
-                    service.name()
+                Warning::new(
+                    WarningId::MachServicesIgnored,
+                    format!(
+                        "macos.mach_services allows {} on macOS only; {platform} has no Mach \
+                         services, so it allows nothing here",
+                        service.name()
+                    ),
                 )
             })
             .collect()
@@ -593,21 +603,24 @@ impl ResolvedPolicy {
     /// warning then follows the spellings (`Unknown::Spelling`), so it names only an overlap sandy
     /// sees. A host whose comparison cannot be read gets no warning: its policy is refused
     /// anyway, for the same reason.
-    pub fn path_directory_notes(&self, directories: &[ProtectedPath]) -> Vec<String> {
+    pub fn path_directory_notes(&self, directories: &[ProtectedPath]) -> Vec<Warning> {
         let Ok(identity) = PathIdentity::read() else {
             return Vec::new();
         };
         self.writable_conflicts(directories, &identity, Unknown::Spelling)
             .map(|(rule, directory)| {
-                format!(
-                    "the writable path {} overlaps {}, a directory on sandy's PATH or on the \
+                Warning::new(
+                    WarningId::WritablePathDirectory,
+                    format!(
+                        "the writable path {} overlaps {}, a directory on sandy's PATH or on the \
                      usual PATH of a user's shell, so a file the program leaves there runs \
                      outside the sandbox when the user next types its name; make only the \
                      subdirectories the program needs writable, so that {} stays outside every \
                      writable path (taking it off sandy's PATH leaves the risk)",
-                    rule.path.display(),
-                    directory.path.display(),
-                    directory.path.display()
+                        rule.path.display(),
+                        directory.path.display(),
+                        directory.path.display()
+                    ),
                 )
             })
             .collect()
@@ -2990,7 +3003,8 @@ mod tests {
                 .unwrap()
                 .warnings(None)
                 .into_iter()
-                .filter(|warning| warning.contains("other terminals this user has open"))
+                .filter(|warning| warning.id == WarningId::TerminalsReachable)
+                .map(|warning| warning.text)
                 .collect::<Vec<_>>()
         };
         let read = warnings(&policy_with(&[pts], &[], &[]));
@@ -3018,7 +3032,18 @@ mod tests {
         policy.network.unix_sockets = NetworkAccess::All;
         policy.linux.path_metadata = PathMetadata::Allow;
         let resolved = ResolvedPolicy::resolve(&policy, None).unwrap();
-        let warnings = resolved.warnings(Some(&home)).join("\n");
+        let warnings = resolved.warnings(Some(&home));
+        let ids: Vec<WarningId> = warnings.iter().map(|warning| warning.id).collect();
+        assert_eq!(
+            ids,
+            [
+                WarningId::UnixSocketsAll,
+                WarningId::SignalsAny,
+                WarningId::PathMetadataAllow,
+                WarningId::WritableHome,
+            ]
+        );
+        let warnings = texts(warnings).join("\n");
         for setting in [
             "unix_sockets = \"all\"",
             "signals = \"any\"",
@@ -3035,7 +3060,7 @@ mod tests {
         let mut policy = policy_with(&[], &[], &[&data]);
         policy.process.signals = SignalScope::Isolated;
         let resolved = ResolvedPolicy::resolve(&policy, None).unwrap();
-        assert_eq!(resolved.warnings(Some(&home)), Vec::<String>::new());
+        assert_eq!(resolved.warnings(Some(&home)), Vec::<Warning>::new());
     }
 
     /// What every egress broker leaves open, named for every policy that has one.
@@ -3052,10 +3077,20 @@ mod tests {
         });
         let warnings = ResolvedPolicy::resolve(&policy, None)
             .unwrap()
-            .warnings(None)
-            .join("\n");
+            .warnings(None);
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.id == WarningId::EgressProbing),
+            "{warnings:?}"
+        );
+        let warnings = texts(warnings).join("\n");
         assert!(warnings.contains("which belong to this host"), "{warnings}");
         assert!(warnings.contains("NAT64"), "{warnings}");
+    }
+
+    fn texts(warnings: Vec<Warning>) -> Vec<String> {
+        warnings.into_iter().map(|warning| warning.text).collect()
     }
 
     fn writable_conflict(
@@ -3254,6 +3289,8 @@ mod tests {
         let warned = notes(&tools);
         assert_eq!(warned.len(), 2, "{warned:?}");
         for (note, directory) in warned.iter().zip(["bin", "sbin"]) {
+            assert_eq!(note.id, WarningId::WritablePathDirectory);
+            let note = &note.text;
             assert!(note.contains("types its name"), "{note}");
             // The advice keeps the directory out of the writable paths; another PATH for sandy
             // would only silence the warning.
