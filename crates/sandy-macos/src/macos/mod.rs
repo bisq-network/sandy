@@ -13,7 +13,7 @@ mod watch;
 
 use sandy_core::{
     Backend, ChildProcesses, ParentProcess, PlanItem, Requirement, ResolvedPolicy, SandboxError,
-    StatusReport, TargetCommand,
+    StatusReport, TargetCommand, Warning,
 };
 
 use std::ffi::CStr;
@@ -60,7 +60,7 @@ impl Backend for MacosBackend {
         self.host.plan(policy)
     }
 
-    fn notes(&self, policy: &ResolvedPolicy) -> Vec<String> {
+    fn notes(&self, policy: &ResolvedPolicy) -> Vec<Warning> {
         self.host.notes(policy)
     }
 

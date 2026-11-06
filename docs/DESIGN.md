@@ -99,7 +99,12 @@ obeys, but `sandy check` names every option that replaced a stricter value of th
 the isolation (`ResolvedPolicy::warnings`) and what the backend found on this host that makes the
 program behave differently inside the sandbox or that its platform gives only in part
 (`Backend::notes`). Warnings do not change what sandy enforces or its exit status; `sandy run`
-prints none, because its standard error belongs to the program.
+prints only the one about the fallback level it takes, because its standard error belongs to the
+program. Each warning has a stable ID (`WarningId`), which its line names in brackets; a caller
+that has accepted a warning hides it with `--hide-warning ID` and still sees every other one,
+including one a later release adds; `--no-warnings` hides all but those `--show-warning`
+names. Hiding is presentation only:
+`check --json` keeps every warning with its ID.
 
 sandy's own executable and the policy file get the checks of rules 3 and 4: sandy refuses to
 start when a writable path contains one of them, reaches one through a link or an alias, or

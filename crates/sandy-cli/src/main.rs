@@ -10,12 +10,12 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use args::{Command, Invocation, Mode, PolicySource, StatusTarget};
+use args::{Command, Invocation, Mode, PolicySource, StatusTarget, WarningFilter};
 use sandy_core::streams::{CreatableSocket, StandardStream};
 use sandy_core::{
     Backend, EnforcementPlan, Outcome, ParentProcess, Policy, PolicyError, ResolvedLevel,
-    ResolvedPolicy, Selection, SetupOptions, SetupOutcome, StatusReport, TargetCommand, select,
-    setup_levels, target_environment,
+    ResolvedPolicy, Selection, SetupOptions, SetupOutcome, StatusReport, TargetCommand, Warning,
+    WarningId, select, setup_levels, target_environment,
 };
 
 const EXIT_FAILURE: u8 = 125;
@@ -38,8 +38,8 @@ const STARTED_AS_VARIABLE: &str = "SANDY_STARTED_AS";
 /// It can only add that refusal, and the program never sees it.
 const PARENT_AT_START_VARIABLE: &str = "SANDY_PARENT_AT_START";
 
-/// Marks the advice `check` writes to standard error. `run` prints none: its standard error
-/// belongs to the program.
+/// Marks the advice `check` writes to standard error. `run` prints only the one about its
+/// fallback level: its standard error belongs to the program.
 const WARNING_PREFIX: &str = "warning: ";
 
 fn main() -> ExitCode {
@@ -572,11 +572,15 @@ fn sandbox(
     let resolved = &levels[index].policy;
     if has_levels {
         if index > 0 {
-            eprintln!(
-                "{WARNING_PREFIX}running fallback level {}: {}",
-                levels[index].name,
-                skipped(&levels, &selection.plans[..index])
+            let fallback = Warning::new(
+                WarningId::FallbackLevel,
+                format!(
+                    "running fallback level {}: {}",
+                    levels[index].name,
+                    skipped(&levels, &selection.plans[..index])
+                ),
             );
+            warn(&invocation.warning_filter, &fallback);
         }
         status.level(&levels[index].name);
     }
@@ -648,7 +652,7 @@ fn check(
     levels: &[ResolvedLevel],
     selection: &Selection,
     has_levels: bool,
-    weakened: &[String],
+    weakened: &[Warning],
 ) -> Result<ExitCode, String> {
     // The level the answers are about: the one that runs, the one that stopped the choice, or
     // the base when none is enforceable.
@@ -656,7 +660,7 @@ fn check(
         Outcome::Selected(index) | Outcome::Stopped(index) => index,
         Outcome::NoneEnforceable { .. } => 0,
     };
-    let warnings = |level: &ResolvedLevel| -> Vec<String> {
+    let warnings = |level: &ResolvedLevel| -> Vec<Warning> {
         let mut warnings = level.policy.warnings(home_directory().as_deref());
         warnings.extend(backend.notes(&level.policy));
         warnings
@@ -688,7 +692,7 @@ fn check(
         // On standard error and with a prefix of their own, so that a caller which reads the
         // one line per requirement that check prints keeps working (see README.md).
         for warning in warnings(&levels[shown]).iter().chain(weakened) {
-            eprintln!("{WARNING_PREFIX}{warning}");
+            warn(&invocation.warning_filter, warning);
         }
     }
     let code = match selection.outcome {
@@ -718,7 +722,7 @@ fn check(
         }
     };
     if invocation.json {
-        let level_warnings: Vec<Vec<String>> = levels
+        let level_warnings: Vec<Vec<Warning>> = levels
             .iter()
             .take(selection.plans.len())
             .map(warnings)
@@ -729,6 +733,13 @@ fn check(
         );
     }
     Ok(code)
+}
+
+/// Prints `warning` on standard error unless the caller hid it.
+fn warn(filter: &WarningFilter, warning: &Warning) {
+    if filter.shows(warning) {
+        eprintln!("{WARNING_PREFIX}{warning}");
+    }
 }
 
 /// `sandy setup` and `sandy setup --remove`, for every level the invocation has.

@@ -13,7 +13,7 @@ use landlock::{ABI, Access, AccessFs, AccessNet, BitFlags, Scope, make_bitflags}
 use sandy_core::{
     ChildProcesses, FileView, IpAccess, NetworkAccess, PathAccess, PathIdentity, PathMetadata,
     PathRule, PlanItem, PolicyError, ProtectedPath, Requirement, ResolvedPolicy, SignalScope,
-    SystemAccess,
+    SystemAccess, Warning, WarningId,
 };
 
 use crate::broker::BrokerConfig;
@@ -265,16 +265,17 @@ fn port_zero_binds(host: &HostCapabilities) -> u64 {
 /// policy does not cover, and a cgroup limit the program cannot see. Before them come the
 /// `shortfalls` of the policy. `sandy check` prints these as warnings; they change nothing sandy
 /// enforces, and a program that uses neither TLS nor the limits runs as it is.
-pub fn notes(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
+pub fn notes(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<Warning> {
     let mut notes = shortfalls(policy, host);
     if policy.ip == IpAccess::Client && policy.unix_sockets == NetworkAccess::All {
-        notes.push(
+        notes.push(Warning::new(
+            WarningId::IpClientUnixListen,
             "with ip = \"client\" the program cannot listen on a Unix socket either on Linux: \
              seccomp denies listen and accept for every socket, because it cannot tell a Unix \
              socket from an IP socket; a program that serves on a Unix socket needs ip = \"all\" \
              there (docs/linux.md, \"Client networking\")"
                 .to_string(),
-        );
+        ));
     }
     notes.extend(policy.mach_services_notes("Linux"));
     notes.extend(policy.path_directory_notes(&host.path_locations));
@@ -292,21 +293,26 @@ pub fn notes(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
         openssl::missing_includes(&system::openssl_configs(), &readable)
             .into_iter()
             .map(|missing| {
-                format!(
-                    "the OpenSSL configuration {} includes {}, which this policy does not let \
+                Warning::new(
+                    WarningId::OpensslInclude,
+                    format!(
+                        "the OpenSSL configuration {} includes {}, which this policy does not let \
                      the program read: OpenSSL drops an include it cannot read without an error \
                      and then runs with weaker built-in defaults, for example other TLS cipher \
                      suites. Add --read {} unless the program needs no cryptography",
-                    missing.config.display(),
-                    missing.target.display(),
-                    missing.target.display()
+                        missing.config.display(),
+                        missing.target.display(),
+                        missing.target.display()
+                    ),
                 )
             }),
     );
     let sees_own_cgroup =
         readable(Path::new("/proc/self/cgroup")) && readable(Path::new("/sys/fs/cgroup"));
     if !sees_own_cgroup {
-        notes.extend(cgroup::note(cgroup::limits()));
+        notes.extend(
+            cgroup::note(cgroup::limits()).map(|text| Warning::new(WarningId::CgroupLimit, text)),
+        );
     }
     notes
 }
@@ -314,7 +320,7 @@ pub fn notes(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
 /// What the policy asks for and Linux gives only in part, although the plan reports it as
 /// enforced (DESIGN.md, "Requirements and the enforcement plan"), each with the section of
 /// docs/linux.md that explains it.
-fn shortfalls(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
+fn shortfalls(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<Warning> {
     let mut shortfalls = Vec::new();
     if policy.ip == IpAccess::Client {
         let any_port = "at any port the program binds it to, because only Landlock ABI 10 \
@@ -326,15 +332,16 @@ fn shortfalls(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
             Ok(version) => format!("{any_port} and this kernel has ABI {version}"),
             Err(_) => any_port.to_string(),
         };
-        shortfalls.push(format!(
+        shortfalls.push(Warning::new(WarningId::IpClientUdp, format!(
             "ip = \"client\" keeps datagrams out only in part on Linux: a UDP socket that is not \
              connected receives datagrams from every sender, not only from the addresses it sent \
              to, {ports}; no seccomp or Landlock rule tells a reply from any other datagram \
              (docs/linux.md, \"Client networking\")"
-        ));
+        )));
     }
     if policy.signals == SignalScope::Isolated && policy.children != ChildProcesses::Contained {
-        shortfalls.push(
+        shortfalls.push(Warning::new(
+            WarningId::SignalsIsolatedTerminal,
             "signals = \"isolated\" is enforced only in part on Linux: when the program reads \
              from the terminal while its process group is in the background, the kernel stops \
              the whole group, and without children = \"contained\" that is the group sandy was \
@@ -342,25 +349,26 @@ fn shortfalls(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
              the shell that ran sandy from a script; children = \"contained\" gives the program \
              a group of its own (docs/linux.md, \"Signals and the terminal\")"
                 .to_string(),
-        );
+        ));
     }
     if policy.ip == IpAccess::Private {
         let ports = match policy.egress {
             Some(_) => "the program's ports, forwarded ports and egress port",
             None => "the program's ports and forwarded ports",
         };
-        shortfalls.push(format!(
+        shortfalls.push(Warning::new(WarningId::IpPrivateSameUser, format!(
             "ip = \"private\" keeps out other users, but not this user, on Linux: the sandbox's \
              network namespace belongs to the user that runs sandy, so a process of this user \
              outside the sandbox can enter it (nsenter) and reach {ports} there without a \
              relay, as it reaches them directly with ip = \"all\"; no process of another user \
              can (docs/linux.md, \"Private network\")"
-        ));
+        )));
     }
     // With ip = "private" the forward listener is in the sandbox's network namespace, which no
     // other user reaches.
     if !policy.forward.is_empty() && policy.ip != IpAccess::Private {
-        shortfalls.push(
+        shortfalls.push(Warning::new(
+            WarningId::ForwardOtherUsers,
             "a forwarded port keeps other users out only in part on Linux: the relay refuses a \
              connection that the kernel names as another user's, but once the client has closed \
              its socket the kernel names no owner, at once on Linux 6.8 and after a moment on \
@@ -369,7 +377,7 @@ fn shortfalls(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
              forward only to services that are safe against such a write or authenticate their \
              clients (docs/linux.md, \"Exposed and forwarded ports\")"
                 .to_string(),
-        );
+        ));
     }
     // In a file system view these paths are read-only binds, where the calls fail with EROFS.
     let read_only = |rule: &PathRule| rule.access != PathAccess::ReadWrite;
@@ -377,7 +385,8 @@ fn shortfalls(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
         && policy.view == FileView::All
         && policy.paths.iter().any(read_only)
     {
-        shortfalls.push(
+        shortfalls.push(Warning::new(
+            WarningId::PathMetadataOpenFiles,
             "path_metadata = \"deny\" is enforced only in part on Linux: through a descriptor it \
              opened for reading, the program can still change the mode, except the setuid and \
              setgid bits, and the times of a file or directory it may only read (fchmod, \
@@ -387,7 +396,7 @@ fn shortfalls(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
              owner and the extended attributes stay protected (docs/linux.md, \"Metadata \
              through open files\")"
                 .to_string(),
-        );
+        ));
     }
     if policy.view == FileView::Policy {
         shortfalls.extend(view_shortfalls(policy));
@@ -396,44 +405,45 @@ fn shortfalls(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<String> {
 }
 
 /// What a file system view leaves visible of the host (docs/linux.md, "File system view").
-fn view_shortfalls(policy: &ResolvedPolicy) -> Vec<String> {
+fn view_shortfalls(policy: &ResolvedPolicy) -> Vec<Warning> {
     let hides = "filesystem.view = \"policy\" hides paths only in part on Linux";
     if policy.paths.iter().any(|rule| rule.path == Path::new("/")) {
-        return vec![
+        return vec![Warning::new(
+            WarningId::ViewHoldsRoot,
             "filesystem.view = \"policy\" hides nothing here: the policy makes / readable, so the \
              view holds the whole file system of the host; grant the directories the program \
-             needs instead of / (docs/linux.md, \"File system view\")"
-                .to_string(),
-        ];
+             needs instead of / (docs/linux.md, \"File system view\")",
+        )];
     }
+    let partial = |text: String| Warning::new(WarningId::ViewPartial, text);
     let mut shortfalls = vec![
-        format!(
+        partial(format!(
             "{hides}: statfs on a path of the view reports the host's file system there, its \
              type, size, free space and number of files, because the view binds the host's own \
              file systems (docs/linux.md, \"File system view\")"
-        ),
-        format!(
+        )),
+        partial(format!(
             "{hides}: the directories above a granted path exist in the view with their names, \
              for example /home and /home/user above a granted /home/user/project, though the \
              program cannot list them (docs/linux.md, \"File system view\")"
-        ),
-        format!(
+        )),
+        partial(format!(
             "{hides}: the link count of a granted file still counts its names outside the view, \
              so the program learns that a file has another name, though not where \
              (docs/linux.md, \"File system view\")"
-        ),
+        )),
     ];
     let proc_granted = policy
         .paths
         .iter()
         .any(|rule| rule.path.starts_with("/proc") || Path::new("/proc").starts_with(&rule.path));
     if proc_granted {
-        shortfalls.push(format!(
+        shortfalls.push(Warning::new(WarningId::ViewPartial, format!(
             "{hides}: with /proc granted, /proc/self/mountinfo lists every mount of the view with \
              the host's device and file system and their mount options, for example the name of \
              an encrypted volume, and the mount table of a process outside the sandbox lists the \
              host's mounts with their paths (docs/linux.md, \"File system view\")"
-        ));
+        )));
     }
     shortfalls
 }
@@ -1697,7 +1707,7 @@ mod tests {
         let warned = |policy: &ResolvedPolicy, text: &str| {
             notes(policy, &host(Some(9)))
                 .iter()
-                .any(|note| note.contains(text))
+                .any(|note| note.text.contains(text))
         };
         let forward = "another local user can deliver a write";
         let own_user = "a process of this user outside the sandbox can enter it";
@@ -1855,14 +1865,16 @@ mod tests {
         let hides_nothing = |policy: &ResolvedPolicy| {
             notes(policy, &host(Some(9)))
                 .iter()
-                .any(|note| note.contains("hides nothing here"))
+                .any(|note| note.text.contains("hides nothing here"))
         };
         assert!(!hides_nothing(&policy));
         policy.paths.push(rule("/", PathAccess::Read, true));
         assert!(hides_nothing(&policy));
         let notes = notes(&policy, &host(Some(9)));
         assert!(
-            !notes.iter().any(|note| note.contains("statfs on a path")),
+            !notes
+                .iter()
+                .any(|note| note.text.contains("statfs on a path")),
             "{notes:?}"
         );
         policy.view = FileView::All;
@@ -1876,7 +1888,7 @@ mod tests {
         let warned = |policy: &ResolvedPolicy, text: &str| {
             notes(policy, &host(Some(9)))
                 .iter()
-                .any(|note| note.contains(text))
+                .any(|note| note.text.contains(text))
         };
         let metadata = "path_metadata = \"deny\" is enforced only in part";
         let view_notes = [
@@ -2337,7 +2349,8 @@ mod tests {
         let udp = |abi| {
             notes(&policy, &host(Some(abi)))
                 .into_iter()
-                .find(|note| note.starts_with("ip = \"client\" keeps datagrams out only in part"))
+                .find(|note| note.id == WarningId::IpClientUdp)
+                .map(|note| note.text)
                 .unwrap_or_else(|| panic!("ABI {abi}: no UDP note"))
         };
         assert!(
@@ -2349,7 +2362,7 @@ mod tests {
         let unix = |policy: &ResolvedPolicy| {
             notes(policy, &host(Some(10)))
                 .iter()
-                .any(|note| note.contains("cannot listen on a Unix socket either"))
+                .any(|note| note.text.contains("cannot listen on a Unix socket either"))
         };
         assert!(!unix(&policy));
         policy.unix_sockets = NetworkAccess::All;
@@ -2359,7 +2372,7 @@ mod tests {
         assert!(
             !notes(&policy, &host(Some(10)))
                 .iter()
-                .any(|note| note.contains("keeps datagrams out"))
+                .any(|note| note.text.contains("keeps datagrams out"))
         );
     }
 
@@ -2487,7 +2500,7 @@ mod tests {
         assert_eq!(unavailable(&plan), vec![]);
         let notes = notes(&policy(), &host);
         assert!(
-            notes.iter().any(|note| note.contains("/data/bin")),
+            notes.iter().any(|note| note.text.contains("/data/bin")),
             "{notes:?}"
         );
 

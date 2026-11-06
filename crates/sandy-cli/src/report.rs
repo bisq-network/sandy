@@ -3,7 +3,7 @@
 
 use std::fmt::Write;
 
-use sandy_core::{EnforcementPlan, Outcome, ResolvedLevel, Selection, Status};
+use sandy_core::{EnforcementPlan, Outcome, ResolvedLevel, Selection, Status, Warning};
 
 /// The plan of each level `check` tried, for a policy with fallback levels: a `[NAME]` line and
 /// the plan of that level, and then `level: NAME` for the level that runs, or `level: none`. A
@@ -30,8 +30,8 @@ pub fn json(
     backend: &str,
     levels: &[ResolvedLevel],
     selection: &Selection,
-    level_warnings: &[Vec<String>],
-    warnings: &[String],
+    level_warnings: &[Vec<Warning>],
+    warnings: &[Warning],
 ) -> String {
     let (selected, setup_helps) = match selection.outcome {
         Outcome::Selected(index) => (Some(levels[index].name.as_str()), false),
@@ -46,15 +46,15 @@ pub fn json(
         .collect();
     format!(
         "{{\"backend\":{},\"selected\":{},\"setup_would_help\":{setup_helps},\"levels\":[{}],\
-         \"warnings\":{}}}",
+         {}}}",
         string(backend),
         selected.map_or_else(|| "null".to_string(), string),
         tried.join(","),
-        strings(warnings),
+        warnings_json(warnings),
     )
 }
 
-fn level_json(name: &str, plan: &EnforcementPlan, warnings: &[String]) -> String {
+fn level_json(name: &str, plan: &EnforcementPlan, warnings: &[Warning]) -> String {
     let mut enforced = Vec::new();
     let mut missing = Vec::new();
     for item in plan.items() {
@@ -80,19 +80,27 @@ fn level_json(name: &str, plan: &EnforcementPlan, warnings: &[String]) -> String
     }
     format!(
         "{{\"name\":{},\"enforceable\":{},\"needs_setup\":{},\"enforced\":[{}],\"missing\":[{}],\
-         \"warnings\":{}}}",
+         {}}}",
         string(name),
         plan.is_enforceable(),
         plan.needs_only_setup(),
         enforced.join(","),
         missing.join(","),
-        strings(warnings),
+        warnings_json(warnings),
     )
 }
 
-fn strings(texts: &[String]) -> String {
-    let items: Vec<String> = texts.iter().map(|text| string(text)).collect();
-    format!("[{}]", items.join(","))
+/// The `warnings` key, the texts, and after it `warning_ids`, the ID of each in the same order.
+fn warnings_json(warnings: &[Warning]) -> String {
+    let list = |item: &dyn Fn(&Warning) -> String| {
+        let items: Vec<String> = warnings.iter().map(item).collect();
+        format!("[{}]", items.join(","))
+    };
+    format!(
+        "\"warnings\":{},\"warning_ids\":{}",
+        list(&|warning| string(&warning.text)),
+        list(&|warning| string(warning.id.as_str()))
+    )
 }
 
 /// `text` as a JSON string (RFC 8259).
@@ -119,7 +127,7 @@ fn string(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sandy_core::{PlanItem, Policy, Requirement, ResolvedPolicy, select};
+    use sandy_core::{PlanItem, Policy, Requirement, ResolvedPolicy, WarningId, select};
 
     #[test]
     fn strings_are_escaped() {
@@ -173,8 +181,12 @@ mod tests {
     fn the_json_has_the_documented_keys() {
         let levels = levels();
         let selection = selection(&levels);
-        let notes = [vec!["w\"1".to_string()], Vec::new()];
-        let json = json("linux", &levels, &selection, &notes, &["option".into()]);
+        let notes = [
+            vec![Warning::new(WarningId::SignalsAny, "w\"1")],
+            Vec::new(),
+        ];
+        let option = Warning::new(WarningId::OptionWidensPolicy, "option");
+        let json = json("linux", &levels, &selection, &notes, &[option]);
         assert!(!json.contains('\n'), "{json}");
         assert!(
             json.starts_with(
@@ -186,7 +198,8 @@ mod tests {
         assert!(
             json.contains(
                 "\"missing\":[{\"requirement\":\"ip-network-private\",\"status\":\"needs-setup\",\
-                 \"reason\":\"no \\\"namespaces\\\"\"}],\"warnings\":[\"w\\\"1\"]}"
+                 \"reason\":\"no \\\"namespaces\\\"\"}],\"warnings\":[\"w\\\"1\"],\
+                 \"warning_ids\":[\"signals-any\"]}"
             ),
             "{json}"
         );
@@ -196,6 +209,13 @@ mod tests {
             ),
             "{json}"
         );
-        assert!(json.ends_with("\"warnings\":[\"option\"]}"), "{json}");
+        assert!(
+            json.contains("\"warnings\":[],\"warning_ids\":[]}"),
+            "{json}"
+        );
+        assert!(
+            json.ends_with("\"warnings\":[\"option\"],\"warning_ids\":[\"option-widens-policy\"]}"),
+            "{json}"
+        );
     }
 }

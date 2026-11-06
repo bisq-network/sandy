@@ -18,8 +18,8 @@ use std::os::windows::io::AsRawSocket;
 
 use sandy_core::{
     Backend, ChildProcesses, PathRule, PlanItem, ProtectedPath, Requirement, ResolvedLevel,
-    ResolvedPolicy, SandboxError, SetupOptions, SetupOutcome, StatusReport, TargetCommand, Win32k,
-    path_directories,
+    ResolvedPolicy, SandboxError, SetupOptions, SetupOutcome, StatusReport, TargetCommand, Warning,
+    WarningId, Win32k, path_directories,
 };
 use windows_sys::Win32::Security::{
     WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
@@ -103,7 +103,7 @@ impl Backend for WindowsBackend {
     /// requirements: the networks `ip = "client"` cannot reach (`plan::notes`) and a directory on
     /// sandy's PATH inside a writable path (rule 12). Before them come the shortfalls of the
     /// policy (`plan::shortfalls`).
-    fn notes(&self, policy: &ResolvedPolicy) -> Vec<String> {
+    fn notes(&self, policy: &ResolvedPolicy) -> Vec<Warning> {
         let mut notes = crate::plan::shortfalls(policy);
         notes.extend(crate::plan::notes(policy));
         notes.extend(policy.mach_services_notes("Windows"));
@@ -701,18 +701,20 @@ fn path_locations() -> Vec<ProtectedPath> {
 /// admit no AppContainer, so `user32.dll` cannot initialize in the program (docs/windows.md,
 /// limitation 13). Interactive users have sessions of their own since Windows Vista. A note,
 /// not a requirement: a program without `user32.dll` runs there.
-fn session_note() -> Option<String> {
+fn session_note() -> Option<Warning> {
     use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 
     let mut session = u32::MAX;
     // SAFETY: session is a valid out pointer.
     let found = unsafe { ProcessIdToSessionId(std::process::id(), &mut session) } != 0;
     (found && session == 0).then(|| {
-        "sandy runs in session 0, where services and SSH sessions run, and its window stations \
+        Warning::new(
+            WarningId::SessionZero,
+            "sandy runs in session 0, where services and SSH sessions run, and its window stations \
          admit no AppContainer: a program that loads user32.dll ends there with \
          STATUS_DLL_INIT_FAILED (0xC0000142) before it runs; run it from a desktop session \
-         (docs/windows.md, \"Known limitations\")"
-            .to_string()
+         (docs/windows.md, \"Known limitations\")",
+        )
     })
 }
 
