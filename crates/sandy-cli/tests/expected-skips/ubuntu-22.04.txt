@@ -74,3 +74,5 @@ review_linux_conformance a_cgroup_limit_is_invisible_and_reported user-cpu-contr
 # /etc/resolv.conf is a plain file on some machines of this runner, so the check of
 # systemd-resolved's directory runs only on the others (seen on ubuntu-22.04 and ubuntu-24.04).
 ? escape_linux the_resolver_directory_is_granted_with_ip resolver-directory
+# ecryptfs-utils is not installed, so the test cannot mount eCryptfs.
+escape_linux a_directory_on_ecryptfs_can_be_listed_and_its_lower_directory_stays_closed ecryptfs

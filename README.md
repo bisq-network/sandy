@@ -641,6 +641,7 @@ releases.
 | `contained-posix-spawn` | macOS | `children = "contained"` denies `posix_spawn` |
 | `openssl-include` | Linux | an OpenSSL include the policy does not let the program read |
 | `cgroup-limit` | Linux | a cgroup limit the program cannot see |
+| `ecryptfs-unlisted` | Linux | a granted directory on eCryptfs that the program cannot list |
 | `appcontainer-shared` | Windows | a named AppContainer is shared with every user of the machine |
 | `grant-follows-file` | Windows | a grant follows the file, not the path |
 | `session-zero` | Windows | sandy runs in session 0 |

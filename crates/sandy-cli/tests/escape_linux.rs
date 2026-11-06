@@ -2388,3 +2388,272 @@ fn client_denies_listening_on_unix_sockets_too() {
     assert_eq!(line.result, "denied", "{line:?}");
     assert!(line.detail.contains("os error 1)"), "not EPERM: {line:?}");
 }
+
+fn path_arg(path: &Path) -> String {
+    path.to_str().unwrap().to_string()
+}
+
+/// An eCryptfs mount over a directory of this test, made with `sudo -n` and file name
+/// encryption, as Linux Mint and Ubuntu make an encrypted home directory. Unmounted on drop.
+struct Ecryptfs {
+    root: PathBuf,
+    upper: PathBuf,
+    lower: PathBuf,
+    /// Bind mounts of directories of `upper`, unmounted first.
+    binds: Vec<PathBuf>,
+}
+
+impl Ecryptfs {
+    /// `None`, with a skip recorded, where this host cannot make one.
+    fn mount(name: &str) -> Option<Ecryptfs> {
+        let sudo = |args: &[&str]| {
+            Command::new("sudo")
+                .arg("-n")
+                .args(args)
+                .stdin(Stdio::null())
+                .output()
+                .is_ok_and(|output| output.status.success())
+        };
+        if !sudo(&["true"]) {
+            skip(
+                "passwordless-sudo",
+                "mounting eCryptfs needs root, and sudo -n asks for a password here",
+            );
+            return None;
+        }
+        if !Path::new("/sbin/mount.ecryptfs").exists() {
+            skip(
+                "ecryptfs",
+                "mount.ecryptfs (ecryptfs-utils) is not installed",
+            );
+            return None;
+        }
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("sandy-ecryptfs-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (upper, lower) = (root.join("upper"), root.join("lower"));
+        fs::create_dir_all(&upper).unwrap();
+        fs::create_dir_all(&lower).unwrap();
+        let options = "key=passphrase:passphrase_passwd=sandy-test,ecryptfs_cipher=aes,\
+            ecryptfs_key_bytes=16,ecryptfs_passthrough=n,no_sig_cache";
+        let (from, onto) = (path_arg(&lower), path_arg(&upper));
+        let mount = |extra: &str| {
+            sudo(&[
+                "mount",
+                "-t",
+                "ecryptfs",
+                &from,
+                &onto,
+                "-o",
+                &format!("{options},{extra}"),
+            ])
+        };
+        if !mount("ecryptfs_enable_filename_crypto=n") {
+            let _ = fs::remove_dir_all(&root);
+            skip("ecryptfs", "this kernel mounts no eCryptfs");
+            return None;
+        }
+        let mounted = Ecryptfs {
+            root,
+            upper,
+            lower,
+            binds: Vec::new(),
+        };
+        // The key of the file names is the one of the contents, whose signature only the
+        // mount tells.
+        let table = fs::read_to_string("/proc/self/mountinfo").unwrap();
+        let signature = table
+            .lines()
+            .find(|line| line.split(' ').nth(4) == mounted.upper.to_str())
+            .and_then(|line| line.split("ecryptfs_sig=").nth(1))
+            .and_then(|rest| rest.split([',', ' ']).next())
+            .unwrap()
+            .to_string();
+        assert!(sudo(&["umount", &onto]));
+        assert!(mount(&format!(
+            "ecryptfs_enable_filename_crypto=y,ecryptfs_fnek_sig={signature}"
+        )));
+        Some(mounted)
+    }
+
+    /// Binds the eCryptfs directory `directory` at `at`: a mount whose root is not the root of
+    /// the eCryptfs file system.
+    fn bind(&mut self, directory: &Path, at: &Path) {
+        fs::create_dir_all(at).unwrap();
+        let status = Command::new("sudo")
+            .args(["-n", "mount", "--bind"])
+            .args([directory, at])
+            .stdin(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        self.binds.push(at.to_path_buf());
+    }
+
+    /// The lower directory or file of `upper`, found as eCryptfs keeps it: by inode.
+    fn lower_of(&self, upper: &Path) -> PathBuf {
+        let mut lower = self.lower.clone();
+        let mut walked = self.upper.clone();
+        for name in upper.strip_prefix(&self.upper).unwrap() {
+            walked.push(name);
+            let inode = walked.symlink_metadata().unwrap().ino();
+            lower = fs::read_dir(&lower)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.symlink_metadata().unwrap().ino() == inode)
+                .unwrap();
+        }
+        lower
+    }
+}
+
+impl Drop for Ecryptfs {
+    fn drop(&mut self) {
+        // mount.ecryptfs mounts with ecryptfs_unlink_sigs, so the unmount also takes the key
+        // out of root's keyring.
+        for point in self.binds.iter().rev().chain([&self.upper]) {
+            let _ = Command::new("sudo")
+                .args(["-n", "umount"])
+                .arg(point)
+                .stdin(Stdio::null())
+                .status();
+        }
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+/// eCryptfs opens the lower directory of a directory with the credentials of the program, so
+/// Landlock checks that open too. sandy lets the program list the lower directory of a granted
+/// directory and nothing else there: not the files in it, not the lower directory of a directory
+/// outside the policy.
+#[test]
+fn a_directory_on_ecryptfs_can_be_listed_and_its_lower_directory_stays_closed() {
+    let Some(mut mount) = Ecryptfs::mount("list") else {
+        return;
+    };
+    let data = mount.upper.join("app").join("data");
+    let other = mount.upper.join("other");
+    fs::create_dir_all(data.join("keys")).unwrap();
+    fs::create_dir_all(&other).unwrap();
+    fs::write(data.join("state"), "state").unwrap();
+    fs::write(other.join("secret"), "secret").unwrap();
+    let lower_data = mount.lower_of(&data);
+    assert_ne!(
+        lower_data.file_name(),
+        data.file_name(),
+        "names not encrypted"
+    );
+    let lower_state = mount.lower_of(&data.join("state"));
+    let lower_other = mount.lower_of(&other);
+    let lower_parent = lower_data.parent().unwrap().to_path_buf();
+
+    let (data_arg, keys, state, created, made) = (
+        path_arg(&data),
+        path_arg(&data.join("keys")),
+        path_arg(&data.join("state")),
+        path_arg(&data.join("created")),
+        path_arg(&data.join("made")),
+    );
+    let (lower_data_arg, lower_state_arg, lower_other_arg, lower_parent_arg) = (
+        path_arg(&lower_data),
+        path_arg(&lower_state),
+        path_arg(&lower_other),
+        path_arg(&lower_parent),
+    );
+    let other_arg = path_arg(&other);
+    let granted = [
+        ("list", data_arg.as_str()),
+        ("list", keys.as_str()),
+        ("read", state.as_str()),
+        ("write", created.as_str()),
+        ("mkdir", made.as_str()),
+        ("list", made.as_str()),
+    ];
+    let (lower_written, lower_made) = (
+        path_arg(&lower_data.join("written")),
+        path_arg(&lower_data.join("made")),
+    );
+    let closed = [
+        ("read", lower_state_arg.as_str()),
+        ("write", lower_written.as_str()),
+        ("mkdir", lower_made.as_str()),
+        ("list", lower_other_arg.as_str()),
+        ("list", lower_parent_arg.as_str()),
+        ("list", other_arg.as_str()),
+    ];
+    for line in probe_outside(&closed) {
+        line.assert_ok();
+    }
+    fs::remove_file(&lower_written).unwrap();
+    fs::remove_dir(&lower_made).unwrap();
+    let sandbox = args(&["--read-write", &data_arg]);
+    let mut actions: Vec<(&str, &str)> = granted.to_vec();
+    actions.extend(closed);
+    let lines = probe_inside(&sandbox, &actions);
+    for line in &lines[..granted.len()] {
+        line.assert_ok();
+    }
+    for line in &lines[granted.len()..] {
+        line.assert_blocked();
+    }
+    // Only the right to list: what the program lists there it already lists under its name.
+    let lines = probe_inside(&sandbox, &[("list", lower_data_arg.as_str())]);
+    lines[0].assert_ok();
+
+    let check = sandy(["check", "--read-write", &data_arg]);
+    assert!(
+        !String::from_utf8_lossy(&check.stderr).contains("ecryptfs-unlisted"),
+        "{check:?}"
+    );
+
+    // A bind mount of an eCryptfs subdirectory names no lower directory sandy can trust, so it
+    // gets no rule, and check says that the program cannot list it.
+    let bound = mount.root.join("bound");
+    mount.bind(&other, &bound);
+    let bound_arg = path_arg(&bound);
+    let check = sandy(["check", "--read-write", &bound_arg]);
+    let warnings = String::from_utf8_lossy(&check.stderr);
+    assert!(
+        warnings.contains("ecryptfs-unlisted") && warnings.contains(&bound_arg),
+        "{check:?}"
+    );
+    probe_inside(
+        &args(&["--read-write", &bound_arg]),
+        &[("list", &bound_arg)],
+    )[0]
+    .assert_blocked();
+
+    // The view does not show the lower directories, and the granted listings still work, since
+    // Landlock checks the lower directory by its inode.
+    let mut view = sandbox.clone();
+    view.extend(args(&["--view", "policy"]));
+    if !sandy(["check", "--view", "policy"]).status.success() {
+        skip(
+            "user-namespaces",
+            "this host gives sandy no file system view",
+        );
+        return;
+    }
+    let listed = [
+        ("list", data_arg.as_str()),
+        ("list", keys.as_str()),
+        ("list", made.as_str()),
+        ("read", state.as_str()),
+    ];
+    let hidden = [
+        ("list", lower_data_arg.as_str()),
+        ("list", lower_other_arg.as_str()),
+        ("read", lower_state_arg.as_str()),
+    ];
+    let mut actions: Vec<(&str, &str)> = listed.to_vec();
+    actions.extend(hidden);
+    let lines = probe_inside(&view, &actions);
+    for line in &lines[..listed.len()] {
+        line.assert_ok();
+    }
+    for line in &lines[listed.len()..] {
+        line.assert_blocked();
+    }
+}

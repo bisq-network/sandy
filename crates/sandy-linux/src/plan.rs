@@ -18,6 +18,7 @@ use sandy_core::{
 
 use crate::broker::BrokerConfig;
 use crate::cgroup;
+use crate::ecryptfs;
 use crate::filter::FilterConfig;
 use crate::host::{self, HostCapabilities, Missing, Support};
 use crate::launch;
@@ -75,6 +76,12 @@ pub struct LandlockConfig {
     pub handled_net: BitFlags<AccessNet>,
     pub scopes: BitFlags<Scope>,
     pub rules: Vec<PathRights>,
+    /// The lower directories of the eCryptfs directories that `rules` let the program list,
+    /// which only Landlock needs: the file system view does not show them (`ecryptfs`).
+    pub lower: Vec<PathRights>,
+    /// The eCryptfs directories of `rules` whose lower directory sandy did not find, which the
+    /// program cannot list.
+    pub unlisted: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -162,7 +169,7 @@ pub fn plan_for(policy: &ResolvedPolicy, host: &HostCapabilities) -> LinuxPlan {
     // Before the checks below, so that a file swapped in while they run is not the one bound.
     let identities: BTreeMap<PathBuf, FileIdentity> = landlock
         .iter()
-        .flat_map(|landlock| &landlock.rules)
+        .flat_map(|landlock| landlock.rules.iter().chain(&landlock.lower))
         .filter_map(|rule| Some((rule.path.clone(), launch::identity(&rule.path)?)))
         .collect();
     let obstacle = match &identity {
@@ -279,10 +286,24 @@ pub fn notes(policy: &ResolvedPolicy, host: &HostCapabilities) -> Vec<Warning> {
     }
     notes.extend(policy.mach_services_notes("Linux"));
     notes.extend(policy.path_directory_notes(&host.path_locations));
-    let Some(rules) = landlock_for(policy, host).map(|landlock| landlock.rules) else {
+    let Some(landlock) = landlock_for(policy, host) else {
         // Without Landlock the policy is refused anyway, and there are no rules to compare with.
         return notes;
     };
+    let rules = landlock.rules;
+    notes.extend(landlock.unlisted.into_iter().map(|directory| {
+        Warning::new(
+            WarningId::EcryptfsUnlisted,
+            format!(
+                "{} lies on eCryptfs, and sandy did not find the directory eCryptfs \
+                         stores it in, which Landlock also checks when the program lists it: \
+                         the program cannot list it, although it can usually open the files \
+                         in it \
+                         (docs/linux.md, \"eCryptfs\")",
+                directory.display()
+            ),
+        )
+    }));
     let readable = |path: &Path| {
         let covers = |rule: &PathRights| {
             rule.access.contains(AccessFs::ReadFile) && path.starts_with(&rule.path)
@@ -1108,6 +1129,7 @@ fn landlock_config(
         rules.push(rule);
     }
     rules.retain(|rule| !rule.access.is_empty());
+    let lower = ecryptfs::lower_directories(&rules);
 
     LandlockConfig {
         abi,
@@ -1115,6 +1137,8 @@ fn landlock_config(
         handled_net,
         scopes,
         rules,
+        lower: lower.rules,
+        unlisted: lower.unfound,
     }
 }
 
