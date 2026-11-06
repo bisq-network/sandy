@@ -90,6 +90,7 @@ relays = "dual-stack"         # "dual-stack" | "ipv4"; ipv4: the program reaches
 [windows]
 appcontainer_name = "example.app"  # required on Windows
 win32k = "allow"              # "allow" | "deny"; deny blocks win32k (GUI kernel) system calls
+junctions = "grant"           # "grant" | "refuse"; refuse: sandy changes no junction
 ```
 
 Command line options extend the policy file (`sandy --help`): path options add paths, and every
@@ -1015,7 +1016,9 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
 - Setuid and setgid files never execute. The root of a writable path cannot be deleted or
   replaced, so the target cannot redirect the next run with a symbolic link.
 - Outside the policy every path answers `ENOENT`, as a path that does not exist, to every call,
-  and every other process `ESRCH`; `getpriority`, `getpgid` and `getsid` are denied by number.
+  and every other process `ESRCH`, except for the symbolic links that the policy's names pass:
+  their own metadata and target text, and the metadata of the directories above them, are
+  readable (docs/macos.md, "The generated profile"); `getpriority`, `getpgid` and `getsid` are denied by number.
   Writes to a `read` path keep `EPERM`. With `unix_sockets = "all"`, `access`, `statfs`,
   `chdir` and the path from `getattrlist` answer for every path again, because a connect to a
   socket outside the policy needs that check. `kill(pid, 0)` still tells a live process ID from
@@ -1107,7 +1110,9 @@ Details, limitations and sources: `docs/windows.md`.
   through a lock file of the user and keyed on the AppContainer SID, because Windows derives the
   SID from the name without regard to case.
 - File grants: one capability per policy path (named after the AppContainer, the level and the
-  file ID), with one inheritable ACE on the path. The program starts with the capabilities of the
+  file ID), with one inheritable ACE on the path, and with `windows.junctions = "grant"` one more
+  per junction of this user on the way to a directory policy path: a read ACE without
+  inheritance on the junction itself (docs/windows.md, "Links and identity"). The program starts with the capabilities of the
   current policy only, so grants of older policies grant nothing. A run never removes grants
   (`sandy setup --remove` does) and serializes its DACL changes with a lock file of the user, so
   concurrent runs do not conflict.

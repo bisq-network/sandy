@@ -584,6 +584,7 @@ it does nothing.
 | `--pass-env NAME` | Copy the variable `NAME` into the program's environment, if it is set. | |
 | `--set-env NAME=VALUE` | Set a variable in the program's environment. Overrides `--pass-env`. | |
 | `--appcontainer NAME` | The AppContainer name (Windows; required there). | |
+| `--windows-junctions grant\|refuse` | On Windows, whether sandy may add a read entry to a junction on the way to a directory policy path, so that the program can open the directory under the junction's name. `refuse` changes nothing but the policy paths and makes such a path a conflict. | `grant` |
 | `--windows-win32k allow\|deny` | On Windows, whether the program may make the system calls of win32k (the GUI part of the kernel). `deny` stops many programs that load `user32.dll`. | `allow` |
 | `--cwd DIR` | Working directory of the program. | sandy's |
 
@@ -643,6 +644,7 @@ releases.
 | `appcontainer-shared` | Windows | a named AppContainer is shared with every user of the machine |
 | `grant-follows-file` | Windows | a grant follows the file, not the path |
 | `session-zero` | Windows | sandy runs in session 0 |
+| `junction-closed` | Windows | a junction on the way to a directory policy path that sandy does not open for the program |
 
 ### Finding the grants a program needs
 
@@ -782,6 +784,7 @@ mach_services = []              # ["com.apple.trustd.agent"]: the certificate ve
 [windows]
 appcontainer_name = "example.app"
 win32k = "allow"                # "allow" | "deny"; deny blocks win32k system calls
+junctions = "grant"             # "grant" | "refuse"; refuse: sandy changes no junction
 ```
 
 The block names every key; it is not a policy that runs as written, because `expose` needs
@@ -1319,7 +1322,10 @@ people and can change. A policy without levels has one entry in `levels`, named 
   AppContainer without administrator rights, so the program can tell an existing path outside
   the policy from a missing one.
 - **File grants.** sandy grants access by adding entries to the access control lists of the
-  policy paths. These entries stay; they grant nothing to programs outside this AppContainer.
+  policy paths, and a read entry to those of this user's junctions on the way to directory
+  policy paths, so that the program can open such a directory under the junction's name
+  (`junctions = "refuse"` keeps sandy from the junctions and refuses such a policy instead).
+  These entries stay; they grant nothing to programs outside this AppContainer.
   `docs/windows.md` explains how to remove them and the profile.
 - **Private folder.** Windows gives every AppContainer a private folder (its `TEMP`). The program
   can always write there, but sandy makes sure it cannot execute anything it writes there.

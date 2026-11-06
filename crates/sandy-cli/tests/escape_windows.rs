@@ -4234,3 +4234,375 @@ fn check_warns_in_session_0() {
         session[0]
     );
 }
+
+/// Makes `link` a junction to `target`, outside the sandbox.
+fn make_junction(link: &Path, target: &Path) {
+    let status = Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(plain_path(link))
+        .arg(plain_path(target))
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "mklink /J {}", link.display());
+}
+
+/// The capability entries on the junction object itself, not on its target.
+fn junction_capability_entries(link: &Path) -> usize {
+    let output = Command::new("icacls")
+        .arg(plain_path(link))
+        .arg("/L")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8_lossy(&output.stdout)
+        .matches("S-1-15-3-1024-")
+        .count()
+}
+
+/// A directory policy path named through a junction opens under that name, as on Linux and
+/// macOS: Windows checks the access a program asks for on the junction itself when the path
+/// ends there, so sandy grants read on the junction, on each junction of a chain. Files below it
+/// need nothing of the junction, and writing works through it into a writable path; the
+/// directory's own attributes change only under its own name, since that needs a write right on
+/// the junction. A directory symbolic link needs nothing of its own.
+#[test]
+fn a_directory_policy_path_named_through_a_junction_opens_under_that_name() {
+    let fixture = Fixture::new("junction-name");
+    make_junction(&fixture.path("j"), &fixture.path("ro"));
+    make_junction(&fixture.path("j2"), &fixture.path("rw"));
+    make_junction(&fixture.path("j1"), &fixture.path("j2"));
+    // A directory inside the granted `ro`, reached through a junction of its own.
+    fs::create_dir_all(fixture.path("ro/sub")).unwrap();
+    fs::write(fixture.path("ro/sub/file"), b"content").unwrap();
+    make_junction(&fixture.path("inner"), &fixture.path("ro/sub"));
+    let (j, j1) = (fixture.arg("j"), fixture.arg("j1"));
+    let inner = fixture.arg("inner");
+    let inner_file = fixture.arg("inner/file");
+    let new_file = fixture.arg("j1/new");
+    let rw = fixture.arg("rw");
+    let actions = [
+        ("list", j.as_str()),
+        ("read", &fixture.arg("j/file")),
+        ("list", j1.as_str()),
+        ("write", new_file.as_str()),
+        ("read", new_file.as_str()),
+        ("set-readonly", rw.as_str()),
+        ("set-writable", rw.as_str()),
+        ("set-readonly", j1.as_str()),
+        ("list", inner.as_str()),
+    ];
+    let policy = args(&["--read", &j, "--read-write", &j1, "--read", &inner_file]);
+    let lines = probe_inside(&policy, &actions);
+    for line in &lines[..7] {
+        line.assert_ok();
+    }
+    lines[7].assert_blocked();
+    lines[8].assert_ok();
+
+    let link = fixture.path("s");
+    if std::os::windows::fs::symlink_dir(fixture.path("bin"), &link).is_err() {
+        skip(
+            "symbolic-links",
+            "this session may not create symbolic links",
+        );
+    } else {
+        let s = fixture.arg("s");
+        probe_inside(&args(&["--read", &s]), &[("list", &s)])[0].assert_ok();
+        assert_eq!(junction_capability_entries(&link), 0);
+        fs::remove_dir(&link).unwrap();
+    }
+    // A junction sandy can open for the program gives `check` nothing to warn about.
+    let mut check = vec!["check".to_string()];
+    check.extend(platform_args());
+    check.extend(policy.iter().cloned());
+    let checked = sandy(&check);
+    assert!(checked.status.success(), "{checked:?}");
+    let stderr = String::from_utf8_lossy(&checked.stderr);
+    assert!(!stderr.contains("junction-closed"), "{stderr}");
+    for name in ["j", "j1", "j2", "inner"] {
+        assert_eq!(
+            junction_capability_entries(&fixture.path(name)),
+            1,
+            "{name}"
+        );
+        fs::remove_dir(fixture.path(name)).unwrap();
+    }
+}
+
+/// The entry on a junction gives read and nothing else: the program cannot change the
+/// junction's DACL, owner, attributes or data, cannot delete it and cannot point it elsewhere, so
+/// it cannot widen what the next start resolves the policy path to. Each action works outside on
+/// a junction of its own, so the denials inside are the sandbox's.
+#[test]
+fn the_program_cannot_change_a_junction_it_may_open() {
+    let fixture = Fixture::new("junction-change");
+    let link = fixture.path("j");
+    make_junction(&link, &fixture.path("ro"));
+    // WRITE_DAC, WRITE_OWNER, DELETE, FILE_WRITE_DATA, FILE_APPEND_DATA, FILE_WRITE_EA,
+    // FILE_WRITE_ATTRIBUTES.
+    let masks = ["40000", "80000", "10000", "2", "4", "10", "100"];
+    let opens = |link: &Path| -> Vec<String> {
+        masks
+            .iter()
+            .map(|mask| format!("{}\u{1f}{mask}", plain_path(link)))
+            .collect()
+    };
+    let repoint = |link: &Path| format!("{}\u{1f}{}", fixture.arg("secret"), plain_path(link));
+
+    let control = fixture.path("control");
+    make_junction(&control, &fixture.path("ro"));
+    let control_opens = opens(&control);
+    let control_repoint = repoint(&control);
+    let mut outside: Vec<(&str, &str)> = control_opens
+        .iter()
+        .map(|target| ("open-link", target.as_str()))
+        .collect();
+    outside.push(("junction-repoint", &control_repoint));
+    for line in probe_outside(&outside) {
+        line.assert_ok();
+    }
+    fs::remove_dir(&control).unwrap();
+
+    let inside_opens = opens(&link);
+    let inside_repoint = repoint(&link);
+    let read_control = format!("{}\u{1f}20000", plain_path(&link));
+    let secret = fixture.arg("secret");
+    let mut actions: Vec<(&str, &str)> = vec![("open-link", &read_control)];
+    actions.extend(
+        inside_opens
+            .iter()
+            .map(|target| ("open-link", target.as_str())),
+    );
+    actions.push(("junction-repoint", &inside_repoint));
+    actions.push(("list", &secret));
+    let lines = probe_inside(&args(&["--read", &fixture.arg("j")]), &actions);
+    lines[0].assert_ok();
+    for line in &lines[1..] {
+        line.assert_blocked();
+    }
+    assert_eq!(fs::canonicalize(&link).unwrap(), fixture.path("ro"));
+    fs::remove_dir(&link).unwrap();
+}
+
+/// The entry on a junction grants nothing of its own: what the program reaches through it is
+/// decided by the permissions of the target. A process outside the sandbox points the junction
+/// at a directory the policy does not name while the program runs, keeping the junction object
+/// and so its entry, and the program reaches nothing there.
+#[test]
+fn a_junction_repointed_during_the_run_leads_only_to_granted_paths() {
+    use std::io::{BufRead, BufReader};
+
+    let fixture = Fixture::new("junction-repoint");
+    let link = fixture.path("j");
+    make_junction(&link, &fixture.path("ro"));
+    let j = fixture.arg("j");
+    let through = fixture.arg("j/file");
+    let ro = fixture.arg("ro/file");
+    let mut run = Command::new(sandy_path())
+        .args(run_args(
+            &args(&["--read", &j]),
+            &[
+                ("list", &j),
+                ("read-line", "-"),
+                ("list", &j),
+                ("read", &through),
+                ("read", &ro),
+            ],
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(run.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    parse_line(line.trim_end()).assert_ok();
+    let repoint = format!("{}\u{1f}{}", fixture.arg("secret"), plain_path(&link));
+    probe_outside(&[("junction-repoint", &repoint)])[0].assert_ok();
+    // The same junction object, with the entry the run added.
+    assert_eq!(junction_capability_entries(&link), 1);
+    writeln!(run.stdin.take().unwrap(), "go").unwrap();
+    let mut rest = String::new();
+    std::io::Read::read_to_string(&mut stdout, &mut rest).unwrap();
+    let output = run.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let lines: Vec<ProbeLine> = rest.lines().map(parse_line).collect();
+    assert_eq!(lines.len(), 4, "{rest}");
+    lines[0].assert_ok(); // read-line
+    lines[1].assert_blocked();
+    lines[2].assert_blocked();
+    lines[3].assert_ok();
+    fs::remove_dir(&link).unwrap();
+}
+
+/// `setup --remove` takes the entry on a junction back with the grants of the policy paths, also
+/// after the junction was pointed elsewhere, and a junction in the middle of a policy path never
+/// gets one.
+#[test]
+fn setup_remove_takes_back_the_junction_entry() {
+    let name = "sandy.remove-junction-test";
+    delete_profile(name);
+    let fixture = Fixture::new("remove-junction");
+    fs::create_dir_all(fixture.path("rw/sub")).unwrap();
+    make_junction(&fixture.path("j"), &fixture.path("ro"));
+    make_junction(&fixture.path("above"), &fixture.path("rw"));
+    let (j, sub) = (fixture.arg("j"), fixture.arg("above/sub"));
+    let run = sandy(named_run(
+        name,
+        &["--read", &j, "--read", &sub],
+        &[("list", &j), ("list", &sub)],
+    ));
+    assert!(run.status.success(), "{run:?}");
+    for line in parse(&run) {
+        line.assert_ok();
+    }
+    assert_eq!(junction_capability_entries(&fixture.path("j")), 1);
+    assert_eq!(junction_capability_entries(&fixture.path("above")), 0);
+    // The same junction object, now leading to a directory that is no policy path.
+    let repoint = format!(
+        "{}\u{1f}{}",
+        fixture.arg("secret"),
+        plain_path(&fixture.path("j"))
+    );
+    probe_outside(&[("junction-repoint", &repoint)])[0].assert_ok();
+    assert_eq!(
+        junction_capability_entries(&fixture.path("j")),
+        1,
+        "the repoint kept the entry"
+    );
+    let removed = sandy([
+        "setup",
+        "--remove",
+        "--appcontainer",
+        name,
+        "--read",
+        &j,
+        "--read",
+        &sub,
+    ]);
+    assert!(removed.status.success(), "{removed:?}");
+    assert_eq!(junction_capability_entries(&fixture.path("j")), 0);
+    for name in ["j", "above"] {
+        fs::remove_dir(fixture.path(name)).unwrap();
+    }
+}
+
+/// A junction whose permissions the user may not change is left alone, and the run still
+/// starts: the program cannot open the directory under that name, as without the grant, and
+/// reaches the files below it. `check` says so in a `junction-closed` warning, which
+/// `--hide-warning` hides. Built under a token without privileges, because one with
+/// SeRestorePrivilege may change every DACL.
+#[test]
+fn a_junction_the_user_cannot_change_is_left_alone() {
+    let fixture = Fixture::new("junction-locked");
+    let link = fixture.path("j");
+    make_junction(&link, &fixture.path("ro"));
+    // OWNER RIGHTS replaces the owner's implicit WRITE_DAC; DELETE keeps the cleanup possible.
+    let locked = Command::new("icacls")
+        .arg(plain_path(&link))
+        .args([
+            "/L",
+            "/inheritance:r",
+            "/grant",
+            "*S-1-3-4:(RX,D)",
+            "/grant",
+            "*S-1-5-11:(RX,D)",
+        ])
+        .output()
+        .unwrap();
+    assert!(locked.status.success(), "{locked:?}");
+    let write_dac = format!("{}\u{1f}40000", plain_path(&link));
+    let (_, opened) = executable_with_restricted_token(
+        &probe_path(),
+        windows_sys::Win32::Security::DISABLE_MAX_PRIVILEGE,
+        &["open-link".to_string(), write_dac],
+    );
+    let opened = parse_line(
+        opened
+            .lines()
+            .find(|line| line.starts_with("open-link\t"))
+            .unwrap_or_default(),
+    );
+    if opened.result == "ok" {
+        fs::remove_dir(&link).unwrap();
+        return skip(
+            "write-dac-revocable",
+            "this user still opens the junction for WRITE_DAC without privileges after the \
+             change, so no junction here lacks the right",
+        );
+    }
+    let j = fixture.arg("j");
+    let mut check = vec!["check".to_string()];
+    check.extend(platform_args());
+    check.extend(args(&["--read", &j]));
+    let (code, output) = sandy_without_privileges(&check);
+    assert_eq!(code, 0, "{output}");
+    let warning = output
+        .lines()
+        .find(|line| line.starts_with("warning: [junction-closed]"))
+        .unwrap_or_else(|| panic!("no junction-closed warning: {output}"));
+    assert!(
+        warning.contains("may not change its permissions"),
+        "{warning}"
+    );
+    check.extend(args(&["--hide-warning", "junction-closed"]));
+    let (code, output) = sandy_without_privileges(&check);
+    assert_eq!(code, 0, "{output}");
+    assert!(!output.contains("junction-closed"), "{output}");
+    let run = run_program(
+        &args(&["--read", &j]),
+        &probe_path(),
+        &["list", &j, "read", &fixture.arg("j/file")],
+    );
+    let (code, output) = sandy_without_privileges(&run);
+    assert_eq!(code, 0, "{output}");
+    let lines: Vec<ProbeLine> = output
+        .lines()
+        .filter(|line| line.starts_with("list\t") || line.starts_with("read\t"))
+        .map(parse_line)
+        .collect();
+    assert_eq!(lines.len(), 2, "{output}");
+    lines[0].assert_blocked();
+    lines[1].assert_ok();
+    assert_eq!(junction_capability_entries(&link), 0);
+    fs::remove_dir(&link).unwrap();
+}
+
+/// With `--windows-junctions refuse` sandy changes no junction: a directory policy path named
+/// through a junction that the program could open only with an entry of sandy's is a conflict,
+/// which `check` reports and `run` refuses, and the junction keeps its permissions. A junction
+/// that every AppContainer may read already needs no entry and passes.
+#[test]
+fn refused_junctions_are_a_conflict_and_stay_untouched() {
+    let fixture = Fixture::new("junction-refuse");
+    let link = fixture.path("j");
+    make_junction(&link, &fixture.path("ro"));
+    let j = fixture.arg("j");
+    let refuse = args(&["--read", &j, "--windows-junctions", "refuse"]);
+    let mut check = vec!["check".to_string()];
+    check.extend(platform_args());
+    check.extend(refuse.iter().cloned());
+    let checked = sandy(&check);
+    assert_eq!(checked.status.code(), Some(EXIT_CONFLICT), "{checked:?}");
+    let stdout = String::from_utf8_lossy(&checked.stdout);
+    assert!(stdout.contains("windows.junctions"), "{stdout}");
+    let run = sandy(run_program(&refuse, &probe_path(), &["list", &j]));
+    assert_eq!(run.status.code(), Some(EXIT_FAILURE), "{run:?}");
+    assert_eq!(junction_capability_entries(&link), 0);
+
+    // Every AppContainer may read this junction already, so nothing needs changing.
+    let opened = Command::new("icacls")
+        .arg(plain_path(&link))
+        .args(["/L", "/grant", "*S-1-15-2-1:(R)"])
+        .output()
+        .unwrap();
+    assert!(opened.status.success(), "{opened:?}");
+    let checked = sandy(&check);
+    assert!(checked.status.success(), "{checked:?}");
+    let lines = probe_inside(&refuse, &[("list", &j)]);
+    lines[0].assert_ok();
+    assert_eq!(junction_capability_entries(&link), 0);
+    fs::remove_dir(&link).unwrap();
+}

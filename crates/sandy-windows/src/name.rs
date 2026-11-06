@@ -129,9 +129,39 @@ pub fn grant_capability_name(
     )
 }
 
+/// The name of the capability that carries the read grant on one junction (docs/windows.md,
+/// "Links and identity"). It has a prefix of its own: a directory turned into a junction keeps
+/// its file ID, and with the name of a path grant the junction's capability would be the one of
+/// an earlier `read` grant on that directory, whose inherited entries files moved out of it
+/// still carry.
+pub fn junction_capability_name(appcontainer: &str, junction: FileIdentity) -> String {
+    format!(
+        "sandy.junction.r.{:016x}.{:032x}.{appcontainer}",
+        junction.volume, junction.file
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One object gives different names for a path grant and a junction grant.
+    #[test]
+    fn junction_capabilities_differ_from_path_capabilities() {
+        let object = FileIdentity { volume: 7, file: 9 };
+        let junction = junction_capability_name("example.app", object);
+        for access in [
+            PathAccess::Read,
+            PathAccess::ReadExec,
+            PathAccess::ReadWrite,
+        ] {
+            assert_ne!(
+                junction,
+                grant_capability_name("example.app", access, object)
+            );
+        }
+        assert!(junction.starts_with("sandy.junction.r."), "{junction}");
+    }
 
     #[test]
     fn accepts_documented_characters() {

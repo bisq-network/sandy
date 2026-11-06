@@ -99,6 +99,8 @@ warning_ids! {
     GrantFollowsFile => "grant-follows-file",
     /// sandy runs in session 0 on Windows.
     SessionZero => "session-zero",
+    /// A junction on the way to a directory policy path that sandy cannot open for the program.
+    JunctionClosed => "junction-closed",
 }
 
 impl fmt::Display for WarningId {

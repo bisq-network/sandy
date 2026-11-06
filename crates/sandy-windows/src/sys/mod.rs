@@ -17,9 +17,9 @@ use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::AsRawSocket;
 
 use sandy_core::{
-    Backend, ChildProcesses, PathRule, PlanItem, ProtectedPath, Requirement, ResolvedLevel,
-    ResolvedPolicy, SandboxError, SetupOptions, SetupOutcome, StatusReport, TargetCommand, Warning,
-    WarningId, Win32k, path_directories,
+    Backend, ChildProcesses, Junctions, PathRule, PlanItem, ProtectedPath, Requirement,
+    ResolvedLevel, ResolvedPolicy, SandboxError, SetupOptions, SetupOutcome, StatusReport,
+    TargetCommand, Warning, WarningId, Win32k, path_directories,
 };
 use windows_sys::Win32::Security::{
     WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
@@ -109,6 +109,7 @@ impl Backend for WindowsBackend {
         notes.extend(policy.mach_services_notes("Windows"));
         notes.extend(policy.path_directory_notes(&path_locations()));
         notes.extend(session_note());
+        notes.extend(junction_notes(policy));
         notes
     }
 
@@ -166,6 +167,11 @@ impl Backend for WindowsBackend {
         let held = held_sids(policy, &container)?;
         for rule in &policy.paths {
             capabilities.push(acl::grant(name, rule, &held)?);
+        }
+        // A directory policy path named through a junction opens under that name only when the
+        // junction itself lets the program in (docs/windows.md, "Links and identity").
+        if policy.windows.junctions == Junctions::Grant {
+            capabilities.extend(acl::grant_junctions(name, policy));
         }
 
         // The relays run sandy's own executable, the one the plan read, with one capability:
@@ -367,6 +373,8 @@ impl Backend for WindowsBackend {
         if let Ok(broker) = crate::name::egress_broker_name(name) {
             network::set_loopback_exempt(&appcontainer::sid(&broker)?, false)?;
         }
+        // First, so that a path whose entry cannot be removed does not keep these.
+        let kept = acl::revoke_junctions(name, policy);
         for rule in &policy.paths {
             acl::revoke(name, rule)?;
         }
@@ -379,9 +387,19 @@ impl Backend for WindowsBackend {
             }
         }
         appcontainer::delete_profile(name)?;
-        Ok(SetupOutcome::Done(format!(
-            "removed what sandy left for the AppContainer {name}"
-        )))
+        let mut done = format!("removed what sandy left for the AppContainer {name}");
+        if !kept.is_empty() {
+            let entries: Vec<String> = kept
+                .iter()
+                .map(|(path, error)| format!("{} ({error})", path.display()))
+                .collect();
+            done.push_str(&format!(
+                ", except the entries on the junctions {}, which grant nothing without the \
+                 AppContainer; remove one with icacls JUNCTION /L /remove:g *SID",
+                entries.join(", ")
+            ));
+        }
+        Ok(SetupOutcome::Done(done))
     }
 
     /// With administrator rights already, setup runs here; otherwise sandy runs again after the
@@ -697,6 +715,35 @@ fn path_locations() -> Vec<ProtectedPath> {
     path_directories(std::env::var_os("PATH").as_deref())
 }
 
+/// The junctions on the way to directory policy paths that `run` would leave closed: the
+/// program then opens what lies below such a junction, but not the directory under the
+/// junction's name (docs/windows.md, "Links and identity"). A note, because `run` goes on.
+fn junction_notes(policy: &ResolvedPolicy) -> Vec<Warning> {
+    // Under "refuse" such a junction is a conflict of the plan, not a note.
+    let Some(name) = policy.windows.appcontainer_name.as_deref() else {
+        return Vec::new();
+    };
+    if policy.windows.junctions == Junctions::Refuse {
+        return Vec::new();
+    }
+    acl::closed_junctions(name, policy)
+        .into_iter()
+        .map(|closed| {
+            Warning::new(
+                WarningId::JunctionClosed,
+                format!(
+                    "sandy does not open the junction {} itself for the program ({}), so the \
+                     program can open what lies below it but cannot list or open the directory \
+                     under that name; {}",
+                    closed.junction.display(),
+                    closed.reason,
+                    closed.remedy
+                ),
+            )
+        })
+        .collect()
+}
+
 /// The warning for a run in session 0, where services and SSH sessions run. Its window stations
 /// admit no AppContainer, so `user32.dll` cannot initialize in the program (docs/windows.md,
 /// limitation 13). Interactive users have sessions of their own since Windows Vista. A note,
@@ -835,7 +882,28 @@ fn check_grants(appcontainer: &str, policy: &ResolvedPolicy) -> Result<(), Probl
             )
         }))
     });
-    worst(problems).map_or(Ok(()), Err)
+    worst(problems.chain(junction_refusals(policy))).map_or(Ok(()), Err)
+}
+
+/// Under `windows.junctions = "refuse"`, each junction that the program could open under its
+/// name only with an entry of sandy's, which this setting forbids: a conflict of the policy with
+/// this host, like a policy path whose permissions sandy may not change.
+fn junction_refusals(policy: &ResolvedPolicy) -> Vec<Problem> {
+    if policy.windows.junctions != Junctions::Refuse {
+        return Vec::new();
+    }
+    acl::junctions_needing_entries(policy)
+        .into_iter()
+        .map(|junction| {
+            Problem::Conflict(format!(
+                "{} is a junction on the way to a directory policy path, and the program could \
+                 open that directory under the junction's name only if sandy changed the \
+                 junction's permissions, which windows.junctions = \"refuse\" forbids; name the \
+                 directory by its own path, or set junctions = \"grant\"",
+                junction.display()
+            ))
+        })
+        .collect()
 }
 
 /// Where Windows puts a known folder. `KF_FLAG_DONT_VERIFY`, because the default verifies that

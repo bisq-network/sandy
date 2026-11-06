@@ -24,10 +24,10 @@ pub use env::target_environment;
 pub use plan::{EnforcementPlan, PlanItem, Requirement, Status};
 pub use policy::{
     BASE_LEVEL, ChildProcesses, Egress, EgressReach, EnvironmentPolicy, ExposedPort, Fallback,
-    FallbackEgress, FileView, FilesystemPolicy, ForwardedPort, IpAccess, Level, LinuxPolicy,
-    MAX_LEVEL_NAME, MAX_POLICY_LEN, MAX_POLICY_NESTING, MachService, MacosPolicy, NetworkAccess,
-    NetworkPolicy, POLICY_VERSION, PathMetadata, Policy, PolicyError, ProcessPolicy, Relays,
-    SignalScope, SystemAccess, Win32k, WindowsPolicy,
+    FallbackEgress, FileView, FilesystemPolicy, ForwardedPort, IpAccess, Junctions, Level,
+    LinuxPolicy, MAX_LEVEL_NAME, MAX_POLICY_LEN, MAX_POLICY_NESTING, MachService, MacosPolicy,
+    NetworkAccess, NetworkPolicy, POLICY_VERSION, PathMetadata, Policy, PolicyError, ProcessPolicy,
+    Relays, SignalScope, SystemAccess, Win32k, WindowsPolicy,
 };
 pub use resolve::{
     PathAccess, PathIdentity, PathRule, ProtectedPath, ResolvedLevel, ResolvedPolicy,

@@ -297,6 +297,21 @@ path, unless Windows already grants the level to all AppContainers. A path witho
 DACL, everyone has full access) also makes the run fail; adding an ACE would take the user's
 access away.
 
+What the merge keeps, measured on build 26200 for a policy path and for a junction
+(`acl::tests::a_path_grant_keeps_every_shape_of_the_list`,
+`a_junction_grant_keeps_every_shape_of_the_list`, which compare the whole list in SDDL before the
+grant, after it and after the removal that `setup --remove` runs): inherited entries, a protected
+list, a conditional entry with its condition, and an order that is not the canonical one (an allow
+before a deny) all stay as they were, each entry in its place, and the removal gives the list back.
+One flag can change: Windows' security API sets the flag of automatic inheritance (`AI`) on every
+list it writes, as `icacls` and Explorer do, so a list without it gains it with sandy's first entry
+and keeps it after the removal (measured on the GitHub windows-2022 and windows-2025 runners, whose
+temporary directory has such a list). It changes how Windows treats the inherited entries when it
+next propagates from the parent, not who may open the object. What sandy cannot rule out is a change
+by another tool at the same moment: Windows reads and writes a DACL in two calls with nothing to
+compare and swap, so a change that `icacls` or another program makes between the two is lost.
+sandy's lock serializes only its own runs.
+
 `sandy check` asks the same question for every policy path (`acl::grantable`, which opens the
 path for `WRITE_DAC` and changes nothing) and reports FilesystemConfined as a conflict of the
 policy with the path, naming the path and the reason, so it does not report as enforced what
@@ -373,6 +388,64 @@ them. On Windows:
   denied at once. `escape_windows::a_file_moved_out_of_a_granted_directory_keeps_its_grant`
   records this. Closing it would mean a new capability per run and a fresh propagation over
   every policy path on every run.
+
+- A directory policy path named through a junction opens under that name. Windows checks the
+  access a program asks for on the junction itself when the path ends there: without an entry
+  on the junction, listing `C:\data\current` with `current` a junction to a granted directory
+  answered `ERROR_ACCESS_DENIED`, and so did `cmd /c type` of a file in it, which lists the
+  directory, while files and directories below it opened, because a junction in the middle of a
+  path needs only the traverse check that `SeChangeNotifyPrivilege` skips (measured on Windows
+  11 build 26200, also with an entry for read attributes alone, list alone or traverse alone;
+  list with `SYNCHRONIZE` was the least that opened it). A directory symbolic link needs
+  nothing of its own. A volume mounted in a folder is a reparse point of the same kind, and
+  sandy treats it the same way (not measured).
+
+  So for every junction that the policy's names pass and that leads to a directory policy path
+  or to a directory inside one, also each one of a chain, sandy adds one entry on the junction
+  object: `FILE_GENERIC_READ`, no inheritance, for a capability named after the junction's own
+  identity (`sandy.junction.r.<volume serial>.<file ID>.<AppContainer name>`). The name differs
+  from that of a path grant on purpose: a directory turned into a junction keeps its file ID,
+  and the capability of an earlier `read` grant on it would open again what files moved out of
+  it still inherit. A junction that leads above or beside the directory policy paths gets
+  nothing, as the program may not open that directory anyway. sandy opens the junction itself
+  (`FILE_FLAG_OPEN_REPARSE_POINT`), checks its reparse tag and reads and writes the DACL on that
+  handle, because the path functions would follow the junction to its target. Measured: writing
+  it so changes nothing behind the junction, also when the junction's parent and the target's
+  parent hand down different entries
+  (`acl::tests::a_junction_grant_leaves_the_tree_behind_it_alone`).
+
+  sandy adds no entry where it would change nothing or where it should not: a junction without
+  DACL or one every AppContainer may read already (it is open), one whose list holds entries
+  sandy cannot evaluate, one with a deny entry for the user or one of its groups that takes
+  listing away (the AppContainer access check passes the user's own token first, so an entry
+  of sandy's could not open it), and one of another owner. sandy changes a junction only when
+  its owner is the user of sandy's token or the token's default owner, which owns what the
+  process creates; for an elevated administrator that is Administrators, which every elevated
+  administrator and every installer running as one shares, so an elevated run may also change
+  such a junction made by another administrator. A junction of another user or of the system
+  stays as it is, also where the token could change it
+  (`acl::tests::a_junction_of_another_owner_is_left_alone`). With
+  `windows.junctions = "refuse"` (`--windows-junctions refuse`) sandy changes no junction at all:
+  a junction that the program could open only with an entry of sandy's makes FilesystemConfined
+  a conflict, so `check` reports it and `run` refuses with status 125.
+
+  The entry holds no write right: a junction takes its target from its own data, and writing
+  that data, its attributes, its owner or its DACL, or deleting it, would let the program point
+  the name elsewhere before the next start. All of these are denied, and so is pointing it
+  elsewhere (`the_program_cannot_change_a_junction_it_may_open`). The entry grants nothing below
+  the junction either: the target's own permissions decide, so a process outside the sandbox
+  that points the junction at another directory while the program runs leads it nowhere new
+  (`a_junction_repointed_during_the_run_leads_only_to_granted_paths`). A junction that stays
+  closed, or that sandy fails to change for another reason, leaves the run going; the program
+  then cannot open the directory under that name, as before
+  (`a_junction_the_user_cannot_change_is_left_alone`). `sandy check` names such a junction in a
+  `junction-closed` warning, with the reason and what to do instead; `run` does not, because
+  its standard error belongs to the program. The directory itself under the junction's name
+  stays read-only for the program even in a `read_write` path: changing its attributes or
+  deleting it through that name would need a write right on the junction (measured: setting
+  the read-only attribute through the junction is denied, through the directory's own name it
+  works). Files and directories below it are written as usual
+  (`a_directory_policy_path_named_through_a_junction_opens_under_that_name`).
 
 `sandy check` prints a warning for the grant that travels with a file when the policy grants a
 directory.
@@ -526,7 +599,10 @@ Old grants grant nothing, so removing them is cleanup, not a security step.
 - the loopback exemption of the AppContainer and of its egress broker's, when it is there. The
   removal needs administrator rights as a whole: without them it changes nothing and exits with
   status 3;
-- the access control entry of every policy path, and of `sandy.exe` for the relays. Only the
+- the access control entry of every policy path, of each junction the names of the policy
+  paths pass (see "Links and identity"), also one that no longer leads to a policy path, and
+  of `sandy.exe` for the relays. A junction whose entry cannot be removed does not stop the
+  rest, and `setup` names it in its message. Only the
   capability SIDs sandy derives for this AppContainer and these objects are removed. Other
   software (Chromium, for example) uses capability SIDs too, and a capability SID cannot be
   mapped back to its name, so removing anything else would be guesswork;
@@ -562,8 +638,9 @@ that user's profile.
 
 When no removal ran, a user removes what stays by hand:
 
-- the entries on the policy paths, on the program file and on `sandy.exe`, with `icacls` as
-  above;
+- the entries on the policy paths, on the junctions that lead to them (`icacls PATH /L` lists
+  and changes the junction itself instead of its target), on the program file and on
+  `sandy.exe`, with `icacls` as above;
 - the loopback exemption of each AppContainer name of the policy, with
   `CheckNetIsolation LoopbackExempt -d -n=NAME` as administrator (see "The setup step");
 - the profile of each AppContainer name of the policy, and with an egress broker the profile

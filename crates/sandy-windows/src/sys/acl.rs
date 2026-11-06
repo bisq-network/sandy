@@ -8,12 +8,15 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::ptr;
 
-use sandy_core::{PathAccess, PathRule, SandboxError};
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, GetLastError, INVALID_HANDLE_VALUE};
+use sandy_core::{PathAccess, PathRule, ResolvedPolicy, SandboxError};
+use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GetLastError, HANDLE,
+    INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::Security::Authorization::{
-    ACCESS_MODE, EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS,
-    SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID,
-    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ACCESS_MODE, EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, GetSecurityInfo, NO_MULTIPLE_TRUSTEE,
+    REVOKE_ACCESS, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW, SetNamedSecurityInfoW,
+    SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
     ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION, GetAce,
@@ -22,13 +25,14 @@ use windows_sys::Win32::Security::{
     UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandleEx, OPEN_EXISTING,
-    WRITE_DAC,
+    CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo, FileIdInfo,
+    GetFileInformationByHandleEx, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
 };
 use windows_sys::Win32::System::SystemServices::{
     ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE, ACCESS_DENIED_ACE_TYPE,
-    ACCESS_DENIED_CALLBACK_ACE_TYPE,
+    ACCESS_DENIED_CALLBACK_ACE_TYPE, IO_REPARSE_TAG_MOUNT_POINT,
 };
 
 use super::host;
@@ -40,7 +44,7 @@ use crate::access::{
     PROFILE_DENIED, REPLACES_ENTRY, access_mask, ace_flags, changeable_by_others, grants,
     has_explicit_ace, map_generic, may_grant,
 };
-use crate::name::{FileIdentity, grant_capability_name};
+use crate::name::{FileIdentity, grant_capability_name, junction_capability_name};
 use crate::plan::Problem;
 use crate::probe::Ungrantable;
 
@@ -178,7 +182,7 @@ pub fn revoke(appcontainer: &str, rule: &PathRule) -> Result<(), SandboxError> {
         return Ok(());
     }
     set_access(
-        &path,
+        Object::Path(&path),
         &rule.path,
         &dacl,
         &capability,
@@ -270,6 +274,579 @@ fn may_change_dacl(path: &[u16]) -> Result<(), i32> {
     Ok(())
 }
 
+/// The rights on a junction that leads to a directory policy path. Windows checks the access a
+/// program asks for on the junction itself when the path ends at it, and only then: the junction
+/// in the middle of a path, and a file below it, need nothing (measured on Windows 11 build
+/// 26200). Read lets the program list the directory under the name the policy used. A junction
+/// takes its target from its own data, and writing that data, its attributes or its DACL would
+/// let the program point it elsewhere before the next start, so no write right is among these.
+const JUNCTION_MASK: u32 = crate::access::FILE_GENERIC_READ;
+
+/// The junctions on the way to directory policy paths that the program could not open under
+/// their names without an entry of sandy's, for `windows.junctions = "refuse"`, under which sandy
+/// adds none. A junction every AppContainer may read already, or without DACL, is open; one sandy
+/// cannot read or judge counts as closed. Changes nothing.
+pub fn junctions_needing_entries(policy: &ResolvedPolicy) -> Vec<PathBuf> {
+    final_junctions(policy)
+        .into_iter()
+        .filter(|junction| !open_to_every_appcontainer(junction).unwrap_or(false))
+        .collect()
+}
+
+fn open_to_every_appcontainer(link: &Path) -> Result<bool, SandboxError> {
+    let wide = wide_nul(link.as_os_str());
+    let Some(opened) = open_junction(&wide, link, READ_CONTROL)? else {
+        // Not a junction, or one whose permissions cannot be read: the latter counts as closed.
+        return Ok(open_junction(&wide, link, 0)?.is_none());
+    };
+    let dacl = Dacl::read_object(Object::Handle(opened.raw()), link)?;
+    if dacl.acl.is_null() {
+        return Ok(true);
+    }
+    let aces = dacl.aces(link)?;
+    Ok(!aces.has_unknown_types
+        && grants(
+            &aces.entries(),
+            ALL_APPLICATION_PACKAGES,
+            JUNCTION_MASK,
+            false,
+        ))
+}
+
+/// Removes what `grant_junctions` added for `appcontainer`, from every junction the policy's
+/// names pass, also one that no longer leads to a policy path, and returns the junctions whose
+/// entry stays. An entry that stays grants nothing (see "One capability per path"), so a
+/// junction that fails does not stop the rest of the removal.
+pub fn revoke_junctions(appcontainer: &str, policy: &ResolvedPolicy) -> Vec<(PathBuf, String)> {
+    policy
+        .links
+        .iter()
+        .filter_map(|junction| {
+            revoke_junction(appcontainer, junction)
+                .err()
+                .map(|error| (junction.clone(), error.to_string()))
+        })
+        .collect()
+}
+
+/// `Ok` when `junction` carries no entry of `appcontainer` afterwards, or is no junction. An
+/// error names the SID of the entry that stays, so that the user can remove it by hand.
+fn revoke_junction(appcontainer: &str, junction: &Path) -> Result<(), SandboxError> {
+    let wide = wide_nul(junction.as_os_str());
+    let Some(opened) = open_junction(&wide, junction, READ_CONTROL)? else {
+        return Ok(());
+    };
+    let identity = opened.identity;
+    let capability = capability_sid(&junction_capability_name(appcontainer, identity))?;
+    if !carries(&opened, junction, &capability)? {
+        return Ok(());
+    }
+    drop(opened);
+    let sid = crate::access::sid_string(capability.bytes());
+    remove_junction_entry(&wide, junction, identity, &capability)
+        .map_err(|error| SandboxError::new(format!("{error}; its entry is for *{sid}")))
+}
+
+fn remove_junction_entry(
+    wide: &[u16],
+    junction: &Path,
+    identity: FileIdentity,
+    capability: &Sid,
+) -> Result<(), SandboxError> {
+    let _lock = UserLock::wait_for(LOCKS, "dacl-changes", SERIALIZE, true)?;
+    let Some(opened) = open_junction(wide, junction, READ_CONTROL | WRITE_DAC)? else {
+        return Err(SandboxError::new(format!(
+            "cannot change the permissions of {}",
+            junction.display()
+        )));
+    };
+    if opened.identity != identity || !carries(&opened, junction, capability)? {
+        return Ok(());
+    }
+    let dacl = Dacl::read_object(Object::Handle(opened.raw()), junction)?;
+    set_access(
+        Object::Handle(opened.raw()),
+        junction,
+        &dacl,
+        capability,
+        REVOKE_ACCESS,
+        0,
+        0,
+    )
+}
+
+/// Whether the junction's DACL holds any entry for `capability`.
+fn carries(opened: &OpenJunction, link: &Path, capability: &Sid) -> Result<bool, SandboxError> {
+    let dacl = Dacl::read_object(Object::Handle(opened.raw()), link)?;
+    if dacl.acl.is_null() {
+        return Ok(false);
+    }
+    Ok(dacl
+        .aces(link)?
+        .entries()
+        .iter()
+        .any(|ace| ace.sid == capability.bytes()))
+}
+
+/// The links of `policy` that lead to a directory policy path or to a directory inside one, as
+/// the last link of a name or as one of a chain of links that ends there: each of them is a name
+/// the program may open such a directory by. Links that lead to a directory above or beside the
+/// directory policy paths are left out, as the program may not open those anyway, and so is
+/// every link that is not a junction (`grant_junction` checks the object itself).
+fn final_junctions(policy: &ResolvedPolicy) -> Vec<PathBuf> {
+    if policy.links.is_empty() {
+        return Vec::new();
+    }
+    // A directory whose identity cannot be read gets no junction: that only leaves a name closed.
+    let directories: Vec<FileIdentity> = policy
+        .paths
+        .iter()
+        .filter(|rule| rule.is_dir)
+        .filter_map(|rule| file_identity(&wide_nul(rule.path.as_os_str()), &rule.path).ok())
+        .collect();
+    let mut junctions = Vec::new();
+    for link in &policy.links {
+        // Follows the link; one that no longer resolves leads to no policy path. The target and
+        // each directory above it are compared by identity, so an alias of a policy directory
+        // counts as well.
+        let Ok(target) = fs::canonicalize(link) else {
+            continue;
+        };
+        let inside = target.ancestors().any(|directory| {
+            file_identity(&wide_nul(directory.as_os_str()), directory)
+                .is_ok_and(|identity| directories.contains(&identity))
+        });
+        if inside && target.is_dir() {
+            junctions.push(link.clone());
+        }
+    }
+    junctions
+}
+
+/// Gives the AppContainer read access to every junction that resolving a directory policy path
+/// ended at (`final_junctions`), and returns the capabilities the target must hold for them.
+///
+/// The entry is on the junction object only, without inheritance, so it grants what the junction
+/// itself holds, its target and attributes, and nothing below it: what the program reaches
+/// through it is decided by the permissions of the target, also when a process outside the
+/// sandbox points the junction elsewhere while the program runs. A junction that `assess` finds
+/// closed, or that sandy fails to change for any other reason, is left as it is: the program
+/// then cannot open the directory under that name, as before, which takes nothing away from the
+/// policy, so the run goes on. The write of a DACL is one call, so a failure leaves nothing half
+/// done.
+pub fn grant_junctions(appcontainer: &str, policy: &ResolvedPolicy) -> Vec<Sid> {
+    let junctions = final_junctions(policy);
+    if junctions.is_empty() {
+        return Vec::new();
+    }
+    let Ok(token) = TokenSids::of_this_process() else {
+        return Vec::new();
+    };
+    junctions
+        .iter()
+        .filter_map(|junction| {
+            grant_junction(appcontainer, junction, &token)
+                .ok()
+                .flatten()
+        })
+        .collect()
+}
+
+/// A junction `grant_junctions` leaves closed: why, and what the user can do instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosedJunction {
+    pub junction: PathBuf,
+    pub reason: String,
+    pub remedy: &'static str,
+}
+
+const NAME_IT_DIRECTLY: &str = "name the directory by its own path in the policy and the program";
+
+/// The junctions `grant_junctions` would leave closed for `appcontainer`, for `sandy check`.
+/// Decided by the same `assess` as the grant. Changes nothing.
+pub fn closed_junctions(appcontainer: &str, policy: &ResolvedPolicy) -> Vec<ClosedJunction> {
+    let junctions = final_junctions(policy);
+    if junctions.is_empty() {
+        return Vec::new();
+    }
+    let token = TokenSids::of_this_process();
+    junctions
+        .into_iter()
+        .filter_map(|junction| {
+            let closed = token
+                .as_ref()
+                .map_err(|error| SandboxError::new(error.to_string()))
+                .and_then(|token| junction_grantable(appcontainer, &junction, token));
+            let (reason, remedy) = match closed {
+                Ok(None) => return None,
+                Ok(Some(closed)) => closed,
+                Err(error) => (error.to_string(), NAME_IT_DIRECTLY),
+            };
+            Some(ClosedJunction {
+                junction,
+                reason,
+                remedy,
+            })
+        })
+        .collect()
+}
+
+/// What sandy does with one junction, decided on its current DACL.
+enum Decision {
+    /// The program opens it without an entry: no DACL, or every AppContainer may read it.
+    Open,
+    /// Sandy's entry is in place already.
+    Granted(Sid),
+    /// It needs the entry, and sandy may add it.
+    Grant(Sid),
+    /// It stays closed: why, and what the user can do instead.
+    Closed(String, &'static str),
+}
+
+/// The one decision both `grant_junction` and `junction_grantable` follow, so that `check`
+/// says what `run` does.
+fn assess(
+    appcontainer: &str,
+    opened: &OpenJunction,
+    link: &Path,
+    dacl: &Dacl,
+    token: &TokenSids,
+) -> Result<Decision, SandboxError> {
+    // A junction without DACL lets everyone open it already, and adding an entry would take
+    // that away from the user.
+    if dacl.acl.is_null() {
+        return Ok(Decision::Open);
+    }
+    let aces = dacl.aces(link)?;
+    let entries = aces.entries();
+    let capability = capability_sid(&junction_capability_name(appcontainer, opened.identity))?;
+    if has_explicit_ace(&entries, capability.bytes(), JUNCTION_MASK, 0) {
+        return Ok(Decision::Granted(capability));
+    }
+    if grants(&entries, ALL_APPLICATION_PACKAGES, JUNCTION_MASK, false) {
+        return Ok(Decision::Open);
+    }
+    if aces.has_unknown_types {
+        return Ok(Decision::Closed(
+            "its permissions hold entries that sandy cannot evaluate".to_string(),
+            NAME_IT_DIRECTLY,
+        ));
+    }
+    // The AppContainer access check passes the user's own token first, so a deny entry for the
+    // user or one of its groups keeps the program out whatever sandy adds.
+    if let Some(sid) = denied_to(&entries, token) {
+        return Ok(Decision::Closed(
+            format!(
+                "a deny entry for {} on it keeps this user out, so an entry of sandy's would \
+                 not open it",
+                crate::access::sid_string(sid)
+            ),
+            NAME_IT_DIRECTLY,
+        ));
+    }
+    let owner = owner_of(opened, link)?;
+    if !owner
+        .as_ref()
+        .is_some_and(|owner| token.owners.contains(owner))
+    {
+        let owner = owner.map_or("nobody".to_string(), |owner| {
+            crate::access::sid_string(owner.bytes())
+        });
+        return Ok(Decision::Closed(
+            format!(
+                "it belongs to {owner}, not to the current user or the owner of what this \
+                 process creates, and sandy changes only those junctions"
+            ),
+            "name the directory by its own path in the policy and the program, or make the \
+             current user the junction's owner",
+        ));
+    }
+    Ok(Decision::Grant(capability))
+}
+
+/// The SID of a deny entry on the junction itself that takes listing or waiting from the user
+/// or one of its groups, deny-only groups included.
+fn denied_to<'a>(entries: &[Ace<'a>], token: &TokenSids) -> Option<&'a [u8]> {
+    use crate::access::{FILE_READ_DATA, INHERIT_ONLY_ACE, SYNCHRONIZE};
+    entries
+        .iter()
+        .find(|ace| {
+            ace.kind == AceKind::Deny
+                && ace.flags & INHERIT_ONLY_ACE == 0
+                && map_generic(ace.mask) & (FILE_READ_DATA | SYNCHRONIZE) != 0
+                && token.all.iter().any(|sid| sid.bytes() == ace.sid)
+        })
+        .map(|ace| ace.sid)
+}
+
+/// One junction, see `grant_junctions`. `None` when it needs no entry or stays closed.
+fn grant_junction(
+    appcontainer: &str,
+    link: &Path,
+    token: &TokenSids,
+) -> Result<Option<Sid>, SandboxError> {
+    let wide = wide_nul(link.as_os_str());
+    let Some(opened) = open_junction(&wide, link, READ_CONTROL)? else {
+        return Ok(None);
+    };
+    let identity = opened.identity;
+    let dacl = Dacl::read_object(Object::Handle(opened.raw()), link)?;
+    match assess(appcontainer, &opened, link, &dacl, token)? {
+        Decision::Granted(capability) => return Ok(Some(capability)),
+        Decision::Open | Decision::Closed(..) => return Ok(None),
+        Decision::Grant(_) => {}
+    }
+    drop(opened);
+    let _lock = UserLock::wait_for(LOCKS, "dacl-changes", SERIALIZE, true)?;
+    let Some(opened) = open_junction(&wide, link, READ_CONTROL | WRITE_DAC)? else {
+        return Ok(None);
+    };
+    // Another object took the name since: its capability is another one, so leave it. One of
+    // the same owner that took the name since `final_junctions` gets the entry instead, which
+    // gives nothing beyond the junction itself.
+    if opened.identity != identity {
+        return Ok(None);
+    }
+    // Decided again on the DACL as it is now, under the lock.
+    let dacl = Dacl::read_object(Object::Handle(opened.raw()), link)?;
+    match assess(appcontainer, &opened, link, &dacl, token)? {
+        Decision::Granted(capability) => Ok(Some(capability)),
+        Decision::Open | Decision::Closed(..) => Ok(None),
+        Decision::Grant(capability) => {
+            set_access(
+                Object::Handle(opened.raw()),
+                link,
+                &dacl,
+                &capability,
+                SET_ACCESS,
+                JUNCTION_MASK,
+                0,
+            )?;
+            Ok(Some(capability))
+        }
+    }
+}
+
+/// Why `grant_junction` would leave `link` closed, `None` when it would not.
+fn junction_grantable(
+    appcontainer: &str,
+    link: &Path,
+    token: &TokenSids,
+) -> Result<Option<(String, &'static str)>, SandboxError> {
+    let wide = wide_nul(link.as_os_str());
+    let Some(opened) = open_junction(&wide, link, READ_CONTROL)? else {
+        // Not a junction, or one the user may not read the permissions of: tell them apart. A
+        // junction whose attributes the user may not read looks like none and is not named,
+        // which takes listing rights away on its parent as well.
+        return Ok(open_junction(&wide, link, 0)?.map(|_| {
+            (
+                "the current user may not read its permissions".to_string(),
+                NAME_IT_DIRECTLY,
+            )
+        }));
+    };
+    let dacl = Dacl::read_object(Object::Handle(opened.raw()), link)?;
+    Ok(match assess(appcontainer, &opened, link, &dacl, token)? {
+        Decision::Open | Decision::Granted(_) => None,
+        Decision::Closed(reason, remedy) => Some((reason, remedy)),
+        Decision::Grant(_) => match open_junction(&wide, link, READ_CONTROL | WRITE_DAC)? {
+            Some(_) => None,
+            None => Some((
+                "the current user may not change its permissions".to_string(),
+                "name the directory by its own path in the policy and the program, or let the \
+                 current user change the junction's permissions",
+            )),
+        },
+    })
+}
+
+/// The owner of the junction, `None` when it has none sandy can read.
+fn owner_of(opened: &OpenJunction, link: &Path) -> Result<Option<Sid>, SandboxError> {
+    let mut owner: PSID = ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: the handle is open with READ_CONTROL; the out pointers are valid.
+    let error = unsafe {
+        GetSecurityInfo(
+            opened.raw(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if error != 0 {
+        return Err(win32_error(
+            format!("cannot read the owner of {}", link.display()),
+            error,
+        ));
+    }
+    let _descriptor = LocalBox(descriptor);
+    // SAFETY: owner is null or points to the owner SID inside the descriptor, still allocated.
+    Ok(unsafe { Sid::copy_from(owner) }.ok())
+}
+
+/// The SIDs of this process's token that decide about a junction: `owners`, its user and its
+/// default owner, which owns what the process creates (Administrators for an elevated
+/// administrator, which every elevated administrator shares); and `all`, its user and every
+/// group, deny-only ones included, against which deny entries count.
+struct TokenSids {
+    owners: Vec<Sid>,
+    all: Vec<Sid>,
+}
+
+impl TokenSids {
+    fn of_this_process() -> Result<TokenSids, SandboxError> {
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY,
+            TOKEN_USER, TokenGroups, TokenOwner, TokenUser,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        let mut token: HANDLE = ptr::null_mut();
+        // SAFETY: the pseudo handle of this process needs no closing; token is a valid out
+        // pointer.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(last_error("cannot open this process's token"));
+        }
+        // SAFETY: OpenProcessToken returned a handle that nothing else owns.
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+        // The information of `class`, in a buffer of u64 so that it is aligned for every
+        // structure and the SIDs that follow it.
+        let read = |class: TOKEN_INFORMATION_CLASS| -> Result<Vec<u64>, SandboxError> {
+            let mut length = 0u32;
+            // SAFETY: a null buffer of length 0 asks for the length only.
+            unsafe {
+                GetTokenInformation(
+                    token.as_raw_handle(),
+                    class,
+                    ptr::null_mut(),
+                    0,
+                    &mut length,
+                )
+            };
+            let mut buffer = vec![0u64; (length as usize).div_ceil(8).max(1)];
+            // SAFETY: the buffer is writable and holds at least `length` bytes.
+            let ok = unsafe {
+                GetTokenInformation(
+                    token.as_raw_handle(),
+                    class,
+                    buffer.as_mut_ptr().cast(),
+                    (buffer.len() * 8) as u32,
+                    &mut length,
+                )
+            };
+            if ok == 0 {
+                return Err(last_error("cannot read this process's token"));
+            }
+            Ok(buffer)
+        };
+        let copy = |sid: PSID| {
+            // SAFETY: the SID lies inside a buffer that is still alive.
+            unsafe { Sid::copy_from(sid) }
+                .map_err(|error| SandboxError::io("a SID of this process's token", error))
+        };
+        let user_buffer = read(TokenUser)?;
+        // SAFETY: the call filled a TOKEN_USER at the start of the buffer.
+        let user = copy(unsafe { user_buffer.as_ptr().cast::<TOKEN_USER>().read().User.Sid })?;
+        let owner_buffer = read(TokenOwner)?;
+        // SAFETY: the call filled a TOKEN_OWNER at the start of the buffer.
+        let owner = copy(unsafe { owner_buffer.as_ptr().cast::<TOKEN_OWNER>().read().Owner })?;
+        let groups_buffer = read(TokenGroups)?;
+        let groups = groups_buffer.as_ptr().cast::<TOKEN_GROUPS>();
+        // SAFETY: the call filled a TOKEN_GROUPS with GroupCount entries at the start of the
+        // buffer.
+        let count = unsafe { (*groups).GroupCount } as usize;
+        let mut all = vec![user.clone()];
+        for index in 0..count {
+            // SAFETY: index is below GroupCount, and the array starts at the field Groups.
+            let sid = unsafe {
+                (*std::ptr::addr_of!((*groups).Groups)
+                    .cast::<windows_sys::Win32::Security::SID_AND_ATTRIBUTES>()
+                    .add(index))
+                .Sid
+            };
+            all.push(copy(sid)?);
+        }
+        Ok(TokenSids {
+            owners: vec![user, owner],
+            all,
+        })
+    }
+}
+
+/// A junction opened as itself, not as the directory it leads to.
+struct OpenJunction {
+    handle: OwnedHandle,
+    identity: FileIdentity,
+}
+
+impl OpenJunction {
+    fn raw(&self) -> HANDLE {
+        self.handle.as_raw_handle()
+    }
+}
+
+/// Opens `path` without following a reparse point there, with `access`, and returns it when it
+/// is a junction (a mount point reparse point, which a volume mounted in a folder is as well). `None` when it is something else, is gone, or
+/// the current user may not open it so.
+fn open_junction(
+    path: &[u16],
+    display: &Path,
+    access: u32,
+) -> Result<Option<OpenJunction>, SandboxError> {
+    // SAFETY: path is NUL-terminated; FILE_FLAG_OPEN_REPARSE_POINT opens the junction itself.
+    let raw = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            access | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        // SAFETY: GetLastError has no preconditions.
+        return match unsafe { GetLastError() } {
+            ERROR_ACCESS_DENIED | ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => Ok(None),
+            code => Err(win32_error(
+                format!("cannot open {}", display.display()),
+                code,
+            )),
+        };
+    }
+    // SAFETY: CreateFileW succeeded, so the handle is new and owned by nobody else.
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+    // SAFETY: the structure is plain data; zero is a valid value for every field.
+    let mut tag: FILE_ATTRIBUTE_TAG_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: tag is a writable FILE_ATTRIBUTE_TAG_INFO and the size matches it.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle.as_raw_handle(),
+            FileAttributeTagInfo,
+            (&mut tag as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(last_error(format!(
+            "cannot read the reparse tag of {}",
+            display.display()
+        )));
+    }
+    if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        || tag.ReparseTag != IO_REPARSE_TAG_MOUNT_POINT
+    {
+        return Ok(None);
+    }
+    let identity = handle_identity(&handle, display)?;
+    Ok(Some(OpenJunction { handle, identity }))
+}
+
 /// Allows `sid`, which the caller already holds as a capability, `mask` with `flags` on the
 /// directory `path` that sandy created. Used for the socket directory of forwarded ports, which
 /// only the relays may use.
@@ -279,7 +856,15 @@ pub fn allow(path: &Path, sid: &Sid, mask: u32, flags: u8) -> Result<(), Sandbox
     let dacl = Dacl::read(&wide, path)?;
     // A NULL DACL would be replaced by one that grants only `sid`; refuse it like `grant` does.
     dacl.aces(path)?;
-    set_access(&wide, path, &dacl, sid, SET_ACCESS, mask, flags)
+    set_access(
+        Object::Path(&wide),
+        path,
+        &dacl,
+        sid,
+        SET_ACCESS,
+        mask,
+        flags,
+    )
 }
 
 /// Reduces the AppContainer's access to its profile folder to the read-write rights, so the
@@ -313,7 +898,7 @@ pub fn deny_execute_in_profile(appcontainer: &Sid, folder: &Path) -> Result<(), 
              reducing",
         )?;
         set_access(
-            &path,
+            Object::Path(&path),
             folder,
             &dacl,
             appcontainer,
@@ -392,6 +977,10 @@ fn file_identity(path: &[u16], display: &Path) -> Result<FileIdentity, SandboxEr
     }
     // SAFETY: CreateFileW succeeded, so the handle is new and owned by nobody else.
     let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    handle_identity(&handle, display)
+}
+
+fn handle_identity(handle: &OwnedHandle, display: &Path) -> Result<FileIdentity, SandboxError> {
     // SAFETY: the structure is plain data; zero is a valid value for every field.
     let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
     // SAFETY: info is a writable FILE_ID_INFO and the size matches it.
@@ -618,7 +1207,16 @@ fn refuse_execute_entry(
     }
 }
 
-/// The DACL of a file from `GetNamedSecurityInfoW`, in its security descriptor.
+/// What a DACL is read from and written to: a path, which Windows follows through links, or an
+/// open handle, which names the object it was opened on.
+#[derive(Clone, Copy)]
+enum Object<'a> {
+    Path(&'a [u16]),
+    Handle(HANDLE),
+}
+
+/// The DACL of a file from `GetNamedSecurityInfoW` or `GetSecurityInfo`, in its security
+/// descriptor.
 struct Dacl {
     descriptor: LocalBox,
     acl: *mut ACL,
@@ -626,21 +1224,40 @@ struct Dacl {
 
 impl Dacl {
     fn read(path: &[u16], display: &Path) -> Result<Dacl, SandboxError> {
+        Dacl::read_object(Object::Path(path), display)
+    }
+
+    fn read_object(object: Object<'_>, display: &Path) -> Result<Dacl, SandboxError> {
         let mut acl: *mut ACL = ptr::null_mut();
         let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-        // SAFETY: path is NUL-terminated; the out pointers are valid or null for the parts not
-        // requested.
-        let error = unsafe {
-            GetNamedSecurityInfoW(
-                path.as_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                &mut acl,
-                ptr::null_mut(),
-                &mut descriptor,
-            )
+        let error = match object {
+            // SAFETY: path is NUL-terminated; the out pointers are valid or null for the parts
+            // not requested.
+            Object::Path(path) => unsafe {
+                GetNamedSecurityInfoW(
+                    path.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut acl,
+                    ptr::null_mut(),
+                    &mut descriptor,
+                )
+            },
+            // SAFETY: the handle is open with READ_CONTROL; the out pointers are as above.
+            Object::Handle(handle) => unsafe {
+                GetSecurityInfo(
+                    handle,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut acl,
+                    ptr::null_mut(),
+                    &mut descriptor,
+                )
+            },
         };
         if error != 0 {
             return Err(win32_error(
@@ -784,7 +1401,15 @@ fn add_ace(
     mask: u32,
     flags: u8,
 ) -> Result<(), SandboxError> {
-    set_access(path, display, current, capability, SET_ACCESS, mask, flags)
+    set_access(
+        Object::Path(path),
+        display,
+        current,
+        capability,
+        SET_ACCESS,
+        mask,
+        flags,
+    )
 }
 
 /// Rewrites the explicit ACEs for `sid` in the DACL of `path` and writes the DACL back, keeping
@@ -792,7 +1417,7 @@ fn add_ace(
 /// allow ACE for `mask` with `flags`, so it both grants (a new SID) and reduces (an SID Windows
 /// already granted more); `REVOKE_ACCESS` removes them.
 fn set_access(
-    path: &[u16],
+    object: Object<'_>,
     display: &Path,
     current: &Dacl,
     sid: &Sid,
@@ -826,17 +1451,32 @@ fn set_access(
     } else {
         UNPROTECTED_DACL_SECURITY_INFORMATION
     };
-    // SAFETY: path is NUL-terminated and merged is a valid ACL from SetEntriesInAclW.
-    let error = unsafe {
-        SetNamedSecurityInfoW(
-            path.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | protection,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            merged.0.cast(),
-            ptr::null(),
-        )
+    let information = DACL_SECURITY_INFORMATION | protection;
+    let error = match object {
+        // SAFETY: path is NUL-terminated and merged is a valid ACL from SetEntriesInAclW.
+        Object::Path(path) => unsafe {
+            SetNamedSecurityInfoW(
+                path.as_ptr(),
+                SE_FILE_OBJECT,
+                information,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                merged.0.cast(),
+                ptr::null(),
+            )
+        },
+        // SAFETY: the handle is open with WRITE_DAC and merged is a valid ACL.
+        Object::Handle(handle) => unsafe {
+            SetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                information,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                merged.0.cast(),
+                ptr::null(),
+            )
+        },
     };
     if error == ERROR_ACCESS_DENIED {
         return Err(SandboxError::new(format!(
@@ -907,7 +1547,7 @@ mod tests {
         let wide = wide_nul(executable.as_os_str());
         let any_package = Sid::from_bytes(ALL_APPLICATION_PACKAGES).unwrap();
         set_access(
-            &wide,
+            Object::Path(&wide),
             &executable,
             &Dacl::read(&wide, &executable).unwrap(),
             &any_package,
@@ -945,5 +1585,500 @@ mod tests {
         for dir in [plain, executable, open] {
             let _ = fs::remove_dir_all(dir);
         }
+    }
+
+    fn junction(link: &Path, target: &Path) {
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J {}", link.display());
+    }
+
+    /// The policy with `read`, resolved, so its links are those the resolver passed.
+    fn resolved(read: &[PathBuf]) -> ResolvedPolicy {
+        let mut policy = sandy_core::Policy::default();
+        policy.filesystem.read = read.to_vec();
+        ResolvedPolicy::resolve(&policy, None).unwrap()
+    }
+
+    /// Every entry of the junction object itself, not of its target.
+    fn junction_entries(link: &Path) -> Vec<(AceKind, u8, u32, Vec<u8>)> {
+        let opened = open_junction(&wide_nul(link.as_os_str()), link, READ_CONTROL)
+            .unwrap()
+            .unwrap();
+        Dacl::read_object(Object::Handle(opened.raw()), link)
+            .unwrap()
+            .aces(link)
+            .unwrap()
+            .aces
+    }
+
+    fn target_entries(path: &Path) -> Vec<(AceKind, u8, u32, Vec<u8>)> {
+        let wide = wide_nul(path.as_os_str());
+        Dacl::read(&wide, path).unwrap().aces(path).unwrap().aces
+    }
+
+    /// Only junctions that lead to a directory policy path or into one count: each one of a
+    /// chain that ends there, not a junction to a directory above a policy path.
+    #[test]
+    fn final_junctions_are_the_names_of_directory_policy_paths() {
+        let root = directory("final-junctions");
+        fs::create_dir_all(root.join("real")).unwrap();
+        fs::create_dir_all(root.join("other/sub")).unwrap();
+        junction(&root.join("j2"), &root.join("real"));
+        junction(&root.join("j1"), &root.join("j2"));
+        junction(&root.join("above"), &root.join("other"));
+        // A directory inside a directory policy path, reached through a junction of its own.
+        fs::create_dir_all(root.join("real/inner")).unwrap();
+        junction(&root.join("inner"), &root.join("real").join("inner"));
+        fs::write(root.join("real/inner/file"), b"x").unwrap();
+        let policy = resolved(&[
+            root.join("j1"),
+            root.join("above/sub"),
+            root.join("inner/file"),
+        ]);
+        let mut found: Vec<String> = final_junctions(&policy)
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        assert_eq!(found, ["inner", "j1", "j2"]);
+        for name in ["j1", "j2", "above", "inner"] {
+            fs::remove_dir(root.join(name)).unwrap();
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The grant is one entry on the junction itself: read, no inheritance, for a capability of
+    /// its own. The target's permissions stay as they were, a second grant adds nothing, and the
+    /// removal takes the entry back.
+    #[test]
+    fn a_junction_grant_is_one_read_entry_on_the_junction_only() {
+        let root = directory("junction-grant");
+        fs::create_dir_all(root.join("real")).unwrap();
+        let link = root.join("link");
+        junction(&link, &root.join("real"));
+        let policy = resolved(std::slice::from_ref(&link));
+        let target_before = target_entries(&root.join("real"));
+        let junction_before = junction_entries(&link);
+
+        let capabilities = grant_junctions("sandy.acl-junction-test", &policy);
+        assert_eq!(capabilities.len(), 1);
+        let after = junction_entries(&link);
+        let added: Vec<_> = after
+            .iter()
+            .filter(|entry| !junction_before.contains(entry))
+            .collect();
+        assert_eq!(added.len(), 1, "{after:?}");
+        let (kind, flags, mask, sid) = added[0];
+        assert_eq!(*kind, AceKind::Allow);
+        assert_eq!(*flags, 0, "the entry must not be inherited by anything");
+        assert_eq!(*mask, JUNCTION_MASK);
+        assert_eq!(sid.as_slice(), capabilities[0].bytes());
+        assert_eq!(map_generic(*mask) & !crate::access::FILE_GENERIC_READ, 0);
+        assert_eq!(target_entries(&root.join("real")), target_before);
+
+        let again = grant_junctions("sandy.acl-junction-test", &policy);
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].bytes(), capabilities[0].bytes());
+        assert_eq!(junction_entries(&link), after);
+
+        revoke_junctions("sandy.acl-junction-test", &policy);
+        assert_eq!(junction_entries(&link), junction_before);
+        assert_eq!(target_entries(&root.join("real")), target_before);
+        fs::remove_dir(&link).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn icacls(path: &Path, args: &[&str]) {
+        let status = std::process::Command::new("icacls")
+            .arg(path)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "icacls {} {args:?}", path.display());
+    }
+
+    /// Writing the junction's DACL must not reach the tree it leads to: the target and the
+    /// files and directories in it keep their permissions, also when the junction's parent
+    /// hands down entries that the target's parent does not. Windows propagates inheritable
+    /// entries when a DACL is written through its security API, so a write that followed the
+    /// junction would show here.
+    #[test]
+    fn a_junction_grant_leaves_the_tree_behind_it_alone() {
+        let root = directory("junction-tree");
+        let (links, targets) = (root.join("links"), root.join("targets"));
+        fs::create_dir_all(targets.join("real/sub")).unwrap();
+        fs::create_dir_all(&links).unwrap();
+        fs::write(targets.join("real/file"), b"x").unwrap();
+        // Distinct inheritable entries above the junction and above the target.
+        icacls(&links, &["/grant", "*S-1-5-32-551:(OI)(CI)(R)"]);
+        icacls(&targets, &["/grant", "*S-1-5-32-546:(OI)(CI)(R)"]);
+        let link = links.join("link");
+        junction(&link, &targets.join("real"));
+        let policy = resolved(std::slice::from_ref(&link));
+        let tree = [
+            targets.join("real"),
+            targets.join("real/file"),
+            targets.join("real/sub"),
+        ];
+        let before: Vec<_> = tree.iter().map(|path| target_entries(path)).collect();
+        // The setup the test rests on: the junction inherits what its parent hands down, and the
+        // target does not.
+        let backup_operators =
+            Sid::from_bytes(&[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 39, 2, 0, 0]).unwrap();
+        let inherits = |entries: &[(AceKind, u8, u32, Vec<u8>)]| {
+            entries.iter().any(|(_, flags, _, sid)| {
+                flags & INHERITED_ACE != 0 && sid.as_slice() == backup_operators.bytes()
+            })
+        };
+        assert!(inherits(&junction_entries(&link)));
+        assert!(!before.iter().any(|entries| inherits(entries)));
+
+        assert_eq!(grant_junctions("sandy.acl-junction-test", &policy).len(), 1);
+        let granted: Vec<_> = tree.iter().map(|path| target_entries(path)).collect();
+        assert_eq!(granted, before);
+        revoke_junctions("sandy.acl-junction-test", &policy);
+        let revoked: Vec<_> = tree.iter().map(|path| target_entries(path)).collect();
+        assert_eq!(revoked, before);
+        fs::remove_dir(&link).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A junction every AppContainer may read already gets no entry and no capability.
+    #[test]
+    fn a_junction_every_appcontainer_reads_gets_nothing() {
+        let root = directory("junction-packages");
+        fs::create_dir_all(root.join("real")).unwrap();
+        let link = root.join("link");
+        junction(&link, &root.join("real"));
+        icacls(&link, &["/L", "/grant", "*S-1-15-2-1:(R)"]);
+        let policy = resolved(std::slice::from_ref(&link));
+        let before = junction_entries(&link);
+        assert!(grant_junctions("sandy.acl-junction-test", &policy).is_empty());
+        assert_eq!(junction_entries(&link), before);
+        fs::remove_dir(&link).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The DACL of `object` in SDDL, with its control flags (`P`, `AI`), every entry, the
+    /// conditions of conditional entries, and the order.
+    fn sddl(object: Object<'_>, display: &Path) -> String {
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        let dacl = Dacl::read_object(object, display).unwrap();
+        let mut text: windows_sys::core::PWSTR = ptr::null_mut();
+        // SAFETY: the descriptor is valid; text receives a LocalAlloc'd string.
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                dacl.descriptor.0,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut text,
+                ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+        let text = LocalBox(text.cast());
+        // SAFETY: the string is NUL-terminated.
+        let len = (0..)
+            .take_while(|&i| unsafe { *text.0.cast::<u16>().add(i) } != 0)
+            .count();
+        // SAFETY: len units are readable.
+        String::from_utf16(unsafe { std::slice::from_raw_parts(text.0.cast::<u16>(), len) })
+            .unwrap()
+    }
+
+    /// Replaces the DACL of `object` with the one in `text`.
+    fn set_sddl(object: Object<'_>, text: &str) {
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::GetSecurityDescriptorDacl;
+        let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: wide is NUL-terminated; descriptor receives a LocalAlloc'd descriptor.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0, "{text}: {}", std::io::Error::last_os_error());
+        let descriptor = LocalBox(descriptor);
+        let (mut present, mut defaulted, mut acl) = (0, 0, ptr::null_mut());
+        // SAFETY: the descriptor is valid; the out pointers are valid.
+        let found = unsafe {
+            GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut acl, &mut defaulted)
+        };
+        assert_ne!(found, 0);
+        let protection = if text.starts_with("D:P") {
+            PROTECTED_DACL_SECURITY_INFORMATION
+        } else {
+            UNPROTECTED_DACL_SECURITY_INFORMATION
+        };
+        let error = match object {
+            // SAFETY: path is NUL-terminated and acl is a valid ACL inside the descriptor.
+            Object::Path(path) => unsafe {
+                SetNamedSecurityInfoW(
+                    path.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | protection,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    acl,
+                    ptr::null(),
+                )
+            },
+            // SAFETY: the handle is open with WRITE_DAC and acl is valid.
+            Object::Handle(handle) => unsafe {
+                SetSecurityInfo(
+                    handle,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | protection,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    acl,
+                    ptr::null(),
+                )
+            },
+        };
+        assert_eq!(error, 0, "{text}");
+    }
+
+    /// DACLs of the shapes that sandy's merge must keep as they are: inherited entries,
+    /// protection, automatic inheritance, a conditional entry, and an order that is not the
+    /// canonical one (an allow before a deny). `None` keeps the DACL the junction or directory
+    /// inherits.
+    const SHAPES: &[(&str, Option<&str>)] = &[
+        ("inherited", None),
+        ("protected", Some("D:P(A;;FA;;;BA)(A;;FA;;;SY)(A;;FA;;;OW)")),
+        (
+            "auto-inherited",
+            Some("D:PAI(A;;FA;;;BA)(A;;FA;;;SY)(A;;FA;;;OW)"),
+        ),
+        (
+            "conditional",
+            Some("D:P(A;;FA;;;BA)(A;;FA;;;SY)(XA;;FR;;;WD;(@User.Title == \"x\"))"),
+        ),
+        (
+            "non-canonical",
+            Some("D:P(A;;FA;;;BA)(A;;FR;;;WD)(D;;FR;;;BG)(A;;FA;;;SY)"),
+        ),
+    ];
+
+    /// The list as Windows' security API writes it back: it sets the flag of automatic
+    /// inheritance (`AI`) on every list it writes, as `icacls` and Explorer do, so a list
+    /// without it gains it and nothing else.
+    fn as_written(list: &str) -> String {
+        if let Some(rest) = list.strip_prefix("D:P(") {
+            format!("D:PAI({rest}")
+        } else if let Some(rest) = list.strip_prefix("D:(") {
+            format!("D:AI({rest}")
+        } else {
+            list.to_string()
+        }
+    }
+
+    /// The list holds the entries of the shape, in its order (Windows writes SDDL keywords in
+    /// capitals and adds `AI` to a protected list).
+    fn assert_shape(text: &Option<&str>, list: &str) {
+        let Some(text) = text else {
+            assert!(list.contains("ID;"), "no inherited entry: {list}");
+            return;
+        };
+        let entries = &text[text.find('(').unwrap()..];
+        assert!(
+            list.to_lowercase().ends_with(&entries.to_lowercase()),
+            "{list} lacks {entries}"
+        );
+    }
+
+    /// A grant adds its one entry and changes nothing else in the list, and the removal gives
+    /// the list back as it was, for every shape, on a junction.
+    #[test]
+    fn a_junction_grant_keeps_every_shape_of_the_list() {
+        for (shape, text) in SHAPES {
+            let root = directory(&format!("junction-shape-{shape}"));
+            fs::create_dir_all(root.join("real")).unwrap();
+            let link = root.join("link");
+            junction(&link, &root.join("real"));
+            let wide = wide_nul(link.as_os_str());
+            let handle = || {
+                open_junction(&wide, &link, READ_CONTROL | WRITE_DAC)
+                    .unwrap()
+                    .unwrap()
+            };
+            if let Some(text) = text {
+                let opened = handle();
+                set_sddl(Object::Handle(opened.raw()), text);
+            }
+            let opened = handle();
+            let before = sddl(Object::Handle(opened.raw()), &link);
+            drop(opened);
+            assert_shape(text, &before);
+            let policy = resolved(std::slice::from_ref(&link));
+            let capabilities = grant_junctions("sandy.acl-junction-test", &policy);
+            assert_eq!(capabilities.len(), 1, "{shape}");
+            let entry = format!(
+                "(A;;FR;;;{})",
+                crate::access::sid_string(capabilities[0].bytes())
+            );
+            let opened = handle();
+            let after = sddl(Object::Handle(opened.raw()), &link);
+            drop(opened);
+            assert_eq!(after.matches(&entry).count(), 1, "{shape}: {after}");
+            assert_eq!(
+                after.replacen(&entry, "", 1),
+                as_written(&before),
+                "{shape}"
+            );
+            assert!(revoke_junctions("sandy.acl-junction-test", &policy).is_empty());
+            let opened = handle();
+            assert_eq!(
+                sddl(Object::Handle(opened.raw()), &link),
+                as_written(&before),
+                "{shape}"
+            );
+            drop(opened);
+            fs::remove_dir(&link).unwrap();
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    /// The same for the grant on a directory policy path, which writes through the path.
+    #[test]
+    fn a_path_grant_keeps_every_shape_of_the_list() {
+        for (shape, text) in SHAPES {
+            let dir = directory(&format!("path-shape-{shape}"));
+            let wide = wide_nul(dir.as_os_str());
+            if let Some(text) = text {
+                set_sddl(Object::Path(&wide), text);
+            }
+            let before = sddl(Object::Path(&wide), &dir);
+            assert_shape(text, &before);
+            let rule = PathRule {
+                path: dir.clone(),
+                access: PathAccess::Read,
+                is_dir: true,
+            };
+            let capability = grant("sandy.acl-shape-test", &rule, &[]).unwrap();
+            let entry = format!(
+                "(A;OICI;FR;;;{})",
+                crate::access::sid_string(capability.bytes())
+            );
+            let after = sddl(Object::Path(&wide), &dir);
+            assert_eq!(after.matches(&entry).count(), 1, "{shape}: {after}");
+            assert_eq!(
+                after.replacen(&entry, "", 1),
+                as_written(&before),
+                "{shape}"
+            );
+            revoke("sandy.acl-shape-test", &rule).unwrap();
+            assert_eq!(
+                sddl(Object::Path(&wide), &dir),
+                as_written(&before),
+                "{shape}"
+            );
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    fn owned(opened: &OpenJunction, link: &Path) -> bool {
+        let token = TokenSids::of_this_process().unwrap();
+        owner_of(opened, link)
+            .unwrap()
+            .is_some_and(|owner| token.owners.contains(&owner))
+    }
+
+    /// A junction of another owner stays as it is, also for a token that could change it (the
+    /// test runs elevated, with SeRestorePrivilege), and `check` names the reason.
+    #[test]
+    fn a_junction_of_another_owner_is_left_alone() {
+        let root = directory("junction-owner");
+        fs::create_dir_all(root.join("real")).unwrap();
+        let link = root.join("link");
+        junction(&link, &root.join("real"));
+        icacls(&link, &["/L", "/setowner", "*S-1-5-18"]);
+        let wide = wide_nul(link.as_os_str());
+        let opened = open_junction(&wide, &link, READ_CONTROL).unwrap().unwrap();
+        assert!(!owned(&opened, &link));
+        // Control: this token may change the junction's permissions, so only the owner keeps
+        // sandy from it.
+        assert!(
+            open_junction(&wide, &link, READ_CONTROL | WRITE_DAC)
+                .unwrap()
+                .is_some()
+        );
+        let before = sddl(Object::Handle(opened.raw()), &link);
+        drop(opened);
+        let policy = resolved(std::slice::from_ref(&link));
+        assert!(grant_junctions("sandy.acl-junction-test", &policy).is_empty());
+        let opened = open_junction(&wide, &link, READ_CONTROL).unwrap().unwrap();
+        assert_eq!(sddl(Object::Handle(opened.raw()), &link), before);
+        drop(opened);
+        let closed = closed_junctions("sandy.acl-junction-test", &policy);
+        assert_eq!(closed.len(), 1, "{closed:?}");
+        assert!(
+            closed[0].reason.contains("belongs to S-1-5-18"),
+            "{closed:?}"
+        );
+        assert!(closed[0].remedy.contains("owner"), "{closed:?}");
+        fs::remove_dir(&link).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A junction this user made is this user's, which is what the other tests rely on.
+    #[test]
+    fn a_junction_this_user_made_is_owned_by_this_user() {
+        let root = directory("junction-own");
+        fs::create_dir_all(root.join("real")).unwrap();
+        let link = root.join("link");
+        junction(&link, &root.join("real"));
+        let opened = open_junction(&wide_nul(link.as_os_str()), &link, READ_CONTROL)
+            .unwrap()
+            .unwrap();
+        assert!(owned(&opened, &link));
+        drop(opened);
+        fs::remove_dir(&link).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A deny entry for the user's own group keeps the program out of the junction whatever
+    /// sandy adds, so sandy adds nothing and `check` names the deny entry.
+    #[test]
+    fn a_junction_denied_to_the_user_gets_nothing() {
+        let root = directory("junction-deny");
+        fs::create_dir_all(root.join("real")).unwrap();
+        let link = root.join("link");
+        junction(&link, &root.join("real"));
+        // Authenticated Users, which every logged-on token holds.
+        icacls(&link, &["/L", "/deny", "*S-1-5-11:(RD)"]);
+        let policy = resolved(std::slice::from_ref(&link));
+        let wide = wide_nul(link.as_os_str());
+        let opened = open_junction(&wide, &link, READ_CONTROL).unwrap().unwrap();
+        let before = sddl(Object::Handle(opened.raw()), &link);
+        drop(opened);
+        assert!(grant_junctions("sandy.acl-junction-test", &policy).is_empty());
+        let opened = open_junction(&wide, &link, READ_CONTROL).unwrap().unwrap();
+        assert_eq!(sddl(Object::Handle(opened.raw()), &link), before);
+        drop(opened);
+        let closed = closed_junctions("sandy.acl-junction-test", &policy);
+        assert_eq!(closed.len(), 1, "{closed:?}");
+        assert!(
+            closed[0].reason.contains("deny entry for S-1-5-11"),
+            "{closed:?}"
+        );
+        icacls(&link, &["/L", "/remove:d", "*S-1-5-11"]);
+        fs::remove_dir(&link).unwrap();
+        fs::remove_dir_all(&root).unwrap();
     }
 }

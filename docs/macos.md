@@ -270,6 +270,36 @@ of earlier definitions"), so the protections come last. The unit test
     `ENOENT`. Because the real path is checked as well, the rule grants nothing that the rules
     for the real paths do not: `access("/etc/passwd")` still answers `ENOENT`
     (`paths_through_the_system_links_reach_only_granted_files`).
+
+    The symbolic links that the names of the policy paths and the program pass
+    (`ResolvedPolicy.links`), such as a data directory reached through a link, get the same pair of
+    rules: `file-read-metadata` and `file-test-existence` on the link itself, which the lookup
+    reads, and `file-test-existence` below it for the spelled paths. Their directories count as
+    ancestors (step 10). Measured on macOS 27.0.1: without the rules every path through such a link
+    answered `ENOENT`; with `file-test-existence` alone as well; with both, the granted files are
+    readable and writable through the link, a file next to them that the policy does not grant still
+    answers `ENOENT`, and so does a path through the link after a process outside the sandbox
+    repointed it to another directory (measured with a hand-written profile of the same rules; the
+    test suite has no step between two actions of a run). The program cannot remove, rename or
+    replace the link, because no rule allows a write there, and the resolver refuses a policy path
+    resolved through an entry inside a writable path (rule 4 of [DESIGN.md](DESIGN.md)), so the link
+    never lies where the program can write
+    (`policy_paths_named_through_links_reach_only_granted_files`, which also covers a chain of links
+    with relative targets and a link to a file). A link that the policy does not pass gets nothing:
+    with `--read /x/real/file`, the path `/x/link/file` answers `ENOENT`, so the program must use
+    the names the policy uses.
+
+    What the rules show the program: the link's own metadata and its target text (`readlink`
+    works through the metadata rule, measured on macOS 27.0.1), and, because the link counts
+    as granted, the metadata of the directories above it (step 10), which need not be
+    ancestors of the real path. A policy path below `/etc`, `/tmp` or `/var` makes that link
+    granted too, so step 11's rule for it applies also under `system = "none"`. The rules
+    match the place where the link lies, whatever is there: if a process outside the sandbox
+    replaces the link with a directory while the program runs, the program can test which
+    names exist below it, but reads nothing there (as it follows from the rules; not
+    measured). Keep the directories that hold the links
+    out of reach of other processes, as for the parents of policy paths (rule 4 of
+    [DESIGN.md](DESIGN.md)).
 12. Protections:
     - Anchors: `(deny file-write-unlink file-write-create (literal ...))` for the root of every
       `read_write` path. Without it the target could delete the root and put a symbolic link in

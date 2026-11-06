@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use lexopt::prelude::*;
 use sandy_core::{
-    ChildProcesses, Egress, EgressReach, ExposedPort, FileView, ForwardedPort, IpAccess,
+    ChildProcesses, Egress, EgressReach, ExposedPort, FileView, ForwardedPort, IpAccess, Junctions,
     MachService, NetworkAccess, PathMetadata, Policy, Relays, SignalScope, SystemAccess, Warning,
     WarningId, Win32k,
 };
@@ -88,6 +88,10 @@ Options (they extend the policy file):
   --windows-win32k allow|deny
                              the system calls of win32k, the GUI part of the Windows kernel;
                              deny stops many programs that load user32.dll (default: allow)
+  --windows-junctions grant|refuse
+                             whether sandy may open a junction on the way to a directory policy
+                             path for the program; refuse changes nothing but the policy paths
+                             and refuses such a junction (default: grant)
   --cwd DIR                  working directory of the program
   -h, --help                 show this help
   -V, --version              show the version
@@ -163,6 +167,7 @@ pub struct Overrides {
     relays: Option<Relays>,
     mach_services: Vec<MachService>,
     win32k: Option<Win32k>,
+    junctions: Option<Junctions>,
     pass_env: Vec<String>,
     set_env: Vec<(String, String)>,
     appcontainer: Option<String>,
@@ -196,6 +201,11 @@ impl Overrides {
             ),
             ("--macos-relays", "macos.relays", self.relays.is_some()),
             ("--windows-win32k", "windows.win32k", self.win32k.is_some()),
+            (
+                "--windows-junctions",
+                "windows.junctions",
+                self.junctions.is_some(),
+            ),
             (
                 "--appcontainer",
                 "windows.appcontainer_name",
@@ -338,6 +348,12 @@ impl Overrides {
                 note("--windows-win32k", "allow", "win32k", "deny");
             }
             policy.windows.win32k = win32k;
+        }
+        if let Some(junctions) = self.junctions {
+            if junctions == Junctions::Grant && policy.windows.junctions == Junctions::Refuse {
+                note("--windows-junctions", "grant", "junctions", "refuse");
+            }
+            policy.windows.junctions = junctions;
         }
         weakened
     }
@@ -671,6 +687,15 @@ where
                     "allow" => Win32k::Allow,
                     "deny" => Win32k::Deny,
                     other => return Err(format!("invalid --windows-win32k value {other:?}").into()),
+                })
+            }
+            Long("windows-junctions") => {
+                overrides.junctions = Some(match parser.value()?.string()?.as_str() {
+                    "grant" => Junctions::Grant,
+                    "refuse" => Junctions::Refuse,
+                    other => {
+                        return Err(format!("invalid --windows-junctions value {other:?}").into());
+                    }
                 })
             }
             Long("forward") => {
@@ -1124,6 +1149,38 @@ mod tests {
         );
         assert!(weakened(Win32k::Allow, "deny").is_empty());
         assert!(parse_strs(&["check", "--windows-win32k", "none"]).is_err());
+    }
+
+    /// `--windows-junctions grant` over a file with `junctions = "refuse"` lets sandy change
+    /// junctions the file keeps it from, so it is named; the other way round it is not.
+    #[test]
+    fn junctions_granted_over_a_file_that_refuses_them_is_named() {
+        let applied = |file: Junctions, option: &str| {
+            let mut policy = Policy::default();
+            policy.windows.junctions = file;
+            let weakened = invocation(&["check", "--windows-junctions", option])
+                .overrides
+                .apply(&mut policy, true)
+                .map(widened)
+                .unwrap();
+            (policy.windows.junctions, weakened)
+        };
+        assert_eq!(
+            applied(Junctions::Refuse, "grant"),
+            (
+                Junctions::Grant,
+                vec![
+                    "--windows-junctions grant replaces junctions = \"refuse\" from the policy \
+                     file and allows more than the file does"
+                        .to_string()
+                ]
+            )
+        );
+        assert_eq!(
+            applied(Junctions::Grant, "refuse"),
+            (Junctions::Refuse, Vec::new())
+        );
+        assert!(parse_strs(&["check", "--windows-junctions", "deny"]).is_err());
     }
 
     /// `--macos-relays dual-stack` gives the program back the IPv6 sockets, and the route, that
