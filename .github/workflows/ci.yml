@@ -20,11 +20,15 @@ jobs:
       # differ in constants that sandy compiles into its filters (O_ACCMODE includes O_PATH on
       # musl), so the release targets run the suite too. Their skips have a list of their own:
       # a static program has no loader to check.
+      #
+      # `ecryptfs` installs ecryptfs-utils, so that the test of directories on eCryptfs mounts
+      # one; one runner is enough, since the test checks Landlock and eCryptfs, not the target.
       matrix:
         include:
           - os: ubuntu-24.04
             min_landlock_abi: 5
-            require: pty
+            require: pty,ecryptfs
+            ecryptfs: true
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             min_landlock_abi: 5
@@ -88,6 +92,18 @@ jobs:
           mkdir -p "$RUNNER_TEMP/bin"
           cp "target/$target/release/sandy" target/debug/sandy-probe target/debug/sandy-marker "$RUNNER_TEMP/bin/"
           echo "SANDY_TEST_BIN_DIR=$RUNNER_TEMP/bin" >> "$GITHUB_ENV"
+      # From the runner's signed Ubuntu archive. The module may be in linux-modules-extra.
+      - name: Install eCryptfs (Linux)
+        if: matrix.ecryptfs
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ecryptfs-utils
+          sudo modprobe ecryptfs || {
+            sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)"
+            sudo modprobe ecryptfs
+          }
+          grep -w ecryptfs /proc/filesystems
       - name: Check how this runner enforces the default policy
         run: cargo run --locked ${{ env.TARGET_OPTION }} --bin sandy -- check ${{ runner.os == 'Windows' && '--appcontainer sandy.escape-tests' || '' }}
       # The skip log is named per step: the runner context, which holds the temporary
