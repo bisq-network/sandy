@@ -195,6 +195,8 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
         "enum-windows" => windows_actions::enum_windows(),
         "icmp-echo" => windows_actions::icmp_echo(target),
         "junction" => windows_actions::junction(target),
+        "junction-repoint" => windows_actions::junction_repoint(target),
+        "open-link" => windows_actions::open_link(target),
         "symbolic-link" => windows_actions::symbolic_link(target),
         "appcontainer-run" => windows_actions::appcontainer_run(target),
         "tcp-listen-bind" => windows_actions::tcp_listen_reuse(target, false),
@@ -3068,6 +3070,37 @@ mod windows_actions {
     /// outside its writable paths is refused this, which is why the escape test can plant one
     /// only outside the sandbox.
     pub fn junction(target: &str) -> io::Result<String> {
+        let (existing, link) = super::pair(target)?;
+        fs::create_dir(link)?;
+        let result = set_mount_point(existing, link);
+        if result.is_err() {
+            let _ = fs::remove_dir(link);
+        }
+        result
+    }
+
+    /// Points the existing junction `LINK` at `TARGET`, the way its owner may change it with
+    /// write access to the junction object alone. Target: `TARGET U+001F LINK`.
+    pub fn junction_repoint(target: &str) -> io::Result<String> {
+        let (existing, link) = super::pair(target)?;
+        set_mount_point(existing, link)
+    }
+
+    /// Opens the object `PATH` itself, not what a link there leads to, with the access mask
+    /// `MASK` (hexadecimal). Target: `PATH U+001F MASK`.
+    pub fn open_link(target: &str) -> io::Result<String> {
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+        let (path, mask) = super::pair(target)?;
+        let mask = u32::from_str_radix(mask, 16).map_err(|_| invalid("invalid access mask"))?;
+        fs::OpenOptions::new()
+            .access_mode(mask)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map(|_| String::new())
+    }
+
+    fn set_mount_point(existing: &str, link: &str) -> io::Result<String> {
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_FLAG_OPEN_REPARSE_POINT, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
         };
@@ -3076,56 +3109,48 @@ mod windows_actions {
         const SET_REPARSE_POINT: u32 = 0x0009_00A4;
         const MOUNT_POINT: u32 = 0xA000_0003;
 
-        let (existing, link) = super::pair(target)?;
-        fs::create_dir(link)?;
-        let result = (|| {
-            let directory = fs::OpenOptions::new()
-                .access_mode(FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES)
-                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-                .open(link)?;
-            // An NT substitute name: `\??\C:\path`, so strip a `\\?\` verbatim prefix first.
-            let plain = existing.strip_prefix(r"\\?\").unwrap_or(existing);
-            let substitute: Vec<u16> = format!(r"\??\{plain}").encode_utf16().collect();
-            let print: Vec<u16> = plain.encode_utf16().collect();
-            let mut names = substitute.clone();
-            names.push(0);
-            names.extend(&print);
-            names.push(0);
-            let mut buffer: Vec<u8> = Vec::new();
-            buffer.extend(MOUNT_POINT.to_le_bytes());
-            buffer.extend((8 + 2 * names.len() as u16).to_le_bytes());
-            buffer.extend(0u16.to_le_bytes());
-            buffer.extend(0u16.to_le_bytes());
-            buffer.extend((2 * substitute.len() as u16).to_le_bytes());
-            buffer.extend((2 * substitute.len() as u16 + 2).to_le_bytes());
-            buffer.extend((2 * print.len() as u16).to_le_bytes());
-            for unit in names {
-                buffer.extend(unit.to_le_bytes());
-            }
-            let mut returned = 0u32;
-            // SAFETY: the handle is open; the buffer holds a mount point reparse buffer of the
-            // length passed; there is no output buffer.
-            let ok = unsafe {
-                DeviceIoControl(
-                    std::os::windows::io::AsRawHandle::as_raw_handle(&directory),
-                    SET_REPARSE_POINT,
-                    buffer.as_ptr().cast(),
-                    buffer.len() as u32,
-                    ptr::null_mut(),
-                    0,
-                    &mut returned,
-                    ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(String::new())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_dir(link);
+        let directory = fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(link)?;
+        // An NT substitute name: `\??\C:\path`, so strip a `\\?\` verbatim prefix first.
+        let plain = existing.strip_prefix(r"\\?\").unwrap_or(existing);
+        let substitute: Vec<u16> = format!(r"\??\{plain}").encode_utf16().collect();
+        let print: Vec<u16> = plain.encode_utf16().collect();
+        let mut names = substitute.clone();
+        names.push(0);
+        names.extend(&print);
+        names.push(0);
+        let mut buffer: Vec<u8> = Vec::new();
+        buffer.extend(MOUNT_POINT.to_le_bytes());
+        buffer.extend((8 + 2 * names.len() as u16).to_le_bytes());
+        buffer.extend(0u16.to_le_bytes());
+        buffer.extend(0u16.to_le_bytes());
+        buffer.extend((2 * substitute.len() as u16).to_le_bytes());
+        buffer.extend((2 * substitute.len() as u16 + 2).to_le_bytes());
+        buffer.extend((2 * print.len() as u16).to_le_bytes());
+        for unit in names {
+            buffer.extend(unit.to_le_bytes());
         }
-        result
+        let mut returned = 0u32;
+        // SAFETY: the handle is open; the buffer holds a mount point reparse buffer of the
+        // length passed; there is no output buffer.
+        let ok = unsafe {
+            DeviceIoControl(
+                std::os::windows::io::AsRawHandle::as_raw_handle(&directory),
+                SET_REPARSE_POINT,
+                buffer.as_ptr().cast(),
+                buffer.len() as u32,
+                ptr::null_mut(),
+                0,
+                &mut returned,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(String::new())
     }
 
     /// A symbolic link `LINK` to `TARGET`, a directory link when `TARGET` is a directory.
@@ -3607,6 +3632,14 @@ mod windows_actions {
     }
 
     pub fn junction(_target: &str) -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn junction_repoint(_target: &str) -> io::Result<String> {
+        unsupported()
+    }
+
+    pub fn open_link(_target: &str) -> io::Result<String> {
         unsupported()
     }
 

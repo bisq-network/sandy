@@ -21,4 +21,5 @@ escape_windows ip_private_reaches_no_host_of_the_network network-gateway
 escape a_connected_unix_socket_on_standard_input_still_runs unix-socket-pair
 # The runner user still opens a file for WRITE_DAC without privileges after the change, so
 # no path lacks the right.
+escape_windows a_junction_the_user_cannot_change_is_left_alone write-dac-revocable
 escape_windows check_reports_a_path_whose_permissions_the_user_cannot_change write-dac-revocable

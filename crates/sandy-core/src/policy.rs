@@ -706,6 +706,24 @@ pub struct WindowsPolicy {
     pub appcontainer_name: Option<String>,
     #[serde(default)]
     pub win32k: Win32k,
+    #[serde(default)]
+    pub junctions: Junctions,
+}
+
+/// Whether sandy may open a junction on the way to a directory policy path for the program, by
+/// adding a read entry on the junction itself (docs/windows.md, "Links and identity").
+///
+/// Windows checks the junction's own permissions when a path ends at it, so without the entry
+/// the program cannot list or open the directory under the junction's name. `refuse` keeps sandy
+/// from changing anything but the policy paths: a directory policy path named through a junction
+/// that not every AppContainer may read is then a conflict of the policy with the host. Other
+/// platforms have no junctions, so there the setting changes nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Junctions {
+    #[default]
+    Grant,
+    Refuse,
 }
 
 /// Whether the target may make the system calls of win32k, the part of the Windows kernel that
@@ -1046,6 +1064,7 @@ mod tests {
         assert_eq!(policy.filesystem.system, SystemAccess::Minimal);
         assert_eq!(policy.linux.path_metadata, PathMetadata::Deny);
         assert_eq!(policy.process.children, ChildProcesses::Allowed);
+        assert_eq!(policy.windows.junctions, Junctions::Grant);
         assert_eq!(policy.windows.win32k, Win32k::Allow);
         assert_eq!(policy.macos.relays, Relays::DualStack);
         assert_eq!(policy.filesystem.view, FileView::All);
@@ -1080,6 +1099,7 @@ mod tests {
             [windows]
             appcontainer_name = "example"
             win32k = "deny"
+            junctions = "refuse"
             "#,
         )
         .unwrap();
@@ -1114,6 +1134,7 @@ mod tests {
         assert_eq!(policy.linux.path_metadata, PathMetadata::Allow);
         assert_eq!(policy.macos.relays, Relays::Ipv4);
         assert_eq!(policy.windows.appcontainer_name.as_deref(), Some("example"));
+        assert_eq!(policy.windows.junctions, Junctions::Refuse);
         assert_eq!(policy.windows.win32k, Win32k::Deny);
     }
 

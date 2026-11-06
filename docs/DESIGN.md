@@ -90,6 +90,7 @@ relays = "dual-stack"         # "dual-stack" | "ipv4"; ipv4: the program reaches
 [windows]
 appcontainer_name = "example.app"  # required on Windows
 win32k = "allow"              # "allow" | "deny"; deny blocks win32k (GUI kernel) system calls
+junctions = "grant"           # "grant" | "refuse"; refuse: sandy changes no junction
 ```
 
 Command line options extend the policy file (`sandy --help`): path options add paths, and every
@@ -1109,7 +1110,9 @@ Details, limitations and sources: `docs/windows.md`.
   through a lock file of the user and keyed on the AppContainer SID, because Windows derives the
   SID from the name without regard to case.
 - File grants: one capability per policy path (named after the AppContainer, the level and the
-  file ID), with one inheritable ACE on the path. The program starts with the capabilities of the
+  file ID), with one inheritable ACE on the path, and with `windows.junctions = "grant"` one more
+  per junction of this user on the way to a directory policy path: a read ACE without
+  inheritance on the junction itself (docs/windows.md, "Links and identity"). The program starts with the capabilities of the
   current policy only, so grants of older policies grant nothing. A run never removes grants
   (`sandy setup --remove` does) and serializes its DACL changes with a lock file of the user, so
   concurrent runs do not conflict.

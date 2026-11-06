@@ -140,9 +140,11 @@ pub struct ResolvedPolicy {
     /// Canonical path of the target executable, when the policy was resolved for one.
     pub program: Option<PathBuf>,
     /// Every symbolic link that resolving the policy paths and the program passed, each where it
-    /// lies (its canonical directory plus its name), sorted. A backend that shows the program
-    /// only the policy paths recreates them, so the names the policy was written with still
-    /// lead there.
+    /// lies (its canonical directory plus its name), sorted. The backends keep the names the
+    /// policy was written with working: the Linux view recreates them, the macOS profile lets
+    /// lookups pass through them, and the Windows backend opens junctions among them for the
+    /// program. Every one has passed `check_not_resolved_through_writable`, so the program
+    /// cannot change any of them.
     pub links: Vec<PathBuf>,
     pub system: SystemAccess,
     pub ip: IpAccess,
