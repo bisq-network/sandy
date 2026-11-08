@@ -54,21 +54,21 @@ pub fn locations() -> Result<Vec<ProtectedPath>, String> {
                 .map(|name| ProtectedPath::entry(home.join(name))),
         );
     }
-    for config in user_directories("XDG_CONFIG_HOME", &homes, ".config") {
+    for config in user_directories("XDG_CONFIG_HOME", &homes, ".config", &[]) {
         platform.extend(
             CONFIG_TREES
                 .iter()
                 .map(|name| ProtectedPath::tree(config.join(name))),
         );
     }
-    for data in user_directories("XDG_DATA_HOME", &homes, ".local/share") {
+    for data in user_directories("XDG_DATA_HOME", &homes, ".local/share", &[]) {
         platform.extend(
             DATA_TREES
                 .iter()
                 .map(|name| ProtectedPath::tree(data.join(name))),
         );
     }
-    Ok(trust::locations(&homes, platform))
+    Ok(trust::locations(&homes, platform, &[]))
 }
 
 /// The directories on sandy's PATH and the usual ones of the user's PATH, which only warn. A
@@ -80,6 +80,7 @@ pub fn path_locations() -> Vec<ProtectedPath> {
     trust::path_locations(
         std::env::var_os("PATH").as_deref(),
         &trust::home_directories().unwrap_or_default(),
+        &[],
         &[],
     )
 }

@@ -975,7 +975,7 @@ fn trust_conflict(
         "writable path {} overlaps {}, which programs outside the sandbox read or execute \
          later; a file the program leaves there runs outside the sandbox",
         rule.path.display(),
-        location.path.display()
+        location.describe()
     ))
 }
 

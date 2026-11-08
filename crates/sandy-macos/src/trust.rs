@@ -39,7 +39,7 @@ pub fn locations(homes: &[PathBuf]) -> Vec<ProtectedPath> {
                 .map(|name| ProtectedPath::tree(home.join(name)))
         })
         .collect();
-    trust::locations(homes, platform)
+    trust::locations(homes, platform, &[])
 }
 
 /// The directories on sandy's PATH and the usual ones of the user's PATH, which only warn. A
@@ -48,7 +48,12 @@ pub fn locations(homes: &[PathBuf]) -> Vec<ProtectedPath> {
 /// cache whose `bin` directory is on PATH for example, so refusing it would turn away the common
 /// case (rule 12).
 pub fn path_locations(homes: &[PathBuf]) -> Vec<ProtectedPath> {
-    trust::path_locations(std::env::var_os("PATH").as_deref(), homes, BIN_DIRECTORIES)
+    trust::path_locations(
+        std::env::var_os("PATH").as_deref(),
+        homes,
+        BIN_DIRECTORIES,
+        &[],
+    )
 }
 
 #[cfg(test)]

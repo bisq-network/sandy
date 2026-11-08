@@ -845,8 +845,9 @@ about 600 on a Mac with 16 addresses. A run beyond the limit fails before the pr
    write rights there, and a file it leaves behind runs with your rights, outside the sandbox.
    sandy refuses a writable path that reaches a location whose content another program reads or
    runs later: your home directory, the startup files of bash, zsh and fish (`~/.bashrc`,
-   `~/.profile`, `~/.config/fish`), the git configuration, cargo's configuration
-   (`~/.cargo/config.toml`), `~/.ssh`; on Linux also autostart entries, user services and the
+   `~/.profile`, `~/.config/fish`), the git configuration (`~/.gitconfig`, `~/.config/git`),
+   the GnuPG configuration (`~/.gnupg`), cargo's configuration (`~/.cargo/config.toml`),
+   `~/.ssh`; on Linux also autostart entries, user services and the
    KDE Plasma login scripts, on macOS also `~/Library/LaunchAgents`, on Windows the Startup
    folders, the PowerShell profile folders, `WindowsApps` and sandy's own state folder. Each
    platform documents its list. A directory below your home directory stays writable, but not
@@ -854,6 +855,17 @@ about 600 on a Mac with 16 addresses. A run beyond the limit fails before the pr
    downloads crates needs `~/.cargo/registry` and `~/.cargo/git` instead. When sandy cannot find
    your home directory (`HOME` unset and no entry in the password database), it cannot check
    this rule and refuses a policy with a writable path; start it with `HOME` set.
+
+   `GNUPGHOME`, `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` move the GnuPG, the global and the
+   system git configuration, so when they are set to an absolute path (for `GNUPGHOME` also one
+   that starts with `~/`, which gpg expands), what they name is protected as well, and a refusal
+   names the variable, for example `overlaps /work/gnupg (GNUPGHOME)`. A relative value is not
+   protected: git and gpg resolve it against their working directory, which sandy does not know. A
+   device they name holds nothing that persists and stays writable: with
+   `GIT_CONFIG_GLOBAL=/dev/null`, `--read-write /dev/null` is allowed. The `.git/config` and
+   `.git/hooks` of a checkout inside a writable path are not protected and stay the program's to
+   change, as before: git reads them only for commands in that checkout, so review a checkout the
+   program could write as you would its other output.
 
    A directory on your `PATH` gets a warning instead, naming it, because a writable path that
    holds one is often what you mean: `--read-write ~/tools` with `~/tools/bin` on `PATH`, or

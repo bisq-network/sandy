@@ -561,12 +561,31 @@ The locations that are refused are in `sys::trusted_locations`:
 | `FOLDERID_Startup`, `FOLDERID_CommonStartup` | the tree | Windows runs what is there at the next logon |
 | `Documents\WindowsPowerShell`, `Documents\PowerShell` | the tree | the profile scripts of PowerShell 5 and PowerShell 7 |
 | `%LOCALAPPDATA%\Microsoft\WindowsApps` | the tree | the app execution aliases, which the default `PATH` holds |
-| `<home>\.gitconfig`, `<config>\git` | the file, the tree | `core.fsmonitor`, `core.sshCommand`, `core.pager` and `!` aliases run commands at the next git command |
+| `<home>\.gitconfig`, `<config>\git`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` | the file, the tree, the file, the file | `core.fsmonitor`, `core.sshCommand`, `core.pager` and `!` aliases run commands at the next git command; `GIT_CONFIG_GLOBAL` replaces `.gitconfig` as the global configuration, `GIT_CONFIG_SYSTEM` the system one |
 | `%PROGRAMDATA%\Git` (`FOLDERID_ProgramData`, `PROGRAMDATA`) | the tree | libgit2, which cargo and other tools use for git, reads `config` there as a level below the system configuration; every user may create folders in `C:\ProgramData` |
 | `<home>\.ssh` | the tree | `ProxyCommand` and `LocalCommand` in the configuration run programs |
-| `<home>\.gnupg`, `%APPDATA%\gnupg` (`FOLDERID_RoamingAppData`) | the tree | `pinentry-program` and `photo-viewer` name programs that gpg runs; Gpg4win keeps its configuration in the second |
+| `<home>\.gnupg`, `%APPDATA%\gnupg` (`FOLDERID_RoamingAppData`), `GNUPGHOME` | the tree | `pinentry-program` and `photo-viewer` name programs that gpg runs; Gpg4win keeps its configuration in the second; `GNUPGHOME` replaces the default directory |
 | `<home>\.cargo\config.toml`, `<home>\.cargo\config`, and both in `CARGO_HOME` | the file | `build.rustc`, `build.rustc-wrapper` and target runners name programs that the next cargo command runs |
 | `%LOCALAPPDATA%\sandy` | the tree | sandy's own state: the policy of each running AppContainer, the lock files and the forwarded-port sockets |
+
+Every variable that names a protected place is read the same way, so one program reads the same
+file whichever way the path is written (`sandy_core::trust::named_directories`): a value with a
+drive names that place; a value rooted without a drive, `\Users\x`, names it on the drive of
+sandy's working directory and on the system drive (`sys::drives`), because that is where the
+program outside the sandbox resolves it; a relative value, which includes `HOMEDRIVE` such as `D:`
+followed by a relative `HOMEPATH`, gives a drive-relative path such as `D:x` that names no one
+place and is left out. This holds for `USERPROFILE`, `PROGRAMDATA`, `XDG_CONFIG_HOME`,
+`CARGO_HOME`, `GNUPGHOME`, `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` as it does for `HOME`. A
+refusal about what one of the last three names says which variable, for example `overlaps
+C:\work\gnupg (GNUPGHOME)`, so that a caller who set it sees why. sandy expands a leading `~` in
+`GNUPGHOME` as gpg does on Linux and macOS (not measured with Gpg4win), so a value such as
+`~\gnupg` names that place below each `<home>`; git does not expand it in its variables, where such
+a value is relative and left out.
+
+sandy reads these from its own process environment, not from the user's persistent environment
+in the registry (`HKCU\Environment`): the process environment is what the program sandy starts
+inherits, so it is what decides where that program's tools look, and the profile folder from the
+known folder covers the default home whether or not the environment names it.
 
 The profile folder comes from the known folder and from `USERPROFILE`, because a service that
 starts sandy with a minimal environment sets no variable. `<home>` is each profile folder,

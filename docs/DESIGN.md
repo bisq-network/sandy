@@ -209,19 +209,21 @@ Rules:
    platform-specific (field 22 of `/proc/PID/stat`, the recorded start time, the creation time).
    sandy also refuses when it sees that the process it would watch has already ended, and on
    macOS when that process is launchd, which has no end to wait for.
-12. No writable policy path may reach a location of this user whose content other programs read
-   or execute later: the home directory (which it may not contain), the startup files of the
-   shells, the SSH, GnuPG, git and cargo configuration, and per platform autostart entries and
-   user services, `~/Library/LaunchAgents`, the Startup folders, the PowerShell profile folders,
-   `WindowsApps` and, on Windows, sandy's own state folder, which decides which policy may join a
-   running AppContainer. Linux and macOS share one list for what every Unix has
+12. No writable policy path may reach a location of this user whose content other programs read or
+   execute later: the home directory (which it may not contain), the startup files of the shells,
+   the SSH, GnuPG, git and cargo configuration (also where `GNUPGHOME`, `GIT_CONFIG_GLOBAL` and
+   `GIT_CONFIG_SYSTEM` move it when set; a device they name holds nothing that persists, so only
+   the directory it lies in counts, and a refusal names the variable), and per platform autostart
+   entries and user services, `~/Library/LaunchAgents`, the Startup folders, the PowerShell profile
+   folders, `WindowsApps` and, on Windows, sandy's own state folder, which decides which policy may
+   join a running AppContainer. Linux and macOS share one list for what every Unix has
    (`sandy_core::trust`), so one policy is refused on both for the same files, and Windows shares
-   the git, SSH, GnuPG and cargo part of it (`trust::tool_configs`). A file the program
-   leaves in one of the others runs outside the sandbox with the user's rights at the next login,
-   the next shell or the next run of the tool, which would make the whole policy pointless. The
-   backend checks this, because only it knows the locations of its platform, and it compares
-   paths as rules 3 and 4 do. A path below the home directory stays writable: only the locations
-   themselves and the trees of those that hold code are protected.
+   the git, SSH, GnuPG and cargo part of it (`trust::tool_configs`). A file the program leaves in
+   one of the others runs outside the sandbox with the user's rights at the next login, the next
+   shell or the next run of the tool, which would make the whole policy pointless. The backend
+   checks this, because only it knows the locations of its platform, and it compares paths as rules
+   3 and 4 do. A path below the home directory stays writable: only the locations themselves and
+   the trees of those that hold code are protected.
 
    A directory on `PATH` is **warned about, not refused**. The escape is the same, a file the
    program leaves there runs when the user next types its name, but a writable path that holds

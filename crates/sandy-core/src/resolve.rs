@@ -48,6 +48,9 @@ pub struct ProtectedPath {
     /// programs read or execute protects its tree; a location that must only not be contained in
     /// a writable path, such as the home directory, does not.
     pub subtree: bool,
+    /// The environment variable that names the location, when one does, so that a refusal says
+    /// why a path of the caller's own is protected.
+    pub variable: Option<&'static str>,
 }
 
 impl ProtectedPath {
@@ -67,6 +70,23 @@ impl ProtectedPath {
             path: path.to_path_buf(),
             resolved: canonical_location(path),
             subtree,
+            variable: None,
+        }
+    }
+
+    /// The same location, named by `variable`.
+    pub fn named_by(self, variable: &'static str) -> ProtectedPath {
+        ProtectedPath {
+            variable: Some(variable),
+            ..self
+        }
+    }
+
+    /// The location as a refusal names it: the path, with the variable that names it.
+    pub fn describe(&self) -> String {
+        match self.variable {
+            Some(variable) => format!("{} ({variable})", self.path.display()),
+            None => self.path.display().to_string(),
         }
     }
 

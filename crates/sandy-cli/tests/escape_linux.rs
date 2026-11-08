@@ -1837,6 +1837,19 @@ fn refuses_a_writable_path_over_a_shell_desktop_or_git_startup_file() {
     assert_refused_beside_an_accepted_path(&fixture, &directories);
 }
 
+/// The variables that move the GnuPG and git configuration (`assert_config_overrides_refused`).
+#[test]
+fn refuses_a_writable_path_over_the_gnupg_home_and_the_git_config_files() {
+    assert_config_overrides_refused(&Fixture::new("config-overrides"), &[]);
+}
+
+/// A device or FIFO that GIT_CONFIG_GLOBAL names stays writable
+/// (`assert_config_device_accepted`).
+#[test]
+fn accepts_a_writable_device_that_git_config_global_names() {
+    assert_config_device_accepted(&Fixture::new("config-device"), &["--system", "none"]);
+}
+
 /// A directory on PATH inside a writable path lets the program leave a command there that the
 /// user runs outside the sandbox by name. Such a policy is ordinary work, so sandy enforces it
 /// and warns, naming the directory (README rule 8). The same writable path without that PATH

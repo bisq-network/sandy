@@ -2319,10 +2319,10 @@ policy is the only way to keep what it promises. The locations every Unix has ar
 | `.bash_aliases` | the file | Debian's `.bashrc` sources it |
 | `.bashrc.d` | the tree | Fedora's `.bashrc` sources every file in it |
 | `<config>/fish` | the tree | the startup files of the fish shell |
-| `.gitconfig`, `<config>/git` | the file, the tree | `core.fsmonitor`, `core.sshCommand`, `core.pager` and `!` aliases run commands at the next git command |
+| `.gitconfig`, `<config>/git`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` | the file, the tree, the file, the file | `core.fsmonitor`, `core.sshCommand`, `core.pager` and `!` aliases run commands at the next git command; `GIT_CONFIG_GLOBAL` replaces `.gitconfig` as the global configuration, `GIT_CONFIG_SYSTEM` the system one |
 | `.cargo/config.toml`, `.cargo/config`, and both in `CARGO_HOME` | the file | `build.rustc`, `build.rustc-wrapper` and target runners name programs that the next cargo command runs |
 | `.ssh` | the tree | `ProxyCommand` and `LocalCommand` in the configuration run programs, and `authorized_keys` admits logins |
-| `.gnupg` | the tree | `pinentry-program` and `photo-viewer` name programs that gpg runs |
+| `.gnupg`, `GNUPGHOME` | the tree | `pinentry-program` and `photo-viewer` name programs that gpg runs; `GNUPGHOME` replaces `.gnupg` |
 | `.pam_environment`, `.xprofile`, `.xinitrc`, `.xsession`, `.xsessionrc` | the file | read when a session starts (Linux) |
 | `<config>/autostart` | the tree | desktop entries that run at the next login (Linux) |
 | `<config>/systemd`, `<data>/systemd` | the tree | systemd user units, which the program can enable with a link of its own (Linux) |
@@ -2337,6 +2337,17 @@ starts sandy, and the same holds for `CARGO_HOME` and `~/.cargo`. So `--read-wri
 refused; a program that downloads crates needs `~/.cargo/registry` and `~/.cargo/git`. A
 location that does not exist counts, because the program could create it, and each counts where
 it lies and where its symbolic links lead.
+
+`GNUPGHOME`, `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` count when they are set to an absolute
+path, and `GNUPGHOME` also when it starts with `~/`, which gpg expands with the home directory (git
+does not expand it in its variables): sandy then protects that place below each home directory. A
+relative value is not protected, because git and gpg resolve it against their working directory,
+which sandy does not know. A refusal names the variable, for example `overlaps /work/gnupg
+(GNUPGHOME)`, so that a caller who set it, in CI for example, sees why a path of their own is
+protected. A device or a named pipe that one of them names holds nothing that persists and stays
+writable: `GIT_CONFIG_GLOBAL=/dev/null`, the usual way to make git ignore the global configuration,
+still allows `--read-write /dev/null` with `system = "none"`. The directory it lies in is protected
+instead, because a writable path there could put a file in its place.
 
 The home directory comes from the password database (`getpwuid_r`) and from `HOME`, for the
 same reason. When neither names one, or the password database cannot be read, sandy cannot tell

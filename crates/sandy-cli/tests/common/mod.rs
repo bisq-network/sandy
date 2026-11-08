@@ -1257,4 +1257,110 @@ pub mod unix {
             }
         }
     }
+
+    /// `check` of `writable` as a read-write path after `args`, with a home directory and a PATH
+    /// of the test's own and `var` set to `value`.
+    fn check_with_variable(
+        fixture: &super::Fixture,
+        args: &[&str],
+        writable: &str,
+        var: &str,
+        value: &str,
+    ) -> std::process::Output {
+        Command::new(super::sandy_path())
+            .arg("check")
+            .args(args)
+            .args(["--read-write", writable])
+            .env("HOME", fixture.arg("home"))
+            .env("PATH", "/usr/bin")
+            .env(var, value)
+            .output()
+            .unwrap()
+    }
+
+    /// GNUPGHOME names the GnuPG configuration directory, GIT_CONFIG_GLOBAL and
+    /// GIT_CONFIG_SYSTEM the one file git reads as the global and the system configuration, each
+    /// replacing the default. A writable path that reaches one lets the program change what gpg
+    /// or git runs, so `check` refuses it and names the location with the variable (README rule
+    /// 8); a path no variable names stays writable. `args` come before the writable path.
+    pub fn assert_config_overrides_refused(fixture: &super::Fixture, args: &[&str]) {
+        for dir in ["home/.local/share/gnupg", "gnupg", "gitdir", "beside"] {
+            std::fs::create_dir_all(fixture.path(dir)).unwrap();
+        }
+        std::fs::write(fixture.path("gitdir/config"), b"").unwrap();
+        let gnupg = fixture.arg("gnupg");
+        let below_home = fixture.arg("home/.local/share/gnupg");
+        let config = fixture.arg("gitdir/config");
+        // (writable path, variable, value, the location the refusal names)
+        for (writable, var, value, named) in [
+            ("gnupg", "GNUPGHOME", gnupg.as_str(), gnupg.as_str()),
+            // gpg expands a leading `~/` itself, so a quoted value names a place as well.
+            (
+                "home/.local/share/gnupg",
+                "GNUPGHOME",
+                "~/.local/share/gnupg",
+                below_home.as_str(),
+            ),
+            ("gitdir", "GIT_CONFIG_GLOBAL", &config, &config),
+            ("gitdir", "GIT_CONFIG_SYSTEM", &config, &config),
+        ] {
+            let refused = check_with_variable(fixture, args, &fixture.arg(writable), var, value);
+            let stdout = String::from_utf8_lossy(&refused.stdout);
+            assert_eq!(
+                refused.status.code(),
+                Some(super::EXIT_FAILURE),
+                "{writable}: {stdout}"
+            );
+            let overlap = format!("overlaps {named} ({var}),");
+            assert!(
+                stdout.lines().any(
+                    |line| line.contains(&overlap) && line.contains("runs outside the sandbox")
+                ),
+                "{writable} with {var}={value}: {stdout}"
+            );
+        }
+        // Control: a path no variable names is accepted.
+        let allowed =
+            check_with_variable(fixture, args, &fixture.arg("beside"), "GNUPGHOME", &gnupg);
+        assert_eq!(
+            allowed.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&allowed.stdout)
+        );
+    }
+
+    /// `GIT_CONFIG_GLOBAL=/dev/null` is the usual way to make git ignore the global
+    /// configuration, in CI for example. A device or a named pipe holds nothing that persists, so
+    /// the one the variable names stays writable, which a policy with `system = "none"` needs for
+    /// `/dev/null`. The directory that holds it is still refused: a writable path there lets the
+    /// program put a file in its place. `args` come before the writable path.
+    pub fn assert_config_device_accepted(fixture: &super::Fixture, args: &[&str]) {
+        std::fs::create_dir_all(fixture.path("home")).unwrap();
+        std::fs::create_dir_all(fixture.path("pipes")).unwrap();
+        let made = Command::new("mkfifo")
+            .arg(fixture.path("pipes/config"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let fifo = fixture.arg("pipes/config");
+        for writable in ["/dev/null", &fifo] {
+            let allowed =
+                check_with_variable(fixture, args, writable, "GIT_CONFIG_GLOBAL", writable);
+            assert_eq!(
+                allowed.status.code(),
+                Some(0),
+                "{writable}: {}",
+                String::from_utf8_lossy(&allowed.stdout)
+            );
+        }
+        let pipes = fixture.arg("pipes");
+        let refused = check_with_variable(fixture, args, &pipes, "GIT_CONFIG_GLOBAL", &fifo);
+        let stdout = String::from_utf8_lossy(&refused.stdout);
+        assert_eq!(refused.status.code(), Some(super::EXIT_FAILURE), "{stdout}");
+        assert!(
+            stdout.contains(&format!("overlaps {pipes} (GIT_CONFIG_GLOBAL),")),
+            "{stdout}"
+        );
+    }
 }

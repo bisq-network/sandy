@@ -846,22 +846,22 @@ fn trusted_locations() -> Result<Vec<ProtectedPath>, SandboxError> {
     // libgit2 reads `Git\config` below the folder that PROGRAMDATA names, as a level below the
     // system configuration (measured with libgit2 1.9.7); every user may create folders in
     // `C:\ProgramData`. Git for Windows 2.54 no longer reads it.
+    let drives = drives()?;
     let program_data = folder(&FOLDERID_ProgramData, "cannot find the program data folder")?;
     locations.extend(
-        known_and_named(program_data, std::env::var_os("PROGRAMDATA"))
+        known_and_named(program_data, std::env::var_os("PROGRAMDATA"), &drives)
             .into_iter()
             .map(|folder| ProtectedPath::tree(folder.join("Git"))),
     );
-    let profiles = user_profiles()?;
+    let profiles = user_profiles(&drives)?;
     let named_homes: Vec<OsString> = [std::env::var_os("HOME"), home_drive_path()]
         .into_iter()
         .flatten()
         .collect();
-    locations.extend(sandy_core::trust::tool_configs(&tool_homes(
-        &profiles,
-        &named_homes,
-        &drives()?,
-    )));
+    locations.extend(sandy_core::trust::tool_configs(
+        &tool_homes(&profiles, &named_homes, &drives),
+        &drives,
+    ));
     // After the folders in it, so that a writable profile is reported with the folder that makes
     // it dangerous.
     locations.extend(profiles.into_iter().map(ProtectedPath::entry));
@@ -881,12 +881,11 @@ fn tool_homes(
     drives: &[std::path::PathBuf],
 ) -> Vec<std::path::PathBuf> {
     let mut homes = profiles.to_vec();
-    for home in named.iter().map(std::path::Path::new) {
-        if home.is_absolute() {
-            homes.push(home.to_path_buf());
-        } else if home.has_root() {
-            homes.extend(drives.iter().map(|drive| drive.join(home)));
-        }
+    for home in named {
+        homes.extend(sandy_core::trust::named_directories(
+            Some(home.clone()),
+            drives,
+        ));
     }
     homes.sort();
     homes.dedup();
@@ -985,20 +984,29 @@ fn session_note() -> Option<Warning> {
 /// The profile folder of this user, from the known folder and from USERPROFILE. The known
 /// folder, because a service that starts sandy with a minimal environment sets no USERPROFILE;
 /// the variable as well, because a user who moves their profile with it keeps their files there.
-fn user_profiles() -> Result<Vec<std::path::PathBuf>, SandboxError> {
+fn user_profiles(drives: &[std::path::PathBuf]) -> Result<Vec<std::path::PathBuf>, SandboxError> {
     let known = std::path::PathBuf::from(OsString::from_wide(&known_folder(
         &FOLDERID_Profile,
         "cannot find the user profile folder",
     )?));
-    Ok(known_and_named(known, std::env::var_os("USERPROFILE")))
+    Ok(known_and_named(
+        known,
+        std::env::var_os("USERPROFILE"),
+        drives,
+    ))
 }
 
-/// A known folder and the folder its variable names, when that is absolute, each once.
-fn known_and_named(known: std::path::PathBuf, named: Option<OsString>) -> Vec<std::path::PathBuf> {
-    let named = named
-        .map(std::path::PathBuf::from)
-        .filter(|path| path.is_absolute());
-    let mut folders: Vec<std::path::PathBuf> = std::iter::once(known).chain(named).collect();
+/// A known folder and the place its variable names, each once. The variable names a place with a
+/// drive directly, and one rooted without a drive on each of `drives`, the same expansion
+/// `tool_homes` does for a home directory; a relative value names no one place and is left out.
+fn known_and_named(
+    known: std::path::PathBuf,
+    named: Option<OsString>,
+    drives: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let mut folders: Vec<std::path::PathBuf> = std::iter::once(known)
+        .chain(sandy_core::trust::named_directories(named, drives))
+        .collect();
     folders.sort();
     folders.dedup();
     folders
@@ -1071,7 +1079,7 @@ fn check_writable_paths(
             problems.push(Problem::Conflict(format!(
                 "writable path {} overlaps {}, {why}",
                 rule.path.display(),
-                location.path.display()
+                location.describe()
             )));
         }
         for protected in [system, trusted] {
@@ -1080,7 +1088,7 @@ fn check_writable_paths(
                     "cannot tell whether writable path {} overlaps {}: sandy cannot read the \
                      identity of a directory on the way",
                     rule.path.display(),
-                    location.path.display()
+                    location.describe()
                 )));
             }
         }
@@ -1207,8 +1215,9 @@ mod tests {
     use std::ffi::OsString;
 
     use super::{
-        FOLDERID_ProgramData, FOLDERID_RoamingAppData, drives, known_folder, relay_ended_first,
-        relay_serves, tool_homes, trusted_locations, user_profiles, windows_directory,
+        FOLDERID_ProgramData, FOLDERID_RoamingAppData, drives, known_and_named, known_folder,
+        relay_ended_first, relay_serves, tool_homes, trusted_locations, user_profiles,
+        windows_directory,
     };
     use crate::{access, probe};
     use windows_sys::Win32::Foundation as f;
@@ -1255,7 +1264,7 @@ mod tests {
     #[test]
     fn trusted_locations_cover_git_and_gnupg() {
         let locations = trusted_locations().unwrap();
-        let profile = user_profiles().unwrap().remove(0);
+        let profile = user_profiles(&drives().unwrap()).unwrap().remove(0);
         let known = |id, error| {
             PathBuf::from(std::ffi::OsString::from_wide(
                 &known_folder(id, error).unwrap(),
@@ -1310,6 +1319,32 @@ mod tests {
         assert_eq!(
             homes(&[r"\\server\share\home"]),
             vec![PathBuf::from(r"\\server\share\home"), profile]
+        );
+    }
+
+    /// USERPROFILE and PROGRAMDATA, like the tool homes, name a place with a drive directly and
+    /// one rooted without a drive on each drive; a relative value is left out.
+    #[test]
+    fn known_and_named_expands_a_rooted_variable() {
+        let known = PathBuf::from(r"C:\Users\someone");
+        let drives = [PathBuf::from(r"C:\"), PathBuf::from(r"D:\")];
+        let folders = |named: &str| known_and_named(known.clone(), Some(named.into()), &drives);
+        assert_eq!(
+            known_and_named(known.clone(), None, &drives),
+            vec![known.clone()]
+        );
+        assert_eq!(folders("relative"), vec![known.clone()]);
+        assert_eq!(
+            folders(r"E:\profiles\x"),
+            vec![known.clone(), PathBuf::from(r"E:\profiles\x")]
+        );
+        assert_eq!(
+            folders(r"\profiles\x"),
+            vec![
+                PathBuf::from(r"C:\Users\someone"),
+                PathBuf::from(r"C:\profiles\x"),
+                PathBuf::from(r"D:\profiles\x"),
+            ]
         );
     }
 
