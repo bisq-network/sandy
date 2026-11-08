@@ -408,9 +408,12 @@ Rules:
    ended it and also while sandy is stopped, and sandy exits with status 125. A dead forward relay frees the program's
    forward port, and any local user can then bind it and receive what the program sends there
    for `to`: its requests, credentials and data. A relay that ends together with the program,
-   or after it, is the normal end of a run. Without `contained` nothing watches the relay,
-   because sandy has become the program, so a relay that something outside the sandbox kills
-   leaves the program running with its forward port free for others to bind.
+   or after it, is the normal end of a run. Without `contained` nothing watches the relay on
+   Linux and macOS, because sandy has become the program, so a relay that something outside the
+   sandbox kills leaves the program running with its forward port free for others to bind. On
+   Windows sandy always stays the parent and waits for the relay and the egress broker next to
+   the program, so with any policy one that ends first ends the program's job, and sandy exits
+   with status 125 (docs/windows.md, "How the relays end").
 6. Who may connect: an exposed port is meant for other processes, including those of other
    users, and the program's own listener is reachable directly on Linux and macOS anyway, so
    the relay serves every connection there. A forwarded port is for the program alone, and the

@@ -42,6 +42,14 @@ use util::{Sid, wide, wide_nul};
 
 pub use host_network::WindowsHost;
 
+/// Why a run fails when its relay ends while the program runs, as on Linux and macOS.
+const RELAY_ENDED_FIRST: &str = "the relay of the exposed or forwarded ports ended before the \
+    program; the ports it served are gone and the program has been ended with it";
+
+/// Why a run fails when its egress broker ends while the program runs, as on Linux and macOS.
+const BROKER_ENDED_FIRST: &str = "the egress broker ended before the program; the program can no \
+    longer connect out and has been ended with it";
+
 /// The Windows backend. It keeps what it learns of the host (`Detection`), so one value serves
 /// one invocation of sandy.
 #[derive(Debug)]
@@ -249,6 +257,7 @@ impl Backend for WindowsBackend {
                     .map(|(listener, _)| Box::new(listener) as Box<dyn process::InheritedSocket>)
                     .collect(),
                 reports_ready: true,
+                ended_first: RELAY_ENDED_FIRST,
             });
             // The broker itself: `sandy __broker` in its own AppContainer, serving the egress
             // AF_UNIX socket it inherits. It is in the relay job, so it ends with the program.
@@ -271,6 +280,7 @@ impl Backend for WindowsBackend {
                     appcontainer: &broker.container,
                     sockets: vec![Box::new(listener)],
                     reports_ready: false,
+                    ended_first: BROKER_ENDED_FIRST,
                 });
             }
         }
@@ -299,7 +309,10 @@ impl Backend for WindowsBackend {
         if let Some(forwarding) = forwarding {
             forwarding.stop(ended.deadline);
         }
-        Ok(ended.code)
+        match ended.failure {
+            Some(failure) => Err(SandboxError::new(failure)),
+            None => Ok(ended.code),
+        }
     }
 
     /// Makes the loopback exemption of the policy's AppContainer match the policy: present with

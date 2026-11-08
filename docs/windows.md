@@ -1105,6 +1105,23 @@ The relays follow docs/DESIGN.md "Forwarded ports" rule 5. When the program exit
    the broker are gone, stops its own forward sockets the same way and removes the socket
    directory.
 
+While the program runs, sandy waits for the relay and the broker next to the program. In a
+normal run neither ends first, because sandy ends them only after the program. One that ends
+before, because something killed it (the program can, from its own AppContainer), leaves its
+ports to whatever binds them next, and a local process that binds the program's forward port
+receives what the program sends there for `to`. So sandy then ends the program's job, waits for
+the program, ends the relays as above, and exits with status 125 and the reason on standard
+error; `--status-fd` records `failed` instead of `exited`. That is what the guard of
+`children = "contained"` does on Linux and macOS; on Windows it holds for every policy
+(`a_dead_relay_or_broker_ends_the_program`). A relay that has ended when sandy finds the program
+ended too is the program's own end. One that ends after its "ready" line and before the program
+starts stops the run the same way: sandy looks at each helper once more after it created the
+program suspended, so a helper that has already ended at that look makes sandy end the program
+before its first instruction. One that ends between that look and the resume is caught by the
+wait that follows the resume at once, which ends the program and exits with status 125. The
+unit test `a_relay_that_has_ended_stops_the_program_from_starting` covers the look itself
+(`ended_relay`), not a whole run.
+
 `TerminateJobObject` only starts the termination of a job's processes. Without the waits, a
 relay was still there up to 2.7 ms after sandy had exited, in 12 of 60 runs of
 `forward_relay_ends_with_the_program` (measured on Windows 11). Windows stops counting a process
@@ -1239,8 +1256,9 @@ prefix.
   names sandy and not the program, and exit code 125 means both "sandy refused" and "the
   program exited with 125". `--status-fd` reports what the exit code cannot, without changing
   any exit code: sandy writes `pid N` once the program runs, then `exited N`, or `failed` when
-  sandy itself failed or refused. The number is an inheritable handle the caller passes to
-  sandy, which clears its inherit flag at once; the program's own
+  sandy itself failed or refused, or ended the program because a relay or the egress broker
+  ended before it (see "How the relays end"). The number is an inheritable handle the caller
+  passes to sandy, which clears its inherit flag at once; the program's own
   `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` names only its three standard handles, so the handle
   never reaches the program or a relay. A program that sandy ended because the parent ended is
   reported as `exited 1`, which is the exit code the job gets.

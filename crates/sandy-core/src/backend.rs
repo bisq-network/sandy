@@ -59,9 +59,9 @@ pub struct ParentProcess {
 /// - `exited N` or `signaled N` when sandy saw the program end. The exec model has no such
 ///   line: sandy is the program there, and the caller's own wait status is the program's.
 /// - `failed` when sandy itself failed or refused. Without a `pid` line the program never ran.
-///   After one it means that the last step, the `execve`, failed, or, with `contained`, that
-///   sandy ended the run because a process it relies on ended while the program ran: the guard,
-///   the init of the PID namespace, a relay or the broker.
+///   After one it means that the last step, the `execve`, failed, or, with `contained` and on
+///   Windows, that sandy ended the run because a process it relies on ended while the program
+///   ran: the guard, the init of the PID namespace, a relay or the broker.
 ///
 /// Writing is best effort: a caller that closed the read end gets no record, and the program
 /// keeps running.

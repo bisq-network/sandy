@@ -3991,6 +3991,92 @@ fn a_killed_run_leaves_no_egress_broker_behind() {
     }
 }
 
+/// A relay or the egress broker that ends while the program runs takes what it served with it,
+/// and a forward or egress port that no relay holds is free for any local process to bind. sandy
+/// then ends the program and fails with status 125 and the record `failed`, as Linux and macOS
+/// do with `children = "contained"`. Control: the program runs while both live, and the end of
+/// its own is the end of the run (`the_egress_broker_ends_with_the_program`).
+#[test]
+fn a_dead_relay_or_broker_ends_the_program() {
+    use windows_sys::Win32::System::Threading::{
+        GetProcessId, OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+    };
+
+    let fixture = Fixture::new("helper-ended");
+    for (index, reason) in [(0, "relay"), (1, "egress broker")] {
+        let status = fixture.path(&format!("status-{index}"));
+        let _ = fs::remove_file(&status);
+        let mut sandbox_args = egress_args(&fixture, free_port(), "public");
+        sandbox_args.extend(args(&["--status-file", status.to_str().unwrap()]));
+        let mut run = Command::new(sandy_path())
+            .args(run_args(&sandbox_args, &[("sleep", "20000")]))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (helpers, program) = loop {
+            let helpers = relay_processes(run.id());
+            let program = child_processes(run.id(), "sandy-probe.exe");
+            if helpers.len() == 2 && program.len() == 1 {
+                break (helpers, program);
+            }
+            assert!(Instant::now() < deadline, "the run did not start");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(!ends_within(&program[0], Duration::from_millis(500)));
+        // sandy starts the relay before the broker.
+        let mut helpers: Vec<_> = helpers
+            .iter()
+            .map(|helper| (creation_time(helper), helper))
+            .collect();
+        helpers.sort_by_key(|(created, _)| *created);
+        let killed = helpers[index].1;
+        // SAFETY: killed is a process handle this test owns.
+        let pid = unsafe { GetProcessId(killed.as_raw_handle()) };
+        // SAFETY: OpenProcess takes no pointers; the handle is checked before use.
+        let terminate = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        assert!(!terminate.is_null(), "cannot open the {reason}");
+        // SAFETY: terminate is a process handle with PROCESS_TERMINATE access.
+        assert_ne!(unsafe { TerminateProcess(terminate, 9) }, 0);
+        // SAFETY: terminate is a handle this test owns.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(terminate) };
+
+        let ended = ends_within(&program[0], Duration::from_secs(10));
+        if !ended {
+            run.kill().unwrap();
+        }
+        let output = run.wait_with_output().unwrap();
+        assert!(ended, "the program kept running after the {reason} ended");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{stderr}");
+        assert!(
+            stderr.contains(&format!("the {reason} ")) && stderr.contains("ended before"),
+            "{stderr}"
+        );
+        let record = fs::read_to_string(&status).unwrap();
+        assert!(
+            record.starts_with("pid ") && record.ends_with("\nfailed\n"),
+            "{record}"
+        );
+    }
+}
+
+/// The creation time of `process`, in 100 ns units.
+fn creation_time(process: &std::os::windows::io::OwnedHandle) -> u64 {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+    let mut times = [FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    }; 4];
+    let [creation, exit, kernel, user] = &mut times;
+    // SAFETY: process has PROCESS_QUERY_INFORMATION access and every pointer is writable.
+    let read = unsafe { GetProcessTimes(process.as_raw_handle(), creation, exit, kernel, user) };
+    assert_ne!(read, 0);
+    u64::from(creation.dwHighDateTime) << 32 | u64::from(creation.dwLowDateTime)
+}
+
 /// The broker holds network capabilities the program must not have, so no process in another
 /// AppContainer may open it, with any right. The probe stands in for the program, in an
 /// AppContainer of its own with `ip = "private"`, because the broker's process ID is not known

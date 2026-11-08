@@ -694,7 +694,7 @@ it.
 |---|---|
 | the program's status | `sandy run` started the program |
 | 128 + signal number | Linux and macOS with `children = "contained"`, and Linux with `--explain`: a signal ended the program |
-| 125 | sandy failed or refused: invalid policy, a requirement this host cannot enforce, a socket on a standard stream that the policy denies, a pseudo-terminal master on one with `signals = "isolated"`, a setup error; with `children = "contained"` or `--explain` also a failure while sandy supervises the program. For `sandy check`: sandy cannot tell now whether this host enforces the policy (an `UNDECIDED` line, or a relay port that another process holds), or the policy conflicts with this host (a `CONFLICT` line) |
+| 125 | sandy failed or refused: invalid policy, a requirement this host cannot enforce, a socket on a standard stream that the policy denies, a pseudo-terminal master on one with `signals = "isolated"`, a setup error; with `children = "contained"`, with `--explain`, and on Windows also a failure while sandy supervises the program. For `sandy check`: sandy cannot tell now whether this host enforces the policy (an `UNDECIDED` line, or a relay port that another process holds), or the policy conflicts with this host (a `CONFLICT` line) |
 | 0 / 1 | `sandy check`: the policy, or one of its levels, is enforceable / none is |
 | 2 | `sandy check`: no level is enforceable, but `sandy setup`, run once with administrator rights, would make one so |
 | 0 | `sandy setup`, with or without `--remove`: done, or nothing to do |
@@ -945,7 +945,7 @@ about 600 on a Mac with 16 addresses. A run beyond the limit fails before the pr
 - A dead relay frees the program's forward port, and any local user can then bind it and
   receive what the program sends there. With `children = "contained"` on Linux and macOS, sandy
   therefore ends the program when its relay dies, and exits with status 125. Without it nothing
-  watches the relay.
+  watches the relay there. On Windows sandy does so with any policy, also for the egress broker.
 - A port another process already holds makes `sandy run` refuse with status 125. `sandy check`
   binds the same listeners for a moment and reports `UNAVAILABLE` for such a port, so it gives
   the same answer. Between the two the port can change hands, so `run` is the final word.
@@ -1367,9 +1367,9 @@ Recommendations:
    just as well. The program then reads the null device on its standard input, so this suits
    programs that need no input.
 4. **Treat exit status 125 as "not started".** sandy prints the reason on standard error. Two
-   exceptions: a program can exit with 125 itself, and with `children = "contained"` or
-   `--explain` sandy can fail while it supervises a running program, for example when the relay
-   of its ports died (its message is `sandy: run failed: ...`). Pass `--status-fd` or
+   exceptions: a program can exit with 125 itself, and with `children = "contained"`, with
+   `--explain` and on Windows sandy can fail while it supervises a running program, for example
+   when the relay of its ports died (its message is `sandy: run failed: ...`). Pass `--status-fd` or
    `--status-file` when you need to tell these apart, or need the program's process ID (see
    [The status record](#the-status-record)): without a `pid` line the program never ran.
 5. **Keep sandy, the policy and the program's binaries out of every writable path.** Use separate
