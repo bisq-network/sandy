@@ -8,6 +8,8 @@ mod common;
 use std::fs;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -146,6 +148,124 @@ fn code_maps_only_from_executable_paths() {
     assert!(has_errno(&view[0], libc::EPERM), "{view:?}");
     assert!(has_errno(&view[1], libc::EPERM), "{view:?}");
     view[2].assert_ok();
+}
+
+/// The program starts in its working directory also when the policy does not hold it, as without
+/// the view and on macOS and Windows: the view holds the directory, empty, and Landlock denies
+/// listing it, so a relative path resolves there and finds nothing, rather than under `/`.
+#[test]
+fn the_program_starts_in_a_working_directory_outside_the_policy() {
+    if !view_works() {
+        return;
+    }
+    let fixture = Fixture::new("view-cwd");
+    let working = fixture.arg("secret");
+    let actions = [("cwd", ""), ("list", "."), ("lstat", "file")];
+    let mut sandbox_args = fixture.access_args();
+    sandbox_args.extend(args(&["--cwd", &working]));
+    let all = probe_inside(&sandbox_args, &actions);
+    let view = probe_inside(&with_view(sandbox_args), &actions);
+    for lines in [&all, &view] {
+        lines[0].assert_ok();
+        assert_eq!(lines[0].detail, working, "{lines:?}");
+        assert!(has_errno(&lines[1], libc::EACCES), "{lines:?}");
+    }
+    all[2].assert_ok();
+    assert!(has_errno(&view[2], libc::ENOENT), "{view:?}");
+}
+
+/// A working directory in /proc that the policy does not grant refuses the run with the view,
+/// which holds no /proc then: an empty directory in its place would show a /proc, and its name
+/// the process ID that `/proc/self` resolves to outside the program's PID namespace. Without the
+/// view the program starts there.
+#[test]
+fn a_working_directory_in_an_ungranted_proc_refuses_the_run() {
+    if !view_works() {
+        return;
+    }
+    let fixture = Fixture::new("view-cwd-proc");
+    let mut sandbox_args = fixture.access_args();
+    sandbox_args.extend(args(&["--cwd", "/proc/self"]));
+    let all = probe_inside(&sandbox_args, &[("cwd", "")]);
+    all[0].assert_ok();
+    assert!(all[0].detail.starts_with("/proc/"), "{all:?}");
+    let refused = sandy(run_args(&with_view(sandbox_args), &[("cwd", "")]));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(125), "{stderr}");
+    assert!(parse(&refused).is_empty(), "{stderr}");
+    assert!(stderr.contains("the working directory /proc/"), "{stderr}");
+    assert!(stderr.contains("grant /proc"), "{stderr}");
+    // The same from sandy's own working directory, which the trial of the host's namespaces
+    // does not depend on.
+    let refused = Command::new(sandy_path())
+        .current_dir("/proc/self")
+        .args(run_args(&with_view(fixture.access_args()), &[("cwd", "")]))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(125), "{stderr}");
+    assert!(
+        stderr.contains("run failed: the working directory /proc/"),
+        "{stderr}"
+    );
+}
+
+/// A working directory without search permission does not refuse the run: sandy reads its file
+/// system through `/proc/self/cwd`, as a path from the directory needs that permission. The
+/// directory belongs to a supplementary group, which the user namespace does not map, so sandy's
+/// capabilities there do not reach it.
+#[test]
+fn the_program_starts_in_a_working_directory_without_search_permission() {
+    if !view_works() {
+        return;
+    }
+    // SAFETY: getgroups with a size of 0 only counts the groups.
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    let mut groups = vec![0; usize::try_from(count).unwrap_or(0)];
+    // SAFETY: the buffer holds `count` group IDs.
+    let count = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+    groups.truncate(usize::try_from(count).unwrap_or(0));
+    // SAFETY: getegid has no preconditions.
+    let primary = unsafe { libc::getegid() };
+    let Some(&group) = groups.iter().find(|&&group| group != primary) else {
+        skip(
+            "supplementary-group",
+            "the test process has no group besides its own",
+        );
+        return;
+    };
+    let fixture = Fixture::new("view-cwd-mode");
+    let working = fixture.path("secret");
+    std::os::unix::fs::chown(&working, None, Some(group)).unwrap();
+    // Gives the directory its mode back before the fixture removes it, also when an assertion
+    // fails.
+    struct Restore<'a>(&'a Path);
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+    let _restore = Restore(&working);
+    let mut command = Command::new(sandy_path());
+    command
+        .current_dir(&working)
+        .args(run_args(&with_view(fixture.access_args()), &[("cwd", "")]));
+    // SAFETY: chmod is async-signal-safe. It runs after the chdir to `working`, which needs
+    // search permission there.
+    unsafe {
+        command.pre_exec(|| match libc::chmod(c".".as_ptr(), 0) {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        });
+    }
+    let output = command.output().unwrap();
+    let mode = fs::metadata(&working).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0, "the directory kept its search permission");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let lines = parse(&output);
+    lines[0].assert_ok();
+    assert_eq!(lines[0].detail, working.to_str().unwrap(), "{lines:?}");
 }
 
 /// A dynamically linked program finds its loader and libraries in the system set, and a Python

@@ -60,6 +60,7 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
             Err(_) => "without it".to_string(),
         }),
         "list" => Ok(format!("{} entries", fs::read_dir(target)?.count())),
+        "cwd" => std::env::current_dir().map(|path| path.display().to_string()),
         "write" => fs::write(target, b"probe").map(|()| String::new()),
         "truncate" => truncate(target),
         "open-rdonly-trunc" => open_read_only_truncate(target),

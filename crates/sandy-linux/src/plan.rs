@@ -445,8 +445,9 @@ fn view_shortfalls(policy: &ResolvedPolicy) -> Vec<Warning> {
         )),
         partial(format!(
             "{hides}: the directories above a granted path exist in the view with their names, \
-             for example /home and /home/user above a granted /home/user/project, though the \
-             program cannot list them (docs/linux.md, \"File system view\")"
+             for example /home and /home/user above a granted /home/user/project, and an empty \
+             directory for a working directory outside the policy; the program cannot list them \
+             (docs/linux.md, \"File system view\")"
         )),
         partial(format!(
             "{hides}: the link count of a granted file still counts its names outside the view, \

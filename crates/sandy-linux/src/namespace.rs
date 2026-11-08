@@ -496,8 +496,10 @@ fn probe_in_child(namespaces: Namespaces) -> Result<(), TrialFailure> {
         0 => {
             drop(report);
             let tried = std::panic::catch_unwind(|| {
-                namespaces
-                    .enter()
+                // The trial does not depend on where sandy runs, which the view would recreate.
+                std::env::set_current_dir("/")
+                    .map_err(|error| SandboxError::io("cannot change to /", error))
+                    .and_then(|()| namespaces.enter())
                     .and_then(|()| match namespaces.pid {
                         true => fork_into_pid_namespace(),
                         false => Ok(()),

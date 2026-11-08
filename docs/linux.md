@@ -595,9 +595,10 @@ may make sandy try a weaker fallback level:
 - No name server is reachable, unless a forwarded port reaches one over TCP. The system set
   keeps `/etc/hosts` and the resolver configuration readable, so `localhost` resolves.
 - Each exposed connection asks the factory for its socket: one round trip over a socket pair.
-- The trial forks a child that creates the namespaces once more, in every `run` and `check`. It
-  adds about 1 ms to the start (0.7 to 1.2 ms in the medians of 150 runs of the release build
-  on the same host).
+- The trial forks a child that creates the namespaces once more, in every `run` and `check`. The
+  child works in `/`, so the directory sandy runs in does not change the plan. It adds about
+  1 ms to the start (0.7 to 1.2 ms in the medians of 150 runs of the release build on the same
+  host).
 - On Ubuntu every run and every `check` adds AppArmor audit records to the kernel log, for the
   trial and for the run.
 
@@ -671,11 +672,22 @@ descriptors only, so no path is resolved twice:
      which must still be the file of the plan; otherwise the run is refused.
    - A path anywhere else gets the directories above it on the tmpfs, with mode 0755 whatever
      the umask, owned by the user, and an empty file as the place of a file.
+   - The working directory, when no bound path holds it, gets an empty directory there in the
+     same way, so the program starts in it as without the view and as on macOS and Windows,
+     and a relative path finds nothing rather than resolving under `/`
+     (`the_program_starts_in_a_working_directory_outside_the_policy`). A working directory on
+     the proc file system refuses the run instead, unless a policy path holds it: an empty
+     directory there would show a `/proc` that the view does not hold, and its name a process ID
+     from outside the program's PID namespace, as `--cwd /proc/self` resolves to sandy's
+     (`a_working_directory_in_an_ungranted_proc_refuses_the_run`). sandy reads that file system
+     through `/proc/self/cwd`, because a path from the working directory, `.` too, needs search
+     permission on it, so a working directory without one starts as without the view
+     (`the_program_starts_in_a_working_directory_without_search_permission`).
 5. The symbolic links on the way to the paths are recreated with their text, `/dev` is built,
    the tmpfs mounts become read-only, and `pivot_root(".", ".")` with `umount2(".",
    MNT_DETACH)` makes the tmpfs the root and detaches the old one. The process then changes to
-   the working directory it had, when the view holds it, as the path itself or a directory above
-   a granted path, and to `/` otherwise.
+   the working directory it had, which the view now holds, and to `/` only when it had none (a
+   removed directory); a change that fails refuses the run.
 
 The descriptors of `/proc/self/task` that the thread checks of the launch sequence use are opened
 before the view, because the view hides `/proc` unless the policy grants it.
@@ -802,7 +814,9 @@ These are exceptions of `PathsHidden` (DESIGN.md, "Requirements and the enforcem
   inode numbers.
 - **The directories above a granted path.** They exist in the view with their names, for example
   `/home` and `/home/user` above a granted `/home/user/project`, owned by the user, with the time
-  sandy built the view. The program cannot list them, because no Landlock rule covers them.
+  sandy built the view. The program cannot list them, because no Landlock rule covers them. A
+  working directory that no policy path holds (`--cwd`, or sandy's own) exists the same way, empty,
+  with the directories above it, except on the proc file system, where it refuses the run.
 - **Link counts.** The link count of a granted file still counts its names outside the view, so
   the program learns that a file has another name, though not where.
   `the_view_leaves_the_file_systems_the_parents_and_link_counts_visible` records the three.
@@ -1461,12 +1475,12 @@ lets only `read_exec` paths be mapped as code (`file-map-executable`), and Windo
 file with `FILE_EXECUTE`, which `read` and `read_write` do not grant. So a library in a `read` or
 `read_write` path loads on Linux and fails to load on macOS and Windows; a policy that loads
 libraries from a path makes it `read_exec` on every platform. The view mounts every path that no
-`read_exec` path holds without execute, and there the mapping fails with `EPERM` (see "File system
-view"). Nothing cheaper does this without the view: seccomp sees the descriptor number of an
-`mmap` but not the file behind it, and `mprotect` names no file at all, so a filter could only
-refuse every executable mapping of a file, also of the system libraries and of `read_exec` paths,
-and Landlock has no right for it. The program can still run code it writes into its own memory on
-every platform (docs/windows.md, "What sandy grants"), so this mapping gives it no code it could
+`read_exec` path holds without execute, and there `mmap` with `PROT_EXEC` fails with `EPERM`
+and `mprotect` with `EACCES` (see "File system view"). Nothing cheaper does this without the
+view: seccomp sees the descriptor number of an `mmap` but not the file behind it, and `mprotect`
+names no file at all, so a filter could only refuse every executable mapping of a file, also of
+the system libraries and of `read_exec` paths, and Landlock has no right for it. The program can
+still run code it writes into its own memory on every platform (docs/windows.md, "What sandy grants"), so this mapping gives it no code it could
 not run otherwise; it changes which policies load a library.
 
 A writable path never gets these rights:

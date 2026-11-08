@@ -645,7 +645,7 @@ exceptions:
 | Linux | `ip = "private"` | processes of the user that runs sandy can enter the sandbox's network namespace, which belongs to that user, and reach the program's ports and forwarded ports there without a relay, and the egress port |
 | Linux | `path_metadata = "deny"` with a `read` or `read_exec` path, without `view = "policy"` | the mode, except the setuid and setgid bits, and the times of a file or directory the program may only read, through a descriptor it opened for reading (`fchmod`, `futimens`) |
 | Linux | `view = "policy"` | `statfs` of a path in the view reports the host's file system there: its type, size, free space and number of files |
-| Linux | `view = "policy"` | the directories above a granted path exist in the view, with their names |
+| Linux | `view = "policy"` | the directories above a granted path, and a working directory outside the policy with the directories above it, exist in the view, with their names |
 | Linux | `view = "policy"` | the link count of a granted file counts its names outside the view |
 | Linux | `view = "policy"` with a `/proc` path | the mount table names the host's device, file system and mount options of every mount of the view, and the mount table of a process outside the sandbox lists the host's mounts with their paths |
 | macOS | `signals = "isolated"` | SIGIO (to a process of any user), and SIGURG with an `ip` other than `"none"`, through the owner ioctls of sockets and pipes; without `children = "contained"` also joining another job of the terminal session and stopping it |
