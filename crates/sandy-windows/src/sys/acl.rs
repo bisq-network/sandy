@@ -200,11 +200,8 @@ fn holders(held: &[Sid]) -> Vec<Holder> {
 
 /// The first of `who` that `aces` may give one of `rights`, named.
 fn holder(aces: &[Ace<'_>], who: &[Holder], rights: u32, is_dir: bool) -> Option<String> {
-    let bits = (0..u32::BITS)
-        .map(|bit| 1 << bit)
-        .filter(|bit| rights & bit != 0);
     who.iter()
-        .find(|(sid, _)| bits.clone().any(|bit| may_grant(aces, sid, bit, is_dir)))
+        .find(|(sid, _)| may_grant(aces, sid, rights, is_dir))
         .map(|(_, name)| name.clone())
 }
 
@@ -1736,6 +1733,36 @@ mod tests {
         revoke("sandy.acl-exec-test", &executable(&below)).unwrap();
 
         for dir in [plain, shared, own, below] {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    /// A deny entry before the allow does not keep an AppContainer from a right: Windows ignores
+    /// it for the package SID, the capabilities and the two package groups (measured on Windows
+    /// 11 build 26200), so the check does too, for either kind of path.
+    #[test]
+    fn a_deny_entry_does_not_keep_a_path_from_conflicting() {
+        // Every right that changes content, and execute.
+        let cases = [
+            (executable as fn(&Path) -> PathRule, "0xc0006", "write"),
+            (writable, "0x20", "execute"),
+        ];
+        for (index, (rule, denied, verb)) in cases.into_iter().enumerate() {
+            let dir = directory(&format!("deny-{index}"));
+            let wide = wide_nul(dir.as_os_str());
+            set_sddl(
+                Object::Path(&wide),
+                &format!("D:(D;OICI;{denied};;;AC)(A;OICI;FA;;;AC)"),
+            );
+            let checked = check_rights(&rule(&dir), &[]);
+            assert!(
+                matches!(
+                    &checked,
+                    Err(Problem::Conflict(reason))
+                        if reason.contains(&format!("PACKAGES) may {verb} files in"))
+                ),
+                "{checked:?}"
+            );
             let _ = fs::remove_dir_all(dir);
         }
     }

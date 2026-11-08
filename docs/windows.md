@@ -157,6 +157,19 @@ program could write a file that it may then execute (rule 3). The plan reports
 
 Permissions that sandy cannot read are indeterminate instead.
 
+A deny entry takes nothing away in this check. The AppContainer access check has two passes: the
+first one evaluates the user's own token and honors deny entries for the user and its groups, the
+second one evaluates the package SID, the capabilities and the two package groups and ignores
+deny entries for every one of them. Measured on Windows 11 build 26200 with a child process in an
+AppContainer with one capability, opening a file whose DACL held a deny entry before a full allow
+entry for the same SID: write data, execute and `WRITE_DAC` were all granted for the package SID,
+the capability, ALL APPLICATION PACKAGES and ALL RESTRICTED APPLICATION PACKAGES, with the deny
+entry explicit or inherited, and also when the deny named one of these SIDs and the allow
+another; a deny entry for the user, Users, Everyone, Authenticated Users or Administrators denied
+write data although the package SID was allowed. `access::may_grant` therefore leaves deny
+entries out, so a DACL such as `(D;;FW;;;AC)(A;;FA;;;AC)` counts as giving the right it denies.
+The deny entries of the first pass are not counted either, which errs towards refusing a policy.
+
 The same holds the other way round for a `read_exec` path, the program file among them: the
 plan reports a conflict, and `grant` refuses, when its DACL may give one of the same SIDs a right
 that changes content (`FILE_WRITE_DATA`, `FILE_APPEND_DATA`, `WRITE_DAC` or `WRITE_OWNER`,
@@ -201,9 +214,9 @@ policy paths. The other two would let it write the file's own permissions and gr
 back, to ALL APPLICATION PACKAGES for example, which every AppContainer belongs to. sandy
 reduces the entry to the rights of a `read_write` policy path, so all three are gone
 (`SetNamedSecurityInfoW` re-propagates the reduced entry to existing files too). A deny entry
-does not work here: the AppContainer access check ignores a deny ACE for the package SID,
-measured on Windows 11; reducing the allow entry is what the check honors, for `WRITE_DAC` as
-much as for `FILE_EXECUTE` (measured on build 26200).
+does not work here: the AppContainer access check ignores a deny ACE for the package SID (see
+"What every AppContainer can read"); reducing the allow entry is what the check honors, for
+`WRITE_DAC` as much as for `FILE_EXECUTE` (measured on build 26200).
 
 The change is idempotent: a run writes only while the entry still carries one of the three
 rights, so it also reduces an entry that lost `FILE_EXECUTE` alone, or that someone widened again

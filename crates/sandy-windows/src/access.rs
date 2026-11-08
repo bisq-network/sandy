@@ -140,7 +140,7 @@ pub struct Ace<'a> {
 /// Only ACEs for `sid` count. The result is meant for skipping a grant that Windows already
 /// gives, so an error towards "not granted" only causes a redundant grant.
 pub fn grants(aces: &[Ace<'_>], sid: &[u8], mask: u32, is_dir: bool) -> bool {
-    let evaluate = |applies: &dyn Fn(&Ace<'_>) -> bool| evaluate(aces, sid, mask, false, applies);
+    let evaluate = |applies: &dyn Fn(&Ace<'_>) -> bool| evaluate(aces, sid, mask, applies);
     let on_object = evaluate(&|ace: &Ace<'_>| ace.flags & INHERIT_ONLY_ACE == 0);
     if !is_dir {
         return on_object;
@@ -153,19 +153,27 @@ pub fn grants(aces: &[Ace<'_>], sid: &[u8], mask: u32, is_dir: bool) -> bool {
         && evaluate(&inherited_by(CONTAINER_INHERIT_ACE))
 }
 
-/// Whether `aces` may give `sid` `right` on the object itself or, for a directory, on a file or
-/// directory created in it. Unlike `grants`, one way suffices: the result is meant for refusing
-/// a writable path whose files an AppContainer could execute, so an error towards "granted" only
-/// refuses a policy.
-pub fn may_grant(aces: &[Ace<'_>], sid: &[u8], right: u32, is_dir: bool) -> bool {
-    let evaluate = |applies: &dyn Fn(&Ace<'_>) -> bool| evaluate(aces, sid, right, true, applies);
-    let on_object = evaluate(&|ace: &Ace<'_>| ace.flags & INHERIT_ONLY_ACE == 0);
+/// Whether `aces` may give `sid` one of `rights` on the object itself or, for a directory, on a
+/// file or directory created in it. Unlike `grants`, one way suffices: the result is meant for
+/// refusing a writable path whose files an AppContainer could execute, so an error towards
+/// "granted" only refuses a policy. An allow entry with a condition counts.
+///
+/// `sid` is one the AppContainer side of the access check evaluates: the package SID, a
+/// capability or one of the two package groups. That side ignores deny entries (measured on
+/// Windows 11 build 26200, for each of them, inherited or not), so they are left out here, and
+/// what remains is the union of the allow entries.
+pub fn may_grant(aces: &[Ace<'_>], sid: &[u8], rights: u32, is_dir: bool) -> bool {
+    let allows = |applies: &dyn Fn(&Ace<'_>) -> bool| {
+        aces.iter()
+            .filter(|ace| ace.kind != AceKind::Deny && ace.sid == sid && applies(ace))
+            .any(|ace| map_generic(ace.mask) & rights != 0)
+    };
+    let on_object = allows(&|ace: &Ace<'_>| ace.flags & INHERIT_ONLY_ACE == 0);
     if on_object || !is_dir {
         return on_object;
     }
     // NO_PROPAGATE_INHERIT_ACE still reaches the direct children, so it counts here.
-    let inherited_by = |bit: u8| move |ace: &Ace<'_>| ace.flags & bit != 0;
-    evaluate(&inherited_by(OBJECT_INHERIT_ACE)) || evaluate(&inherited_by(CONTAINER_INHERIT_ACE))
+    allows(&|ace: &Ace<'_>| ace.flags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) != 0)
 }
 
 /// Whether `aces` contain the ACE sandy adds: explicit (not inherited), allow, exactly `mask` and
@@ -181,21 +189,14 @@ pub fn has_explicit_ace(aces: &[Ace<'_>], sid: &[u8], mask: u32, flags: u8) -> b
 }
 
 /// Evaluates the ACEs in order, like the access check: a deny ACE that hits a right not granted
-/// yet ends the check. `conditional` says whether an allow entry with a condition counts as
-/// granting; the caller picks the answer that errs towards less access.
-fn evaluate(
-    aces: &[Ace<'_>],
-    sid: &[u8],
-    mask: u32,
-    conditional: bool,
-    applies: &dyn Fn(&Ace<'_>) -> bool,
-) -> bool {
+/// yet ends the check. An allow entry with a condition does not count as granting, which errs
+/// towards less access where the answer lets sandy skip a grant.
+fn evaluate(aces: &[Ace<'_>], sid: &[u8], mask: u32, applies: &dyn Fn(&Ace<'_>) -> bool) -> bool {
     let mut granted = 0;
     for ace in aces.iter().filter(|ace| ace.sid == sid && applies(ace)) {
         let rights = map_generic(ace.mask);
         match ace.kind {
             AceKind::Allow => granted |= rights,
-            AceKind::ConditionalAllow if conditional => granted |= rights,
             AceKind::ConditionalAllow => {}
             AceKind::Deny if rights & mask & !granted != 0 => return false,
             AceKind::Deny => {}
@@ -493,8 +494,11 @@ mod tests {
         assert!(!grants(&aces, ALL_APPLICATION_PACKAGES, RX, false));
     }
 
+    /// `grants` counts a deny entry before the allow, so sandy adds its own entry where the
+    /// deny would take a right away. Windows ignores such an entry for the SIDs of an
+    /// AppContainer, so the grant is redundant at worst.
     #[test]
-    fn deny_before_allow_wins() {
+    fn grants_counts_a_deny_before_the_allow() {
         let aces = [
             deny(0, FILE_EXECUTE, ALL_APPLICATION_PACKAGES),
             allow(0, RX, ALL_APPLICATION_PACKAGES),
@@ -506,6 +510,33 @@ mod tests {
             FILE_GENERIC_READ,
             false
         ));
+    }
+
+    /// The AppContainer access check ignores a deny entry for the package SID, a capability
+    /// and the two package groups (measured on Windows 11 build 26200), so for refusing a
+    /// path a deny entry takes nothing away, before the allow or inherited.
+    #[test]
+    fn may_grant_ignores_deny_entries() {
+        const INHERIT: u8 = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+        for sid in [
+            ALL_APPLICATION_PACKAGES,
+            ALL_RESTRICTED_APPLICATION_PACKAGES,
+            OTHER,
+        ] {
+            for (denied, flags) in [(FILE_WRITE_DATA, 0), (FILE_EXECUTE, INHERIT)] {
+                for deny_flags in [flags, flags | INHERITED_ACE] {
+                    let aces = [
+                        deny(deny_flags, denied, sid),
+                        allow(flags, FILE_ALL_ACCESS, sid),
+                    ];
+                    assert!(may_grant(&aces, sid, denied, true), "{denied:#x}");
+                    assert!(may_grant(&aces, sid, denied, false), "{denied:#x}");
+                }
+            }
+            // A deny entry alone grants nothing.
+            let denied_only = [deny(0, FILE_ALL_ACCESS, sid)];
+            assert!(!may_grant(&denied_only, sid, FILE_WRITE_DATA, false));
+        }
     }
 
     #[test]
@@ -608,7 +639,7 @@ mod tests {
             FILE_EXECUTE,
             false
         ));
-        // Read only, another SID, or a deny before the allow: no execute.
+        // Read only, or another SID: no execute.
         let read_only = [allow(
             OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
             FILE_GENERIC_READ,
@@ -621,24 +652,6 @@ mod tests {
             true
         ));
         assert!(!may_grant(&program_files, OTHER, FILE_EXECUTE, true));
-        let denied = [
-            deny(
-                OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
-                FILE_EXECUTE,
-                ALL_APPLICATION_PACKAGES,
-            ),
-            allow(
-                OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
-                RX,
-                ALL_APPLICATION_PACKAGES,
-            ),
-        ];
-        assert!(!may_grant(
-            &denied,
-            ALL_APPLICATION_PACKAGES,
-            FILE_EXECUTE,
-            true
-        ));
     }
 
     const USERS: &[u8] = &[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 33, 2, 0, 0];
