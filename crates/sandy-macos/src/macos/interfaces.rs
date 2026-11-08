@@ -441,6 +441,55 @@ impl HostNetwork for Interfaces {
     }
 }
 
+/// Asks for the route to 127.0.0.1 on `socket` (`RTM_GET`). The kernel copies the answer to every
+/// routing socket, which tests use in place of a change of the network.
+#[cfg(test)]
+pub(crate) fn send_route_lookup(socket: &OwnedFd) {
+    #[repr(C)]
+    struct Lookup {
+        header: libc::rt_msghdr,
+        destination: libc::sockaddr_in,
+    }
+    // SAFETY: both are plain C structures, for which zero is a valid value.
+    let mut lookup: Lookup = unsafe { std::mem::zeroed() };
+    lookup.header.rtm_msglen = size_of::<Lookup>() as u16;
+    lookup.header.rtm_version = libc::RTM_VERSION as u8;
+    lookup.header.rtm_type = libc::RTM_GET as u8;
+    lookup.header.rtm_addrs = libc::RTA_DST;
+    lookup.header.rtm_seq = 1;
+    lookup.destination.sin_len = size_of::<libc::sockaddr_in>() as u8;
+    lookup.destination.sin_family = libc::AF_INET as libc::sa_family_t;
+    lookup.destination.sin_addr.s_addr = u32::from(Ipv4Addr::LOCALHOST).to_be();
+    // SAFETY: the message is a valid buffer of the length passed.
+    let written = unsafe {
+        libc::write(
+            socket.as_raw_fd(),
+            (&raw const lookup).cast(),
+            size_of::<Lookup>(),
+        )
+    };
+    assert_eq!(
+        written,
+        size_of::<Lookup>() as isize,
+        "{}",
+        io::Error::last_os_error()
+    );
+}
+
+#[cfg(test)]
+impl Interfaces {
+    /// Whether the routing socket is kept and a message waits on it, which this reads.
+    pub(crate) fn sees_a_change(&self) -> bool {
+        self.changes.as_ref().is_some_and(changed)
+    }
+}
+
+/// A routing socket of its own, for a test to send on.
+#[cfg(test)]
+pub(crate) fn test_routing_socket() -> io::Result<OwnedFd> {
+    routing_socket()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,58 +835,36 @@ mod tests {
         assert_eq!(netmask(24, true), [7, 0, 0, 0, 255, 255, 255]);
     }
 
-    /// A message on the routing socket counts as a change, which drops what is kept.
-    /// Changing an address needs root, so a route lookup (`RTM_GET`) from a second routing
-    /// socket stands in for the change: the kernel copies its answer to every routing socket.
+    /// A message on the routing socket drops what is kept, and the next question reads the
+    /// routing table again. Changing an address needs root, so a route lookup (`RTM_GET`) from a
+    /// second routing socket stands in for the change: the kernel copies its answer to every
+    /// routing socket.
     #[test]
     fn a_message_on_the_routing_socket_counts_as_a_change() {
         let interfaces = Interfaces::watching();
-        let changes = interfaces.changes.as_ref().expect("a routing socket");
-        // Control: what was read is kept. A change elsewhere on the Mac can drop it in between,
-        // so the read is tried a few times.
+        assert!(interfaces.changes.is_some(), "a routing socket");
+        // Kept in place of what the table holds, so a read of the table shows. No route leads
+        // to the unspecified address alone (macOS can have one to the broadcast address).
+        let marker = Subnet::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 32).unwrap();
+        let keep_marker = || {
+            interfaces.on_link().unwrap();
+            *interfaces
+                .on_link
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(vec![marker]);
+        };
+        // Control: what was kept is the answer. A change elsewhere on the Mac can drop it in
+        // between, so this is tried a few times.
         let kept = (0..5).any(|_| {
-            interfaces.subnets().unwrap();
-            !changed(changes)
-                && interfaces
-                    .on_link
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .is_some()
+            keep_marker();
+            interfaces.on_link().unwrap() == [marker]
         });
         assert!(kept, "the on-link networks are kept");
-
-        #[repr(C)]
-        struct Lookup {
-            header: libc::rt_msghdr,
-            destination: libc::sockaddr_in,
-        }
-        // SAFETY: both are plain C structures, for which zero is a valid value.
-        let mut lookup: Lookup = unsafe { std::mem::zeroed() };
-        lookup.header.rtm_msglen = size_of::<Lookup>() as u16;
-        lookup.header.rtm_version = libc::RTM_VERSION as u8;
-        lookup.header.rtm_type = libc::RTM_GET as u8;
-        lookup.header.rtm_addrs = libc::RTA_DST;
-        lookup.header.rtm_seq = 1;
-        lookup.destination.sin_len = size_of::<libc::sockaddr_in>() as u8;
-        lookup.destination.sin_family = libc::AF_INET as libc::sa_family_t;
-        lookup.destination.sin_addr.s_addr = u32::from(Ipv4Addr::LOCALHOST).to_be();
-        // SAFETY: socket takes no pointers.
-        let other = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC) };
-        assert!(other >= 0);
-        // SAFETY: other is a new descriptor that nothing else owns.
-        let other = unsafe { OwnedFd::from_raw_fd(other) };
-        // SAFETY: the message is a valid buffer of the length passed.
-        let written = unsafe {
-            libc::write(
-                other.as_raw_fd(),
-                (&raw const lookup).cast(),
-                size_of::<Lookup>(),
-            )
-        };
-        assert_eq!(written, size_of::<Lookup>() as isize);
+        keep_marker();
+        send_route_lookup(&routing_socket().unwrap());
         assert!(
-            changed(changes),
-            "the lookup's answer reached the routing socket"
+            !interfaces.on_link().unwrap().contains(&marker),
+            "the lookup's answer did not drop what was kept"
         );
     }
 }
