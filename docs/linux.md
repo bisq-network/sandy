@@ -450,8 +450,8 @@ port the check allows.
    `net.ipv4.nexthop_compat_mode` is 0, does not say whether it has a gateway and is left out,
    so the network of an on-link route of that form is not the local network. The addresses and
    the networks are kept until a second netlink socket, bound to the groups of links, addresses
-   and IPv4 and IPv6 routes, reports a change or an overflow of its queue (`ENOBUFS`); the next
-   connection then reads them anew
+   and IPv4 and IPv6 routes and joined to the nexthop group, reports a change or an overflow of
+   its queue (`ENOBUFS`); the next connection then reads them anew
    (`routes::tests::a_change_of_the_addresses_reaches_the_next_lookup`). Where the kernel does not
    let the broker open or join that socket, or the socket cannot be read once the broker is
    confined, it reads them for every connection. A thread polls
@@ -2411,8 +2411,10 @@ rights of both, so the resolver compares files before it builds the rules.
   "Pseudo-terminals").
 - **Hard links.** sandy's own executable and the policy file must have no second name inside a
   writable path. sandy checks `st_nlink` first and walks the writable trees only when one of the
-  two has more than one name, which costs one `lstat` per file there. A directory the user may
-  not list is skipped: the program runs as the same user and cannot list it either.
+  two has more than one name, which costs one `lstat` per file there. Only the parts of the trees
+  on the file systems of the two are walked, told apart by the device of each mount's superblock
+  in `/proc/self/mountinfo`; a mount point of another file system is not entered. A directory
+  the user may not list is skipped: the program runs as the same user and cannot list it either.
 - Any other file that has a second name inside a writable path, also a `read_exec` file or the
   program, stays writable through that name. The link comes from the host or from an earlier run
   that could write both names; which trees a policy makes executable is its author's choice. Two

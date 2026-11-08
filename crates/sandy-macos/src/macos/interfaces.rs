@@ -312,9 +312,10 @@ fn invalid(message: &'static str) -> io::Error {
 /// (`getifaddrs`, cheap): macOS sends no routing message for some address changes, an alias in a
 /// subnet that already has its route for one, and sends the one for a removed address before the
 /// address leaves the list. The on-link networks, which take a dump of the routing table, are
-/// kept until any message arrives on a routing socket: a route that changes always sends one. The
-/// kernel drops a message only when the socket's queue is full, so some message still waits then
-/// and drops what is kept too. Without the socket (`changes` is `None`) nothing is kept.
+/// kept until any message arrives on a routing socket: a route that changes always sends one. A
+/// message the queue has no room for leaves another waiting, which drops what is kept too; one
+/// the kernel cannot allocate is lost, and what is kept stays until a later message. Without the
+/// socket (`changes` is `None`) nothing is kept.
 #[derive(Debug)]
 pub struct Interfaces {
     changes: Option<OwnedFd>,

@@ -1446,9 +1446,11 @@ struct WritableName {
 /// volume `statfs` names on macOS (`Mounts::filesystem_of`): each writable path whose file
 /// system, and each mount point inside one whose file system, is one of theirs, is a root of the
 /// walk, and a mount point of another file system is not entered. A change of device that no
-/// mount shows, as a btrfs subvolume or an overlay's layers make, stays inside the walk. A path
-/// whose file system cannot be told counts as one of theirs. The mount points are those of
-/// the table read at the start; one mounted since is walked as part of the tree that holds it.
+/// mount shows, as a btrfs subvolume or an overlay's layers make, stays inside the walk. A file
+/// seen through an overlay has the overlay's device or one the overlay makes up, never its
+/// layer's, so its name in a mount of the layer is not a second name of it. A path whose file
+/// system cannot be told counts as one of theirs. The mount points are those of the table read
+/// at the start; one mounted since is walked as part of the tree that holds it.
 #[cfg(unix)]
 fn second_name<'a>(
     linked: &[(&'a PathBuf, FileId)],

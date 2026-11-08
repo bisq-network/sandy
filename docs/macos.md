@@ -350,8 +350,11 @@ of earlier definitions"), so the protections come last. The unit test
       `maild.sb` denies it explicitly after `(deny default)`. A hard link to a file outside the
       policy would make it reachable through a writable path, so links are denied everywhere.
       Links that already exist are the host's, except that sandy's own executable and the
-      policy file must have no second name inside a writable path (see "Links and file
-      identity" in [DESIGN.md](DESIGN.md)).
+      policy file must have no second name inside a writable path. sandy looks for one only
+      when a file has more than one name, and only on the volumes of those files (`statfs`),
+      so a mount point of another volume inside a writable path is not entered. A network
+      mount point is taken as `getfsstat` names it, so one that a writable path reaches under
+      another spelling is walked (see "Links and file identity" in [DESIGN.md](DESIGN.md)).
     - `(deny syscall-unix (syscall-number 427) (syscall-number 217) (syscall-number 479)
       (syscall-number 225))`: `fsgetpath`, `fsgetpath_ext`, `openbyid_np` and `searchfs` find a
       file by volume id and inode number. `fsgetpath` builds the path in the kernel without
@@ -1008,7 +1011,8 @@ It keeps the routing table it read until a routing socket (`PF_ROUTE`), opened b
 broker's profile, reports any message, which a route that changes always sends; an answer to a
 route lookup of another process counts too. Measured on macOS 27.0.1: no message came in 10
 seconds without a change, nor while a process connected to 8 hosts it had not reached before. The
-kernel drops a message only when the socket's queue is full, when one still waits. Without the
+kernel drops a message when the socket's queue is full, when one still waits, and when it cannot
+allocate the message, which leaves the kept table in use until a later message. Without the
 socket the broker reads the table for every connection.
 
 An address is the Mac's own when an interface has it,
