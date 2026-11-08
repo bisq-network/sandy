@@ -171,44 +171,27 @@ fn a_writable_path_that_all_appcontainers_may_execute_is_refused() {
     assert!(stdout.contains("ALL APPLICATION PACKAGES"), "{stdout}");
 }
 
-/// A file below a writable path can carry an execute entry of its own, which the permissions of
-/// the path do not show. Together with sandy's write grant it would be writable and executable,
-/// so sandy refuses it. The walk runs when sandy first adds the grant, not on every run:
-/// `check` reads the path's own permissions only, which this test records.
+/// Recorded: a file below a writable path can carry an execute entry of its own, which the
+/// permissions of the path do not show. sandy does not walk the tree for it: what such a file
+/// lets the program do is run its own changes inside the sandbox, which rule 3 leaves out
+/// (DESIGN.md), and the entry is the host's. `check` reads the path's own permissions only.
 #[test]
-fn a_file_below_a_writable_path_that_all_appcontainers_may_execute_is_refused() {
+fn a_file_below_a_writable_path_keeps_its_own_execute_entry() {
     let fixture = Fixture::new("rw-child-exec");
     let child = fixture.arg("rw/file");
-    let check = || {
-        let mut args = vec!["check".to_string()];
-        args.extend(platform_args());
-        args.extend(fixture.access_args());
-        sandy(&args)
-    };
-
-    // Control: the same policy and the same tree without the entry work.
-    probe_inside(&fixture.access_args(), &[("read", &child)])[0].assert_ok();
-
-    // A new tree, so sandy adds the grant again instead of finding its entry in place.
-    fixture.reset();
     let granted = Command::new("icacls")
         .args([&child, "/grant", "*S-1-15-2-1:(RX)"])
         .output()
         .unwrap();
     assert!(granted.status.success(), "{granted:?}");
-
-    let output = sandy(run_program(
-        &fixture.access_args(),
-        &probe_path(),
-        &["read", &child],
-    ));
-    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("ALL APPLICATION PACKAGES"), "{stderr}");
-    assert!(stderr.contains(r"rw\file"), "{stderr}");
-
-    // Recorded: `check` only reads the permissions of the path itself.
-    assert!(check().status.success(), "{:?}", check());
+    controlled(&fixture.access_args(), &[("read", &child)])[0].assert_ok();
+    let entries = access_rules(fixture.path("rw/file").as_path());
+    assert!(
+        entries
+            .lines()
+            .any(|line| line.starts_with("S-1-15-2-1 ") && line.contains("ReadAndExecute")),
+        "{entries}"
+    );
 }
 
 /// sandy grants each path to a capability that only runs with this path in the policy hold.
@@ -383,8 +366,11 @@ fn a_read_write_path_itself_cannot_be_removed_or_moved() {
     }
 }
 
+/// A junction below a policy path leads nowhere the policy does not grant: the grant does not
+/// propagate through it, so the program cannot read the directory behind it. Control: the same
+/// read outside the sandbox works.
 #[test]
-fn refuses_to_grant_through_a_junction() {
+fn a_junction_below_a_policy_path_reaches_nothing() {
     let fixture = Fixture::new("junction");
     let link = fixture.path("ro/link");
     let status = Command::new("cmd")
@@ -395,17 +381,11 @@ fn refuses_to_grant_through_a_junction() {
         .status()
         .unwrap();
     assert!(status.success(), "mklink /J failed");
-    let secret = fixture.arg("secret/file");
-    let output = sandy(run_program(
-        &fixture.access_args(),
-        &probe_path(),
-        &["read", &secret],
-    ));
+    let through = fixture.arg("ro/link/file");
+    let lines = controlled(&fixture.access_args(), &[("read", &through)]);
     // Remove the junction itself, not the files it points to.
     fs::remove_dir(&link).unwrap();
-    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("junction"), "{stderr}");
+    lines[0].assert_blocked();
 }
 
 /// sandy grants a policy path by adding an entry to its access control list, which needs the

@@ -185,13 +185,16 @@ ports"). The program puts none anywhere, and the capability for one object does 
 another, so a grant capability cannot make a path both writable and executable; a file that is
 writable and executable through a second name is the link question of "Links and identity".
 
-`check` reads the permissions of the path itself. When `run` adds the entry, it also walks the
-tree below the path and refuses a descendant whose own permissions may give one of them execute,
-below a `read_exec` path one that may give them write, in the same walk that refuses junctions.
-The walk runs only where sandy changes something, so it does not slow down a plan, and `check`
-can report a policy as enforceable that `run` then refuses for a file below the path. What outside software adds after the walk is not seen; the
-program cannot add it, because it holds no right to change permissions outside its profile
-folder.
+`check` and `run` read the permissions of the path itself, not of the tree below it. A file
+below can carry an entry of its own that gives every AppContainer execute below a writable path,
+or write below an executable one. Such an entry comes from other software, or from an earlier
+run that could write there: a program may give a file it creates any entries. sandy does not
+judge them, as it does not judge the same entries anywhere else on the disk: the program could
+run its own changes inside the sandbox, which rule 3 does not cover (DESIGN.md), and which trees
+a policy makes executable is the choice of whoever writes it, who gives `read_exec` only to trees
+they trust
+(`escape_windows::a_file_below_a_writable_path_keeps_its_own_execute_entry`). A walk of the tree
+would cost a read of every permission list below the path at every first grant.
 
 `system = "none"` is unavailable. A Less Privileged AppContainer (LPAC,
 `PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY`) drops ALL APPLICATION PACKAGES, but
@@ -220,9 +223,9 @@ does not work here: the AppContainer access check ignores a deny ACE for the pac
 
 The change is idempotent: a run writes only while the entry still carries one of the three
 rights, so it also reduces an entry that lost `FILE_EXECUTE` alone, or that someone widened again
-from outside. Such a run also walks the folder and refuses a junction or symbolic link below it,
-because it re-propagates the entry and the program can write there
-(`review_windows::reducing_a_widened_profile_entry_refuses_a_junction_in_the_folder`).
+from outside. Such a run re-propagates the entry over the folder, where the program can write,
+and the propagation does not follow a junction the program left there (see "How sandy changes a
+DACL"; `review_windows::reducing_a_widened_profile_entry_does_not_follow_a_junction_in_the_folder`).
 
 The folder holds no user data. It is the program's own scratch space, writable in every policy,
 also one with no writable path. `escape_windows` and `review_windows` confirm that the program
@@ -264,24 +267,21 @@ and on macOS, whose profile denies it. Measured on Windows 11 build 26200 before
 program removed an empty read-write directory and moved a read-write directory and a read-write
 file into another read-write path (`a_read_write_path_itself_cannot_be_removed_or_moved`).
 
-A grant that an earlier version of sandy wrote, one entry with `DELETE` on the path, is not the
-grant `acl::lacks_grant` looks for, so the next run replaces it with the two entries like a new
-grant. For a directory that means, once per such path, what a first grant costs: the walk of the
-tree below it (see "What every AppContainer can read") and a write of the DACL with
-`SetNamedSecurityInfoW`, which propagates the inherited entries to every file and directory
-below. Some consequences of treating it as a new grant:
+A read-write directory grant that an earlier version of sandy wrote, one entry with `DELETE` on
+the path, is not the grant `acl::lacks_grant` looks for, so the next run replaces it with the two
+entries. The replacement keeps every right the old entry gave below the path and only takes
+`DELETE` off the path itself, so the tree below keeps its effective rights. For a directory that
+means, once per such path, a write of the DACL with `SetNamedSecurityInfoW`, which propagates the
+inherited entries to every file and directory below. Some consequences:
 
-- The walk can refuse a policy that worked with the earlier version, when a file or directory
-  below the path has gained a junction or an entry that the walk refuses since the old grant was
-  written.
 - Replacing the entries needs the right to change the DACL of the path (`WRITE_DAC`), as a
   first grant does. A path whose old grant came from a run with rights the current user lacks,
   an elevated one for example, is now a conflict of `check` and `run` for this user, as any
   policy path whose grant the current user may not add, until a run with those rights replaces
   it.
 - Runs of an earlier and of this version on the same path each find the other's entries not
-  theirs and write their own, so the entries change at every run that alternates, with a walk and
-  a propagation each time. While a run of the earlier version holds its entry, a program of this
+  theirs and write their own, so the entries change at every run that alternates, with a
+  propagation each time. While a run of the earlier version holds its entry, a program of this
   version on the same path can remove or move the path itself. One version of sandy per machine
   avoids it.
 
@@ -346,20 +346,23 @@ them the protection of the DACL can get lost [Kanthak]. For a directory, Windows
 inheritable ACE to every existing child, except children with a protected DACL
 [SetNamedSecurityInfoW]. Those children stay inaccessible to the program.
 
-Microsoft does not document whether this propagation follows junctions and symbolic links. A
-program that could write below a directory in an earlier run could have planted a link to a
-directory of the user. Before sandy adds an inheritable ACE, it therefore walks the directory and
-refuses the run if it finds a junction or symbolic link (`is_symlink` covers every name-surrogate
-reparse point). Hard links cannot be found this way. Measured on Windows 11 build 26200: an
-AppContainer program cannot create a hard link to a file it may not write (`ERROR_ACCESS_DENIED`),
-so it cannot give a file outside its writable paths a second name itself; a hard link that
-already exists weighs on the resolver instead (see "Links and identity").
-
-Measured once on Windows 11 build 26200: the propagation follows neither. After
-`SetNamedSecurityInfoW` added an inheritable entry to a directory, a junction below it carried
-the entry on the junction itself and nothing reached the directory it led to, and a directory
-symbolic link carried nothing into its target either. The walk stays, because the behaviour is
-not documented. `sandy setup --remove` does not walk: it only takes an entry away.
+Microsoft does not document whether this propagation follows junctions and symbolic links. A program
+that could write below a directory in an earlier run could have planted a junction to a directory of
+the user there, which a later grant of that directory would reach if it did: this is state the
+program can make, so the measurement carries a guarantee, not only the host's own links. Measured on
+Windows 11 build 26200: it follows neither. After `SetNamedSecurityInfoW` added an inheritable entry
+to a directory, a junction below it carried the entry on the junction itself and nothing reached the
+directory it led to, and a directory symbolic link carried nothing into its target either. sandy
+relies on that instead of walking the tree for links before each grant, and the unit test
+`a_grant_does_not_follow_a_link_below_the_path` measures it at every run of the suite, also on the
+windows-2022 and windows-2025 runners of CI, so a Windows that changes it fails there; it covers a
+first grant and the write that replaces an old read-write grant: the entries of a file below the
+path change, while the directory behind a junction and the one behind a directory symbolic link keep
+theirs, with no entry for the capability.
+`escape_windows::a_junction_below_a_policy_path_reaches_nothing` checks that the program cannot read
+through such a junction. Measured on Windows 11 build 26200: an AppContainer program cannot create a
+hard link to a file it may not write (`ERROR_ACCESS_DENIED`), so it cannot give a file outside its
+writable paths a second name itself (see "Links and identity").
 
 A path whose DACL the user cannot change makes `sandy run` fail with an error that names the
 path, unless Windows already grants the level to all AppContainers. A path without DACL (NULL
@@ -419,21 +422,21 @@ On Windows:
   `refuses_a_sandy_executable_a_writable_path_reaches`).
 - A hard link that gives sandy's own executable or the policy file a second name inside a
   writable path is refused. A file lists its own names (`FindFirstFileNameW`), so sandy asks
-  the two files directly and walks no tree. A hard link that the host already has between a
-  writable path and any other file, also a `read_exec` file or the program, is the host's: the
-  program can change the file through the writable name, and the inheritable entry of the
-  writable parent lands on the file itself, for the capability of this policy, which the
-  writable name gives the program anyway.
-- The sandboxed program cannot make such a second name itself: an AppContainer process is
-  refused a hard link to a file it may not write, a junction that leaves its writable paths, and
-  a symbolic link of any kind (it holds no `SeCreateSymbolicLinkPrivilege`), all measured on
-  Windows 11 build 26200 (`the_program_cannot_plant_a_link_reaching_outside_its_writable_paths`).
-  `filesystem.symlinks = "allow"`, which lets the program make symbolic links on Linux and
-  macOS, therefore changes nothing on Windows: sandy accepts the setting and the program still
-  makes no symbolic link. It can still make a junction within its writable paths under either
-  value, as without the setting.
-  The check runs at the start, so a second name that a process outside the sandbox makes while
-  the program runs is not seen, as on the other platforms.
+  the two files directly and walks no tree. A hard link between a writable path and any other
+  file, also a `read_exec` file or the program, from the host or from an earlier run that could
+  write both names, is the policy author's concern: the program can change the file through the
+  writable name, and the inheritable entry of the writable parent lands on the file itself, for
+  the capability of this policy, which the writable name gives the program anyway.
+- Within a run the program makes no second name of a file outside its writable paths: an
+  AppContainer process is refused a hard link to a file it may not write, a junction that leaves its
+  writable paths, and a symbolic link of any kind (it holds no `SeCreateSymbolicLinkPrivilege`), all
+  measured on Windows 11 build 26200
+  (`the_program_cannot_plant_a_link_reaching_outside_its_writable_paths`). `filesystem.symlinks =
+  "allow"`, which lets the program make symbolic links on Linux and macOS, therefore changes nothing
+  on Windows: sandy accepts the setting and the program still makes no symbolic link. It can still
+  make a junction within its writable paths under either value, as without the setting. The check
+  runs at the start, so a second name that a process outside the sandbox makes while the program
+  runs is not seen, as on the other platforms.
 - `sandy` is checked under the name it was started under, which `current_exe` reports on
   Windows, so a junction or symbolic link on the way counts.
 - The backend's own checks, the system directories of rule 6 and the trusted user locations of

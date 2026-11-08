@@ -16,6 +16,7 @@ Draft for the release after 1.1.0. It lists what a user or an integrator may not
 ## Policies that are no longer refused
 
 - **Every platform:** a hard link that gives a `read_exec` file or the program a second name inside a writable path is no longer refused, and sandy no longer walks the writable trees at each start to find one, unless sandy's own executable or the policy file has more than one name. Which trees a policy makes executable is its author's choice: such a link comes from the host or from an earlier run that could write both names. A second name of sandy's own executable or of the policy file is still refused.
+- **Windows:** a junction or symbolic link below a policy path, and a file below with permission entries of its own, no longer stop a run, and sandy no longer walks the tree below a path before it grants it. The grant does not follow a link (measured), so the program reaches nothing through one.
 
 ## New
 

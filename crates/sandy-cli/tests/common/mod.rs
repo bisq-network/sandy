@@ -356,6 +356,33 @@ pub fn appcontainer_sid(container: &str) -> String {
     value
 }
 
+/// The access rules of `path` as `SID RIGHTS` lines, the SIDs as numbers whatever the locale
+/// or the names Windows knows for them. `GetAccessRules` gives the SIDs directly: translating a
+/// name back fails for ALL APPLICATION PACKAGES.
+#[cfg(windows)]
+pub fn access_rules(path: &Path) -> String {
+    // .NET reads the list itself: on the CI runners Windows PowerShell cannot load the module
+    // of Get-Acl.
+    let script = format!(
+        "$p = '{}'; $acl = if ([IO.Directory]::Exists($p)) {{ \
+         [IO.Directory]::GetAccessControl($p) }} else {{ [IO.File]::GetAccessControl($p) }}; \
+         $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | \
+         ForEach-Object {{ $_.IdentityReference.Value + ' ' + $_.FileSystemRights }}",
+        path.display().to_string().replace('\'', "''")
+    );
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .env_remove("PSModulePath")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "access rules of {}: {output:?}",
+        path.display()
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 /// Removes this test's AppContainer profiles (the plain, the loopback and the level name, and
 /// the egress broker's of the plain one). Best effort.
 #[cfg(windows)]

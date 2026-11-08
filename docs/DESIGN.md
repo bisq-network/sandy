@@ -1157,8 +1157,9 @@ Details, limitations and sources: `docs/windows.md`.
   Read and read-write never contain `FILE_EXECUTE`; read levels contain no right that changes
   metadata. The root of a read-write path lacks `DELETE` (a second, inherit-only ACE gives it to
   everything below), so the program cannot remove or move the path itself, as on Linux and
-  macOS. sandy refuses to propagate a grant through junctions or symbolic links, and refuses
-  a policy path on a network share. The system set is what Windows grants ALL APPLICATION
+  macOS. A grant does not propagate through a junction or symbolic link below the path
+  (measured, and checked by `a_grant_does_not_follow_a_link_below_the_path` at every run of the
+  suite), so sandy does not walk the tree for them; it refuses a policy path on a network share. The system set is what Windows grants ALL APPLICATION
   PACKAGES; `system = "none"` is unavailable.
 - Network capabilities `internetClientServer` and `privateNetworkClientServer` only with
   `ip = "all"`, `internetClient` alone with `ip = "client"`: Windows Firewall then drops what
@@ -1195,8 +1196,10 @@ Details, limitations and sources: `docs/windows.md`.
 - Writable paths (rules 3 and 6): the plan refuses a `read_write` path that overlaps the Windows
   or a program files directory, or where ALL APPLICATION PACKAGES, ALL RESTRICTED APPLICATION
   PACKAGES, the policy's AppContainer or one of its network capabilities may execute files, also
-  only files created later. When sandy adds the grant it walks the tree and refuses a file below
-  the path whose own permissions say the same.
+  only files created later, and a `read_exec` path or program file that they may write, also
+  sandy's executable for the relays and the broker. It reads the permissions of the path
+  itself; what files below carry of their own is the policy author's concern (docs/windows.md,
+  "What every AppContainer can read").
 - sandy sets `SystemRoot` and `LOCALAPPDATA`; without the latter Windows refuses to create an
   AppContainer process. Windows sets `LOCALAPPDATA`, `TEMP` and `TMP` to the profile folder.
 - Job object with kill-on-close, no breakaway and all UI restrictions. The program is created
