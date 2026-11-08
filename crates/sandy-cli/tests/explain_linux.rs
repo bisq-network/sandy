@@ -7,6 +7,8 @@
 
 mod common;
 
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Output;
 
 use common::*;
@@ -421,6 +423,39 @@ fn the_program_keeps_its_exit_status() {
     with_mode.push("--explain".to_string());
     let output = run(&with_mode, &[("exit", "7")]);
     assert_eq!(output.status.code(), Some(7), "{output:?}");
+}
+
+/// A program that cannot start still gets the closing line, with sandy's own supervisor and
+/// without it: the lines are written from a queue, which sandy empties before it says why the
+/// start failed. A script whose interpreter does not exist passes sandy's checks and fails in
+/// execve.
+#[test]
+fn a_failed_start_keeps_the_last_lines() {
+    let fixture = Fixture::new("explain-failed-start");
+    let script = fixture.path("bin/script");
+    fs::write(&script, "#!/nonexistent/interpreter\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut modes = vec![Vec::new()];
+    if isolates_signals() {
+        modes.push(args(&["--signals", "isolated", "--children", "contained"]));
+    }
+    for mode in modes {
+        let mut sandy_args = vec!["run".to_string()];
+        sandy_args.extend(fixture.access_args());
+        sandy_args.extend(mode.iter().cloned());
+        sandy_args.push("--explain".to_string());
+        sandy_args.push("--".to_string());
+        sandy_args.push(script.to_str().unwrap().to_string());
+        let output = sandy(&sandy_args);
+        assert!(!output.status.success(), "{mode:?}: {output:?}");
+        let lines = explained(&output);
+        assert!(
+            lines
+                .last()
+                .is_some_and(|line| line.contains("watched calls")),
+            "{mode:?}: no summary: {output:?}"
+        );
+    }
 }
 
 /// Ctrl+C reaches the program and sandy alike, because both are in the terminal's foreground

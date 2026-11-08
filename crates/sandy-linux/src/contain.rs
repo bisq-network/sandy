@@ -174,27 +174,34 @@ pub fn run(
             group.group = program;
         }
     }
-    let mut message = Vec::new();
-    report
-        .read_to_end(&mut message)
-        .map_err(|error| SandboxError::io("cannot read the program's report", error))?;
-    if !message.is_empty() {
-        return Err(SandboxError::new(String::from_utf8_lossy(&message)));
+    let exited = (|| {
+        let mut message = Vec::new();
+        report
+            .read_to_end(&mut message)
+            .map_err(|error| SandboxError::io("cannot read the program's report", error))?;
+        if !message.is_empty() {
+            return Err(SandboxError::new(String::from_utf8_lossy(&message)));
+        }
+        group.reap_split();
+        let Some(program) = group.program else {
+            return Err(SandboxError::new(
+                "the program's process ended before it reported its process ID",
+            ));
+        };
+        // The program has started: the report pipe reached its end without a message, which
+        // only execve does.
+        status.started(program as u32);
+        group.supervise(&signals)
+    })();
+    if exited.is_ok() {
+        group.end();
     }
-    group.reap_split();
-    let Some(program) = group.program else {
-        return Err(SandboxError::new(
-            "the program's process ended before it reported its process ID",
-        ));
-    };
-    // The program has started: the report pipe reached its end without a message, which only
-    // execve does.
-    status.started(program as u32);
-    let exited = group.supervise(&signals)?;
-    group.end();
+    // Also when the start failed: the report's last lines, often the one that names why, are
+    // still queued.
     if let Some(explain) = &mut explain {
         explain.finish();
     }
+    let exited = exited?;
     Ok(match exited.code {
         libc::CLD_EXITED => {
             status.exited(exited.status as u32);
