@@ -122,7 +122,8 @@ const EXEMPTION_TRIES: usize = 5;
 /// read and write are a step that another writer can overtake: it writes the list it read before
 /// this change and so takes the change back. sandy processes of this user take the step one at
 /// a time (`lockfile`), and each reads the list back after its write and repeats the step until
-/// its change is there, which also covers a writer outside sandy. Needs administrator rights.
+/// its change is there. That also covers a writer outside sandy that overtakes the step, but not
+/// one that writes an older list after the read back. Needs administrator rights.
 pub fn set_loopback_exempt(appcontainer: &Sid, exempt: bool) -> Result<(), SandboxError> {
     let _serialized = UserLock::wait_for(LOCKS, "loopback-exemptions", SERIALIZE, true)?;
     for written in 0..=EXEMPTION_TRIES {
