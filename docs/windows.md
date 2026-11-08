@@ -828,19 +828,27 @@ a lookup that fails for another reason than a missing route refuses the destinat
 The local network is the on-link prefix of every interface address and every route of
 `GetIpForwardTable2` whose next hop is the unspecified address (on-link), except the default
 route and the routes into a tunnel: an interface whose type is a tunnel or PPP
-(`IF_TYPE_TUNNEL`, `IF_TYPE_PPP`), or whose access type `GetIfTable2` reports as
-`NET_IF_ACCESS_POINT_TO_POINT`. A route into a link without an address of that prefix counts
+(`IF_TYPE_TUNNEL`, `IF_TYPE_PPP`), or that `GetIfTable2` reports with the access type
+`NET_IF_ACCESS_POINT_TO_POINT` or the medium `NdisMediumIP`. A medium of IP itself has no link
+layer, so the adapter hands every packet to one other end and has no neighbours to address.
+Wintun, the adapter of WireGuard and of the TUN mode of many VPNs and proxies, declares
+`IF_TYPE_PROP_VIRTUAL` with `NET_IF_ACCESS_BROADCAST`, and only its medium tells. Measured on
+the Windows 11 VM with WireGuard 0.5.3 and a tunnel whose `AllowedIPs` is `203.0.113.0/24`: the
+adapter reports `NdisMedium` 19 (`NdisMediumIP`), Windows adds the route on-link, and the
+broker's subnets held 203.0.113.5 before this check and do not now, while the tunnel's own
+10.66.0.0/24 stays the local network. A route into a link without an address of that prefix counts
 too (`on_link_routes_name_their_network` with crafted routes, and
 `the_routing_table_reaches_the_gateway_on_link` with this machine's). What a route sends into a
 tunnel goes to its other end, which takes it on as a router does, so a VPN that splits the
 default route into `0.0.0.0/1` and `128.0.0.0/1` on such an interface leaves the internet
 public; the prefix of the tunnel's own address still counts
-(`routes_into_a_tunnel_name_no_network` and `a_point_to_point_access_type_is_a_tunnel`, with
-crafted input: the test VM has no tunnel interface). `IF_TYPE_PROP_VIRTUAL` is no sign of a
-tunnel, because virtual switches and other virtual adapters with real neighbours declare it too.
-Whether the Wintun adapter of WireGuard and similar VPNs reports a tunnel type or a
-point-to-point access type is not verified here; if it reports neither, its routes still count
-as a link with neighbours of its own. Measured on a Windows 11 VM with 16 routes, the
+(`routes_into_a_tunnel_name_no_network`, `a_point_to_point_access_type_is_a_tunnel` and
+`an_ip_medium_is_a_tunnel`, with crafted input: the test VM has no tunnel interface of its own). Before
+sandy checked the medium, such a split made every public IPv4 address the local network, and
+under `reach = "public"` the broker refused them all with reply 2. `IF_TYPE_PROP_VIRTUAL` is no
+sign of a tunnel, because virtual switches and other virtual adapters with real neighbours
+declare it too; they run over an Ethernet medium.
+Measured on a Windows 11 VM with 16 routes, the
 routing table takes about 20 µs, the adapter list 300 µs, and the whole answer about the local
 network 340 µs.
 It refuses a domain name (reply 8), so it resolves nothing for the program. On Windows there is a

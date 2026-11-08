@@ -18,7 +18,7 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
     IF_TYPE_PPP, IF_TYPE_TUNNEL, IP_ADAPTER_ADDRESSES_LH, MIB_IF_ROW2, MIB_IF_TABLE2,
     MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
 };
-use windows_sys::Win32::NetworkManagement::Ndis::NET_IF_ACCESS_POINT_TO_POINT;
+use windows_sys::Win32::NetworkManagement::Ndis::{NET_IF_ACCESS_POINT_TO_POINT, NdisMediumIP};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
 };
@@ -56,15 +56,15 @@ impl HostNetwork for WindowsHost {
             .filter_map(|address| Subnet::new(address.ip, address.prefix))
             .collect();
         let mut point_to_point = adapters.point_to_point;
-        point_to_point.extend(point_to_point_access()?);
+        point_to_point.extend(point_to_point_links()?);
         subnets.extend(on_link_routes(&point_to_point)?);
         Ok(subnets)
     }
 }
 
-/// The LUIDs of the interfaces whose access type is point-to-point (`GetIfTable2`), which a
-/// tunnel can have whatever type it declares.
-fn point_to_point_access() -> io::Result<Vec<u64>> {
+/// The LUIDs of the interfaces whose link has one other end whatever type they declare
+/// (`GetIfTable2`, `point_to_point_of`).
+fn point_to_point_links() -> io::Result<Vec<u64>> {
     let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
     // SAFETY: the call writes a pointer to a table that FreeMibTable frees below.
     let error = unsafe { GetIfTable2(&mut table) };
@@ -84,11 +84,18 @@ fn point_to_point_access() -> io::Result<Vec<u64>> {
     Ok(found)
 }
 
-/// The LUIDs of the `interfaces` whose access type is point-to-point.
+/// The LUIDs of the `interfaces` whose access type is point-to-point, or whose medium is IP
+/// itself (`NdisMediumIP`). A link without a link layer has no neighbours to address: the
+/// adapter hands every packet to one other end. Wintun, the adapter of WireGuard and of the
+/// TUN mode of many proxies, declares `IF_TYPE_PROP_VIRTUAL` with broadcast access and only
+/// its medium tells.
 fn point_to_point_of(interfaces: &[MIB_IF_ROW2]) -> Vec<u64> {
     interfaces
         .iter()
-        .filter(|interface| interface.AccessType == NET_IF_ACCESS_POINT_TO_POINT)
+        .filter(|interface| {
+            interface.AccessType == NET_IF_ACCESS_POINT_TO_POINT
+                || interface.MediaType == NdisMediumIP
+        })
         // SAFETY: a LUID is a 64-bit value in either view of its union.
         .map(|interface| unsafe { interface.InterfaceLuid.Value })
         .collect()
@@ -427,7 +434,56 @@ mod tests {
             interface(TUNNEL, NET_IF_ACCESS_POINT_TO_POINT),
         ];
         assert_eq!(point_to_point_of(&interfaces), [TUNNEL]);
-        assert!(point_to_point_access().is_ok());
+        assert!(point_to_point_links().is_ok());
+    }
+
+    /// Wintun declares a virtual type with broadcast access, but its medium is IP. A VPN or proxy
+    /// in TUN mode that splits the default route into it leaves the internet public, and the
+    /// prefix of its own address stays the local network.
+    #[test]
+    fn an_ip_medium_is_a_tunnel() {
+        use windows_sys::Win32::NetworkManagement::IpHelper::IF_TYPE_PROP_VIRTUAL;
+        use windows_sys::Win32::NetworkManagement::Ndis::{
+            NET_IF_ACCESS_BROADCAST, NdisMedium802_3,
+        };
+        let interface = |luid, medium| {
+            let mut row = MIB_IF_ROW2::default();
+            row.InterfaceLuid.Value = luid;
+            row.Type = IF_TYPE_PROP_VIRTUAL;
+            row.AccessType = NET_IF_ACCESS_BROADCAST;
+            row.MediaType = medium;
+            row
+        };
+        let interfaces = [
+            interface(ETHERNET, NdisMedium802_3),
+            interface(TUNNEL, NdisMediumIP),
+        ];
+        let tunnels = point_to_point_of(&interfaces);
+        assert_eq!(tunnels, [TUNNEL]);
+        let into_tunnel = |destination, prefix| {
+            let mut route = route(destination, prefix, "0.0.0.0");
+            route.InterfaceLuid.Value = TUNNEL;
+            route
+        };
+        let routes = [
+            into_tunnel("0.0.0.0", 1),
+            into_tunnel("128.0.0.0", 1),
+            route("192.168.122.0", 24, "0.0.0.0"),
+        ];
+        let mut subnets = on_link(&routes, &tunnels);
+        subnets.extend(Subnet::new("198.18.0.1".parse().unwrap(), 16));
+        let reached = |ip: &str| {
+            subnets
+                .iter()
+                .any(|subnet| subnet.contains(ip.parse().unwrap()))
+        };
+        for ip in ["1.1.1.1", "94.237.8.19", "185.220.101.105"] {
+            assert!(!reached(ip), "{ip} in {subnets:?}");
+        }
+        assert!(
+            reached("192.168.122.7") && reached("198.18.4.4"),
+            "{subnets:?}"
+        );
     }
 
     /// The routing table of this machine reaches the gateway of its way out without a router,
@@ -435,7 +491,7 @@ mod tests {
     #[test]
     fn the_routing_table_reaches_the_gateway_on_link() {
         let mut point_to_point = adapters().unwrap().point_to_point;
-        point_to_point.extend(point_to_point_access().unwrap());
+        point_to_point.extend(point_to_point_links().unwrap());
         let routes = on_link_routes(&point_to_point).unwrap();
         let subnets = WindowsHost.subnets().unwrap();
         for route in &routes {
