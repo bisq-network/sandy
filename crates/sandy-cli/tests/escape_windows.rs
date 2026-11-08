@@ -2559,6 +2559,135 @@ fn refuses_a_writable_path_over_the_git_and_gnupg_configuration() {
     }
 }
 
+/// Windows always gives the AppContainer write access to its profile folder, so a program that
+/// may also execute files there could write a program and run it (measured on Windows 11 build
+/// 26200 before sandy refused it: `copy-self` and then `exec` of the copy both succeeded).
+/// Rule 3 keeps a path from being both writable and executable, so an executable path in the
+/// folder, the program among them, is refused as a conflict, before anything runs. The fixture's
+/// own executable directory is the control.
+#[test]
+fn refuses_an_executable_path_in_the_appcontainer_profile_folder() {
+    let name = format!("{}.ac-exec", appcontainer_name());
+    delete_profile(&name);
+    let fixture = Fixture::new("ac-exec");
+    let control = fixture.copy_probe("bin");
+    let created = sandy(named_run(&name, &[], &[("pid", "x")]));
+    assert!(created.status.success(), "{created:?}");
+    let bin = user_local_app_data()
+        .join("Packages")
+        .join(&name)
+        .join("AC")
+        .join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let planted = bin.join("planted.exe");
+    fs::copy(probe_path(), &planted).unwrap();
+    let planted = planted.to_str().unwrap();
+
+    let allowed = sandy(named_run(
+        &name,
+        &["--read-exec", &fixture.arg("bin")],
+        &[("exec", &control)],
+    ));
+    assert!(allowed.status.success(), "{allowed:?}");
+    parse(&allowed)[0].assert_ok();
+
+    let refusals = [
+        named_run(
+            &name,
+            &["--read-exec", bin.to_str().unwrap()],
+            &[("copy-self", planted), ("exec", planted)],
+        ),
+        vec![
+            "run".to_string(),
+            "--appcontainer".to_string(),
+            name.clone(),
+            "--".to_string(),
+            planted.to_string(),
+            "pid".to_string(),
+            "x".to_string(),
+        ],
+    ];
+    for refused in refusals {
+        let output = sandy(&refused);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(EXIT_CONFLICT), "{stderr}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(
+            stderr.contains("may write files in executable path"),
+            "{stderr}"
+        );
+    }
+    delete_profile(&name);
+}
+
+/// The relays run sandy's executable in the program's AppContainer and the egress broker in its
+/// own, with read and execute access, so rule 3 refuses it when its permissions let the
+/// AppContainer that runs it write it, as it refuses such an executable policy path. `check`
+/// refuses what `run` refuses: before, `check` passed both, and `run` refused only the first,
+/// because it checked the broker's grant against the program's SIDs. A copy of sandy whose
+/// permissions are left alone is the control.
+#[test]
+fn refuses_a_sandy_executable_that_the_appcontainer_running_it_may_write() {
+    let name = format!("{}.relay-write", appcontainer_name());
+    let broker = format!("{name}.sandy-egress");
+    let fixture = Fixture::new("relay-write");
+    let expose = format!("127.0.0.1:{}=8555", free_port());
+    let cases = [
+        (
+            &name,
+            ["--ip", "all", "--expose", &expose],
+            "the relays run",
+        ),
+        (
+            &broker,
+            ["--ip", "private", "--egress", "1080"],
+            "the egress broker runs",
+        ),
+    ];
+    for (index, (writer, options, who)) in cases.into_iter().enumerate() {
+        let dir = fixture.path(&format!("sandy-{index}"));
+        fs::create_dir_all(&dir).unwrap();
+        let sandy = dir.join("sandy.exe");
+        fs::copy(sandy_path(), &sandy).unwrap();
+        let sandbox = |command: &str| {
+            let mut args = vec![command, "--appcontainer", &name];
+            args.extend(options);
+            let probe = probe_path();
+            if command == "run" {
+                args.extend(["--", &probe, "pid", "x"]);
+            }
+            Command::new(&sandy).args(&args).output().unwrap()
+        };
+        let control = sandbox("check");
+        assert_eq!(control.status.code(), Some(0), "{who}: {control:?}");
+        let granted = Command::new("icacls")
+            .arg(&sandy)
+            .args(["/grant", &format!("*{}:(W)", appcontainer_sid(writer))])
+            .output()
+            .unwrap();
+        assert!(granted.status.success(), "{granted:?}");
+        for command in ["check", "run"] {
+            let output = sandbox(command);
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(EXIT_CONFLICT),
+                "{command}: {text}"
+            );
+            assert!(
+                text.contains(who) && text.contains("may write files in executable path"),
+                "{command}: {text}"
+            );
+        }
+    }
+    delete_profile(&name);
+    delete_profile(&broker);
+}
+
 /// A junction or a directory symbolic link this test made with `mklink`. Dropping it removes the
 /// link itself, never what it leads to.
 struct DirectoryLink(PathBuf);

@@ -24,7 +24,8 @@ pub trait Host {
     /// `DeriveCapabilitySidsFromName` exists.
     fn capability_sids(&self) -> Result<(), Problem>;
     /// No writable path reaches a system directory or a trusted location, or a place where
-    /// AppContainers may execute files (rules 3 and 6).
+    /// AppContainers may execute files, and no executable path is a place where they may write
+    /// files (rules 3 and 6).
     fn writable_paths(&self) -> Result<(), Problem>;
     /// sandy can give the AppContainer access to every policy path.
     fn grants(&self) -> Result<(), Problem>;
@@ -39,7 +40,8 @@ pub trait Host {
     fn broker_loopback_exempt(&self) -> Result<bool, Problem>;
     /// sandy's own executable, which runs the relays and the egress broker.
     fn relay_program(&self) -> Result<PathBuf, Problem>;
-    /// sandy can allow the AppContainer, and with egress the broker's, to run `relay_program`.
+    /// sandy can allow the AppContainer, and with egress the broker's, to run `relay_program`,
+    /// and neither may write it.
     fn relay_grants(&self) -> Result<(), Problem>;
     /// AF_UNIX sockets work and the socket paths of forwarded ports fit into `sun_path`.
     fn forward_sockets(&self) -> Result<(), Problem>;
@@ -56,7 +58,8 @@ pub struct HostCapabilities {
     /// still starts and can explain the problem on builds that lack it.
     pub capability_sids: Result<(), Problem>,
     /// No writable path overlaps a system directory or a trusted location, and Windows does not
-    /// let every AppContainer execute files in one (rules 3 and 6).
+    /// let an AppContainer execute files in one or write files in an executable path (rules 3
+    /// and 6).
     pub writable_paths: Result<(), Problem>,
     /// sandy can give the AppContainer access to every policy path: the entry is in place, or
     /// the current user may change the path's access control list.
@@ -74,7 +77,8 @@ pub struct HostCapabilities {
     /// sandy's own executable, which runs the relays of exposed and forwarded ports and the egress
     /// broker.
     pub relay_program: Result<PathBuf, Problem>,
-    /// sandy can allow the AppContainer, and with egress the broker's, to run `relay_program`.
+    /// sandy can allow the AppContainer, and with egress the broker's, to run `relay_program`,
+    /// and neither may write it.
     pub relay_grants: Result<(), Problem>,
     /// AF_UNIX sockets work and the socket paths of forwarded ports fit into `sun_path`.
     pub forward_sockets: Result<(), Problem>,

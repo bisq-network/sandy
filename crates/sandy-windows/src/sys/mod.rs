@@ -220,7 +220,7 @@ impl Backend for WindowsBackend {
         // name the AppContainer they belong to. Its profile stays like the program's: the runs
         // of one policy share it, and one that ends must not take it from one that starts.
         let broker = match (policy.egress, &relay_rule) {
-            (Some(egress), Some(rule)) => Some(EgressBroker::prepare(name, egress, rule, &held)?),
+            (Some(egress), Some(rule)) => Some(EgressBroker::prepare(name, egress, rule)?),
             _ => None,
         };
         let relay_capability = match relay_rule {
@@ -367,16 +367,21 @@ impl Backend for WindowsBackend {
             if exempt { "in" } else { "not in" }
         );
         if !policy.expose.is_empty() || !policy.forward.is_empty() || policy.egress.is_some() {
-            // The relay rule is read and execute, so no writable-path check reads `held`.
+            // The SIDs that run sandy.exe, so that setup refuses what check and run refuse.
             let rule = relay::relay_rule().map_err(SandboxError::new)?;
-            acl::grant(name, &rule, &[])?;
+            acl::grant(name, &rule, &held_sids(policy, &container)?)?;
             done.push_str(", and its relays may run sandy.exe");
             // The egress broker runs sandy's executable from an AppContainer of its own, which
             // loopback isolation keeps off this machine only without the exemption.
-            if policy.egress.is_some() {
+            if let Some(egress) = policy.egress {
                 let broker = crate::name::egress_broker_name(name).map_err(SandboxError::new)?;
-                network::set_loopback_exempt(&appcontainer::sid(&broker)?, false)?;
-                acl::grant(&broker, &rule, &[])?;
+                let broker_container = appcontainer::sid(&broker)?;
+                network::set_loopback_exempt(&broker_container, false)?;
+                acl::grant(
+                    &broker,
+                    &rule,
+                    &broker_held_sids(&broker_container, egress.reach)?,
+                )?;
                 done.push_str(
                     ", and so may its egress broker, whose AppContainer is not in the loopback \
                      exemption",
@@ -478,16 +483,16 @@ impl EgressBroker {
         program_name: &str,
         egress: sandy_core::Egress,
         relay: &PathRule,
-        held: &[Sid],
     ) -> Result<EgressBroker, SandboxError> {
         let name = crate::name::egress_broker_name(program_name).map_err(SandboxError::new)?;
         let container = appcontainer::ensure_profile(&name)?;
         // The broker can write its profile folder (its TEMP) but must not execute what it writes.
         acl::deny_execute_in_profile(&container, &profile_folder(&container)?)?;
-        let mut capabilities = vec![acl::grant(&name, relay, held)?];
-        for capability in crate::plan::broker_network_capabilities(egress.reach) {
-            capabilities.push(network_capability_sid(*capability)?);
-        }
+        let network = broker_network_sids(egress.reach)?;
+        let mut held = vec![container.clone()];
+        held.extend(network.iter().cloned());
+        let mut capabilities = vec![acl::grant(&name, relay, &held)?];
+        capabilities.extend(network);
         Ok(EgressBroker {
             container,
             capabilities,
@@ -577,9 +582,18 @@ impl Probes for WindowsProbes {
         relay::grantable(relay, name)
     }
 
+    fn relay_rights(
+        &self,
+        relay: &acl::GrantTarget,
+        name: &str,
+        policy: &ResolvedPolicy,
+    ) -> Result<(), Problem> {
+        check_relay_rights(relay, name, policy)
+    }
+
     fn writable_paths(
         &self,
-        layout: &Layout,
+        layout: Option<&Layout>,
         policy: &ResolvedPolicy,
         container: &Sid,
     ) -> Result<(), Problem> {
@@ -688,7 +702,7 @@ fn system_directories() -> Result<Vec<ProtectedPath>, SandboxError> {
 }
 
 /// The SIDs the program's token will hold that could carry rights on a policy path: its
-/// AppContainer and its network capabilities. `acl::check_writable` says why the grant
+/// AppContainer and its network capabilities. `acl::check_rights` says why the grant
 /// capabilities are not among them.
 fn held_sids(policy: &ResolvedPolicy, container: &Sid) -> Result<Vec<Sid>, SandboxError> {
     let mut held = vec![container.clone()];
@@ -696,6 +710,50 @@ fn held_sids(policy: &ResolvedPolicy, container: &Sid) -> Result<Vec<Sid>, Sandb
         held.push(network_capability_sid(*capability)?);
     }
     Ok(held)
+}
+
+/// The SIDs the egress broker's token holds that could carry rights on sandy's executable: its
+/// AppContainer `container` and the network capabilities of `reach`.
+fn broker_held_sids(
+    container: &Sid,
+    reach: sandy_core::EgressReach,
+) -> Result<Vec<Sid>, SandboxError> {
+    let mut held = vec![container.clone()];
+    held.extend(broker_network_sids(reach)?);
+    Ok(held)
+}
+
+/// The network capabilities the egress broker holds for `reach`.
+fn broker_network_sids(reach: sandy_core::EgressReach) -> Result<Vec<Sid>, SandboxError> {
+    crate::plan::broker_network_capabilities(reach)
+        .iter()
+        .map(|capability| network_capability_sid(*capability))
+        .collect()
+}
+
+/// Rule 3 for sandy's executable, which the relays run in the program's AppContainer and the
+/// egress broker in its own: neither may be able to write it, as `run` and `setup` refuse in
+/// `acl::grant`. Changes nothing.
+fn check_relay_rights(
+    relay: &acl::GrantTarget,
+    name: &str,
+    policy: &ResolvedPolicy,
+) -> Result<(), Problem> {
+    let indeterminate = |error: SandboxError| Problem::Indeterminate(error.to_string());
+    let rule = relay.rule();
+    let container = appcontainer::sid(name).map_err(indeterminate)?;
+    acl::check_rights(rule, &held_sids(policy, &container).map_err(indeterminate)?).map_err(
+        |problem| problem.map(|reason| format!("the relays run sandy's executable: {reason}")),
+    )?;
+    // A name with no room for the broker's suffix is the plan's own conflict.
+    let (Some(egress), Ok(broker)) = (policy.egress, crate::name::egress_broker_name(name)) else {
+        return Ok(());
+    };
+    let container = appcontainer::sid(&broker).map_err(indeterminate)?;
+    let held = broker_held_sids(&container, egress.reach).map_err(indeterminate)?;
+    acl::check_rights(rule, &held).map_err(|problem| {
+        problem.map(|reason| format!("the egress broker runs sandy's executable: {reason}"))
+    })
 }
 
 /// Locations of this user that programs outside the sandbox read or execute later: the folders
@@ -866,9 +924,10 @@ impl Layout {
     }
 }
 
-/// Rules 3 and 6 for the writable paths of `policy`: none may overlap a system directory or one
-/// of the user's trusted locations in `layout`, and nobody the program's token carries may
-/// execute files in one. `container` is the policy's AppContainer. Changes nothing.
+/// Rules 3 and 6 for the policy paths of `policy`: no writable path may overlap a system
+/// directory or one of the user's trusted locations in `layout`, and nobody the program's token
+/// carries may execute files in a writable path or write files in an executable one
+/// (`acl::check_rights`). `container` is the policy's AppContainer. Changes nothing.
 ///
 /// Paths are compared as rules 3 and 4 compare them (`PathIdentity`): by the identity of the
 /// directories on the way, so a junction or another spelling of a directory counts as that
@@ -876,56 +935,59 @@ impl Layout {
 /// with the layout of this host; one that sandy only assumes because it cannot read the
 /// identity of a directory on the way is indeterminate.
 fn check_writable_paths(
-    layout: &Layout,
+    layout: Option<&Layout>,
     policy: &ResolvedPolicy,
     container: &Sid,
 ) -> Result<(), Problem> {
-    let Layout {
+    let held =
+        held_sids(policy, container).map_err(|error| Problem::Indeterminate(error.to_string()))?;
+    let mut problems = Vec::new();
+    // The overlap checks read the layout, so they run only when the policy has a writable path.
+    if let Some(Layout {
         identity,
         system,
         trusted,
         state,
-    } = layout;
-    let held =
-        held_sids(policy, container).map_err(|error| Problem::Indeterminate(error.to_string()))?;
-    let mut problems = Vec::new();
-    if let Some((rule, directory)) = policy.known_writable_conflict(system, identity) {
-        problems.push(Problem::Conflict(format!(
-            "writable path {} overlaps the system directory {}, where Windows lets every \
-             AppContainer read and execute files",
-            rule.path.display(),
-            directory.path.display()
-        )));
-    }
-    if let Some((rule, location)) = policy.known_writable_conflict(trusted, identity) {
-        let why = if location.path == *state {
-            "where sandy keeps the state of its runs; the program could let a run with another \
-             policy join its AppContainer, or make every later run wait"
-        } else {
-            "which programs outside the sandbox read or execute later; a file the program leaves \
-             there runs outside the sandbox"
-        };
-        problems.push(Problem::Conflict(format!(
-            "writable path {} overlaps {}, {why}",
-            rule.path.display(),
-            location.path.display()
-        )));
-    }
-    for protected in [system, trusted] {
-        if let Some((rule, location)) = policy.writable_conflict(protected, identity) {
-            problems.push(Problem::Indeterminate(format!(
-                "cannot tell whether writable path {} overlaps {}: sandy cannot read the identity \
-                 of a directory on the way",
+    }) = layout
+    {
+        if let Some((rule, directory)) = policy.known_writable_conflict(system, identity) {
+            problems.push(Problem::Conflict(format!(
+                "writable path {} overlaps the system directory {}, where Windows lets every \
+                 AppContainer read and execute files",
+                rule.path.display(),
+                directory.path.display()
+            )));
+        }
+        if let Some((rule, location)) = policy.known_writable_conflict(trusted, identity) {
+            let why = if location.path == *state {
+                "where sandy keeps the state of its runs; the program could let a run with \
+                 another policy join its AppContainer, or make every later run wait"
+            } else {
+                "which programs outside the sandbox read or execute later; a file the program \
+                 leaves there runs outside the sandbox"
+            };
+            problems.push(Problem::Conflict(format!(
+                "writable path {} overlaps {}, {why}",
                 rule.path.display(),
                 location.path.display()
             )));
+        }
+        for protected in [system, trusted] {
+            if let Some((rule, location)) = policy.writable_conflict(protected, identity) {
+                problems.push(Problem::Indeterminate(format!(
+                    "cannot tell whether writable path {} overlaps {}: sandy cannot read the \
+                     identity of a directory on the way",
+                    rule.path.display(),
+                    location.path.display()
+                )));
+            }
         }
     }
     problems.extend(
         policy
             .paths
             .iter()
-            .filter_map(|rule| acl::check_writable(rule, &held).err()),
+            .filter_map(|rule| acl::check_rights(rule, &held).err()),
     );
     worst(problems).map_or(Ok(()), Err)
 }

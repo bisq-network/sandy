@@ -68,10 +68,12 @@ in one of four classes:
   policy needs without, and a grant on `sandy.exe` that the current user may not add.
 - **Conflict** (`CONFLICT`, status 125), the same for every level: no AppContainer name or an
   invalid one; a name too long for the egress broker's suffix; a policy path on a share or a
-  mapped drive; `sandy.exe` in a read-write path; a writable path that overlaps a system
+  mapped drive; `sandy.exe` in a read-write path, or with permissions that let the relays' or
+  the egress broker's AppContainer write it; a writable path that overlaps a system
   directory or a trusted location, or whose permissions let an AppContainer execute files there,
-  are missing (NULL DACL) or hold entries sandy cannot evaluate; a policy path whose grant the
-  current user may not add.
+  are missing (NULL DACL) or hold entries sandy cannot evaluate; an executable path, or the
+  program file, whose permissions let an AppContainer write there, as in its profile folder, or
+  are missing or hold such entries; a policy path whose grant the current user may not add.
 - **Indeterminate** (`UNDECIDED`, status 125), a probe that failed for a reason that can pass:
   a firewall service that is starting, stopping or cannot be queried; loopback exemptions, the
   update revision of an affected build, the job sandy runs in, a known folder, or a file ID or
@@ -155,13 +157,24 @@ program could write a file that it may then execute (rule 3). The plan reports
 
 Permissions that sandy cannot read are indeterminate instead.
 
+The same holds the other way round for a `read_exec` path, the program file among them: the
+plan reports a conflict, and `grant` refuses, when its DACL may give one of the same SIDs a right
+that changes content (`FILE_WRITE_DATA`, `FILE_APPEND_DATA`, `WRITE_DAC` or `WRITE_OWNER`,
+`access::CHANGES_CONTENT`), on the path itself or through an inherited entry, when it holds
+entries of an unknown type, or when it has no DACL. The write right would join the execute
+right of sandy's capability. The AppContainer's own profile folder is always such a place (see
+"The AppContainer profile folder"). `sys::acl::check_rights` makes both checks.
+
 The grant capabilities are not on that list. A grant capability is derived from the identity of
-the object it is granted on, so it can appear on that object and nowhere else; a file that is
+the object it is granted on. sandy puts one on that object, and the relay's capability also on
+the forward socket directory sandy creates, which carries no execute right (see "Forwarded
+ports"). The program puts none anywhere, and the capability for one object does not match
+another, so a grant capability cannot make a path both writable and executable; a file that is
 writable and executable through a second name is the link question of "Links and identity".
 
 `check` reads the permissions of the path itself. When `run` adds the entry, it also walks the
 tree below the path and refuses a descendant whose own permissions may give one of them execute,
-in the same walk that refuses junctions. The walk runs only where sandy changes something, so it
+below a `read_exec` path one that may give them write, in the same walk that refuses junctions. The walk runs only where sandy changes something, so it
 does not slow down a plan, and `check` can report a policy as enforceable that `run` then
 refuses for a file below the path. What outside software adds after the walk is not seen; the
 program cannot add it, because it holds no right to change permissions outside its profile
@@ -202,6 +215,13 @@ The folder holds no user data. It is the program's own scratch space, writable i
 also one with no writable path. `escape_windows` and `review_windows` confirm that the program
 can write and read it, cannot execute a file in it (`load-library` is denied while `read`
 succeeds), and cannot grant itself execute back.
+
+The entry keeps the write rights, so an executable path in the folder, or a program file there,
+would be both writable and executable: measured on Windows 11 build 26200, a program with
+`--read-exec` on `AC\bin` copied itself there and started the copy. sandy refuses such a path as
+a conflict, as it refuses a writable path where the program may execute files (see "What every
+AppContainer can read"), and the program file with it
+(`refuses_an_executable_path_in_the_appcontainer_profile_folder`).
 
 What the reduction does not repair: a program that ran while the entry still carried `WRITE_DAC`
 could write an explicit entry of its own on a file in the folder, and re-propagation does not
@@ -481,7 +501,7 @@ process of the user outside the sandbox runs it.
 `review_windows::profile_folder_is_a_persistent_writable_but_not_executable_store` records
 that for the profile folder: inside the sandbox the planted image does not load, outside it
 does. A deny entry for the package SID would not help, because the AppContainer access check
-ignores it (`acl::check_writable`), and rewriting the user's own DACLs is not something sandy
+ignores it (`acl::check_rights`), and rewriting the user's own DACLs is not something sandy
 does.
 
 The locations that are refused are in `sys::trusted_locations`:
@@ -1056,7 +1076,12 @@ name. Without the grant, when the current user may not add it, the plan reports
 sandy cannot read, is indeterminate: setup does not fix it. The plan also reports a conflict when
 `sandy.exe` lies in a read-write path: the program could replace the file that the relays
 execute (writable-and-executable rule), and sandy must stay out of the program's reach in any
-case.
+case. For the same rule, `check`, `setup` and `run` refuse a `sandy.exe` whose permissions may
+give a right that changes content to the AppContainer that runs it, as they refuse such an
+executable policy path (`acl::check_rights`): the program's AppContainer and its network
+capabilities for the relays, the broker's AppContainer and its capabilities for the egress
+broker, and the two package groups for both
+(`refuses_a_sandy_executable_that_the_appcontainer_running_it_may_write`).
 
 ### Forwarded ports
 

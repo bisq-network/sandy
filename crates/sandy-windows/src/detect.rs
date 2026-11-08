@@ -39,11 +39,21 @@ pub trait Probes {
     fn relay_path<'relay>(&self, relay: &'relay Self::Relay) -> &'relay Path;
     /// Whether sandy may let the AppContainer `name` run the relay program.
     fn relay_grantable(&self, relay: &Self::Relay, name: &str) -> Result<(), Problem>;
-    /// `Host::writable_paths` for a policy with a writable path, whose AppContainer is
-    /// `container`.
+    /// Whether the permissions of the relay program let the AppContainer `name` of `policy`, or
+    /// its egress broker's, write it.
+    fn relay_rights(
+        &self,
+        relay: &Self::Relay,
+        name: &str,
+        policy: &ResolvedPolicy,
+    ) -> Result<(), Problem>;
+    /// `Host::writable_paths` for a policy with a writable or an executable path, whose
+    /// AppContainer is `container`. The layout is `None` when the policy has no writable path:
+    /// the per-path permission check reads each path's own permissions and needs no layout, and
+    /// only a writable path can overlap a protected location.
     fn writable_paths(
         &self,
-        layout: &Self::Layout,
+        layout: Option<&Self::Layout>,
         policy: &ResolvedPolicy,
         container: &Self::Sid,
     ) -> Result<(), Problem>;
@@ -194,20 +204,34 @@ impl<P: Probes> Host for ForPolicy<'_, P> {
     }
 
     fn writable_paths(&self) -> Result<(), Problem> {
-        let writable = self
+        // A path that may only be read has nothing to check (`acl::check_rights`).
+        let checked = self
+            .policy
+            .paths
+            .iter()
+            .any(|rule| rule.access != PathAccess::Read);
+        if !checked {
+            return Ok(());
+        }
+        // The layout feeds the overlap checks, which only a writable path can fail, so it is read
+        // only when the policy has one.
+        let detection = self.detection;
+        let has_writable = self
             .policy
             .paths
             .iter()
             .any(|rule| rule.access == PathAccess::ReadWrite);
-        if !writable {
-            return Ok(());
-        }
-        let detection = self.detection;
-        let layout = detection
-            .layout
-            .get_or_init(|| detection.probes.layout())
-            .as_ref()
-            .map_err(Clone::clone)?;
+        let layout = if has_writable {
+            Some(
+                detection
+                    .layout
+                    .get_or_init(|| detection.probes.layout())
+                    .as_ref()
+                    .map_err(Clone::clone)?,
+            )
+        } else {
+            None
+        };
         detection
             .probes
             .writable_paths(layout, self.policy, &self.sid()?)
@@ -251,11 +275,12 @@ impl<P: Probes> Host for ForPolicy<'_, P> {
     fn relay_grants(&self) -> Result<(), Problem> {
         let relay = self.relay()?;
         let probes = &self.detection.probes;
-        probes.relay_grantable(relay, self.name()?)?;
-        match self.broker() {
-            Some(broker) => probes.relay_grantable(relay, &broker),
-            None => Ok(()),
+        let name = self.name()?;
+        probes.relay_grantable(relay, name)?;
+        if let Some(broker) = self.broker() {
+            probes.relay_grantable(relay, &broker)?;
         }
+        probes.relay_rights(relay, name, self.policy)
     }
 
     fn forward_sockets(&self) -> Result<(), Problem> {
@@ -283,6 +308,7 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         exempt: Vec<String>,
+        layout_error: Option<Problem>,
         calls: RefCell<Vec<&'static str>>,
     }
 
@@ -347,7 +373,7 @@ mod tests {
         }
         fn layout(&self) -> Result<(), Problem> {
             self.called("layout");
-            Ok(())
+            self.layout_error.clone().map_or(Ok(()), Err)
         }
         fn appcontainer_sid(&self, name: &str) -> Result<String, Problem> {
             Ok(name.to_lowercase())
@@ -359,7 +385,16 @@ mod tests {
             self.called("relay_grantable");
             Ok(())
         }
-        fn writable_paths(&self, _: &(), _: &ResolvedPolicy, _: &String) -> Result<(), Problem> {
+        fn relay_rights(&self, _: &PathBuf, _: &str, _: &ResolvedPolicy) -> Result<(), Problem> {
+            self.called("relay_rights");
+            Ok(())
+        }
+        fn writable_paths(
+            &self,
+            _: Option<&()>,
+            _: &ResolvedPolicy,
+            _: &String,
+        ) -> Result<(), Problem> {
             self.called("writable_paths");
             Ok(())
         }
@@ -429,6 +464,77 @@ mod tests {
         for probe in ["writable_paths", "grants"] {
             assert_eq!(detection.probes().count(probe), 2, "{probe}");
         }
+    }
+
+    /// `check` asks what `run` refuses: the permissions of an executable path as well as of a
+    /// writable one, and of sandy's executable when the relays run it.
+    #[test]
+    fn a_plan_checks_executable_paths_and_the_relay_program() {
+        let mut policy = ResolvedPolicy::resolve(&Policy::default(), None).unwrap();
+        policy.windows.appcontainer_name = Some("exec.level".into());
+        policy.ip = IpAccess::All;
+        let planned = |policy: &ResolvedPolicy| {
+            let detection = Detection::new(Fake::default());
+            detection.plan(policy);
+            ["writable_paths", "relay_rights"].map(|probe| detection.probes().count(probe))
+        };
+        assert_eq!(planned(&policy), [0, 0]);
+        policy.paths.push(PathRule {
+            path: PathBuf::from(r"C:\tools"),
+            access: PathAccess::ReadExec,
+            is_dir: true,
+        });
+        assert_eq!(planned(&policy), [1, 0]);
+        policy.expose = vec![ExposedPort {
+            listen: "127.0.0.1:18080".parse().unwrap(),
+            port: 8080,
+        }];
+        assert_eq!(planned(&policy), [1, 1]);
+    }
+
+    /// The layout is read only for a policy with a writable path. A policy whose paths may only
+    /// be read or executed, such as one whose only path is the program, never reads it, so a
+    /// layout that cannot be read leaves such a policy enforced rather than indeterminate.
+    #[test]
+    fn the_layout_is_read_only_for_a_writable_path() {
+        let planned = |policy: &ResolvedPolicy| {
+            let detection = Detection::new(Fake {
+                layout_error: Some(Problem::Indeterminate("cannot read a known folder".into())),
+                ..Fake::default()
+            });
+            let items = detection.plan(policy);
+            let filesystem = status(&items, Requirement::FilesystemConfined).clone();
+            (detection.probes().count("layout"), filesystem)
+        };
+        let mut policy = ResolvedPolicy::resolve(&Policy::default(), None).unwrap();
+        policy.windows.appcontainer_name = Some("layout.level".into());
+        policy.ip = IpAccess::All;
+
+        // An executable path alone: the layout is not read and the failure does not matter.
+        policy.paths.push(PathRule {
+            path: PathBuf::from(r"C:\tools"),
+            access: PathAccess::ReadExec,
+            is_dir: true,
+        });
+        let (layout_reads, filesystem) = planned(&policy);
+        assert_eq!(layout_reads, 0);
+        assert!(
+            matches!(filesystem, Status::Enforced { .. }),
+            "{filesystem:?}"
+        );
+
+        // A writable path: the layout is read, and its failure makes the policy indeterminate.
+        policy.paths.push(PathRule {
+            path: PathBuf::from(r"C:\work"),
+            access: PathAccess::ReadWrite,
+            is_dir: true,
+        });
+        let (layout_reads, filesystem) = planned(&policy);
+        assert_eq!(layout_reads, 1);
+        assert!(
+            matches!(filesystem, Status::Indeterminate { .. }),
+            "{filesystem:?}"
+        );
     }
 
     /// A policy planned again is not probed again, so `run`, which checks the plan of the level

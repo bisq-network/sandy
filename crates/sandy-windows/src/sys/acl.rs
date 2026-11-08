@@ -40,9 +40,9 @@ use super::lockfile::{LOCKS, SERIALIZE, UserLock};
 use super::util::{LocalBox, Sid, last_error, wide_nul, win32_error};
 use crate::access::{
     ADDS_LIBRARY, ALL_APPLICATION_PACKAGES, ALL_RESTRICTED_APPLICATION_PACKAGES, Ace, AceKind,
-    CHANGES_FILE, CONTAINER_INHERIT_ACE, FILE_EXECUTE, INHERITED_ACE, OBJECT_INHERIT_ACE,
-    PROFILE_DENIED, REPLACES_ENTRY, access_mask, ace_flags, changeable_by_others, grants,
-    has_explicit_ace, map_generic, may_grant,
+    CHANGES_CONTENT, CHANGES_FILE, CONTAINER_INHERIT_ACE, FILE_EXECUTE, INHERITED_ACE,
+    OBJECT_INHERIT_ACE, PROFILE_DENIED, REPLACES_ENTRY, access_mask, ace_flags,
+    changeable_by_others, grants, has_explicit_ace, map_generic, may_grant,
 };
 use crate::name::{FileIdentity, grant_capability_name, junction_capability_name};
 use crate::plan::Problem;
@@ -50,9 +50,9 @@ use crate::probe::Ungrantable;
 
 /// Makes sure the AppContainer can use `rule.path` at `rule.access` and returns the capability
 /// the target must hold for it. `held` are the other SIDs the program's token will carry (see
-/// `check_writable`). Changes nothing when the grant is already in place.
+/// `check_rights`). Changes nothing when the grant is already in place.
 pub fn grant(appcontainer: &str, rule: &PathRule, held: &[Sid]) -> Result<Sid, SandboxError> {
-    check_writable(rule, held).map_err(|problem| SandboxError::new(problem.to_string()))?;
+    check_rights(rule, held).map_err(|problem| SandboxError::new(problem.to_string()))?;
     let path = wide_nul(rule.path.as_os_str());
     let capability = grant_capability(appcontainer, rule, &path)?;
     if !lacks_grant(rule, &capability, &Dacl::read(&path, &rule.path)?)? {
@@ -67,9 +67,12 @@ pub fn grant(appcontainer: &str, rule: &PathRule, held: &[Sid]) -> Result<Sid, S
     let dacl = Dacl::read(&path, &rule.path)?;
     if lacks_grant(rule, &capability, &dacl)? {
         if rule.is_dir {
+            let who = holders(held);
             check_tree_below(
                 &rule.path,
-                &executors(rule, held),
+                Excluded::of(rule.access)
+                    .as_ref()
+                    .map(|excluded| (excluded, &who[..])),
                 "Remove the link, or list its target in the policy",
             )?;
         }
@@ -85,44 +88,55 @@ pub fn grant(appcontainer: &str, rule: &PathRule, held: &[Sid]) -> Result<Sid, S
     Ok(capability)
 }
 
-/// Refuses a writable path where the program could execute files: on the path itself, or on
-/// files and directories created in it, as below `C:\Program Files`. It could write a program
-/// there and run it (DESIGN.md rules 3 and 6).
+/// Refuses a policy path where Windows lets the program both write and execute files (DESIGN.md
+/// rules 3 and 6): a writable path where it may execute files, on the path itself or on files
+/// and directories created in it, as below `C:\Program Files`; and an executable path where it
+/// may write them, as in its own profile folder, where Windows always gives the AppContainer
+/// write access. Either way the program could write a program there and run it.
 ///
 /// Who counts: the two groups Windows gives every AppContainer, and `held`, the SIDs of the
-/// program's own token that could carry an entry here (its AppContainer and its network
-/// capabilities). The grant capabilities are not among them on purpose: one is derived from the
-/// identity of the object it is granted on, so it can only appear on that object, and a file
-/// that is both writable and executable through a second name is the link question of
-/// "Links and identity". Changes nothing.
+/// token that runs from the path that could carry an entry here: the AppContainer and its network
+/// capabilities, of the program, or of the egress broker for sandy's executable. The grant
+/// capabilities are not among them on purpose: each is derived from the identity of the object it
+/// is granted on. sandy adds one to that object, and the relay's capability also to the forward
+/// socket directory it creates (`forward`), which carries no execute right; the program adds
+/// none, and the capability for one object does not match another, so it cannot combine write and
+/// execute on a path through a grant capability. A file that is both writable and executable
+/// through a second name is the link question of "Links and identity". Changes nothing.
 ///
 /// What the permissions say is how their owner laid out the path, a conflict with the policy; a
 /// list that sandy cannot read can pass, so that is indeterminate.
-pub fn check_writable(rule: &PathRule, held: &[Sid]) -> Result<(), Problem> {
-    if rule.access != PathAccess::ReadWrite {
+pub fn check_rights(rule: &PathRule, held: &[Sid]) -> Result<(), Problem> {
+    let Some(excluded) = Excluded::of(rule.access) else {
         return Ok(());
-    }
+    };
     let unreadable = |error: SandboxError| Problem::Indeterminate(error.to_string());
     let path = wide_nul(rule.path.as_os_str());
     let dacl = Dacl::read(&path, &rule.path).map_err(unreadable)?;
+    let (kind, verb) = (excluded.kind, excluded.verb);
     if dacl.acl.is_null() {
         return Err(Problem::Conflict(format!(
-            "writable path {} has no access control list, so everyone, every AppContainer among \
-             them, may execute files there",
+            "{kind} path {} has no access control list, so everyone, every AppContainer among \
+             them, may {verb} files there",
             rule.path.display()
         )));
     }
     let aces = dacl.aces(&rule.path).map_err(unreadable)?;
     if aces.has_unknown_types {
         return Err(Problem::Conflict(format!(
-            "the permissions of writable path {} contain entries that sandy cannot evaluate, so \
-             it cannot tell whether AppContainers may execute files there",
+            "the permissions of {kind} path {} contain entries that sandy cannot evaluate, so \
+             it cannot tell whether AppContainers may {verb} files there",
             rule.path.display()
         )));
     }
-    match executable_by(&aces.entries(), &executors(rule, held), rule.is_dir) {
+    match holder(
+        &aces.entries(),
+        &holders(held),
+        excluded.rights,
+        rule.is_dir,
+    ) {
         Some(who) => Err(Problem::Conflict(format!(
-            "{who} may execute files in writable path {}, so the program could write a program \
+            "{who} may {verb} files in {kind} path {}, so the program could write a program \
              there and run it",
             rule.path.display()
         ))),
@@ -130,12 +144,41 @@ pub fn check_writable(rule: &PathRule, held: &[Sid]) -> Result<(), Problem> {
     }
 }
 
-/// Everyone whose execute right would reach the program in `rule`, with a name for the message.
-/// Empty for a rule that is not writable, so a walk over such a tree only looks for links.
-fn executors(rule: &PathRule, held: &[Sid]) -> Vec<(Vec<u8>, String)> {
-    if rule.access != PathAccess::ReadWrite {
-        return Vec::new();
+/// The rights the program must not hold on a policy path of some access level besides those of
+/// its grant, and how the messages name them.
+struct Excluded {
+    rights: u32,
+    /// The kind of policy path.
+    kind: &'static str,
+    /// What the rights let the program do to files.
+    verb: &'static str,
+}
+
+impl Excluded {
+    /// `None` for a path that may only be read, which nothing makes executable.
+    fn of(access: PathAccess) -> Option<Excluded> {
+        match access {
+            PathAccess::Read => None,
+            PathAccess::ReadExec => Some(Excluded {
+                rights: CHANGES_CONTENT,
+                kind: "executable",
+                verb: "write",
+            }),
+            PathAccess::ReadWrite => Some(Excluded {
+                rights: FILE_EXECUTE,
+                kind: "writable",
+                verb: "execute",
+            }),
+        }
     }
+}
+
+/// A SID whose rights would reach the program, and its name for the messages.
+type Holder = (Vec<u8>, String);
+
+/// Everyone whose rights on a policy path would reach the program, with a name for the message:
+/// the two groups of every AppContainer and `held`.
+fn holders(held: &[Sid]) -> Vec<Holder> {
     let mut who = vec![
         (
             ALL_APPLICATION_PACKAGES.to_vec(),
@@ -146,17 +189,22 @@ fn executors(rule: &PathRule, held: &[Sid]) -> Vec<(Vec<u8>, String)> {
             "Windows (ALL RESTRICTED APPLICATION PACKAGES)".to_string(),
         ),
     ];
-    who.extend(
-        held.iter()
-            .map(|sid| (sid.bytes().to_vec(), format!("the program's own SID {sid}"))),
-    );
+    who.extend(held.iter().map(|sid| {
+        (
+            sid.bytes().to_vec(),
+            format!("the SID {sid} of the sandbox's own token"),
+        )
+    }));
     who
 }
 
-/// The first of `who` that `aces` may give `FILE_EXECUTE`, named.
-fn executable_by(aces: &[Ace<'_>], who: &[(Vec<u8>, String)], is_dir: bool) -> Option<String> {
+/// The first of `who` that `aces` may give one of `rights`, named.
+fn holder(aces: &[Ace<'_>], who: &[Holder], rights: u32, is_dir: bool) -> Option<String> {
+    let bits = (0..u32::BITS)
+        .map(|bit| 1 << bit)
+        .filter(|bit| rights & bit != 0);
     who.iter()
-        .find(|(sid, _)| may_grant(aces, sid, FILE_EXECUTE, is_dir))
+        .find(|(sid, _)| bits.clone().any(|bit| may_grant(aces, sid, bit, is_dir)))
         .map(|(_, name)| name.clone())
 }
 
@@ -893,7 +941,7 @@ pub fn deny_execute_in_profile(appcontainer: &Sid, folder: &Path) -> Result<(), 
         // can write there, so refuse a planted link first, as `grant` does for a policy path.
         check_tree_below(
             folder,
-            &[],
+            None,
             "Remove the link; the folder is the AppContainer's profile, whose rights sandy is \
              reducing",
         )?;
@@ -1139,14 +1187,16 @@ fn changeable_by(path: &Path, rights: u32) -> Result<Option<String>, String> {
 /// propagate through links. Hard links cannot be detected this way; creating one needs write
 /// access to its target, which the AppContainer lacks outside its paths.
 ///
-/// Execute: a descendant can carry an explicit entry of its own that gives `who` execute, which
-/// the DACL of the directory does not show. Together with the write grant sandy is about to add
-/// it would make that file writable and executable, so the walk refuses it. The program cannot
-/// add such an entry later: it holds no right to change permissions outside its profile folder.
-/// Software outside the sandbox can, which stays a residual risk because the walk runs once.
+/// Rights: a descendant can carry an explicit entry of its own that gives one of `who` a right
+/// of `excluded`, which the DACL of the directory does not show: execute below a writable path,
+/// write below an executable one. Together with the grant sandy is about to add it would make
+/// that file writable and executable, so the walk refuses it. The program cannot add such an
+/// entry later: it holds no right to change permissions outside its profile folder. Software
+/// outside the sandbox can, which stays a residual risk because the walk runs once. `None`
+/// looks only for links.
 fn check_tree_below(
     directory: &Path,
-    who: &[(Vec<u8>, String)],
+    excluded: Option<(&Excluded, &[Holder])>,
     advice: &str,
 ) -> Result<(), SandboxError> {
     let mut pending = vec![directory.to_path_buf()];
@@ -1170,8 +1220,8 @@ fn check_tree_below(
                     directory.display()
                 )));
             }
-            if !who.is_empty() {
-                refuse_execute_entry(&entry.path(), kind.is_dir(), directory, who)?;
+            if let Some((excluded, who)) = excluded {
+                refuse_entry(&entry.path(), kind.is_dir(), directory, excluded, who)?;
             }
             if kind.is_dir() {
                 pending.push(entry.path());
@@ -1181,26 +1231,29 @@ fn check_tree_below(
     Ok(())
 }
 
-/// Refuses `path` when its own permissions may give one of `who` execute.
-fn refuse_execute_entry(
+/// Refuses `path` when its own permissions may give one of `who` one of the rights `excluded`.
+fn refuse_entry(
     path: &Path,
     is_dir: bool,
     directory: &Path,
-    who: &[(Vec<u8>, String)],
+    excluded: &Excluded,
+    who: &[Holder],
 ) -> Result<(), SandboxError> {
     let wide = wide_nul(path.as_os_str());
     let aces = Dacl::read(&wide, path)?.aces(path)?;
     let found = if aces.has_unknown_types {
         Some("entries that sandy cannot evaluate".to_string())
     } else {
-        executable_by(&aces.entries(), who, is_dir)
+        holder(&aces.entries(), who, excluded.rights, is_dir)
     };
     match found {
         Some(who) => Err(SandboxError::new(format!(
-            "the permissions of {} say that {who} may execute it, and it lies in the writable \
-             policy path {}, so the program could write a program there and run it. Remove that \
+            "the permissions of {} say that {who} may {} it, and it lies in the {} policy path \
+             {}, so the program could write a program there and run it. Remove that \
              permission, or take the file out of the path",
             path.display(),
+            excluded.verb,
+            excluded.kind,
             directory.display()
         ))),
         None => Ok(()),
@@ -1497,7 +1550,7 @@ fn set_access(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::access::FILE_GENERIC_EXECUTE;
+    use crate::access::{FILE_GENERIC_EXECUTE, FILE_GENERIC_WRITE};
 
     /// A new, empty directory below the temporary directory.
     fn directory(name: &str) -> PathBuf {
@@ -1540,7 +1593,7 @@ mod tests {
     #[test]
     fn writable_path_permissions_conflict_and_unreadable_ones_are_indeterminate() {
         let plain = directory("plain");
-        assert_eq!(check_writable(&writable(&plain), &[]), Ok(()));
+        assert_eq!(check_rights(&writable(&plain), &[]), Ok(()));
         assert!(grantable("example.app", &writable(&plain)).is_ok());
 
         let executable = directory("executable");
@@ -1557,14 +1610,14 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            check_writable(&writable(&executable), &[]),
+            check_rights(&writable(&executable), &[]),
             Err(Problem::Conflict(reason)) if reason.contains("ALL APPLICATION PACKAGES")
         ));
 
         let open = directory("open");
         remove_dacl(&open);
         assert!(matches!(
-            check_writable(&writable(&open), &[]),
+            check_rights(&writable(&open), &[]),
             Err(Problem::Conflict(reason)) if reason.contains("no access control list")
         ));
         assert!(matches!(
@@ -1574,7 +1627,7 @@ mod tests {
 
         let missing = plain.join("missing");
         assert!(matches!(
-            check_writable(&writable(&missing), &[]),
+            check_rights(&writable(&missing), &[]),
             Err(Problem::Indeterminate(_))
         ));
         assert!(matches!(
@@ -1583,6 +1636,80 @@ mod tests {
         ));
 
         for dir in [plain, executable, open] {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    fn executable(path: &Path) -> PathRule {
+        PathRule {
+            access: PathAccess::ReadExec,
+            ..writable(path)
+        }
+    }
+
+    /// Gives `sid` `mask` on `path` with `flags`.
+    fn allow_on(path: &Path, sid: &[u8], mask: u32, flags: u8) {
+        let wide = wide_nul(path.as_os_str());
+        set_access(
+            Object::Path(&wide),
+            path,
+            &Dacl::read(&wide, path).unwrap(),
+            &Sid::from_bytes(sid).unwrap(),
+            SET_ACCESS,
+            mask,
+            flags,
+        )
+        .unwrap();
+    }
+
+    /// An executable path where an AppContainer may write files is refused like a writable path
+    /// where it may execute them, as in the AppContainer's own profile folder: on the path
+    /// itself, through any right that changes content, and at the grant for an entry below the
+    /// path whose own permissions allow it.
+    #[test]
+    fn executable_path_permissions_that_allow_writing_conflict() {
+        const INHERIT: u8 = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+        let plain = directory("exec-plain");
+        assert_eq!(check_rights(&executable(&plain), &[]), Ok(()));
+
+        let shared = directory("exec-shared");
+        allow_on(
+            &shared,
+            ALL_APPLICATION_PACKAGES,
+            FILE_GENERIC_WRITE,
+            INHERIT,
+        );
+        assert!(matches!(
+            check_rights(&executable(&shared), &[]),
+            Err(Problem::Conflict(reason))
+                if reason.contains("PACKAGES) may write files in executable path")
+        ));
+
+        // The program's own SID, S-1-15-2-99 here, with a right that lets it grant itself write.
+        let own = directory("exec-own");
+        let program = Sid::from_bytes(&[1, 2, 0, 0, 0, 0, 0, 15, 2, 0, 0, 0, 99, 0, 0, 0]).unwrap();
+        allow_on(own.as_path(), program.bytes(), WRITE_DAC, INHERIT);
+        assert_eq!(check_rights(&executable(&own), &[]), Ok(()));
+        assert!(matches!(
+            check_rights(&executable(&own), std::slice::from_ref(&program)),
+            Err(Problem::Conflict(reason)) if reason.contains("SID S-1-15-2-99 of the sandbox's own token")
+        ));
+
+        let below = directory("exec-below");
+        let file = below.join("tool.exe");
+        fs::write(&file, b"").unwrap();
+        allow_on(&file, ALL_APPLICATION_PACKAGES, FILE_GENERIC_WRITE, 0);
+        assert_eq!(check_rights(&executable(&below), &[]), Ok(()));
+        let refused = grant("sandy.acl-exec-test", &executable(&below), &[]).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("may write it, and it lies in the executable policy path"),
+            "{refused}"
+        );
+        revoke("sandy.acl-exec-test", &executable(&below)).unwrap();
+
+        for dir in [plain, shared, own, below] {
             let _ = fs::remove_dir_all(dir);
         }
     }

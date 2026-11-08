@@ -213,6 +213,10 @@ const ADMINISTRATIVE: [&[u8]; 3] = [LOCAL_SYSTEM, ADMINISTRATORS, TRUSTED_INSTAL
 /// attributes, deleting it, and its DACL and owner.
 pub const CHANGES_FILE: u32 =
     FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | DELETE | WRITE_DAC | WRITE_OWNER;
+/// The rights that change what a file holds or add an entry to a directory, directly or by
+/// rewriting its DACL or owner. With one of them on a path the program may execute, it could
+/// write a program there and run it.
+pub const CHANGES_CONTENT: u32 = FILE_WRITE_DATA | FILE_APPEND_DATA | WRITE_DAC | WRITE_OWNER;
 /// The rights on a directory that replace an entry in it or the directory itself.
 pub const REPLACES_ENTRY: u32 = FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER;
 /// `REPLACES_ENTRY` and adding an entry, on the directory that holds a program: Windows looks
