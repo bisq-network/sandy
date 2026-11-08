@@ -501,6 +501,31 @@ What the program gets, measured on Fedora 44:
   `2000::/4`; the private ranges behind it stay refused by the static check
   (`on_link_routes_are_the_local_network_without_an_address`, in a network namespace of its
   own). A dummy link is NOARP too, until `ip link set ... arp on`.
+- The route lookup asks what the broker's connect has before it picks a source, so the rules
+  (`ip rule`) that select on it pick the same route for both: TCP to the destination port
+  (`ipproto`, `dport`), as sandy's user (`uidrange`), with mark 0 (`fwmark`) and no interface
+  (`oif`); `iif lo` matches both, as every connection this host makes. A local route that such a
+  rule leads to is this host: with `ip rule add ipproto tcp lookup local` before `lookup main`,
+  an address of `ip route add local 1.1.1.0/24 dev lo` gets reply 2
+  (`a_rule_for_tcp_selects_the_route_of_the_connect` and
+  `rules_for_the_port_and_the_user_select_the_route_of_the_connect`, each in a network namespace
+  of its own; measured on kernel 7.2). The host's own policy routing beyond that is outside the
+  broker's check, as netfilter is: a rule on the source address or port (`from`, `sport`), which
+  the connect looks the route up again with after it picks them, an interface or a mark that the
+  host gives the broker's sockets (`ip vrf exec`, a cgroup hook), and what netfilter does to the
+  packets. Only root sets these up, the program cannot, and a host that sends this host's own
+  traffic for public addresses back to itself has chosen to.
+- An `unreachable` route, and a `throw` route with nothing behind it, give no route:
+  `RTM_GETROUTE` fails with `EHOSTUNREACH` or `ENETUNREACH`, the error a connect there fails with
+  too, so the broker connects and answers with reply 4 or 3. A `prohibit` or `blackhole` route or
+  rule fails the lookup with `EACCES` or `EINVAL`, and the broker refuses the address with
+  reply 1, also an address on the local network that `public` would refuse with reply 2. The
+  lookup cannot see everything the connect selects on, netfilter for one, so it cannot tell
+  whether the connect would fail the same way, and a failed lookup refuses. An address of this
+  host behind such a rule still gets reply 2 through the address dump
+  (`refusing_routes_fail_the_lookup` and
+  `a_prohibit_rule_after_a_rule_for_tcp_refuses_the_address`, in a network namespace of its own;
+  measured on kernel 7.2).
 - The start takes about 1.8 ms more than without the broker: 6.2 to 6.4 ms against 4.3 to 4.7 ms,
   as the median of 100 runs of `sandy run --ip private -- /usr/bin/true` with the release build
   (kernel 7.2, a busy 24 CPU host). Each connection costs a route lookup, an address dump, a

@@ -172,11 +172,11 @@ mod tests {
     }
 
     impl HostNetwork for TestHost {
-        fn is_host(&self, ip: IpAddr) -> io::Result<bool> {
+        fn is_host(&self, destination: SocketAddr) -> io::Result<bool> {
             if self.fails {
                 return Err(io::Error::other("no answer"));
             }
-            Ok(self.own.contains(&ip))
+            Ok(self.own.contains(&destination.ip()))
         }
 
         fn subnets(&self) -> io::Result<Vec<Subnet>> {

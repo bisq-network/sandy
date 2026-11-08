@@ -285,14 +285,16 @@ impl Subnet {
 /// whatever they need from the system (a socket, a handle) is opened before that. Its threads
 /// have small stacks (`sandy_relay::broker`), so large buffers belong on the heap.
 pub trait HostNetwork {
-    /// Whether `ip` is this host itself, which the broker never connects to. True for:
+    /// Whether a TCP connect to `destination` reaches this host itself, which the broker never
+    /// connects to. The port matters where the routing rules select on it (Linux policy routing);
+    /// elsewhere only the address does. True for:
     /// - every address of every interface, also of one that is down, but not the peer address of
     ///   a point-to-point link;
     /// - the broadcast address of every IPv4 subnet of an interface;
     /// - every other address the host delivers to itself: what its routing table holds as a
     ///   local, broadcast, anycast or multicast route, also when no interface shows it (on Linux,
     ///   `ip route add local ...`).
-    fn is_host(&self, ip: IpAddr) -> io::Result<bool>;
+    fn is_host(&self, destination: SocketAddr) -> io::Result<bool>;
 
     /// Every network the host reaches without a router, which is the local network that
     /// `reach = "public"` refuses and `"public-and-local"` allows:
@@ -342,7 +344,8 @@ pub fn check(
         (Some((_, name)), _) => return Err(Refusal::Block(name)),
     };
     let unknown = |_| Refusal::HostUnknown;
-    if host.is_host(ip).map_err(unknown)? {
+    let checked = SocketAddr::new(ip, destination.port());
+    if host.is_host(checked).map_err(unknown)? {
         return Err(Refusal::Host);
     }
     let on_subnet = || {
@@ -356,7 +359,7 @@ pub fn check(
         (Some(_), _) if on_subnet()? => Ok(()),
         (Some(name), _) => Err(Refusal::Block(name)),
     };
-    allowed.map(|()| SocketAddr::new(ip, destination.port()))
+    allowed.map(|()| checked)
 }
 
 /// The special-purpose block that the canonical address `ip` is in, if any.
@@ -900,7 +903,8 @@ mod tests {
     }
 
     impl HostNetwork for FakeHost {
-        fn is_host(&self, ip: IpAddr) -> io::Result<bool> {
+        fn is_host(&self, destination: SocketAddr) -> io::Result<bool> {
+            let ip = destination.ip();
             self.asked.set(self.asked.get() + 1);
             assert!(!matches!(ip, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some()));
             if self.fails {

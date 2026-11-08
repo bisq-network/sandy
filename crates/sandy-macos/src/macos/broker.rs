@@ -128,7 +128,7 @@ fn watch_and_confine(
     // Without its addresses and routes the broker would refuse every destination with reply 1;
     // better to refuse the run.
     let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
-    if !Interfaces.is_host(loopback)? {
+    if !Interfaces.is_host((loopback, 443).into())? {
         return Err(io::Error::other(
             "the egress broker does not find 127.0.0.1 among this Mac's addresses",
         ));

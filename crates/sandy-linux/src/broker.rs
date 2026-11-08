@@ -258,7 +258,11 @@ mod tests {
             return 6;
         }
         let loopback = IpAddr::from([127, 0, 0, 1]);
-        if !routes.is_host(loopback).unwrap_or(false) || routes.subnets().is_err() {
+        if !routes
+            .is_host(SocketAddr::new(loopback, 443))
+            .unwrap_or(false)
+            || routes.subnets().is_err()
+        {
             return 7;
         }
         // clone with fork's flags; the other arguments are zero on x86_64 and arm64 alike.

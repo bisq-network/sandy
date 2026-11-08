@@ -10,7 +10,7 @@
 
 use std::io;
 use std::mem::size_of;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use sandy_core::destination::{HostNetwork, Subnet};
 
@@ -315,7 +315,8 @@ impl HostNetwork for Interfaces {
     /// macOS delivers to itself only the addresses of its interfaces and the broadcast address
     /// of their subnets: it has no local routes without an address, 127.0.0.2 included
     /// (docs/macos.md, "The private network"), and `check` refuses multicast before it asks.
-    fn is_host(&self, ip: IpAddr) -> io::Result<bool> {
+    fn is_host(&self, destination: SocketAddr) -> io::Result<bool> {
+        let ip = destination.ip();
         Ok(addresses()?.iter().any(|interface| {
             interface.address == ip || interface.broadcast.map(IpAddr::V4) == Some(ip)
         }))
@@ -351,12 +352,16 @@ mod tests {
             .find(|interface| interface.address == IpAddr::V4(Ipv4Addr::LOCALHOST))
             .expect("127.0.0.1");
         assert_eq!(loopback.prefix, Some(8));
-        assert!(Interfaces.is_host(Ipv4Addr::LOCALHOST.into()).unwrap());
+        assert!(
+            Interfaces
+                .is_host((Ipv4Addr::LOCALHOST, 443).into())
+                .unwrap()
+        );
         assert!(all.iter().any(|interface| interface.scope != 0));
         let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         if probe.connect("192.0.2.1:9").is_ok() {
             let own = probe.local_addr().unwrap().ip();
-            assert!(Interfaces.is_host(own).unwrap(), "{own}");
+            assert!(Interfaces.is_host((own, 443).into()).unwrap(), "{own}");
             let on_subnet = Interfaces
                 .subnets()
                 .unwrap()
@@ -364,7 +369,11 @@ mod tests {
                 .any(|subnet| subnet.contains(own));
             assert!(on_subnet, "{own}");
         }
-        assert!(!Interfaces.is_host("192.0.2.1".parse().unwrap()).unwrap());
+        assert!(
+            !Interfaces
+                .is_host("192.0.2.1:443".parse().unwrap())
+                .unwrap()
+        );
     }
 
     /// The routing table names the subnet that the way out leaves through as a route without a

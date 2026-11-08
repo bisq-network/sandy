@@ -540,8 +540,9 @@ everywhere; a backend adds only its answer about its own addresses (`HostNetwork
    `public-and-local` allows it also in a block that is not globally reachable, but a subnet
    never opens what rule 6 never allows, such as loopback or link-local. When the host cannot
    tell, the broker refuses with reply 1. Linux asks the kernel's routing tables
-   (`RTM_GETROUTE`, also as a dump of every table, `RTM_GETADDR` and `RTM_GETLINK`) over a
-   `NETLINK_ROUTE` socket that it opens before the broker confines itself. macOS reads
+   (`RTM_GETROUTE` for a TCP connect to the destination's port, so that policy routing rules
+   select the route the connect takes, also as a dump of every table, `RTM_GETADDR` and
+   `RTM_GETLINK`) over a `NETLINK_ROUTE` socket that it opens before the broker confines itself. macOS reads
    `getifaddrs` and the routing table for every connection, which its broker profile allows
    through the routing sysctl; it has no local route without an interface address. Windows asks
    `GetAdaptersAddresses`, `GetBestRoute2` and `GetIpForwardTable2`.

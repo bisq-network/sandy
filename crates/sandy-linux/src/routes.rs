@@ -1,12 +1,13 @@
 //! The host part of the egress broker's destination check (`HostNetwork`), answered by the kernel
 //! over a NETLINK_ROUTE socket.
 //!
-//! `is_host` asks for the route to the address (RTM_GETROUTE, which `ip route get` shows): a
-//! local, broadcast, anycast or multicast route is the host itself. That covers every interface
-//! address, the broadcast address of every subnet, and local routes that no interface shows
-//! (`ip route add local ...`). It also compares the address with every interface address and
-//! subnet broadcast address (RTM_GETADDR), which does not depend on the routing rules that the
-//! lookup follows.
+//! `is_host` asks for the route that the broker's TCP connect to the address and port takes
+//! (RTM_GETROUTE, which `ip route get ... ipproto tcp dport ...` shows), with what policy routing
+//! rules select on as the connect has it (`lookup`): a local, broadcast, anycast or multicast
+//! route is the host itself. That covers every interface address, the broadcast address of every
+//! subnet, and local routes that no interface shows (`ip route add local ...`). It also compares
+//! the address with every interface address and subnet broadcast address (RTM_GETADDR), which
+//! does not depend on the routing rules that the lookup follows.
 //!
 //! `subnets` is every network this host reaches without a router: the prefix of every interface
 //! address from the same list, and every unicast route of every table whose next hops name no
@@ -27,7 +28,7 @@
 
 use std::io;
 use std::mem::size_of;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -57,6 +58,11 @@ const ATTRIBUTE_HEADER: usize = 4;
 const RTA_VIA: u16 = 18;
 /// What a link dump leaves out (`linux/if_link.h`), which the libc crate names for Android only.
 const IFLA_EXT_MASK: u16 = 29;
+/// What a route lookup selects rules by (`linux/rtnetlink.h`, kernel 4.17 and newer for the
+/// protocol and ports), which the libc crate names for glibc only or not at all.
+const RTA_UID: u16 = 25;
+const RTA_IP_PROTO: u16 = 27;
+const RTA_DPORT: u16 = 29;
 
 const ERROR: u16 = libc::NLMSG_ERROR as u16;
 const DONE: u16 = libc::NLMSG_DONE as u16;
@@ -65,6 +71,9 @@ const MULTIPART: u16 = libc::NLM_F_MULTI as u16;
 /// The kernel's routing tables, asked over one socket that the broker's threads share.
 pub(crate) struct Routes {
     socket: Mutex<Socket>,
+    /// The owner of the broker's sockets, which a rule's `uidrange` matches: the file system
+    /// user ID when the socket is made, which follows the effective one.
+    uid: libc::uid_t,
 }
 
 struct Socket {
@@ -131,10 +140,12 @@ impl Routes {
                 sequence: 0,
                 buffer: vec![0; DATAGRAM],
             }),
+            // SAFETY: geteuid takes nothing and cannot fail.
+            uid: unsafe { libc::geteuid() },
         };
-        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 443));
         let answers = routes
-            .route_type(loopback)
+            .route(loopback)
             .map(|kind| kind == Some(libc::RTN_LOCAL))
             .and_then(|local| routes.subnets().map(|_| local));
         match answers {
@@ -156,28 +167,14 @@ impl Routes {
         socket.fd.as_raw_fd()
     }
 
-    /// The type of the route to `ip` (`RTN_*`), or `None` when the kernel has no route there,
-    /// which a connect would fail on too.
-    fn route_type(&self, ip: IpAddr) -> io::Result<Option<u8>> {
-        let (family, length, bytes) = match ip {
-            IpAddr::V4(ip) => (libc::AF_INET, 32, ip.octets().to_vec()),
-            IpAddr::V6(ip) => (libc::AF_INET6, 128, ip.octets().to_vec()),
-        };
-        let mut payload = vec![0u8; ROUTE_MESSAGE];
-        payload[0] = family as u8;
-        payload[1] = length;
-        push_attribute(&mut payload, libc::RTA_DST, &bytes);
-        let mut kind = None;
-        let asked = self.ask(libc::RTM_GETROUTE, 0, &payload, |message_type, message| {
-            if message_type != libc::RTM_NEWROUTE || message.len() < ROUTE_MESSAGE {
-                return Err(invalid("an answer that is not a route"));
-            }
-            kind = Some(message[7]);
-            Ok(())
-        });
-        match asked {
-            Ok(()) if kind.is_some() => Ok(kind),
-            Ok(()) => Err(invalid("no route in the answer")),
+    /// The type (`RTN_*`) of the route that a TCP connect of the broker to `destination` takes,
+    /// or `None` when the kernel has no route there, which the connect fails on too. Every other
+    /// failure is an error, also a prohibit or blackhole route or rule (EACCES, EINVAL): the
+    /// lookup asks less than a connect has to select on, so it can fail where the connect
+    /// reaches a local route.
+    fn route(&self, destination: SocketAddr) -> io::Result<Option<u8>> {
+        match self.lookup(destination) {
+            Ok(route) => Ok(Some(route)),
             Err(error)
                 if matches!(
                     error.raw_os_error(),
@@ -188,6 +185,35 @@ impl Routes {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// The type of the route to `destination`, or the error the kernel answers instead. The request
+    /// carries what the broker's connect matches rules by before it has a source: TCP, the
+    /// destination port, the broker's user and mark 0 (it sets none). What a rule selects on beyond
+    /// that, the source address and port and an interface or a mark that the host gives the socket,
+    /// is the host's own routing, which docs/linux.md leaves outside the broker's check.
+    fn lookup(&self, destination: SocketAddr) -> io::Result<u8> {
+        let (family, length) = match destination {
+            SocketAddr::V4(_) => (libc::AF_INET, 32),
+            SocketAddr::V6(_) => (libc::AF_INET6, 128),
+        };
+        let mut payload = vec![0u8; ROUTE_MESSAGE];
+        payload[0] = family as u8;
+        payload[1] = length;
+        push_attribute(&mut payload, libc::RTA_DST, &octets(destination.ip()));
+        push_attribute(&mut payload, RTA_IP_PROTO, &[libc::IPPROTO_TCP as u8]);
+        push_attribute(&mut payload, RTA_DPORT, &destination.port().to_be_bytes());
+        push_attribute(&mut payload, RTA_UID, &self.uid.to_ne_bytes());
+        push_attribute(&mut payload, libc::RTA_MARK, &0u32.to_ne_bytes());
+        let mut route = None;
+        self.ask(libc::RTM_GETROUTE, 0, &payload, |message_type, message| {
+            if message_type != libc::RTM_NEWROUTE || message.len() < ROUTE_MESSAGE {
+                return Err(invalid("an answer that is not a route"));
+            }
+            route = Some(message[7]);
+            Ok(())
+        })?;
+        route.ok_or_else(|| invalid("no route in the answer"))
     }
 
     /// Every address of every interface, IPv4 and IPv6.
@@ -312,17 +338,18 @@ impl Routes {
 }
 
 impl HostNetwork for Routes {
-    fn is_host(&self, ip: IpAddr) -> io::Result<bool> {
-        // Every type but unicast counts as the host. Those that are not the host's own
-        // (blackhole, unreachable, prohibit) reach nothing anyway.
-        let routed_here = self
-            .route_type(ip)?
-            .is_some_and(|kind| kind != libc::RTN_UNICAST);
-        Ok(routed_here
-            || self
-                .addresses()?
-                .iter()
-                .any(|address| address.own == ip || address.broadcast == Some(ip)))
+    fn is_host(&self, destination: SocketAddr) -> io::Result<bool> {
+        let ip = destination.ip();
+        let addresses = self.addresses()?;
+        if addresses
+            .iter()
+            .any(|address| address.own == ip || address.broadcast == Some(ip))
+        {
+            return Ok(true);
+        }
+        // Every type but unicast counts as the host.
+        let route = self.route(destination)?;
+        Ok(route.is_some_and(|kind| kind != libc::RTN_UNICAST))
     }
 
     fn subnets(&self) -> io::Result<Vec<Subnet>> {
@@ -590,6 +617,13 @@ fn attributes(bytes: &[u8]) -> impl Iterator<Item = io::Result<(u16, &[u8])>> {
     })
 }
 
+fn octets(ip: IpAddr) -> Vec<u8> {
+    match ip {
+        IpAddr::V4(ip) => ip.octets().to_vec(),
+        IpAddr::V6(ip) => ip.octets().to_vec(),
+    }
+}
+
 /// The address in `bytes`, which are 4 or 16 long.
 fn ip_from(bytes: &[u8]) -> IpAddr {
     match <[u8; 4]>::try_from(bytes) {
@@ -668,6 +702,16 @@ mod tests {
         (addresses, broadcasts)
     }
 
+    /// The type of the route of a connect to `ip`, port 443.
+    fn route_type(routes: &Routes, ip: IpAddr) -> io::Result<Option<u8>> {
+        routes.route(SocketAddr::new(ip, 443))
+    }
+
+    /// Whether a connect to `ip`, port 443, reaches this host.
+    fn is_host(routes: &Routes, ip: IpAddr) -> io::Result<bool> {
+        routes.is_host(SocketAddr::new(ip, 443))
+    }
+
     #[test]
     fn the_kernel_knows_this_host() {
         let routes = Routes::open().unwrap();
@@ -687,7 +731,7 @@ mod tests {
             .chain(addresses.iter().map(|(ip, _)| *ip))
             .chain(broadcasts.iter().copied());
         for ip in all {
-            assert!(routes.is_host(ip).unwrap(), "{ip}");
+            assert!(is_host(&routes, ip).unwrap(), "{ip}");
         }
         // The address list alone knows them too, whatever the routes say.
         let listed = routes.addresses().unwrap();
@@ -703,16 +747,16 @@ mod tests {
             );
         }
         assert_eq!(
-            routes.route_type("127.0.0.1".parse().unwrap()).unwrap(),
+            route_type(&routes, "127.0.0.1".parse().unwrap()).unwrap(),
             Some(libc::RTN_LOCAL)
         );
         assert_eq!(
-            routes.route_type("224.0.0.1".parse().unwrap()).unwrap(),
+            route_type(&routes, "224.0.0.1".parse().unwrap()).unwrap(),
             Some(libc::RTN_MULTICAST)
         );
         for broadcast in broadcasts {
             assert_eq!(
-                routes.route_type(broadcast).unwrap(),
+                route_type(&routes, broadcast).unwrap(),
                 Some(libc::RTN_BROADCAST),
                 "{broadcast}"
             );
@@ -725,7 +769,7 @@ mod tests {
     fn an_address_elsewhere_is_not_the_host() {
         let routes = Routes::open().unwrap();
         for ip in ["198.51.100.1", "8.8.8.8", "2001:db8::1", "2606:4700::1111"] {
-            assert!(!routes.is_host(ip.parse().unwrap()).unwrap(), "{ip}");
+            assert!(!is_host(&routes, ip.parse().unwrap()).unwrap(), "{ip}");
         }
     }
 
@@ -769,9 +813,9 @@ mod tests {
             assert_eq!(sent, stale.len() as isize);
         }
         // The answer about 127.0.0.1 waits in the socket, ahead of this one.
-        let elsewhere = routes.route_type("198.51.100.1".parse().unwrap()).unwrap();
+        let elsewhere = route_type(&routes, "198.51.100.1".parse().unwrap()).unwrap();
         assert_ne!(elsewhere, Some(libc::RTN_LOCAL));
-        assert!(!routes.is_host("198.51.100.1".parse().unwrap()).unwrap());
+        assert!(!is_host(&routes, "198.51.100.1".parse().unwrap()).unwrap());
     }
 
     fn message(kind: u16, flags: u16, sequence: u32, payload: &[u8]) -> Vec<u8> {
@@ -1187,7 +1231,7 @@ mod tests {
         if std::env::var_os(IN_NAMESPACE).is_some() {
             return on_link_routes_in_this_namespace();
         }
-        let setup = [
+        in_namespace(&[
             "ip link set lo up",
             // A broadcast link with ARP, as an Ethernet or Wi-Fi link is: a dummy link is NOARP
             // until `arp on`.
@@ -1212,11 +1256,21 @@ mod tests {
             "ip link add sandy2 type dummy",
             "ip link set sandy2 up",
             "ip route add 192.0.0.0/24 dev sandy2",
-        ]
-        .join(" && ");
+        ]);
+    }
+
+    /// Runs the current test again as root of a user and network namespace of its own, after
+    /// `setup` there, and skips it where no such namespace can be made.
+    fn in_namespace(setup: &[&str]) {
+        // Each step names itself when it fails, so that a wrong step fails the test instead of
+        // skipping it; only a host without the namespaces or the link types skips. A host
+        // without `ip` fails too: the test needs it, and the CI images have it.
+        let steps: String = setup
+            .iter()
+            .map(|step| format!("{step} || {{ echo 'setup step failed: {step}' >&2; exit 97; }}\n"))
+            .collect();
         let name = std::thread::current().name().unwrap().to_string();
-        let script =
-            format!("{setup} || exit 97\nexec \"$0\" {name} --exact --nocapture --test-threads=1");
+        let script = format!("{steps}exec \"$0\" {name} --exact --nocapture --test-threads=1");
         let output = std::process::Command::new("unshare")
             .args(["--user", "--map-root-user", "--net", "sh", "-c", &script])
             .arg(std::env::current_exe().unwrap())
@@ -1228,9 +1282,17 @@ mod tests {
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.code() == Some(97) {
+            let missing_link_type = ["Unknown device type", "Operation not supported"]
+                .iter()
+                .any(|reason| stderr.contains(reason));
+            assert!(missing_link_type, "{stderr}");
+            eprintln!("skipped: this kernel lacks a link type the test needs: {stderr}");
+            return;
+        }
         if !stdout.contains("running 1 test") {
             eprintln!(
-                "skipped: no user and network namespace with dummy and tun links: {}, {stderr}",
+                "skipped: no user and network namespace: {}, {stderr}",
                 output.status
             );
             return;
@@ -1272,5 +1334,191 @@ mod tests {
         // The subnet of the tunnel's own address is the local network as before.
         let tunnel = at("192.88.99.7");
         assert_eq!(check(tunnel, PublicAndLocal, &routes), Ok(tunnel));
+    }
+
+    /// An unreachable route, and a throw route with nothing behind it, is no route: the lookup
+    /// fails with the error a connect fails with, and the broker connects and answers with that.
+    /// A prohibit or blackhole route or rule fails the lookup with EACCES or EINVAL, which the
+    /// broker refuses with reply 1. An address of the host behind such a rule stays the host's
+    /// through the address list (docs/linux.md, "Egress broker").
+    #[test]
+    fn refusing_routes_fail_the_lookup() {
+        if std::env::var_os(IN_NAMESPACE).is_some() {
+            return refusing_routes_in_this_namespace();
+        }
+        in_namespace(&[
+            "ip link set lo up",
+            "ip link add sandy0 type dummy",
+            "ip link set sandy0 arp on up",
+            "ip address add 198.51.100.10/24 brd + dev sandy0",
+            "ip -6 address add 2a01:4f8:5::10/64 dev sandy0 nodad",
+            "ip route add prohibit 1.1.1.0/24",
+            "ip route add blackhole 8.8.8.0/24",
+            "ip route add unreachable 9.9.9.0/24",
+            "ip route add throw 4.4.4.0/24",
+            "ip -6 route add prohibit 2606:4700::/32",
+            "ip -6 route add blackhole 2001:4860::/32",
+            "ip -6 route add unreachable 2620:fe::/32",
+            "ip -6 route add throw 2a00:1450::/32",
+            // The local table after rules that refuse the host's own addresses.
+            "ip rule add pref 10 prohibit to 198.51.100.10",
+            "ip rule add pref 11 blackhole to 198.51.100.255",
+            "ip rule del pref 0",
+            "ip rule add pref 100 table local",
+            "ip -6 rule add pref 10 blackhole to 2a01:4f8:5::10",
+            "ip -6 rule del pref 0",
+            "ip -6 rule add pref 100 table local",
+        ]);
+    }
+
+    fn refusing_routes_in_this_namespace() {
+        use sandy_core::EgressReach::{Public, PublicAndLocal};
+        use sandy_core::destination::{Refusal, check};
+        use std::net::{SocketAddr, TcpStream};
+        let routes = Routes::open().unwrap();
+        let at = |ip: &str| SocketAddr::new(ip.parse().unwrap(), 443);
+        let no_route = [
+            ("9.9.9.9", libc::EHOSTUNREACH),
+            ("4.4.4.4", libc::ENETUNREACH),
+            ("2620:fe::fe", libc::EHOSTUNREACH),
+            ("2a00:1450::1", libc::ENETUNREACH),
+        ];
+        for (ip, error) in no_route {
+            assert_eq!(route_type(&routes, at(ip).ip()).unwrap(), None, "{ip}");
+            assert_eq!(check(at(ip), Public, &routes), Ok(at(ip)), "{ip}");
+            let connected = TcpStream::connect(at(ip)).unwrap_err();
+            assert_eq!(connected.raw_os_error(), Some(error), "{ip}");
+        }
+        let refusing = [
+            ("1.1.1.1", libc::EACCES),
+            ("8.8.8.8", libc::EINVAL),
+            ("2606:4700::1111", libc::EACCES),
+            ("2001:4860::8888", libc::EINVAL),
+        ];
+        for (ip, error) in refusing {
+            let failed = route_type(&routes, at(ip).ip()).unwrap_err();
+            assert_eq!(failed.raw_os_error(), Some(error), "{ip}");
+            assert_eq!(
+                check(at(ip), Public, &routes),
+                Err(Refusal::HostUnknown),
+                "{ip}"
+            );
+            let connected = TcpStream::connect(at(ip)).unwrap_err();
+            assert_eq!(connected.raw_os_error(), Some(error), "{ip}");
+        }
+        for ip in ["198.51.100.10", "198.51.100.255", "2a01:4f8:5::10"] {
+            assert!(route_type(&routes, at(ip).ip()).is_err(), "{ip}");
+            let refused = check(at(ip), PublicAndLocal, &routes);
+            assert_eq!(refused, Err(Refusal::Host), "{ip}");
+        }
+    }
+
+    /// A rule that takes TCP alone to the local table, before a prohibit rule, makes the lookup
+    /// of an address fail where a TCP connect reaches this host through a local route that no
+    /// interface address shows, unless the lookup asks for TCP as the connect does. The broker
+    /// refuses the address either way.
+    #[test]
+    fn a_prohibit_rule_after_a_rule_for_tcp_refuses_the_address() {
+        if std::env::var_os(IN_NAMESPACE).is_some() {
+            return prohibit_after_tcp_in_this_namespace();
+        }
+        in_namespace(&[
+            "ip link set lo up",
+            "ip route add local 1.1.1.0/24 dev lo",
+            "ip rule add pref 4 to 127.0.0.1 lookup local",
+            "ip rule add pref 5 ipproto tcp lookup local",
+            "ip rule add pref 10 prohibit",
+            "ip rule del pref 0",
+        ]);
+    }
+
+    fn prohibit_after_tcp_in_this_namespace() {
+        use sandy_core::EgressReach::Public;
+        use sandy_core::destination::{Refusal, check};
+        use std::net::{SocketAddr, TcpListener, TcpStream};
+        let routes = Routes::open().unwrap();
+        let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let at = SocketAddr::new(
+            "1.1.1.5".parse().unwrap(),
+            listener.local_addr().unwrap().port(),
+        );
+        TcpStream::connect(at).expect("the connect reaches this host");
+        assert_eq!(check(at, Public, &routes), Err(Refusal::Host));
+    }
+
+    /// Whether a TCP connect to `at` reaches a listener of this host at its port.
+    fn reaches_this_host(at: std::net::SocketAddr) -> bool {
+        use std::net::{TcpListener, TcpStream};
+        let any = match at {
+            std::net::SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            std::net::SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        };
+        let _listener = TcpListener::bind((any, at.port())).unwrap();
+        TcpStream::connect_timeout(&at, Duration::from_secs(1)).is_ok()
+    }
+
+    /// A rule that takes TCP alone to the local table makes a local route that no interface
+    /// address shows this host for a TCP connect, which the lookup asks for too.
+    #[test]
+    fn a_rule_for_tcp_selects_the_route_of_the_connect() {
+        if std::env::var_os(IN_NAMESPACE).is_some() {
+            return rule_for_tcp_in_this_namespace();
+        }
+        in_namespace(&[
+            "ip link set lo up",
+            "ip route add local 1.1.1.0/24 dev lo",
+            "ip -6 route add local 2606:4700::/32 dev lo",
+            "ip rule add pref 4 to 127.0.0.1 lookup local",
+            "ip rule add pref 5 ipproto tcp lookup local",
+            "ip rule del pref 0",
+            "ip -6 rule add pref 5 ipproto tcp lookup local",
+            "ip -6 rule del pref 0",
+        ]);
+    }
+
+    fn rule_for_tcp_in_this_namespace() {
+        use sandy_core::EgressReach::Public;
+        use sandy_core::destination::{Refusal, check};
+        let routes = Routes::open().unwrap();
+        for at in ["1.1.1.5:8443", "[2606:4700::5]:8443"] {
+            let at = at.parse().unwrap();
+            assert!(reaches_this_host(at), "{at}");
+            assert_eq!(check(at, Public, &routes), Err(Refusal::Host), "{at}");
+        }
+    }
+
+    /// Rules for the destination port, and for the user together with it, make a local route
+    /// this host for the connect to that port alone, which the lookup asks for too.
+    #[test]
+    fn rules_for_the_port_and_the_user_select_the_route_of_the_connect() {
+        if std::env::var_os(IN_NAMESPACE).is_some() {
+            return rules_for_the_port_in_this_namespace();
+        }
+        in_namespace(&[
+            "ip link set lo up",
+            "ip route add local 1.1.1.0/24 dev lo",
+            "ip rule add pref 4 to 127.0.0.1 lookup local",
+            "ip rule add pref 5 ipproto tcp dport 8443 lookup local",
+            "ip rule add pref 6 dport 8444 uidrange 0-0 lookup local",
+            // The answers, from those ports.
+            "ip rule add pref 8 ipproto tcp sport 8443-8445 lookup local",
+            "ip rule del pref 0",
+        ]);
+    }
+
+    fn rules_for_the_port_in_this_namespace() {
+        use sandy_core::EgressReach::Public;
+        use sandy_core::destination::{Refusal, check};
+        let routes = Routes::open().unwrap();
+        for at in ["1.1.1.5:8443", "1.1.1.5:8444"] {
+            let at = at.parse().unwrap();
+            assert!(reaches_this_host(at), "{at}");
+            assert_eq!(check(at, Public, &routes), Err(Refusal::Host), "{at}");
+        }
+        for at in ["1.1.1.5:8445", "1.1.1.5:443"] {
+            let at = at.parse().unwrap();
+            assert!(!reaches_this_host(at), "{at}");
+            assert_eq!(check(at, Public, &routes), Ok(at), "{at}");
+        }
     }
 }

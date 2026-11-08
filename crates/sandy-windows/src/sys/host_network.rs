@@ -8,7 +8,7 @@
 //! it from reaching this machine at the kernel level as well (docs/windows.md, "Egress broker").
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use sandy_core::destination::{HostNetwork, Subnet};
 use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_NETWORK_UNREACHABLE, NO_ERROR};
@@ -28,7 +28,8 @@ use windows_sys::Win32::Networking::WinSock::{
 pub struct WindowsHost;
 
 impl HostNetwork for WindowsHost {
-    fn is_host(&self, ip: IpAddr) -> io::Result<bool> {
+    fn is_host(&self, destination: SocketAddr) -> io::Result<bool> {
+        let ip = destination.ip();
         let addresses = adapters()?.addresses;
         // An address of one of this host's interfaces.
         if addresses.iter().any(|address| address.ip == ip) {
