@@ -53,9 +53,43 @@ fn refuse_program(program: &Path) -> Result<(), SandboxError> {
     }
 }
 
-/// Why a run fails when its relay ends while the program runs, as on Linux and macOS.
-const RELAY_ENDED_FIRST: &str = "the relay of the exposed or forwarded ports ended before the \
-    program; the ports it served are gone and the program has been ended with it";
+/// The ports the one relay of a run serves, for its messages, such as "the exposed ports and the
+/// egress port".
+fn relay_serves(exposed: usize, forwarded: usize, egress: bool) -> String {
+    let ports = |count: usize, kind: &str| match count {
+        0 => None,
+        1 => Some(format!("the {kind} port")),
+        _ => Some(format!("the {kind} ports")),
+    };
+    let served: Vec<String> = [
+        ports(exposed, "exposed"),
+        ports(forwarded, "forwarded"),
+        ports(usize::from(egress), "egress"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    match served.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => "no port".to_string(),
+    }
+}
+
+/// Why a run fails when its relay, which serves the ports of `relay_serves`, ends while the
+/// program runs, as on Linux and macOS.
+fn relay_ended_first(exposed: usize, forwarded: usize, egress: bool) -> String {
+    let serves = relay_serves(exposed, forwarded, egress);
+    let gone = if exposed + forwarded + usize::from(egress) == 1 {
+        "the port it served is gone"
+    } else {
+        "the ports it served are gone"
+    };
+    format!(
+        "the relay of {serves} ended before the program; {gone} and the program has been ended \
+         with it"
+    )
+}
 
 /// Why a run fails when its egress broker ends while the program runs, as on Linux and macOS.
 const BROKER_ENDED_FIRST: &str = "the egress broker ended before the program; the program can no \
@@ -233,8 +267,13 @@ impl Backend for WindowsBackend {
             let capability = std::slice::from_ref(capability);
             // One `sandy __relay` in the program's AppContainer serves every exposed port, on the
             // listener that sandy creates outside, and every forwarded port, on a listener it
-            // creates inside. The egress broker reaches the program through a forwarded port like
-            // any other, whose socket the broker serves instead of sandy.
+            // creates inside, and the egress port, on a listener it creates inside too, named
+            // with `--egress`; the broker serves that port's AF_UNIX socket instead of sandy.
+            let serves = relay_serves(
+                policy.expose.len(),
+                policy.forward.len(),
+                policy.egress.is_some(),
+            );
             let exposed = relay::listen(&policy.expose)?;
             let mut args = vec![wide(relay::RELAY_COMMAND.as_ref())];
             for (listener, target) in &exposed {
@@ -269,11 +308,7 @@ impl Backend for WindowsBackend {
                 capability,
             )
             .map_err(|error| {
-                SandboxError::new(format!(
-                    "cannot start the relay of {} exposed and {} forwarded ports: {error}",
-                    policy.expose.len(),
-                    policy.forward.len()
-                ))
+                SandboxError::new(format!("cannot start the relay of {serves}: {error}"))
             })?;
             relays.push(process::Relay {
                 process,
@@ -282,8 +317,12 @@ impl Backend for WindowsBackend {
                     .into_iter()
                     .map(|(listener, _)| Box::new(listener) as Box<dyn process::InheritedSocket>)
                     .collect(),
-                reports_ready: true,
-                ended_first: RELAY_ENDED_FIRST,
+                name: "the relay",
+                ended_first: relay_ended_first(
+                    policy.expose.len(),
+                    policy.forward.len(),
+                    policy.egress.is_some(),
+                ),
             });
             // The broker itself: `sandy __broker` in its own AppContainer, serving the egress
             // AF_UNIX socket it inherits. It is in the relay job, so it ends with the program.
@@ -305,8 +344,8 @@ impl Backend for WindowsBackend {
                     )?,
                     appcontainer: &broker.container,
                     sockets: vec![Box::new(listener)],
-                    reports_ready: false,
-                    ended_first: BROKER_ENDED_FIRST,
+                    name: "the egress broker",
+                    ended_first: BROKER_ENDED_FIRST.to_string(),
                 });
             }
         }
@@ -1167,8 +1206,8 @@ mod tests {
     use std::ffi::OsString;
 
     use super::{
-        FOLDERID_ProgramData, FOLDERID_RoamingAppData, drives, known_folder, tool_homes,
-        trusted_locations, user_profiles, windows_directory,
+        FOLDERID_ProgramData, FOLDERID_RoamingAppData, drives, known_folder, relay_ended_first,
+        relay_serves, tool_homes, trusted_locations, user_profiles, windows_directory,
     };
     use crate::{access, probe};
     use windows_sys::Win32::Foundation as f;
@@ -1188,6 +1227,26 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("batch files run in cmd.exe"), "{error}");
+    }
+
+    #[test]
+    fn the_relay_names_the_ports_it_serves() {
+        assert_eq!(relay_serves(0, 0, true), "the egress port");
+        assert_eq!(relay_serves(1, 0, false), "the exposed port");
+        assert_eq!(
+            relay_serves(2, 1, false),
+            "the exposed ports and the forwarded port"
+        );
+        assert_eq!(
+            relay_serves(1, 3, true),
+            "the exposed port, the forwarded ports and the egress port"
+        );
+        assert_eq!(
+            relay_ended_first(0, 0, true),
+            "the relay of the egress port ended before the program; the port it served is gone \
+             and the program has been ended with it"
+        );
+        assert!(relay_ended_first(2, 0, false).contains("; the ports it served are gone "));
     }
 
     /// The configuration of git and GnuPG is protected below the profile as it is below the

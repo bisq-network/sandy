@@ -928,6 +928,14 @@ sandy runs the broker as `sandy __broker` in an AppContainer of its own, alongsi
    AppContainer profile stays between runs like the program's, because the runs of one policy
    share it: a run that removed it when it ended made a run that was starting fail
    (`the_egress_brokers_profile_outlives_the_run`). `sandy setup --remove` removes it.
+5. Like the relay, the broker writes "ready" to its standard output once it serves: Winsock is
+   started, the inherited handle is a listening socket and the end of its input is watched.
+   sandy starts the program only after both lines, so a broker that cannot start stops the run
+   with status 125 and the broker's own error before the program runs
+   (`egress_broker_that_cannot_serve_reports_no_readiness`). A broker that writes nothing stops
+   it after 10 seconds, as a relay does; the test holds the broker under a debugger before its
+   first instruction, and the program never starts
+   (`the_program_waits_until_the_egress_broker_is_ready`).
 
 What the broker connects to is decided by `sandy_core::destination`, the same on every platform,
 with the host's own addresses and subnets answered by `GetAdaptersAddresses` and `GetBestRoute2`;

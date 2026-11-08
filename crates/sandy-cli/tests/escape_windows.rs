@@ -4164,6 +4164,148 @@ fn with_port(address: std::net::IpAddr, port: u16) -> String {
     std::net::SocketAddr::new(address, port).to_string()
 }
 
+/// A broker that cannot serve writes its error and no "ready" line, which sandy waits for before
+/// it starts the program, and ends with status 125. Here its inherited listener is no socket.
+#[test]
+fn egress_broker_that_cannot_serve_reports_no_readiness() {
+    let output = sandy(["__broker", "2147483632", "public"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{stderr}");
+    assert!(stderr.contains("sandy: broker failed"), "{stderr}");
+    assert!(!stdout.contains("ready"), "{stdout}");
+}
+
+/// sandy starts the program only once the egress broker has written "ready". The test runs
+/// sandy under a debugger and holds the broker at its first debug event, so the broker never
+/// gets that far: sandy then fails after the 10 s it gives a helper, with status 125, and the
+/// program never starts, so its first action, writing a file, never happens. The relay starts
+/// first and runs on.
+#[test]
+fn the_program_waits_until_the_egress_broker_is_ready() {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, EXCEPTION_BREAKPOINT,
+        STATUS_WX86_BREAKPOINT,
+    };
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        CREATE_PROCESS_DEBUG_EVENT, ContinueDebugEvent, DEBUG_EVENT, DebugActiveProcessStop,
+        EXCEPTION_DEBUG_EVENT, EXIT_PROCESS_DEBUG_EVENT, LOAD_DLL_DEBUG_EVENT, WaitForDebugEvent,
+    };
+    use windows_sys::Win32::System::Threading::{
+        DEBUG_PROCESS, PROCESS_NAME_WIN32, QueryFullProcessImageNameW,
+    };
+
+    let fixture = Fixture::new("broker-ready");
+    let marker = fixture.path("rw/started");
+    let mut run = Command::new(sandy_path())
+        .args(run_args(
+            &egress_args(&fixture, free_port(), "public"),
+            &[("write", marker.to_str().unwrap())],
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(DEBUG_PROCESS)
+        .spawn()
+        .unwrap();
+    let stderr = run.stderr.take().unwrap();
+    let errors = std::thread::spawn(move || std::io::read_to_string(stderr).unwrap_or_default());
+    let stdout = run.stdout.take().unwrap();
+    let output = std::thread::spawn(move || std::io::read_to_string(stdout).unwrap_or_default());
+
+    // The executables that sandy's descendants run, in the order they started.
+    let mut started: Vec<(u32, String)> = Vec::new();
+    let mut held = None;
+    loop {
+        let mut event = DEBUG_EVENT::default();
+        // SAFETY: event is writable; this thread started sandy as its debugger.
+        let waited = unsafe { WaitForDebugEvent(&mut event, 60_000) };
+        assert_ne!(waited, 0, "{}", std::io::Error::last_os_error());
+        let mut status = DBG_CONTINUE;
+        match event.dwDebugEventCode {
+            CREATE_PROCESS_DEBUG_EVENT => {
+                // SAFETY: the event code says which member of the union is set.
+                let info = unsafe { event.u.CreateProcessInfo };
+                if !info.hFile.is_null() {
+                    // SAFETY: the debugger owns the image file handle of the event.
+                    unsafe { CloseHandle(info.hFile) };
+                }
+                let mut name = [0u16; 1024];
+                let mut length = name.len() as u32;
+                // SAFETY: the event's process handle is valid; name holds `length` units.
+                let named = unsafe {
+                    QueryFullProcessImageNameW(
+                        info.hProcess,
+                        PROCESS_NAME_WIN32,
+                        name.as_mut_ptr(),
+                        &mut length,
+                    )
+                };
+                assert_ne!(named, 0, "{}", std::io::Error::last_os_error());
+                let name = String::from_utf16_lossy(&name[..length as usize]).to_lowercase();
+                if event.dwProcessId != run.id() {
+                    started.push((event.dwProcessId, name.clone()));
+                }
+                // The relay is the first sandy.exe that sandy starts, the broker the second.
+                let helpers = started
+                    .iter()
+                    .filter(|(_, name)| name.ends_with("\\sandy.exe"))
+                    .count();
+                if helpers == 2 && name.ends_with("\\sandy.exe") && held.is_none() {
+                    // Not continued: every thread of the broker stays frozen.
+                    held = Some(event.dwProcessId);
+                    continue;
+                }
+            }
+            LOAD_DLL_DEBUG_EVENT => {
+                // SAFETY: the event code says which member of the union is set.
+                let file = unsafe { event.u.LoadDll }.hFile;
+                if !file.is_null() {
+                    // SAFETY: the debugger owns the file handle of the event.
+                    unsafe { CloseHandle(file) };
+                }
+            }
+            EXCEPTION_DEBUG_EVENT => {
+                // SAFETY: the event code says which member of the union is set.
+                let code = unsafe { event.u.Exception }.ExceptionRecord.ExceptionCode;
+                if code != EXCEPTION_BREAKPOINT && code != STATUS_WX86_BREAKPOINT {
+                    status = DBG_EXCEPTION_NOT_HANDLED;
+                }
+            }
+            _ => {}
+        }
+        // SAFETY: the IDs are those of the event just received.
+        unsafe { ContinueDebugEvent(event.dwProcessId, event.dwThreadId, status) };
+        if event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT && event.dwProcessId == run.id() {
+            break;
+        }
+    }
+    for (pid, _) in &started {
+        // SAFETY: DebugActiveProcessStop takes a process ID; one that has ended fails.
+        unsafe { DebugActiveProcessStop(*pid) };
+    }
+    let status = run.wait().unwrap();
+    let (output, errors) = (output.join().unwrap(), errors.join().unwrap());
+    assert!(
+        held.is_some(),
+        "sandy started no broker: {started:?} {errors}"
+    );
+    let programs: Vec<_> = started
+        .iter()
+        .filter(|(_, name)| name.ends_with("\\sandy-probe.exe"))
+        .collect();
+    assert!(
+        programs.is_empty(),
+        "the program started before the broker was ready: {started:?}"
+    );
+    assert!(!marker.exists(), "the program ran");
+    assert_eq!(status.code(), Some(EXIT_FAILURE), "{output}{errors}");
+    assert!(
+        errors.contains("the egress broker did not serve within 10 seconds"),
+        "{errors}"
+    );
+}
+
 /// With `reach = "public"` the broker connects to a public internet address. Skipped where this
 /// host has no route to one.
 #[test]
@@ -4407,7 +4549,8 @@ fn a_killed_run_leaves_no_egress_broker_behind() {
 /// and a forward or egress port that no relay holds is free for any local process to bind. sandy
 /// then ends the program and fails with status 125 and the record `failed`, as Linux and macOS
 /// do with `children = "contained"`. Control: the program runs while both live, and the end of
-/// its own is the end of the run (`the_egress_broker_ends_with_the_program`).
+/// its own is the end of the run (`the_egress_broker_ends_with_the_program`). The message names
+/// what the one that ended served: here the relay serves only the egress port.
 #[test]
 fn a_dead_relay_or_broker_ends_the_program() {
     use windows_sys::Win32::System::Threading::{
@@ -4415,7 +4558,7 @@ fn a_dead_relay_or_broker_ends_the_program() {
     };
 
     let fixture = Fixture::new("helper-ended");
-    for (index, reason) in [(0, "relay"), (1, "egress broker")] {
+    for (index, reason) in [(0, "relay of the egress port"), (1, "egress broker")] {
         let status = fixture.path(&format!("status-{index}"));
         let _ = fs::remove_file(&status);
         let mut sandbox_args = egress_args(&fixture, free_port(), "public");
@@ -4463,7 +4606,7 @@ fn a_dead_relay_or_broker_ends_the_program() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{stderr}");
         assert!(
-            stderr.contains(&format!("the {reason} ")) && stderr.contains("ended before"),
+            stderr.contains(&format!("the {reason} ended before the program")),
             "{stderr}"
         );
         let record = fs::read_to_string(&status).unwrap();

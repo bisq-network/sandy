@@ -854,8 +854,9 @@ pub mod unix {
     use std::ptr;
 
     use windows_sys::Win32::Networking::WinSock::{
-        AF_UNIX, INVALID_SOCKET, SOCK_STREAM, SOCKADDR, SOCKADDR_UN, SOCKET, WSAGetLastError,
-        accept, bind, closesocket, connect, listen, socket,
+        AF_UNIX, INVALID_SOCKET, SO_ACCEPTCONN, SOCK_STREAM, SOCKADDR, SOCKADDR_UN, SOCKET,
+        SOL_SOCKET, WSAGetLastError, accept, bind, closesocket, connect, getsockopt, listen,
+        socket,
     };
 
     /// The longest socket path, in bytes of UTF-8: `sun_path` holds 108 bytes including the
@@ -896,6 +897,32 @@ pub mod unix {
         /// `raw` must be a listening socket handle that this process owns and nothing else owns.
         pub unsafe fn from_inherited(raw: u64) -> Listener {
             Listener(raw as SOCKET)
+        }
+
+        /// Fails unless this is a socket that listens, such as an inherited handle that is none.
+        pub fn check_listening(&self) -> io::Result<()> {
+            let mut listening: i32 = 0;
+            let mut length = size_of::<i32>() as i32;
+            // SAFETY: listening is a writable i32 and its size is passed.
+            let result = unsafe {
+                getsockopt(
+                    self.0,
+                    SOL_SOCKET,
+                    SO_ACCEPTCONN,
+                    (&raw mut listening).cast(),
+                    &mut length,
+                )
+            };
+            if result != 0 {
+                return Err(last_error());
+            }
+            if listening == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the socket does not listen",
+                ));
+            }
+            Ok(())
         }
 
         /// Waits for the next connection.

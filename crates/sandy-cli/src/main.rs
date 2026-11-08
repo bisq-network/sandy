@@ -332,18 +332,27 @@ fn forward_routes(
     }
 }
 
-/// The line the relay writes to standard output once it listens. The backend that starts it
-/// waits for this line before it starts the program, so the program's first connection to a
-/// forwarded port does not race the relay. It matches the Windows backend.
+/// The line the relay and the egress broker write to standard output once they serve. The
+/// backend that starts them waits for this line before it starts the program, so the program's
+/// first connection does not race them, and one that cannot start stops the run before the
+/// program does. It matches the Windows backend.
 #[cfg(windows)]
 const RELAY_READY: &str = "ready";
+
+/// Writes `RELAY_READY`.
+#[cfg(windows)]
+fn report_ready() -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{RELAY_READY}")?;
+    stdout.flush()
+}
 
 /// On Windows the backend keeps the relay's standard input open while the program runs and
 /// closes it when the program ends; the relay then ends by rule 5 (see `serve_until`).
 #[cfg(windows)]
 fn serve_relay(routes: Vec<Route>) -> ExitCode {
-    use std::io::Write;
-
     let stop = match stop_at_end_of_input() {
         Ok(stop) => stop,
         Err(error) => {
@@ -351,14 +360,9 @@ fn serve_relay(routes: Vec<Route>) -> ExitCode {
             return ExitCode::from(EXIT_FAILURE);
         }
     };
-    let mut stdout = std::io::stdout().lock();
-    if writeln!(stdout, "{RELAY_READY}")
-        .and_then(|()| stdout.flush())
-        .is_err()
-    {
+    if report_ready().is_err() {
         return ExitCode::from(EXIT_FAILURE);
     }
-    drop(stdout);
     sandy_relay::serve_routes_until(
         routes,
         |listener| listener.accept().map(|(client, _)| client),
@@ -411,21 +415,28 @@ fn stop_at_end_of_input() -> std::io::Result<sandy_relay::Stop> {
 /// process in a sandbox of its own, with the AF_UNIX listener that the relay inside the
 /// program's AppContainer passes the program's connections to. It serves SOCKS5 on that listener
 /// and connects out to the destinations `reach` allows, asking the Windows host which addresses
-/// are its own. It ends like a relay when sandy closes its standard input.
+/// are its own. It ends like a relay when sandy closes its standard input, and reports that it
+/// serves like a relay.
 #[cfg(windows)]
 fn broker(listener: u64, reach: sandy_core::EgressReach) -> ExitCode {
+    // SAFETY: a backend starts this command only with a listening AF_UNIX socket it passed to
+    // this process and that nothing else here owns.
+    let listener = unsafe { sandy_relay::unix::Listener::from_inherited(listener) };
     // The inherited socket came from another process, so this one must start Winsock before it
     // uses it, or `accept` fails with WSANOTINITIALISED (`sandy_relay::unix`).
-    let stop = match sandy_relay::unix::available().and_then(|()| stop_at_end_of_input()) {
+    let started = sandy_relay::unix::available()
+        .and_then(|()| listener.check_listening())
+        .and_then(|()| stop_at_end_of_input());
+    let stop = match started {
         Ok(stop) => stop,
         Err(error) => {
             eprintln!("sandy: broker failed: {error}");
             return ExitCode::from(EXIT_FAILURE);
         }
     };
-    // SAFETY: a backend starts this command only with a listening AF_UNIX socket it passed to
-    // this process and that nothing else here owns.
-    let listener = unsafe { sandy_relay::unix::Listener::from_inherited(listener) };
+    if report_ready().is_err() {
+        return ExitCode::from(EXIT_FAILURE);
+    }
     sandy_relay::broker::serve(
         listener,
         |listener| listener.accept(),

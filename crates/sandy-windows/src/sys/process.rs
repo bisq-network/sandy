@@ -118,8 +118,10 @@ impl InheritedSocket for sandy_relay::unix::Listener {
 
 /// A relay process: `sandy __relay` for the exposed and forwarded ports, or `sandy __broker` for
 /// the egress broker. Its standard input is a pipe that sandy closes when the program ends; the
-/// relay then stops taking connections and ends within `sandy_relay::DRAIN`. The broker runs in a
-/// sandbox of its own, so each relay names the AppContainer it belongs to.
+/// relay then stops taking connections and ends within `sandy_relay::DRAIN`. It writes the line
+/// "ready" to standard output once it serves, `__relay` after it created the listeners of the
+/// forwarded ports, and the program starts only after that. The broker runs in a sandbox of its
+/// own, so each relay names the AppContainer it belongs to.
 pub struct Relay<'a> {
     pub process: Process<'a>,
     /// The AppContainer the relay runs in: the program's for `__relay`, the broker's own for
@@ -128,11 +130,10 @@ pub struct Relay<'a> {
     /// The listening sockets the relay receives: those of the exposed ports for `__relay`, the
     /// egress socket for `__broker`.
     pub sockets: Vec<Box<dyn InheritedSocket>>,
-    /// The relay writes the line "ready" to standard output once it listens, and the program
-    /// starts only after that. `__relay` creates the listeners of forwarded ports itself.
-    pub reports_ready: bool,
+    /// What the relay is, for the errors of a relay that does not start.
+    pub name: &'static str,
     /// Why the run fails when this relay ends while the program runs (`wait_for_program`).
-    pub ended_first: &'static str,
+    pub ended_first: String,
 }
 
 /// How a run ended: the program's exit code, and the time by which everything that served the
@@ -142,10 +143,10 @@ pub struct Ended {
     pub deadline: Instant,
     /// Why the run fails although the program has ended: a relay ended before it, and sandy
     /// ended the program with it.
-    pub failure: Option<&'static str>,
+    pub failure: Option<String>,
 }
 
-/// The line the relay writes once it listens. It matches the sandy command line.
+/// The line a relay writes once it serves. It matches the sandy command line.
 const RELAY_READY: &str = "ready";
 /// How long a relay may take to report that it listens.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -305,7 +306,7 @@ fn wait_for_program(
     parent: Option<&OwnedHandle>,
     job: &OwnedHandle,
     relays: &[RunningRelay],
-) -> Result<Option<&'static str>, SandboxError> {
+) -> Result<Option<String>, SandboxError> {
     let mut handles = vec![process.as_raw_handle()];
     handles.extend(parent.map(|parent| parent.as_raw_handle()));
     let first_relay = handles.len();
@@ -330,7 +331,7 @@ fn wait_for_program(
         if ended_by(process, Instant::now()) {
             return Ok(None);
         }
-        Some(relays[index - first_relay].ended_first)
+        Some(relays[index - first_relay].ended_first.clone())
     } else {
         None
     };
@@ -351,7 +352,7 @@ fn ended_relay(relays: &[RunningRelay]) -> Option<&str> {
     relays
         .iter()
         .find(|relay| ended_by(&relay.process, Instant::now()))
-        .map(|relay| relay.ended_first)
+        .map(|relay| relay.ended_first.as_str())
 }
 
 /// A started relay: its process, the write end of its standard input, and why the run fails
@@ -359,11 +360,11 @@ fn ended_relay(relays: &[RunningRelay]) -> Option<&str> {
 struct RunningRelay {
     process: OwnedHandle,
     input: OwnedHandle,
-    ended_first: &'static str,
+    ended_first: String,
 }
 
 /// Starts `relay` suspended in `relay_job` like the program, with a pipe as standard input,
-/// "ready" reporting on standard output if it asks for it, and the program's standard error.
+/// one for "ready" as standard output, and the program's standard error, and waits for "ready".
 fn start_relay(
     mut relay: Relay<'_>,
     relay_job: &OwnedHandle,
@@ -372,13 +373,8 @@ fn start_relay(
 ) -> Result<RunningRelay, SandboxError> {
     let (input_read, input) = pipe("input of a relay")?;
     make_inheritable(&input_read, "input of a relay")?;
-    let (ready_read, output) = if relay.reports_ready {
-        let (read, write) = pipe("output of a relay")?;
-        make_inheritable(&write, "output of a relay")?;
-        (Some(read), write)
-    } else {
-        (None, open_null("output of a relay")?)
-    };
+    let (ready_read, output) = pipe("output of a relay")?;
+    make_inheritable(&output, "output of a relay")?;
     let relay_stdio = [
         input_read.as_raw_handle(),
         output.as_raw_handle(),
@@ -399,9 +395,7 @@ fn start_relay(
     // input when sandy closes `input`, and clients of an exposed port are refused once the relay
     // closes its socket.
     drop((input_read, output, relay.sockets));
-    if let Some(ready_read) = ready_read {
-        wait_until_ready(ready_read)?;
-    }
+    wait_until_ready(ready_read, relay.name)?;
     Ok(RunningRelay {
         process,
         input,
@@ -409,23 +403,29 @@ fn start_relay(
     })
 }
 
-/// Waits until the relay writes "ready", ends, or `READY_TIMEOUT` passes.
-fn wait_until_ready(output: OwnedHandle) -> Result<(), SandboxError> {
+/// Waits until the relay `name` writes "ready", ends, or `READY_TIMEOUT` passes.
+fn wait_until_ready(output: OwnedHandle, name: &str) -> Result<(), SandboxError> {
     let (sender, receiver) = mpsc::channel();
     // The thread ends when the relay writes a line or ends; if the relay hangs, the job closes
     // when the run fails, which ends the relay and with it the thread.
     std::thread::spawn(move || {
         let mut line = String::new();
-        let read = io::BufRead::read_line(&mut io::BufReader::new(File::from(output)), &mut line);
+        // "ready" and a line end, so a relay that writes no line end cannot fill sandy's memory.
+        let output = io::Read::take(File::from(output), RELAY_READY.len() as u64 + 2);
+        let read = io::BufRead::read_line(&mut io::BufReader::new(output), &mut line);
         let _ = sender.send(read.map(|_| line));
     });
     match receiver.recv_timeout(READY_TIMEOUT) {
-        Ok(Ok(line)) if line.trim_end() == RELAY_READY => Ok(()),
-        Ok(_) => Err(SandboxError::new(
-            "the relay ended before it listened; its error is on standard error",
-        )),
+        // The line end is part of the line: a relay that writes "ready" and ends has not served.
+        Ok(Ok(line)) if matches!(line.strip_prefix(RELAY_READY), Some("\n" | "\r\n")) => Ok(()),
+        Ok(Ok(line)) if !line.is_empty() => Err(SandboxError::new(format!(
+            "{name} wrote something other than \"ready\"; its error is on standard error"
+        ))),
+        Ok(_) => Err(SandboxError::new(format!(
+            "{name} ended before it served; its error is on standard error"
+        ))),
         Err(_) => Err(SandboxError::new(format!(
-            "the relay did not listen within {} seconds",
+            "{name} did not serve within {} seconds",
             READY_TIMEOUT.as_secs()
         ))),
     }
@@ -1129,12 +1129,12 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use super::{RunningRelay, ended_relay};
+    use super::{RunningRelay, ended_relay, pipe, wait_until_ready};
 
     /// A relay that has ended before the program starts stops the start, with its own reason.
     #[test]
     fn a_relay_that_has_ended_stops_the_program_from_starting() {
-        let relay = |command: &mut Command, ended_first: &'static str| {
+        let relay = |command: &mut Command, ended_first: &str| {
             let mut child = command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
@@ -1143,7 +1143,7 @@ mod tests {
             RunningRelay {
                 input: OwnedHandle::from(child.stdin.take().unwrap()),
                 process: OwnedHandle::from(child),
-                ended_first,
+                ended_first: ended_first.to_string(),
             }
         };
         // `sort` runs until the end of its input, which the relay's `input` holds open.
@@ -1156,5 +1156,42 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(ended_relay(&relays), Some("ended"));
+    }
+
+    /// A relay that writes a long line without its end is refused once the line is longer than
+    /// "ready", not read into memory until the time limit.
+    #[test]
+    fn the_ready_line_is_read_up_to_a_limit() {
+        let (read, write) = pipe("output of a relay").unwrap();
+        let writer = std::thread::spawn(move || {
+            let mut write = std::fs::File::from(write);
+            let _ = std::io::Write::write_all(&mut write, &vec![b'x'; 1 << 20]);
+            std::thread::sleep(Duration::from_secs(15));
+        });
+        let started = Instant::now();
+        let error = wait_until_ready(read, "the relay").unwrap_err().to_string();
+        assert!(started.elapsed() < Duration::from_secs(5), "{error}");
+        assert!(error.contains("wrote something other than"), "{error}");
+        drop(writer);
+    }
+
+    /// "ready" counts only with its line end: a relay that writes "ready" and ends has not
+    /// served.
+    #[test]
+    fn ready_without_a_line_end_is_not_ready() {
+        for (written, ready) in [
+            (&b"ready\n"[..], true),
+            (b"ready\r\n", true),
+            (b"ready", false),
+            (b"ready \n", false),
+            (b"ready\r", false),
+        ] {
+            let (read, write) = pipe("output of a relay").unwrap();
+            let mut write = std::fs::File::from(write);
+            std::io::Write::write_all(&mut write, written).unwrap();
+            drop(write);
+            let result = wait_until_ready(read, "the relay");
+            assert_eq!(result.is_ok(), ready, "{written:?}: {result:?}");
+        }
     }
 }
