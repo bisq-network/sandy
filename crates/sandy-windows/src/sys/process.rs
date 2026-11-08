@@ -250,7 +250,11 @@ fn start_and_wait(
     // A relay can end after its "ready" line: one that has ended by now stops the start, and one
     // that ends later is caught by `wait_for_program`.
     let process = match ended_relay(&running) {
-        Some(reason) => return Err(process.abort(SandboxError::new(reason))),
+        Some(name) => {
+            return Err(SandboxError::new(format!(
+                "{name} ended before the program started, so sandy did not start the program"
+            )));
+        }
         None => process.resume()?,
     };
     // sandy stays the parent on Windows, so its own process ID is not the program's.
@@ -347,12 +351,12 @@ fn wait_for_program(
     Ok(failure)
 }
 
-/// Why the run fails if one of `relays` has already ended.
-fn ended_relay(relays: &[RunningRelay]) -> Option<&str> {
+/// The name of one of `relays` that has already ended, if any.
+fn ended_relay(relays: &[RunningRelay]) -> Option<&'static str> {
     relays
         .iter()
         .find(|relay| ended_by(&relay.process, Instant::now()))
-        .map(|relay| relay.ended_first.as_str())
+        .map(|relay| relay.name)
 }
 
 /// A started relay: its process, the write end of its standard input, and why the run fails
@@ -360,6 +364,7 @@ fn ended_relay(relays: &[RunningRelay]) -> Option<&str> {
 struct RunningRelay {
     process: OwnedHandle,
     input: OwnedHandle,
+    name: &'static str,
     ended_first: String,
 }
 
@@ -399,6 +404,7 @@ fn start_relay(
     Ok(RunningRelay {
         process,
         input,
+        name: relay.name,
         ended_first: relay.ended_first,
     })
 }
@@ -789,66 +795,64 @@ fn start(
         )));
     }
     // SAFETY: CreateProcessW succeeded, so both handles are new and owned by sandy.
-    let (process, thread) = unsafe {
-        (
-            OwnedHandle::from_raw_handle(info.hProcess),
-            OwnedHandle::from_raw_handle(info.hThread),
-        )
-    };
-
-    let abort = |error: SandboxError| {
-        // SAFETY: process is a valid handle; the process never ran because it is suspended.
-        unsafe { TerminateProcess(process.as_raw_handle(), 1) };
-        error
-    };
-    if deny_win32k {
-        match win32k_disabled(&process) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(abort(SandboxError::new(format!(
-                    "Windows started the {what} with win32k system calls enabled although sandy \
-                     asked to disable them"
-                ))));
-            }
-            Err(error) => return Err(abort(error)),
+    let suspended = unsafe {
+        Suspended {
+            process: Some(OwnedHandle::from_raw_handle(info.hProcess)),
+            thread: OwnedHandle::from_raw_handle(info.hThread),
+            what,
         }
+    };
+    let process = suspended.process();
+    if deny_win32k && !win32k_disabled(process)? {
+        return Err(SandboxError::new(format!(
+            "Windows started the {what} with win32k system calls enabled although sandy asked \
+             to disable them"
+        )));
     }
     // SAFETY: job and process are valid handles.
     if unsafe { AssignProcessToJobObject(job.as_raw_handle(), process.as_raw_handle()) } == 0 {
-        return Err(abort(last_error(format!(
+        return Err(last_error(format!(
             "cannot put the {what} into the job object"
-        ))));
+        )));
     }
-    Ok(Suspended {
-        process,
-        thread,
-        what,
-    })
+    Ok(suspended)
 }
 
-/// A process that `start` created and that has not run yet.
+/// A process that `start` created and that has not run yet. Dropped without `resume`, it ends,
+/// so that no early return leaves it suspended in its job.
 struct Suspended {
-    process: OwnedHandle,
+    /// `None` once resumed.
+    process: Option<OwnedHandle>,
     thread: OwnedHandle,
     what: &'static str,
 }
 
 impl Suspended {
-    /// Lets the process run.
-    fn resume(self) -> Result<OwnedHandle, SandboxError> {
-        // SAFETY: thread is the valid handle of the suspended main thread.
-        if unsafe { ResumeThread(self.thread.as_raw_handle()) } == u32::MAX {
-            let error = last_error(format!("cannot resume the {}", self.what));
-            return Err(self.abort(error));
-        }
-        Ok(self.process)
+    fn process(&self) -> &OwnedHandle {
+        self.process
+            .as_ref()
+            .expect("a Suspended is resumed only by consuming it")
     }
 
-    /// Ends the process, which never ran, and returns `error`.
-    fn abort(self, error: SandboxError) -> SandboxError {
-        // SAFETY: process is a valid process handle.
-        unsafe { TerminateProcess(self.process.as_raw_handle(), 1) };
-        error
+    /// Lets the process run.
+    fn resume(mut self) -> Result<OwnedHandle, SandboxError> {
+        // SAFETY: thread is the valid handle of the suspended main thread.
+        if unsafe { ResumeThread(self.thread.as_raw_handle()) } == u32::MAX {
+            return Err(last_error(format!("cannot resume the {}", self.what)));
+        }
+        Ok(self
+            .process
+            .take()
+            .expect("a Suspended is resumed only by consuming it"))
+    }
+}
+
+impl Drop for Suspended {
+    fn drop(&mut self) {
+        if let Some(process) = &self.process {
+            // SAFETY: process is a valid process handle; the process never ran.
+            unsafe { TerminateProcess(process.as_raw_handle(), 1) };
+        }
     }
 }
 
@@ -1129,12 +1133,12 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use super::{RunningRelay, ended_relay, pipe, wait_until_ready};
+    use super::{RunningRelay, Suspended, ended_relay, pipe, wait_until_ready};
 
-    /// A relay that has ended before the program starts stops the start, with its own reason.
+    /// A relay that has ended before the program starts stops the start, and the error names it.
     #[test]
     fn a_relay_that_has_ended_stops_the_program_from_starting() {
-        let relay = |command: &mut Command, ended_first: &str| {
+        let relay = |command: &mut Command, name: &'static str| {
             let mut child = command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
@@ -1143,7 +1147,8 @@ mod tests {
             RunningRelay {
                 input: OwnedHandle::from(child.stdin.take().unwrap()),
                 process: OwnedHandle::from(child),
-                ended_first: ended_first.to_string(),
+                name,
+                ended_first: String::new(),
             }
         };
         // `sort` runs until the end of its input, which the relay's `input` holds open.
@@ -1173,6 +1178,41 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5), "{error}");
         assert!(error.contains("wrote something other than"), "{error}");
         drop(writer);
+    }
+
+    /// A process that `start` created and that is dropped without `resume` ends, so that no
+    /// return before `resume` leaves it suspended in its job.
+    #[test]
+    fn a_suspended_process_that_is_dropped_ends() {
+        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{
+            CREATE_SUSPENDED, GetExitCodeProcess, WaitForSingleObject,
+        };
+
+        let child = Command::new("cmd")
+            .args(["/c", "exit", "0"])
+            .creation_flags(CREATE_SUSPENDED)
+            .spawn()
+            .unwrap();
+        let process = OwnedHandle::from(child);
+        let watched = process.try_clone().unwrap();
+        // `drop` does not use the thread handle.
+        let thread = process.try_clone().unwrap();
+        drop(Suspended {
+            process: Some(process),
+            thread,
+            what: "test process",
+        });
+        // SAFETY: watched is a valid process handle.
+        let waited = unsafe { WaitForSingleObject(watched.as_raw_handle(), 5000) };
+        assert_eq!(waited, WAIT_OBJECT_0, "the suspended process still runs");
+        let mut code = 0u32;
+        // SAFETY: watched is valid and code is a writable u32.
+        let read = unsafe { GetExitCodeProcess(watched.as_raw_handle(), &mut code) };
+        assert_ne!(read, 0);
+        assert_eq!(code, 1);
     }
 
     /// "ready" counts only with its line end: a relay that writes "ready" and ends has not
