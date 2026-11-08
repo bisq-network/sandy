@@ -188,6 +188,8 @@ impl Backend for WindowsBackend {
         command: &TargetCommand,
         status: &StatusReport,
     ) -> Result<i32, SandboxError> {
+        // Also checked in `refuse`; kept here so no caller of `run` can start a batch file.
+        refuse_program(&command.program)?;
         // The plan of the selection, kept with the answers it saw: the caller checked it, and
         // every mechanism below is one it named. A step that finds the host changed fails.
         if let Some(item) = self.plan(policy).into_iter().find(|i| !i.is_enforced()) {
@@ -1240,6 +1242,30 @@ mod tests {
         policy.program = Some(std::path::PathBuf::from("C:\\nowhere\\run.cmd"));
         let error = super::WindowsBackend::new()
             .refuse(&policy, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("batch files run in cmd.exe"), "{error}");
+    }
+
+    /// `run` refuses a batch file by itself, for a caller that did not call `refuse`.
+    #[test]
+    fn run_refuses_a_batch_file() {
+        use sandy_core::{Backend, Policy, ResolvedPolicy, StatusReport, TargetCommand};
+
+        let program = std::path::PathBuf::from("C:\\nowhere\\run.bat");
+        let mut policy = ResolvedPolicy::resolve(&Policy::default(), None).unwrap();
+        policy.program = Some(program.clone());
+        let command = TargetCommand {
+            arg0: program.clone().into_os_string(),
+            program,
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+            parent: None,
+            explain: false,
+        };
+        let error = super::WindowsBackend::new()
+            .run(&policy, &command, &StatusReport::none())
             .unwrap_err()
             .to_string();
         assert!(error.contains("batch files run in cmd.exe"), "{error}");
