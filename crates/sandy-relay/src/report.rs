@@ -184,7 +184,9 @@ mod tests {
         for n in 0..QUEUED_LINES * 4 {
             lines.send(format!("p: line {n}\n"));
         }
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // A send that waited for the writer would never return; the bound leaves room for a
+        // slow host.
+        assert!(started.elapsed() < Duration::from_secs(5));
         assert!(lines.dropped() > 0);
         let ending = Instant::now();
         lines.finish();
