@@ -44,8 +44,10 @@ const WARNING_PREFIX: &str = "warning: ";
 
 fn main() -> ExitCode {
     // First, so that the window in which sandy's parent can end unseen stays as short as possible
-    // (`process.end_with_parent`).
-    let parent_at_start = parent_process_id();
+    // (`process.end_with_parent`). Windows keeps the parent's process ID recorded, so it can be
+    // read later, and only for the commands that use it: it takes a process snapshot.
+    #[cfg(unix)]
+    let parent_at_start = Some(parent_process_id());
     let started_as = take_started_as();
     let handed_parent = take_handed_parent();
     let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -69,13 +71,16 @@ fn main() -> ExitCode {
             exposed,
             sockets,
             forwarded,
-        } => relay(exposed, sockets, forwarded),
+            egress,
+        } => relay(exposed, sockets, forwarded, egress),
         Command::Broker { listener, reach } => broker(listener, reach),
         Command::Sandbox(invocation) => {
+            #[cfg(windows)]
+            let parent_at_start =
+                matches!(invocation.mode, Mode::Run | Mode::Check).then(parent_process_id);
+            let known_parent = parent_id(parent_at_start.as_ref());
             let handed_over = match invocation.mode {
-                Mode::Run | Mode::Check => {
-                    hand_over(&started_as, handed_parent.or(parent_at_start))
-                }
+                Mode::Run | Mode::Check => hand_over(&started_as, handed_parent.or(known_parent)),
                 _ => Ok(()),
             };
             let context = Context {
@@ -98,7 +103,9 @@ fn main() -> ExitCode {
 
 /// What `main` learns before the invocation runs.
 struct Context {
-    parent_at_start: Option<u32>,
+    /// sandy's parent as `parent_process_id` read it at the start, or `None` when it was not
+    /// read: on Windows only `run` and `check` read it.
+    parent_at_start: Option<Result<u32, String>>,
     /// The value of `PARENT_AT_START_VARIABLE`.
     handed_parent: Option<u32>,
     /// The names of `STARTED_AS_VARIABLE`.
@@ -237,11 +244,15 @@ fn hand_over(_started_as: &[PathBuf], _parent_at_start: Option<u32>) -> Result<(
 /// How the relay reaches the other side of one port.
 type Connect = Box<dyn Fn() -> std::io::Result<std::net::TcpStream> + Send + Sync>;
 
-/// One relay serves every exposed and forwarded port that it is given.
+/// A route of the relay: its listener, how it reaches the other side, and its connection limit.
+type Route = (std::net::TcpListener, Connect, sandy_relay::Capacity);
+
+/// One relay serves every exposed and forwarded port that it is given, and the egress port.
 fn relay(
     exposed: Vec<(u64, std::net::SocketAddr)>,
     sockets: Option<std::path::PathBuf>,
     forwarded: Vec<std::net::SocketAddr>,
+    egress: Option<std::net::SocketAddr>,
 ) -> ExitCode {
     let mut handles: Vec<u64> = exposed.iter().map(|(listener, _)| *listener).collect();
     handles.sort_unstable();
@@ -250,45 +261,57 @@ fn relay(
         eprintln!("sandy: relay failed: a socket is named twice");
         return ExitCode::from(EXIT_FAILURE);
     }
-    let mut routes: Vec<(std::net::TcpListener, Connect)> = Vec::new();
+    let mut routes: Vec<Route> = Vec::new();
     for (listener, target) in exposed {
         // SAFETY: a backend starts this command only with listening sockets it passed to this
         // process and that nothing else here owns, and each is named once (checked above).
         let listener = unsafe { sandy_relay::inherited_listener(listener) }
             .and_then(|listener| listener.set_nonblocking(false).map(|()| listener));
         match listener {
-            Ok(listener) => routes.push((listener, Box::new(move || sandy_relay::connect(target)))),
+            Ok(listener) => routes.push((
+                listener,
+                Box::new(move || sandy_relay::connect(target)),
+                sandy_relay::Capacity::Port,
+            )),
             Err(error) => {
                 eprintln!("sandy: relay failed: {error}");
                 return ExitCode::from(EXIT_FAILURE);
             }
         }
     }
-    if let Err(message) = forward_routes(sockets, forwarded, &mut routes) {
+    if let Err(message) = forward_routes(sockets, forwarded, egress, &mut routes) {
         eprintln!("sandy: {message}");
         return ExitCode::from(EXIT_FAILURE);
     }
     serve_relay(routes)
 }
 
-/// The routes of the forwarded ports: the relay listens on each address inside the sandbox and
-/// passes every connection to the socket named after its port in `sockets`.
+/// The routes of the forwarded ports and the egress port: the relay listens on each address
+/// inside the sandbox and passes every connection to the socket named after its port in
+/// `sockets`. The egress route has the broker's connection limit, so the relay in front of the
+/// broker does not lower it.
 #[cfg(windows)]
 fn forward_routes(
     sockets: Option<std::path::PathBuf>,
     forwarded: Vec<std::net::SocketAddr>,
-    routes: &mut Vec<(std::net::TcpListener, Connect)>,
+    egress: Option<std::net::SocketAddr>,
+    routes: &mut Vec<Route>,
 ) -> Result<(), String> {
     let Some(directory) = sockets else {
         return Ok(());
     };
-    for listen in forwarded {
+    let ports = forwarded
+        .into_iter()
+        .map(|listen| (listen, sandy_relay::Capacity::Port));
+    let egress = egress.map(|listen| (listen, sandy_relay::Capacity::Egress));
+    for (listen, capacity) in ports.chain(egress) {
         let listener = std::net::TcpListener::bind(listen)
             .map_err(|error| format!("relay cannot listen on {listen}: {error}"))?;
         let socket = sandy_relay::unix::socket_path(&directory, listen.port());
         routes.push((
             listener,
             Box::new(move || sandy_relay::unix::connect_to(&socket)),
+            capacity,
         ));
     }
     Ok(())
@@ -299,27 +322,37 @@ fn forward_routes(
 fn forward_routes(
     _sockets: Option<std::path::PathBuf>,
     forwarded: Vec<std::net::SocketAddr>,
-    _routes: &mut Vec<(std::net::TcpListener, Connect)>,
+    egress: Option<std::net::SocketAddr>,
+    _routes: &mut Vec<Route>,
 ) -> Result<(), String> {
-    if forwarded.is_empty() {
+    if forwarded.is_empty() && egress.is_none() {
         Ok(())
     } else {
         Err("the relay serves forwarded ports only on Windows".to_string())
     }
 }
 
-/// The line the relay writes to standard output once it listens. The backend that starts it
-/// waits for this line before it starts the program, so the program's first connection to a
-/// forwarded port does not race the relay. It matches the Windows backend.
+/// The line the relay and the egress broker write to standard output once they serve. The
+/// backend that starts them waits for this line before it starts the program, so the program's
+/// first connection does not race them, and one that cannot start stops the run before the
+/// program does. It matches the Windows backend.
 #[cfg(windows)]
 const RELAY_READY: &str = "ready";
+
+/// Writes `RELAY_READY`.
+#[cfg(windows)]
+fn report_ready() -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{RELAY_READY}")?;
+    stdout.flush()
+}
 
 /// On Windows the backend keeps the relay's standard input open while the program runs and
 /// closes it when the program ends; the relay then ends by rule 5 (see `serve_until`).
 #[cfg(windows)]
-fn serve_relay(routes: Vec<(std::net::TcpListener, Connect)>) -> ExitCode {
-    use std::io::Write;
-
+fn serve_relay(routes: Vec<Route>) -> ExitCode {
     let stop = match stop_at_end_of_input() {
         Ok(stop) => stop,
         Err(error) => {
@@ -327,15 +360,10 @@ fn serve_relay(routes: Vec<(std::net::TcpListener, Connect)>) -> ExitCode {
             return ExitCode::from(EXIT_FAILURE);
         }
     };
-    let mut stdout = std::io::stdout().lock();
-    if writeln!(stdout, "{RELAY_READY}")
-        .and_then(|()| stdout.flush())
-        .is_err()
-    {
+    if report_ready().is_err() {
         return ExitCode::from(EXIT_FAILURE);
     }
-    drop(stdout);
-    sandy_relay::serve_until(
+    sandy_relay::serve_routes_until(
         routes,
         |listener| listener.accept().map(|(client, _)| client),
         &stop,
@@ -347,10 +375,10 @@ fn serve_relay(routes: Vec<(std::net::TcpListener, Connect)>) -> ExitCode {
 /// No Unix backend starts the relay as a process of its own; started by hand, it serves until it
 /// is ended.
 #[cfg(not(windows))]
-fn serve_relay(routes: Vec<(std::net::TcpListener, Connect)>) -> ExitCode {
+fn serve_relay(routes: Vec<Route>) -> ExitCode {
     match sandy_relay::Stop::new() {
         Ok(never) => {
-            sandy_relay::serve_until(
+            sandy_relay::serve_routes_until(
                 routes,
                 |listener| listener.accept().map(|(client, _)| client),
                 &never,
@@ -387,26 +415,35 @@ fn stop_at_end_of_input() -> std::io::Result<sandy_relay::Stop> {
 /// process in a sandbox of its own, with the AF_UNIX listener that the relay inside the
 /// program's AppContainer passes the program's connections to. It serves SOCKS5 on that listener
 /// and connects out to the destinations `reach` allows, asking the Windows host which addresses
-/// are its own. It ends like a relay when sandy closes its standard input.
+/// are its own. It ends like a relay when sandy closes its standard input, and reports that it
+/// serves like a relay.
 #[cfg(windows)]
 fn broker(listener: u64, reach: sandy_core::EgressReach) -> ExitCode {
+    // SAFETY: a backend starts this command only with a listening AF_UNIX socket it passed to
+    // this process and that nothing else here owns.
+    let listener = unsafe { sandy_relay::unix::Listener::from_inherited(listener) };
     // The inherited socket came from another process, so this one must start Winsock before it
     // uses it, or `accept` fails with WSANOTINITIALISED (`sandy_relay::unix`).
-    let stop = match sandy_relay::unix::available().and_then(|()| stop_at_end_of_input()) {
+    let started = sandy_relay::unix::available()
+        .and_then(|()| listener.check_listening())
+        .and_then(|()| stop_at_end_of_input());
+    let stop = match started {
         Ok(stop) => stop,
         Err(error) => {
             eprintln!("sandy: broker failed: {error}");
             return ExitCode::from(EXIT_FAILURE);
         }
     };
-    // SAFETY: a backend starts this command only with a listening AF_UNIX socket it passed to
-    // this process and that nothing else here owns.
-    let listener = unsafe { sandy_relay::unix::Listener::from_inherited(listener) };
+    // Without the change notifications the broker reads the network for every connection.
+    let host = sandy_windows::WindowsHost::watching().unwrap_or_default();
+    if report_ready().is_err() {
+        return ExitCode::from(EXIT_FAILURE);
+    }
     sandy_relay::broker::serve(
         listener,
         |listener| listener.accept(),
         reach,
-        sandy_windows::WindowsHost,
+        host,
         &stop,
         sandy_relay::DRAIN,
     );
@@ -419,27 +456,33 @@ fn broker(_listener: u64, _reach: sandy_core::EgressReach) -> ExitCode {
     ExitCode::from(EXIT_FAILURE)
 }
 
-/// The process ID of sandy's parent. Windows does not re-parent processes, so the backend finds
-/// the parent there.
+/// The process ID of sandy's parent, so that `check` compares `--parent-pid` with it as `run`
+/// does. Windows records it once and does not re-parent processes.
 #[cfg(unix)]
-fn parent_process_id() -> Option<u32> {
+fn parent_process_id() -> Result<u32, String> {
     // SAFETY: getppid has no preconditions.
-    Some(unsafe { libc::getppid() } as u32)
+    Ok(unsafe { libc::getppid() } as u32)
 }
 
-#[cfg(not(unix))]
-fn parent_process_id() -> Option<u32> {
-    None
+#[cfg(windows)]
+fn parent_process_id() -> Result<u32, String> {
+    sandy_windows::recorded_parent().map_err(|error| error.to_string())
+}
+
+/// The ID of a parent that sandy read, `None` when it was not read or could not be.
+fn parent_id(at_start: Option<&Result<u32, String>>) -> Option<u32> {
+    at_start?.as_ref().ok().copied()
 }
 
 /// The parent for `end_with_parent`: the one the caller named with `--parent-pid`, which must be
 /// the parent sandy saw at its start, or else that parent. With `--parent-start` the caller
 /// proves which process it means, so the named one need not be sandy's own parent; the backend
-/// checks the token against the process.
+/// checks the token against the process. A parent that sandy could not read refuses
+/// `end_with_parent`, as `run` on Windows does; `None` means it was not read, for `setup`.
 fn parent_for(
     named: Option<u32>,
     start: Option<u64>,
-    at_start: Option<u32>,
+    at_start: Option<&Result<u32, String>>,
     end_with_parent: bool,
 ) -> Result<Option<ParentProcess>, String> {
     match (named, start) {
@@ -451,6 +494,15 @@ fn parent_for(
         }
         _ => {}
     }
+    let at_start = match at_start {
+        Some(Err(error)) if end_with_parent => {
+            return Err(format!(
+                "cannot tell which process started sandy, which end_with_parent needs: {error}"
+            ));
+        }
+        Some(Ok(id)) => Some(*id),
+        _ => None,
+    };
     match (named, at_start) {
         (Some(named), Some(actual)) if start.is_none() && named != actual => Err(format!(
             "the process that started sandy is {actual}, not {named} (--parent-pid); \
@@ -496,10 +548,10 @@ fn sandbox(
     let mut levels = ResolvedPolicy::resolve_levels(&policy, invocation.program.as_deref())
         .map_err(|error| error.to_string())?;
     // The paths, the program and the environment are the same in every level, so the checks
-    // of the invocation hold for all of them. The parent is checked for any level that ends
-    // with it, also when another level is chosen or pinned with --level: checked in every mode,
-    // so that check reports what run would refuse, and run --level takes the options that check
-    // took. A level that does not end with its parent ignores it.
+    // of the invocation hold for all of them. The parent options are checked for any level that
+    // ends with its parent, also when another level is chosen or pinned with --level: checked in
+    // every mode, so that check reports what run would refuse, and run --level takes the options
+    // that check took. A level that does not end with its parent ignores them.
     let ends_with_parent = levels.iter().any(|level| level.policy.end_with_parent);
     if let Some(name) = &invocation.level {
         let index = levels
@@ -516,7 +568,7 @@ fn sandbox(
     }
     if let Some(reason) = parent_ended_during_hand_over(
         context.handed_parent,
-        context.parent_at_start,
+        parent_id(context.parent_at_start.as_ref()),
         ends_with_parent,
     ) {
         return Err(reason);
@@ -524,7 +576,7 @@ fn sandbox(
     let parent = parent_for(
         invocation.parent_pid,
         invocation.parent_start,
-        context.parent_at_start,
+        context.parent_at_start.as_ref(),
         ends_with_parent,
     )?;
     let policy_file = match &invocation.policy {
@@ -555,6 +607,11 @@ fn sandbox(
         EnforcementPlan::new(&policy.requirements(), backend.plan(policy))
     });
     if invocation.mode == Mode::Check {
+        if let Outcome::Selected(index) = selection.outcome {
+            backend
+                .refuse(&levels[index].policy, parent)
+                .map_err(|error| error.to_string())?;
+        }
         return check(
             &invocation,
             backend.as_ref(),
@@ -603,6 +660,10 @@ fn sandbox(
         parent,
         explain: invocation.explain,
     };
+    // What `check` refuses for the level it selects, refused here before anything starts.
+    backend
+        .refuse(resolved, parent)
+        .map_err(|error| error.to_string())?;
     let code = backend
         .run(resolved, &command, status)
         // Also after the program started: with children = "contained" on Linux and macOS, sandy
@@ -1082,28 +1143,44 @@ mod tests {
 
     #[test]
     fn the_named_parent_must_be_the_parent_at_start() {
-        assert_eq!(parent_for(None, None, Some(7), true), parent(7, None));
-        assert_eq!(parent_for(None, None, None, true), Ok(None));
-        assert_eq!(parent_for(Some(7), None, Some(7), true), parent(7, None));
-        // Windows reads no parent at start; the backend checks the named one.
-        assert_eq!(parent_for(Some(7), None, None, true), parent(7, None));
-        let error = parent_for(Some(7), None, Some(1), true).unwrap_err();
+        assert_eq!(parent_for(None, None, Some(&Ok(7)), true), parent(7, None));
+        assert_eq!(
+            parent_for(Some(7), None, Some(&Ok(7)), true),
+            parent(7, None)
+        );
+        let error = parent_for(Some(7), None, Some(&Ok(1)), true).unwrap_err();
         assert!(error.contains("is 1, not 7"), "{error}");
-        assert!(parent_for(Some(7), None, Some(7), false).is_err());
+        assert!(parent_for(Some(7), None, Some(&Ok(7)), false).is_err());
+        // Not read, for setup, which watches no parent.
+        assert_eq!(parent_for(None, None, None, true), Ok(None));
+        assert_eq!(parent_for(Some(7), None, None, true), parent(7, None));
+    }
+
+    /// A parent that sandy could not read (the process snapshot on Windows) refuses every
+    /// end_with_parent, named or not, as run does; without it, it decides nothing.
+    #[test]
+    fn a_parent_that_cannot_be_read_refuses_end_with_parent() {
+        let failed = Err("cannot list the processes".to_string());
+        for (named, start) in [(None, None), (Some(7), None), (Some(7), Some(99))] {
+            let error = parent_for(named, start, Some(&failed), true).unwrap_err();
+            assert!(error.contains("cannot list the processes"), "{error}");
+        }
+        assert_eq!(parent_for(None, None, Some(&failed), false), Ok(None));
+        assert!(parent_for(Some(7), None, Some(&failed), false).is_err());
     }
 
     #[test]
     fn a_start_token_allows_a_parent_that_is_not_sandys_own() {
         assert_eq!(
-            parent_for(Some(7), Some(99), Some(1), true),
+            parent_for(Some(7), Some(99), Some(&Ok(1)), true),
             parent(7, Some(99))
         );
-        let error = parent_for(None, Some(99), Some(1), true).unwrap_err();
+        let error = parent_for(None, Some(99), Some(&Ok(1)), true).unwrap_err();
         assert!(
             error.contains("--parent-start needs --parent-pid"),
             "{error}"
         );
-        assert!(parent_for(Some(7), Some(99), Some(7), false).is_err());
+        assert!(parent_for(Some(7), Some(99), Some(&Ok(7)), false).is_err());
     }
 
     /// After a hand-over the copy refuses `end_with_parent` when its parent is not the one the

@@ -221,7 +221,7 @@ fn trust_conflict(
             "writable path {} overlaps {}, which programs outside the sandbox read or execute \
              later; a file the program leaves there runs outside the sandbox",
             rule.path.display(),
-            location.path.display()
+            location.describe()
         ),
     })
 }
@@ -718,6 +718,7 @@ mod tests {
             forward: Vec::new(),
             egress: None,
             view: sandy_core::FileView::All,
+            symlinks: sandy_core::Symlinks::Deny,
             signals,
             children: sandy_core::ChildProcesses::Allowed,
             end_with_parent: false,

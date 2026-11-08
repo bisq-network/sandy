@@ -118,8 +118,10 @@ impl InheritedSocket for sandy_relay::unix::Listener {
 
 /// A relay process: `sandy __relay` for the exposed and forwarded ports, or `sandy __broker` for
 /// the egress broker. Its standard input is a pipe that sandy closes when the program ends; the
-/// relay then stops taking connections and ends within `sandy_relay::DRAIN`. The broker runs in a
-/// sandbox of its own, so each relay names the AppContainer it belongs to.
+/// relay then stops taking connections and ends within `sandy_relay::DRAIN`. It writes the line
+/// "ready" to standard output once it serves, `__relay` after it created the listeners of the
+/// forwarded ports, and the program starts only after that. The broker runs in a sandbox of its
+/// own, so each relay names the AppContainer it belongs to.
 pub struct Relay<'a> {
     pub process: Process<'a>,
     /// The AppContainer the relay runs in: the program's for `__relay`, the broker's own for
@@ -128,9 +130,10 @@ pub struct Relay<'a> {
     /// The listening sockets the relay receives: those of the exposed ports for `__relay`, the
     /// egress socket for `__broker`.
     pub sockets: Vec<Box<dyn InheritedSocket>>,
-    /// The relay writes the line "ready" to standard output once it listens, and the program
-    /// starts only after that. `__relay` creates the listeners of forwarded ports itself.
-    pub reports_ready: bool,
+    /// What the relay is, for the errors of a relay that does not start.
+    pub name: &'static str,
+    /// Why the run fails when this relay ends while the program runs (`wait_for_program`).
+    pub ended_first: String,
 }
 
 /// How a run ended: the program's exit code, and the time by which everything that served the
@@ -138,9 +141,12 @@ pub struct Relay<'a> {
 pub struct Ended {
     pub code: i32,
     pub deadline: Instant,
+    /// Why the run fails although the program has ended: a relay ended before it, and sandy
+    /// ended the program with it.
+    pub failure: Option<String>,
 }
 
-/// The line the relay writes once it listens. It matches the sandy command line.
+/// The line a relay writes once it serves. It matches the sandy command line.
 const RELAY_READY: &str = "ready";
 /// How long a relay may take to report that it listens.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -241,6 +247,16 @@ fn start_and_wait(
         Role::Program,
         deny_win32k,
     )?;
+    // A relay can end after its "ready" line: one that has ended by now stops the start, and one
+    // that ends later is caught by `wait_for_program`.
+    let process = match ended_relay(&running) {
+        Some(name) => {
+            return Err(SandboxError::new(format!(
+                "{name} ended before the program started, so sandy did not start the program"
+            )));
+        }
+        None => process.resume()?,
+    };
     // sandy stays the parent on Windows, so its own process ID is not the program's.
     // SAFETY: process is a valid process handle with the rights CreateProcessW gives.
     status.started(unsafe { GetProcessId(process.as_raw_handle()) });
@@ -249,14 +265,17 @@ fn start_and_wait(
     // from seeing the end of the output.
     drop(child);
 
-    wait_for_program(&process, parent.as_ref(), job)?;
+    let failure = wait_for_program(&process, parent.as_ref(), job, &running)?;
     let deadline = Instant::now() + sandy_relay::DRAIN;
     let mut code = 0u32;
     // SAFETY: process is valid and code is a writable u32.
     if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) } == 0 {
         return Err(last_error("cannot read the exit code of the program"));
     }
-    status.exited(code as i32);
+    // A run that fails records `failed` instead (the caller writes it).
+    if failure.is_none() {
+        status.exited(code);
+    }
     // Processes the program left behind would die when sandy exits and the job closes. Ending
     // them now also closes their copies of the output pipes, so the console relays finish, and
     // once they have ended nothing in the sandbox can make a new connection while the relays
@@ -272,52 +291,85 @@ fn start_and_wait(
     Ok(Ended {
         code: code as i32,
         deadline,
+        failure,
     })
 }
 
-/// The exit code of a program whose job sandy ended because sandy's parent ended.
-const PARENT_ENDED: u32 = 1;
+/// The exit code of a program whose job sandy ended because sandy's parent or a relay ended.
+const ENDED_BY_SANDY: u32 = 1;
 
-/// Waits until the program exits. With `parent`, also until that process ends; then sandy ends
-/// the program's job and waits for the program.
+/// Waits until the program exits. With `parent`, also until that process ends, and until one of
+/// the `relays` ends; then sandy ends the program's job and waits for the program. Returns the
+/// relay's `ended_first` when a relay ended before the program, as Linux and macOS do with
+/// `children = "contained"` (docs/DESIGN.md, "Forwarded ports", rule 5): a forward port that
+/// its relay no longer holds is free for any local process to bind. In a normal run no relay
+/// ends first, because sandy ends them only after the program, so a relay that ended while the
+/// program also had ended is the program's own end.
 fn wait_for_program(
     process: &OwnedHandle,
     parent: Option<&OwnedHandle>,
     job: &OwnedHandle,
-) -> Result<(), SandboxError> {
-    let waited = match parent {
-        // SAFETY: process is a valid process handle.
-        None => unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) },
-        Some(parent) => {
-            let handles = [process.as_raw_handle(), parent.as_raw_handle()];
-            // SAFETY: both handles are valid and have SYNCHRONIZE access.
-            unsafe { WaitForMultipleObjects(2, handles.as_ptr(), FALSE, INFINITE) }
-        }
-    };
-    if waited == WAIT_OBJECT_0 + 1 {
-        match end_job(job, PARENT_ENDED) {
-            // The caller closes the job then, and kill-on-close ends the program.
-            Err(NotEnded::Refused(error)) => {
-                return Err(SandboxError::io("cannot end the program's job", error));
-            }
-            ended => report_end(ended, "the program and the processes it started"),
-        }
-        // SAFETY: process is a valid process handle.
-        unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) };
-    } else if waited != WAIT_OBJECT_0 {
+    relays: &[RunningRelay],
+) -> Result<Option<String>, SandboxError> {
+    let mut handles = vec![process.as_raw_handle()];
+    handles.extend(parent.map(|parent| parent.as_raw_handle()));
+    let first_relay = handles.len();
+    handles.extend(relays.iter().map(|relay| relay.process.as_raw_handle()));
+    // The program, its parent, the relay and the broker.
+    assert!(
+        handles.len() <= 64,
+        "more handles than WaitForMultipleObjects takes"
+    );
+    // SAFETY: every handle is a valid process handle with SYNCHRONIZE access, and there are at
+    // most MAXIMUM_WAIT_OBJECTS (64), checked above.
+    let waited =
+        unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), FALSE, INFINITE) };
+    let index = waited.wrapping_sub(WAIT_OBJECT_0) as usize;
+    if index >= handles.len() {
         return Err(last_error("cannot wait for the program"));
     }
-    Ok(())
+    if index == 0 {
+        return Ok(None);
+    }
+    let failure = if index >= first_relay {
+        if ended_by(process, Instant::now()) {
+            return Ok(None);
+        }
+        Some(relays[index - first_relay].ended_first.clone())
+    } else {
+        None
+    };
+    match end_job(job, ENDED_BY_SANDY) {
+        // The caller closes the job then, and kill-on-close ends the program.
+        Err(NotEnded::Refused(error)) => {
+            return Err(SandboxError::io("cannot end the program's job", error));
+        }
+        ended => report_end(ended, "the program and the processes it started"),
+    }
+    // SAFETY: process is a valid process handle.
+    unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) };
+    Ok(failure)
 }
 
-/// A started relay: its process and the write end of its standard input.
+/// The name of one of `relays` that has already ended, if any.
+fn ended_relay(relays: &[RunningRelay]) -> Option<&'static str> {
+    relays
+        .iter()
+        .find(|relay| ended_by(&relay.process, Instant::now()))
+        .map(|relay| relay.name)
+}
+
+/// A started relay: its process, the write end of its standard input, and why the run fails
+/// when it ends first.
 struct RunningRelay {
     process: OwnedHandle,
     input: OwnedHandle,
+    name: &'static str,
+    ended_first: String,
 }
 
 /// Starts `relay` suspended in `relay_job` like the program, with a pipe as standard input,
-/// "ready" reporting on standard output if it asks for it, and the program's standard error.
+/// one for "ready" as standard output, and the program's standard error, and waits for "ready".
 fn start_relay(
     mut relay: Relay<'_>,
     relay_job: &OwnedHandle,
@@ -326,13 +378,8 @@ fn start_relay(
 ) -> Result<RunningRelay, SandboxError> {
     let (input_read, input) = pipe("input of a relay")?;
     make_inheritable(&input_read, "input of a relay")?;
-    let (ready_read, output) = if relay.reports_ready {
-        let (read, write) = pipe("output of a relay")?;
-        make_inheritable(&write, "output of a relay")?;
-        (Some(read), write)
-    } else {
-        (None, open_null("output of a relay")?)
-    };
+    let (ready_read, output) = pipe("output of a relay")?;
+    make_inheritable(&output, "output of a relay")?;
     let relay_stdio = [
         input_read.as_raw_handle(),
         output.as_raw_handle(),
@@ -347,34 +394,44 @@ fn start_relay(
         &sockets,
         Role::Relay,
         deny_win32k,
-    )?;
+    )?
+    .resume()?;
     // The relay holds its own handles now. Without sandy's copies, the relay sees the end of its
     // input when sandy closes `input`, and clients of an exposed port are refused once the relay
     // closes its socket.
     drop((input_read, output, relay.sockets));
-    if let Some(ready_read) = ready_read {
-        wait_until_ready(ready_read)?;
-    }
-    Ok(RunningRelay { process, input })
+    wait_until_ready(ready_read, relay.name)?;
+    Ok(RunningRelay {
+        process,
+        input,
+        name: relay.name,
+        ended_first: relay.ended_first,
+    })
 }
 
-/// Waits until the relay writes "ready", ends, or `READY_TIMEOUT` passes.
-fn wait_until_ready(output: OwnedHandle) -> Result<(), SandboxError> {
+/// Waits until the relay `name` writes "ready", ends, or `READY_TIMEOUT` passes.
+fn wait_until_ready(output: OwnedHandle, name: &str) -> Result<(), SandboxError> {
     let (sender, receiver) = mpsc::channel();
     // The thread ends when the relay writes a line or ends; if the relay hangs, the job closes
     // when the run fails, which ends the relay and with it the thread.
     std::thread::spawn(move || {
         let mut line = String::new();
-        let read = io::BufRead::read_line(&mut io::BufReader::new(File::from(output)), &mut line);
+        // "ready" and a line end, so a relay that writes no line end cannot fill sandy's memory.
+        let output = io::Read::take(File::from(output), RELAY_READY.len() as u64 + 2);
+        let read = io::BufRead::read_line(&mut io::BufReader::new(output), &mut line);
         let _ = sender.send(read.map(|_| line));
     });
     match receiver.recv_timeout(READY_TIMEOUT) {
-        Ok(Ok(line)) if line.trim_end() == RELAY_READY => Ok(()),
-        Ok(_) => Err(SandboxError::new(
-            "the relay ended before it listened; its error is on standard error",
-        )),
+        // The line end is part of the line: a relay that writes "ready" and ends has not served.
+        Ok(Ok(line)) if matches!(line.strip_prefix(RELAY_READY), Some("\n" | "\r\n")) => Ok(()),
+        Ok(Ok(line)) if !line.is_empty() => Err(SandboxError::new(format!(
+            "{name} wrote something other than \"ready\"; its error is on standard error"
+        ))),
+        Ok(_) => Err(SandboxError::new(format!(
+            "{name} ended before it served; its error is on standard error"
+        ))),
         Err(_) => Err(SandboxError::new(format!(
-            "the relay did not listen within {} seconds",
+            "{name} did not serve within {} seconds",
             READY_TIMEOUT.as_secs()
         ))),
     }
@@ -626,9 +683,9 @@ fn set_job_information<T>(
     Ok(())
 }
 
-/// Creates the process suspended in the AppContainer, puts it into the job, then lets it run.
-/// It cannot run any code before it is in the job. It inherits `stdio` and `extra`, which must
-/// be inheritable, and no other handle.
+/// Creates the process suspended in the AppContainer and puts it into the job; the caller lets it
+/// run (`Suspended::resume`). It cannot run any code before it is in the job. It inherits
+/// `stdio` and `extra`, which must be inheritable, and no other handle.
 ///
 /// A relay starts without a console and with `CHILD_PROCESS_RESTRICTED`: it never needs either,
 /// and the program, which can open the relay because both run in one AppContainer, then cannot
@@ -646,7 +703,7 @@ fn start(
     extra: &[HANDLE],
     role: Role,
     deny_win32k: bool,
-) -> Result<OwnedHandle, SandboxError> {
+) -> Result<Suspended, SandboxError> {
     let what = role.name();
     let mut capabilities: Vec<SID_AND_ATTRIBUTES> = launch
         .capabilities
@@ -738,41 +795,65 @@ fn start(
         )));
     }
     // SAFETY: CreateProcessW succeeded, so both handles are new and owned by sandy.
-    let (process, thread) = unsafe {
-        (
-            OwnedHandle::from_raw_handle(info.hProcess),
-            OwnedHandle::from_raw_handle(info.hThread),
-        )
-    };
-
-    let abort = |error: SandboxError| {
-        // SAFETY: process is a valid handle; the process never ran because it is suspended.
-        unsafe { TerminateProcess(process.as_raw_handle(), 1) };
-        error
-    };
-    if deny_win32k {
-        match win32k_disabled(&process) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(abort(SandboxError::new(format!(
-                    "Windows started the {what} with win32k system calls enabled although sandy \
-                     asked to disable them"
-                ))));
-            }
-            Err(error) => return Err(abort(error)),
+    let suspended = unsafe {
+        Suspended {
+            process: Some(OwnedHandle::from_raw_handle(info.hProcess)),
+            thread: OwnedHandle::from_raw_handle(info.hThread),
+            what,
         }
+    };
+    let process = suspended.process();
+    if deny_win32k && !win32k_disabled(process)? {
+        return Err(SandboxError::new(format!(
+            "Windows started the {what} with win32k system calls enabled although sandy asked \
+             to disable them"
+        )));
     }
     // SAFETY: job and process are valid handles.
     if unsafe { AssignProcessToJobObject(job.as_raw_handle(), process.as_raw_handle()) } == 0 {
-        return Err(abort(last_error(format!(
+        return Err(last_error(format!(
             "cannot put the {what} into the job object"
-        ))));
+        )));
     }
-    // SAFETY: thread is the valid handle of the suspended main thread.
-    if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
-        return Err(abort(last_error(format!("cannot resume the {what}"))));
+    Ok(suspended)
+}
+
+/// A process that `start` created and that has not run yet. Dropped without `resume`, it ends,
+/// so that no early return leaves it suspended in its job.
+struct Suspended {
+    /// `None` once resumed.
+    process: Option<OwnedHandle>,
+    thread: OwnedHandle,
+    what: &'static str,
+}
+
+impl Suspended {
+    fn process(&self) -> &OwnedHandle {
+        self.process
+            .as_ref()
+            .expect("a Suspended is resumed only by consuming it")
     }
-    Ok(process)
+
+    /// Lets the process run.
+    fn resume(mut self) -> Result<OwnedHandle, SandboxError> {
+        // SAFETY: thread is the valid handle of the suspended main thread.
+        if unsafe { ResumeThread(self.thread.as_raw_handle()) } == u32::MAX {
+            return Err(last_error(format!("cannot resume the {}", self.what)));
+        }
+        Ok(self
+            .process
+            .take()
+            .expect("a Suspended is resumed only by consuming it"))
+    }
+}
+
+impl Drop for Suspended {
+    fn drop(&mut self) {
+        if let Some(process) = &self.process {
+            // SAFETY: process is a valid process handle; the process never ran.
+            unsafe { TerminateProcess(process.as_raw_handle(), 1) };
+        }
+    }
 }
 
 /// Whether win32k system calls are disabled for `process`, as `GetProcessMitigationPolicy`
@@ -1043,5 +1124,114 @@ fn relay_output(mut source: File, mut console: impl Write) {
             }
         }
         let _ = console.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::windows::io::OwnedHandle;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    use super::{RunningRelay, Suspended, ended_relay, pipe, wait_until_ready};
+
+    /// A relay that has ended before the program starts stops the start, and the error names it.
+    #[test]
+    fn a_relay_that_has_ended_stops_the_program_from_starting() {
+        let relay = |command: &mut Command, name: &'static str| {
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap();
+            RunningRelay {
+                input: OwnedHandle::from(child.stdin.take().unwrap()),
+                process: OwnedHandle::from(child),
+                name,
+                ended_first: String::new(),
+            }
+        };
+        // `sort` runs until the end of its input, which the relay's `input` holds open.
+        let mut relays = vec![relay(&mut Command::new("sort"), "running")];
+        assert_eq!(ended_relay(&relays), None);
+        relays.push(relay(Command::new("cmd").args(["/c", "exit"]), "ended"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ended_relay(&relays).is_none() {
+            assert!(Instant::now() < deadline, "cmd did not end");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(ended_relay(&relays), Some("ended"));
+    }
+
+    /// A relay that writes a long line without its end is refused once the line is longer than
+    /// "ready", not read into memory until the time limit.
+    #[test]
+    fn the_ready_line_is_read_up_to_a_limit() {
+        let (read, write) = pipe("output of a relay").unwrap();
+        let writer = std::thread::spawn(move || {
+            let mut write = std::fs::File::from(write);
+            let _ = std::io::Write::write_all(&mut write, &vec![b'x'; 1 << 20]);
+            std::thread::sleep(Duration::from_secs(15));
+        });
+        let started = Instant::now();
+        let error = wait_until_ready(read, "the relay").unwrap_err().to_string();
+        assert!(started.elapsed() < Duration::from_secs(5), "{error}");
+        assert!(error.contains("wrote something other than"), "{error}");
+        drop(writer);
+    }
+
+    /// A process that `start` created and that is dropped without `resume` ends, so that no
+    /// return before `resume` leaves it suspended in its job.
+    #[test]
+    fn a_suspended_process_that_is_dropped_ends() {
+        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{
+            CREATE_SUSPENDED, GetExitCodeProcess, WaitForSingleObject,
+        };
+
+        let child = Command::new("cmd")
+            .args(["/c", "exit", "0"])
+            .creation_flags(CREATE_SUSPENDED)
+            .spawn()
+            .unwrap();
+        let process = OwnedHandle::from(child);
+        let watched = process.try_clone().unwrap();
+        // `drop` does not use the thread handle.
+        let thread = process.try_clone().unwrap();
+        drop(Suspended {
+            process: Some(process),
+            thread,
+            what: "test process",
+        });
+        // SAFETY: watched is a valid process handle.
+        let waited = unsafe { WaitForSingleObject(watched.as_raw_handle(), 5000) };
+        assert_eq!(waited, WAIT_OBJECT_0, "the suspended process still runs");
+        let mut code = 0u32;
+        // SAFETY: watched is valid and code is a writable u32.
+        let read = unsafe { GetExitCodeProcess(watched.as_raw_handle(), &mut code) };
+        assert_ne!(read, 0);
+        assert_eq!(code, 1);
+    }
+
+    /// "ready" counts only with its line end: a relay that writes "ready" and ends has not
+    /// served.
+    #[test]
+    fn ready_without_a_line_end_is_not_ready() {
+        for (written, ready) in [
+            (&b"ready\n"[..], true),
+            (b"ready\r\n", true),
+            (b"ready", false),
+            (b"ready \n", false),
+            (b"ready\r", false),
+        ] {
+            let (read, write) = pipe("output of a relay").unwrap();
+            let mut write = std::fs::File::from(write);
+            std::io::Write::write_all(&mut write, written).unwrap();
+            drop(write);
+            let result = wait_until_ready(read, "the relay");
+            assert_eq!(result.is_ok(), ready, "{written:?}: {result:?}");
+        }
     }
 }

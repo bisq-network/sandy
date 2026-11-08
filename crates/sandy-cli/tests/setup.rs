@@ -93,8 +93,7 @@ fn started_as_never_reaches_the_program() {
 /// `SANDY_PARENT_AT_START`, the parent that a sandy read before it handed over, can only add a
 /// refusal: with `end_with_parent`, a value that is not sandy's parent, or not a process ID at
 /// all, refuses the policy in every mode, and the program never sees the variable. Control: the
-/// real parent refuses nothing on Unix, and another variable passed the same way arrives. On
-/// Windows sandy reads no parent at its start, so there every value refuses.
+/// real parent refuses nothing, and another variable passed the same way arrives.
 #[test]
 fn parent_at_start_only_adds_a_refusal() {
     let check = arguments(
@@ -108,9 +107,8 @@ fn parent_at_start_only_adds_a_refusal() {
         .args(&check)
         .output()
         .unwrap();
-    assert_eq!(
-        String::from_utf8_lossy(&control.stderr).contains(refusal),
-        cfg!(windows),
+    assert!(
+        !String::from_utf8_lossy(&control.stderr).contains(refusal),
         "{control:?}"
     );
     let other = if parent == "1" { "2" } else { "1" };

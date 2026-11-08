@@ -161,3 +161,69 @@ fn symlink_and_fifo_in_writable_paths_are_denied() {
     lines[0].assert_blocked();
     lines[1].assert_blocked();
 }
+
+/// `symlinks = "allow"` grants Landlock's make-symlink right on writable paths and nothing else:
+/// the program can make and rename links there, a FIFO stays denied, a link in a read path too,
+/// and a link to a file outside the policy leads nowhere, because Landlock checks the file a
+/// link resolves to. A link to a file of the writable path works. Each call works outside.
+#[test]
+fn symlinks_allow_makes_links_that_reach_nothing_new() {
+    let fixture = Fixture::new("review-symlinks-allow");
+    let make = |link: &str, target: &str| format!("{}::{}", fixture.arg(link), fixture.arg(target));
+    let outside_link = make("rw/outside", "secret/file");
+    let inside_link = make("rw/inside", "rw/file");
+    let read_link = make("ro/link", "ro/file");
+    let fifo = fixture.arg("rw/fifo");
+    // The probe takes the two paths of a rename apart at U+001F.
+    let renamed = format!(
+        "{}\u{1f}{}",
+        fixture.arg("rw/inside"),
+        fixture.arg("rw/renamed")
+    );
+    let actions = [
+        ("symlink", outside_link.as_str()),
+        ("symlink", inside_link.as_str()),
+        ("symlink", read_link.as_str()),
+        ("mkfifo", fifo.as_str()),
+        ("rename", renamed.as_str()),
+    ];
+    for line in probe_outside(&actions) {
+        line.assert_ok();
+    }
+    fixture.reset();
+
+    // The default refuses every one of them with EACCES. The rename needs a link to move, and
+    // the refused link before it leaves none, so one is made outside first; the link inside then
+    // takes another name, where nothing exists yet.
+    std::os::unix::fs::symlink(fixture.path("rw/file"), fixture.path("rw/inside")).unwrap();
+    let other_inside_link = make("rw/inside-too", "rw/file");
+    let mut denied = actions;
+    denied[1] = ("symlink", other_inside_link.as_str());
+    for line in probe_inside(&fixture.access_args(), &denied) {
+        line.assert_blocked();
+        assert!(line.detail.contains("(os error 13)"), "{line:?}");
+    }
+    assert!(fixture.path("rw/inside").is_symlink());
+    fixture.reset();
+
+    let mut allow = fixture.access_args();
+    allow.extend(args(&["--symlinks", "allow"]));
+    let (through_outside, through_renamed) = (fixture.arg("rw/outside"), fixture.arg("rw/renamed"));
+    let mut reads = actions.to_vec();
+    reads.extend([
+        ("read", through_outside.as_str()),
+        ("read", through_renamed.as_str()),
+    ]);
+    let lines = probe_inside(&allow, &reads);
+    lines[0].assert_ok();
+    lines[1].assert_ok();
+    lines[2].assert_blocked();
+    lines[3].assert_blocked();
+    lines[4].assert_ok();
+    lines[5].assert_blocked();
+    lines[6].assert_ok();
+    assert_eq!(
+        std::fs::read_link(fixture.path("rw/outside")).unwrap(),
+        fixture.path("secret/file")
+    );
+}

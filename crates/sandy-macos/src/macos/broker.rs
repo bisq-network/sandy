@@ -76,9 +76,10 @@ fn serve(
     ready: Ready,
 ) {
     let started = Stop::new().and_then(|stop| {
-        watch_and_confine(ended.as_ref(), profile, seatbelt, watched).map(|queue| (stop, queue))
+        watch_and_confine(ended.as_ref(), profile, seatbelt, watched)
+            .map(|(queue, interfaces)| (stop, queue, interfaces))
     });
-    let (stop, queue) = match started {
+    let (stop, queue, interfaces) = match started {
         Ok(started) => started,
         Err(error) => ready.fail(&error.to_string()),
     };
@@ -90,7 +91,7 @@ fn serve(
                 listener,
                 |listener: &TcpListener| listener.accept().map(|(client, _)| client),
                 reach,
-                Interfaces,
+                interfaces,
                 &request,
                 sandy_relay::DRAIN,
             );
@@ -109,14 +110,15 @@ fn serve(
     let _ = server.join();
 }
 
-/// Registers the end of the watched process in a kqueue, raises the descriptor limit, applies
-/// the profile and checks that the destination check still works under it.
+/// Registers the end of the watched process in a kqueue, raises the descriptor limit, opens the
+/// routing socket that reports changes of the network, applies the profile and checks that the
+/// destination check still works under it.
 fn watch_and_confine(
     ended: Option<&File>,
     profile: &Profile,
     seatbelt: &Seatbelt,
     watched: libc::pid_t,
-) -> io::Result<OwnedFd> {
+) -> io::Result<(OwnedFd, Interfaces)> {
     sandy_relay::broker::raise_descriptor_limit()?;
     let queue = new_queue()?;
     register(&queue, watched as usize, libc::EVFILT_PROC, libc::NOTE_EXIT)?;
@@ -124,15 +126,17 @@ fn watch_and_confine(
         // Readable only at its end: nothing writes into this pipe.
         register(&queue, ended.as_raw_fd() as usize, libc::EVFILT_READ, 0)?;
     }
+    let mut interfaces = Interfaces::watching();
     seatbelt.apply(profile).map_err(io::Error::other)?;
+    interfaces.check_watch();
     // Without its addresses and routes the broker would refuse every destination with reply 1;
     // better to refuse the run.
     let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
-    if !Interfaces.is_host(loopback)? {
+    if !interfaces.is_host((loopback, 443).into())? {
         return Err(io::Error::other(
             "the egress broker does not find 127.0.0.1 among this Mac's addresses",
         ));
     }
-    Interfaces.subnets()?;
-    Ok(queue)
+    interfaces.subnets()?;
+    Ok((queue, interfaces))
 }

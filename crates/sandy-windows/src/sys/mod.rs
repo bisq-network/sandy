@@ -15,11 +15,12 @@ mod util;
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::AsRawSocket;
+use std::path::Path;
 
 use sandy_core::{
-    Backend, ChildProcesses, Junctions, PathRule, PlanItem, ProtectedPath, Requirement,
-    ResolvedLevel, ResolvedPolicy, SandboxError, SetupOptions, SetupOutcome, StatusReport,
-    TargetCommand, Warning, WarningId, Win32k, path_directories,
+    Backend, ChildProcesses, Junctions, ParentProcess, PathRule, PlanItem, ProtectedPath,
+    Requirement, ResolvedLevel, ResolvedPolicy, SandboxError, SetupOptions, SetupOutcome,
+    StatusReport, TargetCommand, Warning, WarningId, Win32k, path_directories,
 };
 use windows_sys::Win32::Security::{
     WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
@@ -29,10 +30,11 @@ use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 use windows_sys::Win32::UI::Shell::{
     FOLDERID_CommonStartup, FOLDERID_Documents, FOLDERID_LocalAppData, FOLDERID_Profile,
-    FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_Startup, KF_FLAG_DONT_VERIFY,
+    FOLDERID_ProgramData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_RoamingAppData,
+    FOLDERID_Startup, KF_FLAG_DONT_VERIFY,
 };
 
-use crate::cmdline::{command_line, is_batch_file, without_verbatim_prefix};
+use crate::cmdline::{command_line, refused_program, without_verbatim_prefix};
 use crate::detect::{Detection, Probes};
 use crate::envblock::{LOCAL_APP_DATA, SYSTEM_ROOT, environment_block};
 use crate::name::validate_appcontainer_name;
@@ -41,6 +43,57 @@ use crate::version::WindowsVersion;
 use util::{Sid, wide, wide_nul};
 
 pub use host_network::WindowsHost;
+pub use parent::recorded_parent;
+
+/// Refuses a program that Windows does not start as named (`cmdline::refused_program`).
+fn refuse_program(program: &Path) -> Result<(), SandboxError> {
+    match refused_program(&wide(program.as_os_str())) {
+        Some(reason) => Err(SandboxError::new(reason)),
+        None => Ok(()),
+    }
+}
+
+/// The ports the one relay of a run serves, for its messages, such as "the exposed ports and the
+/// egress port".
+fn relay_serves(exposed: usize, forwarded: usize, egress: bool) -> String {
+    let ports = |count: usize, kind: &str| match count {
+        0 => None,
+        1 => Some(format!("the {kind} port")),
+        _ => Some(format!("the {kind} ports")),
+    };
+    let served: Vec<String> = [
+        ports(exposed, "exposed"),
+        ports(forwarded, "forwarded"),
+        ports(usize::from(egress), "egress"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    match served.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => "no port".to_string(),
+    }
+}
+
+/// Why a run fails when its relay, which serves the ports of `relay_serves`, ends while the
+/// program runs, as on Linux and macOS.
+fn relay_ended_first(exposed: usize, forwarded: usize, egress: bool) -> String {
+    let serves = relay_serves(exposed, forwarded, egress);
+    let gone = if exposed + forwarded + usize::from(egress) == 1 {
+        "the port it served is gone"
+    } else {
+        "the ports it served are gone"
+    };
+    format!(
+        "the relay of {serves} ended before the program; {gone} and the program has been ended \
+         with it"
+    )
+}
+
+/// Why a run fails when its egress broker ends while the program runs, as on Linux and macOS.
+const BROKER_ENDED_FIRST: &str = "the egress broker ended before the program; the program can no \
+    longer connect out and has been ended with it";
 
 /// The Windows backend. It keeps what it learns of the host (`Detection`), so one value serves
 /// one invocation of sandy.
@@ -113,6 +166,22 @@ impl Backend for WindowsBackend {
         notes
     }
 
+    /// A batch file program and, with `end_with_parent`, a parent that has ended, which `run`
+    /// refuses before it changes anything.
+    fn refuse(
+        &self,
+        policy: &ResolvedPolicy,
+        parent: Option<ParentProcess>,
+    ) -> Result<(), SandboxError> {
+        if let Some(program) = &policy.program {
+            refuse_program(program)?;
+        }
+        if policy.end_with_parent {
+            parent::open_parent(parent)?;
+        }
+        Ok(())
+    }
+
     fn run(
         &self,
         policy: &ResolvedPolicy,
@@ -136,11 +205,6 @@ impl Backend for WindowsBackend {
         if policy.program.as_deref() != Some(command.program.as_path()) {
             return Err(SandboxError::new(
                 "the policy was resolved for another program",
-            ));
-        }
-        if is_batch_file(&command.program) {
-            return Err(SandboxError::new(
-                "batch files run in cmd.exe with other argument rules; run cmd.exe /c explicitly",
             ));
         }
         // Opened first, so a parent that has already ended stops the run before anything starts.
@@ -190,7 +254,7 @@ impl Backend for WindowsBackend {
         // name the AppContainer they belong to. Its profile stays like the program's: the runs
         // of one policy share it, and one that ends must not take it from one that starts.
         let broker = match (policy.egress, &relay_rule) {
-            (Some(egress), Some(rule)) => Some(EgressBroker::prepare(name, egress, rule, &held)?),
+            (Some(egress), Some(rule)) => Some(EgressBroker::prepare(name, egress, rule)?),
             _ => None,
         };
         let relay_capability = match relay_rule {
@@ -203,8 +267,13 @@ impl Backend for WindowsBackend {
             let capability = std::slice::from_ref(capability);
             // One `sandy __relay` in the program's AppContainer serves every exposed port, on the
             // listener that sandy creates outside, and every forwarded port, on a listener it
-            // creates inside. The egress broker reaches the program through a forwarded port like
-            // any other, whose socket the broker serves instead of sandy.
+            // creates inside, and the egress port, on a listener it creates inside too, named
+            // with `--egress`; the broker serves that port's AF_UNIX socket instead of sandy.
+            let serves = relay_serves(
+                policy.expose.len(),
+                policy.forward.len(),
+                policy.egress.is_some(),
+            );
             let exposed = relay::listen(&policy.expose)?;
             let mut args = vec![wide(relay::RELAY_COMMAND.as_ref())];
             for (listener, target) in &exposed {
@@ -223,6 +292,10 @@ impl Backend for WindowsBackend {
                     args.push(wide("--forward".as_ref()));
                     args.push(wide(listen.to_string().as_ref()));
                 }
+                if let Some(listen) = egress_listen {
+                    args.push(wide("--egress".as_ref()));
+                    args.push(wide(listen.to_string().as_ref()));
+                }
                 forwarding = Some(started);
                 egress_listener = listener;
             }
@@ -235,11 +308,7 @@ impl Backend for WindowsBackend {
                 capability,
             )
             .map_err(|error| {
-                SandboxError::new(format!(
-                    "cannot start the relay of {} exposed and {} forwarded ports: {error}",
-                    policy.expose.len(),
-                    policy.forward.len()
-                ))
+                SandboxError::new(format!("cannot start the relay of {serves}: {error}"))
             })?;
             relays.push(process::Relay {
                 process,
@@ -248,7 +317,12 @@ impl Backend for WindowsBackend {
                     .into_iter()
                     .map(|(listener, _)| Box::new(listener) as Box<dyn process::InheritedSocket>)
                     .collect(),
-                reports_ready: true,
+                name: "the relay",
+                ended_first: relay_ended_first(
+                    policy.expose.len(),
+                    policy.forward.len(),
+                    policy.egress.is_some(),
+                ),
             });
             // The broker itself: `sandy __broker` in its own AppContainer, serving the egress
             // AF_UNIX socket it inherits. It is in the relay job, so it ends with the program.
@@ -270,7 +344,8 @@ impl Backend for WindowsBackend {
                     )?,
                     appcontainer: &broker.container,
                     sockets: vec![Box::new(listener)],
-                    reports_ready: false,
+                    name: "the egress broker",
+                    ended_first: BROKER_ENDED_FIRST.to_string(),
                 });
             }
         }
@@ -299,7 +374,10 @@ impl Backend for WindowsBackend {
         if let Some(forwarding) = forwarding {
             forwarding.stop(ended.deadline);
         }
-        Ok(ended.code)
+        match ended.failure {
+            Some(failure) => Err(SandboxError::new(failure)),
+            None => Ok(ended.code),
+        }
     }
 
     /// Makes the loopback exemption of the policy's AppContainer match the policy: present with
@@ -328,16 +406,21 @@ impl Backend for WindowsBackend {
             if exempt { "in" } else { "not in" }
         );
         if !policy.expose.is_empty() || !policy.forward.is_empty() || policy.egress.is_some() {
-            // The relay rule is read and execute, so no writable-path check reads `held`.
+            // The SIDs that run sandy.exe, so that setup refuses what check and run refuse.
             let rule = relay::relay_rule().map_err(SandboxError::new)?;
-            acl::grant(name, &rule, &[])?;
+            acl::grant(name, &rule, &held_sids(policy, &container)?)?;
             done.push_str(", and its relays may run sandy.exe");
             // The egress broker runs sandy's executable from an AppContainer of its own, which
             // loopback isolation keeps off this machine only without the exemption.
-            if policy.egress.is_some() {
+            if let Some(egress) = policy.egress {
                 let broker = crate::name::egress_broker_name(name).map_err(SandboxError::new)?;
-                network::set_loopback_exempt(&appcontainer::sid(&broker)?, false)?;
-                acl::grant(&broker, &rule, &[])?;
+                let broker_container = appcontainer::sid(&broker)?;
+                network::set_loopback_exempt(&broker_container, false)?;
+                acl::grant(
+                    &broker,
+                    &rule,
+                    &broker_held_sids(&broker_container, egress.reach)?,
+                )?;
                 done.push_str(
                     ", and so may its egress broker, whose AppContainer is not in the loopback \
                      exemption",
@@ -347,10 +430,11 @@ impl Backend for WindowsBackend {
         Ok(SetupOutcome::Done(done))
     }
 
-    /// Takes back what `setup` and the runs of this policy left behind: the loopback exemptions
-    /// of its AppContainer and of the egress broker's, the access control entry of every policy path and of sandy's own executable, and the
-    /// AppContainer profile with its folder. Only entries for the capability SIDs sandy derives
-    /// for this AppContainer are removed; other software uses capability SIDs too.
+    /// Takes back what `setup` and the runs of this policy left behind: the loopback exemptions of
+    /// its AppContainer and of the egress broker's, the access control entry of every policy path
+    /// and of sandy's own executable, and the AppContainer profile with its folder. Only entries
+    /// for the capability SIDs sandy derives for this AppContainer are removed; other software uses
+    /// capability SIDs too.
     ///
     /// Entries on objects that have left the policy stay, because nothing says where they are.
     /// Without administrator rights it changes nothing (`elevate::needs_rights`).
@@ -439,16 +523,16 @@ impl EgressBroker {
         program_name: &str,
         egress: sandy_core::Egress,
         relay: &PathRule,
-        held: &[Sid],
     ) -> Result<EgressBroker, SandboxError> {
         let name = crate::name::egress_broker_name(program_name).map_err(SandboxError::new)?;
         let container = appcontainer::ensure_profile(&name)?;
         // The broker can write its profile folder (its TEMP) but must not execute what it writes.
         acl::deny_execute_in_profile(&container, &profile_folder(&container)?)?;
-        let mut capabilities = vec![acl::grant(&name, relay, held)?];
-        for capability in crate::plan::broker_network_capabilities(egress.reach) {
-            capabilities.push(network_capability_sid(*capability)?);
-        }
+        let network = broker_network_sids(egress.reach)?;
+        let mut held = vec![container.clone()];
+        held.extend(network.iter().cloned());
+        let mut capabilities = vec![acl::grant(&name, relay, &held)?];
+        capabilities.extend(network);
         Ok(EgressBroker {
             container,
             capabilities,
@@ -538,9 +622,18 @@ impl Probes for WindowsProbes {
         relay::grantable(relay, name)
     }
 
+    fn relay_rights(
+        &self,
+        relay: &acl::GrantTarget,
+        name: &str,
+        policy: &ResolvedPolicy,
+    ) -> Result<(), Problem> {
+        check_relay_rights(relay, name, policy)
+    }
+
     fn writable_paths(
         &self,
-        layout: &Layout,
+        layout: Option<&Layout>,
         policy: &ResolvedPolicy,
         container: &Sid,
     ) -> Result<(), Problem> {
@@ -649,7 +742,7 @@ fn system_directories() -> Result<Vec<ProtectedPath>, SandboxError> {
 }
 
 /// The SIDs the program's token will hold that could carry rights on a policy path: its
-/// AppContainer and its network capabilities. `acl::check_writable` says why the grant
+/// AppContainer and its network capabilities. `acl::check_rights` says why the grant
 /// capabilities are not among them.
 fn held_sids(policy: &ResolvedPolicy, container: &Sid) -> Result<Vec<Sid>, SandboxError> {
     let mut held = vec![container.clone()];
@@ -659,14 +752,59 @@ fn held_sids(policy: &ResolvedPolicy, container: &Sid) -> Result<Vec<Sid>, Sandb
     Ok(held)
 }
 
+/// The SIDs the egress broker's token holds that could carry rights on sandy's executable: its
+/// AppContainer `container` and the network capabilities of `reach`.
+fn broker_held_sids(
+    container: &Sid,
+    reach: sandy_core::EgressReach,
+) -> Result<Vec<Sid>, SandboxError> {
+    let mut held = vec![container.clone()];
+    held.extend(broker_network_sids(reach)?);
+    Ok(held)
+}
+
+/// The network capabilities the egress broker holds for `reach`.
+fn broker_network_sids(reach: sandy_core::EgressReach) -> Result<Vec<Sid>, SandboxError> {
+    crate::plan::broker_network_capabilities(reach)
+        .iter()
+        .map(|capability| network_capability_sid(*capability))
+        .collect()
+}
+
+/// Rule 3 for sandy's executable, which the relays run in the program's AppContainer and the
+/// egress broker in its own: neither may be able to write it, as `run` and `setup` refuse in
+/// `acl::grant`. Changes nothing.
+fn check_relay_rights(
+    relay: &acl::GrantTarget,
+    name: &str,
+    policy: &ResolvedPolicy,
+) -> Result<(), Problem> {
+    let indeterminate = |error: SandboxError| Problem::Indeterminate(error.to_string());
+    let rule = relay.rule();
+    let container = appcontainer::sid(name).map_err(indeterminate)?;
+    acl::check_rights(rule, &held_sids(policy, &container).map_err(indeterminate)?).map_err(
+        |problem| problem.map(|reason| format!("the relays run sandy's executable: {reason}")),
+    )?;
+    // A name with no room for the broker's suffix is the plan's own conflict.
+    let (Some(egress), Ok(broker)) = (policy.egress, crate::name::egress_broker_name(name)) else {
+        return Ok(());
+    };
+    let container = appcontainer::sid(&broker).map_err(indeterminate)?;
+    let held = broker_held_sids(&container, egress.reach).map_err(indeterminate)?;
+    acl::check_rights(rule, &held).map_err(|problem| {
+        problem.map(|reason| format!("the egress broker runs sandy's executable: {reason}"))
+    })
+}
+
 /// Locations of this user that programs outside the sandbox read or execute later: the folders
 /// Windows runs programs from at logon, the PowerShell profile folders, the app execution
-/// aliases, the SSH configuration, cargo's configuration (shared with the Unix backends,
-/// `sandy_core::trust::cargo_configs`) and sandy's own state. A writable path that reaches one of
-/// them lets the program leave a file there that runs outside the sandbox at the next logon or
-/// the next build, and a file the program creates keeps the user's own rights on it, including
-/// the right to execute it (see "Trusted user locations" in docs/windows.md). Such a path is
-/// refused; the directories on sandy's PATH only warn (`path_locations`).
+/// aliases, the configuration of git, SSH, GnuPG and cargo (shared with the Unix backends,
+/// `sandy_core::trust::tool_configs`), libgit2's `%PROGRAMDATA%\Git`, Gpg4win's GnuPG folder
+/// and sandy's own state. A writable path that reaches one of them lets the program leave a file
+/// there that runs outside the sandbox at the next logon or the next build, and a file the
+/// program creates keeps the user's own rights on it, including the right to execute it (see
+/// "Trusted user locations" in docs/windows.md). Such a path is refused; the directories on
+/// sandy's PATH only warn (`path_locations`).
 ///
 /// The list is a heuristic and can never be complete: no list knows which files the programs of
 /// this user trust. The user profile is protected only against a writable path that contains it,
@@ -696,15 +834,93 @@ fn trusted_locations() -> Result<Vec<ProtectedPath>, SandboxError> {
         // The state that decides which policy may join a running AppContainer.
         ProtectedPath::tree(state_directory()?),
     ];
-    let profiles = user_profiles()?;
-    locations.extend(sandy_core::trust::cargo_configs(&profiles));
-    for profile in profiles {
-        locations.push(ProtectedPath::tree(profile.join(".ssh")));
-        // After the folders in it, so that a writable profile is reported with the folder that
-        // makes it dangerous.
-        locations.push(ProtectedPath::entry(profile));
-    }
+    // Where Gpg4win keeps the GnuPG configuration; GnuPG of MSYS2 and Git for Windows reads
+    // `.gnupg` below HOME.
+    locations.push(ProtectedPath::tree(
+        folder(
+            &FOLDERID_RoamingAppData,
+            "cannot find the roaming application data folder",
+        )?
+        .join("gnupg"),
+    ));
+    // libgit2 reads `Git\config` below the folder that PROGRAMDATA names, as a level below the
+    // system configuration (measured with libgit2 1.9.7); every user may create folders in
+    // `C:\ProgramData`. Git for Windows 2.54 no longer reads it.
+    let drives = drives()?;
+    let program_data = folder(&FOLDERID_ProgramData, "cannot find the program data folder")?;
+    locations.extend(
+        known_and_named(program_data, std::env::var_os("PROGRAMDATA"), &drives)
+            .into_iter()
+            .map(|folder| ProtectedPath::tree(folder.join("Git"))),
+    );
+    let profiles = user_profiles(&drives)?;
+    let named_homes: Vec<OsString> = [std::env::var_os("HOME"), home_drive_path()]
+        .into_iter()
+        .flatten()
+        .collect();
+    locations.extend(sandy_core::trust::tool_configs(
+        &tool_homes(&profiles, &named_homes, &drives),
+        &drives,
+    ));
+    // After the folders in it, so that a writable profile is reported with the folder that makes
+    // it dangerous.
+    locations.extend(profiles.into_iter().map(ProtectedPath::entry));
     Ok(locations)
+}
+
+/// The home directories the tools of `sandy_core::trust::tool_configs` read their configuration
+/// below: the profile folders and the `named` homes, HOME and the one of `home_drive_path`. Git
+/// for Windows reads `.gitconfig` and `.config\git` below HOME when it is set, and without HOME
+/// below HOMEDRIVE followed by HOMEPATH (measured on Windows 11 with Git for Windows 2.54); a
+/// tool that does not only makes the list longer. A home without a drive, `\Users\x`, which
+/// git resolves on its current drive, counts on each of `drives`. A relative home, which git
+/// resolves against its working directory, names no one place and is left out.
+fn tool_homes(
+    profiles: &[std::path::PathBuf],
+    named: &[OsString],
+    drives: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let mut homes = profiles.to_vec();
+    for home in named {
+        homes.extend(sandy_core::trust::named_directories(
+            Some(home.clone()),
+            drives,
+        ));
+    }
+    homes.sort();
+    homes.dedup();
+    homes
+}
+
+/// Where Git for Windows and libgit2 look for the home without HOME: HOMEDRIVE followed by
+/// HOMEPATH, and HOMEPATH alone without HOMEDRIVE.
+fn home_drive_path() -> Option<OsString> {
+    let mut home = std::env::var_os("HOMEDRIVE").unwrap_or_default();
+    home.push(std::env::var_os("HOMEPATH")?);
+    Some(home)
+}
+
+/// The drives a path without one may mean to a program outside the sandbox: the drive of
+/// sandy's working directory and the system drive. A program started on another drive is not
+/// covered.
+fn drives() -> Result<Vec<std::path::PathBuf>, SandboxError> {
+    let windows = std::path::PathBuf::from(OsString::from_wide(&windows_directory()?));
+    let current = std::env::current_dir().ok();
+    let mut drives: Vec<std::path::PathBuf> = [Some(windows), current]
+        .into_iter()
+        .flatten()
+        .filter_map(|path| {
+            let std::path::Component::Prefix(prefix) = path.components().next()? else {
+                return None;
+            };
+            let mut drive = std::path::PathBuf::from(prefix.as_os_str());
+            drive.push(std::path::Component::RootDir);
+            Some(drive)
+        })
+        .collect();
+    drives.sort();
+    drives.dedup();
+    Ok(drives)
 }
 
 /// The directories on sandy's PATH, which only warn. A program the sandboxed one leaves in one
@@ -768,18 +984,32 @@ fn session_note() -> Option<Warning> {
 /// The profile folder of this user, from the known folder and from USERPROFILE. The known
 /// folder, because a service that starts sandy with a minimal environment sets no USERPROFILE;
 /// the variable as well, because a user who moves their profile with it keeps their files there.
-fn user_profiles() -> Result<Vec<std::path::PathBuf>, SandboxError> {
+fn user_profiles(drives: &[std::path::PathBuf]) -> Result<Vec<std::path::PathBuf>, SandboxError> {
     let known = std::path::PathBuf::from(OsString::from_wide(&known_folder(
         &FOLDERID_Profile,
         "cannot find the user profile folder",
     )?));
-    let named = std::env::var_os("USERPROFILE")
-        .map(std::path::PathBuf::from)
-        .filter(|path| path.is_absolute());
-    let mut profiles: Vec<std::path::PathBuf> = std::iter::once(known).chain(named).collect();
-    profiles.sort();
-    profiles.dedup();
-    Ok(profiles)
+    Ok(known_and_named(
+        known,
+        std::env::var_os("USERPROFILE"),
+        drives,
+    ))
+}
+
+/// A known folder and the place its variable names, each once. The variable names a place with a
+/// drive directly, and one rooted without a drive on each of `drives`, the same expansion
+/// `tool_homes` does for a home directory; a relative value names no one place and is left out.
+fn known_and_named(
+    known: std::path::PathBuf,
+    named: Option<OsString>,
+    drives: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let mut folders: Vec<std::path::PathBuf> = std::iter::once(known)
+        .chain(sandy_core::trust::named_directories(named, drives))
+        .collect();
+    folders.sort();
+    folders.dedup();
+    folders
 }
 
 /// The locations of this host that a writable path must not reach (rules 3 and 6), and how to
@@ -804,9 +1034,10 @@ impl Layout {
     }
 }
 
-/// Rules 3 and 6 for the writable paths of `policy`: none may overlap a system directory or one
-/// of the user's trusted locations in `layout`, and nobody the program's token carries may
-/// execute files in one. `container` is the policy's AppContainer. Changes nothing.
+/// Rules 3 and 6 for the policy paths of `policy`: no writable path may overlap a system
+/// directory or one of the user's trusted locations in `layout`, and nobody the program's token
+/// carries may execute files in a writable path or write files in an executable one
+/// (`acl::check_rights`). `container` is the policy's AppContainer. Changes nothing.
 ///
 /// Paths are compared as rules 3 and 4 compare them (`PathIdentity`): by the identity of the
 /// directories on the way, so a junction or another spelling of a directory counts as that
@@ -814,56 +1045,59 @@ impl Layout {
 /// with the layout of this host; one that sandy only assumes because it cannot read the
 /// identity of a directory on the way is indeterminate.
 fn check_writable_paths(
-    layout: &Layout,
+    layout: Option<&Layout>,
     policy: &ResolvedPolicy,
     container: &Sid,
 ) -> Result<(), Problem> {
-    let Layout {
+    let held =
+        held_sids(policy, container).map_err(|error| Problem::Indeterminate(error.to_string()))?;
+    let mut problems = Vec::new();
+    // The overlap checks read the layout, so they run only when the policy has a writable path.
+    if let Some(Layout {
         identity,
         system,
         trusted,
         state,
-    } = layout;
-    let held =
-        held_sids(policy, container).map_err(|error| Problem::Indeterminate(error.to_string()))?;
-    let mut problems = Vec::new();
-    if let Some((rule, directory)) = policy.known_writable_conflict(system, identity) {
-        problems.push(Problem::Conflict(format!(
-            "writable path {} overlaps the system directory {}, where Windows lets every \
-             AppContainer read and execute files",
-            rule.path.display(),
-            directory.path.display()
-        )));
-    }
-    if let Some((rule, location)) = policy.known_writable_conflict(trusted, identity) {
-        let why = if location.path == *state {
-            "where sandy keeps the state of its runs; the program could let a run with another \
-             policy join its AppContainer, or make every later run wait"
-        } else {
-            "which programs outside the sandbox read or execute later; a file the program leaves \
-             there runs outside the sandbox"
-        };
-        problems.push(Problem::Conflict(format!(
-            "writable path {} overlaps {}, {why}",
-            rule.path.display(),
-            location.path.display()
-        )));
-    }
-    for protected in [system, trusted] {
-        if let Some((rule, location)) = policy.writable_conflict(protected, identity) {
-            problems.push(Problem::Indeterminate(format!(
-                "cannot tell whether writable path {} overlaps {}: sandy cannot read the identity \
-                 of a directory on the way",
+    }) = layout
+    {
+        if let Some((rule, directory)) = policy.known_writable_conflict(system, identity) {
+            problems.push(Problem::Conflict(format!(
+                "writable path {} overlaps the system directory {}, where Windows lets every \
+                 AppContainer read and execute files",
                 rule.path.display(),
-                location.path.display()
+                directory.path.display()
             )));
+        }
+        if let Some((rule, location)) = policy.known_writable_conflict(trusted, identity) {
+            let why = if location.path == *state {
+                "where sandy keeps the state of its runs; the program could let a run with \
+                 another policy join its AppContainer, or make every later run wait"
+            } else {
+                "which programs outside the sandbox read or execute later; a file the program \
+                 leaves there runs outside the sandbox"
+            };
+            problems.push(Problem::Conflict(format!(
+                "writable path {} overlaps {}, {why}",
+                rule.path.display(),
+                location.describe()
+            )));
+        }
+        for protected in [system, trusted] {
+            if let Some((rule, location)) = policy.writable_conflict(protected, identity) {
+                problems.push(Problem::Indeterminate(format!(
+                    "cannot tell whether writable path {} overlaps {}: sandy cannot read the \
+                     identity of a directory on the way",
+                    rule.path.display(),
+                    location.describe()
+                )));
+            }
         }
     }
     problems.extend(
         policy
             .paths
             .iter()
-            .filter_map(|rule| acl::check_writable(rule, &held).err()),
+            .filter_map(|rule| acl::check_rights(rule, &held).err()),
     );
     worst(problems).map_or(Ok(()), Err)
 }
@@ -973,10 +1207,160 @@ fn network_capability_sid(capability: NetworkCapability) -> Result<Sid, SandboxE
 
 #[cfg(test)]
 mod tests {
+    use std::os::windows::ffi::OsStringExt;
+    use std::path::PathBuf;
+
+    use sandy_core::ProtectedPath;
+
+    use std::ffi::OsString;
+
+    use super::{
+        FOLDERID_ProgramData, FOLDERID_RoamingAppData, drives, known_and_named, known_folder,
+        relay_ended_first, relay_serves, tool_homes, trusted_locations, user_profiles,
+        windows_directory,
+    };
     use crate::{access, probe};
     use windows_sys::Win32::Foundation as f;
     use windows_sys::Win32::Security as ss;
     use windows_sys::Win32::Storage::FileSystem as fs;
+
+    /// `refuse`, which the command line calls for `check` and before `run`, refuses a batch
+    /// file. Nothing of the host is touched before.
+    #[test]
+    fn refuse_names_a_batch_file() {
+        use sandy_core::{Backend, Policy, ResolvedPolicy};
+
+        let mut policy = ResolvedPolicy::resolve(&Policy::default(), None).unwrap();
+        policy.program = Some(std::path::PathBuf::from("C:\\nowhere\\run.cmd"));
+        let error = super::WindowsBackend::new()
+            .refuse(&policy, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("batch files run in cmd.exe"), "{error}");
+    }
+
+    #[test]
+    fn the_relay_names_the_ports_it_serves() {
+        assert_eq!(relay_serves(0, 0, true), "the egress port");
+        assert_eq!(relay_serves(1, 0, false), "the exposed port");
+        assert_eq!(
+            relay_serves(2, 1, false),
+            "the exposed ports and the forwarded port"
+        );
+        assert_eq!(
+            relay_serves(1, 3, true),
+            "the exposed port, the forwarded ports and the egress port"
+        );
+        assert_eq!(
+            relay_ended_first(0, 0, true),
+            "the relay of the egress port ended before the program; the port it served is gone \
+             and the program has been ended with it"
+        );
+        assert!(relay_ended_first(2, 0, false).contains("; the ports it served are gone "));
+    }
+
+    /// The configuration of git and GnuPG is protected below the profile as it is below the
+    /// home directory on Linux and macOS, and Gpg4win's GnuPG folder with it.
+    #[test]
+    fn trusted_locations_cover_git_and_gnupg() {
+        let locations = trusted_locations().unwrap();
+        let profile = user_profiles(&drives().unwrap()).unwrap().remove(0);
+        let known = |id, error| {
+            PathBuf::from(std::ffi::OsString::from_wide(
+                &known_folder(id, error).unwrap(),
+            ))
+        };
+        let roaming = known(&FOLDERID_RoamingAppData, "no roaming folder");
+        let program_data = known(&FOLDERID_ProgramData, "no program data folder");
+        for expected in [
+            ProtectedPath::entry(profile.join(".gitconfig")),
+            ProtectedPath::tree(profile.join(".config").join("git")),
+            ProtectedPath::tree(profile.join(".gnupg")),
+            ProtectedPath::tree(profile.join(".ssh")),
+            ProtectedPath::entry(profile.join(".cargo").join("config.toml")),
+            ProtectedPath::tree(roaming.join("gnupg")),
+            ProtectedPath::tree(program_data.join("Git")),
+        ] {
+            assert!(locations.contains(&expected), "{expected:?}: {locations:?}");
+        }
+        assert!(
+            locations
+                .iter()
+                .position(|l| *l == ProtectedPath::entry(&profile))
+                > locations
+                    .iter()
+                    .position(|l| *l == ProtectedPath::tree(profile.join(".gnupg")))
+        );
+    }
+
+    /// A named home adds a home directory for the tools when it is absolute, on each drive when
+    /// it has a root but no drive, never when it is relative, and each once.
+    #[test]
+    fn tool_homes_add_the_named_homes() {
+        let profile = PathBuf::from(r"C:\Users\someone");
+        let moved = PathBuf::from(r"D:\home");
+        let profiles = std::slice::from_ref(&profile);
+        let drives = [PathBuf::from(r"C:\"), PathBuf::from(r"E:\")];
+        let homes = |named: &[&str]| {
+            let named: Vec<OsString> = named.iter().map(OsString::from).collect();
+            tool_homes(profiles, &named, &drives)
+        };
+        assert_eq!(homes(&[]), vec![profile.clone()]);
+        assert_eq!(homes(&["relative", r"C:relative"]), vec![profile.clone()]);
+        assert_eq!(homes(&[r"C:\Users\someone"]), vec![profile.clone()]);
+        assert_eq!(
+            homes(&[r"D:\home", r"D:\home"]),
+            vec![profile.clone(), moved.clone()]
+        );
+        assert_eq!(
+            homes(&[r"\Users\someone", r"D:\home"]),
+            vec![profile.clone(), moved, PathBuf::from(r"E:\Users\someone")]
+        );
+        assert_eq!(
+            homes(&[r"\\server\share\home"]),
+            vec![PathBuf::from(r"\\server\share\home"), profile]
+        );
+    }
+
+    /// USERPROFILE and PROGRAMDATA, like the tool homes, name a place with a drive directly and
+    /// one rooted without a drive on each drive; a relative value is left out.
+    #[test]
+    fn known_and_named_expands_a_rooted_variable() {
+        let known = PathBuf::from(r"C:\Users\someone");
+        let drives = [PathBuf::from(r"C:\"), PathBuf::from(r"D:\")];
+        let folders = |named: &str| known_and_named(known.clone(), Some(named.into()), &drives);
+        assert_eq!(
+            known_and_named(known.clone(), None, &drives),
+            vec![known.clone()]
+        );
+        assert_eq!(folders("relative"), vec![known.clone()]);
+        assert_eq!(
+            folders(r"E:\profiles\x"),
+            vec![known.clone(), PathBuf::from(r"E:\profiles\x")]
+        );
+        assert_eq!(
+            folders(r"\profiles\x"),
+            vec![
+                PathBuf::from(r"C:\Users\someone"),
+                PathBuf::from(r"C:\profiles\x"),
+                PathBuf::from(r"D:\profiles\x"),
+            ]
+        );
+    }
+
+    /// The drives are drive roots, the system drive among them.
+    #[test]
+    fn drives_hold_the_system_drive() {
+        let drives = drives().unwrap();
+        let windows = PathBuf::from(std::ffi::OsString::from_wide(&windows_directory().unwrap()));
+        assert!(
+            drives.iter().any(|drive| windows.starts_with(drive)),
+            "{drives:?}"
+        );
+        for drive in &drives {
+            assert_eq!(drive.parent(), None, "{drive:?}");
+        }
+    }
 
     #[test]
     fn probe_constants_match_windows_sys() {

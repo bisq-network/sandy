@@ -242,30 +242,219 @@ fn metadata_through_a_read_only_descriptor_is_denied() {
     }
 }
 
-/// A symbolic link planted in a writable path must not reach its target. macOS allows creating the
-/// link (there is no symlink-creation right as on Landlock), but the sandbox resolves it at access
-/// time and checks the real path, so reading through it is denied.
+/// Writable paths grant no symlink or FIFO creation, as on Linux, so the program cannot plant a
+/// link or a FIFO that a later start or a process outside would open.
+#[test]
+fn symlink_and_fifo_in_writable_paths_are_denied() {
+    let fixture = Fixture::new("macos-special");
+    let link = fixture.arg("rw/link");
+    let fifo = fixture.arg("rw/fifo");
+    let make = format!("{link}::{}", fixture.arg("secret/file"));
+
+    let outside = probe_outside(&[("symlink", &make), ("mkfifo", &fifo)]);
+    outside[0].assert_ok();
+    outside[1].assert_ok();
+    let _ = fs::remove_file(fixture.path("rw/link"));
+    let _ = fs::remove_file(fixture.path("rw/fifo"));
+
+    let inside = probe_inside(
+        &fixture.access_args(),
+        &[
+            ("symlink", &make),
+            ("mkfifo", &fifo),
+            ("write", &fixture.arg("rw/file")),
+        ],
+    );
+    assert_not_permitted(&inside[0]);
+    assert_not_permitted(&inside[1]);
+    inside[2].assert_ok();
+
+    // A Unix socket is a name of its own kind, which unix_sockets decides.
+    let unix = with(fixture.access_args(), &["--unix-sockets", "all"]);
+    probe_inside(&unix, &[("unix-listen", &fixture.arg("rw/socket"))])[0].assert_ok();
+}
+
+/// The refusal of the profile rule (EPERM), not any failure: a name left over from an earlier
+/// call would fail with EEXIST.
+fn assert_not_permitted(line: &ProbeLine) {
+    line.assert_blocked();
+    assert!(line.detail.ends_with("(os error 1)"), "{line:?}");
+}
+
+/// A rename, a swap (`renamex_np` with `RENAME_SWAP`) or a clone (`clonefile` with
+/// `CLONE_NOFOLLOW`) of a symbolic link or a FIFO that a process outside made in a writable path
+/// gives it a new name, which Seatbelt checks like a new link or FIFO, so each fails as on Linux.
+/// The program can still delete them. Each call works outside, except a clone of a FIFO, which
+/// APFS refuses with EINVAL there too, so it is left out.
+#[test]
+fn links_and_fifos_in_writable_paths_get_no_new_name() {
+    let fixture = Fixture::new("macos-special-names");
+    let make = || {
+        for kind in ["link", "fifo"] {
+            fs::write(fixture.path(&format!("rw/{kind}-partner")), b"content").unwrap();
+        }
+        for name in ["rename", "swap", "clone", "delete"] {
+            let link = fixture.path(&format!("rw/link-{name}"));
+            std::os::unix::fs::symlink(fixture.path("secret/file"), link).unwrap();
+        }
+        let fifos: Vec<String> = ["rename", "swap", "delete"]
+            .iter()
+            .map(|name| fixture.arg(&format!("rw/fifo-{name}")))
+            .collect();
+        let made: Vec<(&str, &str)> = fifos.iter().map(|fifo| ("mkfifo", fifo.as_str())).collect();
+        for line in probe_outside(&made) {
+            line.assert_ok();
+        }
+    };
+    let pair = |from: &str, to: &str| {
+        format!(
+            "{}{ARGUMENT_SEPARATOR}{}",
+            fixture.arg(from),
+            fixture.arg(to)
+        )
+    };
+    let mut changes = Vec::new();
+    for kind in ["link", "fifo"] {
+        changes.push((
+            "rename",
+            pair(&format!("rw/{kind}-rename"), &format!("rw/{kind}-renamed")),
+        ));
+        changes.push((
+            "rename-swap",
+            pair(&format!("rw/{kind}-swap"), &format!("rw/{kind}-partner")),
+        ));
+    }
+    changes.push(("clone-nofollow", pair("rw/link-clone", "rw/link-cloned")));
+    let changes: Vec<(&str, &str)> = changes.iter().map(|(a, t)| (*a, t.as_str())).collect();
+
+    make();
+    for line in probe_outside(&changes) {
+        line.assert_ok();
+    }
+    fixture.reset();
+    make();
+    let deletes = [fixture.arg("rw/link-delete"), fixture.arg("rw/fifo-delete")];
+    let mut actions = changes.clone();
+    actions.extend(deletes.iter().map(|path| ("delete", path.as_str())));
+    let inside = probe_inside(&fixture.access_args(), &actions);
+    for line in &inside[..changes.len()] {
+        assert_not_permitted(line);
+    }
+    for line in &inside[changes.len()..] {
+        line.assert_ok();
+    }
+}
+
+/// `symlinks = "allow"` takes only the symbolic links out of the rule: the program can make and
+/// rename links in its writable paths, FIFOs and links in read paths stay refused, and a link to a
+/// file outside the policy leads nowhere, because Seatbelt checks the path a link resolves to. A
+/// link to a file of the writable path works. Each call works outside.
+#[test]
+fn symlinks_allow_makes_links_that_reach_nothing_new() {
+    let fixture = Fixture::new("macos-symlinks-allow");
+    let make = |link: &str, target: &str| format!("{}::{}", fixture.arg(link), fixture.arg(target));
+    let outside_link = make("rw/outside", "secret/file");
+    let inside_link = make("rw/inside", "rw/file");
+    let read_link = make("ro/link", "ro/file");
+    let fifo = fixture.arg("rw/fifo");
+    let renamed = format!(
+        "{}{ARGUMENT_SEPARATOR}{}",
+        fixture.arg("rw/inside"),
+        fixture.arg("rw/renamed")
+    );
+    let actions = [
+        ("symlink", outside_link.as_str()),
+        ("symlink", inside_link.as_str()),
+        ("symlink", read_link.as_str()),
+        ("mkfifo", fifo.as_str()),
+        ("rename", renamed.as_str()),
+    ];
+    for line in probe_outside(&actions) {
+        line.assert_ok();
+    }
+    fixture.reset();
+
+    let allow = with(fixture.access_args(), &["--symlinks", "allow"]);
+    let (through_outside, through_renamed) = (fixture.arg("rw/outside"), fixture.arg("rw/renamed"));
+    let mut reads = actions.to_vec();
+    reads.extend([
+        ("read", through_outside.as_str()),
+        ("read", through_renamed.as_str()),
+    ]);
+    let lines = probe_inside(&allow, &reads);
+    lines[0].assert_ok();
+    lines[1].assert_ok();
+    assert_not_permitted(&lines[2]);
+    assert_not_permitted(&lines[3]);
+    lines[4].assert_ok();
+    lines[5].assert_blocked();
+    lines[6].assert_ok();
+    assert_eq!(
+        fs::read_link(fixture.path("rw/outside")).unwrap(),
+        fixture.path("secret/file")
+    );
+}
+
+/// `clonefile` of a directory copies the whole tree, and Seatbelt checks only the directory it
+/// creates, not the links and FIFOs inside (measured on macOS 27.0.1: the clone of a tree with
+/// both was allowed). The profile therefore refuses directory clones, from a read path and within
+/// a writable one; a clone of a file still works. Each clone works outside.
+#[test]
+fn directory_clones_bring_no_links_or_fifos_into_writable_paths() {
+    let fixture = Fixture::new("macos-tree-clone");
+    for tree in ["ro/tree", "rw/tree"] {
+        fs::create_dir_all(fixture.path(tree)).unwrap();
+        fs::write(fixture.path(tree).join("file"), b"content").unwrap();
+        std::os::unix::fs::symlink(fixture.path("secret/file"), fixture.path(tree).join("link"))
+            .unwrap();
+    }
+    let fifos = [fixture.arg("ro/tree/fifo"), fixture.arg("rw/tree/fifo")];
+    let made: Vec<(&str, &str)> = fifos.iter().map(|fifo| ("mkfifo", fifo.as_str())).collect();
+    for line in probe_outside(&made) {
+        line.assert_ok();
+    }
+    let pair = |from: &str, to: &str| {
+        format!(
+            "{}{ARGUMENT_SEPARATOR}{}",
+            fixture.arg(from),
+            fixture.arg(to)
+        )
+    };
+    let trees = [pair("ro/tree", "rw/from-ro"), pair("rw/tree", "rw/from-rw")];
+    let clones: Vec<(&str, &str)> = trees.iter().map(|tree| ("clone", tree.as_str())).collect();
+    for line in probe_outside(&clones) {
+        line.assert_ok();
+    }
+    for copy in ["rw/from-ro", "rw/from-rw"] {
+        fs::remove_dir_all(fixture.path(copy)).unwrap();
+    }
+
+    let file = pair("ro/tree/file", "rw/file-clone");
+    let mut actions = clones.clone();
+    actions.push(("clone", &file));
+    let inside = probe_inside(&fixture.access_args(), &actions);
+    assert_not_permitted(&inside[0]);
+    assert_not_permitted(&inside[1]);
+    inside[2].assert_ok();
+    for copy in ["rw/from-ro", "rw/from-rw"] {
+        assert!(!fixture.path(copy).exists(), "{copy} exists");
+    }
+}
+
+/// A symbolic link that a process outside put in a writable path does not reach its target: the
+/// sandbox checks the path the link resolves to.
 #[test]
 fn symlink_in_writable_path_does_not_grant_its_target() {
     let fixture = Fixture::new("macos-symlink");
     let link = fixture.arg("rw/link");
-    let secret = fixture.arg("secret/file");
-    let make = format!("{link}::{secret}");
+    let make = format!("{link}::{}", fixture.arg("secret/file"));
 
-    // Control outside: the link is created and reading through it yields the secret.
     let outside = probe_outside(&[("symlink", &make), ("read", &link)]);
     outside[0].assert_ok();
     outside[1].assert_ok();
-    let _ = fs::remove_file(fixture.path("rw/link"));
 
-    let inside = probe_inside(
-        &fixture.access_args(),
-        &[("symlink", &make), ("read", &link)],
-    );
-    // Creating the link inside a writable path is allowed on macOS.
-    inside[0].assert_ok();
-    // Reading through it must be denied: it resolves to a file outside the policy.
-    inside[1].assert_blocked();
+    let inside = probe_inside(&fixture.access_args(), &[("read", &link)]);
+    inside[0].assert_blocked();
 }
 
 /// The host name port (mach_host_self) is a task special port inherited across exec and needs no
@@ -768,7 +957,8 @@ fn paths_through_the_system_links_reach_only_granted_files() {
 /// real path is checked as well, so through such a link the program reaches the granted files
 /// and nothing else, also for the calls that only test existence, and a link the policy does not
 /// pass leads nowhere, also one to a granted file. The program can neither
-/// remove nor rename a link, nor rename a link of its own over it; each of these works outside.
+/// remove nor rename a link, nor rename a file of a writable path over it; each of these works
+/// outside.
 #[test]
 fn policy_paths_named_through_links_reach_only_granted_files() {
     use std::os::unix::fs::symlink;
@@ -795,13 +985,12 @@ fn policy_paths_named_through_links_reach_only_granted_files() {
     for spare in ["spare-delete", "spare-rename", "spare-replaced"] {
         symlink(path("ro"), path(spare)).unwrap();
     }
+    fs::write(path("rw/spare-file"), b"content").unwrap();
     let pair = |from: &str, to: &str| format!("{}{ARGUMENT_SEPARATOR}{}", arg(from), arg(to));
-    let plant = |link: &str| format!("{}::{}", arg(link), arg("secret"));
     let outside = [
         ("delete", arg("spare-delete")),
         ("rename", pair("spare-rename", "spare-renamed")),
-        ("symlink", plant("rw/evil-outside")),
-        ("rename", pair("rw/evil-outside", "spare-replaced")),
+        ("rename", pair("rw/spare-file", "spare-replaced")),
     ];
     let outside: Vec<(&str, &str)> = outside.iter().map(|(a, t)| (*a, t.as_str())).collect();
     for line in probe_outside(&outside) {
@@ -829,7 +1018,6 @@ fn policy_paths_named_through_links_reach_only_granted_files() {
         ("read", arg("rw-link/new")),
         ("read", arg("chain-a/file")),
         ("read", arg("file-link")),
-        ("symlink", plant("rw/evil")),
     ];
     // Each pair: a path through a link that exists but is not granted, and one that does not
     // exist. Every call that only tests existence is here, so the link is no oracle.
@@ -901,10 +1089,12 @@ fn policy_paths_named_through_links_reach_only_granted_files() {
     let hidden: Vec<(&str, String, String)> = hidden.into_iter().chain(creates).collect();
     // Changes to a policy link, with the errno each must give: EPERM, because no rule allows
     // a write there, or ENOENT where the other name lies outside the policy and looks missing.
+    // A regular file is renamed over the link, so the rule against new links in writable paths
+    // plays no part.
     let changes = [
         ("delete", arg("ro-link"), "(os error 1)"),
         ("rename", pair("ro-link", "moved"), "(os error 2)"),
-        ("rename", pair("rw/evil", "ro-link"), "(os error 1)"),
+        ("rename", pair("rw/file", "ro-link"), "(os error 1)"),
     ];
     let mut actions: Vec<(&str, &str)> = granted.iter().map(|(a, t)| (*a, t.as_str())).collect();
     for (action, existing, missing) in &hidden {

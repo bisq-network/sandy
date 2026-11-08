@@ -61,6 +61,8 @@ read = ["/opt/app/share"]     # read files, list directories
 read_exec = ["/opt/app/bin"]  # read, list, execute
 read_write = ["/var/lib/app"] # read, list, create, change, delete; never execute
 view = "all"                  # "all" | "policy"; policy: paths outside the policy look missing
+symlinks = "deny"             # "deny" | "allow"; allow: new symbolic links in read_write paths;
+                              # see rule 14
 
 [network]
 ip = "none"                   # "none" | "private" | "client" | "all"; IPv4 and IPv6 including
@@ -121,10 +123,14 @@ Rules:
    on the folder behind the share (docs/windows.md, "Network and share paths").
 2. A rule applies to the path and everything beneath it.
 3. No path may be both writable and executable, also not through nesting. sandy rejects such a
-   policy. The program could otherwise drop an executable that a process outside the sandbox
-   later runs. The rule holds per file, not per name: a file that has a second name inside a
-   writable path is writable, so an executable path, or the program file, that leads to the same
-   file is refused as well (see "Links and file identity").
+   policy. The program could otherwise drop an executable that a process outside the sandbox later
+   runs. A hard link that gives an executable file a second name inside a writable path, from the
+   host or from an earlier run that could write both names, is the policy author's concern: sandy
+   does not walk the trees for it (see "Links and file identity"). The rule is about the grants of
+   the policy: sandy gives no writable path the right to start or load a file. Code the program runs
+   inside the sandbox from a file it wrote, mapped as code (Linux without the view; see "File system
+   view") or made executable by permissions it set when it created the file (Windows), keeps the
+   program's own rights, so the rule does not cover it.
 4. No policy path may lie inside a writable path, and none may be resolved through an entry
    inside one, such as a symbolic link in a writable directory that points elsewhere. sandy
    resolves symbolic links at every start, so the program could replace such an entry with a
@@ -207,18 +213,21 @@ Rules:
    platform-specific (field 22 of `/proc/PID/stat`, the recorded start time, the creation time).
    sandy also refuses when it sees that the process it would watch has already ended, and on
    macOS when that process is launchd, which has no end to wait for.
-12. No writable policy path may reach a location of this user whose content other programs read
-   or execute later: the home directory (which it may not contain), the startup files of the
-   shells, the SSH, GnuPG, git and cargo configuration, and per platform autostart entries and
-   user services, `~/Library/LaunchAgents`, the Startup folders, the PowerShell profile folders,
-   `WindowsApps` and, on Windows, sandy's own state folder, which decides which policy may join a
-   running AppContainer. Linux and macOS share one list for what every Unix has
-   (`sandy_core::trust`), so one policy is refused on both for the same files. A file the program
-   leaves in one of the others runs outside the sandbox with the user's rights at the next login,
-   the next shell or the next run of the tool, which would make the whole policy pointless. The
-   backend checks this, because only it knows the locations of its platform, and it compares
-   paths as rules 3 and 4 do. A path below the home directory stays writable: only the locations
-   themselves and the trees of those that hold code are protected.
+12. No writable policy path may reach a location of this user whose content other programs read or
+   execute later: the home directory (which it may not contain), the startup files of the shells,
+   the SSH, GnuPG, git and cargo configuration (also where `GNUPGHOME`, `GIT_CONFIG_GLOBAL` and
+   `GIT_CONFIG_SYSTEM` move it when set; a device they name holds nothing that persists, so only
+   the directory it lies in counts, and a refusal names the variable), and per platform autostart
+   entries and user services, `~/Library/LaunchAgents`, the Startup folders, the PowerShell profile
+   folders, `WindowsApps` and, on Windows, sandy's own state folder, which decides which policy may
+   join a running AppContainer. Linux and macOS share one list for what every Unix has
+   (`sandy_core::trust`), so one policy is refused on both for the same files, and Windows shares
+   the git, SSH, GnuPG and cargo part of it (`trust::tool_configs`). A file the program leaves in
+   one of the others runs outside the sandbox with the user's rights at the next login, the next
+   shell or the next run of the tool, which would make the whole policy pointless. The backend
+   checks this, because only it knows the locations of its platform, and it compares paths as rules
+   3 and 4 do. A path below the home directory stays writable: only the locations themselves and
+   the trees of those that hold code are protected.
 
    A directory on `PATH` is **warned about, not refused**. The escape is the same, a file the
    program leaves there runs when the user next types its name, but a writable path that holds
@@ -279,6 +288,20 @@ Rules:
    terminal, is accepted. Linux knows a master by its device number, macOS by the major number
    of `/dev/ptmx` (see the platform docs); Windows has no such device. `check` cannot report
    any of this: the streams it is given are not the streams of the later `run`.
+14. A writable path never gets new named pipes or devices, and new symbolic links only with
+   `filesystem.symlinks = "allow"`. The names of a writable path stay there after the run, and a
+   process outside the sandbox that opens one of them, a configuration file it writes before every
+   start for example, would follow a link the program left there to any file of the user, or wait on
+   a FIFO. A rename or a clone that gives an existing link or FIFO a new name counts as a new one.
+   The default `deny` costs tools that make links (README.md, "Symbolic links"). `allow` gives the
+   program nothing it could not reach otherwise, because Landlock and Seatbelt check the file a link
+   resolves to, but a link can point anywhere: neither can look at its target when it is created, so
+   no rule can keep a link to a file outside the policy out, and `check` warns that processes
+   outside follow such links (`symlinks-followed-outside`). Rule 4 still holds: a policy path
+   reached through a link in a writable path is refused. Windows refuses an AppContainer every
+   symbolic link, so there the setting changes nothing; the program can still make a junction, which
+   Windows counts as a link, that leads to a directory within its writable paths, under either
+   value, and none that leads out of them (docs/windows.md, "Links and file identity").
 
 ## Links and file identity
 
@@ -303,26 +326,26 @@ write the other changes what programs read.
   names only an overlap sandy sees (see docs/windows.md).
 - **Two names, one file.** A hard link gives one file a second name. The kernels check the name
   a call uses, so a file that is executable under one name and writable under another is both.
-  At the start sandy looks for a second name inside the writable paths of every file that must
-  not be writable: the files and trees of `read_exec` paths, the program file, its own
-  executable and the policy file. It walks the writable trees first, because a file with more
-  than one name is rare there, and the executable trees only when it found one. A directory
-  the user may not list is skipped: the program runs as the same user and cannot list it
-  either. So is an entry that disappears during the walk, such as one of a process that ends
-  meanwhile below a writable `/proc`. On Windows a file lists its own names
-  (`FindFirstFileNameW`), so sandy asks the files themselves and walks the writable trees only
-  for a `read_exec` directory.
-- **What stays open.** A hard link between a writable path and a file that no rule names, or
-  that only a `read` rule names, is allowed: the program can change that file through the
-  writable name. Refusing it would stop the package managers that fill a project from a shared
-  cache with hard links, so the policy decides what a writable path may hold. The entries of the
-  system set and the locations of rule 12 are compared as paths and directories, not for second
-  names: a hard link of a shell startup file inside a writable path stays writable through that
-  name. Two names that different file systems show for one file, as a passthrough FUSE mount
-  does, have different identities and stay unseen. The check runs at the start, so a link that a
-  process outside the sandbox makes while the program runs is not covered. The program cannot
-  make one itself: it gets no link right out of its writable paths and no execute access inside
-  them.
+  Within a run the program can link only files it may write: Landlock refuses a link across
+  directories without the refer right and to a file it may not write, Seatbelt refuses
+  `link(2)` everywhere, and an AppContainer cannot link a file it may not write. Across runs it
+  can: a run that may write a tree can link two of its files, which a later policy may name
+  differently. What a policy makes executable is the choice of whoever writes it, so sandy does
+  not judge the history of the trees it names, as it does not judge the permission entries of
+  other software on them. It looks for a second name inside the
+  writable paths only of the files it trusts itself, its own executable and the policy file,
+  which a program must not rewrite for the next start. On Unix that walks the writable trees
+  only when one of those files has more than one name; on Windows a file lists its own names
+  (`FindFirstFileNameW`).
+- **What stays open.** A hard link between a writable path and any other file, also one of a
+  `read_exec` path or the program file, is allowed: the program can change that file through the
+  writable name. Refusing it would cost a walk of the writable trees at every start, and package
+  managers fill projects from a shared cache with hard links. The
+  entries of the system set and the locations of rule 12 are compared as paths and directories, not
+  for second names: a hard link of a shell startup file inside a writable path stays writable
+  through that name. Two names that different file systems show for one file, as a passthrough FUSE
+  mount does, have different identities and stay unseen. The check runs at the start, so a link that
+  a process outside the sandbox makes while the program runs is not covered.
 
 ## Exposed ports
 
@@ -408,9 +431,12 @@ Rules:
    ended it and also while sandy is stopped, and sandy exits with status 125. A dead forward relay frees the program's
    forward port, and any local user can then bind it and receive what the program sends there
    for `to`: its requests, credentials and data. A relay that ends together with the program,
-   or after it, is the normal end of a run. Without `contained` nothing watches the relay,
-   because sandy has become the program, so a relay that something outside the sandbox kills
-   leaves the program running with its forward port free for others to bind.
+   or after it, is the normal end of a run. Without `contained` nothing watches the relay on
+   Linux and macOS, because sandy has become the program, so a relay that something outside the
+   sandbox kills leaves the program running with its forward port free for others to bind. On
+   Windows sandy always stays the parent and waits for the relay and the egress broker next to
+   the program, so with any policy one that ends first ends the program's job, and sandy exits
+   with status 125 (docs/windows.md, "How the relays end").
 6. Who may connect: an exposed port is meant for other processes, including those of other
    users, and the program's own listener is reachable directly on Linux and macOS anyway, so
    the relay serves every connection there. A forwarded port is for the program alone, and the
@@ -523,7 +549,7 @@ everywhere; a backend adds only its answer about its own addresses (`HostNetwork
    depends on the network. Port 0 is refused.
 3. The host's part: whether an address is the host's own (an interface address, a subnet
    broadcast address, or a local, broadcast, anycast or multicast route), and which networks the
-   host reaches without a router, asked for every connection. Those are the subnet of every
+   host reaches without a router, when a connection comes in. Those are the subnet of every
    interface address, for a point-to-point link that of its peer, and the network of every
    unicast route whose next hop is no gateway, except the default route and routes into a
    point-to-point or tunnel link. A route counts also where no address of the host has its
@@ -540,11 +566,16 @@ everywhere; a backend adds only its answer about its own addresses (`HostNetwork
    `public-and-local` allows it also in a block that is not globally reachable, but a subnet
    never opens what rule 6 never allows, such as loopback or link-local. When the host cannot
    tell, the broker refuses with reply 1. Linux asks the kernel's routing tables
-   (`RTM_GETROUTE`, also as a dump of every table, `RTM_GETADDR` and `RTM_GETLINK`) over a
-   `NETLINK_ROUTE` socket that it opens before the broker confines itself. macOS reads
-   `getifaddrs` and the routing table for every connection, which its broker profile allows
-   through the routing sysctl; it has no local route without an interface address. Windows asks
-   `GetAdaptersAddresses`, `GetBestRoute2` and `GetIpForwardTable2`.
+   (`RTM_GETROUTE` for a TCP connect to the destination's port, so that policy routing rules
+   select the route the connect takes, also as a dump of every table, `RTM_GETADDR` and
+   `RTM_GETLINK`) over a `NETLINK_ROUTE` socket that it opens before the broker confines itself,
+   and keeps the addresses and networks until a second netlink socket reports a change. macOS
+   reads `getifaddrs` and the routing table, which its broker profile allows through the routing
+   sysctl, and keeps the routes until a routing socket reports a message; it has no local route
+   without an interface address. Windows asks `GetAdaptersAddresses`, `GetBestRoute2` and
+   `GetIpForwardTable2`, and keeps all but the best route until a change notification of an
+   address, an interface or a route. Where the system lets a broker not watch for changes, it
+   reads everything for every connection.
 4. The broker connects to the address it checked, an IPv4-mapped one as IPv4, within 10
    seconds. A refused, unreachable or timed-out connect gets reply 5, 3 or 4, any other failure
    reply 1. It judges only the address: a router that maps a public address back to this host,
@@ -553,7 +584,10 @@ everywhere; a backend adds only its answer about its own addresses (`HostNetwork
    address the program named as the peer (the exceptions table, row "All").
 5. It serves at most `sandy_relay::broker::MAX_CONNECTIONS` (1000) connections at the same time,
    more than a relayed port, because a program that talks to many peers needs them. Each takes
-   two threads with small stacks and two descriptors; macOS allows a process 2048 threads.
+   two threads with small stacks and two descriptors; macOS allows a process 2048 threads. On
+   Windows the program reaches the broker through the relay in its AppContainer, whose egress
+   route has the same limit and the same small stacks (`sandy_relay::Capacity::Egress`), so the
+   relay does not lower it.
 
 ## The file system view
 
@@ -568,7 +602,10 @@ Rules:
    the program may do with what it sees.
 2. Execute stays a right of its own. On Linux every path the policy does not make executable, a
    writable path or a `read` path, is mounted without execute, so a file there can be neither
-   executed nor mapped as code; `read_exec` is how a policy grants both.
+   executed nor mapped as code; `read_exec` is how a policy grants both. Without the view,
+   Landlock checks only `execve`, so a file of a `read` or writable path can be mapped as code
+   on Linux, which macOS and Windows refuse: a library there loads on Linux only
+   (docs/linux.md, "Rights per access level").
 3. A platform that cannot hide paths reports the requirement as unavailable, and `run` refuses
    (Windows: docs/windows.md).
 4. What the view changes for programs is in the platform docs: on Linux a rename or a link
@@ -641,7 +678,7 @@ exceptions:
 | Linux | `ip = "private"` | processes of the user that runs sandy can enter the sandbox's network namespace, which belongs to that user, and reach the program's ports and forwarded ports there without a relay, and the egress port |
 | Linux | `path_metadata = "deny"` with a `read` or `read_exec` path, without `view = "policy"` | the mode, except the setuid and setgid bits, and the times of a file or directory the program may only read, through a descriptor it opened for reading (`fchmod`, `futimens`) |
 | Linux | `view = "policy"` | `statfs` of a path in the view reports the host's file system there: its type, size, free space and number of files |
-| Linux | `view = "policy"` | the directories above a granted path exist in the view, with their names |
+| Linux | `view = "policy"` | the directories above a granted path, and a working directory outside the policy with the directories above it, exist in the view, with their names |
 | Linux | `view = "policy"` | the link count of a granted file counts its names outside the view |
 | Linux | `view = "policy"` with a `/proc` path | the mount table names the host's device, file system and mount options of every mount of the view, and the mount table of a process outside the sandbox lists the host's mounts with their paths |
 | macOS | `signals = "isolated"` | SIGIO (to a process of any user), and SIGURG with an `ip` other than `"none"`, through the owner ioctls of sockets and pipes; without `children = "contained"` also joining another job of the terminal session and stopping it |
@@ -706,12 +743,12 @@ probes, instead of in every program that embeds it.
    program is isolated: `filesystem.view`, `network.ip`, `network.unix_sockets`,
    `network.egress`, `process.signals`, `process.children`, `process.end_with_parent`,
    `linux.path_metadata`, `macos.relays`, `windows.win32k` and `windows.appcontainer_name`.
-   Paths, `system`, the environment, `expose` and `forward` are the same in every level, so the
-   program finds the same files and ports in each, and the path rules (rules 2 to 4 and 8 of
-   README.md), checked once, cover every level: no level's writable path can reach a path of
-   another. `ResolvedPolicy::resolve_levels` resolves the paths once and checks the settings of
-   each level as a policy of its own, on every host, so a level that could never run is an
-   error everywhere.
+   Paths, `system`, `symlinks`, the environment, `expose` and `forward` are the same in every
+   level, so the program finds the same files and ports in each, and the path rules (rules 2 to
+   4 and 8 of README.md), checked once, cover every level: no level's writable path can reach a
+   path of another. `ResolvedPolicy::resolve_levels` resolves the paths once and checks the
+   settings of each level as a policy of its own, on every host, so a level that could never run
+   is an error everywhere.
 2. **A level is skipped only for a lasting shortfall of the host**: its plan is not enforceable,
    and every report that is not enforced is `Unavailable` or `NeedsSetup`. An `Indeterminate`
    report or a `Conflict` stops the choice with status 125, also when a weaker level would be
@@ -838,7 +875,10 @@ the program controls; it reads at most one path of bounded length per call and n
 what it reads. On Linux the watcher is a thread with a seccomp filter of its own, which ends
 sandy at any call the watcher does not need. The thread shares its memory with sandy's
 unconfined main thread, so the filter narrows what a flaw in the parsing reaches without walling
-it off.
+it off. The lines go to standard error through a queue that a thread of sandy writes from, so a
+standard error that nobody reads holds up neither the watcher nor the end of sandy: lines that
+do not fit are dropped and counted in the report, and at the end sandy waits at most a second
+for what is queued.
 
 ## Mechanisms (each backend section is owned by its backend)
 
@@ -889,16 +929,16 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   the root and detaches the old one. Landlock decides access as without the view. It requires
   the fix of Landlock erratum 3, read from the errata bitmask; `run` refuses a directory on a
   standard stream, through which the program would reach the hidden paths by name.
-- Landlock (ABI 1 or newer, read from the kernel at run time) handles every file system right of
-  the ABI. Writable paths never get execute, symbolic link, named pipe or device rights. Each
-  rule path is opened without following links and must still be the file sandy planned with. ABI 6
-  scopes signals (required for `signals = "isolated"`, unless `children = "contained"` runs the
-  program in a PID namespace) and abstract Unix sockets; ABI 9 denies
-  pathname Unix sockets when `unix_sockets = "none"`; ABI 4 denies TCP when `ip = "none"`. With
-  `ip = "client"` a second ruleset, built with raw system calls because the `landlock` crate
+- Landlock (ABI 1 or newer, read from the kernel at run time) handles every file system right of the
+  ABI. Writable paths never get execute, named pipe or device rights, and symbolic link rights only
+  with `symlinks = "allow"`. Each rule path is opened without following links and must still be the
+  file sandy planned with. ABI 6 scopes signals (required for `signals = "isolated"`, unless
+  `children = "contained"` runs the program in a PID namespace) and abstract Unix sockets; ABI 9
+  denies pathname Unix sockets when `unix_sockets = "none"`; ABI 4 denies TCP when `ip = "none"`.
+  With `ip = "client"` a second ruleset, built with raw system calls because the `landlock` crate
   does not know the UDP right, lets sockets bind only port 0, a port the kernel chooses: TCP from
-  ABI 4, UDP from ABI 10. It decides nothing about listening: `listen` on an unbound socket picks
-  a port without that check.
+  ABI 4, UDP from ABI 10. It decides nothing about listening: `listen` on an unbound socket picks a
+  port without that check.
 - Seccomp allowlist: the reviewed system call table of Linux 7.2; every other number, x32 numbers,
   `clone3`, `openat2`, `fanotify_init` and `name_to_handle_at` fail with `ENOSYS`; other CPU
   architectures are killed.
@@ -1023,8 +1063,10 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   `chdir` and the path from `getattrlist` answer for every path again, because a connect to a
   socket outside the policy needs that check. `kill(pid, 0)` still tells a live process ID from
   an unused one.
-- Hard links are denied; clones (`std::fs::copy`) work only into writable paths and only from
-  files the target may read. ptrace attach is denied (Seatbelt checks it as `system-debug`).
+- Hard links are denied, and writable paths never get new named pipes or devices, and new
+  symbolic links only with `symlinks = "allow"`, as on Linux; clones (`std::fs::copy`) work
+  only of files, only into writable paths and only from files the target may read. ptrace
+  attach is denied (Seatbelt checks it as `system-debug`).
 - dyld needs the root directory itself (only the names in `/`) to find the shared cache, so the
   minimal system set contains it; with `system = "none"` no program can start on macOS, so the
   backend refuses that unless a policy path covers "/".
@@ -1045,7 +1087,8 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
 - The egress broker is a helper process of its own, forked twice like the relay and watched like
   it, with its own profile: accept on its port, TCP out with every address of the Mac denied
   after that allow, the routing sysctl for `getifaddrs` and the routing table, no files, no Mach
-  services. Its `HostNetwork` answer comes from both at every connection.
+  services. Its `HostNetwork` answer comes from both; the routes are kept until a routing socket
+  opened before the profile reports a message.
 - `filesystem.view = "policy"` is the `ENOENT` rule that every profile has; it is unavailable
   with `unix_sockets = "all"`, which allows the existence check for every path.
 - `ip = "client"`: `network-outbound` and `network-bind` for IP sockets, `network-inbound` for UDP
@@ -1117,8 +1160,11 @@ Details, limitations and sources: `docs/windows.md`.
   (`sandy setup --remove` does) and serializes its DACL changes with a lock file of the user, so
   concurrent runs do not conflict.
   Read and read-write never contain `FILE_EXECUTE`; read levels contain no right that changes
-  metadata. sandy refuses to propagate a grant through junctions or symbolic links, and refuses
-  a policy path on a network share. The system set is what Windows grants ALL APPLICATION
+  metadata. The root of a read-write path lacks `DELETE` (a second, inherit-only ACE gives it to
+  everything below), so the program cannot remove or move the path itself, as on Linux and
+  macOS. A grant does not propagate through a junction or symbolic link below the path
+  (measured, and checked by `a_grant_does_not_follow_a_link_below_the_path` at every run of the
+  suite), so sandy does not walk the tree for them; it refuses a policy path on a network share. The system set is what Windows grants ALL APPLICATION
   PACKAGES; `system = "none"` is unavailable.
 - Network capabilities `internetClientServer` and `privateNetworkClientServer` only with
   `ip = "all"`, `internetClient` alone with `ip = "client"`: Windows Firewall then drops what
@@ -1155,8 +1201,10 @@ Details, limitations and sources: `docs/windows.md`.
 - Writable paths (rules 3 and 6): the plan refuses a `read_write` path that overlaps the Windows
   or a program files directory, or where ALL APPLICATION PACKAGES, ALL RESTRICTED APPLICATION
   PACKAGES, the policy's AppContainer or one of its network capabilities may execute files, also
-  only files created later. When sandy adds the grant it walks the tree and refuses a file below
-  the path whose own permissions say the same.
+  only files created later, and a `read_exec` path or program file that they may write, also
+  sandy's executable for the relays and the broker. It reads the permissions of the path
+  itself; what files below carry of their own is the policy author's concern (docs/windows.md,
+  "What every AppContainer can read").
 - sandy sets `SystemRoot` and `LOCALAPPDATA`; without the latter Windows refuses to create an
   AppContainer process. Windows sets `LOCALAPPDATA`, `TEMP` and `TMP` to the profile folder.
 - Job object with kill-on-close, no breakaway and all UI restrictions. The program is created

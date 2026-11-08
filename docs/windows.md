@@ -68,10 +68,12 @@ in one of four classes:
   policy needs without, and a grant on `sandy.exe` that the current user may not add.
 - **Conflict** (`CONFLICT`, status 125), the same for every level: no AppContainer name or an
   invalid one; a name too long for the egress broker's suffix; a policy path on a share or a
-  mapped drive; `sandy.exe` in a read-write path; a writable path that overlaps a system
+  mapped drive; `sandy.exe` in a read-write path, or with permissions that let the relays' or
+  the egress broker's AppContainer write it; a writable path that overlaps a system
   directory or a trusted location, or whose permissions let an AppContainer execute files there,
-  are missing (NULL DACL) or hold entries sandy cannot evaluate; a policy path whose grant the
-  current user may not add.
+  are missing (NULL DACL) or hold entries sandy cannot evaluate; an executable path, or the
+  program file, whose permissions let an AppContainer write there, as in its profile folder, or
+  are missing or hold such entries; a policy path whose grant the current user may not add.
 - **Indeterminate** (`UNDECIDED`, status 125), a probe that failed for a reason that can pass:
   a firewall service that is starting, stopping or cannot be queried; loopback exemptions, the
   update revision of an affected build, the job sandy runs in, a known folder, or a file ID or
@@ -155,17 +157,44 @@ program could write a file that it may then execute (rule 3). The plan reports
 
 Permissions that sandy cannot read are indeterminate instead.
 
+A deny entry takes nothing away in this check. The AppContainer access check has two passes: the
+first one evaluates the user's own token and honors deny entries for the user and its groups, the
+second one evaluates the package SID, the capabilities and the two package groups and ignores
+deny entries for every one of them. Measured on Windows 11 build 26200 with a child process in an
+AppContainer with one capability, opening a file whose DACL held a deny entry before a full allow
+entry for the same SID: write data, execute and `WRITE_DAC` were all granted for the package SID,
+the capability, ALL APPLICATION PACKAGES and ALL RESTRICTED APPLICATION PACKAGES, with the deny
+entry explicit or inherited, and also when the deny named one of these SIDs and the allow
+another; a deny entry for the user, Users, Everyone, Authenticated Users or Administrators denied
+write data although the package SID was allowed. `access::may_grant` therefore leaves deny
+entries out, so a DACL such as `(D;;FW;;;AC)(A;;FA;;;AC)` counts as giving the right it denies.
+The deny entries of the first pass are not counted either, which errs towards refusing a policy.
+
+The same holds the other way round for a `read_exec` path, the program file among them: the
+plan reports a conflict, and `grant` refuses, when its DACL may give one of the same SIDs a right
+that changes content (`FILE_WRITE_DATA`, `FILE_APPEND_DATA`, `WRITE_DAC` or `WRITE_OWNER`,
+`access::CHANGES_CONTENT`), on the path itself or through an inherited entry, when it holds
+entries of an unknown type, or when it has no DACL. The write right would join the execute
+right of sandy's capability. The AppContainer's own profile folder is always such a place (see
+"The AppContainer profile folder"). `sys::acl::check_rights` makes both checks.
+
 The grant capabilities are not on that list. A grant capability is derived from the identity of
-the object it is granted on, so it can appear on that object and nowhere else; a file that is
+the object it is granted on. sandy puts one on that object, and the relay's capability also on
+the forward socket directory sandy creates, which carries no execute right (see "Forwarded
+ports"). The program puts none anywhere, and the capability for one object does not match
+another, so a grant capability cannot make a path both writable and executable; a file that is
 writable and executable through a second name is the link question of "Links and identity".
 
-`check` reads the permissions of the path itself. When `run` adds the entry, it also walks the
-tree below the path and refuses a descendant whose own permissions may give one of them execute,
-in the same walk that refuses junctions. The walk runs only where sandy changes something, so it
-does not slow down a plan, and `check` can report a policy as enforceable that `run` then
-refuses for a file below the path. What outside software adds after the walk is not seen; the
-program cannot add it, because it holds no right to change permissions outside its profile
-folder.
+`check` and `run` read the permissions of the path itself, not of the tree below it. A file
+below can carry an entry of its own that gives every AppContainer execute below a writable path,
+or write below an executable one. Such an entry comes from other software, or from an earlier
+run that could write there: a program may give a file it creates any entries. sandy does not
+judge them, as it does not judge the same entries anywhere else on the disk: the program could
+run its own changes inside the sandbox, which rule 3 does not cover (DESIGN.md), and which trees
+a policy makes executable is the choice of whoever writes it, who gives `read_exec` only to trees
+they trust
+(`escape_windows::a_file_below_a_writable_path_keeps_its_own_execute_entry`). A walk of the tree
+would cost a read of every permission list below the path at every first grant.
 
 `system = "none"` is unavailable. A Less Privileged AppContainer (LPAC,
 `PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY`) drops ALL APPLICATION PACKAGES, but
@@ -188,20 +217,27 @@ policy paths. The other two would let it write the file's own permissions and gr
 back, to ALL APPLICATION PACKAGES for example, which every AppContainer belongs to. sandy
 reduces the entry to the rights of a `read_write` policy path, so all three are gone
 (`SetNamedSecurityInfoW` re-propagates the reduced entry to existing files too). A deny entry
-does not work here: the AppContainer access check ignores a deny ACE for the package SID,
-measured on Windows 11; reducing the allow entry is what the check honors, for `WRITE_DAC` as
-much as for `FILE_EXECUTE` (measured on build 26200).
+does not work here: the AppContainer access check ignores a deny ACE for the package SID (see
+"What every AppContainer can read"); reducing the allow entry is what the check honors, for
+`WRITE_DAC` as much as for `FILE_EXECUTE` (measured on build 26200).
 
 The change is idempotent: a run writes only while the entry still carries one of the three
 rights, so it also reduces an entry that lost `FILE_EXECUTE` alone, or that someone widened again
-from outside. Such a run also walks the folder and refuses a junction or symbolic link below it,
-because it re-propagates the entry and the program can write there
-(`review_windows::reducing_a_widened_profile_entry_refuses_a_junction_in_the_folder`).
+from outside. Such a run re-propagates the entry over the folder, where the program can write,
+and the propagation does not follow a junction the program left there (see "How sandy changes a
+DACL"; `review_windows::reducing_a_widened_profile_entry_does_not_follow_a_junction_in_the_folder`).
 
 The folder holds no user data. It is the program's own scratch space, writable in every policy,
 also one with no writable path. `escape_windows` and `review_windows` confirm that the program
 can write and read it, cannot execute a file in it (`load-library` is denied while `read`
 succeeds), and cannot grant itself execute back.
+
+The entry keeps the write rights, so an executable path in the folder, or a program file there,
+would be both writable and executable: measured on Windows 11 build 26200, a program with
+`--read-exec` on `AC\bin` copied itself there and started the copy. sandy refuses such a path as
+a conflict, as it refuses a writable path where the program may execute files (see "What every
+AppContainer can read"), and the program file with it
+(`refuses_an_executable_path_in_the_appcontainer_profile_folder`).
 
 What the reduction does not repair: a program that ran while the entry still carried `WRITE_DAC`
 could write an explicit entry of its own on a file in the folder, and re-propagation does not
@@ -216,18 +252,50 @@ profile and with it any entry left there.
 |---|---|---|
 | read | `FILE_GENERIC_READ` (read data, list, attributes, extended attributes, permissions) | `FILE_EXECUTE`, any write right |
 | read-exec | `FILE_GENERIC_READ`, `FILE_GENERIC_EXECUTE` | any write right |
-| read-write | `FILE_GENERIC_READ`, `FILE_GENERIC_WRITE`, `DELETE`, `FILE_DELETE_CHILD` | `FILE_EXECUTE`, `WRITE_DAC`, `WRITE_OWNER` |
+| read-write | `FILE_GENERIC_READ`, `FILE_GENERIC_WRITE`, `FILE_DELETE_CHILD`, and `DELETE` below the path | `FILE_EXECUTE`, `WRITE_DAC`, `WRITE_OWNER`, `DELETE` on the path itself |
 
 On a directory the ACE has the flags object inherit and container inherit, so files and
 directories below it receive the same rights. The program file gets read and execute.
+
+A read-write path gets two entries when it is a directory (`access::grant_entries`): the rights
+above without `DELETE`, inherited by everything below, and an inherit-only entry with `DELETE`
+alone, so a file or directory below the path has every right of the level and the path itself
+lacks `DELETE`. A read-write file gets the first entry only. The program can therefore change,
+create, remove and move what lies below the path, and write a read-write file, but can neither
+remove nor move the path itself, as on Linux, where removing an entry is a right on its parent,
+and on macOS, whose profile denies it. Measured on Windows 11 build 26200 before the split: the
+program removed an empty read-write directory and moved a read-write directory and a read-write
+file into another read-write path (`a_read_write_path_itself_cannot_be_removed_or_moved`).
+
+A read-write directory grant that an earlier version of sandy wrote, one entry with `DELETE` on
+the path, is not the grant `acl::lacks_grant` looks for, so the next run replaces it with the two
+entries. The replacement keeps every right the old entry gave below the path and only takes
+`DELETE` off the path itself, so the tree below keeps its effective rights. For a directory that
+means, once per such path, a write of the DACL with `SetNamedSecurityInfoW`, which propagates the
+inherited entries to every file and directory below. Some consequences:
+
+- Replacing the entries needs the right to change the DACL of the path (`WRITE_DAC`), as a
+  first grant does. A path whose old grant came from a run with rights the current user lacks,
+  an elevated one for example, is now a conflict of `check` and `run` for this user, as any
+  policy path whose grant the current user may not add, until a run with those rights replaces
+  it.
+- Runs of an earlier and of this version on the same path each find the other's entries not
+  theirs and write their own, so the entries change at every run that alternates, with a
+  propagation each time. While a run of the earlier version holds its entry, a program of this
+  version on the same path can remove or move the path itself. One version of sandy per machine
+  avoids it.
 
 Without `FILE_EXECUTE`, Windows does not load a file as a program or library. The program can
 still read the bytes of a file; this backend, like the others, does not prevent code that the
 program maps into its own memory.
 
 The AppContainer access check grants no implicit owner rights in its second pass [Forshaw
-access check]. The program therefore cannot change the DACL of files it creates, although the
-user's SID owns them. The escape test `read_write_paths_are_not_executable` checks this.
+access check]. The program therefore cannot change the DACL of a file once it exists, although
+the user's SID owns it (`read_write_paths_are_not_executable`). It can give a file a DACL when it
+creates it (`CreateFileW` with a security descriptor), also one that lets it execute the file.
+Such a file runs inside the sandbox with the program's own rights, as code the program maps into
+its memory does, so rule 3, which keeps a process outside from running what the program left
+behind, does not cover it (DESIGN.md, rule 3).
 
 AppContainer processes run at low integrity, and files without a label count as medium. sandy
 sets no integrity label. Microsoft: "if a resource has a mandatory label of Medium IL or lower
@@ -244,15 +312,16 @@ capability SID (`S-1-15-3-1024-...`, `DeriveCapabilitySidsFromName`) from the na
 sandy.grant.<r|rx|rw>.<volume serial>.<file ID>.<AppContainer name>
 ```
 
-adds one ACE for that SID, and starts the program with the capabilities of the current policy
-only. Chromium grants its install directory to capability SIDs in the same way [Chromium
-install]. The file ID names the object, not the path: a renamed directory keeps its grant, and a
-new object at the old path needs a new one.
+adds one ACE for that SID (two for a read-write directory, see "What sandy grants"), and
+starts the program with the capabilities of the current policy only. Chromium grants its install
+directory to capability SIDs in the same way [Chromium install]. The file ID names the object,
+not the path: a renamed directory keeps its grant, and a new object at the old path needs a new
+one.
 
 The consequences:
 
 - **Grants stay on disk.** A run never removes them; `sandy setup --remove` does (see "Removing
-  the changes"). A run checks for its ACE and changes nothing when the ACE exists.
+  the changes"). A run checks for its ACEs and changes nothing when they exist.
 - **Old grants grant nothing.** When a path leaves the policy, or its level changes, no later
   process holds the old capability. The escape test
   `a_path_removed_from_the_policy_is_denied_at_the_next_run` checks this.
@@ -277,20 +346,23 @@ them the protection of the DACL can get lost [Kanthak]. For a directory, Windows
 inheritable ACE to every existing child, except children with a protected DACL
 [SetNamedSecurityInfoW]. Those children stay inaccessible to the program.
 
-Microsoft does not document whether this propagation follows junctions and symbolic links. A
-program that could write below a directory in an earlier run could have planted a link to a
-directory of the user. Before sandy adds an inheritable ACE, it therefore walks the directory and
-refuses the run if it finds a junction or symbolic link (`is_symlink` covers every name-surrogate
-reparse point). Hard links cannot be found this way. Measured on Windows 11 build 26200: an
-AppContainer program cannot create a hard link to a file it may not write (`ERROR_ACCESS_DENIED`),
-so it cannot give a file outside its writable paths a second name itself; a hard link that
-already exists weighs on the resolver instead (see "Links and identity").
-
-Measured once on Windows 11 build 26200: the propagation follows neither. After
-`SetNamedSecurityInfoW` added an inheritable entry to a directory, a junction below it carried
-the entry on the junction itself and nothing reached the directory it led to, and a directory
-symbolic link carried nothing into its target either. The walk stays, because the behaviour is
-not documented. `sandy setup --remove` does not walk: it only takes an entry away.
+Microsoft does not document whether this propagation follows junctions and symbolic links. A program
+that could write below a directory in an earlier run could have planted a junction to a directory of
+the user there, which a later grant of that directory would reach if it did: this is state the
+program can make, so the measurement carries a guarantee, not only the host's own links. Measured on
+Windows 11 build 26200: it follows neither. After `SetNamedSecurityInfoW` added an inheritable entry
+to a directory, a junction below it carried the entry on the junction itself and nothing reached the
+directory it led to, and a directory symbolic link carried nothing into its target either. sandy
+relies on that instead of walking the tree for links before each grant, and the unit test
+`a_grant_does_not_follow_a_link_below_the_path` measures it at every run of the suite, also on the
+windows-2022 and windows-2025 runners of CI, so a Windows that changes it fails there; it covers a
+first grant and the write that replaces an old read-write grant: the entries of a file below the
+path change, while the directory behind a junction and the one behind a directory symbolic link keep
+theirs, with no entry for the capability.
+`escape_windows::a_junction_below_a_policy_path_reaches_nothing` checks that the program cannot read
+through such a junction. Measured on Windows 11 build 26200: an AppContainer program cannot create a
+hard link to a file it may not write (`ERROR_ACCESS_DENIED`), so it cannot give a file outside its
+writable paths a second name itself (see "Links and identity").
 
 A path whose DACL the user cannot change makes `sandy run` fail with an error that names the
 path, unless Windows already grants the level to all AppContainers. A path without DACL (NULL
@@ -325,19 +397,19 @@ so only such paths and paths the user does not own can fail this way
 
 ### Links and identity
 
-The resolver compares files and not only paths: one directory reachable under two paths counts
-as one, and a file with a second name inside a writable path counts as writable (see "Links and
-file identity" in [DESIGN.md](DESIGN.md)). On Windows the identity of a file is the serial
-number of its volume and its file ID (`FILE_ID_INFO`, or `BY_HANDLE_FILE_INFORMATION` on a file
-system without 128-bit file IDs), read with the object opened for its attributes only. An object
-whose identity sandy cannot read counts as the one it is compared with, so the check refuses
-instead of passing it; `check` reports such an overlap as indeterminate, and only one it sees as
-a conflict. The warning for a directory on `PATH` follows the spellings instead, the
-one given and the canonical one, so it names only an overlap sandy sees. Such an object is, for
-example, a directory behind a junction that a less trusted process made: an elevated process
+The resolver compares files and not only paths: one directory reachable under two paths counts as
+one, and sandy's own executable and the policy file with a second name inside a writable path count
+as writable (see "Links and file identity" in [DESIGN.md](DESIGN.md)). On Windows the identity of a
+file is the serial number of its volume and its file ID (`FILE_ID_INFO`, or
+`BY_HANDLE_FILE_INFORMATION` on a file system without 128-bit file IDs), read with the object opened
+for its attributes only. An object whose identity sandy cannot read counts as the one it is compared
+with, so the check refuses instead of passing it; `check` reports such an overlap as indeterminate,
+and only one it sees as a conflict. The warning for a directory on `PATH` follows the spellings
+instead, the one given and the canonical one, so it names only an overlap sandy sees. Such an object
+is, for example, a directory behind a junction that a less trusted process made: an elevated process
 does not follow it (`ERROR_UNTRUSTED_MOUNT_POINT`), and package managers of the user make such
-junctions (`scoop\apps\<app>\current`). Junctions count as symbolic links, as `std::fs` counts
-them. On Windows:
+junctions (`scoop\apps\<app>\current`). Junctions count as symbolic links, as `std::fs` counts them.
+On Windows:
 
 - A policy path, sandy's executable or the policy file reached through a junction or a
   symbolic link inside a writable path is refused, as a symbolic link there is on Linux and
@@ -348,23 +420,23 @@ them. On Windows:
   (`escape_windows::refuses_a_policy_path_resolved_through_a_link_in_a_writable_path`,
   `refuses_a_policy_file_a_writable_path_reaches`,
   `refuses_a_sandy_executable_a_writable_path_reaches`).
-- A hard link between a `read_write` and a `read_exec` path, or one that gives the program
-  file, sandy's own executable or the policy file a second name inside a writable path, is
-  refused (`escape::a_hard_link_between_writable_and_executable_paths_is_refused`,
-  `escape::a_hard_link_of_the_program_into_a_writable_path_is_refused`). This weighs more here
-  than on Linux and macOS: the rights live in the one security descriptor of the file, so the
-  inheritable ACE of the writable parent would land on the file and stay there after the run. A
-  file lists its own names (`FindFirstFileNameW`), so sandy asks the program file, the files
-  that `read_exec` paths name, its own executable and the policy file directly, and walks the
-  writable trees only for a `read_exec` directory. That keeps an ordinary run from walking every
-  writable tree: the programs in `System32` have a second name in the component store
-  (`WinSxS`), measured for `cmd.exe`.
-- The sandboxed program cannot make such a second name itself: an AppContainer process is
-  refused a hard link to a file it may not write, a junction that leaves its writable paths, and
-  a symbolic link of any kind (it holds no `SeCreateSymbolicLinkPrivilege`), all measured on
-  Windows 11 build 26200 (`the_program_cannot_plant_a_link_reaching_outside_its_writable_paths`).
-  The check runs at the start, so a second name that a process outside the sandbox makes while
-  the program runs is not seen, as on the other platforms.
+- A hard link that gives sandy's own executable or the policy file a second name inside a
+  writable path is refused. A file lists its own names (`FindFirstFileNameW`), so sandy asks
+  the two files directly and walks no tree. A hard link between a writable path and any other
+  file, also a `read_exec` file or the program, from the host or from an earlier run that could
+  write both names, is the policy author's concern: the program can change the file through the
+  writable name, and the inheritable entry of the writable parent lands on the file itself, for
+  the capability of this policy, which the writable name gives the program anyway.
+- Within a run the program makes no second name of a file outside its writable paths: an
+  AppContainer process is refused a hard link to a file it may not write, a junction that leaves its
+  writable paths, and a symbolic link of any kind (it holds no `SeCreateSymbolicLinkPrivilege`), all
+  measured on Windows 11 build 26200
+  (`the_program_cannot_plant_a_link_reaching_outside_its_writable_paths`). `filesystem.symlinks =
+  "allow"`, which lets the program make symbolic links on Linux and macOS, therefore changes nothing
+  on Windows: sandy accepts the setting and the program still makes no symbolic link. It can still
+  make a junction within its writable paths under either value, as without the setting. The check
+  runs at the start, so a second name that a process outside the sandbox makes while the program
+  runs is not seen, as on the other platforms.
 - `sandy` is checked under the name it was started under, which `current_exe` reports on
   Windows, so a junction or symbolic link on the way counts.
 - The backend's own checks, the system directories of rule 6 and the trusted user locations of
@@ -481,7 +553,7 @@ process of the user outside the sandbox runs it.
 `review_windows::profile_folder_is_a_persistent_writable_but_not_executable_store` records
 that for the profile folder: inside the sandbox the planted image does not load, outside it
 does. A deny entry for the package SID would not help, because the AppContainer access check
-ignores it (`acl::check_writable`), and rewriting the user's own DACLs is not something sandy
+ignores it (`acl::check_rights`), and rewriting the user's own DACLs is not something sandy
 does.
 
 The locations that are refused are in `sys::trusted_locations`:
@@ -492,14 +564,65 @@ The locations that are refused are in `sys::trusted_locations`:
 | `FOLDERID_Startup`, `FOLDERID_CommonStartup` | the tree | Windows runs what is there at the next logon |
 | `Documents\WindowsPowerShell`, `Documents\PowerShell` | the tree | the profile scripts of PowerShell 5 and PowerShell 7 |
 | `%LOCALAPPDATA%\Microsoft\WindowsApps` | the tree | the app execution aliases, which the default `PATH` holds |
-| `<profile>\.ssh` | the tree | `ProxyCommand` and `LocalCommand` in the configuration run programs |
-| `<profile>\.cargo\config.toml`, `<profile>\.cargo\config`, and both in `CARGO_HOME` | the file | `build.rustc`, `build.rustc-wrapper` and target runners name programs that the next cargo command runs; the list is shared with Linux and macOS (`sandy_core::trust::cargo_configs`) |
+| `<home>\.gitconfig`, `<config>\git`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` | the file, the tree, the file, the file | `core.fsmonitor`, `core.sshCommand`, `core.pager` and `!` aliases run commands at the next git command; `GIT_CONFIG_GLOBAL` replaces `.gitconfig` as the global configuration, `GIT_CONFIG_SYSTEM` the system one |
+| `%PROGRAMDATA%\Git` (`FOLDERID_ProgramData`, `PROGRAMDATA`) | the tree | libgit2, which cargo and other tools use for git, reads `config` there as a level below the system configuration; every user may create folders in `C:\ProgramData` |
+| `<home>\.ssh` | the tree | `ProxyCommand` and `LocalCommand` in the configuration run programs |
+| `<home>\.gnupg`, `%APPDATA%\gnupg` (`FOLDERID_RoamingAppData`), `GNUPGHOME` | the tree | `pinentry-program` and `photo-viewer` name programs that gpg runs; Gpg4win keeps its configuration in the second; `GNUPGHOME` replaces the default directory |
+| `<home>\.cargo\config.toml`, `<home>\.cargo\config`, and both in `CARGO_HOME` | the file | `build.rustc`, `build.rustc-wrapper` and target runners name programs that the next cargo command runs |
 | `%LOCALAPPDATA%\sandy` | the tree | sandy's own state: the policy of each running AppContainer, the lock files and the forwarded-port sockets |
 
+Every variable that names a protected place is read the same way, so one program reads the same
+file whichever way the path is written (`sandy_core::trust::named_directories`): a value with a
+drive names that place; a value rooted without a drive, `\Users\x`, names it on the drive of
+sandy's working directory and on the system drive (`sys::drives`), because that is where the
+program outside the sandbox resolves it; a relative value, which includes `HOMEDRIVE` such as `D:`
+followed by a relative `HOMEPATH`, gives a drive-relative path such as `D:x` that names no one
+place and is left out. This holds for `USERPROFILE`, `PROGRAMDATA`, `XDG_CONFIG_HOME`,
+`CARGO_HOME`, `GNUPGHOME`, `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` as it does for `HOME`. A
+refusal about what one of the last three names says which variable, for example `overlaps
+C:\work\gnupg (GNUPGHOME)`, so that a caller who set it sees why. sandy expands a leading `~` in
+`GNUPGHOME` as gpg does on Linux and macOS (not measured with Gpg4win), so a value such as
+`~\gnupg` names that place below each `<home>`; git does not expand it in its variables, where such
+a value is relative and left out.
+
+sandy reads these from its own process environment, not from the user's persistent environment
+in the registry (`HKCU\Environment`): the process environment is what the program sandy starts
+inherits, so it is what decides where that program's tools look, and the profile folder from the
+known folder covers the default home whether or not the environment names it.
+
 The profile folder comes from the known folder and from `USERPROFILE`, because a service that
-starts sandy with a minimal environment sets no variable. A location that does not exist counts,
-because the program could create it. Paths are compared by file identity, as rules 3 and 4 compare
-them (see "Links and identity").
+starts sandy with a minimal environment sets no variable. `<home>` is each profile folder,
+`HOME`, and `HOMEDRIVE` followed by `HOMEPATH` (`HOMEPATH` alone without `HOMEDRIVE`). Measured on
+Windows 11 build 26200 with Git for Windows 2.54 and libgit2 1.9.7: both read `.gitconfig` below
+`HOME` when it is set, and without `HOME` below `HOMEDRIVE` followed by `HOMEPATH` when that
+directory exists, otherwise below `USERPROFILE`; without `HOMEDRIVE` Git for Windows takes
+`HOMEPATH` alone. A home without a drive, `\Users\x`, both resolve on the current drive, so
+sandy counts it on the drive of its working directory and on the system drive
+(`sys::drives`); a program started on another drive is not covered. A relative `HOME` both
+resolve against the working directory of the program that reads it, which names no one place,
+so it is left out. sandy counts every one of these homes whatever its own environment says
+about the others, because the programs outside the sandbox may run with another one.
+`<config>` is
+`XDG_CONFIG_HOME`, which Git for Windows honours too, and `.config` below each `<home>`. The
+git, SSH, GnuPG and cargo rows are the list of Linux and macOS (`sandy_core::trust::tool_configs`),
+so one policy is refused on every platform for the same files.
+`refuses_a_writable_path_over_the_git_and_gnupg_configuration` checks them with `USERPROFILE` and
+`HOME` pointed at a fixture, `refuses_a_writable_path_over_the_git_configuration_of_other_homes`
+with `HOMEDRIVE` and `HOMEPATH` and with a `HOME` without a drive. A location that does not
+exist counts, because the program could create it. Paths are compared by file identity, as rules
+3 and 4 compare them (see "Links and identity").
+
+Git's system configuration on Windows, `C:\Program Files\Git\etc\gitconfig` for both Git for
+Windows and libgit2, lies in a system directory, which no writable path may reach anyway.
+libgit2 also reads `Git\config` below the folder that `PROGRAMDATA` names, measured on Windows 11
+build 26200 with libgit2 1.9.7 (`git2::Config::open_default` reported the entry at the
+`ProgramData` level), and accepts a file there that the current user owns, as every file the
+program creates is. Git for Windows 2.54 no longer reads it: with `PROGRAMDATA` pointed at a
+folder holding `Git\config`, `git config --show-origin --list --system` listed only
+`C:/Program Files/Git/etc/gitconfig`, and its executable does not hold the name. The folder is
+protected from the known folder and from the variable, like the profile, and
+`refuses_a_writable_path_over_the_program_data_git_configuration` checks it with `PROGRAMDATA`
+pointed at a fixture.
 
 Every absolute directory on sandy's `PATH` (`sys::path_locations`) is such a location too, and
 rule 12 warns about it instead of refusing it, because a writable path that holds one is
@@ -813,7 +936,13 @@ sandy runs the broker as `sandy __broker` in an AppContainer of its own, alongsi
    inside the sandbox and passes each connection over an AF_UNIX socket. sandy binds that socket
    outside the AppContainers and hands the listening handle to the broker, which inherits it and
    accepts on it; the broker needs no access to the socket file. The relay connects to the socket
-   file with the capability it already holds.
+   file with the capability it already holds. sandy names the port with `--egress` instead of
+   `--forward`, and the relay serves it with the broker's limit of 1000 connections at a time and
+   threads with 256 KiB stacks (`sandy_relay::Capacity::Egress`) instead of the 256 of a
+   forwarded port, so it does not lower the broker's limit
+   (`the_egress_port_takes_as_many_connections_as_the_broker`). Each connection holds two sockets
+   and two threads in the relay, which at the limit is a few thousand handles, far below the
+   about 16 million that Windows allows a process.
 4. The broker is in the relay job, so it ends with the program and within one second of it
    (docs/DESIGN.md, "Forwarded ports", rule 5); kill-on-close ends it if sandy dies, and so does
    the end of its standard input (`a_killed_run_leaves_no_egress_broker_behind`). No process of
@@ -821,10 +950,24 @@ sandy runs the broker as `sandy __broker` in an AppContainer of its own, alongsi
    AppContainer profile stays between runs like the program's, because the runs of one policy
    share it: a run that removed it when it ended made a run that was starting fail
    (`the_egress_brokers_profile_outlives_the_run`). `sandy setup --remove` removes it.
+5. Like the relay, the broker writes "ready" to its standard output once it serves: Winsock is
+   started, the inherited handle is a listening socket and the end of its input is watched.
+   sandy starts the program only after both lines, so a broker that cannot start stops the run
+   with status 125 and the broker's own error before the program runs
+   (`egress_broker_that_cannot_serve_reports_no_readiness`). A broker that writes nothing stops
+   it after 10 seconds, as a relay does; the test holds the broker under a debugger before its
+   first instruction, and the program never starts
+   (`the_program_waits_until_the_egress_broker_is_ready`).
 
 What the broker connects to is decided by `sandy_core::destination`, the same on every platform,
 with the host's own addresses and subnets answered by `GetAdaptersAddresses` and `GetBestRoute2`;
 a lookup that fails for another reason than a missing route refuses the destination with reply 1.
+The broker keeps the addresses, the point-to-point links and the on-link networks until Windows
+reports a change of an address, an IP interface or a route (`NotifyUnicastIpAddressChange`,
+`NotifyIpInterfaceChange`, `NotifyRouteChange2`, registered from its AppContainer before it
+serves; where a registration fails it reads everything for every connection, as without the
+cache), and asks `GetBestRoute2` for every connection
+(`host_network::tests::a_route_change_drops_what_is_kept`).
 The local network is the on-link prefix of every interface address and every route of
 `GetIpForwardTable2` whose next hop is the unspecified address (on-link), except the default
 route and the routes into a tunnel: an interface whose type is a tunnel or PPP
@@ -1041,7 +1184,12 @@ name. Without the grant, when the current user may not add it, the plan reports
 sandy cannot read, is indeterminate: setup does not fix it. The plan also reports a conflict when
 `sandy.exe` lies in a read-write path: the program could replace the file that the relays
 execute (writable-and-executable rule), and sandy must stay out of the program's reach in any
-case.
+case. For the same rule, `check`, `setup` and `run` refuse a `sandy.exe` whose permissions may
+give a right that changes content to the AppContainer that runs it, as they refuse such an
+executable policy path (`acl::check_rights`): the program's AppContainer and its network
+capabilities for the relays, the broker's AppContainer and its capabilities for the egress
+broker, and the two package groups for both
+(`refuses_a_sandy_executable_that_the_appcontainer_running_it_may_write`).
 
 ### Forwarded ports
 
@@ -1059,6 +1207,21 @@ to `port` on its own loopback address, without the loopback exemption:
    standard output (a pipe to sandy) once all of them listen. sandy starts the program only
    after that line, so the program's first connection cannot come too early.
 4. The relay passes each connection it accepts to the AF_UNIX socket named after its port.
+
+A reset crosses the AF_UNIX hop as a reset, as docs/DESIGN.md "Forwarded ports" rule 7 asks: an
+AF_UNIX socket closed with `SO_LINGER` 0 makes the read at the other end fail with
+`WSAECONNRESET`, not end, so the relay on the other side resets its TCP peer in turn, in both
+directions (`a_reset_crosses_the_unix_socket_hop`, measured on Windows 11 build 26200).
+
+The relays' listeners are blocking sockets without `SO_EXCLUSIVEADDRUSE`, and neither is needed
+(measured on Windows 11 build 26200). A socket with `SO_REUSEADDR` cannot bind the address of a
+listener that holds it without that option: the bind fails with `WSAEACCES` for a process of the
+same user outside the sandbox, for one in the program's AppContainer, and even in the process
+that holds the listener, for the forward listener inside and the expose listener outside
+(`no_socket_shares_the_address_of_a_relay_listener`). And where Linux can drop a connection
+that is reset between the poll and the accept from the backlog, so that a blocking accept would
+wait for the next one, Winsock leaves it there and the accept returns it at once, reset, for TCP
+and AF_UNIX listeners alike (`a_connection_reset_in_the_backlog_does_not_block_accept`).
 
 Why this works: a listener that sandy creates outside the AppContainer is outside it, and the
 program's connection to it is blocked like any connection to a loopback listener outside. A
@@ -1104,6 +1267,23 @@ The relays follow docs/DESIGN.md "Forwarded ports" rule 5. When the program exit
 3. One second after the program's end, sandy ends the relay job and waits until the relays and
    the broker are gone, stops its own forward sockets the same way and removes the socket
    directory.
+
+While the program runs, sandy waits for the relay and the broker next to the program. In a
+normal run neither ends first, because sandy ends them only after the program. One that ends
+before, because something killed it (the program can, from its own AppContainer), leaves its
+ports to whatever binds them next, and a local process that binds the program's forward port
+receives what the program sends there for `to`. So sandy then ends the program's job, waits for
+the program, ends the relays as above, and exits with status 125 and the reason on standard
+error; `--status-fd` records `failed` instead of `exited`. That is what the guard of
+`children = "contained"` does on Linux and macOS; on Windows it holds for every policy
+(`a_dead_relay_or_broker_ends_the_program`). A relay that has ended when sandy finds the program
+ended too is the program's own end. One that ends after its "ready" line and before the program
+starts stops the run the same way: sandy looks at each helper once more after it created the
+program suspended, so a helper that has already ended at that look makes sandy end the program
+before its first instruction. One that ends between that look and the resume is caught by the
+wait that follows the resume at once, which ends the program and exits with status 125. The
+unit test `a_relay_that_has_ended_stops_the_program_from_starting` covers the look itself
+(`ended_relay`), not a whole run.
 
 `TerminateJobObject` only starts the termination of a job's processes. Without the waits, a
 relay was still there up to 2.7 ms after sandy had exited, in 12 of 60 runs of
@@ -1239,11 +1419,16 @@ prefix.
   names sandy and not the program, and exit code 125 means both "sandy refused" and "the
   program exited with 125". `--status-fd` reports what the exit code cannot, without changing
   any exit code: sandy writes `pid N` once the program runs, then `exited N`, or `failed` when
-  sandy itself failed or refused. The number is an inheritable handle the caller passes to
-  sandy, which clears its inherit flag at once; the program's own
+  sandy itself failed or refused, or ended the program because a relay or the egress broker
+  ended before it (see "How the relays end"). The number is an inheritable handle the caller
+  passes to sandy, which clears its inherit flag at once; the program's own
   `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` names only its three standard handles, so the handle
   never reaches the program or a relay. A program that sandy ended because the parent ended is
-  reported as `exited 1`, which is the exit code the job gets.
+  reported as `exited 1`, which is the exit code the job gets. `N` is the exit code as
+  `GetExitCodeProcess` returns it, an unsigned 32-bit number, so an NTSTATUS such as
+  `STATUS_CONTROL_C_EXIT` (`0xC000013A`) is `exited 3221225786`; sandy's own exit code has the
+  same 32 bits, which callers that read it as a signed number (cmd, PowerShell, Java, .NET) see
+  as `-1073741510` (`the_status_record_writes_the_exit_code_unsigned`).
 - **Ending with the parent.** With `process.end_with_parent = true`, sandy finds its parent's
   process ID in a process snapshot (`CreateToolhelp32Snapshot`), opens the process for waiting,
   and checks that it was created before sandy and still runs. Windows records only the parent's
@@ -1253,7 +1438,18 @@ prefix.
   times). This is an ordering test on the wall clock, so a system clock set back between the
   start of the parent and the start of sandy makes sandy refuse a running parent, and an early
   death of the parent, a clock set back and a reused process ID together could let an unrelated
-  process pass. With `--parent-pid`, the recorded parent must also be the named process.
+  process pass. With `--parent-pid`, the recorded parent must also be the named process;
+  `sandy run` and `sandy check` read the recorded parent once their arguments are parsed
+  (Windows keeps it, so this need not be sandy's first step as `getppid` is on Linux and macOS,
+  and other commands take no snapshot). When the level that `sandy check` takes, or the one
+  `--level` names, ends with its parent, check opens the parent as `run` does and makes the same
+  tests, so it refuses with status 125 a named process that is not the recorded parent and a
+  parent that has ended, whose process ID Windows still records
+  (`check_refuses_a_parent_that_has_ended`). A fallback level that ends with its parent does not
+  make check test the parent for a level that does not, as it does not make `run` open it
+  (`check_tests_the_parent_of_the_level_it_takes_only`). On Linux and macOS, `check` refuses a
+  parent that has ended only with `--parent-pid`, because `getppid` then returns another process
+  than the named one. When the snapshot fails, both refuse `end_with_parent`.
   `--parent-start` adds the caller's own creation time (`GetProcessTimes`, read after
   `OpenProcess`), and sandy then requires that exact value instead of the ordering test: no
   clock change alters a recorded creation time, and a process that got the ID later has another
@@ -1397,9 +1593,16 @@ every platform answers.
     build 26200.
 - **Command line.** sandy quotes each argument so that `CommandLineToArgvW` and the C runtime
   read it back unchanged [Parsing arguments], and refuses command lines longer than 32,767
-  characters [CreateProcessW]. It refuses `.bat` and `.cmd` programs: `CreateProcessW` runs them
-  in `cmd.exe`, which parses arguments with other rules, so arguments could run commands
-  [BatBadBut]. Run `cmd.exe /c` explicitly instead.
+  characters [CreateProcessW]. It refuses `.bat` and `.cmd` programs, in `check` as in `run`,
+  with status 125: `CreateProcessW` runs them in `cmd.exe`, which parses arguments with other
+  rules, so arguments could run commands [BatBadBut]. Run `cmd.exe /c` explicitly instead.
+  The refusal is the backend's `refuse`, which the command line calls for `check` and before
+  `run` (`refuse_names_a_batch_file`).
+  sandy matches as `CreateProcessW` does: the last four characters of the program path in any
+  case, so a file named only `.bat` counts too. Measured on build 26200: a verbatim path that
+  ends in `.bat.` or `.bat ` (Win32 drops such trailing dots and spaces only from ordinary
+  paths) and a stream such as `run.bat:s` load as executables, not in `cmd.exe`, and a canonical
+  path never names the `::$DATA` stream.
 - **Program path.** `std::fs::canonicalize` returns `\\?\C:\...` paths. sandy passes the
   ordinary form to `CreateProcessW` when it names the same file. The first token of the command
   line, the program's `argv[0]`, is the program as the caller wrote it (`TargetCommand::arg0`), as
@@ -1549,10 +1752,10 @@ about a path is worse than none, so the backend answers nothing and sandy refuse
 
 Host: Windows 11 build 26200 (VM), binaries built for `x86_64-pc-windows-gnu`. The tests run in
 an elevated SSH session and without administrator rights. Latest elevated run, every test
-passing: `sandy_core` 104, `sandy_relay` 43, `sandy_windows` 117, `sandy` 26, `escape` 27,
-`escape_windows` 90, `expose` 5, `forward` 3, `children` 5, `parent` 5, `check` 13, `levels` 7,
-`runner` 3, `review_windows` 12, `setup` 3. `crossuser_windows` skips without `SANDY_TEST_OTHER_USER` and
-`SANDY_TEST_OTHER_PASSWORD` (see "Other users of the machine"). The
+passing: `sandy_core` 115, `sandy_relay` 51, `sandy_windows` 147, `sandy` 34, `escape` 25,
+`escape_windows` 111, `expose` 5, `forward` 4, `children` 6, `parent` 8, `check` 15, `levels` 8,
+`runner` 3, `review_windows` 12, `setup` 3. `crossuser_windows` skips without
+`SANDY_TEST_OTHER_USER` and `SANDY_TEST_OTHER_PASSWORD` (see "Other users of the machine"). The
 COM check of `review_windows` is skipped there: the SSH session is session 0, where `ole32.dll`
 does not load in an AppContainer (limitation 13), so a denial would not be the COM boundary.
 Earlier non-administrator runs used a scheduled task with `/RL LIMITED` (medium integrity,

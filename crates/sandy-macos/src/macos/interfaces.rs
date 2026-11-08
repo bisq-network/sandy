@@ -10,7 +10,9 @@
 
 use std::io;
 use std::mem::size_of;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::{Mutex, PoisonError};
 
 use sandy_core::destination::{HostNetwork, Subnet};
 
@@ -56,8 +58,8 @@ pub fn addresses() -> io::Result<Vec<InterfaceAddress>> {
     Ok(found)
 }
 
-/// The indexes of the point-to-point interfaces, such as `utun`, `gif`, `stf` and `ppp`, from
-/// the link-layer entry that `getifaddrs` lists for every interface.
+/// The indexes of the point-to-point interfaces, such as `utun`, `gif` and `ppp`, from the
+/// link-layer entry that `getifaddrs` lists for every interface.
 fn point_to_point_links() -> io::Result<Vec<u16>> {
     let mut found = Vec::new();
     each_interface(|interface| {
@@ -306,16 +308,117 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-/// The egress broker's answer about this Mac, read again for every connection, because its
-/// addresses change while the program runs.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Interfaces;
+/// The egress broker's answer about this Mac. The addresses are read for every question
+/// (`getifaddrs`, cheap): macOS sends no routing message for some address changes, an alias in a
+/// subnet that already has its route for one, and sends the one for a removed address before the
+/// address leaves the list. The on-link networks, which take a dump of the routing table, are
+/// kept until any message arrives on a routing socket: a route that changes always sends one. The
+/// kernel drops a message only when the socket's queue is full, so some message still waits then
+/// and drops what is kept too. Without the socket (`changes` is `None`) nothing is kept.
+#[derive(Debug)]
+pub struct Interfaces {
+    changes: Option<OwnedFd>,
+    on_link: Mutex<Option<Vec<Subnet>>>,
+}
+
+impl Interfaces {
+    /// Opens the routing socket (`PF_ROUTE`) that reports changes. The broker opens it before it
+    /// applies its profile. A socket that cannot be opened leaves nothing kept.
+    pub fn watching() -> Interfaces {
+        Interfaces {
+            changes: routing_socket().ok(),
+            on_link: Mutex::new(None),
+        }
+    }
+
+    /// Stops keeping anything unless the routing socket can still be read, which the broker
+    /// checks once its profile is applied.
+    pub fn check_watch(&mut self) {
+        let Some(changes) = &self.changes else {
+            return;
+        };
+        let mut byte = [0u8; 1];
+        // SAFETY: the kernel writes at most one byte; MSG_PEEK leaves a message in place.
+        let read = unsafe {
+            libc::recv(
+                changes.as_raw_fd(),
+                byte.as_mut_ptr().cast(),
+                1,
+                libc::MSG_DONTWAIT | libc::MSG_PEEK,
+            )
+        };
+        if read < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN) {
+            self.changes = None;
+        }
+    }
+
+    /// The on-link networks: the ones read before, unless a routing message came since.
+    fn on_link(&self) -> io::Result<Vec<Subnet>> {
+        let mut held = self.on_link.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.changes.as_ref().is_none_or(changed) {
+            *held = None;
+        }
+        if let Some(on_link) = held.as_ref() {
+            return Ok(on_link.clone());
+        }
+        let on_link = on_link_routes(&routing_table()?, &point_to_point_links()?)?;
+        *held = Some(on_link.clone());
+        Ok(on_link)
+    }
+}
+
+/// A routing socket (`PF_ROUTE`) for every family, closed on exec. Every read passes
+/// MSG_DONTWAIT, so it needs no O_NONBLOCK.
+fn routing_socket() -> io::Result<OwnedFd> {
+    // SAFETY: socket takes no pointers and returns a new descriptor.
+    let fd = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor was just created and nothing else owns it.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: fcntl with an integer argument on a descriptor this function owns.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+/// Whether a message waits on `changes`, which it reads, at most `DRAINED` of them. More
+/// messages and any error but an empty queue count as a change.
+fn changed(changes: &OwnedFd) -> bool {
+    const DRAINED: usize = 1000;
+    let mut buffer = [0u8; 2048];
+    let mut changed = false;
+    for _ in 0..DRAINED {
+        // SAFETY: the kernel writes at most `len` bytes into the buffer.
+        let read = unsafe {
+            libc::recv(
+                changes.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if read >= 0 {
+            changed = true;
+            continue;
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::EAGAIN) => return changed,
+            Some(libc::EINTR) => continue,
+            _ => return true,
+        }
+    }
+    true
+}
 
 impl HostNetwork for Interfaces {
     /// macOS delivers to itself only the addresses of its interfaces and the broadcast address
     /// of their subnets: it has no local routes without an address, 127.0.0.2 included
     /// (docs/macos.md, "The private network"), and `check` refuses multicast before it asks.
-    fn is_host(&self, ip: IpAddr) -> io::Result<bool> {
+    fn is_host(&self, destination: SocketAddr) -> io::Result<bool> {
+        let ip = destination.ip();
         Ok(addresses()?.iter().any(|interface| {
             interface.address == ip || interface.broadcast.map(IpAddr::V4) == Some(ip)
         }))
@@ -332,7 +435,7 @@ impl HostNetwork for Interfaces {
                 Subnet::new(network, interface.prefix?)
             })
             .collect();
-        subnets.extend(on_link_routes(&routing_table()?, &point_to_point_links()?)?);
+        subnets.extend(self.on_link()?);
         Ok(subnets)
     }
 }
@@ -351,20 +454,31 @@ mod tests {
             .find(|interface| interface.address == IpAddr::V4(Ipv4Addr::LOCALHOST))
             .expect("127.0.0.1");
         assert_eq!(loopback.prefix, Some(8));
-        assert!(Interfaces.is_host(Ipv4Addr::LOCALHOST.into()).unwrap());
+        assert!(
+            Interfaces::watching()
+                .is_host((Ipv4Addr::LOCALHOST, 443).into())
+                .unwrap()
+        );
         assert!(all.iter().any(|interface| interface.scope != 0));
         let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         if probe.connect("192.0.2.1:9").is_ok() {
             let own = probe.local_addr().unwrap().ip();
-            assert!(Interfaces.is_host(own).unwrap(), "{own}");
-            let on_subnet = Interfaces
+            assert!(
+                Interfaces::watching().is_host((own, 443).into()).unwrap(),
+                "{own}"
+            );
+            let on_subnet = Interfaces::watching()
                 .subnets()
                 .unwrap()
                 .iter()
                 .any(|subnet| subnet.contains(own));
             assert!(on_subnet, "{own}");
         }
-        assert!(!Interfaces.is_host("192.0.2.1".parse().unwrap()).unwrap());
+        assert!(
+            !Interfaces::watching()
+                .is_host("192.0.2.1:443".parse().unwrap())
+                .unwrap()
+        );
     }
 
     /// The routing table names the subnet that the way out leaves through as a route without a
@@ -373,7 +487,7 @@ mod tests {
     fn the_routing_table_holds_the_subnet_of_the_way_out() {
         let routes =
             on_link_routes(&routing_table().unwrap(), &point_to_point_links().unwrap()).unwrap();
-        let subnets = Interfaces.subnets().unwrap();
+        let subnets = Interfaces::watching().subnets().unwrap();
         for route in &routes {
             assert!(subnets.contains(route), "{route:?} in {subnets:?}");
         }
@@ -669,5 +783,60 @@ mod tests {
             assert_eq!(mask_length(&netmask(prefix, false), v6), prefix as u8);
         }
         assert_eq!(netmask(24, true), [7, 0, 0, 0, 255, 255, 255]);
+    }
+
+    /// A message on the routing socket counts as a change, which drops what is kept.
+    /// Changing an address needs root, so a route lookup (`RTM_GET`) from a second routing
+    /// socket stands in for the change: the kernel copies its answer to every routing socket.
+    #[test]
+    fn a_message_on_the_routing_socket_counts_as_a_change() {
+        let interfaces = Interfaces::watching();
+        let changes = interfaces.changes.as_ref().expect("a routing socket");
+        // Control: what was read is kept. A change elsewhere on the Mac can drop it in between,
+        // so the read is tried a few times.
+        let kept = (0..5).any(|_| {
+            interfaces.subnets().unwrap();
+            !changed(changes)
+                && interfaces
+                    .on_link
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_some()
+        });
+        assert!(kept, "the on-link networks are kept");
+
+        #[repr(C)]
+        struct Lookup {
+            header: libc::rt_msghdr,
+            destination: libc::sockaddr_in,
+        }
+        // SAFETY: both are plain C structures, for which zero is a valid value.
+        let mut lookup: Lookup = unsafe { std::mem::zeroed() };
+        lookup.header.rtm_msglen = size_of::<Lookup>() as u16;
+        lookup.header.rtm_version = libc::RTM_VERSION as u8;
+        lookup.header.rtm_type = libc::RTM_GET as u8;
+        lookup.header.rtm_addrs = libc::RTA_DST;
+        lookup.header.rtm_seq = 1;
+        lookup.destination.sin_len = size_of::<libc::sockaddr_in>() as u8;
+        lookup.destination.sin_family = libc::AF_INET as libc::sa_family_t;
+        lookup.destination.sin_addr.s_addr = u32::from(Ipv4Addr::LOCALHOST).to_be();
+        // SAFETY: socket takes no pointers.
+        let other = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC) };
+        assert!(other >= 0);
+        // SAFETY: other is a new descriptor that nothing else owns.
+        let other = unsafe { OwnedFd::from_raw_fd(other) };
+        // SAFETY: the message is a valid buffer of the length passed.
+        let written = unsafe {
+            libc::write(
+                other.as_raw_fd(),
+                (&raw const lookup).cast(),
+                size_of::<Lookup>(),
+            )
+        };
+        assert_eq!(written, size_of::<Lookup>() as isize);
+        assert!(
+            changed(changes),
+            "the lookup's answer reached the routing socket"
+        );
     }
 }

@@ -25,7 +25,8 @@
 //!
 //! A path inside another bound path is mounted inside that bind, on the host's own file there,
 //! which must still be the planned file. A path anywhere else gets the directories above it on
-//! the tmpfs, with mode 0755 whatever the umask.
+//! the tmpfs, with mode 0755 whatever the umask, and so does a working directory that no bind
+//! holds, as an empty directory; one on the proc file system refuses the run instead.
 
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr};
@@ -118,7 +119,7 @@ impl Bind {
 
 /// Builds `view` in this process's new mount namespace and makes it the root, steps 1 to 5 of the
 /// module documentation. `terminal` adds `/dev/tty` and a private `/dev/pts`. Afterwards the
-/// working directory is the one before, when the view holds it, and `/` otherwise.
+/// working directory is the one before, which the view holds, or `/` when there was none.
 pub fn enter(
     view: &View,
     identities: &BTreeMap<PathBuf, FileIdentity>,
@@ -168,6 +169,26 @@ pub fn enter(
     for link in &view.links {
         make_link(&root, link)?;
     }
+    // A working directory that no bind holds gets an empty directory of its own, so the program
+    // starts there as without the view, and a relative path does not resolve under `/`. One in
+    // /proc would show a /proc that the view does not hold, and its name a process ID outside the
+    // program's PID namespace (`/proc/self` is sandy's).
+    if let Some(working) = &working
+        && !view
+            .binds
+            .iter()
+            .any(|bind| working.starts_with(&bind.path))
+    {
+        if working_on_proc()? {
+            return Err(SandboxError::new(format!(
+                "the working directory {} is on the proc file system, which the file system view \
+                 holds only where the policy grants it: grant /proc, or choose another working \
+                 directory",
+                working.display()
+            )));
+        }
+        directory_on_root(&root, working)?;
+    }
     for mount in [&dev, &root] {
         set_attributes(mount, 0, MOUNT_ATTR_RDONLY)
             .map_err(|error| failed("make the root read-only".to_string(), error))?;
@@ -178,13 +199,24 @@ pub fn enter(
         .find(|(path, _)| *path == Path::new("/"))
         .map_or(&root, |(_, tree)| tree);
     pivot(top)?;
-    if let Some(working) = working
-        && std::env::set_current_dir(&working).is_err()
-    {
-        std::env::set_current_dir("/")
-            .map_err(|error| failed("change to the new root".to_string(), error))?;
+    let working = working.as_deref().unwrap_or(Path::new("/"));
+    std::env::set_current_dir(working)
+        .map_err(|error| failed(format!("change to {}", working.display()), error))
+}
+
+/// Whether the working directory is on a proc file system, wherever it is mounted.
+fn working_on_proc() -> Result<bool, SandboxError> {
+    // A path that starts at the working directory, "." too, needs search permission on it, also
+    // with O_PATH. The link /proc/self/cwd leads to it without a lookup there. This /proc is still
+    // the host's before the pivot, which the user namespace needed for its ID maps already.
+    // SAFETY: an all-zero statfs is a valid value of the plain C struct.
+    let mut info: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: the path is NUL-terminated and info a statfs the call writes.
+    if unsafe { libc::statfs(c"/proc/self/cwd".as_ptr(), &mut info) } != 0 {
+        return Err(last_error("read the file system of the working directory"));
     }
-    Ok(())
+    #[allow(clippy::unnecessary_cast)]
+    Ok(info.f_type as i64 == libc::PROC_SUPER_MAGIC as i64)
 }
 
 fn failed(what: String, error: io::Error) -> SandboxError {

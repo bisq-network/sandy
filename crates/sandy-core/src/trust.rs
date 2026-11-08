@@ -4,8 +4,8 @@
 //! runs outside the sandbox at the next login, the next shell or the next run of the tool, so a
 //! writable path that reaches one is refused (rule 12 in DESIGN.md). The Linux and macOS backends
 //! add the locations of their platform (`locations`) and compare the whole set with
-//! `ResolvedPolicy::writable_conflict`. Windows keeps a list of its own and shares only cargo's
-//! configuration (`cargo_configs`).
+//! `ResolvedPolicy::writable_conflict`. Windows keeps a list of its own and shares the
+//! configuration of the tools that read it there too (`tool_configs`).
 //!
 //! The directories a shell looks commands up in are the same kind of location, but rule 12 warns
 //! about them instead of refusing them (`path_locations`).
@@ -15,14 +15,13 @@
 //! that hold code or name a program to run: a location that only holds data is no escape.
 
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::{ProtectedPath, path_directories};
+use crate::{ProtectedPath, canonical_location, path_directories};
 
-/// Files below the home directory that a shell or a tool reads at its start. A missing one
-/// counts, because the program could create it. Debian's `.bashrc` sources `.bash_aliases`. In
-/// `.gitconfig`, `core.fsmonitor`, `core.sshCommand`, `core.pager` and `!` aliases run commands.
-const HOME_FILES: &[&str] = &[
+/// Files below the home directory that a shell reads at its start. A missing one counts, because
+/// the program could create it. Debian's `.bashrc` sources `.bash_aliases`.
+const SHELL_FILES: &[&str] = &[
     ".bashrc",
     ".bash_profile",
     ".bash_login",
@@ -34,18 +33,25 @@ const HOME_FILES: &[&str] = &[
     ".zshrc",
     ".zlogin",
     ".zlogout",
-    ".gitconfig",
 ];
 
-/// Directories below the home directory whose content decides what other programs of this user
-/// run: the files Fedora's `.bashrc` sources, the SSH configuration (`ProxyCommand`,
-/// `LocalCommand`, `authorized_keys`) and the GnuPG configuration (`pinentry-program`,
-/// `photo-viewer`).
-const HOME_TREES: &[&str] = &[".bashrc.d", ".ssh", ".gnupg"];
+/// The files Fedora's `.bashrc` sources.
+const SHELL_TREES: &[&str] = &[".bashrc.d"];
 
-/// Directories below the configuration directory: the startup files of fish, and the git
-/// configuration that git reads besides `.gitconfig`.
-const CONFIG_TREES: &[&str] = &["fish", "git"];
+/// The startup files of fish, below the configuration directory.
+const SHELL_CONFIG_TREES: &[&str] = &["fish"];
+
+/// Files below the home directory that a tool reads at its start. In `.gitconfig`,
+/// `core.fsmonitor`, `core.sshCommand`, `core.pager` and `!` aliases run commands.
+const TOOL_FILES: &[&str] = &[".gitconfig"];
+
+/// Directories below the home directory whose content decides what a tool of this user runs:
+/// the SSH configuration (`ProxyCommand`, `LocalCommand`, `authorized_keys`) and the GnuPG
+/// configuration (`pinentry-program`, `photo-viewer`).
+const TOOL_TREES: &[&str] = &[".ssh", ".gnupg"];
+
+/// The git configuration that git reads besides `.gitconfig`, below the configuration directory.
+const TOOL_CONFIG_TREES: &[&str] = &["git"];
 
 /// Files in cargo's home that name programs the next cargo command runs: `build.rustc`,
 /// `build.rustc-wrapper` and target runners. `config` is the name before `config.toml`, and cargo
@@ -65,36 +71,145 @@ const LOCAL_BIN_DIRECTORIES: &[&str] = &["/usr/local/bin", "/usr/local/sbin"];
 /// home directory itself. The home directory comes last, so that a writable home directory is
 /// reported with the file that makes it dangerous. It protects only itself: the usual policies
 /// make a directory below it writable, which stays allowed.
-pub fn locations(homes: &[PathBuf], platform: Vec<ProtectedPath>) -> Vec<ProtectedPath> {
-    let mut locations = Vec::new();
-    for home in homes {
-        locations.extend(
-            HOME_FILES
-                .iter()
-                .map(|name| ProtectedPath::entry(home.join(name))),
-        );
-        locations.extend(
-            HOME_TREES
-                .iter()
-                .map(|name| ProtectedPath::tree(home.join(name))),
-        );
-    }
-    for config in user_directories("XDG_CONFIG_HOME", homes, ".config") {
-        locations.extend(
-            CONFIG_TREES
-                .iter()
-                .map(|name| ProtectedPath::tree(config.join(name))),
-        );
-    }
-    locations.extend(cargo_configs(homes));
+pub fn locations(
+    homes: &[PathBuf],
+    platform: Vec<ProtectedPath>,
+    drives: &[PathBuf],
+) -> Vec<ProtectedPath> {
+    let mut locations = below_homes(homes, SHELL_FILES, SHELL_TREES, SHELL_CONFIG_TREES, drives);
+    locations.extend(tool_configs(homes, drives));
     locations.extend(platform);
     locations.extend(homes.iter().map(ProtectedPath::entry));
     locations
 }
 
+/// The configuration of the tools that read it on every platform, Windows included: git, SSH,
+/// GnuPG and cargo, below every home directory and the directories their variables name.
+///
+/// `drives` are the drives a path without one may mean, empty off Windows. A variable that names
+/// a path with a drive protects that path; one rooted without a drive protects it on each of
+/// `drives`, as the homes of `tool_homes` do.
+pub fn tool_configs(homes: &[PathBuf], drives: &[PathBuf]) -> Vec<ProtectedPath> {
+    let mut locations = below_homes(homes, TOOL_FILES, TOOL_TREES, TOOL_CONFIG_TREES, drives);
+    locations.extend(cargo_configs(homes, drives));
+    // GNUPGHOME names the GnuPG configuration directory, GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM
+    // the one file git reads as the global and the system configuration, each replacing the
+    // default. A writable path that reaches one lets the program change what gpg or git runs, so
+    // protect it when the variable names a place (rule 12). gpg expands a leading `~` itself, git
+    // does not.
+    locations.extend(configured("GNUPGHOME", true, homes, drives));
+    locations.extend(configured("GIT_CONFIG_GLOBAL", false, &[], drives));
+    locations.extend(configured("GIT_CONFIG_SYSTEM", false, &[], drives));
+    locations
+}
+
+/// The locations `variable` names (`named_directories`), with their tree when `subtree`. A value
+/// that starts with the component `~` names the rest below each of `tilde_homes`, for a tool that
+/// expands it itself; pass none for one that does not. A relative value names no one place: the
+/// tool resolves it against its working directory, which sandy does not know.
+///
+/// A device or a named pipe, such as the `/dev/null` that CI sets `GIT_CONFIG_GLOBAL` to so that
+/// git ignores the global configuration, holds nothing that persists, so it stays writable; the
+/// directory it lies in is protected instead, because a writable path there could put a file in
+/// its place.
+fn configured(
+    variable: &'static str,
+    subtree: bool,
+    tilde_homes: &[PathBuf],
+    drives: &[PathBuf],
+) -> Vec<ProtectedPath> {
+    named_locations(
+        variable,
+        std::env::var_os(variable),
+        subtree,
+        tilde_homes,
+        drives,
+    )
+}
+
+/// `configured` for the `value` of `variable`.
+fn named_locations(
+    variable: &'static str,
+    value: Option<OsString>,
+    subtree: bool,
+    tilde_homes: &[PathBuf],
+    drives: &[PathBuf],
+) -> Vec<ProtectedPath> {
+    let rest = value
+        .as_deref()
+        .and_then(|value| Path::new(value).strip_prefix("~").ok())
+        .filter(|_| !tilde_homes.is_empty());
+    let paths = match rest {
+        // `join` with an empty path would add a separator to the home directory.
+        Some(rest) if rest.as_os_str().is_empty() => tilde_homes.to_vec(),
+        Some(rest) => tilde_homes.iter().map(|home| home.join(rest)).collect(),
+        None => named_directories(value, drives),
+    };
+    let mut locations = Vec::new();
+    for path in paths {
+        let special = std::fs::metadata(&path)
+            .is_ok_and(|metadata| !metadata.is_file() && !metadata.is_dir());
+        if !special {
+            let location = if subtree {
+                ProtectedPath::tree(path)
+            } else {
+                ProtectedPath::entry(path)
+            };
+            locations.push(location.named_by(variable));
+            continue;
+        }
+        // Both the directory of the name and that of the file it leads to: whoever can write
+        // where a link lies can repoint it.
+        let target = canonical_location(&path);
+        let mut parents: Vec<&Path> = [path.parent(), target.parent()]
+            .into_iter()
+            .flatten()
+            .collect();
+        parents.dedup();
+        locations.extend(
+            parents
+                .into_iter()
+                .map(|parent| ProtectedPath::entry(parent).named_by(variable)),
+        );
+    }
+    locations
+}
+
+/// `files` and `trees` below every home directory, and `config_trees` below every configuration
+/// directory.
+fn below_homes(
+    homes: &[PathBuf],
+    files: &[&str],
+    trees: &[&str],
+    config_trees: &[&str],
+    drives: &[PathBuf],
+) -> Vec<ProtectedPath> {
+    let mut locations = Vec::new();
+    for home in homes {
+        locations.extend(
+            files
+                .iter()
+                .map(|name| ProtectedPath::entry(home.join(name))),
+        );
+        locations.extend(
+            trees
+                .iter()
+                .map(|name| ProtectedPath::tree(home.join(name))),
+        );
+    }
+    for config in user_directories("XDG_CONFIG_HOME", homes, ".config", drives) {
+        locations.extend(
+            config_trees
+                .iter()
+                .map(|name| ProtectedPath::tree(config.join(name))),
+        );
+    }
+    locations
+}
+
 /// cargo's configuration files in `CARGO_HOME` and in `.cargo` below every home directory.
-pub fn cargo_configs(homes: &[PathBuf]) -> Vec<ProtectedPath> {
-    user_directories("CARGO_HOME", homes, ".cargo")
+fn cargo_configs(homes: &[PathBuf], drives: &[PathBuf]) -> Vec<ProtectedPath> {
+    user_directories("CARGO_HOME", homes, ".cargo", drives)
         .iter()
         .flat_map(|cargo| {
             CARGO_CONFIGS
@@ -113,13 +228,14 @@ pub fn path_locations(
     path: Option<&OsStr>,
     homes: &[PathBuf],
     platform: &[&str],
+    drives: &[PathBuf],
 ) -> Vec<ProtectedPath> {
     let mut directories = path_directories(path);
     let usual = homes
         .iter()
         .flat_map(|home| HOME_BIN_DIRECTORIES.iter().map(|name| home.join(name)))
         .chain(
-            user_directories("CARGO_HOME", homes, ".cargo")
+            user_directories("CARGO_HOME", homes, ".cargo", drives)
                 .into_iter()
                 .map(|cargo| cargo.join("bin")),
         )
@@ -137,13 +253,17 @@ pub fn path_locations(
     directories
 }
 
-/// The directory `variable` names when it is absolute, and `fallback` below every home
-/// directory. Both, because a program that starts sandy with a minimal environment does not set
-/// the variable while the user's own session does.
-pub fn user_directories(variable: &str, homes: &[PathBuf], fallback: &str) -> Vec<PathBuf> {
-    let named = std::env::var_os(variable)
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute());
+/// The place `variable` names, and `fallback` below every home directory. Both, because a program
+/// that starts sandy with a minimal environment does not set the variable while the user's own
+/// session does. `drives` are the drives a path without one may mean (empty off Windows); see
+/// `named_directories`.
+pub fn user_directories(
+    variable: &str,
+    homes: &[PathBuf],
+    fallback: &str,
+    drives: &[PathBuf],
+) -> Vec<PathBuf> {
+    let named = named_directories(std::env::var_os(variable), drives);
     let mut directories: Vec<PathBuf> = homes
         .iter()
         .map(|home| home.join(fallback))
@@ -152,6 +272,26 @@ pub fn user_directories(variable: &str, homes: &[PathBuf], fallback: &str) -> Ve
     directories.sort();
     directories.dedup();
     directories
+}
+
+/// The places a variable's `value` names, so that one program reads the same file whichever way
+/// the path is written. A value with a drive, or an absolute Unix path, names one place. A value
+/// rooted without a drive, as on Windows (`\Users\x`), names one place on each of `drives`, the
+/// drives a path without one may mean; `drives` is empty off Windows, where every rooted path is
+/// absolute. A relative value names no one place and is left out. This is the expansion
+/// `tool_homes` does for the home directory, applied to every variable that names a protected
+/// place.
+pub fn named_directories(value: Option<OsString>, drives: &[PathBuf]) -> Vec<PathBuf> {
+    let Some(path) = value.map(PathBuf::from) else {
+        return Vec::new();
+    };
+    if path.is_absolute() {
+        vec![path]
+    } else if path.has_root() {
+        drives.iter().map(|drive| drive.join(&path)).collect()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Why there is no home directory to check, when neither source names one.
@@ -262,7 +402,7 @@ mod tests {
     fn the_shared_locations_cover_the_shells_and_tools_of_every_home() {
         let home = PathBuf::from("/home/someone");
         let platform = ProtectedPath::tree(home.join("platform"));
-        let locations = locations(std::slice::from_ref(&home), vec![platform.clone()]);
+        let locations = locations(std::slice::from_ref(&home), vec![platform.clone()], &[]);
         let protects = |path: &str, subtree: bool| {
             locations
                 .iter()
@@ -298,6 +438,7 @@ mod tests {
             Some(&path),
             std::slice::from_ref(&home),
             &["/opt/homebrew/bin"],
+            &[],
         );
         let count = |directory: &Path| {
             directories
@@ -347,5 +488,94 @@ mod tests {
             homes(Some(passwd.clone()), Some(moved.clone().into())),
             Ok(vec![moved, passwd])
         );
+    }
+
+    /// A configuration variable that names a device protects the directory the device lies in,
+    /// not the device, which holds nothing that persists; a file or a directory protects itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_configured_device_protects_only_its_directory() {
+        let locations = named_locations(
+            "GIT_CONFIG_GLOBAL",
+            Some("/dev/null".into()),
+            false,
+            &[],
+            &[],
+        );
+        let paths: Vec<&Path> = locations
+            .iter()
+            .map(|location| location.path.as_path())
+            .collect();
+        assert_eq!(paths, [Path::new("/dev")]);
+        assert!(!locations[0].subtree);
+        assert_eq!(locations[0].describe(), "/dev (GIT_CONFIG_GLOBAL)");
+
+        let directory = std::env::temp_dir();
+        let locations =
+            named_locations("GNUPGHOME", Some(directory.clone().into()), true, &[], &[]);
+        assert_eq!(
+            locations,
+            [ProtectedPath::tree(&directory).named_by("GNUPGHOME")]
+        );
+    }
+
+    /// gpg expands a leading `~` in GNUPGHOME with the home directory, so a quoted
+    /// `GNUPGHOME="~/.local/share/gnupg"` names a place below every home directory; git does
+    /// not, so for GIT_CONFIG_GLOBAL, which gets no homes to expand with, the value is relative
+    /// and names none.
+    #[test]
+    fn a_leading_tilde_names_a_place_below_every_home_directory_that_is_given() {
+        let homes = [PathBuf::from("/home/one"), PathBuf::from("/home/two")];
+        let paths = |value: &str, tilde_homes: &[PathBuf]| -> Vec<PathBuf> {
+            named_locations("GNUPGHOME", Some(value.into()), true, tilde_homes, &[])
+                .into_iter()
+                .map(|location| location.path)
+                .collect()
+        };
+        assert_eq!(
+            paths("~/.local/share/gnupg", &homes),
+            [
+                PathBuf::from("/home/one/.local/share/gnupg"),
+                PathBuf::from("/home/two/.local/share/gnupg")
+            ]
+        );
+        assert_eq!(paths("~", &homes), homes);
+        assert_eq!(paths("~other/gnupg", &homes), Vec::<PathBuf>::new());
+        assert_eq!(paths("~/gitconfig", &[]), Vec::<PathBuf>::new());
+    }
+
+    /// A variable that names a place with a drive, or an absolute Unix path, names one place; one
+    /// rooted without a drive names one on each drive; a relative value or none names none.
+    #[test]
+    fn named_directories_expand_a_rooted_value_across_the_drives() {
+        let drives = [PathBuf::from(r"C:\"), PathBuf::from(r"E:\")];
+        assert_eq!(named_directories(None, &drives), Vec::<PathBuf>::new());
+        assert_eq!(
+            named_directories(Some("relative".into()), &drives),
+            Vec::<PathBuf>::new()
+        );
+        if cfg!(windows) {
+            assert_eq!(
+                named_directories(Some(r"C:relative".into()), &drives),
+                Vec::<PathBuf>::new()
+            );
+            assert_eq!(
+                named_directories(Some(r"D:\config".into()), &drives),
+                vec![PathBuf::from(r"D:\config")]
+            );
+            assert_eq!(
+                named_directories(Some(r"\shared\config".into()), &drives),
+                vec![
+                    PathBuf::from(r"C:\shared\config"),
+                    PathBuf::from(r"E:\shared\config")
+                ]
+            );
+        } else {
+            // Off Windows there are no drives and every rooted path is absolute.
+            assert_eq!(
+                named_directories(Some("/etc/config".into()), &[]),
+                vec![PathBuf::from("/etc/config")]
+            );
+        }
     }
 }

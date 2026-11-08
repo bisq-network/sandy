@@ -36,8 +36,8 @@ pub struct TargetCommand {
 /// For `process.end_with_parent`: the process sandy watches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParentProcess {
-    /// The process ID. On Unix sandy reads it as its first step, or the caller names it with
-    /// `--parent-pid` and sandy checks it then; on Windows only the caller names it.
+    /// The process ID. sandy reads it as its first step, or the caller names it with
+    /// `--parent-pid` and sandy checks it then.
     pub id: u32,
     /// `--parent-start`: the start of the process with that ID, which only the caller itself
     /// can know, so a process that got the ID after the caller ended is told apart from the
@@ -56,12 +56,13 @@ pub struct ParentProcess {
 /// - `pid N` once the program runs, with the program's process ID. In the exec model (Linux and
 ///   macOS without `contained`) sandy writes it right before it replaces itself with the
 ///   program, because afterwards it cannot write any more.
-/// - `exited N` or `signaled N` when sandy saw the program end. The exec model has no such
+/// - `exited N` or `signaled N` when sandy saw the program end. `N` is never negative: a
+///   Windows exit code is written as the unsigned 32-bit number it is. The exec model has no such
 ///   line: sandy is the program there, and the caller's own wait status is the program's.
 /// - `failed` when sandy itself failed or refused. Without a `pid` line the program never ran.
-///   After one it means that the last step, the `execve`, failed, or, with `contained`, that
-///   sandy ended the run because a process it relies on ended while the program ran: the guard,
-///   the init of the PID namespace, a relay or the broker.
+///   After one it means that the last step, the `execve`, failed, or, with `contained` and on
+///   Windows, that sandy ended the run because a process it relies on ended while the program
+///   ran: the guard, the init of the PID namespace, a relay or the broker.
 ///
 /// Writing is best effort: a caller that closed the read end gets no record, and the program
 /// keeps running.
@@ -101,7 +102,8 @@ impl StatusReport {
         self.write(format_args!("pid {pid}"));
     }
 
-    pub fn exited(&self, code: i32) {
+    /// `code` as the platform reports it: 0 to 255 on Unix, the 32-bit exit code on Windows.
+    pub fn exited(&self, code: u32) {
         self.write(format_args!("exited {code}"));
     }
 
@@ -162,6 +164,19 @@ pub trait Backend {
     /// authoritative answer.
     fn verify(&self, policy: &ResolvedPolicy) -> Vec<PlanItem> {
         crate::verify::relay_listeners(policy)
+    }
+
+    /// What sandy refuses about the program or the parent of the selected level that `plan`
+    /// does not judge, for example a program type the platform does not start as named, or a
+    /// parent that has ended. The command line calls it once it has selected a level, for
+    /// `check` and before `run`, so both refuse the same. Like `verify`, it may read host state
+    /// and must leave the host as it found it.
+    fn refuse(
+        &self,
+        _policy: &ResolvedPolicy,
+        _parent: Option<ParentProcess>,
+    ) -> Result<(), SandboxError> {
+        Ok(())
     }
 
     fn run(

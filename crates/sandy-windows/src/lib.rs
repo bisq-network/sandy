@@ -19,4 +19,4 @@ pub mod version;
 mod sys;
 
 #[cfg(windows)]
-pub use sys::{WindowsBackend, WindowsHost};
+pub use sys::{WindowsBackend, WindowsHost, recorded_parent};

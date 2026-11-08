@@ -43,8 +43,10 @@ exports:
                        __Unwind_GetRegionStart, __Unwind_GetTextRelBase, __Unwind_Resume,
                        __Unwind_SetGR, __Unwind_SetIP, _waitid, _waitpid, _write, _writev ]
   - targets:         [ arm64-macos ]
-    symbols:         [ _bzero, _close, _fstat, _lstat, _opendir, _readdir_r, _stat ]
+    symbols:         [ _bzero, _close, _fstat, _getfsstat, _lstat, _opendir, _readdir_r, _stat,
+                       _statfs ]
   - targets:         [ x86_64-macos ]
-    symbols:         [ ___bzero, '_close$NOCANCEL', '_fstat$INODE64', '_lstat$INODE64',
-                       '_opendir$INODE64', '_readdir_r$INODE64', '_stat$INODE64' ]
+    symbols:         [ ___bzero, '_close$NOCANCEL', '_fstat$INODE64', '_getfsstat$INODE64',
+                       '_lstat$INODE64', '_opendir$INODE64', '_readdir_r$INODE64',
+                       '_stat$INODE64', '_statfs$INODE64' ]
 ...

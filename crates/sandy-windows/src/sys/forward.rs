@@ -79,8 +79,9 @@ impl Forwarding {
     /// socket per forwarded port and serves them all on one thread, connecting each connection to
     /// its port's target. When `egress` is set, it also binds one socket for the egress broker but
     /// does not serve it: the broker serves that one in its own sandbox, so the bound listener is
-    /// handed back. The addresses are the program's ports that the relay inside the program's
-    /// AppContainer listens on, each passing its connections to the socket named after its port.
+    /// handed back. The addresses are the program's forwarded ports that the relay inside the
+    /// program's AppContainer listens on, each passing its connections to the socket named after
+    /// its port; the relay listens on the egress port the same way.
     pub fn start(
         forward: &[ForwardedPort],
         egress: Option<SocketAddr>,
@@ -105,7 +106,7 @@ impl Forwarding {
             SOCKET_ACCESS,
             OBJECT_INHERIT_ACE | INHERIT_ONLY_ACE,
         )?;
-        let mut listens = Vec::with_capacity(forward.len() + 1);
+        let mut listens = Vec::with_capacity(forward.len());
         let mut routes = Vec::with_capacity(forward.len());
         for entry in forward {
             let listener = forwarding.bind(entry.port)?;
@@ -116,11 +117,7 @@ impl Forwarding {
         // Bound before the server starts, so a failure leaves no thread behind.
         let egress_listener = match egress {
             None => None,
-            Some(listen) => {
-                let listener = forwarding.bind(listen.port())?;
-                listens.push(listen);
-                Some(listener)
-            }
+            Some(listen) => Some(forwarding.bind(listen.port())?),
         };
         if !routes.is_empty() {
             let stop = Stop::new().map_err(|error| {

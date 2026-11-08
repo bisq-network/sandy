@@ -252,6 +252,32 @@ fn a_named_parent_must_be_sandys_parent() {
     assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
 }
 
+/// `check` refuses a named parent that is not sandy's parent, as `run` does, so that it reports
+/// what `run` would refuse. Control: the caller's own process ID passes.
+#[test]
+fn check_refuses_a_named_parent_that_is_not_sandys_parent() {
+    let fixture = Fixture::new("parent-check");
+    let checked = |parent: &str| {
+        let mut args = vec!["check".to_string()];
+        args.extend(platform_args());
+        args.extend(ending_with_parent(&fixture));
+        args.extend(["--parent-pid".to_string(), parent.to_string()]);
+        args.extend(["--".to_string(), probe_path()]);
+        sandy(args)
+    };
+    let other = (std::process::id() + 1).to_string();
+    let output = checked(&other);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{stderr}");
+    assert!(stderr.contains(&format!("not {other}")), "{stderr}");
+    if let Some(reason) = unsupported() {
+        skip("landlock-abi-6", reason);
+        return;
+    }
+    let output = checked(&std::process::id().to_string());
+    assert!(output.status.success(), "{output:?}");
+}
+
 /// A parent that ends before sandy's `main` runs. The kernel gives sandy another parent at
 /// once, so `getppid` can no longer find the caller. With its own process ID and start, the
 /// caller says which process it means, and sandy refuses because that process is gone.
@@ -561,4 +587,226 @@ fn a_signal_to_the_callers_process_group_does_not_end_the_watcher() {
         kill_process(pid);
     }
     assert!(ended, "sandy {pid} outlived its parent");
+}
+
+/// Windows keeps the process ID of sandy's parent recorded after that parent ends, so the ID
+/// alone does not tell that it still runs. `check` refuses a parent that has ended, as `run`
+/// does, named with `--parent-pid` or not. The test starts sandy suspended under a parent of its
+/// choosing and ends that parent before sandy runs. Control: the same check while the parent
+/// runs passes.
+#[cfg(windows)]
+#[test]
+fn check_refuses_a_parent_that_has_ended() {
+    let fixture = Fixture::new("parent-check-ended");
+    let mut base = vec!["check".to_string()];
+    base.extend(platform_args());
+    base.extend(ending_with_parent(&fixture));
+    for named in [false, true] {
+        for ended in [false, true] {
+            let (code, output) = windows::check_under_parent(&base, named, ended);
+            let case = format!("named: {named}, ended: {ended}: {output}");
+            if ended {
+                assert_eq!(code, EXIT_FAILURE as u32, "{case}");
+                assert!(output.contains("has already ended"), "{case}");
+            } else {
+                assert_eq!(code, 0, "{case}");
+            }
+        }
+    }
+}
+
+/// `check` opens the parent only for the level it takes, as `run` does: a fallback level that
+/// ends with its parent does not make `check` refuse an ended parent for a base that does not.
+/// Control: pinned with `--level`, that fallback level refuses it.
+#[cfg(windows)]
+#[test]
+fn check_tests_the_parent_of_the_level_it_takes_only() {
+    let fixture = Fixture::new("parent-check-level");
+    let policy = fixture.path("policy.toml");
+    fs::write(
+        &policy,
+        format!(
+            "version = 1\n[filesystem]\nread = [{:?}]\nread_write = [{:?}]\n\
+             [process]\nsignals = \"isolated\"\n\
+             [windows]\nappcontainer_name = \"{}\"\n\
+             [[fallback]]\nname = \"ending\"\nprocess.end_with_parent = true\n\
+             windows.appcontainer_name = \"{}\"\n",
+            fixture.arg("ro"),
+            fixture.arg("rw"),
+            appcontainer_name(),
+            level_appcontainer_name()
+        ),
+    )
+    .unwrap();
+    let policy = policy.to_str().unwrap().to_string();
+    for named in [false, true] {
+        for level in [None, Some("base"), Some("ending")] {
+            let mut args = vec!["check".to_string(), "--policy".to_string(), policy.clone()];
+            if let Some(level) = level {
+                args.extend(["--level".to_string(), level.to_string()]);
+            }
+            let (code, output) = windows::check_under_parent(&args, named, true);
+            let case = format!("named: {named}, level: {level:?}: {output}");
+            if level == Some("ending") {
+                assert_eq!(code, EXIT_FAILURE as u32, "{case}");
+                assert!(output.contains("has already ended"), "{case}");
+            } else {
+                assert_eq!(code, 0, "{case}");
+                assert!(output.contains("level: base"), "{case}");
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+mod windows {
+    use std::io::Read;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::process::{Command, Stdio};
+
+    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList,
+        EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, INFINITE,
+        InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+        PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+        UpdateProcThreadAttribute, WaitForSingleObject,
+    };
+
+    use crate::common::{probe_args, probe_path, sandy_path};
+
+    /// Runs sandy with `sandy_args`, `--parent-pid` of its parent if `named`, and the probe as
+    /// the program, as the child of a sleeping probe. With `end_parent`, the probe ends before
+    /// sandy runs. Returns sandy's exit code and what it wrote.
+    pub fn check_under_parent(
+        sandy_args: &[String],
+        named: bool,
+        end_parent: bool,
+    ) -> (u32, String) {
+        let mut parent = Command::new(probe_path())
+            .args(probe_args(&[("sleep", "60000")]))
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut args = sandy_args.to_vec();
+        if named {
+            args.extend(["--parent-pid".to_string(), parent.id().to_string()]);
+        }
+        args.extend(["--".to_string(), probe_path()]);
+        let mut line = format!("\"{}\"", sandy_path());
+        for arg in &args {
+            line.push_str(&format!(" \"{arg}\""));
+        }
+        let mut line: Vec<u16> = line.encode_utf16().chain([0]).collect();
+
+        let (mut read, mut write): (HANDLE, HANDLE) = (std::ptr::null_mut(), std::ptr::null_mut());
+        // SAFETY: both out pointers are valid.
+        let piped = unsafe { CreatePipe(&mut read, &mut write, std::ptr::null(), 0) };
+        assert_ne!(piped, 0);
+        // SAFETY: CreatePipe returned two new handles that this function owns.
+        let (read, write) = unsafe {
+            (
+                OwnedHandle::from_raw_handle(read),
+                OwnedHandle::from_raw_handle(write),
+            )
+        };
+        // A process created with another parent inherits that parent's handles, so the write
+        // end goes into the parent, inheritable.
+        let mut inherited: HANDLE = std::ptr::null_mut();
+        // SAFETY: every handle is valid and the out pointer is writable.
+        let duplicated = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                write.as_raw_handle(),
+                parent.as_raw_handle(),
+                &mut inherited,
+                0,
+                1,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        assert_ne!(duplicated, 0, "{}", std::io::Error::last_os_error());
+        drop(write);
+        let reader = std::thread::spawn(move || {
+            let mut output = String::new();
+            let _ = std::fs::File::from(read).read_to_string(&mut output);
+            output
+        });
+
+        let mut size = 0;
+        // SAFETY: a null list asks only for the size.
+        unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) };
+        let mut list = vec![0u8; size];
+        // SAFETY: list holds `size` bytes.
+        let ok =
+            unsafe { InitializeProcThreadAttributeList(list.as_mut_ptr().cast(), 1, 0, &mut size) };
+        assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+        let parent_handle: HANDLE = parent.as_raw_handle();
+        // SAFETY: the list is initialized; the value is a process handle that outlives the list.
+        let ok = unsafe {
+            UpdateProcThreadAttribute(
+                list.as_mut_ptr().cast(),
+                0,
+                PROC_THREAD_ATTRIBUTE_PARENT_PROCESS as usize,
+                (&raw const parent_handle).cast(),
+                size_of::<HANDLE>(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: the structure is plain data; zero is a valid value for every field.
+        let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+        startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdOutput = inherited;
+        startup.StartupInfo.hStdError = inherited;
+        startup.lpAttributeList = list.as_mut_ptr().cast();
+        // SAFETY: the structure is plain data; zero is a valid value for every field.
+        let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: line is NUL-terminated and writable; startup, the list and info outlive the
+        // call.
+        let created = unsafe {
+            CreateProcessW(
+                std::ptr::null(),
+                line.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
+                std::ptr::null(),
+                std::ptr::null(),
+                &startup.StartupInfo,
+                &mut info,
+            )
+        };
+        let error = std::io::Error::last_os_error();
+        // SAFETY: the list was initialized above.
+        unsafe { DeleteProcThreadAttributeList(list.as_mut_ptr().cast()) };
+        assert_ne!(created, 0, "{error}");
+        // SAFETY: CreateProcessW returned two new handles that this function owns.
+        let (process, thread) = unsafe {
+            (
+                OwnedHandle::from_raw_handle(info.hProcess),
+                OwnedHandle::from_raw_handle(info.hThread),
+            )
+        };
+        if end_parent {
+            parent.kill().unwrap();
+            parent.wait().unwrap();
+        }
+        // SAFETY: thread is the suspended main thread of sandy.
+        unsafe { ResumeThread(thread.as_raw_handle()) };
+        // SAFETY: process is a valid process handle.
+        unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) };
+        let mut code = 0u32;
+        // SAFETY: process is valid and code is a writable u32.
+        let read = unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) };
+        assert_ne!(read, 0);
+        // The parent's copy of the write end ends the output with the parent.
+        let _ = parent.kill();
+        let _ = parent.wait();
+        (code, reader.join().unwrap())
+    }
 }

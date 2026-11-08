@@ -124,7 +124,8 @@ fn broker_main(broker: Broker, ready: Ready, config: &BrokerConfig) {
             "the egress broker cannot make the pipe that stops it: {error}"
         )),
     };
-    let mut keep = vec![routes.fd(), inbox.fd(), program.as_raw_fd(), ready.fd()];
+    let mut keep = vec![inbox.fd(), program.as_raw_fd(), ready.fd()];
+    keep.extend(routes.fds());
     keep.extend(helper::STANDARD_DESCRIPTORS);
     keep.extend(ended.as_ref().map(AsRawFd::as_raw_fd));
     keep.extend(stop.descriptors());
@@ -138,6 +139,7 @@ fn broker_main(broker: Broker, ready: Ready, config: &BrokerConfig) {
             .then(|| Watchdog::create("the egress broker"))
             .transpose()?;
         confine(&keep, config.abi)?;
+        routes.check_watch();
         // Every connection gets its own threads. Starting one now shows that the filter allows
         // it, so a missing system call fails the start instead of the first connection.
         thread::Builder::new()
@@ -232,7 +234,7 @@ mod tests {
 
     /// What a compromised broker would try after `confine`. Returns an index into `OUTCOMES`.
     fn try_escapes(routes: &mut Routes, abi: ABI, other: SocketAddr) -> i32 {
-        if confine(&[routes.fd()], abi).is_err() {
+        if confine(&routes.fds(), abi).is_err() {
             return 1;
         }
         if std::fs::File::open("/proc/self/status").is_ok() {
@@ -258,7 +260,11 @@ mod tests {
             return 6;
         }
         let loopback = IpAddr::from([127, 0, 0, 1]);
-        if !routes.is_host(loopback).unwrap_or(false) || routes.subnets().is_err() {
+        if !routes
+            .is_host(SocketAddr::new(loopback, 443))
+            .unwrap_or(false)
+            || routes.subnets().is_err()
+        {
             return 7;
         }
         // clone with fork's flags; the other arguments are zero on x86_64 and arm64 alike.

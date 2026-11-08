@@ -33,11 +33,12 @@ use std::io::{self, Read, Write};
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
 use landlock::{AccessFs, BitFlags};
 use sandy_core::{SandboxError, StatusReport, canonical_location};
+use sandy_relay::report::Lines;
 use seccompiler::BpfProgram;
 
 use crate::contain::{SIGNALED, START_FAILED, default_child_action};
@@ -67,11 +68,24 @@ const PATH_MAX: usize = 4096;
 /// here.
 const MOST_PATHS: usize = 1000;
 
-/// Writes one line of the report. Not `eprintln!`, which panics when standard error is gone:
-/// the watcher would end and every watched call of the program would fail with ENOSYS from
-/// then on.
+/// The writer of the report once the watcher runs (`Explain::start`). A standard error that
+/// nobody reads fills its pipe, and a blocking write would then hold up the watcher, and with
+/// it every watched call of the program, and the end of sandy; the writer drops lines instead
+/// and says how many (`sandy_relay::report`). It starts after the fork, because sandy forks
+/// only while it has one thread.
+static WRITER: OnceLock<Lines> = OnceLock::new();
+
+/// Writes one line of the report, whole. Not `eprintln!`, which panics when standard error is
+/// gone: the watcher would end and every watched call of the program would fail with ENOSYS
+/// from then on.
 fn report(line: &str) {
-    let _ = writeln!(std::io::stderr(), "{PREFIX}{line}");
+    let line = format!("{PREFIX}{line}\n");
+    match WRITER.get() {
+        Some(writer) => writer.send(line),
+        None => {
+            let _ = std::io::stderr().write_all(line.as_bytes());
+        }
+    }
 }
 
 /// What a watched call needs from Landlock, in the words of the report.
@@ -132,8 +146,8 @@ impl Need {
     }
 
     /// The policy grant that would allow it, if any does. sandy never lets a writable path hold
-    /// a symbolic link, a device or a named pipe (see `plan::policy_rights`), so for those the
-    /// report names no grant instead of advice that does not work.
+    /// a device or a named pipe (see `plan::policy_rights`), so for those the report names no
+    /// grant instead of advice that does not work.
     fn grant(self) -> Option<&'static str> {
         match self {
             Need::Read | Need::List => Some("read"),
@@ -144,9 +158,18 @@ impl Need {
             | Need::CreateDirectory
             | Need::Remove
             | Need::RemoveDirectory => Some("read_write"),
-            Need::Symlink | Need::Device | Need::Fifo => None,
-            // Only with unix_sockets = "all"; `policy_rights` adds MakeSock then.
-            Need::Socket => Some("read_write with unix_sockets = \"all\""),
+            Need::Symlink | Need::Socket => Some("read_write"),
+            Need::Device | Need::Fifo => None,
+        }
+    }
+
+    /// The setting that the use needs next to its grant, and the option that sets it:
+    /// `policy_rights` adds MakeSym and MakeSock only with these.
+    fn setting(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Need::Symlink => Some(("filesystem.symlinks = \"allow\"", "--symlinks allow")),
+            Need::Socket => Some(("network.unix_sockets = \"all\"", "--unix-sockets all")),
+            _ => None,
         }
     }
 
@@ -375,6 +398,7 @@ impl Rules {
             path: path.to_path_buf(),
             need,
             covered_by: self.covering(checked).first().map(|rule| rule.path.clone()),
+            writable: self.granted(checked).contains(AccessFs::WriteFile),
         })
     }
 }
@@ -386,6 +410,8 @@ struct Gap {
     need: Need,
     /// The deepest rule that covers the path but not this use of it.
     covered_by: Option<PathBuf>,
+    /// Whether the rules already make the path writable, so that only a setting is missing.
+    writable: bool,
 }
 
 impl Gap {
@@ -396,9 +422,13 @@ impl Gap {
             (None, Some(directory)) => format!("no rule covers {}", directory.display()),
             (None, None) => "no rule covers it".to_string(),
         };
-        let advice = match self.need.grant() {
-            Some(grant) => format!("grant it with {grant}"),
-            None => "no grant of sandy allows that".to_string(),
+        let advice = match (self.need.grant(), self.need.setting()) {
+            (_, Some((setting, option))) if self.writable => {
+                format!("allow it with {setting} ({option})")
+            }
+            (Some(grant), Some((setting, _))) => format!("grant it with {grant} and {setting}"),
+            (Some(grant), None) => format!("grant it with {grant}"),
+            (None, _) => "no grant of sandy allows that".to_string(),
         };
         format!(
             "cannot {} {}: {what}; {advice} ({call} in process {pid})",
@@ -519,6 +549,7 @@ impl Explain {
         drop(self.send.take());
         // A report that nobody reads must not end sandy: the program would lose its watcher.
         ignore(libc::SIGPIPE)?;
+        let _ = WRITER.set(Lines::start(std::io::stderr(), PREFIX, "path"));
         let (stop_read, stop_write) = pipe("the watcher's stop pipe")?;
         self.stop = Some(stop_write);
         let receive = self.receive.take().expect("the watcher starts once");
@@ -539,6 +570,9 @@ impl Explain {
         };
         let counts = watcher.join().unwrap_or_default();
         report(&counts.summary());
+        if let Some(writer) = WRITER.get() {
+            writer.finish();
+        }
     }
 }
 
@@ -879,7 +913,7 @@ pub fn supervise(
     explain.finish();
     match code {
         Ended::Exited(code) => {
-            status.exited(code);
+            status.exited(code as u32);
             Ok(code)
         }
         Ended::Signaled(signal) => {
@@ -1262,9 +1296,44 @@ mod tests {
             "cannot write to /a/b: the rule /a does not allow it; grant it with read_write \
              (openat in process 7)"
         );
-        // sandy grants no rule that allows a symbolic link, so the report names no option.
-        let line = gap(&rules, "/a/b", Need::Symlink).expect("no rule allows a symbolic link");
+        let line = gap(&rules, "/a/b", Need::Symlink).expect("read does not allow a link");
+        assert!(
+            line.contains("grant it with read_write and filesystem.symlinks = \"allow\""),
+            "{line}"
+        );
+        // sandy grants no rule that allows a named pipe, so the report names no option.
+        let line = gap(&rules, "/a/b", Need::Fifo).expect("no rule allows a named pipe");
         assert!(line.contains("no grant of sandy allows that"), "{line}");
+    }
+
+    /// Under a read_write rule only the setting is missing for a link or a socket, so the report
+    /// names only that setting; under a read rule it names the whole grant.
+    #[test]
+    fn a_writable_path_names_only_the_missing_setting() {
+        // What `policy_rights` grants a read_write path without the two settings.
+        let read_write = READ
+            | make_bitflags!(AccessFs::{
+                WriteFile | Truncate | RemoveDir | RemoveFile | MakeDir | MakeReg | Refer
+                    | IoctlDev
+            });
+        let rules = rules(vec![rule("/a", READ), rule("/rw", read_write)]);
+        let line = gap(&rules, "/rw/b", Need::Symlink).expect("no link without the setting");
+        assert_eq!(
+            line,
+            "cannot create a symbolic link at /rw/b: the rule /rw does not allow it; allow it \
+             with filesystem.symlinks = \"allow\" (--symlinks allow) (openat in process 7)"
+        );
+        let line = gap(&rules, "/rw/b", Need::Socket).expect("no socket without the setting");
+        assert_eq!(
+            line,
+            "cannot create a socket at /rw/b: the rule /rw does not allow it; allow it with \
+             network.unix_sockets = \"all\" (--unix-sockets all) (openat in process 7)"
+        );
+        let line = gap(&rules, "/a/b", Need::Socket).expect("read does not allow a socket");
+        assert!(
+            line.contains("grant it with read_write and network.unix_sockets = \"all\""),
+            "{line}"
+        );
     }
 
     /// Landlock checks only the rights the ruleset handles, so a call that needs another one is

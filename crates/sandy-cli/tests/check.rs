@@ -92,6 +92,20 @@ fn check_warns_about_settings_that_give_up_isolation() {
     }
 }
 
+/// `symlinks = "allow"` gets a warning where the program can make links, Linux and macOS: a
+/// process outside follows them. Windows refuses every link to an AppContainer, so it keeps
+/// quiet there. The control: the default denies links and says nothing.
+#[test]
+fn check_warns_that_processes_outside_follow_the_links_of_the_program() {
+    let fixture = Fixture::new("check-symlinks");
+    let rw = fixture.arg("rw");
+    let allowed = check_warnings(&["--read-write", &rw, "--symlinks", "allow"]);
+    let id = "[symlinks-followed-outside]";
+    assert_eq!(allowed.contains(id), cfg!(not(windows)), "{allowed}");
+    let denied = check_warnings(&["--read-write", &rw]);
+    assert!(!denied.contains(id), "{denied}");
+}
+
 /// A writable path that holds the home directory lets the program change shell startup files
 /// and autostart entries, which run outside the sandbox (README rule 8). The backend refuses
 /// such a policy, and the warning says what the program could reach.

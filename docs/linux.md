@@ -430,7 +430,7 @@ port the check allows.
      `getpeername` for the check after the connect, `sendto` and `recvfrom` for the route
      lookups, `recvmsg` for the listener, polling, memory calls, `clone` for threads only,
      `timer_settime` for the watchdog and `FIONBIO`. `socket` is allowed for IPv4 and IPv6 TCP
-     with protocol 0 alone; the netlink socket exists already. Every other call fails with
+     with protocol 0 alone; the netlink sockets exist already. Every other call fails with
      `EPERM`, among them `bind`, `listen`, `sendmsg`, `read` and every call on a file; `clone3`
      fails with `ENOSYS`.
 4. It starts and joins one test thread and reports ready. In step 4 of "Launch order" the process
@@ -438,8 +438,8 @@ port the check allows.
    pair; a port below 1024 works, because the capability that binds one is still there. The
    broker waits for it as the relay waits for its forward listeners: it watches the end of the
    program and of the guard's pipe meanwhile, and keeps its watchdog armed.
-5. It serves the listener with `sandy_relay::broker::serve`, which asks the kernel for every
-   connection whether the destination is this host (`RTM_GETROUTE` for the destination, and
+5. It serves the listener with `sandy_relay::broker::serve`, which asks the kernel whether the
+   destination is this host (`RTM_GETROUTE` for the destination, for every connection, and
    `RTM_GETADDR` for the addresses and subnets of every interface) and which networks the host
    reaches without a router (the subnets, and an `RTM_GETROUTE` dump of every table for the
    unicast routes without a gateway other than the default route, over links that an
@@ -448,7 +448,13 @@ port the check allows.
    connections, such as a VRF's, so it can only add networks to the local network. A route that
    names only a nexthop object, which is all the kernel sends when
    `net.ipv4.nexthop_compat_mode` is 0, does not say whether it has a gateway and is left out,
-   so the network of an on-link route of that form is not the local network. A thread polls
+   so the network of an on-link route of that form is not the local network. The addresses and
+   the networks are kept until a second netlink socket, bound to the groups of links, addresses
+   and IPv4 and IPv6 routes, reports a change or an overflow of its queue (`ENOBUFS`); the next
+   connection then reads them anew
+   (`routes::tests::a_change_of_the_addresses_reaches_the_next_lookup`). Where the kernel does not
+   let the broker open or join that socket, or the socket cannot be read once the broker is
+   confined, it reads them for every connection. A thread polls
    the pidfd and the guard's pipe, keeps the watchdog armed, and asks the serve loop to stop
    when either ends. It asks through a pipe that the loop polls next to its listener, so the
    listener closes at once; the pipe is made before the filter, which allows no new one.
@@ -501,6 +507,31 @@ What the program gets, measured on Fedora 44:
   `2000::/4`; the private ranges behind it stay refused by the static check
   (`on_link_routes_are_the_local_network_without_an_address`, in a network namespace of its
   own). A dummy link is NOARP too, until `ip link set ... arp on`.
+- The route lookup asks what the broker's connect has before it picks a source, so the rules
+  (`ip rule`) that select on it pick the same route for both: TCP to the destination port
+  (`ipproto`, `dport`), as sandy's user (`uidrange`), with mark 0 (`fwmark`) and no interface
+  (`oif`); `iif lo` matches both, as every connection this host makes. A local route that such a
+  rule leads to is this host: with `ip rule add ipproto tcp lookup local` before `lookup main`,
+  an address of `ip route add local 1.1.1.0/24 dev lo` gets reply 2
+  (`a_rule_for_tcp_selects_the_route_of_the_connect` and
+  `rules_for_the_port_and_the_user_select_the_route_of_the_connect`, each in a network namespace
+  of its own; measured on kernel 7.2). The host's own policy routing beyond that is outside the
+  broker's check, as netfilter is: a rule on the source address or port (`from`, `sport`), which
+  the connect looks the route up again with after it picks them, an interface or a mark that the
+  host gives the broker's sockets (`ip vrf exec`, a cgroup hook), and what netfilter does to the
+  packets. Only root sets these up, the program cannot, and a host that sends this host's own
+  traffic for public addresses back to itself has chosen to.
+- An `unreachable` route, and a `throw` route with nothing behind it, give no route:
+  `RTM_GETROUTE` fails with `EHOSTUNREACH` or `ENETUNREACH`, the error a connect there fails with
+  too, so the broker connects and answers with reply 4 or 3. A `prohibit` or `blackhole` route or
+  rule fails the lookup with `EACCES` or `EINVAL`, and the broker refuses the address with
+  reply 1, also an address on the local network that `public` would refuse with reply 2. The
+  lookup cannot see everything the connect selects on, netfilter for one, so it cannot tell
+  whether the connect would fail the same way, and a failed lookup refuses. An address of this
+  host behind such a rule still gets reply 2 through the address dump
+  (`refusing_routes_fail_the_lookup` and
+  `a_prohibit_rule_after_a_rule_for_tcp_refuses_the_address`, in a network namespace of its own;
+  measured on kernel 7.2).
 - The start takes about 1.8 ms more than without the broker: 6.2 to 6.4 ms against 4.3 to 4.7 ms,
   as the median of 100 runs of `sandy run --ip private -- /usr/bin/true` with the release build
   (kernel 7.2, a busy 24 CPU host). Each connection costs a route lookup, an address dump, a
@@ -570,9 +601,10 @@ may make sandy try a weaker fallback level:
 - No name server is reachable, unless a forwarded port reaches one over TCP. The system set
   keeps `/etc/hosts` and the resolver configuration readable, so `localhost` resolves.
 - Each exposed connection asks the factory for its socket: one round trip over a socket pair.
-- The trial forks a child that creates the namespaces once more, in every `run` and `check`. It
-  adds about 1 ms to the start (0.7 to 1.2 ms in the medians of 150 runs of the release build
-  on the same host).
+- The trial forks a child that creates the namespaces once more, in every `run` and `check`. The
+  child works in `/`, so the directory sandy runs in does not change the plan. It adds about
+  1 ms to the start (0.7 to 1.2 ms in the medians of 150 runs of the release build on the same
+  host).
 - On Ubuntu every run and every `check` adds AppArmor audit records to the kernel log, for the
   trial and for the run.
 
@@ -646,11 +678,22 @@ descriptors only, so no path is resolved twice:
      which must still be the file of the plan; otherwise the run is refused.
    - A path anywhere else gets the directories above it on the tmpfs, with mode 0755 whatever
      the umask, owned by the user, and an empty file as the place of a file.
+   - The working directory, when no bound path holds it, gets an empty directory there in the
+     same way, so the program starts in it as without the view and as on macOS and Windows,
+     and a relative path finds nothing rather than resolving under `/`
+     (`the_program_starts_in_a_working_directory_outside_the_policy`). A working directory on
+     the proc file system refuses the run instead, unless a policy path holds it: an empty
+     directory there would show a `/proc` that the view does not hold, and its name a process ID
+     from outside the program's PID namespace, as `--cwd /proc/self` resolves to sandy's
+     (`a_working_directory_in_an_ungranted_proc_refuses_the_run`). sandy reads that file system
+     through `/proc/self/cwd`, because a path from the working directory, `.` too, needs search
+     permission on it, so a working directory without one starts as without the view
+     (`the_program_starts_in_a_working_directory_without_search_permission`).
 5. The symbolic links on the way to the paths are recreated with their text, `/dev` is built,
    the tmpfs mounts become read-only, and `pivot_root(".", ".")` with `umount2(".",
    MNT_DETACH)` makes the tmpfs the root and detaches the old one. The process then changes to
-   the working directory it had, when the view holds it, as the path itself or a directory above
-   a granted path, and to `/` otherwise.
+   the working directory it had, which the view now holds, and to `/` only when it had none (a
+   removed directory); a change that fails refuses the run.
 
 The descriptors of `/proc/self/task` that the thread checks of the launch sequence use are opened
 before the view, because the view hides `/proc` unless the policy grants it.
@@ -777,7 +820,9 @@ These are exceptions of `PathsHidden` (DESIGN.md, "Requirements and the enforcem
   inode numbers.
 - **The directories above a granted path.** They exist in the view with their names, for example
   `/home` and `/home/user` above a granted `/home/user/project`, owned by the user, with the time
-  sandy built the view. The program cannot list them, because no Landlock rule covers them.
+  sandy built the view. The program cannot list them, because no Landlock rule covers them. A
+  working directory that no policy path holds (`--cwd`, or sandy's own) exists the same way, empty,
+  with the directories above it, except on the proc file system, where it refuses the run.
 - **Link counts.** The link count of a granted file still counts its names outside the view, so
   the program learns that a file has another name, though not where.
   `the_view_leaves_the_file_systems_the_parents_and_link_counts_visible` records the three.
@@ -1425,14 +1470,38 @@ before the sandbox is refused on a standard stream and closed on every other des
 |---|---|
 | `read` | read file, read directory |
 | `read_exec` | read file, read directory, execute |
-| `read_write` | read file, read directory, write file, truncate, remove file, remove directory, make directory, make regular file, refer (move between writable directories), device ioctl; make socket only with `unix_sockets = "all"` |
+| `read_write` | read file, read directory, write file, truncate, remove file, remove directory, make directory, make regular file, refer (move between writable directories), device ioctl; make socket only with `unix_sockets = "all"`; make symbolic link only with `symlinks = "allow"` |
+
+Execute is the right to start a file with `execve`; Landlock checks nothing else as execute.
+Without `filesystem.view = "policy"` a file of a `read` or `read_write` path can therefore be
+mapped as code (`mmap` or `mprotect` with `PROT_EXEC`), and `dlopen` loads a library from there
+(measured on kernel 7.2: Python's `ctypes.CDLL` loaded a copy of `libz.so.1` from a `--read` and
+from a `--read-write` directory; `code_maps_only_from_executable_paths` checks the mapping). macOS
+lets only `read_exec` paths be mapped as code (`file-map-executable`), and Windows loads only a
+file with `FILE_EXECUTE`, which `read` and `read_write` do not grant. So a library in a `read` or
+`read_write` path loads on Linux and fails to load on macOS and Windows; a policy that loads
+libraries from a path makes it `read_exec` on every platform. The view mounts every path that no
+`read_exec` path holds without execute, and there `mmap` with `PROT_EXEC` fails with `EPERM`
+and `mprotect` with `EACCES` (see "File system view"). Nothing cheaper does this without the
+view: seccomp sees the descriptor number of an `mmap` but not the file behind it, and `mprotect`
+names no file at all, so a filter could only refuse every executable mapping of a file, also of
+the system libraries and of `read_exec` paths, and Landlock has no right for it. The program can
+still run code it writes into its own memory on every platform (docs/windows.md, "What sandy grants"), so this mapping gives it no code it could
+not run otherwise; it changes which policies load a library.
 
 A writable path never gets these rights:
 
-- **Execute.** The policy rule against writable and executable paths.
-- **Make symbolic link.** A process outside the sandbox that later writes a file in the writable
-  directory (for example a configuration file that it writes before every start) would follow a
-  planted link to any file of the user.
+- **Execute.** The policy rule against writable and executable paths. Mapping as code is not
+  execute, see above.
+- **Make symbolic link**, unless `filesystem.symlinks = "allow"`. A process outside the sandbox
+  that later writes a file in the writable directory (for example a configuration file that it
+  writes before every start) would follow a link the program left there to any file of the user.
+  Landlock asks the same right when a rename or a link gives an existing symbolic link a new
+  name. With `"allow"` the program can make links that point anywhere: Landlock never sees the
+  target of a new link, so no rule can keep a link to a file outside the policy out, and
+  `sandy check` warns (`symlinks-followed-outside`). The program gains nothing through such a
+  link, because Landlock checks the file a path resolves to: a link to a file outside the policy
+  is refused like the file (`symlinks_allow_makes_links_that_reach_nothing_new`).
 - **Make named pipe.** A planted FIFO blocks a process outside the sandbox that opens the path.
 - **Make character or block device.** Never needed; it also needs `CAP_MKNOD`.
 - **Make socket** when Unix sockets are denied. Binding a pathname socket needs an `AF_UNIX`
@@ -2075,7 +2144,8 @@ one it denied. That is a wrong report, not a weaker sandbox: see DESIGN.md.
   coreutils ran under `--explain` with the filter in the glibc and musl builds.
 - The report goes to sandy's standard error, which is usually the program's as well. A reader
   that goes away does not end the run: sandy ignores `SIGPIPE` (the program gets the default
-  action back before it confines itself), and a line that cannot be written is dropped.
+  action back before it confines itself), and the report is written from a queue: lines that
+  do not fit are dropped and counted in the report.
   Without that, sandy would die and the program would lose its watcher.
 - A run with `--explain` is otherwise the same run: the Landlock ruleset and the other filters
   are built exactly as without it.
@@ -2256,10 +2326,10 @@ policy is the only way to keep what it promises. The locations every Unix has ar
 | `.bash_aliases` | the file | Debian's `.bashrc` sources it |
 | `.bashrc.d` | the tree | Fedora's `.bashrc` sources every file in it |
 | `<config>/fish` | the tree | the startup files of the fish shell |
-| `.gitconfig`, `<config>/git` | the file, the tree | `core.fsmonitor`, `core.sshCommand`, `core.pager` and `!` aliases run commands at the next git command |
+| `.gitconfig`, `<config>/git`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` | the file, the tree, the file, the file | `core.fsmonitor`, `core.sshCommand`, `core.pager` and `!` aliases run commands at the next git command; `GIT_CONFIG_GLOBAL` replaces `.gitconfig` as the global configuration, `GIT_CONFIG_SYSTEM` the system one |
 | `.cargo/config.toml`, `.cargo/config`, and both in `CARGO_HOME` | the file | `build.rustc`, `build.rustc-wrapper` and target runners name programs that the next cargo command runs |
 | `.ssh` | the tree | `ProxyCommand` and `LocalCommand` in the configuration run programs, and `authorized_keys` admits logins |
-| `.gnupg` | the tree | `pinentry-program` and `photo-viewer` name programs that gpg runs |
+| `.gnupg`, `GNUPGHOME` | the tree | `pinentry-program` and `photo-viewer` name programs that gpg runs; `GNUPGHOME` replaces `.gnupg` |
 | `.pam_environment`, `.xprofile`, `.xinitrc`, `.xsession`, `.xsessionrc` | the file | read when a session starts (Linux) |
 | `<config>/autostart` | the tree | desktop entries that run at the next login (Linux) |
 | `<config>/systemd`, `<data>/systemd` | the tree | systemd user units, which the program can enable with a link of its own (Linux) |
@@ -2274,6 +2344,17 @@ starts sandy, and the same holds for `CARGO_HOME` and `~/.cargo`. So `--read-wri
 refused; a program that downloads crates needs `~/.cargo/registry` and `~/.cargo/git`. A
 location that does not exist counts, because the program could create it, and each counts where
 it lies and where its symbolic links lead.
+
+`GNUPGHOME`, `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` count when they are set to an absolute
+path, and `GNUPGHOME` also when it starts with `~/`, which gpg expands with the home directory (git
+does not expand it in its variables): sandy then protects that place below each home directory. A
+relative value is not protected, because git and gpg resolve it against their working directory,
+which sandy does not know. A refusal names the variable, for example `overlaps /work/gnupg
+(GNUPGHOME)`, so that a caller who set it, in CI for example, sees why a path of their own is
+protected. A device or a named pipe that one of them names holds nothing that persists and stays
+writable: `GIT_CONFIG_GLOBAL=/dev/null`, the usual way to make git ignore the global configuration,
+still allows `--read-write /dev/null` with `system = "none"`. The directory it lies in is protected
+instead, because a writable path there could put a file in its place.
 
 The home directory comes from the password database (`getpwuid_r`) and from `HOME`, for the
 same reason. When neither names one, or the password database cannot be read, sandy cannot tell
@@ -2326,15 +2407,15 @@ rights of both, so the resolver compares files before it builds the rules.
   the one case where that can pick the wrong one. A bind mount of `/dev/pts/ptmx` at
   `/dev/ptmx` lies inside `/dev/pts` this way, which a writable devpts allows (see
   "Pseudo-terminals").
-- **Hard links.** `read_exec` files, the program file, sandy's own executable and the policy
-  file must have no second name inside a writable path. sandy checks `st_nlink` first and then
-  walks the writable trees, which costs one `lstat` per file there; it walks the `read_exec`
-  trees only when the writable trees hold a file with more than one name, which is rare. A
-  directory the user may not list is skipped: the program runs as the same user and cannot list
-  it either.
-- A file outside the policy that has a second name inside a writable path stays writable through
-  that name, and two names that a passthrough FUSE mount shows for one file have different
-  identities and stay unseen. See "Links and file identity" in [DESIGN.md](DESIGN.md).
+- **Hard links.** sandy's own executable and the policy file must have no second name inside a
+  writable path. sandy checks `st_nlink` first and walks the writable trees only when one of the
+  two has more than one name, which costs one `lstat` per file there. A directory the user may
+  not list is skipped: the program runs as the same user and cannot list it either.
+- Any other file that has a second name inside a writable path, also a `read_exec` file or the
+  program, stays writable through that name. The link comes from the host or from an earlier run
+  that could write both names; which trees a policy makes executable is its author's choice. Two
+  names that a passthrough FUSE mount shows for one file have different identities and
+  stay unseen. See "Links and file identity" in [DESIGN.md](DESIGN.md).
 
 ## Refusals
 
@@ -2503,6 +2584,14 @@ exit code 125 and the paths it compared.
   keeps the default view. The test `a_read_only_descriptor_changes_only_the_mode_and_the_times`
   records it. With `filesystem.view = "policy"` these paths are read-only mounts, where both calls
   fail with `EROFS`, so the exception does not apply there (see "File system view").
+- **Tools that make symbolic links.** A writable path gets no right to make symbolic links (see
+  "Rights per access level"), so `ln -s` there fails with "Permission denied", npm and pnpm
+  cannot make the links of `node_modules/.bin`, Emacs cannot make its lock links `.#NAME`,
+  `python3 -m venv` fails with `EACCES` when it links `lib64` (Python 3.14), and `git init` and
+  `git clone` set `core.symlinks = false`, so git checks out a link of the repository as a plain
+  file holding the link's target, without an error (measured on Linux 7.2 for `ln`, Python and
+  git 2.56). `filesystem.symlinks = "allow"` (`--symlinks allow`) grants the right on writable
+  paths; named pipes and devices stay denied (README.md, "Symbolic links").
 - **Files the program writes can be executed outside the sandbox.** The program gets no execute
   right in a writable path, but a file it writes keeps the mode it gives it: the filter strips
   only the setuid and setgid bits, and Landlock has no right over the execute bit. A process
@@ -2555,10 +2644,9 @@ exit code 125 and the paths it compared.
   files of systemd-resolved sandy grants their directory instead; a plain `/etc/resolv.conf`,
   the other layouts and `/etc/hosts` stay single files, so a long-running program needs a
   restart after the system replaces one (see "Replaced resolver files").
-- **Hard links made outside.** The link check runs at the start. A process outside the sandbox
-  can link a file into a writable path while the program runs, and the program can then change
-  that file. The program cannot do it itself: it gets no `refer` right out of its writable paths
-  and no execute right inside them.
+- **Hard links made outside.** A process outside the sandbox can link a file into a writable path,
+  before or while the program runs, and the program can then change that file. The program itself
+  can link only files it may write: it gets no `refer` right out of its writable paths.
 - **What fails inside the sandbox:** 32-bit programs (killed), user namespace sandboxes of browsers
   (they fall back or fail), io_uring, debuggers, System V IPC, datagram socket pairs, `mkfifo` and
   symbolic links in writable paths, metadata changes and extended attribute reads by path with the

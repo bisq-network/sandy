@@ -16,6 +16,7 @@ use windows_sys::Win32::System::Services::{
     SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS, SERVICE_STATUS,
 };
 
+use super::lockfile::{LOCKS, SERIALIZE, UserLock};
 use super::util::{Sid, wide_nul, win32_error};
 use crate::plan::Problem;
 use crate::probe;
@@ -112,19 +113,43 @@ pub fn loopback_exemptions() -> Result<Vec<Sid>, Problem> {
         .map_err(|error| Problem::Indeterminate(error.to_string()))
 }
 
-/// Adds or removes the loopback exemption of `appcontainer`. The call replaces the whole list,
-/// so the other entries are read first and written back. Needs administrator rights.
+/// How often `set_loopback_exempt` writes the list again when it reads back a list that lacks
+/// its change.
+const EXEMPTION_TRIES: usize = 5;
+
+/// Adds or removes the loopback exemption of `appcontainer`. Windows keeps one list for the
+/// machine and replaces it whole, so the other entries are read first and written back. That
+/// read and write are a step that another writer can overtake: it writes the list it read before
+/// this change and so takes the change back. sandy processes of this user take the step one at
+/// a time (`lockfile`), and each reads the list back after its write and repeats the step until
+/// its change is there, which also covers a writer outside sandy. Needs administrator rights.
 pub fn set_loopback_exempt(appcontainer: &Sid, exempt: bool) -> Result<(), SandboxError> {
-    let mut list = exemptions()
-        .map_err(|error| SandboxError::io("cannot read the loopback exemptions", error))?;
-    if list.iter().any(|(sid, _)| sid == appcontainer) == exempt {
-        return Ok(());
+    let _serialized = UserLock::wait_for(LOCKS, "loopback-exemptions", SERIALIZE, true)?;
+    for written in 0..=EXEMPTION_TRIES {
+        let mut list = exemptions()
+            .map_err(|error| SandboxError::io("cannot read the loopback exemptions", error))?;
+        if list.iter().any(|(sid, _)| sid == appcontainer) == exempt {
+            return Ok(());
+        }
+        if written == EXEMPTION_TRIES {
+            break;
+        }
+        if exempt {
+            list.push((appcontainer.clone(), 0));
+        } else {
+            list.retain(|(sid, _)| sid != appcontainer);
+        }
+        write_exemptions(&list)?;
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    if exempt {
-        list.push((appcontainer.clone(), 0));
-    } else {
-        list.retain(|(sid, _)| sid != appcontainer);
-    }
+    Err(SandboxError::new(format!(
+        "the loopback exemptions lost this change {EXEMPTION_TRIES} times; another program \
+         changes them at the same time"
+    )))
+}
+
+/// Replaces the list of loopback exemptions with `list`.
+fn write_exemptions(list: &[(Sid, u32)]) -> Result<(), SandboxError> {
     let entries: Vec<SID_AND_ATTRIBUTES> = list
         .iter()
         .map(|(sid, attributes)| SID_AND_ATTRIBUTES {

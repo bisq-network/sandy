@@ -60,11 +60,17 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
             Err(_) => "without it".to_string(),
         }),
         "list" => Ok(format!("{} entries", fs::read_dir(target)?.count())),
+        "cwd" => std::env::current_dir().map(|path| path.display().to_string()),
         "write" => fs::write(target, b"probe").map(|()| String::new()),
         "truncate" => truncate(target),
         "open-rdonly-trunc" => open_read_only_truncate(target),
         "delete" => fs::remove_file(target).map(|()| String::new()),
         "mkdir" => fs::create_dir(target).map(|()| String::new()),
+        "rmdir" => fs::remove_dir(target).map(|()| String::new()),
+        "rename" => {
+            let (from, to) = pair(target)?;
+            fs::rename(from, to).map(|()| String::new())
+        }
         "set-readonly" => set_readonly(target, true),
         "set-writable" => set_readonly(target, false),
         "exec" => {
@@ -275,6 +281,28 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
             }
             stream.shutdown(std::net::Shutdown::Write)?;
             Ok(format!("{count} bytes"))
+        }
+        // ADDRESS<U+001F>COUNT: opens COUNT connections to ADDRESS, waits a second and says how
+        // many are still open; a server that closes the connections beyond a limit leaves fewer.
+        "tcp-hold-many" => {
+            let (address, count) = pair(target)?;
+            let count: usize = count
+                .parse()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid count"))?;
+            let address = socket_address(address)?;
+            let streams = (0..count)
+                .map(|_| TcpStream::connect_timeout(&address, CONNECT_TIMEOUT))
+                .collect::<io::Result<Vec<_>>>()?;
+            std::thread::sleep(Duration::from_secs(1));
+            let open = streams
+                .iter()
+                .filter(|stream| {
+                    stream.set_nonblocking(true).is_ok()
+                        && matches!((&**stream).read(&mut [0]),
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+                })
+                .count();
+            Ok(format!("{open} open"))
         }
         // STREAM<U+001F>ADDRESS: sends a datagram to ADDRESS from the socket the caller passed as
         // standard stream STREAM (0, 1 or 2), without creating a socket of its own.
@@ -3691,6 +3719,8 @@ mod macos {
 
     pub const ACTIONS: &[&str] = &[
         "clone",
+        "clone-nofollow",
+        "rename-swap",
         "ptrace-attach",
         "vol-read",
         "fsgetpath",
@@ -3702,6 +3732,8 @@ mod macos {
         "getxattr-get",
         "host-vm-stats",
         "symlink",
+        "mkfifo",
+        "unix-listen",
         "sysctl-proc-cputype",
         "icmp-socket-echo",
         "fork",
@@ -3709,8 +3741,6 @@ mod macos {
         "posix-spawn",
         "execve",
         "thread",
-        "rename",
-        "rmdir",
         "host-uuid",
         "fcntl-read-only",
         "exception-ports",
@@ -3778,11 +3808,6 @@ mod macos {
             }),
             "necp-open" => necp_open(),
             "mach-lookup" => mach_lookup(target),
-            "rename" => {
-                let (from, to) = super::pair(target)?;
-                fs::rename(from, to).map(|()| String::new())
-            }
-            "rmdir" => fs::remove_dir(target).map(|()| String::new()),
             "host-uuid" => host_uuid(),
             "fcntl-read-only" => fcntl_read_only(target),
             "fork" => fork(false),
@@ -3793,7 +3818,9 @@ mod macos {
                 .join()
                 .map(|_| String::new())
                 .map_err(|_| io::Error::other("the thread panicked")),
-            "clone" => clone(target),
+            "clone" => clone(target, 0),
+            "clone-nofollow" => clone(target, CLONE_NOFOLLOW),
+            "rename-swap" => rename_swap(target),
             "ptrace-attach" => ptrace_attach(target),
             "vol-read" => vol_read(target),
             "fsgetpath" => fsgetpath_action(target),
@@ -3805,6 +3832,11 @@ mod macos {
             "getxattr-get" => getxattr_get(target),
             "host-vm-stats" => host_vm_stats(),
             "symlink" => symlink(target),
+            "mkfifo" => path_call(target, |path| {
+                // SAFETY: mknod reads the NUL-terminated path; S_IFIFO needs no device number.
+                unsafe { libc::mknod(path, libc::S_IFIFO | 0o600, 0) }
+            }),
+            "unix-listen" => std::os::unix::net::UnixListener::bind(target).map(|_| String::new()),
             "sysctl-proc-cputype" => sysctl_proc_cputype(target),
             "icmp-socket-echo" => icmp_socket_echo(target),
             _ => Err(io::Error::new(
@@ -4431,15 +4463,34 @@ mod macos {
         }
     }
 
-    /// clonefile(2) with a source path, which the kernel does not open for reading first.
-    fn clone(target: &str) -> io::Result<String> {
+    /// `CLONE_NOFOLLOW` of `<sys/clonefile.h>`: clone a symbolic link itself, not its target.
+    const CLONE_NOFOLLOW: u32 = 0x0001;
+
+    /// The two paths of `FROM<sep>TO` as C strings.
+    fn c_pair(target: &str) -> io::Result<(CString, CString)> {
         let (from, to) = super::pair(target)?;
         let c = |path: &str| {
             CString::new(path).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL"))
         };
-        let (from, to) = (c(from)?, c(to)?);
+        Ok((c(from)?, c(to)?))
+    }
+
+    /// clonefile(2) with a source path, which the kernel does not open for reading first.
+    fn clone(target: &str, flags: u32) -> io::Result<String> {
+        let (from, to) = c_pair(target)?;
         // SAFETY: both arguments are NUL-terminated strings that outlive the call.
-        if unsafe { libc::clonefile(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+        if unsafe { libc::clonefile(from.as_ptr(), to.as_ptr(), flags) } == 0 {
+            Ok(String::new())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// renamex_np(2) with `RENAME_SWAP`: the two existing names trade places.
+    fn rename_swap(target: &str) -> io::Result<String> {
+        let (from, to) = c_pair(target)?;
+        // SAFETY: both arguments are NUL-terminated strings that outlive the call.
+        if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_SWAP) } == 0 {
             Ok(String::new())
         } else {
             Err(io::Error::last_os_error())

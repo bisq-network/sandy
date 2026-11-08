@@ -367,6 +367,7 @@ mod tests {
             forward: Vec::new(),
             egress: None,
             view: sandy_core::FileView::All,
+            symlinks: sandy_core::Symlinks::Deny,
             signals: SignalScope::Any,
             children: sandy_core::ChildProcesses::Allowed,
             end_with_parent: false,
@@ -420,6 +421,7 @@ mod tests {
                 reach: sandy_core::EgressReach::Public,
             }),
             view: sandy_core::FileView::Policy,
+            symlinks: sandy_core::Symlinks::Deny,
             ..base.clone()
         });
         policies.push(ResolvedPolicy {

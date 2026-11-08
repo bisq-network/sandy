@@ -57,7 +57,6 @@ pub(super) fn entry(path: &Path) -> io::Result<Entry> {
         && tag.ReparseTag & NAME_SURROGATE != 0;
     Ok(Entry {
         id: identity(&handle)?,
-        is_dir: directory && !link,
         linked: !directory && !link && standard.NumberOfLinks > 1,
     })
 }

@@ -8,7 +8,7 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use common::*;
@@ -223,15 +223,17 @@ fn the_program_cannot_grant_itself_execute_in_its_profile_folder() {
 }
 
 /// The run that reduces a widened profile entry re-propagates it over the folder, which the
-/// program could write, so it first refuses a junction there, as `grant` does for a policy path.
-/// Once the entry is reduced nothing propagates, and the same junction refuses nothing.
+/// program could write, so a junction the program left there must not carry the entry to the
+/// directory it leads to. The run goes through, and that directory gains no entry for the
+/// AppContainer. Control: the restored entry widened the folder again, and the run reduced it.
 #[test]
-fn reducing_a_widened_profile_entry_refuses_a_junction_in_the_folder() {
+fn reducing_a_widened_profile_entry_does_not_follow_a_junction_in_the_folder() {
     delete_profile(C_RELINK);
     let fixture = Fixture::new("relink");
     let temp = profile_temp(C_RELINK);
     let folder = temp.parent().unwrap().to_path_buf();
     let link = temp.join("link");
+    let secret = fixture.path("secret");
     let policy = args(&["--appcontainer", C_RELINK]);
     let run = || {
         let mut run = vec!["run".to_string()];
@@ -239,39 +241,39 @@ fn reducing_a_widened_profile_entry_refuses_a_junction_in_the_folder() {
         run.extend(["--".into(), probe_path(), "env".into(), "SystemRoot".into()]);
         sandy(&run)
     };
+    let entries = |path: &Path| access_rules(path);
+    let sid = appcontainer_sid(C_RELINK);
 
     probe_inside(&policy, &[("env", "SystemRoot")])[0].assert_ok();
     let made = Command::new("cmd")
         .args(["/c", "mklink", "/J"])
         .arg(&link)
-        .arg(fixture.path("secret"))
+        .arg(&secret)
         .output()
         .unwrap();
     assert!(made.status.success(), "{made:?}");
-    // Control: the folder is reduced, so the junction alone refuses nothing.
-    let reduced = run();
-
     let restored = Command::new("icacls")
         .args([
             folder.to_str().unwrap(),
             "/grant:r",
-            &format!("*{}:{MASK_WITHOUT_EXECUTE}", appcontainer_sid(C_RELINK)),
+            &format!("*{sid}:{MASK_WITHOUT_EXECUTE}"),
         ])
         .output()
         .unwrap();
-    let old = run();
+    let widened = entries(&folder);
+    let reduced = run();
+    let behind = entries(&secret);
+    let after = entries(&folder);
     // The junction itself, not the directory it leads to.
     std::fs::remove_dir(&link).unwrap();
     delete_profile(C_RELINK);
 
-    assert!(reduced.status.success(), "{reduced:?}");
     assert!(restored.status.success(), "{restored:?}");
-    assert_eq!(old.status.code(), Some(EXIT_FAILURE), "{old:?}");
-    let stderr = String::from_utf8_lossy(&old.stderr);
-    assert!(stderr.contains("junction"), "{stderr}");
-    assert!(stderr.contains(link.to_str().unwrap()), "{stderr}");
-    // The folder is no policy path, and listing the target in the policy would not help.
-    assert!(!stderr.contains("policy"), "{stderr}");
+    assert!(reduced.status.success(), "{reduced:?}");
+    // Control: the AppContainer's SID shows where it has an entry.
+    assert!(widened.contains(&sid), "{widened}");
+    assert_ne!(widened, after, "the run did not reduce the entry");
+    assert!(!behind.contains(&sid), "{behind}");
 }
 
 /// Held: a sandboxed program cannot reach a COM service that runs outside the AppContainer, so

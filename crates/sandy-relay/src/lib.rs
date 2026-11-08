@@ -11,6 +11,7 @@
 //! bytes as the relay does; the handshake is the only thing it parses.
 
 pub mod broker;
+pub mod report;
 pub mod socks;
 
 use std::io::{self, Read, Write};
@@ -69,7 +70,7 @@ where
     A: FnMut() -> io::Result<TcpStream>,
     C: Fn() -> io::Result<TcpStream> + Send + Sync + 'static,
 {
-    let connections = relayed(connect);
+    let connections = relayed(connect, Capacity::Port);
     loop {
         match accept() {
             Ok(client) => {
@@ -92,14 +93,46 @@ struct Connections<H> {
     stack_size: Option<usize>,
 }
 
-/// The connections of a relay: each one is relayed to a connection from `connect`.
-fn relayed<C>(connect: C) -> Connections<impl Fn(TcpStream) + Send + Sync + 'static>
+/// How many connections one route of `serve_routes_until` relays at the same time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capacity {
+    /// An exposed or forwarded port: `MAX_CONNECTIONS`.
+    Port,
+    /// The route to the egress broker, where a relay stands in front of it (Windows): the
+    /// broker's own `broker::MAX_CONNECTIONS`, on threads with the broker's small stacks, so the
+    /// relay does not lower the broker's limit.
+    Egress,
+}
+
+impl Capacity {
+    fn connections(self) -> usize {
+        match self {
+            Capacity::Port => MAX_CONNECTIONS,
+            Capacity::Egress => broker::MAX_CONNECTIONS,
+        }
+    }
+
+    fn stack_size(self) -> Option<usize> {
+        match self {
+            Capacity::Port => None,
+            Capacity::Egress => Some(broker::THREAD_STACK),
+        }
+    }
+}
+
+/// The connections of a relay with `capacity`: each one is relayed to a connection from
+/// `connect`.
+fn relayed<C>(
+    connect: C,
+    capacity: Capacity,
+) -> Connections<impl Fn(TcpStream) + Send + Sync + 'static>
 where
     C: Fn() -> io::Result<TcpStream> + Send + Sync + 'static,
 {
-    Connections::new(MAX_CONNECTIONS, None, move |client| {
+    let stack_size = capacity.stack_size();
+    Connections::new(capacity.connections(), stack_size, move |client| {
         if let Ok(server) = connect() {
-            let _ = relay_streams(client, server);
+            let _ = relay_streams_with(client, server, HALF_CLOSED_IDLE, stack_size);
         }
     })
 }
@@ -235,9 +268,27 @@ where
     A: FnMut(&L) -> io::Result<TcpStream>,
     C: Fn() -> io::Result<TcpStream> + Send + Sync + 'static,
 {
+    let routes = routes
+        .into_iter()
+        .map(|(listener, connect)| (listener, connect, Capacity::Port))
+        .collect();
+    serve_routes_until(routes, accept, stop, drain);
+}
+
+/// `serve_until` with a `Capacity` of its own for each route.
+pub fn serve_routes_until<L, A, C>(
+    routes: Vec<(L, C, Capacity)>,
+    accept: A,
+    stop: &Stop,
+    drain: Duration,
+) where
+    L: AsRawListener,
+    A: FnMut(&L) -> io::Result<TcpStream>,
+    C: Fn() -> io::Result<TcpStream> + Send + Sync + 'static,
+{
     let servers = routes
         .into_iter()
-        .map(|(listener, connect)| (listener, relayed(connect)))
+        .map(|(listener, connect, capacity)| (listener, relayed(connect, capacity)))
         .collect();
     serve_connections_until(servers, accept, stop, drain);
 }
@@ -804,8 +855,9 @@ pub mod unix {
     use std::ptr;
 
     use windows_sys::Win32::Networking::WinSock::{
-        AF_UNIX, INVALID_SOCKET, SOCK_STREAM, SOCKADDR, SOCKADDR_UN, SOCKET, WSAGetLastError,
-        accept, bind, closesocket, connect, listen, socket,
+        AF_UNIX, INVALID_SOCKET, SO_ACCEPTCONN, SOCK_STREAM, SOCKADDR, SOCKADDR_UN, SOCKET,
+        SOL_SOCKET, WSAGetLastError, accept, bind, closesocket, connect, getsockopt, listen,
+        socket,
     };
 
     /// The longest socket path, in bytes of UTF-8: `sun_path` holds 108 bytes including the
@@ -846,6 +898,32 @@ pub mod unix {
         /// `raw` must be a listening socket handle that this process owns and nothing else owns.
         pub unsafe fn from_inherited(raw: u64) -> Listener {
             Listener(raw as SOCKET)
+        }
+
+        /// Fails unless this is a socket that listens, such as an inherited handle that is none.
+        pub fn check_listening(&self) -> io::Result<()> {
+            let mut listening: i32 = 0;
+            let mut length = size_of::<i32>() as i32;
+            // SAFETY: listening is a writable i32 and its size is passed.
+            let result = unsafe {
+                getsockopt(
+                    self.0,
+                    SOL_SOCKET,
+                    SO_ACCEPTCONN,
+                    (&raw mut listening).cast(),
+                    &mut length,
+                )
+            };
+            if result != 0 {
+                return Err(last_error());
+            }
+            if listening == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the socket does not listen",
+                ));
+            }
+            Ok(())
         }
 
         /// Waits for the next connection.
@@ -1270,6 +1348,48 @@ mod tests {
         drop(listener);
     }
 
+    /// A route relays as many connections at a time as its capacity allows, the route to the
+    /// egress broker as many as the broker serves, and closes the rest at once.
+    #[test]
+    fn a_route_relays_at_most_its_capacity() {
+        assert_eq!(Capacity::Port.connections(), MAX_CONNECTIONS);
+        assert_eq!(Capacity::Egress.connections(), broker::MAX_CONNECTIONS);
+        assert_eq!(Capacity::Egress.stack_size(), Some(broker::THREAD_STACK));
+
+        // Each handled connection stays open until its client closes it.
+        let connections = Connections::new(2, None, |server: TcpStream| {
+            let _ = (&server).read(&mut [0]);
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let clients: Vec<TcpStream> = (0..3)
+            .map(|_| {
+                let client = TcpStream::connect(address).unwrap();
+                let (server, _) = listener.accept().unwrap();
+                assert!(connections.start(server));
+                client
+            })
+            .collect();
+        assert_eq!(connections.active(), 2);
+        let open = |client: &TcpStream| {
+            client
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            matches!((&*client).read(&mut [0]), Err(error) if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ))
+        };
+        assert!(open(&clients[0]) && open(&clients[1]));
+        assert!(!open(&clients[2]));
+        drop(clients);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while connections.active() > 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(connections.active(), 0);
+    }
+
     /// One server serves several listeners, each to its own target.
     #[test]
     fn each_listener_relays_to_its_own_target() {
@@ -1360,6 +1480,99 @@ mod tests {
             elapsed >= drain && elapsed < Duration::from_secs(3),
             "{elapsed:?}"
         );
+    }
+
+    /// On Windows a forwarded or egress connection crosses an AF_UNIX hop between the relay in
+    /// the AppContainer and sandy or the broker. A reset at either end must still arrive at the
+    /// other as a reset, never as a normal end: client, relay to AF_UNIX, relay to TCP, target.
+    #[cfg(windows)]
+    #[test]
+    fn a_reset_crosses_the_unix_socket_hop() {
+        let dir = std::env::temp_dir().join(format!("sandy-relay-reset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s");
+        let hop = unix::Listener::bind(&path).unwrap();
+        for reset_at_target in [true, false] {
+            let (client, client_end) = pair();
+            let (target, target_end) = pair();
+            let inner = unix::connect_to(&path).unwrap();
+            let outer = hop.accept().unwrap();
+            let relays = [
+                thread::spawn(move || relay_streams(client_end, inner)),
+                thread::spawn(move || relay_streams(outer, target_end)),
+            ];
+            let (resetting, mut watching) = if reset_at_target {
+                (target, client)
+            } else {
+                (client, target)
+            };
+            (&resetting).write_all(&[7; 100_000]).unwrap();
+            reset_on_close(raw(&resetting));
+            drop(resetting);
+            watching
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut received = Vec::new();
+            let result = watching.read_to_end(&mut received);
+            assert_eq!(
+                result.map_err(|error| error.kind()),
+                Err(io::ErrorKind::ConnectionReset),
+                "reset at the target: {reset_at_target}; {} bytes arrived",
+                received.len()
+            );
+            for relay in relays {
+                relay.join().unwrap().unwrap();
+            }
+        }
+        drop(hop);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The relay and the broker poll their blocking listeners and then accept. On Linux a
+    /// connection reset between the two leaves the backlog, and the accept would block; Winsock
+    /// keeps it there and hands it out, reset, so the accept returns at once, for TCP and for
+    /// AF_UNIX listeners alike.
+    #[cfg(windows)]
+    #[test]
+    fn a_connection_reset_in_the_backlog_does_not_block_accept() {
+        fn returns_after_a_reset<L: AsRawListener + Send + 'static>(
+            listener: L,
+            client: TcpStream,
+            accept: fn(&L) -> io::Result<TcpStream>,
+        ) {
+            let stop = Stop::new().unwrap();
+            let socket = raw_listener(&listener);
+            assert_eq!(
+                pending(&[socket], &stop, Some(Duration::from_secs(5))).unwrap(),
+                [0]
+            );
+            reset_on_close(raw(&client));
+            drop(client);
+            thread::sleep(Duration::from_millis(200));
+            let (sender, accepted) = std::sync::mpsc::channel();
+            thread::spawn(move || {
+                let read = accept(&listener).and_then(|stream| (&stream).read(&mut [0]));
+                let _ = sender.send(read.map_err(|error| error.kind()));
+            });
+            assert_eq!(
+                accepted.recv_timeout(Duration::from_secs(5)),
+                Ok(Err(io::ErrorKind::ConnectionReset))
+            );
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        returns_after_a_reset(listener, client, accept_tcp);
+
+        let dir = std::env::temp_dir().join(format!("sandy-relay-backlog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s");
+        let listener = unix::Listener::bind(&path).unwrap();
+        let client = unix::connect_to(&path).unwrap();
+        returns_after_a_reset(listener, client, unix::Listener::accept);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[cfg(windows)]

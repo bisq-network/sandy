@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use common::unix::{assert_config_device_accepted, assert_config_overrides_refused};
 use common::*;
 
 /// Separates the program and its arguments in the target of the probe's `spawn` action.
@@ -1667,6 +1668,24 @@ fn refuses_a_writable_path_over_a_shell_or_git_startup_file() {
     }
     assert_refused_beside_an_accepted_path(&fixture, &files);
     assert_refused_beside_an_accepted_path(&fixture, &directories);
+}
+
+/// The variables that move the GnuPG and git configuration, as on Linux
+/// (`assert_config_overrides_refused`).
+#[test]
+fn refuses_a_writable_path_over_the_gnupg_home_and_the_git_config_files() {
+    assert_config_overrides_refused(&home_fixture("config-overrides"), &[]);
+}
+
+/// A device or FIFO that GIT_CONFIG_GLOBAL names stays writable, as on Linux
+/// (`assert_config_device_accepted`).
+#[test]
+fn accepts_a_writable_device_that_git_config_global_names() {
+    // dyld needs the root directory to start a program without the system set.
+    assert_config_device_accepted(
+        &home_fixture("config-device"),
+        &["--system", "none", "--read", "/"],
+    );
 }
 
 /// A directory on PATH inside a writable path lets the program leave a command there that the

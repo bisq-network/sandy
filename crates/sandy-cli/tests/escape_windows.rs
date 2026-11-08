@@ -171,44 +171,27 @@ fn a_writable_path_that_all_appcontainers_may_execute_is_refused() {
     assert!(stdout.contains("ALL APPLICATION PACKAGES"), "{stdout}");
 }
 
-/// A file below a writable path can carry an execute entry of its own, which the permissions of
-/// the path do not show. Together with sandy's write grant it would be writable and executable,
-/// so sandy refuses it. The walk runs when sandy first adds the grant, not on every run:
-/// `check` reads the path's own permissions only, which this test records.
+/// Recorded: a file below a writable path can carry an execute entry of its own, which the
+/// permissions of the path do not show. sandy does not walk the tree for it: what such a file
+/// lets the program do is run its own changes inside the sandbox, which rule 3 leaves out
+/// (DESIGN.md), and the entry is the host's. `check` reads the path's own permissions only.
 #[test]
-fn a_file_below_a_writable_path_that_all_appcontainers_may_execute_is_refused() {
+fn a_file_below_a_writable_path_keeps_its_own_execute_entry() {
     let fixture = Fixture::new("rw-child-exec");
     let child = fixture.arg("rw/file");
-    let check = || {
-        let mut args = vec!["check".to_string()];
-        args.extend(platform_args());
-        args.extend(fixture.access_args());
-        sandy(&args)
-    };
-
-    // Control: the same policy and the same tree without the entry work.
-    probe_inside(&fixture.access_args(), &[("read", &child)])[0].assert_ok();
-
-    // A new tree, so sandy adds the grant again instead of finding its entry in place.
-    fixture.reset();
     let granted = Command::new("icacls")
         .args([&child, "/grant", "*S-1-15-2-1:(RX)"])
         .output()
         .unwrap();
     assert!(granted.status.success(), "{granted:?}");
-
-    let output = sandy(run_program(
-        &fixture.access_args(),
-        &probe_path(),
-        &["read", &child],
-    ));
-    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("ALL APPLICATION PACKAGES"), "{stderr}");
-    assert!(stderr.contains(r"rw\file"), "{stderr}");
-
-    // Recorded: `check` only reads the permissions of the path itself.
-    assert!(check().status.success(), "{:?}", check());
+    controlled(&fixture.access_args(), &[("read", &child)])[0].assert_ok();
+    let entries = access_rules(fixture.path("rw/file").as_path());
+    assert!(
+        entries
+            .lines()
+            .any(|line| line.starts_with("S-1-15-2-1 ") && line.contains("ReadAndExecute")),
+        "{entries}"
+    );
 }
 
 /// sandy grants each path to a capability that only runs with this path in the policy hold.
@@ -315,8 +298,79 @@ fn the_program_cannot_plant_a_link_reaching_outside_its_writable_paths() {
     }
 }
 
+/// The program removes and moves what lies below a read-write path but not the path itself, also
+/// not a read-write file, as on Linux, where removing an entry is a right on its parent, and on
+/// macOS: the grant leaves `DELETE` off the path (docs/windows.md, "What sandy grants"). Before,
+/// the program could remove an empty writable directory and move a writable directory or file
+/// into another writable path (measured on Windows 11 build 26200). The outside run is the
+/// control that every action works for the owner.
 #[test]
-fn refuses_to_grant_through_a_junction() {
+fn a_read_write_path_itself_cannot_be_removed_or_moved() {
+    let fixture = Fixture::new("rw-root");
+    let prepare = || {
+        fixture.reset();
+        for dir in ["rw/sub/empty", "rw2/sub", "rw3"] {
+            fs::create_dir_all(fixture.path(dir)).unwrap();
+        }
+        for file in ["wfile", "rw/child", "rw/other"] {
+            fs::write(fixture.path(file), b"content").unwrap();
+        }
+    };
+    let p = |from: &str, to: &str| format!("{}\u{1f}{}", fixture.arg(from), fixture.arg(to));
+    let (wfile, rw3) = (fixture.arg("wfile"), fixture.arg("rw3"));
+    let (empty, moved_child) = (fixture.arg("rw/sub/empty"), fixture.arg("rw/sub/child"));
+    let (move_dir, over_file, move_file) = (
+        p("rw2", "rw/moved"),
+        p("rw/other", "wfile"),
+        p("wfile", "rw/moved-file"),
+    );
+    let (move_child, rename_child) = (p("rw/child", "rw/sub/child"), p("rw2/sub", "rw2/renamed"));
+    let actions = [
+        ("write", wfile.as_str()),
+        ("rename", move_child.as_str()),
+        ("delete", moved_child.as_str()),
+        ("rmdir", empty.as_str()),
+        ("rename", rename_child.as_str()),
+        ("rename", move_dir.as_str()),
+        ("rmdir", rw3.as_str()),
+        ("rename", over_file.as_str()),
+        ("rename", move_file.as_str()),
+        ("delete", wfile.as_str()),
+    ];
+    let roots = 5;
+    // Outside, each root action runs on a fresh tree: one that succeeds removes the root that a
+    // later one needs.
+    prepare();
+    for line in probe_outside(&actions[..roots]) {
+        line.assert_ok();
+    }
+    for action in &actions[roots..] {
+        prepare();
+        probe_outside(std::slice::from_ref(action))[0].assert_ok();
+    }
+
+    prepare();
+    let mut args = fixture.access_args();
+    for writable in ["rw2", "rw3", "wfile"] {
+        args.extend(["--read-write".to_string(), fixture.arg(writable)]);
+    }
+    let lines = probe_inside(&args, &actions);
+    for line in &lines[..roots] {
+        line.assert_ok();
+    }
+    for line in &lines[roots..] {
+        line.assert_blocked();
+    }
+    for root in ["rw2/renamed", "rw3", "wfile", "rw/other"] {
+        assert!(fixture.path(root).exists(), "{root} was moved or deleted");
+    }
+}
+
+/// A junction below a policy path leads nowhere the policy does not grant: the grant does not
+/// propagate through it, so the program cannot read the directory behind it. Control: the same
+/// read outside the sandbox works.
+#[test]
+fn a_junction_below_a_policy_path_reaches_nothing() {
     let fixture = Fixture::new("junction");
     let link = fixture.path("ro/link");
     let status = Command::new("cmd")
@@ -327,17 +381,11 @@ fn refuses_to_grant_through_a_junction() {
         .status()
         .unwrap();
     assert!(status.success(), "mklink /J failed");
-    let secret = fixture.arg("secret/file");
-    let output = sandy(run_program(
-        &fixture.access_args(),
-        &probe_path(),
-        &["read", &secret],
-    ));
+    let through = fixture.arg("ro/link/file");
+    let lines = controlled(&fixture.access_args(), &[("read", &through)]);
     // Remove the junction itself, not the files it points to.
     fs::remove_dir(&link).unwrap();
-    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("junction"), "{stderr}");
+    lines[0].assert_blocked();
 }
 
 /// sandy grants a policy path by adding an entry to its access control list, which needs the
@@ -1036,17 +1084,53 @@ fn environment_has_system_root_and_nothing_else_unasked() {
     lines[2].assert_blocked();
 }
 
+/// The status record writes a Windows exit code as the unsigned 32-bit number that
+/// `GetExitCodeProcess` returns, so the record never holds a negative number on any platform;
+/// sandy's own exit code is the same 32 bits.
+#[test]
+fn the_status_record_writes_the_exit_code_unsigned() {
+    let fixture = Fixture::new("status-unsigned");
+    let code = STATUS_CONTROL_C_EXIT;
+    let (output, record) = sandy_with_status(&run_args(
+        &fixture.access_args(),
+        &[("exit", &code.to_string())],
+    ));
+    assert_eq!(output.status.code(), Some(code), "{output:?}");
+    assert!(
+        record.ends_with(&format!("\nexited {}\n", code as u32)),
+        "{record}"
+    );
+}
+
+/// `run` refuses a batch file, and `check` says so too, since the refusal depends only on the
+/// program. Control: the same check of an executable passes.
 #[test]
 fn refuses_batch_files() {
     let fixture = Fixture::new("batch");
     let script = fixture.path("bin/run.cmd");
     fs::write(&script, b"@echo off\r\n").unwrap();
-    let output = sandy(run_program(
-        &args(&["--read-exec", &fixture.arg("bin")]),
-        script.to_str().unwrap(),
-        &[],
-    ));
+    let sandbox_args = args(&["--read-exec", &fixture.arg("bin")]);
+    let output = sandy(run_program(&sandbox_args, script.to_str().unwrap(), &[]));
     assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    let checked = |program: &str| {
+        let mut check = run_program(&sandbox_args, program, &[]);
+        check[0] = "check".to_string();
+        sandy(check)
+    };
+    let output = checked(script.to_str().unwrap());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{stderr}");
+    assert!(stderr.contains("batch files run in cmd.exe"), "{stderr}");
+    // CreateProcessW also runs a file named only `.bat` in cmd.exe.
+    let bare = fixture.path("bin/.BAT");
+    fs::write(&bare, b"@echo off\r\n").unwrap();
+    let output = sandy(run_program(&sandbox_args, bare.to_str().unwrap(), &[]));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{stderr}");
+    assert!(stderr.contains("batch files run in cmd.exe"), "{stderr}");
+    let probe = fixture.copy_probe("bin");
+    let output = checked(&probe);
+    assert!(output.status.success(), "{output:?}");
 }
 
 #[test]
@@ -2468,6 +2552,301 @@ fn refuses_a_writable_path_over_the_startup_folder() {
     assert!(report.contains("runs outside the sandbox"), "{report}");
 }
 
+/// The configuration of git and GnuPG below the profile, and below HOME, which Git for Windows
+/// reads, is refused as a writable path as on Linux and macOS: the program could name a command
+/// there that the next git or gpg command of the user runs outside the sandbox. USERPROFILE and
+/// HOME lead to the fixture, so the result does not depend on the account; a writable folder
+/// next to them stays allowed.
+#[test]
+fn refuses_a_writable_path_over_the_git_and_gnupg_configuration() {
+    let fixture = Fixture::new("trusted-tools");
+    for dir in [
+        "profile/.config/git",
+        "profile/.gnupg",
+        "home/.gnupg",
+        "profile/work",
+    ] {
+        fs::create_dir_all(fixture.path(dir)).unwrap();
+    }
+    for file in ["profile/.gitconfig", "home/.gitconfig"] {
+        fs::write(fixture.path(file), "").unwrap();
+    }
+    let check = |writable: &str| {
+        Command::new(sandy_path())
+            .args([
+                "check",
+                "--appcontainer",
+                &appcontainer_name(),
+                "--read-write",
+                &fixture.arg(writable),
+            ])
+            .env("PATH", "C:\\Windows\\system32")
+            .env("USERPROFILE", fixture.path("profile"))
+            .env("HOME", fixture.path("home"))
+            .output()
+            .unwrap()
+    };
+    let allowed = check("profile/work");
+    assert_eq!(allowed.status.code(), Some(0), "{allowed:?}");
+    for writable in [
+        "profile/.gitconfig",
+        "profile/.config/git",
+        "profile/.config",
+        "profile/.gnupg",
+        "home/.gitconfig",
+        "home/.gnupg",
+    ] {
+        let refused = check(writable);
+        let report = String::from_utf8_lossy(&refused.stdout);
+        assert_eq!(
+            refused.status.code(),
+            Some(EXIT_CONFLICT),
+            "{writable}: {report}"
+        );
+        assert!(report.contains("runs outside the sandbox"), "{report}");
+    }
+}
+
+/// Without HOME, Git for Windows and libgit2 read `.gitconfig` below HOMEDRIVE followed by
+/// HOMEPATH, and Git for Windows resolves a HOME without a drive, `\Users\x`, on the current
+/// drive (measured with Git for Windows 2.54 and libgit2 1.9.7 on Windows 11 build 26200). Both
+/// homes are refused as writable paths like the profile; a writable folder next to the
+/// configuration stays allowed.
+#[test]
+fn refuses_a_writable_path_over_the_git_configuration_of_other_homes() {
+    let fixture = Fixture::new("other-homes");
+    for dir in ["drive-path/work", "rooted"] {
+        fs::create_dir_all(fixture.path(dir)).unwrap();
+    }
+    for file in ["drive-path/.gitconfig", "rooted/.gitconfig"] {
+        fs::write(fixture.path(file), "").unwrap();
+    }
+    let without_drive = |relative: &str| {
+        let path = fixture.arg(relative);
+        let path = path.trim_start_matches(r"\\?\");
+        assert_eq!(&path[1..3], ":\\", "{path}");
+        (path[..2].to_string(), path[2..].to_string())
+    };
+    let (drive, drive_path) = without_drive("drive-path");
+    let (_, rooted) = without_drive("rooted");
+    let check = |writable: &str, env: &[(&str, &str)]| {
+        let mut command = Command::new(sandy_path());
+        command
+            .args([
+                "check",
+                "--appcontainer",
+                &appcontainer_name(),
+                "--read-write",
+                &fixture.arg(writable),
+            ])
+            // A home without a drive counts on sandy's working drive and the system drive. Run
+            // sandy with its working directory on the fixture's drive, so the test does not
+            // depend on which drive the temporary directory lies on.
+            .current_dir(format!("{drive}\\"))
+            .env("PATH", "C:\\Windows\\system32")
+            .env_remove("HOME")
+            .env_remove("HOMEDRIVE")
+            .env_remove("HOMEPATH")
+            .envs(env.iter().copied());
+        command.output().unwrap()
+    };
+    let drive_env = [
+        ("HOMEDRIVE", drive.as_str()),
+        ("HOMEPATH", drive_path.as_str()),
+    ];
+    let allowed = check("drive-path/work", &drive_env);
+    assert_eq!(allowed.status.code(), Some(0), "{allowed:?}");
+    for (writable, env) in [
+        ("drive-path/.gitconfig", &drive_env[..]),
+        ("drive-path", &drive_env[..]),
+        // HOME without a drive, and HOMEPATH without HOMEDRIVE, both resolve on the working
+        // drive, so each refuses the configuration below the rooted home.
+        ("rooted/.gitconfig", &[("HOME", rooted.as_str())][..]),
+        ("rooted/.gitconfig", &[("HOMEPATH", rooted.as_str())][..]),
+    ] {
+        let refused = check(writable, env);
+        let report = String::from_utf8_lossy(&refused.stdout);
+        assert_eq!(
+            refused.status.code(),
+            Some(EXIT_CONFLICT),
+            "{writable}: {report}"
+        );
+        assert!(report.contains("runs outside the sandbox"), "{report}");
+    }
+}
+
+/// libgit2, which cargo and other tools use for git, reads `%PROGRAMDATA%\Git\config` as a level
+/// below the system configuration, from the folder PROGRAMDATA names (measured with libgit2 1.9.7
+/// on Windows 11 build 26200). `C:\ProgramData` lets every user create a folder, so that folder is
+/// refused as a writable path like the git configuration below the profile. PROGRAMDATA leads to
+/// the fixture; a writable folder next to `Git` stays allowed.
+#[test]
+fn refuses_a_writable_path_over_the_program_data_git_configuration() {
+    let fixture = Fixture::new("program-data-git");
+    for dir in ["data/Git", "data/other"] {
+        fs::create_dir_all(fixture.path(dir)).unwrap();
+    }
+    let check = |writable: &str| {
+        Command::new(sandy_path())
+            .args([
+                "check",
+                "--appcontainer",
+                &appcontainer_name(),
+                "--read-write",
+                &fixture.arg(writable),
+            ])
+            .env("PATH", "C:\\Windows\\system32")
+            .env("PROGRAMDATA", fixture.path("data"))
+            .output()
+            .unwrap()
+    };
+    let allowed = check("data/other");
+    assert_eq!(allowed.status.code(), Some(0), "{allowed:?}");
+    for writable in ["data/Git", "data"] {
+        let refused = check(writable);
+        let report = String::from_utf8_lossy(&refused.stdout);
+        assert_eq!(
+            refused.status.code(),
+            Some(EXIT_CONFLICT),
+            "{writable}: {report}"
+        );
+        assert!(report.contains("runs outside the sandbox"), "{report}");
+    }
+}
+
+/// Windows always gives the AppContainer write access to its profile folder, so a program that
+/// may also execute files there could write a program and run it (measured on Windows 11 build
+/// 26200 before sandy refused it: `copy-self` and then `exec` of the copy both succeeded).
+/// Rule 3 keeps a path from being both writable and executable, so an executable path in the
+/// folder, the program among them, is refused as a conflict, before anything runs. The fixture's
+/// own executable directory is the control.
+#[test]
+fn refuses_an_executable_path_in_the_appcontainer_profile_folder() {
+    // The control starts a program in the sandbox.
+    if appcontainer_children_blocked() {
+        return;
+    }
+    let name = format!("{}.ac-exec", appcontainer_name());
+    delete_profile(&name);
+    let fixture = Fixture::new("ac-exec");
+    let control = fixture.copy_probe("bin");
+    let created = sandy(named_run(&name, &[], &[("pid", "x")]));
+    assert!(created.status.success(), "{created:?}");
+    let bin = user_local_app_data()
+        .join("Packages")
+        .join(&name)
+        .join("AC")
+        .join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let planted = bin.join("planted.exe");
+    fs::copy(probe_path(), &planted).unwrap();
+    let planted = planted.to_str().unwrap();
+
+    let allowed = sandy(named_run(
+        &name,
+        &["--read-exec", &fixture.arg("bin")],
+        &[("exec", &control)],
+    ));
+    assert!(allowed.status.success(), "{allowed:?}");
+    parse(&allowed)[0].assert_ok();
+
+    let refusals = [
+        named_run(
+            &name,
+            &["--read-exec", bin.to_str().unwrap()],
+            &[("copy-self", planted), ("exec", planted)],
+        ),
+        vec![
+            "run".to_string(),
+            "--appcontainer".to_string(),
+            name.clone(),
+            "--".to_string(),
+            planted.to_string(),
+            "pid".to_string(),
+            "x".to_string(),
+        ],
+    ];
+    for refused in refusals {
+        let output = sandy(&refused);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(EXIT_CONFLICT), "{stderr}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(
+            stderr.contains("may write files in executable path"),
+            "{stderr}"
+        );
+    }
+    delete_profile(&name);
+}
+
+/// The relays run sandy's executable in the program's AppContainer and the egress broker in its
+/// own, with read and execute access, so rule 3 refuses it when its permissions let the
+/// AppContainer that runs it write it, as it refuses such an executable policy path. `check`
+/// refuses what `run` refuses: before, `check` passed both, and `run` refused only the first,
+/// because it checked the broker's grant against the program's SIDs. A copy of sandy whose
+/// permissions are left alone is the control.
+#[test]
+fn refuses_a_sandy_executable_that_the_appcontainer_running_it_may_write() {
+    let name = format!("{}.relay-write", appcontainer_name());
+    let broker = format!("{name}.sandy-egress");
+    let fixture = Fixture::new("relay-write");
+    let expose = format!("127.0.0.1:{}=8555", free_port());
+    let cases = [
+        (
+            &name,
+            ["--ip", "all", "--expose", &expose],
+            "the relays run",
+        ),
+        (
+            &broker,
+            ["--ip", "private", "--egress", "1080"],
+            "the egress broker runs",
+        ),
+    ];
+    for (index, (writer, options, who)) in cases.into_iter().enumerate() {
+        let dir = fixture.path(&format!("sandy-{index}"));
+        fs::create_dir_all(&dir).unwrap();
+        let sandy = dir.join("sandy.exe");
+        fs::copy(sandy_path(), &sandy).unwrap();
+        let sandbox = |command: &str| {
+            let mut args = vec![command, "--appcontainer", &name];
+            args.extend(options);
+            let probe = probe_path();
+            if command == "run" {
+                args.extend(["--", &probe, "pid", "x"]);
+            }
+            Command::new(&sandy).args(&args).output().unwrap()
+        };
+        let control = sandbox("check");
+        assert_eq!(control.status.code(), Some(0), "{who}: {control:?}");
+        let granted = Command::new("icacls")
+            .arg(&sandy)
+            .args(["/grant", &format!("*{}:(W)", appcontainer_sid(writer))])
+            .output()
+            .unwrap();
+        assert!(granted.status.success(), "{granted:?}");
+        for command in ["check", "run"] {
+            let output = sandbox(command);
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(EXIT_CONFLICT),
+                "{command}: {text}"
+            );
+            assert!(
+                text.contains(who) && text.contains("may write files in executable path"),
+                "{command}: {text}"
+            );
+        }
+    }
+    delete_profile(&name);
+    delete_profile(&broker);
+}
+
 /// A junction or a directory symbolic link this test made with `mklink`. Dropping it removes the
 /// link itself, never what it leads to.
 struct DirectoryLink(PathBuf);
@@ -3769,6 +4148,148 @@ fn with_port(address: std::net::IpAddr, port: u16) -> String {
     std::net::SocketAddr::new(address, port).to_string()
 }
 
+/// A broker that cannot serve writes its error and no "ready" line, which sandy waits for before
+/// it starts the program, and ends with status 125. Here its inherited listener is no socket.
+#[test]
+fn egress_broker_that_cannot_serve_reports_no_readiness() {
+    let output = sandy(["__broker", "2147483632", "public"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{stderr}");
+    assert!(stderr.contains("sandy: broker failed"), "{stderr}");
+    assert!(!stdout.contains("ready"), "{stdout}");
+}
+
+/// sandy starts the program only once the egress broker has written "ready". The test runs
+/// sandy under a debugger and holds the broker at its first debug event, so the broker never
+/// gets that far: sandy then fails after the 10 s it gives a helper, with status 125, and the
+/// program never starts, so its first action, writing a file, never happens. The relay starts
+/// first and runs on.
+#[test]
+fn the_program_waits_until_the_egress_broker_is_ready() {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, EXCEPTION_BREAKPOINT,
+        STATUS_WX86_BREAKPOINT,
+    };
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        CREATE_PROCESS_DEBUG_EVENT, ContinueDebugEvent, DEBUG_EVENT, DebugActiveProcessStop,
+        EXCEPTION_DEBUG_EVENT, EXIT_PROCESS_DEBUG_EVENT, LOAD_DLL_DEBUG_EVENT, WaitForDebugEvent,
+    };
+    use windows_sys::Win32::System::Threading::{
+        DEBUG_PROCESS, PROCESS_NAME_WIN32, QueryFullProcessImageNameW,
+    };
+
+    let fixture = Fixture::new("broker-ready");
+    let marker = fixture.path("rw/started");
+    let mut run = Command::new(sandy_path())
+        .args(run_args(
+            &egress_args(&fixture, free_port(), "public"),
+            &[("write", marker.to_str().unwrap())],
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(DEBUG_PROCESS)
+        .spawn()
+        .unwrap();
+    let stderr = run.stderr.take().unwrap();
+    let errors = std::thread::spawn(move || std::io::read_to_string(stderr).unwrap_or_default());
+    let stdout = run.stdout.take().unwrap();
+    let output = std::thread::spawn(move || std::io::read_to_string(stdout).unwrap_or_default());
+
+    // The executables that sandy's descendants run, in the order they started.
+    let mut started: Vec<(u32, String)> = Vec::new();
+    let mut held = None;
+    loop {
+        let mut event = DEBUG_EVENT::default();
+        // SAFETY: event is writable; this thread started sandy as its debugger.
+        let waited = unsafe { WaitForDebugEvent(&mut event, 60_000) };
+        assert_ne!(waited, 0, "{}", std::io::Error::last_os_error());
+        let mut status = DBG_CONTINUE;
+        match event.dwDebugEventCode {
+            CREATE_PROCESS_DEBUG_EVENT => {
+                // SAFETY: the event code says which member of the union is set.
+                let info = unsafe { event.u.CreateProcessInfo };
+                if !info.hFile.is_null() {
+                    // SAFETY: the debugger owns the image file handle of the event.
+                    unsafe { CloseHandle(info.hFile) };
+                }
+                let mut name = [0u16; 1024];
+                let mut length = name.len() as u32;
+                // SAFETY: the event's process handle is valid; name holds `length` units.
+                let named = unsafe {
+                    QueryFullProcessImageNameW(
+                        info.hProcess,
+                        PROCESS_NAME_WIN32,
+                        name.as_mut_ptr(),
+                        &mut length,
+                    )
+                };
+                assert_ne!(named, 0, "{}", std::io::Error::last_os_error());
+                let name = String::from_utf16_lossy(&name[..length as usize]).to_lowercase();
+                if event.dwProcessId != run.id() {
+                    started.push((event.dwProcessId, name.clone()));
+                }
+                // The relay is the first sandy.exe that sandy starts, the broker the second.
+                let helpers = started
+                    .iter()
+                    .filter(|(_, name)| name.ends_with("\\sandy.exe"))
+                    .count();
+                if helpers == 2 && name.ends_with("\\sandy.exe") && held.is_none() {
+                    // Not continued: every thread of the broker stays frozen.
+                    held = Some(event.dwProcessId);
+                    continue;
+                }
+            }
+            LOAD_DLL_DEBUG_EVENT => {
+                // SAFETY: the event code says which member of the union is set.
+                let file = unsafe { event.u.LoadDll }.hFile;
+                if !file.is_null() {
+                    // SAFETY: the debugger owns the file handle of the event.
+                    unsafe { CloseHandle(file) };
+                }
+            }
+            EXCEPTION_DEBUG_EVENT => {
+                // SAFETY: the event code says which member of the union is set.
+                let code = unsafe { event.u.Exception }.ExceptionRecord.ExceptionCode;
+                if code != EXCEPTION_BREAKPOINT && code != STATUS_WX86_BREAKPOINT {
+                    status = DBG_EXCEPTION_NOT_HANDLED;
+                }
+            }
+            _ => {}
+        }
+        // SAFETY: the IDs are those of the event just received.
+        unsafe { ContinueDebugEvent(event.dwProcessId, event.dwThreadId, status) };
+        if event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT && event.dwProcessId == run.id() {
+            break;
+        }
+    }
+    for (pid, _) in &started {
+        // SAFETY: DebugActiveProcessStop takes a process ID; one that has ended fails.
+        unsafe { DebugActiveProcessStop(*pid) };
+    }
+    let status = run.wait().unwrap();
+    let (output, errors) = (output.join().unwrap(), errors.join().unwrap());
+    assert!(
+        held.is_some(),
+        "sandy started no broker: {started:?} {errors}"
+    );
+    let programs: Vec<_> = started
+        .iter()
+        .filter(|(_, name)| name.ends_with("\\sandy-probe.exe"))
+        .collect();
+    assert!(
+        programs.is_empty(),
+        "the program started before the broker was ready: {started:?}"
+    );
+    assert!(!marker.exists(), "the program ran");
+    assert_eq!(status.code(), Some(EXIT_FAILURE), "{output}{errors}");
+    assert!(
+        errors.contains("the egress broker did not serve within 10 seconds"),
+        "{errors}"
+    );
+}
+
 /// With `reach = "public"` the broker connects to a public internet address. Skipped where this
 /// host has no route to one.
 #[test]
@@ -3970,6 +4491,23 @@ fn egress_run_with_relays(fixture: &Fixture) -> (Child, Vec<std::os::windows::io
     (run, children)
 }
 
+/// The relay in front of the egress broker lets as many connections through at a time as the
+/// broker serves (`sandy_relay::broker::MAX_CONNECTIONS`), not the limit of a forwarded port, as
+/// on Linux and macOS, where the program reaches the broker directly. The broker holds each
+/// connection while it waits for the SOCKS5 request.
+#[test]
+fn the_egress_port_takes_as_many_connections_as_the_broker() {
+    let fixture = Fixture::new("egress-many");
+    let port = free_port();
+    let count = 300;
+    let lines = probe_inside(
+        &egress_args(&fixture, port, "public"),
+        &[("tcp-hold-many", &format!("127.0.0.1:{port}\u{1f}{count}"))],
+    );
+    lines[0].assert_ok();
+    assert_eq!(lines[0].detail, format!("{count} open"));
+}
+
 /// A killed run leaves no broker behind with its network capabilities: the relay job's
 /// kill-on-close ends it when sandy dies, and so does the end of its standard input, whose other
 /// end sandy holds (either alone passes this test).
@@ -3989,6 +4527,93 @@ fn a_killed_run_leaves_no_egress_broker_behind() {
             "a relay or the broker outlived sandy"
         );
     }
+}
+
+/// A relay or the egress broker that ends while the program runs takes what it served with it,
+/// and a forward or egress port that no relay holds is free for any local process to bind. sandy
+/// then ends the program and fails with status 125 and the record `failed`, as Linux and macOS
+/// do with `children = "contained"`. Control: the program runs while both live, and the end of
+/// its own is the end of the run (`the_egress_broker_ends_with_the_program`). The message names
+/// what the one that ended served: here the relay serves only the egress port.
+#[test]
+fn a_dead_relay_or_broker_ends_the_program() {
+    use windows_sys::Win32::System::Threading::{
+        GetProcessId, OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+    };
+
+    let fixture = Fixture::new("helper-ended");
+    for (index, reason) in [(0, "relay of the egress port"), (1, "egress broker")] {
+        let status = fixture.path(&format!("status-{index}"));
+        let _ = fs::remove_file(&status);
+        let mut sandbox_args = egress_args(&fixture, free_port(), "public");
+        sandbox_args.extend(args(&["--status-file", status.to_str().unwrap()]));
+        let mut run = Command::new(sandy_path())
+            .args(run_args(&sandbox_args, &[("sleep", "20000")]))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (helpers, program) = loop {
+            let helpers = relay_processes(run.id());
+            let program = child_processes(run.id(), "sandy-probe.exe");
+            if helpers.len() == 2 && program.len() == 1 {
+                break (helpers, program);
+            }
+            assert!(Instant::now() < deadline, "the run did not start");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(!ends_within(&program[0], Duration::from_millis(500)));
+        // sandy starts the relay before the broker.
+        let mut helpers: Vec<_> = helpers
+            .iter()
+            .map(|helper| (creation_time(helper), helper))
+            .collect();
+        helpers.sort_by_key(|(created, _)| *created);
+        let killed = helpers[index].1;
+        // SAFETY: killed is a process handle this test owns.
+        let pid = unsafe { GetProcessId(killed.as_raw_handle()) };
+        // SAFETY: OpenProcess takes no pointers; the handle is checked before use.
+        let terminate = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        assert!(!terminate.is_null(), "cannot open the {reason}");
+        // SAFETY: terminate is a process handle with PROCESS_TERMINATE access.
+        assert_ne!(unsafe { TerminateProcess(terminate, 9) }, 0);
+        // SAFETY: terminate is a handle this test owns.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(terminate) };
+
+        let ended = ends_within(&program[0], Duration::from_secs(10));
+        if !ended {
+            run.kill().unwrap();
+        }
+        let output = run.wait_with_output().unwrap();
+        assert!(ended, "the program kept running after the {reason} ended");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{stderr}");
+        assert!(
+            stderr.contains(&format!("the {reason} ended before the program")),
+            "{stderr}"
+        );
+        let record = fs::read_to_string(&status).unwrap();
+        assert!(
+            record.starts_with("pid ") && record.ends_with("\nfailed\n"),
+            "{record}"
+        );
+    }
+}
+
+/// The creation time of `process`, in 100 ns units.
+fn creation_time(process: &std::os::windows::io::OwnedHandle) -> u64 {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+    let mut times = [FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    }; 4];
+    let [creation, exit, kernel, user] = &mut times;
+    // SAFETY: process has PROCESS_QUERY_INFORMATION access and every pointer is writable.
+    let read = unsafe { GetProcessTimes(process.as_raw_handle(), creation, exit, kernel, user) };
+    assert_ne!(read, 0);
+    u64::from(creation.dwHighDateTime) << 32 | u64::from(creation.dwLowDateTime)
 }
 
 /// The broker holds network capabilities the program must not have, so no process in another
@@ -4605,4 +5230,161 @@ fn refused_junctions_are_a_conflict_and_stay_untouched() {
     lines[0].assert_ok();
     assert_eq!(junction_capability_entries(&link), 0);
     fs::remove_dir(&link).unwrap();
+}
+
+/// A listening socket on `address` with `SO_REUSEADDR`, which on Windows lets a socket share an
+/// address that another socket holds unless that one is exclusive.
+fn reuse_listener(address: std::net::SocketAddrV4) -> std::io::Result<TcpListener> {
+    use std::os::windows::io::FromRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, SO_REUSEADDR, SOCK_STREAM, SOCKADDR_IN,
+        SOL_SOCKET, WSAGetLastError, bind, htons, listen, setsockopt, socket,
+    };
+    // Starts Winsock for the raw calls below.
+    drop(TcpListener::bind("127.0.0.1:0"));
+    // SAFETY: WSAGetLastError has no preconditions.
+    let last = || std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() });
+    // SAFETY: socket has no memory safety preconditions.
+    let handle = unsafe { socket(i32::from(AF_INET), SOCK_STREAM, 0) };
+    if handle == INVALID_SOCKET {
+        return Err(last());
+    }
+    // SAFETY: handle is a new socket that nothing else owns.
+    let listener = unsafe { TcpListener::from_raw_socket(handle as u64) };
+    let on: u32 = 1;
+    // SAFETY: handle is a valid socket; on is a u32 whose size is passed.
+    let set = unsafe {
+        setsockopt(
+            handle,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            (&on as *const u32).cast(),
+            std::mem::size_of::<u32>() as i32,
+        )
+    };
+    if set != 0 {
+        return Err(last());
+    }
+    let sockaddr = SOCKADDR_IN {
+        sin_family: AF_INET,
+        // SAFETY: htons byte-swaps a u16.
+        sin_port: unsafe { htons(address.port()) },
+        sin_addr: IN_ADDR {
+            S_un: IN_ADDR_0 {
+                S_addr: u32::from_ne_bytes(address.ip().octets()),
+            },
+        },
+        sin_zero: [0; 8],
+    };
+    // SAFETY: sockaddr is a SOCKADDR_IN and its size is passed.
+    let bound = unsafe {
+        bind(
+            handle,
+            (&sockaddr as *const SOCKADDR_IN).cast(),
+            std::mem::size_of::<SOCKADDR_IN>() as i32,
+        )
+    };
+    // SAFETY: handle is a bound socket.
+    if bound != 0 || unsafe { listen(handle, 1) } != 0 {
+        return Err(last());
+    }
+    Ok(listener)
+}
+
+/// Waits until sandy `run` has started the program, which it does only once its relays have
+/// written "ready", after they listen.
+fn wait_until_relays_listen(run: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child_processes(run.id(), "sandy-probe.exe").is_empty() {
+        assert!(run.try_wait().unwrap().is_none(), "sandy ended early");
+        assert!(
+            Instant::now() < deadline,
+            "sandy {} started no program",
+            run.id()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// No socket can share the address of a relay's listener with `SO_REUSEADDR` and take its
+/// connections: neither a process of this user outside the sandbox, nor one in the program's
+/// AppContainer, for the forward listener the relay creates inside and for the expose listener
+/// sandy creates outside. Windows refuses such a bind (`WSAEACCES`) for a socket that holds the
+/// address without `SO_REUSEADDR` itself, also in the same process, so the listeners need no
+/// `SO_EXCLUSIVEADDRUSE`. Control: the same bind on a free port succeeds.
+#[test]
+fn no_socket_shares_the_address_of_a_relay_listener() {
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    let refused = |result: std::io::Result<TcpListener>, what: &str| {
+        let error = result
+            .err()
+            .unwrap_or_else(|| panic!("{what}: the bind succeeded"));
+        assert_eq!(error.raw_os_error(), Some(10013), "{what}: {error}");
+    };
+    assert!(reuse_listener(SocketAddrV4::new(Ipv4Addr::LOCALHOST, free_port())).is_ok());
+
+    let fixture = Fixture::new("reuse-relay");
+    let holder = TcpListener::bind("127.0.0.1:0").unwrap();
+    let inner = free_port();
+    let mut run = Command::new(sandy_path())
+        .args(run_args(
+            &forward_args(&fixture, inner, holder.local_addr().unwrap().port()),
+            &[("sleep", "3000")],
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until_relays_listen(&mut run);
+    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, inner);
+    refused(reuse_listener(address), "forward listener, outside");
+    let inside = Command::new(probe_path())
+        .args([
+            "appcontainer-run",
+            &format!(
+                "{}\u{1f}S-1-15-3-2,S-1-15-3-3\u{1f}tcp-listen-reuse\u{1f}{address}",
+                appcontainer_name()
+            ),
+        ])
+        .output()
+        .unwrap();
+    let line = parse_line(
+        String::from_utf8_lossy(&inside.stdout)
+            .lines()
+            .next()
+            .unwrap(),
+    );
+    assert_eq!(
+        line.result, "denied",
+        "forward listener, same AppContainer: {line:?}"
+    );
+    assert!(line.detail.contains("10013"), "{line:?}");
+    let output = run.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let (inner, outer) = (free_port(), free_port());
+    let mut sandbox_args = fixture.access_args();
+    sandbox_args.extend(args(&[
+        "--ip",
+        "all",
+        "--expose",
+        &format!("127.0.0.1:{outer}={inner}"),
+    ]));
+    let mut run = Command::new(sandy_path())
+        .args(run_args(
+            &sandbox_args,
+            &[("tcp-accept", &format!("127.0.0.1:{inner}"))],
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until_relays_listen(&mut run);
+    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, outer);
+    refused(reuse_listener(address), "expose listener, outside");
+    // Ends the program, which waits for one connection.
+    let _client = TcpStream::connect_timeout(&address.into(), Duration::from_secs(5)).unwrap();
+    let output = run.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
 }

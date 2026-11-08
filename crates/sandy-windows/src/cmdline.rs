@@ -5,7 +5,6 @@
 //! exactly the arguments sandy was given. Strings are UTF-16 code units, as in the Windows API.
 
 use std::fmt;
-use std::path::Path;
 
 /// `CreateProcessW` accepts at most this many UTF-16 units, including the terminating NUL.
 pub const MAX_COMMAND_LINE: usize = 32_767;
@@ -17,6 +16,7 @@ const VT: u16 = 0x0B;
 const SPACE: u16 = b' ' as u16;
 const QUOTE: u16 = b'"' as u16;
 const BACKSLASH: u16 = b'\\' as u16;
+const VERBATIM_PREFIX: [u16; 4] = [BACKSLASH, BACKSLASH, b'?' as u16, BACKSLASH];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandLineError {
@@ -116,10 +116,34 @@ fn push_quoted(line: &mut Vec<u16>, arg: &[u16]) {
 /// `CreateProcessW` starts `cmd.exe` for `.bat` and `.cmd` files, and `cmd.exe` parses the command
 /// line with other rules. Arguments could then run commands. sandy refuses such programs; a
 /// policy can run `cmd.exe` explicitly instead.
-pub fn is_batch_file(program: &Path) -> bool {
-    program.extension().is_some_and(|extension| {
-        extension.eq_ignore_ascii_case("bat") || extension.eq_ignore_ascii_case("cmd")
+///
+/// Windows decides by the last four units of the path, also for a file named only `.bat`, after
+/// Win32 drops the trailing dots and spaces of an ordinary path; a verbatim path keeps them.
+pub fn is_batch_file(program: &[u16]) -> bool {
+    let name = if program.starts_with(&VERBATIM_PREFIX) {
+        program
+    } else {
+        let kept = program
+            .iter()
+            .rposition(|&unit| unit != b'.' as u16 && unit != SPACE)
+            .map_or(0, |last| last + 1);
+        &program[..kept]
+    };
+    let Some(extension) = name.len().checked_sub(4).map(|start| &name[start..]) else {
+        return false;
+    };
+    [".bat", ".cmd"].iter().any(|batch| {
+        batch.bytes().zip(extension).all(|(byte, &unit)| {
+            u8::try_from(unit).is_ok_and(|unit| unit.eq_ignore_ascii_case(&byte))
+        })
     })
+}
+
+/// Why sandy refuses `program`, which `check` and `run` both report, or `None`.
+pub fn refused_program(program: &[u16]) -> Option<&'static str> {
+    is_batch_file(program).then_some(
+        "batch files run in cmd.exe with other argument rules; run cmd.exe /c explicitly",
+    )
 }
 
 /// `std::fs::canonicalize` returns verbatim paths (`\\?\C:\dir\file`). The target sees the path
@@ -128,7 +152,7 @@ pub fn is_batch_file(program: &Path) -> bool {
 /// (trailing dots and spaces, device names, the `MAX_PATH` limit), and verbatim paths skip that.
 pub fn without_verbatim_prefix(path: &[u16]) -> &[u16] {
     const MAX_PATH: usize = 260;
-    let Some(rest) = path.strip_prefix(&[BACKSLASH, BACKSLASH, b'?' as u16, BACKSLASH]) else {
+    let Some(rest) = path.strip_prefix(&VERBATIM_PREFIX) else {
         return path;
     };
     let is_drive_path = rest.len() >= 3
@@ -413,9 +437,26 @@ mod tests {
 
     #[test]
     fn detects_batch_files() {
-        assert!(is_batch_file(Path::new("C:/x/run.bat")));
-        assert!(is_batch_file(Path::new("C:/x/RUN.CMD")));
-        assert!(!is_batch_file(Path::new("C:/x/run.exe")));
-        assert!(!is_batch_file(Path::new("C:/x/bat")));
+        let batch = |path: &str| is_batch_file(&wide(path));
+        assert!(batch("C:\\x\\run.bat"));
+        assert!(batch("C:\\x\\RUN.CMD"));
+        assert!(batch("\\\\?\\C:\\x\\run.CmD"));
+        assert!(!batch("C:\\x\\run.exe"));
+        assert!(!batch("C:\\x\\bat"));
+        assert!(!batch("bat"));
+        // CreateProcessW runs a file named only `.bat` or `.cmd` with cmd.exe as well.
+        assert!(batch("C:\\x\\.bat"));
+        assert!(batch("\\\\?\\C:\\x\\.CMD"));
+        // Win32 drops trailing dots and spaces of an ordinary path, not of a verbatim one, and
+        // CreateProcessW starts a verbatim `x.bat.` or `x.bat ` as a program (Windows 11 26200).
+        assert!(batch("C:\\x\\run.bat."));
+        assert!(batch("C:\\x\\run.cmd . "));
+        assert!(!batch("\\\\?\\C:\\x\\run.bat."));
+        assert!(!batch("\\\\?\\C:\\x\\run.bat "));
+        // A stream name ends the path; CreateProcessW starts no stream of a batch file in cmd.exe.
+        assert!(!batch("C:\\x\\run.bat::$DATA"));
+        assert!(!batch("\\\\?\\C:\\x\\run.bat:s"));
+        assert!(refused_program(&wide("C:\\x\\run.bat")).is_some());
+        assert_eq!(refused_program(&wide("C:\\x\\run.exe")), None);
     }
 }

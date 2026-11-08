@@ -351,6 +351,38 @@ pub struct FilesystemPolicy {
     /// Whether paths outside the policy are visible to the target.
     #[serde(default)]
     pub view: FileView,
+    /// Whether the program may create symbolic links in its `read_write` paths.
+    #[serde(default)]
+    pub symlinks: Symlinks,
+}
+
+/// Whether the program may create symbolic links in its `read_write` paths (README.md,
+/// "Symbolic links"). A process outside the sandbox that opens a name in a writable path follows
+/// a link the program left there, to any file of the user, so `deny` keeps links out as Linux
+/// and macOS do by default. Named pipes and devices stay denied either way. Windows refuses an
+/// AppContainer every symbolic link, so there the setting changes nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Symlinks {
+    #[default]
+    Deny,
+    Allow,
+}
+
+impl Symlinks {
+    /// The value as the policy writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Symlinks::Deny => "deny",
+            Symlinks::Allow => "allow",
+        }
+    }
+
+    /// Whether the program may create symbolic links in its writable paths on this platform:
+    /// `allow`, except on Windows, which refuses an AppContainer every symbolic link.
+    pub fn lets_program_link(self) -> bool {
+        self == Symlinks::Allow && cfg!(not(windows))
+    }
 }
 
 /// What the target sees of the paths outside the policy (and the system set).
@@ -1068,6 +1100,7 @@ mod tests {
         assert_eq!(policy.windows.win32k, Win32k::Allow);
         assert_eq!(policy.macos.relays, Relays::DualStack);
         assert_eq!(policy.filesystem.view, FileView::All);
+        assert_eq!(policy.filesystem.symlinks, Symlinks::Deny);
         assert_eq!(policy.network.egress, None);
     }
 
@@ -1081,6 +1114,7 @@ mod tests {
             read = ["/a"]
             read_exec = ["/b"]
             read_write = ["/c"]
+            symlinks = "allow"
             [network]
             ip = "all"
             unix_sockets = "none"
@@ -1105,6 +1139,7 @@ mod tests {
         .unwrap();
         assert_eq!(policy.filesystem.system, SystemAccess::None);
         assert_eq!(policy.filesystem.read_write, vec![PathBuf::from("/c")]);
+        assert_eq!(policy.filesystem.symlinks, Symlinks::Allow);
         assert_eq!(policy.network.ip, IpAccess::All);
         assert_eq!(
             policy.network.expose,
@@ -1136,6 +1171,17 @@ mod tests {
         assert_eq!(policy.windows.appcontainer_name.as_deref(), Some("example"));
         assert_eq!(policy.windows.junctions, Junctions::Refuse);
         assert_eq!(policy.windows.win32k, Win32k::Deny);
+    }
+
+    #[test]
+    fn symlinks_take_deny_and_allow_only() {
+        for value in [Symlinks::Deny, Symlinks::Allow] {
+            let text = format!("version = 1\n[filesystem]\nsymlinks = {:?}", value.name());
+            assert_eq!(Policy::from_toml(&text).unwrap().filesystem.symlinks, value);
+        }
+        let error =
+            Policy::from_toml("version = 1\n[filesystem]\nsymlinks = \"fifo\"").unwrap_err();
+        assert!(matches!(error, PolicyError::Parse(_)), "{error}");
     }
 
     #[test]
@@ -1352,6 +1398,7 @@ mod tests {
             "filesystem.read_exec = [\"/a\"]",
             "filesystem.read_write = [\"/a\"]",
             "filesystem.system = \"none\"",
+            "filesystem.symlinks = \"allow\"",
             "network.expose = []",
             "network.forward = []",
             "environment.pass = [\"A\"]",

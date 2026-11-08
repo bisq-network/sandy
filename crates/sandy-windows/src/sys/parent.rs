@@ -33,7 +33,7 @@ use super::util::last_error;
 /// and sandy is allowed.
 pub fn open_parent(named: Option<ParentProcess>) -> Result<OwnedHandle, SandboxError> {
     let ended = || SandboxError::new("the process that started sandy has already ended");
-    let recorded = parent_id()?;
+    let recorded = recorded_parent()?;
     let token = named.and_then(|named| named.start);
     let parent_id = match named {
         Some(named) if token.is_none() && named.id != recorded => {
@@ -94,8 +94,10 @@ fn is_the_caller(created: u64, own: u64, token: Option<u64>) -> bool {
     }
 }
 
-/// The process ID that Windows recorded as sandy's parent.
-fn parent_id() -> Result<u32, SandboxError> {
+/// The process ID that Windows recorded as sandy's parent. Windows does not re-parent
+/// processes, so the ID stays the same while sandy runs; the process may have ended, which
+/// `open_parent` tells by creation times.
+pub fn recorded_parent() -> Result<u32, SandboxError> {
     // SAFETY: a process snapshot needs no process ID.
     let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if raw == INVALID_HANDLE_VALUE {

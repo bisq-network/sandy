@@ -494,7 +494,8 @@ level it tried, and last `level: NAME`, the level that `run` takes, or `level: n
 `check --json` prints the same as one JSON object instead (see [Fallback levels](#fallback-levels)).
 
 Four kinds of finding get a `warning:` line on standard error: a setting that gives up part of the
-isolation (`unix_sockets = "all"`, `signals = "any"`, `path_metadata = "allow"`), an option that
+isolation (`unix_sockets = "all"`, `signals = "any"`, `path_metadata = "allow"`,
+`symlinks = "allow"`), an option that
 replaced a stricter value of the policy file, a guarantee of the policy that this platform gives
 only in part (for example `signals = "isolated"` on macOS, which leaves SIGIO open; the list is in
 [docs/DESIGN.md](docs/DESIGN.md), "Requirements and the enforcement plan"), and a fact about this
@@ -564,6 +565,7 @@ it does nothing.
 | `--read-write PATH` | Allow reading, creating, changing and deleting below `PATH`. Never executing. | |
 | `--system minimal\|none` | Add the minimal set of system paths programs need to start. | `minimal` |
 | `--view all\|policy` | `policy` makes every path outside the policy look missing. See [The file system view](#the-file-system-view). | `all` |
+| `--symlinks deny\|allow` | Whether the program may create symbolic links in its `read_write` paths. No effect on Windows, where it can make only junctions that stay within them. See [Symbolic links](#symbolic-links). | `deny` |
 | `--ip all\|client\|private\|none` | IPv4 and IPv6 networking, including loopback. `client` connects out but cannot listen or accept. `private` keeps the program on a loopback of its own. | `none` |
 | `--unix-sockets all\|none` | Unix domain sockets. Read the warning below before using `all`. | `none` |
 | `--signals any\|isolated` | Whether the program may signal processes outside its sandbox. | `any` |
@@ -613,6 +615,7 @@ releases.
 | `signals-any` | all | `signals = "any"` lets the program signal every process of this user |
 | `egress-probing` | all | what the egress broker's answers tell the program about this host's addresses |
 | `path-metadata-allow` | all | `path_metadata = "allow"` |
+| `symlinks-followed-outside` | Linux, macOS | `symlinks = "allow"`: a process outside the sandbox follows the links the program leaves in writable paths |
 | `writable-home` | all | a writable path holds the home directory |
 | `terminals-reachable` | Linux | a policy path holds `/dev/pts`, with the other terminals of this user |
 | `writable-path-directory` | all | a writable path reaches a directory on `PATH` |
@@ -694,7 +697,7 @@ it.
 |---|---|
 | the program's status | `sandy run` started the program |
 | 128 + signal number | Linux and macOS with `children = "contained"`, and Linux with `--explain`: a signal ended the program |
-| 125 | sandy failed or refused: invalid policy, a requirement this host cannot enforce, a socket on a standard stream that the policy denies, a pseudo-terminal master on one with `signals = "isolated"`, a setup error; with `children = "contained"` or `--explain` also a failure while sandy supervises the program. For `sandy check`: sandy cannot tell now whether this host enforces the policy (an `UNDECIDED` line, or a relay port that another process holds), or the policy conflicts with this host (a `CONFLICT` line) |
+| 125 | sandy failed or refused: invalid policy, a requirement this host cannot enforce, a socket on a standard stream that the policy denies, a pseudo-terminal master on one with `signals = "isolated"`, a setup error; with `children = "contained"`, with `--explain`, and on Windows also a failure while sandy supervises the program. For `sandy check`: sandy cannot tell now whether this host enforces the policy (an `UNDECIDED` line, or a relay port that another process holds), or the policy conflicts with this host (a `CONFLICT` line) |
 | 0 / 1 | `sandy check`: the policy, or one of its levels, is enforceable / none is |
 | 2 | `sandy check`: no level is enforceable, but `sandy setup`, run once with administrator rights, would make one so |
 | 0 | `sandy setup`, with or without `--remove`: done, or nothing to do |
@@ -721,9 +724,9 @@ this order:
 
 | Line | When |
 |---|---|
-| `level NAME` | first, for a policy with fallback levels: the level that runs |
+| `level NAME` | first, for a policy with fallback levels: the level that runs; absent when sandy refuses before it chooses one |
 | `pid N` | the program runs; `N` is its process ID |
-| `exited N` | sandy saw the program exit with status `N` |
+| `exited N` | sandy saw the program exit with status `N`, never negative: on Windows the 32-bit exit code as an unsigned number, such as `3221225786` for `0xC000013A`, which cmd, PowerShell, Java and .NET show as `-1073741510` |
 | `signaled N` | sandy saw signal `N` end the program (Linux and macOS with `contained`, Linux with `--explain`) |
 | `failed` | sandy itself failed or refused; without a `pid` line the program never ran |
 
@@ -758,6 +761,7 @@ read = ["/path"]                # read files, list directories
 read_exec = ["/path"]           # read, list, execute
 read_write = ["/path"]          # read, list, create, change, delete; never execute
 view = "all"                    # "all" | "policy"; policy hides paths outside the policy
+symlinks = "deny"               # "deny" | "allow"; allow: new symbolic links in read_write paths
 
 [network]
 ip = "none"                     # "none" | "private" | "client" | "all"
@@ -812,8 +816,12 @@ about 600 on a Mac with 16 addresses. A run beyond the limit fails before the pr
    drive) and asks for the local path instead.
 2. **Never writable and executable.** No path may be both writable and executable, also not
    through nesting (a `read_write` directory inside a `read_exec` directory, or the reverse).
-   The rule compares files, not names: a hard link that gives an executable file a second name
-   inside a `read_write` path is refused too.
+   The rule compares the paths the policy names, not the history of the files below them: a
+   hard link that gives an executable file a second name inside a `read_write` path lets the
+   program change the file through that name. Such a link comes from the host, or from an
+   earlier run that could write both names, since a program may link its own files. Which trees
+   a policy makes executable is the choice of whoever writes it: give `read_exec` only to trees
+   you trust, not to one an earlier sandbox could write.
 3. **Nothing inside a writable path.** No policy path may lie inside a `read_write` path, or be
    reached through a symbolic link (on Windows also a junction) inside one. The program could
    replace it with a symbolic link, and the next start would follow the link. sandy's own
@@ -823,7 +831,7 @@ about 600 on a Mac with 16 addresses. A run beyond the limit fails before the pr
    entries, so nothing there can be replaced. A pseudo-terminal needs `/dev/ptmx` and
    `/dev/pts`, and on some hosts `/dev/ptmx` is the `ptmx` of `/dev/pts` itself.
 4. **The program file** gets read and execute access automatically. It must not lie inside a
-   `read_write` path, and must have no second name in one.
+   `read_write` path.
 5. **The minimal system set** (`system = "minimal"`) adds, read-only, what programs need to start:
    shared libraries, the dynamic loader, time zone data, `/dev/null` and the random devices. It
    never contains user data. Each platform documents its exact list. Programs that need more
@@ -841,8 +849,9 @@ about 600 on a Mac with 16 addresses. A run beyond the limit fails before the pr
    write rights there, and a file it leaves behind runs with your rights, outside the sandbox.
    sandy refuses a writable path that reaches a location whose content another program reads or
    runs later: your home directory, the startup files of bash, zsh and fish (`~/.bashrc`,
-   `~/.profile`, `~/.config/fish`), the git configuration, cargo's configuration
-   (`~/.cargo/config.toml`), `~/.ssh`; on Linux also autostart entries, user services and the
+   `~/.profile`, `~/.config/fish`), the git configuration (`~/.gitconfig`, `~/.config/git`),
+   the GnuPG configuration (`~/.gnupg`), cargo's configuration (`~/.cargo/config.toml`),
+   `~/.ssh`; on Linux also autostart entries, user services and the
    KDE Plasma login scripts, on macOS also `~/Library/LaunchAgents`, on Windows the Startup
    folders, the PowerShell profile folders, `WindowsApps` and sandy's own state folder. Each
    platform documents its list. A directory below your home directory stays writable, but not
@@ -850,6 +859,17 @@ about 600 on a Mac with 16 addresses. A run beyond the limit fails before the pr
    downloads crates needs `~/.cargo/registry` and `~/.cargo/git` instead. When sandy cannot find
    your home directory (`HOME` unset and no entry in the password database), it cannot check
    this rule and refuses a policy with a writable path; start it with `HOME` set.
+
+   `GNUPGHOME`, `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` move the GnuPG, the global and the
+   system git configuration, so when they are set to an absolute path (for `GNUPGHOME` also one
+   that starts with `~/`, which gpg expands), what they name is protected as well, and a refusal
+   names the variable, for example `overlaps /work/gnupg (GNUPGHOME)`. A relative value is not
+   protected: git and gpg resolve it against their working directory, which sandy does not know. A
+   device they name holds nothing that persists and stays writable: with
+   `GIT_CONFIG_GLOBAL=/dev/null`, `--read-write /dev/null` is allowed. The `.git/config` and
+   `.git/hooks` of a checkout inside a writable path are not protected and stay the program's to
+   change, as before: git reads them only for commands in that checkout, so review a checkout the
+   program could write as you would its other output.
 
    A directory on your `PATH` gets a warning instead, naming it, because a writable path that
    holds one is often what you mean: `--read-write ~/tools` with `~/tools/bin` on `PATH`, or
@@ -945,7 +965,7 @@ about 600 on a Mac with 16 addresses. A run beyond the limit fails before the pr
 - A dead relay frees the program's forward port, and any local user can then bind it and
   receive what the program sends there. With `children = "contained"` on Linux and macOS, sandy
   therefore ends the program when its relay dies, and exits with status 125. Without it nothing
-  watches the relay.
+  watches the relay there. On Windows sandy does so with any policy, also for the egress broker.
 - A port another process already holds makes `sandy run` refuse with status 125. `sandy check`
   binds the same listeners for a moment and reports `UNAVAILABLE` for such a port, so it gives
   the same answer. Between the two the port can change hands, so `run` is the final word.
@@ -1042,6 +1062,34 @@ about 600 on a Mac with 16 addresses. A run beyond the limit fails before the pr
   `unix_sockets = "all"`. Windows cannot hide paths and refuses the setting. See
   docs/DESIGN.md, "The file system view".
 
+### Symbolic links
+
+With the default `symlinks = "deny"`, the program cannot create symbolic links, named pipes or
+devices anywhere, also not in its `read_write` paths, and a rename or a clone that would give an
+existing link or named pipe a new name there fails too. A process outside the sandbox that later
+opens a name in a writable path, a configuration file it writes before every start for example,
+would otherwise follow a link the program left there to any file of the user.
+
+Some tools need links. npm and pnpm put the commands of a package in `node_modules/.bin` as
+links, and Emacs marks a file it edits with a lock link `.#NAME`; under `"deny"` these fail
+("Permission denied" on Linux, "Operation not permitted" on macOS). `python3 -m venv` links the
+interpreter into the environment: Python 3.14 on Linux fails, Python 3.9 on macOS prints "Unable
+to symlink" and copies it. git checks out a link of a repository as a plain file holding the
+link's target, because `git init` and `git clone` find that they cannot make links and set
+`core.symlinks = false` (measured with git 2.56 on Linux and 2.54 on macOS).
+
+`symlinks = "allow"` (`--symlinks allow`) lets the program create symbolic links in its
+`read_write` paths; named pipes and devices stay denied. The program gains no access through a
+link: the sandbox checks the path the link resolves to, so a link to a file outside the policy
+leads nowhere for it. A link can point anywhere, though, and neither Landlock nor Seatbelt can
+check its target when it is created, so whatever runs outside the sandbox and opens names in a
+writable path follows the links there with its own rights; `sandy check` warns about it. Grant it
+only when no process outside the sandbox relies on the content of the writable paths, and never
+for a path that one of your own programs reads as configuration or runs from. Windows refuses
+an AppContainer every symbolic link, so there the setting changes nothing; the program can still
+make a junction to a directory within its writable paths, as before, but none that leads out
+of them.
+
 ### Linux metadata
 
 Landlock does not control `chmod`, `chown`, `utimensat` and `setxattr`. With the default
@@ -1105,9 +1153,9 @@ windows.appcontainer_name = "example.app.host"
   `filesystem.view`, `network.ip`, `network.unix_sockets`, `network.egress` (a table, or `"none"`
   for no broker), `process.signals`, `process.children`, `process.end_with_parent`,
   `linux.path_metadata`, `macos.relays`, `windows.win32k` and `windows.appcontainer_name`. The
-  paths, `system`, the environment, `expose`, `forward` and `macos.mach_services` are the same in
-  every level, so the program finds the same files and ports in each. Any other key in a level is an
-  error.
+  paths, `system`, `symlinks`, the environment, `expose`, `forward` and `macos.mach_services` are
+  the same in every level, so the program finds the same files and ports in each. Any other key in a
+  level is an error.
 - **Every level is checked as a policy of its own on every host**, so a level that could never
   run (for example `children = "contained"` with `signals = "any"`) is an error everywhere, not
   a surprise on the one host that reaches it.
@@ -1136,7 +1184,10 @@ windows.appcontainer_name = "example.app.host"
   on it.
 
 `sandy check --json` prints one JSON object on one line on standard output, and nothing there
-when it exits with status 125:
+when it exits with status 125. A refusal then has its reason on standard error, as without
+`--json`, whatever it is: an invalid policy, a policy this host cannot enforce as written (a
+writable path over a location other programs read), or on Windows a `.bat` or `.cmd` program.
+The object:
 
 ```json
 {"backend":"linux","selected":"contained","setup_would_help":false,
@@ -1367,9 +1418,9 @@ Recommendations:
    just as well. The program then reads the null device on its standard input, so this suits
    programs that need no input.
 4. **Treat exit status 125 as "not started".** sandy prints the reason on standard error. Two
-   exceptions: a program can exit with 125 itself, and with `children = "contained"` or
-   `--explain` sandy can fail while it supervises a running program, for example when the relay
-   of its ports died (its message is `sandy: run failed: ...`). Pass `--status-fd` or
+   exceptions: a program can exit with 125 itself, and with `children = "contained"`, with
+   `--explain` and on Windows sandy can fail while it supervises a running program, for example
+   when the relay of its ports died (its message is `sandy: run failed: ...`). Pass `--status-fd` or
    `--status-file` when you need to tell these apart, or need the program's process ID (see
    [The status record](#the-status-record)): without a `pid` line the program never ran.
 5. **Keep sandy, the policy and the program's binaries out of every writable path.** Use separate
