@@ -534,7 +534,7 @@ everywhere; a backend adds only its answer about its own addresses (`HostNetwork
    while the subnet of the tunnel's own address stays the local network and the private ranges
    behind it stay refused by the static check. Linux takes a link with `IFF_POINTOPOINT` or
    `IFF_NOARP` for a tunnel, macOS one with `IFF_POINTOPOINT`, Windows an interface of a tunnel
-   or PPP type or of a point-to-point access type. An address on such a network is the local
+   or PPP type, of a point-to-point access type or of the medium `NdisMediumIP`. An address on such a network is the local
    network. `public` refuses it also when it is globally reachable, because on IPv6 a local
    network often has a global prefix.
    `public-and-local` allows it also in a block that is not globally reachable, but a subnet
