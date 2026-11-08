@@ -990,9 +990,10 @@ a point-to-point link that of its peer, and every network that a route reaches w
 a route that is up, other than the default route, whose gateway is none or a link-layer address,
 that is neither a route of the Mac itself (local, broadcast, multicast) nor one that reaches
 nothing (reject, blackhole), and whose interface is not point-to-point (`IFF_POINTOPOINT` in
-`getifaddrs`, such as `utun`, `gif`, `stf` and `ppp`). That covers the on-link prefix of router
-advertisements beside an address of another prefix, such as a DHCPv6 address, and a route into
-a link where the Mac has no address of its prefix. What a route sends into a tunnel goes to its
+`getifaddrs`, such as `utun`, `gif` and `ppp`; the 6to4 interface `stf0` is not, `ifconfig`
+shows `flags=0<>` on macOS 27.0.1, and its prefix `2002::/16` is never allowed anyway). That
+covers the on-link prefix of router advertisements beside an address of another prefix, such as
+a DHCPv6 address, and a route into a link where the Mac has no address of its prefix. What a route sends into a tunnel goes to its
 other end, which takes it on as a router does, so a VPN that splits the default route into
 `0/1` and `128.0/1` on its `utun` leaves the internet public; the subnet of the tunnel's own
 address still counts (`routes_into_a_tunnel_name_no_network`). On the test Mac that leaves out

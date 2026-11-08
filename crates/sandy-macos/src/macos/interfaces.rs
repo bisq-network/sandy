@@ -56,8 +56,8 @@ pub fn addresses() -> io::Result<Vec<InterfaceAddress>> {
     Ok(found)
 }
 
-/// The indexes of the point-to-point interfaces, such as `utun`, `gif`, `stf` and `ppp`, from
-/// the link-layer entry that `getifaddrs` lists for every interface.
+/// The indexes of the point-to-point interfaces, such as `utun`, `gif` and `ppp`, from the
+/// link-layer entry that `getifaddrs` lists for every interface.
 fn point_to_point_links() -> io::Result<Vec<u16>> {
     let mut found = Vec::new();
     each_interface(|interface| {
