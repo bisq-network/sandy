@@ -1036,6 +1036,24 @@ fn environment_has_system_root_and_nothing_else_unasked() {
     lines[2].assert_blocked();
 }
 
+/// The status record writes a Windows exit code as the unsigned 32-bit number that
+/// `GetExitCodeProcess` returns, so the record never holds a negative number on any platform;
+/// sandy's own exit code is the same 32 bits.
+#[test]
+fn the_status_record_writes_the_exit_code_unsigned() {
+    let fixture = Fixture::new("status-unsigned");
+    let code = STATUS_CONTROL_C_EXIT;
+    let (output, record) = sandy_with_status(&run_args(
+        &fixture.access_args(),
+        &[("exit", &code.to_string())],
+    ));
+    assert_eq!(output.status.code(), Some(code), "{output:?}");
+    assert!(
+        record.ends_with(&format!("\nexited {}\n", code as u32)),
+        "{record}"
+    );
+}
+
 /// `run` refuses a batch file, and `check` says so too, since the refusal depends only on the
 /// program. Control: the same check of an executable passes.
 #[test]

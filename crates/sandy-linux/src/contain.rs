@@ -197,7 +197,7 @@ pub fn run(
     }
     Ok(match exited.code {
         libc::CLD_EXITED => {
-            status.exited(exited.status);
+            status.exited(exited.status as u32);
             exited.status
         }
         _ => {

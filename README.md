@@ -723,7 +723,7 @@ this order:
 |---|---|
 | `level NAME` | first, for a policy with fallback levels: the level that runs; absent when sandy refuses before it chooses one |
 | `pid N` | the program runs; `N` is its process ID |
-| `exited N` | sandy saw the program exit with status `N` |
+| `exited N` | sandy saw the program exit with status `N`, never negative: on Windows the 32-bit exit code as an unsigned number, such as `3221225786` for `0xC000013A`, which cmd, PowerShell, Java and .NET show as `-1073741510` |
 | `signaled N` | sandy saw signal `N` end the program (Linux and macOS with `contained`, Linux with `--explain`) |
 | `failed` | sandy itself failed or refused; without a `pid` line the program never ran |
 

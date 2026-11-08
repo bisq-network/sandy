@@ -1282,7 +1282,11 @@ prefix.
   passes to sandy, which clears its inherit flag at once; the program's own
   `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` names only its three standard handles, so the handle
   never reaches the program or a relay. A program that sandy ended because the parent ended is
-  reported as `exited 1`, which is the exit code the job gets.
+  reported as `exited 1`, which is the exit code the job gets. `N` is the exit code as
+  `GetExitCodeProcess` returns it, an unsigned 32-bit number, so an NTSTATUS such as
+  `STATUS_CONTROL_C_EXIT` (`0xC000013A`) is `exited 3221225786`; sandy's own exit code has the
+  same 32 bits, which callers that read it as a signed number (cmd, PowerShell, Java, .NET) see
+  as `-1073741510` (`the_status_record_writes_the_exit_code_unsigned`).
 - **Ending with the parent.** With `process.end_with_parent = true`, sandy finds its parent's
   process ID in a process snapshot (`CreateToolhelp32Snapshot`), opens the process for waiting,
   and checks that it was created before sandy and still runs. Windows records only the parent's

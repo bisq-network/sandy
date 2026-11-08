@@ -879,7 +879,7 @@ pub fn supervise(
     explain.finish();
     match code {
         Ended::Exited(code) => {
-            status.exited(code);
+            status.exited(code as u32);
             Ok(code)
         }
         Ended::Signaled(signal) => {

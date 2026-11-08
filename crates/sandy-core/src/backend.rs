@@ -56,7 +56,8 @@ pub struct ParentProcess {
 /// - `pid N` once the program runs, with the program's process ID. In the exec model (Linux and
 ///   macOS without `contained`) sandy writes it right before it replaces itself with the
 ///   program, because afterwards it cannot write any more.
-/// - `exited N` or `signaled N` when sandy saw the program end. The exec model has no such
+/// - `exited N` or `signaled N` when sandy saw the program end. `N` is never negative: a
+///   Windows exit code is written as the unsigned 32-bit number it is. The exec model has no such
 ///   line: sandy is the program there, and the caller's own wait status is the program's.
 /// - `failed` when sandy itself failed or refused. Without a `pid` line the program never ran.
 ///   After one it means that the last step, the `execve`, failed, or, with `contained` and on
@@ -101,7 +102,8 @@ impl StatusReport {
         self.write(format_args!("pid {pid}"));
     }
 
-    pub fn exited(&self, code: i32) {
+    /// `code` as the platform reports it: 0 to 255 on Unix, the 32-bit exit code on Windows.
+    pub fn exited(&self, code: u32) {
         self.write(format_args!("exited {code}"));
     }
 

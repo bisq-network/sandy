@@ -269,7 +269,7 @@ fn start_and_wait(
     }
     // A run that fails records `failed` instead (the caller writes it).
     if failure.is_none() {
-        status.exited(code as i32);
+        status.exited(code);
     }
     // Processes the program left behind would die when sandy exits and the job closes. Ending
     // them now also closes their copies of the output pipes, so the console relays finish, and
