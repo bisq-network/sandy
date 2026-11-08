@@ -91,7 +91,7 @@ compiler fail, and sandy fails closed.
 
 | Requirement | Mechanism |
 |---|---|
-| `FilesystemConfined` | Profile: `(deny default)`, and every path outside the policy answers `ENOENT`; `file-read*` for every policy path and the system set; `file-write*` only for `read_write` paths; `process-exec*` and `file-map-executable` only for `read_exec` paths, the program and system code. No hard links; clones only into `read_write` paths and only from files the target may read. No Mach or XPC service, so no other process acts on files for the target. Policy paths cannot be deleted or replaced. |
+| `FilesystemConfined` | Profile: `(deny default)`, and every path outside the policy answers `ENOENT`; `file-read*` for every policy path and the system set; `file-write*` only for `read_write` paths; `process-exec*` and `file-map-executable` only for `read_exec` paths, the program and system code. No hard links, and no new symbolic links, FIFOs or devices; clones only of files, only into `read_write` paths and only from files the target may read. No Mach or XPC service, so no other process acts on files for the target. Policy paths cannot be deleted or replaced. |
 | `NoPrivilegeEscalation` | Only policy paths execute. Sandbox.kext refuses to execute setuid or setgid files from any sandboxed process, and the profile also denies `process-exec*` for files with mode bit `#o4000` or `#o2000`. No Mach service (authorization, privileged helpers, launchd). |
 | `ProcessMemoryIsolated` | Profile: `process-info*` (allowed by default) is denied with `ESRCH` and then allowed only for `(target self)`; task ports are denied (`mach-priv*`, `mach-task-name`, `mach-task-read`, `mach-task-inspect`); `ptrace` attach, which Seatbelt checks as `system-debug`, is denied. |
 | `InheritedHandlesClosed` | `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`; descriptors 0, 1 and 2 are named with `posix_spawn_file_actions_addinherit_np`. The kernel closes every other descriptor during the exec. With `children = "contained"` the forked target, a single thread, marks every descriptor above 2 close-on-exec (`PROC_PIDLISTFDS`) right before `execve`. |
@@ -307,6 +307,36 @@ of earlier definitions"), so the protections come last. The unit test
       link's target, for example the home directory. The OpenAI Codex CLI found and fixed the same
       problem (commit f6950546e5). Policy paths inside writable paths need no rule: sandy-core
       rejects them for the same reason.
+    - `(deny file-write-create (vnode-type SYMLINK) (vnode-type FIFO) (vnode-type
+      CHARACTER-DEVICE) (vnode-type BLOCK-DEVICE))`. `file-write*` of a `read_write` path would
+      allow `symlink`, `mkfifo` and `mknod` there, which Linux never grants in a writable path
+      (see "Rights per access level" in [linux.md](linux.md)): a process outside the sandbox that
+      later opens a name in the writable path would follow a link the program left there to any
+      file of the user, or wait on a FIFO. Seatbelt checks the type of the new name when it is
+      created, so ordinary files, directories and Unix sockets (decided by `unix_sockets`) are
+      not affected. Measured on macOS 27.0.1 with this rule in a hand-written profile:
+      `symlink`, `symlinkat`, `mkfifo` and `mknod(S_IFIFO)` fail with `EPERM`; creating a file, a
+      directory, `rename`, `clonefile`, `unlink` and binding a Unix socket still work. A rename or
+      a clone that gives an existing link or FIFO a new name creates one too, so it fails as well,
+      as on Linux, where Landlock asks the same right for the new name: `rename` and
+      `renamex_np(RENAME_SWAP)` of a link or a FIFO that a process outside made, and
+      `clonefile(CLONE_NOFOLLOW)` of such a link, fail with `EPERM` (a clone of a FIFO fails
+      with `EINVAL` outside the sandbox too). Deleting such a name stays possible. A device needs
+      root in any case; `mknod(S_IFCHR)` answers `EPERM` outside the sandbox too, so the device
+      types follow from the rule but are not measured
+      (`symlink_and_fifo_in_writable_paths_are_denied`,
+      `links_and_fifos_in_writable_paths_get_no_new_name`).
+    - `(deny file-clone (vnode-type DIRECTORY))`. `clonefile(2)` of a directory copies the whole
+      tree in one call, and Seatbelt checks only the directory it creates: on macOS 27.0.1 the
+      clone of a directory that held a symbolic link and a FIFO, from a `read` path and within a
+      `read_write` path, was allowed despite the rule above and brought both into the writable
+      path. A directory clone is refused with `EPERM` now; a clone of a file still works, and so
+      do `cp -R`, `cp -cR`, `ditto` and `ditto --clone` of a tree without links, which copy it
+      entry by entry, and `copyfile(3)` with `COPYFILE_RECURSIVE | COPYFILE_CLONE`, which
+      `FileManager.copyItem` uses, copied the whole tree in the sandbox too.
+      `COPYFILE_CLONE_FORCE` with `COPYFILE_RECURSIVE` fails with `EINVAL` outside the sandbox
+      as well (measured on macOS 27.0.1;
+      `directory_clones_bring_no_links_or_fifos_into_writable_paths`).
     - `(deny file-link nvram* iokit-get-properties mach-priv* mach-task-name mach-task-read
       mach-task-inspect system-debug)`. `file-link` is not part of `file-write*`, and Apple's
       `maild.sb` denies it explicitly after `(deny default)`. A hard link to a file outside the
@@ -1474,6 +1504,10 @@ none, so the backend answers nothing and sandy refuses the option.
   conflict. The locks are advisory and give no access (measured on macOS 27.0.1, test
   `a_lock_on_a_readable_file_holds_off_other_processes`).
 - `link(2)` fails everywhere (see the hard link rule above).
+- `symlink(2)`, `mkfifo(3)` and `mknod(2)` fail everywhere, also in writable paths, as on Linux, and so
+  does a rename or a clone of an existing symbolic link or FIFO (see the protections above). Tools
+  that make links fail: `ln -s` in a `read_write` path answers "Operation not permitted"
+  (measured on macOS 27.0.1).
 - With `system = "none"` no program starts on macOS: every program is linked dynamically, and dyld
   itself needs the root directory and the shared cache from the system set. sandy refuses such a
   policy unless a policy path covers "/", which is the only way a policy can bring those paths

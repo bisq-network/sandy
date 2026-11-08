@@ -1023,8 +1023,10 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   `chdir` and the path from `getattrlist` answer for every path again, because a connect to a
   socket outside the policy needs that check. `kill(pid, 0)` still tells a live process ID from
   an unused one.
-- Hard links are denied; clones (`std::fs::copy`) work only into writable paths and only from
-  files the target may read. ptrace attach is denied (Seatbelt checks it as `system-debug`).
+- Hard links are denied, and writable paths never get new symbolic links, named pipes or
+  devices, as on Linux; clones (`std::fs::copy`) work only of files, only into writable paths
+  and only from files the target may read. ptrace attach is denied (Seatbelt checks it as
+  `system-debug`).
 - dyld needs the root directory itself (only the names in `/`) to find the shared cache, so the
   minimal system set contains it; with `system = "none"` no program can start on macOS, so the
   backend refuses that unless a policy path covers "/".

@@ -614,6 +614,21 @@ fn protection_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
         &["file-write-unlink", "file-write-create"],
         &filters,
     );
+    writer.comment(
+        "No new symbolic links, named pipes or devices, as on Linux: a process outside that\n\
+         later opens a name in a writable path would follow a link or wait on a pipe that the\n\
+         target left there. Seatbelt checks the type of the new name, also when a rename or a\n\
+         clone creates it.",
+    );
+    writer.line(
+        "(deny file-write-create (vnode-type SYMLINK) (vnode-type FIFO) \
+         (vnode-type CHARACTER-DEVICE) (vnode-type BLOCK-DEVICE))",
+    );
+    writer.comment(
+        "A clone of a directory copies the whole tree, and Seatbelt checks only the new\n\
+         directory, not the links and pipes inside it. Clones of files stay possible.",
+    );
+    writer.line("(deny file-clone (vnode-type DIRECTORY))");
     if policy.children == ChildProcesses::None {
         writer.comment(
             "process.children = \"none\": no fork, vfork or posix_spawn. Threads, and replacing\n\
@@ -853,6 +868,16 @@ mod tests {
 ; link's target. (Policy paths inside writable paths are rejected before this.)
 (deny file-write-unlink file-write-create
   (literal (param "ANCHOR_0")))
+
+; No new symbolic links, named pipes or devices, as on Linux: a process outside that
+; later opens a name in a writable path would follow a link or wait on a pipe that the
+; target left there. Seatbelt checks the type of the new name, also when a rename or a
+; clone creates it.
+(deny file-write-create (vnode-type SYMLINK) (vnode-type FIFO) (vnode-type CHARACTER-DEVICE) (vnode-type BLOCK-DEVICE))
+
+; A clone of a directory copies the whole tree, and Seatbelt checks only the new
+; directory, not the links and pipes inside it. Clones of files stay possible.
+(deny file-clone (vnode-type DIRECTORY))
 
 ; The priority, process group and session of any process ID reach no profile operation:
 ; getpriority, getpgid, getsid. A rule cannot tell the program's own ID from another.
@@ -1374,7 +1399,10 @@ mod tests {
         let clone: Vec<&str> = text.lines().filter(|l| l.contains("file-clone")).collect();
         assert_eq!(
             clone,
-            vec!["(allow file-read* file-test-existence file-write* file-clone"]
+            vec![
+                "(allow file-read* file-test-existence file-write* file-clone",
+                "(deny file-clone (vnode-type DIRECTORY))"
+            ]
         );
     }
 
