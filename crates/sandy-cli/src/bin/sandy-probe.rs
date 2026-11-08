@@ -277,6 +277,28 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
             stream.shutdown(std::net::Shutdown::Write)?;
             Ok(format!("{count} bytes"))
         }
+        // ADDRESS<U+001F>COUNT: opens COUNT connections to ADDRESS, waits a second and says how
+        // many are still open; a server that closes the connections beyond a limit leaves fewer.
+        "tcp-hold-many" => {
+            let (address, count) = pair(target)?;
+            let count: usize = count
+                .parse()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid count"))?;
+            let address = socket_address(address)?;
+            let streams = (0..count)
+                .map(|_| TcpStream::connect_timeout(&address, CONNECT_TIMEOUT))
+                .collect::<io::Result<Vec<_>>>()?;
+            std::thread::sleep(Duration::from_secs(1));
+            let open = streams
+                .iter()
+                .filter(|stream| {
+                    stream.set_nonblocking(true).is_ok()
+                        && matches!((&**stream).read(&mut [0]),
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+                })
+                .count();
+            Ok(format!("{open} open"))
+        }
         // STREAM<U+001F>ADDRESS: sends a datagram to ADDRESS from the socket the caller passed as
         // standard stream STREAM (0, 1 or 2), without creating a socket of its own.
         "udp-send-fd" => {

@@ -69,7 +69,7 @@ where
     A: FnMut() -> io::Result<TcpStream>,
     C: Fn() -> io::Result<TcpStream> + Send + Sync + 'static,
 {
-    let connections = relayed(connect);
+    let connections = relayed(connect, Capacity::Port);
     loop {
         match accept() {
             Ok(client) => {
@@ -92,14 +92,46 @@ struct Connections<H> {
     stack_size: Option<usize>,
 }
 
-/// The connections of a relay: each one is relayed to a connection from `connect`.
-fn relayed<C>(connect: C) -> Connections<impl Fn(TcpStream) + Send + Sync + 'static>
+/// How many connections one route of `serve_routes_until` relays at the same time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capacity {
+    /// An exposed or forwarded port: `MAX_CONNECTIONS`.
+    Port,
+    /// The route to the egress broker, where a relay stands in front of it (Windows): the
+    /// broker's own `broker::MAX_CONNECTIONS`, on threads with the broker's small stacks, so the
+    /// relay does not lower the broker's limit.
+    Egress,
+}
+
+impl Capacity {
+    fn connections(self) -> usize {
+        match self {
+            Capacity::Port => MAX_CONNECTIONS,
+            Capacity::Egress => broker::MAX_CONNECTIONS,
+        }
+    }
+
+    fn stack_size(self) -> Option<usize> {
+        match self {
+            Capacity::Port => None,
+            Capacity::Egress => Some(broker::THREAD_STACK),
+        }
+    }
+}
+
+/// The connections of a relay with `capacity`: each one is relayed to a connection from
+/// `connect`.
+fn relayed<C>(
+    connect: C,
+    capacity: Capacity,
+) -> Connections<impl Fn(TcpStream) + Send + Sync + 'static>
 where
     C: Fn() -> io::Result<TcpStream> + Send + Sync + 'static,
 {
-    Connections::new(MAX_CONNECTIONS, None, move |client| {
+    let stack_size = capacity.stack_size();
+    Connections::new(capacity.connections(), stack_size, move |client| {
         if let Ok(server) = connect() {
-            let _ = relay_streams(client, server);
+            let _ = relay_streams_with(client, server, HALF_CLOSED_IDLE, stack_size);
         }
     })
 }
@@ -235,9 +267,27 @@ where
     A: FnMut(&L) -> io::Result<TcpStream>,
     C: Fn() -> io::Result<TcpStream> + Send + Sync + 'static,
 {
+    let routes = routes
+        .into_iter()
+        .map(|(listener, connect)| (listener, connect, Capacity::Port))
+        .collect();
+    serve_routes_until(routes, accept, stop, drain);
+}
+
+/// `serve_until` with a `Capacity` of its own for each route.
+pub fn serve_routes_until<L, A, C>(
+    routes: Vec<(L, C, Capacity)>,
+    accept: A,
+    stop: &Stop,
+    drain: Duration,
+) where
+    L: AsRawListener,
+    A: FnMut(&L) -> io::Result<TcpStream>,
+    C: Fn() -> io::Result<TcpStream> + Send + Sync + 'static,
+{
     let servers = routes
         .into_iter()
-        .map(|(listener, connect)| (listener, relayed(connect)))
+        .map(|(listener, connect, capacity)| (listener, relayed(connect, capacity)))
         .collect();
     serve_connections_until(servers, accept, stop, drain);
 }
@@ -1268,6 +1318,48 @@ mod tests {
             .expect("the stop woke nothing");
         assert_eq!(ready.unwrap(), 0);
         drop(listener);
+    }
+
+    /// A route relays as many connections at a time as its capacity allows, the route to the
+    /// egress broker as many as the broker serves, and closes the rest at once.
+    #[test]
+    fn a_route_relays_at_most_its_capacity() {
+        assert_eq!(Capacity::Port.connections(), MAX_CONNECTIONS);
+        assert_eq!(Capacity::Egress.connections(), broker::MAX_CONNECTIONS);
+        assert_eq!(Capacity::Egress.stack_size(), Some(broker::THREAD_STACK));
+
+        // Each handled connection stays open until its client closes it.
+        let connections = Connections::new(2, None, |server: TcpStream| {
+            let _ = (&server).read(&mut [0]);
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let clients: Vec<TcpStream> = (0..3)
+            .map(|_| {
+                let client = TcpStream::connect(address).unwrap();
+                let (server, _) = listener.accept().unwrap();
+                assert!(connections.start(server));
+                client
+            })
+            .collect();
+        assert_eq!(connections.active(), 2);
+        let open = |client: &TcpStream| {
+            client
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            matches!((&*client).read(&mut [0]), Err(error) if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ))
+        };
+        assert!(open(&clients[0]) && open(&clients[1]));
+        assert!(!open(&clients[2]));
+        drop(clients);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while connections.active() > 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(connections.active(), 0);
     }
 
     /// One server serves several listeners, each to its own target.

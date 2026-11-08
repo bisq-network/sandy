@@ -813,7 +813,13 @@ sandy runs the broker as `sandy __broker` in an AppContainer of its own, alongsi
    inside the sandbox and passes each connection over an AF_UNIX socket. sandy binds that socket
    outside the AppContainers and hands the listening handle to the broker, which inherits it and
    accepts on it; the broker needs no access to the socket file. The relay connects to the socket
-   file with the capability it already holds.
+   file with the capability it already holds. sandy names the port with `--egress` instead of
+   `--forward`, and the relay serves it with the broker's limit of 1000 connections at a time and
+   threads with 256 KiB stacks (`sandy_relay::Capacity::Egress`) instead of the 256 of a
+   forwarded port, so it does not lower the broker's limit
+   (`the_egress_port_takes_as_many_connections_as_the_broker`). Each connection holds two sockets
+   and two threads in the relay, which at the limit is a few thousand handles, far below the
+   about 16 million that Windows allows a process.
 4. The broker is in the relay job, so it ends with the program and within one second of it
    (docs/DESIGN.md, "Forwarded ports", rule 5); kill-on-close ends it if sandy dies, and so does
    the end of its standard input (`a_killed_run_leaves_no_egress_broker_behind`). No process of

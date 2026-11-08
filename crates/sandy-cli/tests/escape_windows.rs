@@ -3970,6 +3970,23 @@ fn egress_run_with_relays(fixture: &Fixture) -> (Child, Vec<std::os::windows::io
     (run, children)
 }
 
+/// The relay in front of the egress broker lets as many connections through at a time as the
+/// broker serves (`sandy_relay::broker::MAX_CONNECTIONS`), not the limit of a forwarded port, as
+/// on Linux and macOS, where the program reaches the broker directly. The broker holds each
+/// connection while it waits for the SOCKS5 request.
+#[test]
+fn the_egress_port_takes_as_many_connections_as_the_broker() {
+    let fixture = Fixture::new("egress-many");
+    let port = free_port();
+    let count = 300;
+    let lines = probe_inside(
+        &egress_args(&fixture, port, "public"),
+        &[("tcp-hold-many", &format!("127.0.0.1:{port}\u{1f}{count}"))],
+    );
+    lines[0].assert_ok();
+    assert_eq!(lines[0].detail, format!("{count} open"));
+}
+
 /// A killed run leaves no broker behind with its network capabilities: the relay job's
 /// kill-on-close ends it when sandy dies, and so does the end of its standard input, whose other
 /// end sandy holds (either alone passes this test).

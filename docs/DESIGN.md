@@ -557,7 +557,10 @@ everywhere; a backend adds only its answer about its own addresses (`HostNetwork
    address the program named as the peer (the exceptions table, row "All").
 5. It serves at most `sandy_relay::broker::MAX_CONNECTIONS` (1000) connections at the same time,
    more than a relayed port, because a program that talks to many peers needs them. Each takes
-   two threads with small stacks and two descriptors; macOS allows a process 2048 threads.
+   two threads with small stacks and two descriptors; macOS allows a process 2048 threads. On
+   Windows the program reaches the broker through the relay in its AppContainer, whose egress
+   route has the same limit and the same small stacks (`sandy_relay::Capacity::Egress`), so the
+   relay does not lower it.
 
 ## The file system view
 

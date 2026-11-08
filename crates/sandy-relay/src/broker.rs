@@ -41,7 +41,7 @@ const _: () = assert!(MAX_CONNECTIONS > crate::MAX_CONNECTIONS);
 /// The stack of each broker thread. The handshake, the check and the copying keep their buffers
 /// on the heap, so this is ample, and `MAX_CONNECTIONS` reserve about 500 MiB of address space
 /// instead of the 4 GiB that the standard library's default of 2 MiB would.
-const THREAD_STACK: usize = 256 * 1024;
+pub(crate) const THREAD_STACK: usize = 256 * 1024;
 
 /// Serves the broker on `listener` until `stop` is requested, then ends as `serve_until` does:
 /// it still takes the connections that wait in the backlog, closes the listener, waits up to

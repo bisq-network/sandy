@@ -386,11 +386,13 @@ pub enum Command {
     /// port with a listening socket it passed by descriptor or handle number and the program's
     /// address to connect to; each forwarded port, on Windows only, as the address inside the
     /// sandbox to listen on, whose connections go to the Unix domain socket named after its port
-    /// in the directory `sockets`.
+    /// in the directory `sockets`. `egress` is a forwarded port too, to the egress broker, with
+    /// the broker's connection limit (`sandy_relay::Capacity::Egress`).
     Relay {
         exposed: Vec<(u64, SocketAddr)>,
         sockets: Option<PathBuf>,
         forwarded: Vec<SocketAddr>,
+        egress: Option<SocketAddr>,
     },
     /// Internal: run the egress broker (`network.egress`). A backend starts sandy this way, in a
     /// sandbox of its own, with a listening socket it passed by descriptor or handle number; the
@@ -402,7 +404,8 @@ pub enum Command {
 }
 
 /// The internal command that runs a relay. It is not part of the documented interface:
-/// `__relay [--expose LISTENER TARGET]... [--sockets DIRECTORY] [--forward LISTEN]...`
+/// `__relay [--expose LISTENER TARGET]... [--sockets DIRECTORY] [--forward LISTEN]...
+/// [--egress LISTEN]`
 pub const RELAY_COMMAND: &str = "__relay";
 
 /// The internal command that runs the egress broker. It is not part of the documented interface.
@@ -457,6 +460,7 @@ fn parse_relay(parser: &mut lexopt::Parser) -> Result<Command, lexopt::Error> {
     let mut exposed = Vec::new();
     let mut sockets = None;
     let mut forwarded = Vec::new();
+    let mut egress = None;
     while let Some(arg) = parser.next()? {
         match arg {
             Long("expose") => {
@@ -471,19 +475,26 @@ fn parse_relay(parser: &mut lexopt::Parser) -> Result<Command, lexopt::Error> {
                 sockets = Some(PathBuf::from(parser.value()?));
             }
             Long("forward") => forwarded.push(parser.value()?.parse()?),
+            Long("egress") => {
+                if egress.is_some() {
+                    return Err("--egress given twice".into());
+                }
+                egress = Some(parser.value()?.parse()?);
+            }
             other => return Err(other.unexpected()),
         }
     }
-    if exposed.is_empty() && forwarded.is_empty() {
+    if exposed.is_empty() && forwarded.is_empty() && egress.is_none() {
         return Err("the relay has no port to serve".into());
     }
-    if forwarded.is_empty() != sockets.is_none() {
-        return Err("--forward and --sockets go together".into());
+    if (forwarded.is_empty() && egress.is_none()) != sockets.is_none() {
+        return Err("--forward and --egress go together with --sockets".into());
     }
     Ok(Command::Relay {
         exposed,
         sockets,
         forwarded,
+        egress,
     })
 }
 
@@ -1404,12 +1415,15 @@ mod tests {
             "127.0.0.1:9090",
             "--forward",
             "[::1]:9091",
+            "--egress",
+            "127.0.0.1:9092",
         ]);
         match command.unwrap() {
             Command::Relay {
                 exposed,
                 sockets,
                 forwarded,
+                egress,
             } => {
                 assert_eq!(
                     exposed,
@@ -1426,6 +1440,7 @@ mod tests {
                         "[::1]:9091".parse().unwrap()
                     ]
                 );
+                assert_eq!(egress, Some("127.0.0.1:9092".parse().unwrap()));
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -1434,10 +1449,21 @@ mod tests {
                 exposed,
                 sockets,
                 forwarded,
+                egress,
             } => {
                 assert_eq!(exposed.len(), 1);
                 assert_eq!(sockets, None);
                 assert!(forwarded.is_empty());
+                assert_eq!(egress, None);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse_strs(&[RELAY_COMMAND, "--sockets", "s", "--egress", "127.0.0.1:9"]).unwrap() {
+            Command::Relay {
+                forwarded, egress, ..
+            } => {
+                assert!(forwarded.is_empty());
+                assert_eq!(egress, Some("127.0.0.1:9".parse().unwrap()));
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -1453,6 +1479,16 @@ mod tests {
             &[RELAY_COMMAND, "--forward", "127.0.0.1:9090"],
             &[RELAY_COMMAND, "--sockets", "s", "--forward", "9090"],
             &[RELAY_COMMAND, "--sockets", "s"],
+            &[RELAY_COMMAND, "--egress", "127.0.0.1:9"],
+            &[
+                RELAY_COMMAND,
+                "--sockets",
+                "s",
+                "--egress",
+                "127.0.0.1:9",
+                "--egress",
+                "127.0.0.1:10",
+            ],
             &[
                 RELAY_COMMAND,
                 "--sockets",

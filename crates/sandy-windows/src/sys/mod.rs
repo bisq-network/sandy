@@ -231,6 +231,10 @@ impl Backend for WindowsBackend {
                     args.push(wide("--forward".as_ref()));
                     args.push(wide(listen.to_string().as_ref()));
                 }
+                if let Some(listen) = egress_listen {
+                    args.push(wide("--egress".as_ref()));
+                    args.push(wide(listen.to_string().as_ref()));
+                }
                 forwarding = Some(started);
                 egress_listener = listener;
             }

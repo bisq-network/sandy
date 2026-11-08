@@ -69,7 +69,8 @@ fn main() -> ExitCode {
             exposed,
             sockets,
             forwarded,
-        } => relay(exposed, sockets, forwarded),
+            egress,
+        } => relay(exposed, sockets, forwarded, egress),
         Command::Broker { listener, reach } => broker(listener, reach),
         Command::Sandbox(invocation) => {
             let handed_over = match invocation.mode {
@@ -237,11 +238,15 @@ fn hand_over(_started_as: &[PathBuf], _parent_at_start: Option<u32>) -> Result<(
 /// How the relay reaches the other side of one port.
 type Connect = Box<dyn Fn() -> std::io::Result<std::net::TcpStream> + Send + Sync>;
 
-/// One relay serves every exposed and forwarded port that it is given.
+/// A route of the relay: its listener, how it reaches the other side, and its connection limit.
+type Route = (std::net::TcpListener, Connect, sandy_relay::Capacity);
+
+/// One relay serves every exposed and forwarded port that it is given, and the egress port.
 fn relay(
     exposed: Vec<(u64, std::net::SocketAddr)>,
     sockets: Option<std::path::PathBuf>,
     forwarded: Vec<std::net::SocketAddr>,
+    egress: Option<std::net::SocketAddr>,
 ) -> ExitCode {
     let mut handles: Vec<u64> = exposed.iter().map(|(listener, _)| *listener).collect();
     handles.sort_unstable();
@@ -250,45 +255,57 @@ fn relay(
         eprintln!("sandy: relay failed: a socket is named twice");
         return ExitCode::from(EXIT_FAILURE);
     }
-    let mut routes: Vec<(std::net::TcpListener, Connect)> = Vec::new();
+    let mut routes: Vec<Route> = Vec::new();
     for (listener, target) in exposed {
         // SAFETY: a backend starts this command only with listening sockets it passed to this
         // process and that nothing else here owns, and each is named once (checked above).
         let listener = unsafe { sandy_relay::inherited_listener(listener) }
             .and_then(|listener| listener.set_nonblocking(false).map(|()| listener));
         match listener {
-            Ok(listener) => routes.push((listener, Box::new(move || sandy_relay::connect(target)))),
+            Ok(listener) => routes.push((
+                listener,
+                Box::new(move || sandy_relay::connect(target)),
+                sandy_relay::Capacity::Port,
+            )),
             Err(error) => {
                 eprintln!("sandy: relay failed: {error}");
                 return ExitCode::from(EXIT_FAILURE);
             }
         }
     }
-    if let Err(message) = forward_routes(sockets, forwarded, &mut routes) {
+    if let Err(message) = forward_routes(sockets, forwarded, egress, &mut routes) {
         eprintln!("sandy: {message}");
         return ExitCode::from(EXIT_FAILURE);
     }
     serve_relay(routes)
 }
 
-/// The routes of the forwarded ports: the relay listens on each address inside the sandbox and
-/// passes every connection to the socket named after its port in `sockets`.
+/// The routes of the forwarded ports and the egress port: the relay listens on each address
+/// inside the sandbox and passes every connection to the socket named after its port in
+/// `sockets`. The egress route has the broker's connection limit, so the relay in front of the
+/// broker does not lower it.
 #[cfg(windows)]
 fn forward_routes(
     sockets: Option<std::path::PathBuf>,
     forwarded: Vec<std::net::SocketAddr>,
-    routes: &mut Vec<(std::net::TcpListener, Connect)>,
+    egress: Option<std::net::SocketAddr>,
+    routes: &mut Vec<Route>,
 ) -> Result<(), String> {
     let Some(directory) = sockets else {
         return Ok(());
     };
-    for listen in forwarded {
+    let ports = forwarded
+        .into_iter()
+        .map(|listen| (listen, sandy_relay::Capacity::Port));
+    let egress = egress.map(|listen| (listen, sandy_relay::Capacity::Egress));
+    for (listen, capacity) in ports.chain(egress) {
         let listener = std::net::TcpListener::bind(listen)
             .map_err(|error| format!("relay cannot listen on {listen}: {error}"))?;
         let socket = sandy_relay::unix::socket_path(&directory, listen.port());
         routes.push((
             listener,
             Box::new(move || sandy_relay::unix::connect_to(&socket)),
+            capacity,
         ));
     }
     Ok(())
@@ -299,9 +316,10 @@ fn forward_routes(
 fn forward_routes(
     _sockets: Option<std::path::PathBuf>,
     forwarded: Vec<std::net::SocketAddr>,
-    _routes: &mut Vec<(std::net::TcpListener, Connect)>,
+    egress: Option<std::net::SocketAddr>,
+    _routes: &mut Vec<Route>,
 ) -> Result<(), String> {
-    if forwarded.is_empty() {
+    if forwarded.is_empty() && egress.is_none() {
         Ok(())
     } else {
         Err("the relay serves forwarded ports only on Windows".to_string())
@@ -317,7 +335,7 @@ const RELAY_READY: &str = "ready";
 /// On Windows the backend keeps the relay's standard input open while the program runs and
 /// closes it when the program ends; the relay then ends by rule 5 (see `serve_until`).
 #[cfg(windows)]
-fn serve_relay(routes: Vec<(std::net::TcpListener, Connect)>) -> ExitCode {
+fn serve_relay(routes: Vec<Route>) -> ExitCode {
     use std::io::Write;
 
     let stop = match stop_at_end_of_input() {
@@ -335,7 +353,7 @@ fn serve_relay(routes: Vec<(std::net::TcpListener, Connect)>) -> ExitCode {
         return ExitCode::from(EXIT_FAILURE);
     }
     drop(stdout);
-    sandy_relay::serve_until(
+    sandy_relay::serve_routes_until(
         routes,
         |listener| listener.accept().map(|(client, _)| client),
         &stop,
@@ -347,10 +365,10 @@ fn serve_relay(routes: Vec<(std::net::TcpListener, Connect)>) -> ExitCode {
 /// No Unix backend starts the relay as a process of its own; started by hand, it serves until it
 /// is ended.
 #[cfg(not(windows))]
-fn serve_relay(routes: Vec<(std::net::TcpListener, Connect)>) -> ExitCode {
+fn serve_relay(routes: Vec<Route>) -> ExitCode {
     match sandy_relay::Stop::new() {
         Ok(never) => {
-            sandy_relay::serve_until(
+            sandy_relay::serve_routes_until(
                 routes,
                 |listener| listener.accept().map(|(client, _)| client),
                 &never,
