@@ -1724,10 +1724,10 @@ about a path is worse than none, so the backend answers nothing and sandy refuse
 
 Host: Windows 11 build 26200 (VM), binaries built for `x86_64-pc-windows-gnu`. The tests run in
 an elevated SSH session and without administrator rights. Latest elevated run, every test
-passing: `sandy_core` 104, `sandy_relay` 43, `sandy_windows` 117, `sandy` 26, `escape` 27,
-`escape_windows` 90, `expose` 5, `forward` 3, `children` 5, `parent` 5, `check` 13, `levels` 7,
-`runner` 3, `review_windows` 12, `setup` 3. `crossuser_windows` skips without `SANDY_TEST_OTHER_USER` and
-`SANDY_TEST_OTHER_PASSWORD` (see "Other users of the machine"). The
+passing: `sandy_core` 115, `sandy_relay` 51, `sandy_windows` 147, `sandy` 34, `escape` 25,
+`escape_windows` 111, `expose` 5, `forward` 4, `children` 6, `parent` 8, `check` 15, `levels` 8,
+`runner` 3, `review_windows` 12, `setup` 3. `crossuser_windows` skips without
+`SANDY_TEST_OTHER_USER` and `SANDY_TEST_OTHER_PASSWORD` (see "Other users of the machine"). The
 COM check of `review_windows` is skipped there: the SSH session is session 0, where `ole32.dll`
 does not load in an AppContainer (limitation 13), so a denial would not be the COM boundary.
 Earlier non-administrator runs used a scheduled task with `/RL LIMITED` (medium integrity,
