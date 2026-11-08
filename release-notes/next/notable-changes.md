@@ -13,6 +13,10 @@ Draft for the release after 1.1.0. It lists what a user or an integrator may not
 - **Linux:** the egress broker looks up the route of a destination with TCP, the destination port and its own user, as its connect does, so an address that a policy routing rule sends to the local table only for TCP or for one port is refused as this host (reply 2) where it was allowed before.
 - **Linux:** `--explain` writes its report from a queue; lines that standard error does not take in time are dropped and counted in a line of the report.
 
+## Policies that are no longer refused
+
+- **Every platform:** a hard link that gives a `read_exec` file or the program a second name inside a writable path is no longer refused, and sandy no longer walks the writable trees at each start to find one, unless sandy's own executable or the policy file has more than one name. Which trees a policy makes executable is its author's choice: such a link comes from the host or from an earlier run that could write both names. A second name of sandy's own executable or of the policy file is still refused.
+
 ## New
 
 - `filesystem.symlinks = "deny" | "allow"` (`--symlinks`), default `deny`, with the warning `symlinks-followed-outside`.

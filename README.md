@@ -816,8 +816,12 @@ about 600 on a Mac with 16 addresses. A run beyond the limit fails before the pr
    drive) and asks for the local path instead.
 2. **Never writable and executable.** No path may be both writable and executable, also not
    through nesting (a `read_write` directory inside a `read_exec` directory, or the reverse).
-   The rule compares files, not names: a hard link that gives an executable file a second name
-   inside a `read_write` path is refused too.
+   The rule compares the paths the policy names, not the history of the files below them: a
+   hard link that gives an executable file a second name inside a `read_write` path lets the
+   program change the file through that name. Such a link comes from the host, or from an
+   earlier run that could write both names, since a program may link its own files. Which trees
+   a policy makes executable is the choice of whoever writes it: give `read_exec` only to trees
+   you trust, not to one an earlier sandbox could write.
 3. **Nothing inside a writable path.** No policy path may lie inside a `read_write` path, or be
    reached through a symbolic link (on Windows also a junction) inside one. The program could
    replace it with a symbolic link, and the next start would follow the link. sandy's own
@@ -827,7 +831,7 @@ about 600 on a Mac with 16 addresses. A run beyond the limit fails before the pr
    entries, so nothing there can be replaced. A pseudo-terminal needs `/dev/ptmx` and
    `/dev/pts`, and on some hosts `/dev/ptmx` is the `ptmx` of `/dev/pts` itself.
 4. **The program file** gets read and execute access automatically. It must not lie inside a
-   `read_write` path, and must have no second name in one.
+   `read_write` path.
 5. **The minimal system set** (`system = "minimal"`) adds, read-only, what programs need to start:
    shared libraries, the dynamic loader, time zone data, `/dev/null` and the random devices. It
    never contains user data. Each platform documents its exact list. Programs that need more

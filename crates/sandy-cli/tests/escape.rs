@@ -519,66 +519,43 @@ fn refuses_a_sandy_executable_a_writable_path_reaches() {
     assert!(stderr.contains("writable path"), "{stderr}");
 }
 
-/// Rule 3 by identity: a file with one name in an executable path and one in a writable path is
-/// writable and executable, whichever name a call uses. The program could rewrite the code that
-/// the next run, or a process outside the sandbox, executes.
+/// A hard link that gives a file of a `read_exec` path a second name inside a writable path is
+/// not refused, and the program can change the file through that name: which trees a policy
+/// makes executable is its author's choice (see "Links" in docs/DESIGN.md). Control: the file
+/// changed.
+#[cfg(unix)]
 #[test]
-fn a_hard_link_between_writable_and_executable_paths_is_refused() {
-    let fixture = Fixture::new("link-wx");
+fn a_hard_link_of_an_executable_file_stays_writable() {
+    let fixture = Fixture::new("link-executable");
     let tool = fixture.copy_probe("bin");
-    let run = || {
-        sandy(run_args(
-            &fixture.access_args(),
-            &[("read", &fixture.arg("ro/file"))],
-        ))
-    };
-
-    // Control: the same policy without the link.
-    let output = run();
-    assert!(output.status.success(), "{output:?}");
-
-    fs::hard_link(&tool, fixture.path("rw/data")).unwrap();
-    let output = run();
-    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("writable"), "{stderr}");
+    let data = fixture.arg("rw/data");
+    fs::hard_link(&tool, &data).unwrap();
+    probe_inside(&fixture.access_args(), &[("write", &data)])[0].assert_ok();
+    assert_eq!(fs::read(&tool).unwrap(), b"probe");
 }
 
-/// The program file gets execute access of its own (rule 5), so a second name of it inside a
-/// writable path is refused as well.
+/// A second name of the program inside a writable path does not refuse the run either.
+#[cfg(unix)]
 #[test]
-fn a_hard_link_of_the_program_into_a_writable_path_is_refused() {
+fn a_hard_link_of_the_program_into_a_writable_path_runs() {
     let fixture = Fixture::new("link-program");
     let program = fixture.copy_probe("bin");
-    let run = || {
-        let mut args = vec!["run".to_string()];
-        args.extend(platform_args());
-        args.extend(["--read-write".to_string(), fixture.arg("rw")]);
-        args.extend([
-            "--".to_string(),
-            program.clone(),
-            "read".to_string(),
-            fixture.arg("rw/file"),
-        ]);
-        sandy(&args)
-    };
-
-    // Control: the same program without the link.
-    let output = run();
-    assert!(output.status.success(), "{output:?}");
-
     fs::hard_link(&program, fixture.path("rw/copy")).unwrap();
-    let output = run();
-    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("writable"), "{stderr}");
+    let mut args = vec!["run".to_string()];
+    args.extend(platform_args());
+    args.extend(["--read-write".to_string(), fixture.arg("rw")]);
+    args.extend([
+        "--".to_string(),
+        program.clone(),
+        "read".to_string(),
+        fixture.arg("rw/file"),
+    ]);
+    let output = sandy(&args);
+    assert!(output.status.success(), "{output:?}");
 }
 
-/// What a hard link still carries, so a change in it does not pass unnoticed: a file that lies
-/// outside the policy and has a second name inside a writable path can be changed through that
-/// name. sandy refuses the second name only when the other one is executable, the program or a
-/// file sandy trusts. Refusing every one would stop the package managers that fill a project
-/// from a shared cache with hard links (see "Links" in docs/DESIGN.md).
+/// What a hard link still carries, so a change in it does not pass unnoticed: a file outside the
+/// policy that has a second name inside a writable path can be changed through that name.
 #[cfg(unix)]
 #[test]
 fn a_hard_link_to_a_file_outside_the_policy_stays_writable() {

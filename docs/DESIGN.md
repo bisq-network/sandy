@@ -123,14 +123,14 @@ Rules:
    on the folder behind the share (docs/windows.md, "Network and share paths").
 2. A rule applies to the path and everything beneath it.
 3. No path may be both writable and executable, also not through nesting. sandy rejects such a
-   policy. The program could otherwise drop an executable that a process outside the sandbox
-   later runs. The rule holds per file, not per name: a file that has a second name inside a
-   writable path is writable, so an executable path, or the program file, that leads to the same
-   file is refused as well (see "Links and file identity"). The rule is about the grants of the
-   policy: sandy gives no writable path the right to start or load a file. Code the program runs
-   inside the sandbox from a file it wrote, mapped as code (Linux without the view; see "File
-   system view") or made executable by permissions it set when it created the file (Windows),
-   keeps the program's own rights, so the rule does not cover it.
+   policy. The program could otherwise drop an executable that a process outside the sandbox later
+   runs. A hard link that gives an executable file a second name inside a writable path, from the
+   host or from an earlier run that could write both names, is the policy author's concern: sandy
+   does not walk the trees for it (see "Links and file identity"). The rule is about the grants of
+   the policy: sandy gives no writable path the right to start or load a file. Code the program runs
+   inside the sandbox from a file it wrote, mapped as code (Linux without the view; see "File system
+   view") or made executable by permissions it set when it created the file (Windows), keeps the
+   program's own rights, so the rule does not cover it.
 4. No policy path may lie inside a writable path, and none may be resolved through an entry
    inside one, such as a symbolic link in a writable directory that points elsewhere. sandy
    resolves symbolic links at every start, so the program could replace such an entry with a
@@ -326,26 +326,26 @@ write the other changes what programs read.
   names only an overlap sandy sees (see docs/windows.md).
 - **Two names, one file.** A hard link gives one file a second name. The kernels check the name
   a call uses, so a file that is executable under one name and writable under another is both.
-  At the start sandy looks for a second name inside the writable paths of every file that must
-  not be writable: the files and trees of `read_exec` paths, the program file, its own
-  executable and the policy file. It walks the writable trees first, because a file with more
-  than one name is rare there, and the executable trees only when it found one. A directory
-  the user may not list is skipped: the program runs as the same user and cannot list it
-  either. So is an entry that disappears during the walk, such as one of a process that ends
-  meanwhile below a writable `/proc`. On Windows a file lists its own names
-  (`FindFirstFileNameW`), so sandy asks the files themselves and walks the writable trees only
-  for a `read_exec` directory.
-- **What stays open.** A hard link between a writable path and a file that no rule names, or
-  that only a `read` rule names, is allowed: the program can change that file through the
-  writable name. Refusing it would stop the package managers that fill a project from a shared
-  cache with hard links, so the policy decides what a writable path may hold. The entries of the
-  system set and the locations of rule 12 are compared as paths and directories, not for second
-  names: a hard link of a shell startup file inside a writable path stays writable through that
-  name. Two names that different file systems show for one file, as a passthrough FUSE mount
-  does, have different identities and stay unseen. The check runs at the start, so a link that a
-  process outside the sandbox makes while the program runs is not covered. The program cannot
-  make one itself: it gets no link right out of its writable paths and no execute access inside
-  them.
+  Within a run the program can link only files it may write: Landlock refuses a link across
+  directories without the refer right and to a file it may not write, Seatbelt refuses
+  `link(2)` everywhere, and an AppContainer cannot link a file it may not write. Across runs it
+  can: a run that may write a tree can link two of its files, which a later policy may name
+  differently. What a policy makes executable is the choice of whoever writes it, so sandy does
+  not judge the history of the trees it names, as it does not judge the permission entries of
+  other software on them. It looks for a second name inside the
+  writable paths only of the files it trusts itself, its own executable and the policy file,
+  which a program must not rewrite for the next start. On Unix that walks the writable trees
+  only when one of those files has more than one name; on Windows a file lists its own names
+  (`FindFirstFileNameW`).
+- **What stays open.** A hard link between a writable path and any other file, also one of a
+  `read_exec` path or the program file, is allowed: the program can change that file through the
+  writable name. Refusing it would cost a walk of the writable trees at every start, and package
+  managers fill projects from a shared cache with hard links. The
+  entries of the system set and the locations of rule 12 are compared as paths and directories, not
+  for second names: a hard link of a shell startup file inside a writable path stays writable
+  through that name. Two names that different file systems show for one file, as a passthrough FUSE
+  mount does, have different identities and stay unseen. The check runs at the start, so a link that
+  a process outside the sandbox makes while the program runs is not covered.
 
 ## Exposed ports
 

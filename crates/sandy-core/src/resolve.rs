@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::net::SocketAddr;
+#[cfg(unix)]
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
@@ -238,7 +239,6 @@ impl ResolvedPaths {
         check_writable_not_executable(&paths, &mounts)?;
         check_nothing_inside_writable(&paths, &mounts)?;
         check_not_resolved_through_writable(&paths, &traversals, &mounts)?;
-        check_no_writable_second_name(&paths, &mounts)?;
         validate_environment(&policy.environment)?;
         validate_relay_addresses(&policy.network.expose, &policy.network.forward)?;
         Ok(ResolvedPaths {
@@ -1253,6 +1253,7 @@ struct FileId {
 struct Entry {
     id: FileId,
     /// A directory, not a link to one.
+    #[cfg(unix)]
     is_dir: bool,
     /// A regular file with more than one name. A file with one name is reachable only where the
     /// policy says it is.
@@ -1290,10 +1291,11 @@ struct WritableName {
     writable: PathBuf,
 }
 
-/// The names inside the writable paths that files with more than one name have there. The
-/// writable trees are walked once, when the first question needs it.
+/// The names inside the writable paths that files with more than one name have there. On Unix
+/// the writable trees are walked once, when the first question needs it.
 struct WritableNames<'a> {
     rules: &'a [PathRule],
+    #[cfg(unix)]
     walked: Option<std::collections::HashMap<FileId, WritableName>>,
 }
 
@@ -1301,11 +1303,13 @@ impl<'a> WritableNames<'a> {
     fn new(rules: &'a [PathRule]) -> Self {
         WritableNames {
             rules,
+            #[cfg(unix)]
             walked: None,
         }
     }
 
     /// Every name below a writable path that its file shares with another name, by identity.
+    #[cfg(unix)]
     fn walked(&mut self) -> Result<&std::collections::HashMap<FileId, WritableName>, PolicyError> {
         let walked = match self.walked.take() {
             Some(walked) => walked,
@@ -1357,63 +1361,8 @@ impl<'a> WritableNames<'a> {
     }
 }
 
-/// Rule 3 by identity: a file that also has a name inside a writable path is writable, whichever
-/// name the policy grants execute access to. Landlock and Seatbelt check the name a call uses,
-/// and on Windows the grant of the writable parent lands on the file itself, so the program
-/// could rewrite the file through the writable name and still run it through the executable
-/// one. The program cannot create such a link itself, so this start-time check holds against
-/// it; links that processes outside the sandbox make while it runs are not covered.
-fn check_no_writable_second_name(rules: &[PathRule], mounts: &Mounts) -> Result<(), PolicyError> {
-    let executable: Vec<&PathRule> = rules
-        .iter()
-        .filter(|rule| rule.access == PathAccess::ReadExec)
-        .collect();
-    let conflict = |name: &WritableName, executable: &Path| PolicyError::WritableAndExecutable {
-        writable: name.path.clone(),
-        executable: executable.to_path_buf(),
-        relation: "is another name of",
-    };
-    let mut writable = WritableNames::new(rules);
-    for rule in executable.iter().filter(|rule| !rule.is_dir) {
-        let Some(id) = linked_file(&rule.path)? else {
-            continue;
-        };
-        if let Some(name) = writable.of_file(&rule.path, id, mounts)? {
-            return Err(conflict(&name, &rule.path));
-        }
-    }
-    let directories: Vec<&&PathRule> = executable.iter().filter(|rule| rule.is_dir).collect();
-    if directories.is_empty() {
-        return Ok(());
-    }
-    // Hard links are rare, so the writable paths, which are usually the smaller trees, are
-    // walked first; the executable trees are walked only when they can hold the other name.
-    let writable = writable.walked()?;
-    if writable.is_empty() {
-        return Ok(());
-    }
-    for rule in directories {
-        let mut found = None;
-        for_each_linked_file(&rule.path, &mut |path, id| match writable.get(&id) {
-            Some(name) => {
-                found = Some(conflict(name, path));
-                ControlFlow::Break(())
-            }
-            None => ControlFlow::Continue(()),
-        })
-        .map_err(|source| PolicyError::Unreadable {
-            path: rule.path.clone(),
-            source,
-        })?;
-        if let Some(conflict) = found {
-            return Err(conflict);
-        }
-    }
-    Ok(())
-}
-
-/// The same for the files sandy itself trusts, which no policy path names: a second name inside
-/// a writable path would let the program rewrite them for the next start.
+/// The files sandy itself trusts, which no policy path names: a second name inside a writable
+/// path would let the program rewrite them for the next start, whoever made it.
 fn check_no_writable_trusted_name(
     files: &[PathBuf],
     rules: &[PathRule],
@@ -1436,6 +1385,7 @@ fn check_no_writable_trusted_name(
 }
 
 /// Every name below a writable path that its file shares with another name, by identity.
+#[cfg(unix)]
 fn writable_names(
     rules: &[PathRule],
 ) -> Result<std::collections::HashMap<FileId, WritableName>, PolicyError> {
@@ -1467,6 +1417,7 @@ fn writable_names(
 /// not list: the program runs as the same user, so it cannot list them either, and a name it
 /// cannot reach cannot carry a grant (`skipped`). Any other error ends the walk, because a tree
 /// sandy cannot read is a tree it cannot clear.
+#[cfg(unix)]
 fn for_each_linked_file(
     root: &Path,
     visit: &mut impl FnMut(&Path, FileId) -> ControlFlow<()>,
@@ -1508,6 +1459,7 @@ fn for_each_linked_file(
 /// `--read-write /proc` the entries of a process that is going away fail with `EINVAL` (the
 /// listing of `/proc/<pid>/net`) or `ESRCH` (`/proc/<pid>/ns` and the files in
 /// `/proc/<pid>/net`, measured on Linux 7.2), and the program cannot reach them either.
+#[cfg(unix)]
 fn skipped(error: &std::io::Error) -> bool {
     use std::io::ErrorKind;
 
@@ -2898,39 +2850,6 @@ mod tests {
             assert!(skipped(&std::io::Error::from_raw_os_error(code)), "{code}");
         }
         assert!(!skipped(&std::io::Error::from_raw_os_error(libc::EIO)));
-    }
-
-    /// Rule 3 by identity: one file under two names, one of them writable.
-    #[test]
-    fn rejects_an_executable_file_hard_linked_into_a_writable_path() {
-        let root = temp_dir();
-        let (data, tools) = (root.join("data"), root.join("tools"));
-        fs::create_dir_all(&data).unwrap();
-        fs::create_dir_all(&tools).unwrap();
-        fs::write(tools.join("tool"), b"").unwrap();
-
-        // Control: without the link the two trees are unrelated.
-        let policy = policy_with(&[], &[&tools], &[&data]);
-        ResolvedPolicy::resolve(&policy, None).unwrap();
-
-        fs::hard_link(tools.join("tool"), data.join("copy")).unwrap();
-        let error = ResolvedPolicy::resolve(&policy, None).unwrap_err();
-        assert!(
-            matches!(&error, PolicyError::WritableAndExecutable { writable, executable, .. }
-                if *writable == data.join("copy") && *executable == tools.join("tool")),
-            "{error}"
-        );
-        // The same for an executable path that names the file itself, and for the program.
-        let policy = policy_with(&[], &[&tools.join("tool")], &[&data]);
-        assert!(matches!(
-            ResolvedPolicy::resolve(&policy, None),
-            Err(PolicyError::WritableAndExecutable { .. })
-        ));
-        let policy = policy_with(&[], &[], &[&data]);
-        assert!(matches!(
-            ResolvedPolicy::resolve(&policy, Some(&tools.join("tool"))),
-            Err(PolicyError::WritableAndExecutable { .. })
-        ));
     }
 
     /// The files sandy itself trusts get the same checks as policy paths.

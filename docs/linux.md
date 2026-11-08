@@ -2401,15 +2401,15 @@ rights of both, so the resolver compares files before it builds the rules.
   the one case where that can pick the wrong one. A bind mount of `/dev/pts/ptmx` at
   `/dev/ptmx` lies inside `/dev/pts` this way, which a writable devpts allows (see
   "Pseudo-terminals").
-- **Hard links.** `read_exec` files, the program file, sandy's own executable and the policy
-  file must have no second name inside a writable path. sandy checks `st_nlink` first and then
-  walks the writable trees, which costs one `lstat` per file there; it walks the `read_exec`
-  trees only when the writable trees hold a file with more than one name, which is rare. A
-  directory the user may not list is skipped: the program runs as the same user and cannot list
-  it either.
-- A file outside the policy that has a second name inside a writable path stays writable through
-  that name, and two names that a passthrough FUSE mount shows for one file have different
-  identities and stay unseen. See "Links and file identity" in [DESIGN.md](DESIGN.md).
+- **Hard links.** sandy's own executable and the policy file must have no second name inside a
+  writable path. sandy checks `st_nlink` first and walks the writable trees only when one of the
+  two has more than one name, which costs one `lstat` per file there. A directory the user may
+  not list is skipped: the program runs as the same user and cannot list it either.
+- Any other file that has a second name inside a writable path, also a `read_exec` file or the
+  program, stays writable through that name. The link comes from the host or from an earlier run
+  that could write both names; which trees a policy makes executable is its author's choice. Two
+  names that a passthrough FUSE mount shows for one file have different identities and
+  stay unseen. See "Links and file identity" in [DESIGN.md](DESIGN.md).
 
 ## Refusals
 
@@ -2638,10 +2638,9 @@ exit code 125 and the paths it compared.
   files of systemd-resolved sandy grants their directory instead; a plain `/etc/resolv.conf`,
   the other layouts and `/etc/hosts` stay single files, so a long-running program needs a
   restart after the system replaces one (see "Replaced resolver files").
-- **Hard links made outside.** The link check runs at the start. A process outside the sandbox
-  can link a file into a writable path while the program runs, and the program can then change
-  that file. The program cannot do it itself: it gets no `refer` right out of its writable paths
-  and no execute right inside them.
+- **Hard links made outside.** A process outside the sandbox can link a file into a writable path,
+  before or while the program runs, and the program can then change that file. The program itself
+  can link only files it may write: it gets no `refer` right out of its writable paths.
 - **What fails inside the sandbox:** 32-bit programs (killed), user namespace sandboxes of browsers
   (they fall back or fail), io_uring, debuggers, System V IPC, datagram socket pairs, `mkfifo` and
   symbolic links in writable paths, metadata changes and extended attribute reads by path with the

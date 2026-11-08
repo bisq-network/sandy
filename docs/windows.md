@@ -394,19 +394,19 @@ so only such paths and paths the user does not own can fail this way
 
 ### Links and identity
 
-The resolver compares files and not only paths: one directory reachable under two paths counts
-as one, and a file with a second name inside a writable path counts as writable (see "Links and
-file identity" in [DESIGN.md](DESIGN.md)). On Windows the identity of a file is the serial
-number of its volume and its file ID (`FILE_ID_INFO`, or `BY_HANDLE_FILE_INFORMATION` on a file
-system without 128-bit file IDs), read with the object opened for its attributes only. An object
-whose identity sandy cannot read counts as the one it is compared with, so the check refuses
-instead of passing it; `check` reports such an overlap as indeterminate, and only one it sees as
-a conflict. The warning for a directory on `PATH` follows the spellings instead, the
-one given and the canonical one, so it names only an overlap sandy sees. Such an object is, for
-example, a directory behind a junction that a less trusted process made: an elevated process
+The resolver compares files and not only paths: one directory reachable under two paths counts as
+one, and sandy's own executable and the policy file with a second name inside a writable path count
+as writable (see "Links and file identity" in [DESIGN.md](DESIGN.md)). On Windows the identity of a
+file is the serial number of its volume and its file ID (`FILE_ID_INFO`, or
+`BY_HANDLE_FILE_INFORMATION` on a file system without 128-bit file IDs), read with the object opened
+for its attributes only. An object whose identity sandy cannot read counts as the one it is compared
+with, so the check refuses instead of passing it; `check` reports such an overlap as indeterminate,
+and only one it sees as a conflict. The warning for a directory on `PATH` follows the spellings
+instead, the one given and the canonical one, so it names only an overlap sandy sees. Such an object
+is, for example, a directory behind a junction that a less trusted process made: an elevated process
 does not follow it (`ERROR_UNTRUSTED_MOUNT_POINT`), and package managers of the user make such
-junctions (`scoop\apps\<app>\current`). Junctions count as symbolic links, as `std::fs` counts
-them. On Windows:
+junctions (`scoop\apps\<app>\current`). Junctions count as symbolic links, as `std::fs` counts them.
+On Windows:
 
 - A policy path, sandy's executable or the policy file reached through a junction or a
   symbolic link inside a writable path is refused, as a symbolic link there is on Linux and
@@ -417,17 +417,13 @@ them. On Windows:
   (`escape_windows::refuses_a_policy_path_resolved_through_a_link_in_a_writable_path`,
   `refuses_a_policy_file_a_writable_path_reaches`,
   `refuses_a_sandy_executable_a_writable_path_reaches`).
-- A hard link between a `read_write` and a `read_exec` path, or one that gives the program
-  file, sandy's own executable or the policy file a second name inside a writable path, is
-  refused (`escape::a_hard_link_between_writable_and_executable_paths_is_refused`,
-  `escape::a_hard_link_of_the_program_into_a_writable_path_is_refused`). This weighs more here
-  than on Linux and macOS: the rights live in the one security descriptor of the file, so the
-  inheritable ACE of the writable parent would land on the file and stay there after the run. A
-  file lists its own names (`FindFirstFileNameW`), so sandy asks the program file, the files
-  that `read_exec` paths name, its own executable and the policy file directly, and walks the
-  writable trees only for a `read_exec` directory. That keeps an ordinary run from walking every
-  writable tree: the programs in `System32` have a second name in the component store
-  (`WinSxS`), measured for `cmd.exe`.
+- A hard link that gives sandy's own executable or the policy file a second name inside a
+  writable path is refused. A file lists its own names (`FindFirstFileNameW`), so sandy asks
+  the two files directly and walks no tree. A hard link that the host already has between a
+  writable path and any other file, also a `read_exec` file or the program, is the host's: the
+  program can change the file through the writable name, and the inheritable entry of the
+  writable parent lands on the file itself, for the capability of this policy, which the
+  writable name gives the program anyway.
 - The sandboxed program cannot make such a second name itself: an AppContainer process is
   refused a hard link to a file it may not write, a junction that leaves its writable paths, and
   a symbolic link of any kind (it holds no `SeCreateSymbolicLinkPrivilege`), all measured on

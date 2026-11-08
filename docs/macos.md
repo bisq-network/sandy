@@ -349,9 +349,9 @@ of earlier definitions"), so the protections come last. The unit test
       mach-task-inspect system-debug)`. `file-link` is not part of `file-write*`, and Apple's
       `maild.sb` denies it explicitly after `(deny default)`. A hard link to a file outside the
       policy would make it reachable through a writable path, so links are denied everywhere.
-      Links that already exist are a start-time check of the resolver: a `read_exec` file, the
-      program, sandy's own executable or the policy file must have no second name inside a
-      writable path (see "Links and file identity" in [DESIGN.md](DESIGN.md)).
+      Links that already exist are the host's, except that sandy's own executable and the
+      policy file must have no second name inside a writable path (see "Links and file
+      identity" in [DESIGN.md](DESIGN.md)).
     - `(deny syscall-unix (syscall-number 427) (syscall-number 217) (syscall-number 479)
       (syscall-number 225))`: `fsgetpath`, `fsgetpath_ext`, `openbyid_np` and `searchfs` find a
       file by volume id and inode number. `fsgetpath` builds the path in the kernel without
