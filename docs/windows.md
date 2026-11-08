@@ -543,20 +543,43 @@ The locations that are refused are in `sys::trusted_locations`:
 | `Documents\WindowsPowerShell`, `Documents\PowerShell` | the tree | the profile scripts of PowerShell 5 and PowerShell 7 |
 | `%LOCALAPPDATA%\Microsoft\WindowsApps` | the tree | the app execution aliases, which the default `PATH` holds |
 | `<home>\.gitconfig`, `<config>\git` | the file, the tree | `core.fsmonitor`, `core.sshCommand`, `core.pager` and `!` aliases run commands at the next git command |
+| `%PROGRAMDATA%\Git` (`FOLDERID_ProgramData`, `PROGRAMDATA`) | the tree | libgit2, which cargo and other tools use for git, reads `config` there as a level below the system configuration; every user may create folders in `C:\ProgramData` |
 | `<home>\.ssh` | the tree | `ProxyCommand` and `LocalCommand` in the configuration run programs |
 | `<home>\.gnupg`, `%APPDATA%\gnupg` (`FOLDERID_RoamingAppData`) | the tree | `pinentry-program` and `photo-viewer` name programs that gpg runs; Gpg4win keeps its configuration in the second |
 | `<home>\.cargo\config.toml`, `<home>\.cargo\config`, and both in `CARGO_HOME` | the file | `build.rustc`, `build.rustc-wrapper` and target runners name programs that the next cargo command runs |
 | `%LOCALAPPDATA%\sandy` | the tree | sandy's own state: the policy of each running AppContainer, the lock files and the forwarded-port sockets |
 
 The profile folder comes from the known folder and from `USERPROFILE`, because a service that
-starts sandy with a minimal environment sets no variable. `<home>` is each profile folder and
-`HOME` when it is absolute: Git for Windows reads `.gitconfig` and `.config\git` below `HOME`
-when it is set (measured on Windows 11 build 26200 with Git for Windows 2.54). `<config>` is
+starts sandy with a minimal environment sets no variable. `<home>` is each profile folder,
+`HOME`, and `HOMEDRIVE` followed by `HOMEPATH` (`HOMEPATH` alone without `HOMEDRIVE`). Measured on
+Windows 11 build 26200 with Git for Windows 2.54 and libgit2 1.9.7: both read `.gitconfig` below
+`HOME` when it is set, and without `HOME` below `HOMEDRIVE` followed by `HOMEPATH` when that
+directory exists, otherwise below `USERPROFILE`; without `HOMEDRIVE` Git for Windows takes
+`HOMEPATH` alone. A home without a drive, `\Users\x`, both resolve on the current drive, so
+sandy counts it on the drive of its working directory and on the system drive
+(`sys::drives`); a program started on another drive is not covered. A relative `HOME` both
+resolve against the working directory of the program that reads it, which names no one place,
+so it is left out. sandy counts every one of these homes whatever its own environment says
+about the others, because the programs outside the sandbox may run with another one.
+`<config>` is
 `XDG_CONFIG_HOME`, which Git for Windows honours too, and `.config` below each `<home>`. The
 git, SSH, GnuPG and cargo rows are the list of Linux and macOS (`sandy_core::trust::tool_configs`),
 so one policy is refused on every platform for the same files.
+
+Git's system configuration on Windows, `C:\Program Files\Git\etc\gitconfig` for both Git for
+Windows and libgit2, lies in a system directory, which no writable path may reach anyway.
+libgit2 also reads `Git\config` below the folder that `PROGRAMDATA` names, measured on Windows 11
+build 26200 with libgit2 1.9.7 (`git2::Config::open_default` reported the entry at the
+`ProgramData` level), and accepts a file there that the current user owns, as every file the
+program creates is. Git for Windows 2.54 no longer reads it: with `PROGRAMDATA` pointed at a
+folder holding `Git\config`, `git config --show-origin --list --system` listed only
+`C:/Program Files/Git/etc/gitconfig`, and its executable does not hold the name. The folder is
+protected from the known folder and from the variable, like the profile, and
+`refuses_a_writable_path_over_the_program_data_git_configuration` checks it with `PROGRAMDATA`
+pointed at a fixture.
 `refuses_a_writable_path_over_the_git_and_gnupg_configuration` checks them with `USERPROFILE` and
-`HOME` pointed at a fixture. A location that does not exist counts,
+`HOME` pointed at a fixture, `refuses_a_writable_path_over_the_git_configuration_of_other_homes`
+with `HOMEDRIVE` and `HOMEPATH` and with a `HOME` without a drive. A location that does not exist counts,
 because the program could create it. Paths are compared by file identity, as rules 3 and 4 compare
 them (see "Links and identity").
 

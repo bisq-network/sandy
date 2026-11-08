@@ -2627,6 +2627,113 @@ fn refuses_a_writable_path_over_the_git_and_gnupg_configuration() {
     }
 }
 
+/// Without HOME, Git for Windows and libgit2 read `.gitconfig` below HOMEDRIVE followed by
+/// HOMEPATH, and Git for Windows resolves a HOME without a drive, `\Users\x`, on the current
+/// drive (measured with Git for Windows 2.54 and libgit2 1.9.7 on Windows 11 build 26200). Both
+/// homes are refused as writable paths like the profile; a writable folder next to the
+/// configuration stays allowed.
+#[test]
+fn refuses_a_writable_path_over_the_git_configuration_of_other_homes() {
+    let fixture = Fixture::new("other-homes");
+    for dir in ["drive-path/work", "rooted"] {
+        fs::create_dir_all(fixture.path(dir)).unwrap();
+    }
+    for file in ["drive-path/.gitconfig", "rooted/.gitconfig"] {
+        fs::write(fixture.path(file), "").unwrap();
+    }
+    let without_drive = |relative: &str| {
+        let path = fixture.arg(relative);
+        let path = path.trim_start_matches(r"\\?\");
+        assert_eq!(&path[1..3], ":\\", "{path}");
+        (path[..2].to_string(), path[2..].to_string())
+    };
+    let (drive, drive_path) = without_drive("drive-path");
+    let (_, rooted) = without_drive("rooted");
+    let check = |writable: &str, env: &[(&str, &str)]| {
+        let mut command = Command::new(sandy_path());
+        command
+            .args([
+                "check",
+                "--appcontainer",
+                &appcontainer_name(),
+                "--read-write",
+                &fixture.arg(writable),
+            ])
+            // A home without a drive counts on sandy's working drive and the system drive. Run
+            // sandy with its working directory on the fixture's drive, so the test does not
+            // depend on which drive the temporary directory lies on.
+            .current_dir(format!("{drive}\\"))
+            .env("PATH", "C:\\Windows\\system32")
+            .env_remove("HOME")
+            .env_remove("HOMEDRIVE")
+            .env_remove("HOMEPATH")
+            .envs(env.iter().copied());
+        command.output().unwrap()
+    };
+    let drive_env = [
+        ("HOMEDRIVE", drive.as_str()),
+        ("HOMEPATH", drive_path.as_str()),
+    ];
+    let allowed = check("drive-path/work", &drive_env);
+    assert_eq!(allowed.status.code(), Some(0), "{allowed:?}");
+    for (writable, env) in [
+        ("drive-path/.gitconfig", &drive_env[..]),
+        ("drive-path", &drive_env[..]),
+        // HOME without a drive, and HOMEPATH without HOMEDRIVE, both resolve on the working
+        // drive, so each refuses the configuration below the rooted home.
+        ("rooted/.gitconfig", &[("HOME", rooted.as_str())][..]),
+        ("rooted/.gitconfig", &[("HOMEPATH", rooted.as_str())][..]),
+    ] {
+        let refused = check(writable, env);
+        let report = String::from_utf8_lossy(&refused.stdout);
+        assert_eq!(
+            refused.status.code(),
+            Some(EXIT_CONFLICT),
+            "{writable}: {report}"
+        );
+        assert!(report.contains("runs outside the sandbox"), "{report}");
+    }
+}
+
+/// libgit2, which cargo and other tools use for git, reads `%PROGRAMDATA%\Git\config` as a
+/// level below the system configuration, from the folder PROGRAMDATA names (measured with
+/// libgit2 1.9.7 on Windows 11 build 26200). `C:\ProgramData` lets every user create a folder, so that folder is
+/// refused as a writable path like the git configuration below the profile. PROGRAMDATA leads to
+/// the fixture; a writable folder next to `Git` stays allowed.
+#[test]
+fn refuses_a_writable_path_over_the_program_data_git_configuration() {
+    let fixture = Fixture::new("program-data-git");
+    for dir in ["data/Git", "data/other"] {
+        fs::create_dir_all(fixture.path(dir)).unwrap();
+    }
+    let check = |writable: &str| {
+        Command::new(sandy_path())
+            .args([
+                "check",
+                "--appcontainer",
+                &appcontainer_name(),
+                "--read-write",
+                &fixture.arg(writable),
+            ])
+            .env("PATH", "C:\\Windows\\system32")
+            .env("PROGRAMDATA", fixture.path("data"))
+            .output()
+            .unwrap()
+    };
+    let allowed = check("data/other");
+    assert_eq!(allowed.status.code(), Some(0), "{allowed:?}");
+    for writable in ["data/Git", "data"] {
+        let refused = check(writable);
+        let report = String::from_utf8_lossy(&refused.stdout);
+        assert_eq!(
+            refused.status.code(),
+            Some(EXIT_CONFLICT),
+            "{writable}: {report}"
+        );
+        assert!(report.contains("runs outside the sandbox"), "{report}");
+    }
+}
+
 /// Windows always gives the AppContainer write access to its profile folder, so a program that
 /// may also execute files there could write a program and run it (measured on Windows 11 build
 /// 26200 before sandy refused it: `copy-self` and then `exec` of the copy both succeeded).

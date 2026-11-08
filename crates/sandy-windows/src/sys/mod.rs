@@ -30,8 +30,8 @@ use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 use windows_sys::Win32::UI::Shell::{
     FOLDERID_CommonStartup, FOLDERID_Documents, FOLDERID_LocalAppData, FOLDERID_Profile,
-    FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_RoamingAppData, FOLDERID_Startup,
-    KF_FLAG_DONT_VERIFY,
+    FOLDERID_ProgramData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_RoamingAppData,
+    FOLDERID_Startup, KF_FLAG_DONT_VERIFY,
 };
 
 use crate::cmdline::{command_line, refused_program, without_verbatim_prefix};
@@ -759,11 +759,12 @@ fn check_relay_rights(
 /// Locations of this user that programs outside the sandbox read or execute later: the folders
 /// Windows runs programs from at logon, the PowerShell profile folders, the app execution
 /// aliases, the configuration of git, SSH, GnuPG and cargo (shared with the Unix backends,
-/// `sandy_core::trust::tool_configs`), Gpg4win's GnuPG folder and sandy's own state. A writable path that reaches one of
-/// them lets the program leave a file there that runs outside the sandbox at the next logon or
-/// the next build, and a file the program creates keeps the user's own rights on it, including
-/// the right to execute it (see "Trusted user locations" in docs/windows.md). Such a path is
-/// refused; the directories on sandy's PATH only warn (`path_locations`).
+/// `sandy_core::trust::tool_configs`), libgit2's `%PROGRAMDATA%\Git`, Gpg4win's GnuPG folder
+/// and sandy's own state. A writable path that reaches one of them lets the program leave a file
+/// there that runs outside the sandbox at the next logon or the next build, and a file the
+/// program creates keeps the user's own rights on it, including the right to execute it (see
+/// "Trusted user locations" in docs/windows.md). Such a path is refused; the directories on
+/// sandy's PATH only warn (`path_locations`).
 ///
 /// The list is a heuristic and can never be complete: no list knows which files the programs of
 /// this user trust. The user profile is protected only against a writable path that contains it,
@@ -802,10 +803,24 @@ fn trusted_locations() -> Result<Vec<ProtectedPath>, SandboxError> {
         )?
         .join("gnupg"),
     ));
+    // libgit2 reads `Git\config` below the folder that PROGRAMDATA names, as a level below the
+    // system configuration (measured with libgit2 1.9.7); every user may create folders in
+    // `C:\ProgramData`. Git for Windows 2.54 no longer reads it.
+    let program_data = folder(&FOLDERID_ProgramData, "cannot find the program data folder")?;
+    locations.extend(
+        known_and_named(program_data, std::env::var_os("PROGRAMDATA"))
+            .into_iter()
+            .map(|folder| ProtectedPath::tree(folder.join("Git"))),
+    );
     let profiles = user_profiles()?;
+    let named_homes: Vec<OsString> = [std::env::var_os("HOME"), home_drive_path()]
+        .into_iter()
+        .flatten()
+        .collect();
     locations.extend(sandy_core::trust::tool_configs(&tool_homes(
         &profiles,
-        std::env::var_os("HOME"),
+        &named_homes,
+        &drives()?,
     )));
     // After the folders in it, so that a writable profile is reported with the folder that makes
     // it dangerous.
@@ -814,17 +829,59 @@ fn trusted_locations() -> Result<Vec<ProtectedPath>, SandboxError> {
 }
 
 /// The home directories the tools of `sandy_core::trust::tool_configs` read their configuration
-/// below: the profile folders and HOME, when it is absolute. Git for Windows reads `.gitconfig`
-/// and `.config\git` below HOME when it is set (measured on Windows 11 with Git for Windows
-/// 2.54); a tool that does not only makes the list longer.
-fn tool_homes(profiles: &[std::path::PathBuf], home: Option<OsString>) -> Vec<std::path::PathBuf> {
-    let named = home
-        .map(std::path::PathBuf::from)
-        .filter(|path| path.is_absolute());
-    let mut homes: Vec<std::path::PathBuf> = profiles.iter().cloned().chain(named).collect();
+/// below: the profile folders and the `named` homes, HOME and the one of `home_drive_path`. Git
+/// for Windows reads `.gitconfig` and `.config\git` below HOME when it is set, and without HOME
+/// below HOMEDRIVE followed by HOMEPATH (measured on Windows 11 with Git for Windows 2.54); a
+/// tool that does not only makes the list longer. A home without a drive, `\Users\x`, which
+/// git resolves on its current drive, counts on each of `drives`. A relative home, which git
+/// resolves against its working directory, names no one place and is left out.
+fn tool_homes(
+    profiles: &[std::path::PathBuf],
+    named: &[OsString],
+    drives: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let mut homes = profiles.to_vec();
+    for home in named.iter().map(std::path::Path::new) {
+        if home.is_absolute() {
+            homes.push(home.to_path_buf());
+        } else if home.has_root() {
+            homes.extend(drives.iter().map(|drive| drive.join(home)));
+        }
+    }
     homes.sort();
     homes.dedup();
     homes
+}
+
+/// Where Git for Windows and libgit2 look for the home without HOME: HOMEDRIVE followed by
+/// HOMEPATH, and HOMEPATH alone without HOMEDRIVE.
+fn home_drive_path() -> Option<OsString> {
+    let mut home = std::env::var_os("HOMEDRIVE").unwrap_or_default();
+    home.push(std::env::var_os("HOMEPATH")?);
+    Some(home)
+}
+
+/// The drives a path without one may mean to a program outside the sandbox: the drive of
+/// sandy's working directory and the system drive. A program started on another drive is not
+/// covered.
+fn drives() -> Result<Vec<std::path::PathBuf>, SandboxError> {
+    let windows = std::path::PathBuf::from(OsString::from_wide(&windows_directory()?));
+    let current = std::env::current_dir().ok();
+    let mut drives: Vec<std::path::PathBuf> = [Some(windows), current]
+        .into_iter()
+        .flatten()
+        .filter_map(|path| {
+            let std::path::Component::Prefix(prefix) = path.components().next()? else {
+                return None;
+            };
+            let mut drive = std::path::PathBuf::from(prefix.as_os_str());
+            drive.push(std::path::Component::RootDir);
+            Some(drive)
+        })
+        .collect();
+    drives.sort();
+    drives.dedup();
+    Ok(drives)
 }
 
 /// The directories on sandy's PATH, which only warn. A program the sandboxed one leaves in one
@@ -893,13 +950,18 @@ fn user_profiles() -> Result<Vec<std::path::PathBuf>, SandboxError> {
         &FOLDERID_Profile,
         "cannot find the user profile folder",
     )?));
-    let named = std::env::var_os("USERPROFILE")
+    Ok(known_and_named(known, std::env::var_os("USERPROFILE")))
+}
+
+/// A known folder and the folder its variable names, when that is absolute, each once.
+fn known_and_named(known: std::path::PathBuf, named: Option<OsString>) -> Vec<std::path::PathBuf> {
+    let named = named
         .map(std::path::PathBuf::from)
         .filter(|path| path.is_absolute());
-    let mut profiles: Vec<std::path::PathBuf> = std::iter::once(known).chain(named).collect();
-    profiles.sort();
-    profiles.dedup();
-    Ok(profiles)
+    let mut folders: Vec<std::path::PathBuf> = std::iter::once(known).chain(named).collect();
+    folders.sort();
+    folders.dedup();
+    folders
 }
 
 /// The locations of this host that a writable path must not reach (rules 3 and 6), and how to
@@ -1102,8 +1164,11 @@ mod tests {
 
     use sandy_core::ProtectedPath;
 
+    use std::ffi::OsString;
+
     use super::{
-        FOLDERID_RoamingAppData, known_folder, tool_homes, trusted_locations, user_profiles,
+        FOLDERID_ProgramData, FOLDERID_RoamingAppData, drives, known_folder, tool_homes,
+        trusted_locations, user_profiles, windows_directory,
     };
     use crate::{access, probe};
     use windows_sys::Win32::Foundation as f;
@@ -1131,9 +1196,13 @@ mod tests {
     fn trusted_locations_cover_git_and_gnupg() {
         let locations = trusted_locations().unwrap();
         let profile = user_profiles().unwrap().remove(0);
-        let roaming = PathBuf::from(std::ffi::OsString::from_wide(
-            &known_folder(&FOLDERID_RoamingAppData, "no roaming folder").unwrap(),
-        ));
+        let known = |id, error| {
+            PathBuf::from(std::ffi::OsString::from_wide(
+                &known_folder(id, error).unwrap(),
+            ))
+        };
+        let roaming = known(&FOLDERID_RoamingAppData, "no roaming folder");
+        let program_data = known(&FOLDERID_ProgramData, "no program data folder");
         for expected in [
             ProtectedPath::entry(profile.join(".gitconfig")),
             ProtectedPath::tree(profile.join(".config").join("git")),
@@ -1141,6 +1210,7 @@ mod tests {
             ProtectedPath::tree(profile.join(".ssh")),
             ProtectedPath::entry(profile.join(".cargo").join("config.toml")),
             ProtectedPath::tree(roaming.join("gnupg")),
+            ProtectedPath::tree(program_data.join("Git")),
         ] {
             assert!(locations.contains(&expected), "{expected:?}: {locations:?}");
         }
@@ -1154,25 +1224,47 @@ mod tests {
         );
     }
 
-    /// HOME adds a home directory for the tools only when it is absolute, and each once.
+    /// A named home adds a home directory for the tools when it is absolute, on each drive when
+    /// it has a root but no drive, never when it is relative, and each once.
     #[test]
-    fn tool_homes_add_an_absolute_home() {
+    fn tool_homes_add_the_named_homes() {
         let profile = PathBuf::from(r"C:\Users\someone");
         let moved = PathBuf::from(r"D:\home");
         let profiles = std::slice::from_ref(&profile);
-        assert_eq!(tool_homes(profiles, None), vec![profile.clone()]);
+        let drives = [PathBuf::from(r"C:\"), PathBuf::from(r"E:\")];
+        let homes = |named: &[&str]| {
+            let named: Vec<OsString> = named.iter().map(OsString::from).collect();
+            tool_homes(profiles, &named, &drives)
+        };
+        assert_eq!(homes(&[]), vec![profile.clone()]);
+        assert_eq!(homes(&["relative", r"C:relative"]), vec![profile.clone()]);
+        assert_eq!(homes(&[r"C:\Users\someone"]), vec![profile.clone()]);
         assert_eq!(
-            tool_homes(profiles, Some("relative".into())),
-            vec![profile.clone()]
+            homes(&[r"D:\home", r"D:\home"]),
+            vec![profile.clone(), moved.clone()]
         );
         assert_eq!(
-            tool_homes(profiles, Some(profile.clone().into())),
-            vec![profile.clone()]
+            homes(&[r"\Users\someone", r"D:\home"]),
+            vec![profile.clone(), moved, PathBuf::from(r"E:\Users\someone")]
         );
         assert_eq!(
-            tool_homes(profiles, Some(moved.clone().into())),
-            vec![profile, moved]
+            homes(&[r"\\server\share\home"]),
+            vec![PathBuf::from(r"\\server\share\home"), profile]
         );
+    }
+
+    /// The drives are drive roots, the system drive among them.
+    #[test]
+    fn drives_hold_the_system_drive() {
+        let drives = drives().unwrap();
+        let windows = PathBuf::from(std::ffi::OsString::from_wide(&windows_directory().unwrap()));
+        assert!(
+            drives.iter().any(|drive| windows.starts_with(drive)),
+            "{drives:?}"
+        );
+        for drive in &drives {
+            assert_eq!(drive.parent(), None, "{drive:?}");
+        }
     }
 
     #[test]
