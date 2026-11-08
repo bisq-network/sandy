@@ -290,8 +290,12 @@ still read the bytes of a file; this backend, like the others, does not prevent 
 program maps into its own memory.
 
 The AppContainer access check grants no implicit owner rights in its second pass [Forshaw
-access check]. The program therefore cannot change the DACL of files it creates, although the
-user's SID owns them. The escape test `read_write_paths_are_not_executable` checks this.
+access check]. The program therefore cannot change the DACL of a file once it exists, although
+the user's SID owns it (`read_write_paths_are_not_executable`). It can give a file a DACL when it
+creates it (`CreateFileW` with a security descriptor), also one that lets it execute the file.
+Such a file runs inside the sandbox with the program's own rights, as code the program maps into
+its memory does, so rule 3, which keeps a process outside from running what the program left
+behind, does not cover it (DESIGN.md, rule 3).
 
 AppContainer processes run at low integrity, and files without a label count as medium. sandy
 sets no integrity label. Microsoft: "if a resource has a mandatory label of Medium IL or lower

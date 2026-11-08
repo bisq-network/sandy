@@ -126,7 +126,11 @@ Rules:
    policy. The program could otherwise drop an executable that a process outside the sandbox
    later runs. The rule holds per file, not per name: a file that has a second name inside a
    writable path is writable, so an executable path, or the program file, that leads to the same
-   file is refused as well (see "Links and file identity").
+   file is refused as well (see "Links and file identity"). The rule is about the grants of the
+   policy: sandy gives no writable path the right to start or load a file. Code the program runs
+   inside the sandbox from a file it wrote, mapped as code (Linux without the view; see "File
+   system view") or made executable by permissions it set when it created the file (Windows),
+   keeps the program's own rights, so the rule does not cover it.
 4. No policy path may lie inside a writable path, and none may be resolved through an entry
    inside one, such as a symbolic link in a writable directory that points elsewhere. sandy
    resolves symbolic links at every start, so the program could replace such an entry with a
@@ -295,7 +299,9 @@ Rules:
    no rule can keep a link to a file outside the policy out, and `check` warns that processes
    outside follow such links (`symlinks-followed-outside`). Rule 4 still holds: a policy path
    reached through a link in a writable path is refused. Windows refuses an AppContainer every
-   symbolic link, so there the setting changes nothing.
+   symbolic link, so there the setting changes nothing; the program can still make a junction, which
+   Windows counts as a link, that leads to a directory within its writable paths, under either
+   value, and none that leads out of them (docs/windows.md, "Links and file identity").
 
 ## Links and file identity
 

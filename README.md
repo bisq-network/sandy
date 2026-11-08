@@ -565,7 +565,7 @@ it does nothing.
 | `--read-write PATH` | Allow reading, creating, changing and deleting below `PATH`. Never executing. | |
 | `--system minimal\|none` | Add the minimal set of system paths programs need to start. | `minimal` |
 | `--view all\|policy` | `policy` makes every path outside the policy look missing. See [The file system view](#the-file-system-view). | `all` |
-| `--symlinks deny\|allow` | Whether the program may create symbolic links in its `read_write` paths. No effect on Windows. See [Symbolic links](#symbolic-links). | `deny` |
+| `--symlinks deny\|allow` | Whether the program may create symbolic links in its `read_write` paths. No effect on Windows, where it can make only junctions that stay within them. See [Symbolic links](#symbolic-links). | `deny` |
 | `--ip all\|client\|private\|none` | IPv4 and IPv6 networking, including loopback. `client` connects out but cannot listen or accept. `private` keeps the program on a loopback of its own. | `none` |
 | `--unix-sockets all\|none` | Unix domain sockets. Read the warning below before using `all`. | `none` |
 | `--signals any\|isolated` | Whether the program may signal processes outside its sandbox. | `any` |
@@ -1082,7 +1082,9 @@ check its target when it is created, so whatever runs outside the sandbox and op
 writable path follows the links there with its own rights; `sandy check` warns about it. Grant it
 only when no process outside the sandbox relies on the content of the writable paths, and never
 for a path that one of your own programs reads as configuration or runs from. Windows refuses
-an AppContainer every symbolic link, so there the setting changes nothing.
+an AppContainer every symbolic link, so there the setting changes nothing; the program can still
+make a junction to a directory within its writable paths, as before, but none that leads out
+of them.
 
 ### Linux metadata
 
