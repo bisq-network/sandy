@@ -44,8 +44,10 @@ const WARNING_PREFIX: &str = "warning: ";
 
 fn main() -> ExitCode {
     // First, so that the window in which sandy's parent can end unseen stays as short as possible
-    // (`process.end_with_parent`).
-    let parent_at_start = parent_process_id();
+    // (`process.end_with_parent`). Windows keeps the parent's process ID recorded, so it can be
+    // read later, and only for the commands that use it: it takes a process snapshot.
+    #[cfg(unix)]
+    let parent_at_start = Some(parent_process_id());
     let started_as = take_started_as();
     let handed_parent = take_handed_parent();
     let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -73,10 +75,12 @@ fn main() -> ExitCode {
         } => relay(exposed, sockets, forwarded, egress),
         Command::Broker { listener, reach } => broker(listener, reach),
         Command::Sandbox(invocation) => {
+            #[cfg(windows)]
+            let parent_at_start =
+                matches!(invocation.mode, Mode::Run | Mode::Check).then(parent_process_id);
+            let known_parent = parent_id(parent_at_start.as_ref());
             let handed_over = match invocation.mode {
-                Mode::Run | Mode::Check => {
-                    hand_over(&started_as, handed_parent.or(parent_at_start))
-                }
+                Mode::Run | Mode::Check => hand_over(&started_as, handed_parent.or(known_parent)),
                 _ => Ok(()),
             };
             let context = Context {
@@ -99,7 +103,9 @@ fn main() -> ExitCode {
 
 /// What `main` learns before the invocation runs.
 struct Context {
-    parent_at_start: Option<u32>,
+    /// sandy's parent as `parent_process_id` read it at the start, or `None` when it was not
+    /// read: on Windows only `run` and `check` read it.
+    parent_at_start: Option<Result<u32, String>>,
     /// The value of `PARENT_AT_START_VARIABLE`.
     handed_parent: Option<u32>,
     /// The names of `STARTED_AS_VARIABLE`.
@@ -437,27 +443,33 @@ fn broker(_listener: u64, _reach: sandy_core::EgressReach) -> ExitCode {
     ExitCode::from(EXIT_FAILURE)
 }
 
-/// The process ID of sandy's parent. Windows does not re-parent processes, so the backend finds
-/// the parent there.
+/// The process ID of sandy's parent, so that `check` compares `--parent-pid` with it as `run`
+/// does. Windows records it once and does not re-parent processes.
 #[cfg(unix)]
-fn parent_process_id() -> Option<u32> {
+fn parent_process_id() -> Result<u32, String> {
     // SAFETY: getppid has no preconditions.
-    Some(unsafe { libc::getppid() } as u32)
+    Ok(unsafe { libc::getppid() } as u32)
 }
 
-#[cfg(not(unix))]
-fn parent_process_id() -> Option<u32> {
-    None
+#[cfg(windows)]
+fn parent_process_id() -> Result<u32, String> {
+    sandy_windows::recorded_parent().map_err(|error| error.to_string())
+}
+
+/// The ID of a parent that sandy read, `None` when it was not read or could not be.
+fn parent_id(at_start: Option<&Result<u32, String>>) -> Option<u32> {
+    at_start?.as_ref().ok().copied()
 }
 
 /// The parent for `end_with_parent`: the one the caller named with `--parent-pid`, which must be
 /// the parent sandy saw at its start, or else that parent. With `--parent-start` the caller
 /// proves which process it means, so the named one need not be sandy's own parent; the backend
-/// checks the token against the process.
+/// checks the token against the process. A parent that sandy could not read refuses
+/// `end_with_parent`, as `run` on Windows does; `None` means it was not read, for `setup`.
 fn parent_for(
     named: Option<u32>,
     start: Option<u64>,
-    at_start: Option<u32>,
+    at_start: Option<&Result<u32, String>>,
     end_with_parent: bool,
 ) -> Result<Option<ParentProcess>, String> {
     match (named, start) {
@@ -469,6 +481,15 @@ fn parent_for(
         }
         _ => {}
     }
+    let at_start = match at_start {
+        Some(Err(error)) if end_with_parent => {
+            return Err(format!(
+                "cannot tell which process started sandy, which end_with_parent needs: {error}"
+            ));
+        }
+        Some(Ok(id)) => Some(*id),
+        _ => None,
+    };
     match (named, at_start) {
         (Some(named), Some(actual)) if start.is_none() && named != actual => Err(format!(
             "the process that started sandy is {actual}, not {named} (--parent-pid); \
@@ -514,10 +535,10 @@ fn sandbox(
     let mut levels = ResolvedPolicy::resolve_levels(&policy, invocation.program.as_deref())
         .map_err(|error| error.to_string())?;
     // The paths, the program and the environment are the same in every level, so the checks
-    // of the invocation hold for all of them. The parent is checked for any level that ends
-    // with it, also when another level is chosen or pinned with --level: checked in every mode,
-    // so that check reports what run would refuse, and run --level takes the options that check
-    // took. A level that does not end with its parent ignores it.
+    // of the invocation hold for all of them. The parent options are checked for any level that
+    // ends with its parent, also when another level is chosen or pinned with --level: checked in
+    // every mode, so that check reports what run would refuse, and run --level takes the options
+    // that check took. A level that does not end with its parent ignores them.
     let ends_with_parent = levels.iter().any(|level| level.policy.end_with_parent);
     if let Some(name) = &invocation.level {
         let index = levels
@@ -534,7 +555,7 @@ fn sandbox(
     }
     if let Some(reason) = parent_ended_during_hand_over(
         context.handed_parent,
-        context.parent_at_start,
+        parent_id(context.parent_at_start.as_ref()),
         ends_with_parent,
     ) {
         return Err(reason);
@@ -542,7 +563,7 @@ fn sandbox(
     let parent = parent_for(
         invocation.parent_pid,
         invocation.parent_start,
-        context.parent_at_start,
+        context.parent_at_start.as_ref(),
         ends_with_parent,
     )?;
     let policy_file = match &invocation.policy {
@@ -573,6 +594,14 @@ fn sandbox(
         EnforcementPlan::new(&policy.requirements(), backend.plan(policy))
     });
     if invocation.mode == Mode::Check {
+        // Windows keeps the ID of a parent that has ended; run opens the parent of the level it
+        // takes and refuses one that no longer runs, and check does the same.
+        #[cfg(windows)]
+        if let Outcome::Selected(index) = selection.outcome
+            && levels[index].policy.end_with_parent
+        {
+            sandy_windows::check_parent(parent).map_err(|error| error.to_string())?;
+        }
         return check(
             &invocation,
             backend.as_ref(),
@@ -1100,28 +1129,44 @@ mod tests {
 
     #[test]
     fn the_named_parent_must_be_the_parent_at_start() {
-        assert_eq!(parent_for(None, None, Some(7), true), parent(7, None));
-        assert_eq!(parent_for(None, None, None, true), Ok(None));
-        assert_eq!(parent_for(Some(7), None, Some(7), true), parent(7, None));
-        // Windows reads no parent at start; the backend checks the named one.
-        assert_eq!(parent_for(Some(7), None, None, true), parent(7, None));
-        let error = parent_for(Some(7), None, Some(1), true).unwrap_err();
+        assert_eq!(parent_for(None, None, Some(&Ok(7)), true), parent(7, None));
+        assert_eq!(
+            parent_for(Some(7), None, Some(&Ok(7)), true),
+            parent(7, None)
+        );
+        let error = parent_for(Some(7), None, Some(&Ok(1)), true).unwrap_err();
         assert!(error.contains("is 1, not 7"), "{error}");
-        assert!(parent_for(Some(7), None, Some(7), false).is_err());
+        assert!(parent_for(Some(7), None, Some(&Ok(7)), false).is_err());
+        // Not read, for setup, which watches no parent.
+        assert_eq!(parent_for(None, None, None, true), Ok(None));
+        assert_eq!(parent_for(Some(7), None, None, true), parent(7, None));
+    }
+
+    /// A parent that sandy could not read (the process snapshot on Windows) refuses every
+    /// end_with_parent, named or not, as run does; without it, it decides nothing.
+    #[test]
+    fn a_parent_that_cannot_be_read_refuses_end_with_parent() {
+        let failed = Err("cannot list the processes".to_string());
+        for (named, start) in [(None, None), (Some(7), None), (Some(7), Some(99))] {
+            let error = parent_for(named, start, Some(&failed), true).unwrap_err();
+            assert!(error.contains("cannot list the processes"), "{error}");
+        }
+        assert_eq!(parent_for(None, None, Some(&failed), false), Ok(None));
+        assert!(parent_for(Some(7), None, Some(&failed), false).is_err());
     }
 
     #[test]
     fn a_start_token_allows_a_parent_that_is_not_sandys_own() {
         assert_eq!(
-            parent_for(Some(7), Some(99), Some(1), true),
+            parent_for(Some(7), Some(99), Some(&Ok(1)), true),
             parent(7, Some(99))
         );
-        let error = parent_for(None, Some(99), Some(1), true).unwrap_err();
+        let error = parent_for(None, Some(99), Some(&Ok(1)), true).unwrap_err();
         assert!(
             error.contains("--parent-start needs --parent-pid"),
             "{error}"
         );
-        assert!(parent_for(Some(7), Some(99), Some(7), false).is_err());
+        assert!(parent_for(Some(7), Some(99), Some(&Ok(7)), false).is_err());
     }
 
     /// After a hand-over the copy refuses `end_with_parent` when its parent is not the one the

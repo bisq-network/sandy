@@ -1292,7 +1292,18 @@ prefix.
   times). This is an ordering test on the wall clock, so a system clock set back between the
   start of the parent and the start of sandy makes sandy refuse a running parent, and an early
   death of the parent, a clock set back and a reused process ID together could let an unrelated
-  process pass. With `--parent-pid`, the recorded parent must also be the named process.
+  process pass. With `--parent-pid`, the recorded parent must also be the named process;
+  `sandy run` and `sandy check` read the recorded parent once their arguments are parsed
+  (Windows keeps it, so this need not be sandy's first step as `getppid` is on Linux and macOS,
+  and other commands take no snapshot). When the level that `sandy check` takes, or the one
+  `--level` names, ends with its parent, check opens the parent as `run` does and makes the same
+  tests, so it refuses with status 125 a named process that is not the recorded parent and a
+  parent that has ended, whose process ID Windows still records
+  (`check_refuses_a_parent_that_has_ended`). A fallback level that ends with its parent does not
+  make check test the parent for a level that does not, as it does not make `run` open it
+  (`check_tests_the_parent_of_the_level_it_takes_only`). On Linux and macOS, `check` refuses a
+  parent that has ended only with `--parent-pid`, because `getppid` then returns another process
+  than the named one. When the snapshot fails, both refuse `end_with_parent`.
   `--parent-start` adds the caller's own creation time (`GetProcessTimes`, read after
   `OpenProcess`), and sandy then requires that exact value instead of the ordering test: no
   clock change alters a recorded creation time, and a process that got the ID later has another

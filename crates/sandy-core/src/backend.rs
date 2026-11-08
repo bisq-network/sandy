@@ -36,8 +36,8 @@ pub struct TargetCommand {
 /// For `process.end_with_parent`: the process sandy watches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParentProcess {
-    /// The process ID. On Unix sandy reads it as its first step, or the caller names it with
-    /// `--parent-pid` and sandy checks it then; on Windows only the caller names it.
+    /// The process ID. sandy reads it as its first step, or the caller names it with
+    /// `--parent-pid` and sandy checks it then.
     pub id: u32,
     /// `--parent-start`: the start of the process with that ID, which only the caller itself
     /// can know, so a process that got the ID after the caller ended is told apart from the

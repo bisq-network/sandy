@@ -41,6 +41,7 @@ use crate::version::WindowsVersion;
 use util::{Sid, wide, wide_nul};
 
 pub use host_network::WindowsHost;
+pub use parent::{check_parent, recorded_parent};
 
 /// Why a run fails when its relay ends while the program runs, as on Linux and macOS.
 const RELAY_ENDED_FIRST: &str = "the relay of the exposed or forwarded ports ended before the \
