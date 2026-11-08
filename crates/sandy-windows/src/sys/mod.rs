@@ -430,10 +430,11 @@ impl Backend for WindowsBackend {
         Ok(SetupOutcome::Done(done))
     }
 
-    /// Takes back what `setup` and the runs of this policy left behind: the loopback exemptions
-    /// of its AppContainer and of the egress broker's, the access control entry of every policy path and of sandy's own executable, and the
-    /// AppContainer profile with its folder. Only entries for the capability SIDs sandy derives
-    /// for this AppContainer are removed; other software uses capability SIDs too.
+    /// Takes back what `setup` and the runs of this policy left behind: the loopback exemptions of
+    /// its AppContainer and of the egress broker's, the access control entry of every policy path
+    /// and of sandy's own executable, and the AppContainer profile with its folder. Only entries
+    /// for the capability SIDs sandy derives for this AppContainer are removed; other software uses
+    /// capability SIDs too.
     ///
     /// Entries on objects that have left the policy stay, because nothing says where they are.
     /// Without administrator rights it changes nothing (`elevate::needs_rights`).

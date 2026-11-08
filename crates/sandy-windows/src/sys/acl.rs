@@ -834,9 +834,9 @@ impl OpenJunction {
     }
 }
 
-/// Opens `path` without following a reparse point there, with `access`, and returns it when it
-/// is a junction (a mount point reparse point, which a volume mounted in a folder is as well). `None` when it is something else, is gone, or
-/// the current user may not open it so.
+/// Opens `path` without following a reparse point there, with `access`, and returns it when it is a
+/// junction (a mount point reparse point, which a volume mounted in a folder is as well). `None`
+/// when it is something else, is gone, or the current user may not open it so.
 fn open_junction(
     path: &[u16],
     display: &Path,

@@ -2695,9 +2695,9 @@ fn refuses_a_writable_path_over_the_git_configuration_of_other_homes() {
     }
 }
 
-/// libgit2, which cargo and other tools use for git, reads `%PROGRAMDATA%\Git\config` as a
-/// level below the system configuration, from the folder PROGRAMDATA names (measured with
-/// libgit2 1.9.7 on Windows 11 build 26200). `C:\ProgramData` lets every user create a folder, so that folder is
+/// libgit2, which cargo and other tools use for git, reads `%PROGRAMDATA%\Git\config` as a level
+/// below the system configuration, from the folder PROGRAMDATA names (measured with libgit2 1.9.7
+/// on Windows 11 build 26200). `C:\ProgramData` lets every user create a folder, so that folder is
 /// refused as a writable path like the git configuration below the profile. PROGRAMDATA leads to
 /// the fixture; a writable folder next to `Git` stays allowed.
 #[test]
