@@ -1452,9 +1452,27 @@ before the sandbox is refused on a standard stream and closed on every other des
 | `read_exec` | read file, read directory, execute |
 | `read_write` | read file, read directory, write file, truncate, remove file, remove directory, make directory, make regular file, refer (move between writable directories), device ioctl; make socket only with `unix_sockets = "all"` |
 
+Execute is the right to start a file with `execve`; Landlock checks nothing else as execute.
+Without `filesystem.view = "policy"` a file of a `read` or `read_write` path can therefore be
+mapped as code (`mmap` or `mprotect` with `PROT_EXEC`), and `dlopen` loads a library from there
+(measured on kernel 7.2: Python's `ctypes.CDLL` loaded a copy of `libz.so.1` from a `--read` and
+from a `--read-write` directory; `code_maps_only_from_executable_paths` checks the mapping). macOS
+lets only `read_exec` paths be mapped as code (`file-map-executable`), and Windows loads only a
+file with `FILE_EXECUTE`, which `read` and `read_write` do not grant. So a library in a `read` or
+`read_write` path loads on Linux and fails to load on macOS and Windows; a policy that loads
+libraries from a path makes it `read_exec` on every platform. The view mounts every path that no
+`read_exec` path holds without execute, and there the mapping fails with `EPERM` (see "File system
+view"). Nothing cheaper does this without the view: seccomp sees the descriptor number of an
+`mmap` but not the file behind it, and `mprotect` names no file at all, so a filter could only
+refuse every executable mapping of a file, also of the system libraries and of `read_exec` paths,
+and Landlock has no right for it. The program can still run code it writes into its own memory on
+every platform (docs/windows.md, "What sandy grants"), so this mapping gives it no code it could
+not run otherwise; it changes which policies load a library.
+
 A writable path never gets these rights:
 
-- **Execute.** The policy rule against writable and executable paths.
+- **Execute.** The policy rule against writable and executable paths. Mapping as code is not
+  execute, see above.
 - **Make symbolic link.** A process outside the sandbox that later writes a file in the writable
   directory (for example a configuration file that it writes before every start) would follow a
   planted link to any file of the user.

@@ -569,7 +569,10 @@ Rules:
    the program may do with what it sees.
 2. Execute stays a right of its own. On Linux every path the policy does not make executable, a
    writable path or a `read` path, is mounted without execute, so a file there can be neither
-   executed nor mapped as code; `read_exec` is how a policy grants both.
+   executed nor mapped as code; `read_exec` is how a policy grants both. Without the view,
+   Landlock checks only `execve`, so a file of a `read` or writable path can be mapped as code
+   on Linux, which macOS and Windows refuse: a library there loads on Linux only
+   (docs/linux.md, "Rights per access level").
 3. A platform that cannot hide paths reports the requirement as unavailable, and `run` refuses
    (Windows: docs/windows.md).
 4. What the view changes for programs is in the platform docs: on Linux a rename or a link
