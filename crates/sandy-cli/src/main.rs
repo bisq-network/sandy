@@ -434,6 +434,8 @@ fn broker(listener: u64, reach: sandy_core::EgressReach) -> ExitCode {
             return ExitCode::from(EXIT_FAILURE);
         }
     };
+    // Without the change notifications the broker reads the network for every connection.
+    let host = sandy_windows::WindowsHost::watching().unwrap_or_default();
     if report_ready().is_err() {
         return ExitCode::from(EXIT_FAILURE);
     }
@@ -441,7 +443,7 @@ fn broker(listener: u64, reach: sandy_core::EgressReach) -> ExitCode {
         listener,
         |listener| listener.accept(),
         reach,
-        sandy_windows::WindowsHost,
+        host,
         &stop,
         sandy_relay::DRAIN,
     );

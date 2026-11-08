@@ -430,7 +430,7 @@ port the check allows.
      `getpeername` for the check after the connect, `sendto` and `recvfrom` for the route
      lookups, `recvmsg` for the listener, polling, memory calls, `clone` for threads only,
      `timer_settime` for the watchdog and `FIONBIO`. `socket` is allowed for IPv4 and IPv6 TCP
-     with protocol 0 alone; the netlink socket exists already. Every other call fails with
+     with protocol 0 alone; the netlink sockets exist already. Every other call fails with
      `EPERM`, among them `bind`, `listen`, `sendmsg`, `read` and every call on a file; `clone3`
      fails with `ENOSYS`.
 4. It starts and joins one test thread and reports ready. In step 4 of "Launch order" the process
@@ -438,8 +438,8 @@ port the check allows.
    pair; a port below 1024 works, because the capability that binds one is still there. The
    broker waits for it as the relay waits for its forward listeners: it watches the end of the
    program and of the guard's pipe meanwhile, and keeps its watchdog armed.
-5. It serves the listener with `sandy_relay::broker::serve`, which asks the kernel for every
-   connection whether the destination is this host (`RTM_GETROUTE` for the destination, and
+5. It serves the listener with `sandy_relay::broker::serve`, which asks the kernel whether the
+   destination is this host (`RTM_GETROUTE` for the destination, for every connection, and
    `RTM_GETADDR` for the addresses and subnets of every interface) and which networks the host
    reaches without a router (the subnets, and an `RTM_GETROUTE` dump of every table for the
    unicast routes without a gateway other than the default route, over links that an
@@ -448,7 +448,13 @@ port the check allows.
    connections, such as a VRF's, so it can only add networks to the local network. A route that
    names only a nexthop object, which is all the kernel sends when
    `net.ipv4.nexthop_compat_mode` is 0, does not say whether it has a gateway and is left out,
-   so the network of an on-link route of that form is not the local network. A thread polls
+   so the network of an on-link route of that form is not the local network. The addresses and
+   the networks are kept until a second netlink socket, bound to the groups of links, addresses
+   and IPv4 and IPv6 routes, reports a change or an overflow of its queue (`ENOBUFS`); the next
+   connection then reads them anew
+   (`routes::tests::a_change_of_the_addresses_reaches_the_next_lookup`). Where the kernel does not
+   let the broker open or join that socket, or the socket cannot be read once the broker is
+   confined, it reads them for every connection. A thread polls
    the pidfd and the guard's pipe, keeps the watchdog armed, and asks the serve loop to stop
    when either ends. It asks through a pipe that the loop polls next to its listener, so the
    listener closes at once; the pipe is made before the filter, which allows no new one.

@@ -21,7 +21,13 @@
 //! every table, also one that no rule uses for the broker's connections, so it can name more
 //! networks than the broker reaches directly.
 //!
-//! The socket is opened before the broker confines itself, so the broker needs no rule beyond
+//! The addresses and the networks are read once and kept until the kernel reports a change of
+//! a link, an address or a route on a second socket that listens to those groups: a lookup
+//! drains it first and reads anew after any message, and after an overflow of its queue
+//! (`ENOBUFS`), so a change is seen from the next connection on. The route of a connect is still
+//! looked up for each one, because it depends on the destination and the policy rules.
+//!
+//! The sockets are opened before the broker confines itself, so the broker needs no rule beyond
 //! `sendto` and `recvfrom` for it, as for the relay's peer check (`peer`); Landlock does not
 //! mediate netlink. Every answer is checked: it must come from the kernel, carry the sequence
 //! number of its request and fit its own lengths. A lookup that fails refuses the destination.
@@ -30,7 +36,7 @@ use std::io;
 use std::mem::size_of;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use sandy_core::SandboxError;
@@ -71,6 +77,12 @@ const MULTIPART: u16 = libc::NLM_F_MULTI as u16;
 /// The kernel's routing tables, asked over one socket that the broker's threads share.
 pub(crate) struct Routes {
     socket: Mutex<Socket>,
+    /// Non-blocking, bound to the groups of links, addresses and routes.
+    /// `None` where the kernel would not let sandy watch, which reads everything anew for every
+    /// connection, as before the cache.
+    changes: Option<OwnedFd>,
+    /// The addresses and on-link networks of the last read, until a change drops them.
+    held: Mutex<Option<Arc<Snapshot>>>,
     /// The owner of the broker's sockets, which a rule's `uidrange` matches: the file system
     /// user ID when the socket is made, which follows the effective one.
     uid: libc::uid_t,
@@ -81,6 +93,22 @@ struct Socket {
     sequence: u32,
     buffer: Vec<u8>,
 }
+
+/// What `is_host` and `subnets` read from the kernel apart from the route of a connect.
+struct Snapshot {
+    addresses: Vec<InterfaceAddress>,
+    on_link: Vec<Subnet>,
+}
+
+/// The groups a change of which drops the snapshot (`linux/rtnetlink.h`).
+const CHANGE_GROUPS: libc::c_int = libc::RTMGRP_LINK
+    | libc::RTMGRP_IPV4_IFADDR
+    | libc::RTMGRP_IPV6_IFADDR
+    | libc::RTMGRP_IPV4_ROUTE
+    | libc::RTMGRP_IPV6_ROUTE;
+
+/// The group of nexthop objects (`linux/rtnetlink.h`).
+const RTNLGRP_NEXTHOP: libc::c_int = 32;
 
 /// One address of an interface, from RTM_GETADDR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +168,9 @@ impl Routes {
                 sequence: 0,
                 buffer: vec![0; DATAGRAM],
             }),
+            // Bound before the first read, so no change after it goes unseen.
+            changes: change_socket().ok(),
+            held: Mutex::new(None),
             // SAFETY: geteuid takes nothing and cannot fail.
             uid: unsafe { libc::geteuid() },
         };
@@ -158,13 +189,63 @@ impl Routes {
         }
     }
 
-    /// The netlink socket, which the broker keeps when it closes its other descriptors.
-    pub(crate) fn fd(&mut self) -> RawFd {
+    /// The netlink sockets, which the broker keeps when it closes its other descriptors.
+    pub(crate) fn fds(&mut self) -> Vec<RawFd> {
         let socket = self
             .socket
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner);
-        socket.fd.as_raw_fd()
+        let mut fds = vec![socket.fd.as_raw_fd()];
+        fds.extend(self.changes.as_ref().map(AsRawFd::as_raw_fd));
+        fds
+    }
+
+    /// Stops watching unless the change socket can still be read, which the broker checks once
+    /// it is confined: a socket the confinement closed would count every lookup as a change. It
+    /// also drops what was read before, so the first connection reads under the confinement.
+    pub(crate) fn check_watch(&mut self) {
+        *self.held.get_mut().unwrap_or_else(PoisonError::into_inner) = None;
+        let Some(changes) = &self.changes else {
+            return;
+        };
+        let mut byte = [0u8; 1];
+        // SAFETY: the kernel writes at most one byte; MSG_PEEK leaves a message in place.
+        let read = unsafe {
+            libc::recvfrom(
+                changes.as_raw_fd(),
+                byte.as_mut_ptr().cast(),
+                1,
+                libc::MSG_DONTWAIT | libc::MSG_PEEK,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        let readable = read >= 0
+            || matches!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::EAGAIN | libc::ENOBUFS)
+            );
+        if !readable {
+            self.changes = None;
+        }
+    }
+
+    /// The addresses and on-link networks: the ones read before, unless the kernel reported a
+    /// change since, which drops them.
+    fn snapshot(&self) -> io::Result<Arc<Snapshot>> {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.changes.as_ref().is_none_or(changed) {
+            *held = None;
+        }
+        if let Some(snapshot) = held.as_ref() {
+            return Ok(Arc::clone(snapshot));
+        }
+        let snapshot = Arc::new(Snapshot {
+            addresses: self.addresses()?,
+            on_link: self.on_link_routes()?,
+        });
+        *held = Some(Arc::clone(&snapshot));
+        Ok(snapshot)
     }
 
     /// The type (`RTN_*`) of the route that a TCP connect of the broker to `destination` takes,
@@ -340,8 +421,9 @@ impl Routes {
 impl HostNetwork for Routes {
     fn is_host(&self, destination: SocketAddr) -> io::Result<bool> {
         let ip = destination.ip();
-        let addresses = self.addresses()?;
-        if addresses
+        let snapshot = self.snapshot()?;
+        if snapshot
+            .addresses
             .iter()
             .any(|address| address.own == ip || address.broadcast == Some(ip))
         {
@@ -353,14 +435,98 @@ impl HostNetwork for Routes {
     }
 
     fn subnets(&self) -> io::Result<Vec<Subnet>> {
-        let mut subnets: Vec<Subnet> = self
-            .addresses()?
+        let snapshot = self.snapshot()?;
+        let mut subnets: Vec<Subnet> = snapshot
+            .addresses
             .iter()
             .map(|address| address.subnet)
             .collect();
-        subnets.extend(self.on_link_routes()?);
+        subnets.extend(snapshot.on_link.iter().copied());
         Ok(subnets)
     }
+}
+
+/// A non-blocking netlink socket bound to `CHANGE_GROUPS` and the nexthop group. An error
+/// leaves the broker without a watch, so it reads for every connection.
+fn change_socket() -> io::Result<OwnedFd> {
+    // SAFETY: socket takes no pointers and returns a new descriptor.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            libc::NETLINK_ROUTE,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor was just created and nothing else owns it.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: sockaddr_nl is plain data; zero is a valid value for every field.
+    let mut address: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    address.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    address.nl_groups = CHANGE_GROUPS as u32;
+    // SAFETY: the address is a valid sockaddr_nl of the size passed.
+    let bound = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            (&raw const address).cast(),
+            size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if bound != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Nexthop objects have a group above 31, which `nl_groups` cannot name. Deleting a nexthop
+    // removes the routes that name it with a message on that group alone.
+    let group: libc::c_int = RTNLGRP_NEXTHOP;
+    // SAFETY: the option value is a c_int of the size passed.
+    let joined = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_NETLINK,
+            libc::NETLINK_ADD_MEMBERSHIP,
+            (&raw const group).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if joined != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+/// Whether the kernel reported a change on `changes` since the last call, which reads the
+/// waiting messages, at most `DRAINED` of them. A full queue (`ENOBUFS`), more messages and any
+/// other error count as a change.
+fn changed(changes: &OwnedFd) -> bool {
+    const DRAINED: usize = 1000;
+    let mut buffer = [0u8; 4096];
+    let mut changed = false;
+    for _ in 0..DRAINED {
+        // SAFETY: the kernel writes at most `len` bytes into the buffer.
+        let read = unsafe {
+            libc::recvfrom(
+                changes.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if read >= 0 {
+            changed = true;
+            continue;
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::EAGAIN) => return changed,
+            Some(libc::EINTR) => continue,
+            Some(libc::ENOBUFS) => changed = true,
+            _ => return true,
+        }
+    }
+    true
 }
 
 /// A netlink request: the header, then `payload`.
@@ -1520,5 +1686,57 @@ mod tests {
             assert!(!reaches_this_host(at), "{at}");
             assert_eq!(check(at, Public, &routes), Ok(at), "{at}");
         }
+    }
+
+    /// The addresses and networks are kept between connections and read anew after the kernel
+    /// reports a change: an address added while the broker runs is this host, and its subnet
+    /// the local network, from the next lookup on; once removed, neither is. A route added
+    /// alone, and a change of the link's flags alone, reach the next lookup too.
+    #[test]
+    fn a_change_of_the_addresses_reaches_the_next_lookup() {
+        if std::env::var_os(IN_NAMESPACE).is_some() {
+            return a_change_in_this_namespace();
+        }
+        in_namespace(&[
+            "ip link set lo up",
+            "ip link add name eth9 type dummy",
+            "ip link set eth9 up",
+        ]);
+    }
+
+    fn a_change_in_this_namespace() {
+        use sandy_core::EgressReach::Public;
+        use sandy_core::destination::{Refusal, check};
+        let routes = Routes::open().unwrap();
+        let ip = |command: &str| {
+            let status = std::process::Command::new("sh")
+                .args(["-c", command])
+                .status()
+                .unwrap();
+            assert!(status.success(), "{command}");
+        };
+        let own: SocketAddr = "1.2.3.4:443".parse().unwrap();
+        let neighbour: SocketAddr = "1.2.3.9:443".parse().unwrap();
+        assert_eq!(check(own, Public, &routes), Ok(own));
+        assert_eq!(check(neighbour, Public, &routes), Ok(neighbour));
+        ip("ip addr add 1.2.3.4/24 dev eth9");
+        assert_eq!(check(own, Public, &routes), Err(Refusal::Host));
+        assert_eq!(check(neighbour, Public, &routes), Err(Refusal::HostSubnet));
+        ip("ip addr del 1.2.3.4/24 dev eth9");
+        assert_eq!(check(own, Public, &routes), Ok(own));
+        assert_eq!(check(neighbour, Public, &routes), Ok(neighbour));
+        // A route alone, with no address, and then a change of the link's flags alone. A
+        // dummy link starts without ARP, which counts as a tunnel.
+        let routed: SocketAddr = "5.6.7.8:443".parse().unwrap();
+        ip("ip link set eth9 arp on");
+        assert_eq!(check(routed, Public, &routes), Ok(routed));
+        ip("ip route add 5.6.7.0/24 dev eth9 table 100");
+        assert_eq!(check(routed, Public, &routes), Err(Refusal::HostSubnet));
+        ip("ip link set eth9 arp off");
+        assert_eq!(check(routed, Public, &routes), Ok(routed));
+        ip("ip link set eth9 arp on");
+        assert_eq!(check(routed, Public, &routes), Err(Refusal::HostSubnet));
+        ip("ip route del 5.6.7.0/24 dev eth9 table 100");
+        assert_eq!(check(routed, Public, &routes), Ok(routed));
     }
 }

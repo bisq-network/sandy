@@ -549,7 +549,7 @@ everywhere; a backend adds only its answer about its own addresses (`HostNetwork
    depends on the network. Port 0 is refused.
 3. The host's part: whether an address is the host's own (an interface address, a subnet
    broadcast address, or a local, broadcast, anycast or multicast route), and which networks the
-   host reaches without a router, asked for every connection. Those are the subnet of every
+   host reaches without a router, when a connection comes in. Those are the subnet of every
    interface address, for a point-to-point link that of its peer, and the network of every
    unicast route whose next hop is no gateway, except the default route and routes into a
    point-to-point or tunnel link. A route counts also where no address of the host has its
@@ -568,10 +568,14 @@ everywhere; a backend adds only its answer about its own addresses (`HostNetwork
    tell, the broker refuses with reply 1. Linux asks the kernel's routing tables
    (`RTM_GETROUTE` for a TCP connect to the destination's port, so that policy routing rules
    select the route the connect takes, also as a dump of every table, `RTM_GETADDR` and
-   `RTM_GETLINK`) over a `NETLINK_ROUTE` socket that it opens before the broker confines itself. macOS reads
-   `getifaddrs` and the routing table for every connection, which its broker profile allows
-   through the routing sysctl; it has no local route without an interface address. Windows asks
-   `GetAdaptersAddresses`, `GetBestRoute2` and `GetIpForwardTable2`.
+   `RTM_GETLINK`) over a `NETLINK_ROUTE` socket that it opens before the broker confines itself,
+   and keeps the addresses and networks until a second netlink socket reports a change. macOS
+   reads `getifaddrs` and the routing table, which its broker profile allows through the routing
+   sysctl, and keeps the routes until a routing socket reports a message; it has no local route
+   without an interface address. Windows asks `GetAdaptersAddresses`, `GetBestRoute2` and
+   `GetIpForwardTable2`, and keeps all but the best route until a change notification of an
+   address, an interface or a route. Where the system lets a broker not watch for changes, it
+   reads everything for every connection.
 4. The broker connects to the address it checked, an IPv4-mapped one as IPv4, within 10
    seconds. A refused, unreachable or timed-out connect gets reply 5, 3 or 4, any other failure
    reply 1. It judges only the address: a router that maps a public address back to this host,
@@ -1083,7 +1087,8 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
 - The egress broker is a helper process of its own, forked twice like the relay and watched like
   it, with its own profile: accept on its port, TCP out with every address of the Mac denied
   after that allow, the routing sysctl for `getifaddrs` and the routing table, no files, no Mach
-  services. Its `HostNetwork` answer comes from both at every connection.
+  services. Its `HostNetwork` answer comes from both; the routes are kept until a routing socket
+  opened before the profile reports a message.
 - `filesystem.view = "policy"` is the `ENOENT` rule that every profile has; it is unavailable
   with `unix_sockets = "all"`, which allows the existence check for every path.
 - `ip = "client"`: `network-outbound` and `network-bind` for IP sockets, `network-inbound` for UDP

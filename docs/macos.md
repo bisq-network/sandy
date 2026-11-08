@@ -1001,8 +1001,17 @@ connects only to the destinations that `sandy_core::destination` allows for the 
 5. It serves `sandy_relay::broker::serve` until the program ends, then closes its listener and
    its holder sockets at once and gives the connections a second, like the relay.
 
-The host's part of the check (`HostNetwork`, `macos::interfaces`) reads `getifaddrs` and the
-routing table again for every connection. An address is the Mac's own when an interface has it,
+The host's part of the check (`HostNetwork`, `macos::interfaces`) reads `getifaddrs` for every
+connection: macOS sends no routing message for some address changes (an alias in a subnet that
+already has its route) and sends the one of a removed address before the address leaves the list.
+It keeps the routing table it read until a routing socket (`PF_ROUTE`), opened before the
+broker's profile, reports any message, which a route that changes always sends; an answer to a
+route lookup of another process counts too. Measured on macOS 27.0.1: no message came in 10
+seconds without a change, nor while a process connected to 8 hosts it had not reached before. The
+kernel drops a message only when the socket's queue is full, when one still waits. Without the
+socket the broker reads the table for every connection.
+
+An address is the Mac's own when an interface has it,
 also one that is down, or when it is the broadcast address of an interface's IPv4 subnet. macOS
 delivers nothing else to itself: it has no local route without an address, so 127.0.0.2 gets no
 answer (see the table above). The local network is the subnet of every interface address, for

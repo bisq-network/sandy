@@ -962,6 +962,12 @@ sandy runs the broker as `sandy __broker` in an AppContainer of its own, alongsi
 What the broker connects to is decided by `sandy_core::destination`, the same on every platform,
 with the host's own addresses and subnets answered by `GetAdaptersAddresses` and `GetBestRoute2`;
 a lookup that fails for another reason than a missing route refuses the destination with reply 1.
+The broker keeps the addresses, the point-to-point links and the on-link networks until Windows
+reports a change of an address, an IP interface or a route (`NotifyUnicastIpAddressChange`,
+`NotifyIpInterfaceChange`, `NotifyRouteChange2`, registered from its AppContainer before it
+serves; where a registration fails it reads everything for every connection, as without the
+cache), and asks `GetBestRoute2` for every connection
+(`host_network::tests::a_route_change_drops_what_is_kept`).
 The local network is the on-link prefix of every interface address and every route of
 `GetIpForwardTable2` whose next hop is the unspecified address (on-link), except the default
 route and the routes into a tunnel: an interface whose type is a tunnel or PPP
