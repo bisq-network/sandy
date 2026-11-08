@@ -15,11 +15,12 @@ mod util;
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::AsRawSocket;
+use std::path::Path;
 
 use sandy_core::{
-    Backend, ChildProcesses, Junctions, PathRule, PlanItem, ProtectedPath, Requirement,
-    ResolvedLevel, ResolvedPolicy, SandboxError, SetupOptions, SetupOutcome, StatusReport,
-    TargetCommand, Warning, WarningId, Win32k, path_directories,
+    Backend, ChildProcesses, Junctions, ParentProcess, PathRule, PlanItem, ProtectedPath,
+    Requirement, ResolvedLevel, ResolvedPolicy, SandboxError, SetupOptions, SetupOutcome,
+    StatusReport, TargetCommand, Warning, WarningId, Win32k, path_directories,
 };
 use windows_sys::Win32::Security::{
     WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
@@ -32,7 +33,7 @@ use windows_sys::Win32::UI::Shell::{
     FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_Startup, KF_FLAG_DONT_VERIFY,
 };
 
-use crate::cmdline::{command_line, is_batch_file, without_verbatim_prefix};
+use crate::cmdline::{command_line, refused_program, without_verbatim_prefix};
 use crate::detect::{Detection, Probes};
 use crate::envblock::{LOCAL_APP_DATA, SYSTEM_ROOT, environment_block};
 use crate::name::validate_appcontainer_name;
@@ -41,7 +42,15 @@ use crate::version::WindowsVersion;
 use util::{Sid, wide, wide_nul};
 
 pub use host_network::WindowsHost;
-pub use parent::{check_parent, recorded_parent};
+pub use parent::recorded_parent;
+
+/// Refuses a program that Windows does not start as named (`cmdline::refused_program`).
+fn refuse_program(program: &Path) -> Result<(), SandboxError> {
+    match refused_program(&wide(program.as_os_str())) {
+        Some(reason) => Err(SandboxError::new(reason)),
+        None => Ok(()),
+    }
+}
 
 /// Why a run fails when its relay ends while the program runs, as on Linux and macOS.
 const RELAY_ENDED_FIRST: &str = "the relay of the exposed or forwarded ports ended before the \
@@ -122,6 +131,22 @@ impl Backend for WindowsBackend {
         notes
     }
 
+    /// A batch file program and, with `end_with_parent`, a parent that has ended, which `run`
+    /// refuses before it changes anything.
+    fn refuse(
+        &self,
+        policy: &ResolvedPolicy,
+        parent: Option<ParentProcess>,
+    ) -> Result<(), SandboxError> {
+        if let Some(program) = &policy.program {
+            refuse_program(program)?;
+        }
+        if policy.end_with_parent {
+            parent::open_parent(parent)?;
+        }
+        Ok(())
+    }
+
     fn run(
         &self,
         policy: &ResolvedPolicy,
@@ -145,11 +170,6 @@ impl Backend for WindowsBackend {
         if policy.program.as_deref() != Some(command.program.as_path()) {
             return Err(SandboxError::new(
                 "the policy was resolved for another program",
-            ));
-        }
-        if is_batch_file(&command.program) {
-            return Err(SandboxError::new(
-                "batch files run in cmd.exe with other argument rules; run cmd.exe /c explicitly",
             ));
         }
         // Opened first, so a parent that has already ended stops the run before anything starts.
@@ -995,6 +1015,21 @@ mod tests {
     use windows_sys::Win32::Foundation as f;
     use windows_sys::Win32::Security as ss;
     use windows_sys::Win32::Storage::FileSystem as fs;
+
+    /// `refuse`, which the command line calls for `check` and before `run`, refuses a batch
+    /// file. Nothing of the host is touched before.
+    #[test]
+    fn refuse_names_a_batch_file() {
+        use sandy_core::{Backend, Policy, ResolvedPolicy};
+
+        let mut policy = ResolvedPolicy::resolve(&Policy::default(), None).unwrap();
+        policy.program = Some(std::path::PathBuf::from("C:\\nowhere\\run.cmd"));
+        let error = super::WindowsBackend::new()
+            .refuse(&policy, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("batch files run in cmd.exe"), "{error}");
+    }
 
     #[test]
     fn probe_constants_match_windows_sys() {

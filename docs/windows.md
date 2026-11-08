@@ -1447,9 +1447,16 @@ every platform answers.
     build 26200.
 - **Command line.** sandy quotes each argument so that `CommandLineToArgvW` and the C runtime
   read it back unchanged [Parsing arguments], and refuses command lines longer than 32,767
-  characters [CreateProcessW]. It refuses `.bat` and `.cmd` programs: `CreateProcessW` runs them
-  in `cmd.exe`, which parses arguments with other rules, so arguments could run commands
-  [BatBadBut]. Run `cmd.exe /c` explicitly instead.
+  characters [CreateProcessW]. It refuses `.bat` and `.cmd` programs, in `check` as in `run`,
+  with status 125: `CreateProcessW` runs them in `cmd.exe`, which parses arguments with other
+  rules, so arguments could run commands [BatBadBut]. Run `cmd.exe /c` explicitly instead.
+  The refusal is the backend's `refuse`, which the command line calls for `check` and before
+  `run` (`refuse_names_a_batch_file`).
+  sandy matches as `CreateProcessW` does: the last four characters of the program path in any
+  case, so a file named only `.bat` counts too. Measured on build 26200: a verbatim path that
+  ends in `.bat.` or `.bat ` (Win32 drops such trailing dots and spaces only from ordinary
+  paths) and a stream such as `run.bat:s` load as executables, not in `cmd.exe`, and a canonical
+  path never names the `::$DATA` stream.
 - **Program path.** `std::fs::canonicalize` returns `\\?\C:\...` paths. sandy passes the
   ordinary form to `CreateProcessW` when it names the same file. The first token of the command
   line, the program's `argv[0]`, is the program as the caller wrote it (`TargetCommand::arg0`), as

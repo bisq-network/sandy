@@ -721,7 +721,7 @@ this order:
 
 | Line | When |
 |---|---|
-| `level NAME` | first, for a policy with fallback levels: the level that runs |
+| `level NAME` | first, for a policy with fallback levels: the level that runs; absent when sandy refuses before it chooses one |
 | `pid N` | the program runs; `N` is its process ID |
 | `exited N` | sandy saw the program exit with status `N` |
 | `signaled N` | sandy saw signal `N` end the program (Linux and macOS with `contained`, Linux with `--explain`) |
@@ -1136,7 +1136,10 @@ windows.appcontainer_name = "example.app.host"
   on it.
 
 `sandy check --json` prints one JSON object on one line on standard output, and nothing there
-when it exits with status 125:
+when it exits with status 125. A refusal then has its reason on standard error, as without
+`--json`, whatever it is: an invalid policy, a policy this host cannot enforce as written (a
+writable path over a location other programs read), or on Windows a `.bat` or `.cmd` program.
+The object:
 
 ```json
 {"backend":"linux","selected":"contained","setup_would_help":false,

@@ -164,6 +164,19 @@ pub trait Backend {
         crate::verify::relay_listeners(policy)
     }
 
+    /// What sandy refuses about the program or the parent of the selected level that `plan`
+    /// does not judge, for example a program type the platform does not start as named, or a
+    /// parent that has ended. The command line calls it once it has selected a level, for
+    /// `check` and before `run`, so both refuse the same. Like `verify`, it may read host state
+    /// and must leave the host as it found it.
+    fn refuse(
+        &self,
+        _policy: &ResolvedPolicy,
+        _parent: Option<ParentProcess>,
+    ) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
     fn run(
         &self,
         policy: &ResolvedPolicy,

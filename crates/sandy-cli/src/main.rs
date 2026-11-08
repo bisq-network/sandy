@@ -594,13 +594,10 @@ fn sandbox(
         EnforcementPlan::new(&policy.requirements(), backend.plan(policy))
     });
     if invocation.mode == Mode::Check {
-        // Windows keeps the ID of a parent that has ended; run opens the parent of the level it
-        // takes and refuses one that no longer runs, and check does the same.
-        #[cfg(windows)]
-        if let Outcome::Selected(index) = selection.outcome
-            && levels[index].policy.end_with_parent
-        {
-            sandy_windows::check_parent(parent).map_err(|error| error.to_string())?;
+        if let Outcome::Selected(index) = selection.outcome {
+            backend
+                .refuse(&levels[index].policy, parent)
+                .map_err(|error| error.to_string())?;
         }
         return check(
             &invocation,
@@ -650,6 +647,10 @@ fn sandbox(
         parent,
         explain: invocation.explain,
     };
+    // What `check` refuses for the level it selects, refused here before anything starts.
+    backend
+        .refuse(resolved, parent)
+        .map_err(|error| error.to_string())?;
     let code = backend
         .run(resolved, &command, status)
         // Also after the program started: with children = "contained" on Linux and macOS, sandy

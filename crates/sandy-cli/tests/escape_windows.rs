@@ -1036,17 +1036,35 @@ fn environment_has_system_root_and_nothing_else_unasked() {
     lines[2].assert_blocked();
 }
 
+/// `run` refuses a batch file, and `check` says so too, since the refusal depends only on the
+/// program. Control: the same check of an executable passes.
 #[test]
 fn refuses_batch_files() {
     let fixture = Fixture::new("batch");
     let script = fixture.path("bin/run.cmd");
     fs::write(&script, b"@echo off\r\n").unwrap();
-    let output = sandy(run_program(
-        &args(&["--read-exec", &fixture.arg("bin")]),
-        script.to_str().unwrap(),
-        &[],
-    ));
+    let sandbox_args = args(&["--read-exec", &fixture.arg("bin")]);
+    let output = sandy(run_program(&sandbox_args, script.to_str().unwrap(), &[]));
     assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{output:?}");
+    let checked = |program: &str| {
+        let mut check = run_program(&sandbox_args, program, &[]);
+        check[0] = "check".to_string();
+        sandy(check)
+    };
+    let output = checked(script.to_str().unwrap());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{stderr}");
+    assert!(stderr.contains("batch files run in cmd.exe"), "{stderr}");
+    // CreateProcessW also runs a file named only `.bat` in cmd.exe.
+    let bare = fixture.path("bin/.BAT");
+    fs::write(&bare, b"@echo off\r\n").unwrap();
+    let output = sandy(run_program(&sandbox_args, bare.to_str().unwrap(), &[]));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(EXIT_FAILURE), "{stderr}");
+    assert!(stderr.contains("batch files run in cmd.exe"), "{stderr}");
+    let probe = fixture.copy_probe("bin");
+    let output = checked(&probe);
+    assert!(output.status.success(), "{output:?}");
 }
 
 #[test]
