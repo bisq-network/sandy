@@ -28,8 +28,10 @@ pub struct TargetCommand {
     /// find the parent itself.
     pub parent: Option<ParentProcess>,
     /// `--explain`: report what the sandbox denied while the program runs. It must change
-    /// nothing the sandbox enforces. A backend that has no sound way to report it refuses the
-    /// run, because silence would read as "nothing was denied".
+    /// nothing the sandbox enforces. The paths are reported only where `can_explain` says so;
+    /// every backend passes it to its egress broker, which names the connections it refuses.
+    /// The CLI refuses the option where nothing would be reported, because silence would read
+    /// as "nothing was denied".
     pub explain: bool,
 }
 

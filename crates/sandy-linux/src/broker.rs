@@ -80,10 +80,13 @@ impl BrokerConfig {
 
 /// Starts the broker and returns its process ID once it is confined, and the handover of its
 /// listener, which the process that enters the namespace sends (`launch::enter`). `ended` is the
-/// read end of the guard's pipe with `children = "contained"`.
+/// read end of the guard's pipe with `children = "contained"`. `report` is a copy of sandy's
+/// standard error with `--explain`, where the broker names the connections it refuses; without
+/// it the broker keeps no descriptor of the caller's.
 pub fn start(
     config: &BrokerConfig,
     ended: Option<File>,
+    report: Option<File>,
 ) -> Result<(libc::pid_t, Handover), SandboxError> {
     // A kernel that cannot answer refuses the run here instead of every connection later.
     let routes = Routes::open()?;
@@ -95,6 +98,7 @@ pub fn start(
         inbox,
         program,
         ended,
+        report,
     };
     let pid = helper::start("the egress broker", &Threads::open()?, move |ready| {
         broker_main(broker, ready, config)
@@ -108,6 +112,7 @@ struct Broker {
     inbox: Inbox,
     program: OwnedFd,
     ended: Option<File>,
+    report: Option<File>,
 }
 
 fn broker_main(broker: Broker, ready: Ready, config: &BrokerConfig) {
@@ -116,6 +121,7 @@ fn broker_main(broker: Broker, ready: Ready, config: &BrokerConfig) {
         inbox,
         program,
         ended,
+        report,
     } = broker;
     // Made before the confinement, whose filter allows no new pipe.
     let stop = match Stop::new() {
@@ -128,6 +134,7 @@ fn broker_main(broker: Broker, ready: Ready, config: &BrokerConfig) {
     keep.extend(routes.fds());
     keep.extend(helper::STANDARD_DESCRIPTORS);
     keep.extend(ended.as_ref().map(AsRawFd::as_raw_fd));
+    keep.extend(report.as_ref().map(AsRawFd::as_raw_fd));
     keep.extend(stop.descriptors());
     let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         sandy_relay::broker::raise_descriptor_limit().map_err(|error| {
@@ -189,6 +196,7 @@ fn broker_main(broker: Broker, ready: Ready, config: &BrokerConfig) {
         |listener| listener.accept().map(|(client, _)| client),
         config.reach,
         routes,
+        report.map(sandy_relay::broker::Explain::new),
         &stop,
         sandy_relay::DRAIN,
     );
@@ -372,7 +380,7 @@ mod tests {
                         watchdog: true,
                         abi: ABI::from(version),
                     };
-                    let (pid, handover) = start(&config, None).map_err(|_| 2)?;
+                    let (pid, handover) = start(&config, None, None).map_err(|_| 2)?;
                     match handover.send() {
                         Ok(()) => break (pid, config.listen),
                         Err(error) if address_in_use(&error) && tries < 5 => tries += 1,

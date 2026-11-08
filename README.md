@@ -574,7 +574,7 @@ it does nothing.
 | `--parent-start TOKEN` | With `--parent-pid`: when that process started, so sandy can tell the caller from a process that got its ID later. The caller may then start sandy through a wrapper. See [Processes](#processes). | |
 | `--status-fd N` | Report the program's process ID and how it ended on descriptor `N` (on Windows: an inherited handle). `run` only. See [Exit status](#exit-status). | |
 | `--status-file PATH` | The same record in a file sandy creates at the absolute `PATH`, which must not exist yet and must lie outside every writable path. `run` only. See [The status record](#the-status-record). | |
-| `--explain` | Name the paths of the run that the policy does not grant, on standard error. `run` only, Linux only. See [Finding the grants a program needs](#finding-the-grants-a-program-needs). | off |
+| `--explain` | Name, on standard error, the paths of the run that the policy does not grant (Linux only) and the connections the egress broker refuses or cannot make (every platform, with `network.egress` or `--egress`). `run` only. See [Finding the grants a program needs](#finding-the-grants-a-program-needs). | off |
 | `--explain-path PATH` | Say what the policy allows for `PATH` and which rule decides it. `check` only, Linux only. | |
 | `--children allowed\|none\|contained` | Whether the program may start other processes, and whether they may outlive it. See [Processes](#processes). | `allowed` |
 | `--expose ADDRESS=PORT` | Relay connections on the loopback `ADDRESS` to the program's loopback `PORT`. Needs `--ip all` or `--ip private`. | |
@@ -657,8 +657,9 @@ runs on with less than it was built for: without its country database, without i
 configuration, with built-in defaults instead of yours. Nothing in the output says so, and the
 program's own logs say nothing either.
 
-Two options answer the question "which grant does this program need". Both are Linux only
-today; the platform documents say what the other two hosts can and cannot report.
+Two options answer the question "which grant does this program need". For paths both are Linux
+only today; the platform documents say what the other two hosts can and cannot report. For the
+egress broker `--explain` works on every platform (see below).
 
 `sandy check --explain-path PATH` says what the policy allows for one path and which rule
 decides it, without running anything:
@@ -691,13 +692,35 @@ program's parent while it runs, and a process that outlives sandy loses the watc
 the paths a call uses, not what the kernel answered, and several kinds of denial never reach
 it.
 
+With `--egress`, `--explain` also names every connection the egress broker refuses or cannot
+make, with the SOCKS5 reply the program got and the reason, on Linux, macOS and Windows alike:
+
+```console
+$ sandy run --ip private --egress 9050 --explain -- ./client
+sandy explain: on for egress. It names the connections that the egress broker refuses or cannot make, but not the paths the sandbox denies: the windows backend cannot report those.
+sandy explain: egress to 10.1.2.3:80 refused with reply 2: private use (10.0.0.0/8); reach = "public-and-local" allows it
+sandy explain: egress to 93.184.215.14:443 refused with reply 2: on 0.0.0.0/1, a network this host reaches without a router, which is the local network; reach = "public-and-local" allows it
+sandy explain: egress to 1.1.1.1:9 failed with reply 4: the connect failed: connection timed out
+```
+
+Each distinct line appears once, at most 1000 in a run (on Windows the relay in front of the
+broker can add one more), and each in one write, so it stays whole next to the program's output.
+The broker answers first and reports after, from a queue: when standard error takes nothing for
+a while, lines are dropped and the report says how many, so a caller that reads standard error
+only at the end holds up no connection. On macOS and Windows, where sandy cannot name denied
+paths, `--explain` is refused for a policy without `network.egress`, because it would report
+nothing. Unlike the path report on Linux, the egress report does not change how sandy runs the
+program. The broker then holds a copy of sandy's standard error until it ends, at most two
+seconds after the program: the broker's drain, then at most a second for the lines it has
+queued.
+
 ### Exit status
 
 | Status | Meaning |
 |---|---|
 | the program's status | `sandy run` started the program |
 | 128 + signal number | Linux and macOS with `children = "contained"`, and Linux with `--explain`: a signal ended the program |
-| 125 | sandy failed or refused: invalid policy, a requirement this host cannot enforce, a socket on a standard stream that the policy denies, a pseudo-terminal master on one with `signals = "isolated"`, a setup error; with `children = "contained"`, with `--explain`, and on Windows also a failure while sandy supervises the program. For `sandy check`: sandy cannot tell now whether this host enforces the policy (an `UNDECIDED` line, or a relay port that another process holds), or the policy conflicts with this host (a `CONFLICT` line) |
+| 125 | sandy failed or refused: invalid policy, a requirement this host cannot enforce, a socket on a standard stream that the policy denies, a pseudo-terminal master on one with `signals = "isolated"`, a setup error; with `children = "contained"`, on Linux with `--explain`, and on Windows also a failure while sandy supervises the program. For `sandy check`: sandy cannot tell now whether this host enforces the policy (an `UNDECIDED` line, or a relay port that another process holds), or the policy conflicts with this host (a `CONFLICT` line) |
 | 0 / 1 | `sandy check`: the policy, or one of its levels, is enforceable / none is |
 | 2 | `sandy check`: no level is enforceable, but `sandy setup`, run once with administrator rights, would make one so |
 | 0 | `sandy setup`, with or without `--remove`: done, or nothing to do |
@@ -716,11 +739,11 @@ On Windows the program's 32-bit exit code is passed through unchanged.
 
 ### The status record
 
-The exit status leaves two things open. With `children = "contained"`, with `--explain`, and
-always on Windows, sandy stays the parent, so the caller holds sandy's process ID and not the
-program's; and 125 means both "sandy refused" and "the program exited with 125". `--status-fd N`
-answers both without changing any exit status. sandy writes short lines to the descriptor, in
-this order:
+The exit status leaves two things open. With `children = "contained"`, on Linux with
+`--explain`, and always on Windows, sandy stays the parent, so the caller holds sandy's process
+ID and not the program's; and 125 means both "sandy refused" and "the program exited with 125".
+`--status-fd N` answers both without changing any exit status. sandy writes short lines to the
+descriptor, in this order:
 
 | Line | When |
 |---|---|
@@ -730,7 +753,7 @@ this order:
 | `signaled N` | sandy saw signal `N` end the program (Linux and macOS with `contained`, Linux with `--explain`) |
 | `failed` | sandy itself failed or refused; without a `pid` line the program never ran |
 
-In the exec model (Linux and macOS without `contained` and without `--explain`) sandy becomes
+In the exec model (Linux and macOS without `contained`, and Linux without `--explain`) sandy becomes
 the program, so the record ends after `pid` and the caller's own wait status is the program's.
 sandy writes that line right before it confines itself and replaces itself with the program, so
 a `failed` line after it means that applying the sandbox or the `execve` failed. sandy makes the descriptor
@@ -1418,8 +1441,8 @@ Recommendations:
    just as well. The program then reads the null device on its standard input, so this suits
    programs that need no input.
 4. **Treat exit status 125 as "not started".** sandy prints the reason on standard error. Two
-   exceptions: a program can exit with 125 itself, and with `children = "contained"`, with
-   `--explain` and on Windows sandy can fail while it supervises a running program, for example
+   exceptions: a program can exit with 125 itself, and with `children = "contained"`, on Linux
+   with `--explain` and on Windows sandy can fail while it supervises a running program, for example
    when the relay of its ports died (its message is `sandy: run failed: ...`). Pass `--status-fd` or
    `--status-file` when you need to tell these apart, or need the program's process ID (see
    [The status record](#the-status-record)): without a `pid` line the program never ran.

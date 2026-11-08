@@ -16,6 +16,10 @@ pub mod trust;
 pub mod verify;
 mod warning;
 
+/// Marks every line of the diagnostic mode (`run --explain`) on standard error, whichever part
+/// of sandy writes it.
+pub const EXPLAIN_PREFIX: &str = "sandy explain: ";
+
 pub use backend::{
     Backend, ParentProcess, SandboxError, SetupOptions, SetupOutcome, StatusReport, TargetCommand,
     setup_levels,

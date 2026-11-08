@@ -21,6 +21,7 @@ Draft for the release after 1.1.0. It lists what a user or an integrator may not
 ## New
 
 - `filesystem.symlinks = "deny" | "allow"` (`--symlinks`), default `deny`, with the warning `symlinks-followed-outside`.
+- `--explain` names the connections the egress broker refuses or cannot make, on Linux, macOS and Windows, for a policy with `network.egress`.
 
 ## Integration Requirements
 
@@ -28,4 +29,5 @@ Draft for the release after 1.1.0. It lists what a user or an integrator may not
 - **Windows:** `check` refuses a `--parent-pid` that is not sandy's parent or has ended, and a `.bat` or `.cmd` program, as `run` does. A run whose relay or egress broker ends while the program runs now exits with 125 with any policy.
 - **Windows:** the egress port serves up to 1000 connections at a time, as on Linux and macOS.
 - A refusal before sandy chooses a level writes no `level` line to the status record, and `check --json` prints nothing on standard output for it.
+- `--explain` on macOS and Windows, which name no denied paths, is accepted for a policy with `network.egress` and refused for one without it ("--explain is not available here").
 - Policies keep the format `version = 1`; `filesystem.symlinks` is not a key of a fallback level.

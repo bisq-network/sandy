@@ -25,12 +25,14 @@ use crate::profile::{Hold, Profile, broker_profile};
 /// confined, watches this process and serves; any failure before that is an error, and then no
 /// broker serves. It keeps the port of `hold` bound for as long as it runs. With
 /// `children = "contained"`, `ended` is the read end of the pipe whose end means that the
-/// program's group has ended (`relay::start`).
+/// program's group has ended (`relay::start`). `report` is a copy of sandy's standard error with
+/// `--explain`, where the broker names the connections it refuses.
 pub fn start(
     egress: Egress,
     hold: Option<&Hold>,
     seatbelt: &Seatbelt,
     ended: Option<File>,
+    report: Option<File>,
 ) -> Result<libc::pid_t, SandboxError> {
     let holders = match hold {
         Some(hold) => holder::hold(hold.port, &hold.leave)?,
@@ -49,13 +51,14 @@ pub fn start(
     let watched = unsafe { libc::getpid() };
     let mut keep: Vec<RawFd> = vec![listener.as_raw_fd()];
     keep.extend(ended.as_ref().map(AsRawFd::as_raw_fd));
+    keep.extend(report.as_ref().map(AsRawFd::as_raw_fd));
     keep.extend(holders.iter().map(AsRawFd::as_raw_fd));
     helper::start("the egress broker", &keep, move |ready| {
         let sockets = (listener, holders);
         serve(
             sockets,
             egress.reach,
-            ended,
+            Files { ended, report },
             &profile,
             &seatbelt,
             watched,
@@ -64,12 +67,19 @@ pub fn start(
     })
 }
 
+/// The files the broker process keeps besides its sockets: the pipe of the group's end with
+/// `children = "contained"`, and standard error with `--explain`.
+struct Files {
+    ended: Option<File>,
+    report: Option<File>,
+}
+
 /// The broker process. Returns when the program has ended. Like the relay's listeners, the
 /// holder sockets go as soon as the program has ended.
 fn serve(
     (listener, holders): (TcpListener, Vec<OwnedFd>),
     reach: EgressReach,
-    ended: Option<File>,
+    Files { ended, report }: Files,
     profile: &Profile,
     seatbelt: &Seatbelt,
     watched: libc::pid_t,
@@ -92,6 +102,7 @@ fn serve(
                 |listener: &TcpListener| listener.accept().map(|(client, _)| client),
                 reach,
                 interfaces,
+                report.map(sandy_relay::broker::Explain::new),
                 &request,
                 sandy_relay::DRAIN,
             );

@@ -7,6 +7,7 @@ mod status;
 mod stdio;
 
 use std::ffi::OsString;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -72,8 +73,13 @@ fn main() -> ExitCode {
             sockets,
             forwarded,
             egress,
-        } => relay(exposed, sockets, forwarded, egress),
-        Command::Broker { listener, reach } => broker(listener, reach),
+            explain,
+        } => relay(exposed, sockets, forwarded, egress, explain),
+        Command::Broker {
+            listener,
+            reach,
+            explain,
+        } => broker(listener, reach, explain),
         Command::Sandbox(invocation) => {
             #[cfg(windows)]
             let parent_at_start =
@@ -253,6 +259,7 @@ fn relay(
     sockets: Option<std::path::PathBuf>,
     forwarded: Vec<std::net::SocketAddr>,
     egress: Option<std::net::SocketAddr>,
+    explain: bool,
 ) -> ExitCode {
     let mut handles: Vec<u64> = exposed.iter().map(|(listener, _)| *listener).collect();
     handles.sort_unstable();
@@ -283,7 +290,13 @@ fn relay(
         eprintln!("sandy: {message}");
         return ExitCode::from(EXIT_FAILURE);
     }
-    serve_relay(routes)
+    serve_relay(routes, explain.then(explain_to_stderr))
+}
+
+/// The diagnostic report of the relay and the broker, on their standard error, which the
+/// backend points at the program's.
+fn explain_to_stderr() -> std::sync::Arc<sandy_relay::broker::Explain> {
+    std::sync::Arc::new(sandy_relay::broker::Explain::new(std::io::stderr()))
 }
 
 /// The routes of the forwarded ports and the egress port: the relay listens on each address
@@ -352,7 +365,10 @@ fn report_ready() -> std::io::Result<()> {
 /// On Windows the backend keeps the relay's standard input open while the program runs and
 /// closes it when the program ends; the relay then ends by rule 5 (see `serve_until`).
 #[cfg(windows)]
-fn serve_relay(routes: Vec<Route>) -> ExitCode {
+fn serve_relay(
+    routes: Vec<Route>,
+    explain: Option<std::sync::Arc<sandy_relay::broker::Explain>>,
+) -> ExitCode {
     let stop = match stop_at_end_of_input() {
         Ok(stop) => stop,
         Err(error) => {
@@ -366,6 +382,7 @@ fn serve_relay(routes: Vec<Route>) -> ExitCode {
     sandy_relay::serve_routes_until(
         routes,
         |listener| listener.accept().map(|(client, _)| client),
+        explain,
         &stop,
         sandy_relay::DRAIN,
     );
@@ -375,12 +392,16 @@ fn serve_relay(routes: Vec<Route>) -> ExitCode {
 /// No Unix backend starts the relay as a process of its own; started by hand, it serves until it
 /// is ended.
 #[cfg(not(windows))]
-fn serve_relay(routes: Vec<Route>) -> ExitCode {
+fn serve_relay(
+    routes: Vec<Route>,
+    explain: Option<std::sync::Arc<sandy_relay::broker::Explain>>,
+) -> ExitCode {
     match sandy_relay::Stop::new() {
         Ok(never) => {
             sandy_relay::serve_routes_until(
                 routes,
                 |listener| listener.accept().map(|(client, _)| client),
+                explain,
                 &never,
                 sandy_relay::DRAIN,
             );
@@ -418,7 +439,7 @@ fn stop_at_end_of_input() -> std::io::Result<sandy_relay::Stop> {
 /// are its own. It ends like a relay when sandy closes its standard input, and reports that it
 /// serves like a relay.
 #[cfg(windows)]
-fn broker(listener: u64, reach: sandy_core::EgressReach) -> ExitCode {
+fn broker(listener: u64, reach: sandy_core::EgressReach, explain: bool) -> ExitCode {
     // SAFETY: a backend starts this command only with a listening AF_UNIX socket it passed to
     // this process and that nothing else here owns.
     let listener = unsafe { sandy_relay::unix::Listener::from_inherited(listener) };
@@ -444,6 +465,7 @@ fn broker(listener: u64, reach: sandy_core::EgressReach) -> ExitCode {
         |listener| listener.accept(),
         reach,
         host,
+        explain.then(|| sandy_relay::broker::Explain::new(std::io::stderr())),
         &stop,
         sandy_relay::DRAIN,
     );
@@ -451,7 +473,7 @@ fn broker(listener: u64, reach: sandy_core::EgressReach) -> ExitCode {
 }
 
 #[cfg(not(windows))]
-fn broker(_listener: u64, _reach: sandy_core::EgressReach) -> ExitCode {
+fn broker(_listener: u64, _reach: sandy_core::EgressReach, _explain: bool) -> ExitCode {
     eprintln!("sandy: {} is used only on Windows", args::BROKER_COMMAND);
     ExitCode::from(EXIT_FAILURE)
 }
@@ -588,13 +610,11 @@ fn sandbox(
         refuse_writable_status_file(&levels[0].policy, path)?;
     }
     let backend = platform_backend();
-    if invocation.explain && !backend.can_explain() {
-        return Err(format!(
-            "--explain is not available on this host: the {} backend has no way to report what \
-             it denied that does not need more rights than sandy has (see the platform \
-             documentation)",
-            backend.name()
-        ));
+    if invocation.explain
+        && !backend.can_explain()
+        && levels.iter().all(|level| level.policy.egress.is_none())
+    {
+        return Err(explain_unavailable(backend.name(), "the policy"));
     }
 
     if matches!(invocation.mode, Mode::Setup | Mode::Remove) {
@@ -642,6 +662,9 @@ fn sandbox(
         status.level(&levels[index].name);
     }
     refuse_unsafe_standard_streams(resolved, backend.ip_also_allows())?;
+    if invocation.explain {
+        explain_banner(resolved, backend.as_ref())?;
+    }
     let program = resolved
         .program
         .clone()
@@ -671,6 +694,47 @@ fn sandbox(
         .map_err(|error| format!("run failed: {error}"))?;
     // Exit codes on Windows are 32 bits wide; ExitCode only carries 8.
     std::process::exit(code)
+}
+
+/// Why `--explain` reports nothing on a backend that cannot name denied paths, for a policy
+/// without an egress broker: a report that names nothing would read as "nothing was denied".
+fn explain_unavailable(backend: &str, what: &str) -> String {
+    format!(
+        "--explain is not available here: the {backend} backend has no way to report the paths \
+         it denied that does not need more rights than sandy has, and {what} has no \
+         network.egress whose refusals it could name (see the platform documentation)"
+    )
+}
+
+/// The first line of the egress part of `--explain`, or the refusal for the selected level when
+/// the backend would report nothing for it. The backend's own report of paths, where it has
+/// one, says what it covers itself.
+fn explain_banner(
+    resolved: &sandy_core::ResolvedPolicy,
+    backend: &dyn sandy_core::Backend,
+) -> Result<(), String> {
+    if resolved.egress.is_none() {
+        return if backend.can_explain() {
+            Ok(())
+        } else {
+            Err(explain_unavailable(backend.name(), "the level that runs"))
+        };
+    }
+    let paths = if backend.can_explain() {
+        String::new()
+    } else {
+        format!(
+            ", but not the paths the sandbox denies: the {} backend cannot report those",
+            backend.name()
+        )
+    };
+    let _ = writeln!(
+        std::io::stderr(),
+        "{}on for egress. It names the connections that the egress broker refuses or cannot \
+         make{paths}.",
+        sandy_core::EXPLAIN_PREFIX
+    );
+    Ok(())
 }
 
 /// The policy the invocation names, or the empty one.

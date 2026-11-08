@@ -295,6 +295,9 @@ impl Backend for WindowsBackend {
                 if let Some(listen) = egress_listen {
                     args.push(wide("--egress".as_ref()));
                     args.push(wide(listen.to_string().as_ref()));
+                    if command.explain {
+                        args.push(wide("--explain".as_ref()));
+                    }
                 }
                 forwarding = Some(started);
                 egress_listener = listener;
@@ -328,11 +331,14 @@ impl Backend for WindowsBackend {
             // AF_UNIX socket it inherits. It is in the relay job, so it ends with the program.
             if let (Some(broker), Some(listener)) = (&broker, egress_listener) {
                 let reach = policy.egress.expect("egress set with a broker").reach;
-                let args = [
+                let mut args = vec![
                     wide(relay::BROKER_COMMAND.as_ref()),
                     wide(listener.as_raw_socket().to_string().as_ref()),
                     wide(reach.name().as_ref()),
                 ];
+                if command.explain {
+                    args.push(wide("--explain".as_ref()));
+                }
                 relays.push(process::Relay {
                     process: process_for(
                         sandy.as_os_str(),

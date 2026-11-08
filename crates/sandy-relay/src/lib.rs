@@ -91,6 +91,8 @@ struct Connections<H> {
     active: Arc<AtomicUsize>,
     limit: usize,
     stack_size: Option<usize>,
+    /// Called for each connection closed at once because `limit` connections are active.
+    full: Option<Arc<dyn Fn(usize) + Send + Sync>>,
 }
 
 /// How many connections one route of `serve_routes_until` relays at the same time.
@@ -149,7 +151,14 @@ where
             active: Arc::new(AtomicUsize::new(0)),
             limit,
             stack_size,
+            full: None,
         }
+    }
+
+    /// Reports each connection that `start` closes at once to `full`, with the limit.
+    fn reporting_full(mut self, full: Arc<dyn Fn(usize) + Send + Sync>) -> Connections<H> {
+        self.full = Some(full);
+        self
     }
 
     /// Handles `client` on a new thread, or closes it while `limit` connections are active.
@@ -157,6 +166,9 @@ where
     fn start(&self, client: TcpStream) -> bool {
         if self.active.fetch_add(1, Ordering::AcqRel) >= self.limit {
             self.active.fetch_sub(1, Ordering::AcqRel);
+            if let Some(full) = &self.full {
+                full(self.limit);
+            }
             return true;
         }
         let active = Arc::clone(&self.active);
@@ -272,13 +284,17 @@ where
         .into_iter()
         .map(|(listener, connect)| (listener, connect, Capacity::Port))
         .collect();
-    serve_routes_until(routes, accept, stop, drain);
+    serve_routes_until(routes, accept, None, stop, drain);
 }
 
 /// `serve_until` with a `Capacity` of its own for each route.
+///
+/// With `explain`, a route of `Capacity::Egress` names each connection it closes at once because
+/// it is full, as the broker behind it does (`broker::full_line`).
 pub fn serve_routes_until<L, A, C>(
     routes: Vec<(L, C, Capacity)>,
     accept: A,
+    explain: Option<Arc<broker::Explain>>,
     stop: &Stop,
     drain: Duration,
 ) where
@@ -288,9 +304,24 @@ pub fn serve_routes_until<L, A, C>(
 {
     let servers = routes
         .into_iter()
-        .map(|(listener, connect, capacity)| (listener, relayed(connect, capacity)))
+        .map(|(listener, connect, capacity)| {
+            let connections = relayed(connect, capacity);
+            let connections = match (&explain, capacity) {
+                (Some(explain), Capacity::Egress) => {
+                    let explain = Arc::clone(explain);
+                    connections.reporting_full(Arc::new(move |limit| {
+                        explain.report(broker::full_line(limit));
+                    }))
+                }
+                _ => connections,
+            };
+            (listener, connections)
+        })
         .collect();
     serve_connections_until(servers, accept, stop, drain);
+    if let Some(explain) = explain {
+        explain.finish();
+    }
 }
 
 /// Where a listener of `serve_connections_until` is.

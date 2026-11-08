@@ -1480,8 +1480,13 @@ no privilege, and closing them would break ordinary programs:
 
 ## Diagnostic mode
 
-`run --explain` is not available on macOS: sandy refuses the option here instead of reporting
-nothing, which would read as "nothing was denied". The question it answers, "which grant does
+`run --explain` names no denied paths on macOS. With `network.egress` it names the connections
+the egress broker refuses or cannot make (README, "Finding the grants a program needs"); for a
+policy without one sandy refuses the option instead of reporting nothing, which would read as
+"nothing was denied". The broker writes to a copy of sandy's standard error that it keeps when
+it starts; its profile allows no file write, but Seatbelt does not check a write to a descriptor
+the process already holds (measured on macOS 27.0.1 with standard error a pipe, a file and a
+terminal). The question it answers, "which grant does
 this program need", is in [DESIGN.md](DESIGN.md), "Diagnostic mode", and the Linux
 implementation is in [linux.md](linux.md).
 
@@ -1501,7 +1506,7 @@ the standard user `mini`:
   observe it, which the diagnostic mode must never do. In the measurement the traced process
   could not even start (`execvp() ... Operation not permitted`).
 
-`check --explain-path` is Linux only as well. The profile that decides a path here is SBPL text,
+`check --explain-path` is Linux only. The profile that decides a path here is SBPL text,
 not a rule list sandy keeps, so the macOS backend would have to answer from a second source
 that can disagree with the profile it generates. A wrong answer about a path is worse than
 none, so the backend answers nothing and sandy refuses the option.
@@ -1568,11 +1573,11 @@ none, so the backend answers nothing and sandy refuses the option.
 - A `read_write` path itself cannot be deleted or replaced, and a writable file cannot be replaced
   by renaming another file over it. Programs must write such a file in place.
 - A path outside the policy answers "No such file or directory" (`ENOENT`), not "Operation not
-  permitted", so a denial no longer looks like one, and macOS has no `--explain` (see
-  [Diagnostic mode](#diagnostic-mode)). dyld says "no such file" instead of "blocked by sandbox"
-  for a library outside the policy. A program that fails on a file it cannot find may need a
-  grant for it. Programs that treat a missing optional file as normal gain from it: under
-  `EPERM`, LibreSSL stopped `curl` at startup on `/private/etc/ssl/openssl.cnf`, and under
+  permitted", so a denial no longer looks like one, and `--explain` names no denied paths on
+  macOS (see [Diagnostic mode](#diagnostic-mode)). dyld says "no such file" instead of "blocked
+  by sandbox" for a library outside the policy. A program that fails on a file it cannot find
+  may need a grant for it. Programs that treat a missing optional file as normal gain from it:
+  under `EPERM`, LibreSSL stopped `curl` at startup on `/private/etc/ssl/openssl.cnf`, and under
   `ENOENT` it starts (measured on macOS 27.0.1). A write to a `read` path still answers `EPERM`
   (`writes_to_a_read_path_stay_refused`).
 - `getcwd` fails when the working directory is outside the policy, and so do programs that save

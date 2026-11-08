@@ -56,9 +56,10 @@ Options (they extend the policy file):
                              (on Windows: an inherited handle); run only
   --status-file PATH         as --status-fd, into a file sandy creates at PATH, which must not
                              exist yet, outside every writable path; run only
-  --explain                  name the paths of the run that the policy does not grant, on
-                             standard error; off by default, it sees not every denial, and it
-                             is not available on every platform (run only)
+  --explain                  name, on standard error, the paths of the run that the policy does
+                             not grant (Linux only; it sees not every denial) and the
+                             connections the egress broker refuses (every platform, with
+                             network.egress or --egress); off by default (run only)
   --explain-path PATH        say what the policy allows for PATH and which rule decides it
                              (repeatable; check only)
   --hide-warning ID          leave out the warning lines with this ID, the name in brackets
@@ -403,6 +404,8 @@ pub enum Command {
         sockets: Option<PathBuf>,
         forwarded: Vec<SocketAddr>,
         egress: Option<SocketAddr>,
+        /// `--explain`: name the egress connections closed at once because the route is full.
+        explain: bool,
     },
     /// Internal: run the egress broker (`network.egress`). A backend starts sandy this way, in a
     /// sandbox of its own, with a listening socket it passed by descriptor or handle number; the
@@ -410,15 +413,18 @@ pub enum Command {
     Broker {
         listener: u64,
         reach: EgressReach,
+        /// `--explain`: name every connection the broker refuses or cannot make.
+        explain: bool,
     },
 }
 
 /// The internal command that runs a relay. It is not part of the documented interface:
 /// `__relay [--expose LISTENER TARGET]... [--sockets DIRECTORY] [--forward LISTEN]...
-/// [--egress LISTEN]`
+/// [--egress LISTEN] [--explain]`
 pub const RELAY_COMMAND: &str = "__relay";
 
-/// The internal command that runs the egress broker. It is not part of the documented interface.
+/// The internal command that runs the egress broker. It is not part of the documented interface:
+/// `__broker LISTENER REACH [--explain]`
 pub const BROKER_COMMAND: &str = "__broker";
 
 /// Where the policy comes from.
@@ -471,6 +477,7 @@ fn parse_relay(parser: &mut lexopt::Parser) -> Result<Command, lexopt::Error> {
     let mut sockets = None;
     let mut forwarded = Vec::new();
     let mut egress = None;
+    let mut explain = false;
     while let Some(arg) = parser.next()? {
         match arg {
             Long("expose") => {
@@ -491,6 +498,12 @@ fn parse_relay(parser: &mut lexopt::Parser) -> Result<Command, lexopt::Error> {
                 }
                 egress = Some(parser.value()?.parse()?);
             }
+            Long("explain") => {
+                if explain {
+                    return Err("--explain given twice".into());
+                }
+                explain = true;
+            }
             other => return Err(other.unexpected()),
         }
     }
@@ -500,11 +513,15 @@ fn parse_relay(parser: &mut lexopt::Parser) -> Result<Command, lexopt::Error> {
     if (forwarded.is_empty() && egress.is_none()) != sockets.is_none() {
         return Err("--forward and --egress go together with --sockets".into());
     }
+    if explain && egress.is_none() {
+        return Err("--explain goes together with --egress".into());
+    }
     Ok(Command::Relay {
         exposed,
         sockets,
         forwarded,
         egress,
+        explain,
     })
 }
 
@@ -535,7 +552,19 @@ where
                     .into_iter()
                     .find(|reach| value.to_str() == Some(reach.name()))
                     .ok_or_else(|| format!("unknown egress reach {value:?}"))?;
-                return Ok(Command::Broker { listener, reach });
+                let explain = match parser.next()? {
+                    None => false,
+                    Some(Long("explain")) => true,
+                    Some(other) => return Err(other.unexpected()),
+                };
+                if let Some(other) = parser.next()? {
+                    return Err(other.unexpected());
+                }
+                return Ok(Command::Broker {
+                    listener,
+                    reach,
+                    explain,
+                });
             }
             _ => return Err(format!("unknown command {value:?}").into()),
         },
@@ -1472,7 +1501,9 @@ mod tests {
                 sockets,
                 forwarded,
                 egress,
+                explain,
             } => {
+                assert!(!explain);
                 assert_eq!(
                     exposed,
                     [
@@ -1498,6 +1529,7 @@ mod tests {
                 sockets,
                 forwarded,
                 egress,
+                ..
             } => {
                 assert_eq!(exposed.len(), 1);
                 assert_eq!(sockets, None);
@@ -1513,6 +1545,18 @@ mod tests {
                 assert!(forwarded.is_empty());
                 assert_eq!(egress, Some("127.0.0.1:9".parse().unwrap()));
             }
+            other => panic!("unexpected {other:?}"),
+        }
+        let explained = [
+            RELAY_COMMAND,
+            "--sockets",
+            "s",
+            "--egress",
+            "127.0.0.1:9",
+            "--explain",
+        ];
+        match parse_strs(&explained).unwrap() {
+            Command::Relay { explain, .. } => assert!(explain),
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -1547,6 +1591,22 @@ mod tests {
                 "127.0.0.1:9",
             ],
             &["__forward", "127.0.0.1:8081", "socket"],
+            &[
+                RELAY_COMMAND,
+                "--expose",
+                "7",
+                "127.0.0.1:8080",
+                "--explain",
+            ],
+            &[
+                RELAY_COMMAND,
+                "--sockets",
+                "s",
+                "--egress",
+                "127.0.0.1:9",
+                "--explain",
+                "--explain",
+            ],
         ] {
             assert!(parse_strs(args).is_err(), "{args:?}");
         }
@@ -1555,9 +1615,14 @@ mod tests {
     #[test]
     fn parses_the_internal_broker_command() {
         match parse_strs(&[BROKER_COMMAND, "9", "public"]).unwrap() {
-            Command::Broker { listener, reach } => {
+            Command::Broker {
+                listener,
+                reach,
+                explain,
+            } => {
                 assert_eq!(listener, 9);
                 assert_eq!(reach, EgressReach::Public);
+                assert!(!explain);
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -1568,6 +1633,12 @@ mod tests {
         assert!(parse_strs(&[BROKER_COMMAND, "x", "public"]).is_err());
         assert!(parse_strs(&[BROKER_COMMAND, "9", "local"]).is_err());
         assert!(parse_strs(&[BROKER_COMMAND, "9"]).is_err());
+        match parse_strs(&[BROKER_COMMAND, "9", "public", "--explain"]).unwrap() {
+            Command::Broker { explain, .. } => assert!(explain),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(parse_strs(&[BROKER_COMMAND, "9", "public", "--explain", "x"]).is_err());
+        assert!(parse_strs(&[BROKER_COMMAND, "9", "public", "x"]).is_err());
     }
 
     #[test]

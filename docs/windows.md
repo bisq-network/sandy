@@ -1647,8 +1647,11 @@ every platform answers.
 
 ## Diagnostic mode
 
-`run --explain` is not available on Windows: sandy refuses the option here instead of reporting
-nothing, which would read as "nothing was denied". The question it answers, "which grant does
+`run --explain` names no denied paths on Windows. With `network.egress` it names the connections
+the egress broker refuses or cannot make (README, "Finding the grants a program needs"), and the
+relay in front of the broker names a connection it closes because 1000 are open; both write to
+the standard error they share with the program. For a policy without `network.egress` sandy
+refuses the option instead of reporting nothing, which would read as "nothing was denied". The question it answers, "which grant does
 this program need", is in [DESIGN.md](DESIGN.md), "Diagnostic mode", and the Linux
 implementation is in [linux.md](linux.md).
 
@@ -1662,7 +1665,7 @@ write SACLs on a user's directories to get it. There is no unprivileged alternat
 reports what the AppContainer denied: a denied access returns `ERROR_ACCESS_DENIED` to the
 program and leaves no trace the program or sandy can read back.
 
-`check --explain-path` is Linux only as well. What decides a path here is the access control
+`check --explain-path` is Linux only. What decides a path here is the access control
 list of each object plus the AppContainer's capabilities, not a rule list sandy keeps, so an
 answer would be a second opinion that can disagree with what the kernel does. A wrong answer
 about a path is worse than none, so the backend answers nothing and sandy refuses the option.
@@ -1752,8 +1755,8 @@ about a path is worse than none, so the backend answers nothing and sandy refuse
 
 Host: Windows 11 build 26200 (VM), binaries built for `x86_64-pc-windows-gnu`. The tests run in
 an elevated SSH session and without administrator rights. Latest elevated run, every test
-passing: `sandy_core` 115, `sandy_relay` 51, `sandy_windows` 147, `sandy` 34, `escape` 25,
-`escape_windows` 111, `expose` 5, `forward` 4, `children` 6, `parent` 8, `check` 15, `levels` 8,
+passing: `sandy_core` 115, `sandy_relay` 55, `sandy_windows` 147, `sandy` 34, `escape` 25,
+`escape_windows` 112, `expose` 5, `forward` 4, `children` 6, `parent` 8, `check` 15, `levels` 8,
 `runner` 3, `review_windows` 12, `setup` 3. `crossuser_windows` skips without
 `SANDY_TEST_OTHER_USER` and `SANDY_TEST_OTHER_PASSWORD` (see "Other users of the machine"). The
 COM check of `review_windows` is skipped there: the SSH session is session 0, where `ole32.dll`

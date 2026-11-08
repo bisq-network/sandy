@@ -8,6 +8,7 @@
 //! client sends behind its request stays in the socket for the relay. The few bytes written
 //! before the relay starts fit into an empty send buffer, so writes need no timeout.
 
+use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
@@ -86,6 +87,7 @@ fn read_request_within(client: &TcpStream, timeout: Duration) -> io::Result<Sock
     if !methods.contains(&NO_AUTHENTICATION) {
         send(client, &[VERSION, NO_ACCEPTABLE_METHOD])?;
         return Err(refused(
+            None,
             "the client offers no method without authentication",
         ));
     }
@@ -133,16 +135,25 @@ fn read_request_within(client: &TcpStream, timeout: Duration) -> io::Result<Sock
         // The length of an unknown address is unknown too, so this one is answered unread.
         _ => {
             reply(client, Reply::AddressTypeNotSupported)?;
-            return Err(refused("unknown address type"));
+            return Err(refused(
+                Some(Reply::AddressTypeNotSupported),
+                "unknown address type",
+            ));
         }
     };
     if command != CONNECT {
         reply(client, Reply::CommandNotSupported)?;
-        return Err(refused("only CONNECT is supported"));
+        return Err(refused(
+            Some(Reply::CommandNotSupported),
+            "only CONNECT is supported",
+        ));
     }
     let Some(destination) = destination else {
         reply(client, Reply::AddressTypeNotSupported)?;
-        return Err(refused("names are not resolved"));
+        return Err(refused(
+            Some(Reply::AddressTypeNotSupported),
+            NAMES_NOT_RESOLVED,
+        ));
     };
     client.set_read_timeout(None)?;
     Ok(destination)
@@ -184,8 +195,34 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn refused(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::Unsupported, message)
+/// Why `read_request` refused a request that it answered, inside the `io::Error` it returns:
+/// the reply the client got, `None` for a greeting without an acceptable method, and the reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Refused {
+    pub reply: Option<Reply>,
+    pub reason: &'static str,
+}
+
+/// The reason of a CONNECT to a domain name.
+pub const NAMES_NOT_RESOLVED: &str = "names are not resolved";
+
+impl fmt::Display for Refused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.reason)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+impl Refused {
+    /// The refusal inside `error`, if `read_request` answered the request with one.
+    pub fn of(error: &io::Error) -> Option<Refused> {
+        error.get_ref()?.downcast_ref::<Refused>().copied()
+    }
+}
+
+fn refused(reply: Option<Reply>, reason: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, Refused { reply, reason })
 }
 
 #[cfg(test)]

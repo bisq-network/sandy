@@ -52,7 +52,7 @@ use crate::plan::{LandlockConfig, PathRights};
 
 /// Marks every line of the diagnostic mode on standard error. `run` prints nothing else there;
 /// this output is the one exception and only with `--explain`.
-const PREFIX: &str = "sandy explain: ";
+const PREFIX: &str = sandy_core::EXPLAIN_PREFIX;
 
 /// What the mode reports when it starts, so that output which names paths is never mistaken for
 /// a complete list of denials.
