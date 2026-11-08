@@ -701,7 +701,7 @@ fn reaches(
 /// What it sees per platform is in `is_within`.
 #[derive(Debug)]
 pub struct PathIdentity {
-    mounts: Mounts,
+    mounts: std::sync::Arc<Mounts>,
 }
 
 impl PathIdentity {
@@ -987,12 +987,30 @@ impl Mounts {
     /// weaker path comparison. Nothing is lost: the Linux backend already needs /proc to count
     /// its threads before it applies Landlock, so a host without /proc cannot enforce a policy
     /// anyway.
-    fn read() -> Result<Mounts, PolicyError> {
+    ///
+    /// The table is read once per mount namespace and kept: a start compares paths in several
+    /// steps, and a host can have thousands of mounts.
+    fn read() -> Result<std::sync::Arc<Mounts>, PolicyError> {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::{Arc, Mutex, PoisonError};
+
+        static READ: Mutex<Option<(u64, Arc<Mounts>)>> = Mutex::new(None);
+        let namespace = std::fs::metadata("/proc/self/ns/mnt")
+            .map(|ns| ns.ino())
+            .ok();
+        let mut read = READ.lock().unwrap_or_else(PoisonError::into_inner);
+        if let (Some(namespace), Some((held, mounts))) = (namespace, read.as_ref())
+            && namespace == *held
+        {
+            return Ok(Arc::clone(mounts));
+        }
         let text = std::fs::read(Self::TABLE).map_err(|source| PolicyError::Unreadable {
             path: PathBuf::from(Self::TABLE),
             source,
         })?;
-        Ok(Mounts::parse(&text))
+        let mounts = Arc::new(Mounts::parse(&text));
+        *read = namespace.map(|namespace| (namespace, Arc::clone(&mounts)));
+        Ok(mounts)
     }
 
     /// Fields 4 and 5 of each line are the mount root and the mount point, and field 3 the
@@ -1132,8 +1150,8 @@ struct Mounts;
 
 #[cfg(not(target_os = "linux"))]
 impl Mounts {
-    fn read() -> Result<Mounts, PolicyError> {
-        Ok(Mounts)
+    fn read() -> Result<std::sync::Arc<Mounts>, PolicyError> {
+        Ok(std::sync::Arc::new(Mounts))
     }
 }
 
