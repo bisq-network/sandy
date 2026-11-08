@@ -1454,6 +1454,99 @@ mod tests {
         );
     }
 
+    /// On Windows a forwarded or egress connection crosses an AF_UNIX hop between the relay in
+    /// the AppContainer and sandy or the broker. A reset at either end must still arrive at the
+    /// other as a reset, never as a normal end: client, relay to AF_UNIX, relay to TCP, target.
+    #[cfg(windows)]
+    #[test]
+    fn a_reset_crosses_the_unix_socket_hop() {
+        let dir = std::env::temp_dir().join(format!("sandy-relay-reset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s");
+        let hop = unix::Listener::bind(&path).unwrap();
+        for reset_at_target in [true, false] {
+            let (client, client_end) = pair();
+            let (target, target_end) = pair();
+            let inner = unix::connect_to(&path).unwrap();
+            let outer = hop.accept().unwrap();
+            let relays = [
+                thread::spawn(move || relay_streams(client_end, inner)),
+                thread::spawn(move || relay_streams(outer, target_end)),
+            ];
+            let (resetting, mut watching) = if reset_at_target {
+                (target, client)
+            } else {
+                (client, target)
+            };
+            (&resetting).write_all(&[7; 100_000]).unwrap();
+            reset_on_close(raw(&resetting));
+            drop(resetting);
+            watching
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut received = Vec::new();
+            let result = watching.read_to_end(&mut received);
+            assert_eq!(
+                result.map_err(|error| error.kind()),
+                Err(io::ErrorKind::ConnectionReset),
+                "reset at the target: {reset_at_target}; {} bytes arrived",
+                received.len()
+            );
+            for relay in relays {
+                relay.join().unwrap().unwrap();
+            }
+        }
+        drop(hop);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The relay and the broker poll their blocking listeners and then accept. On Linux a
+    /// connection reset between the two leaves the backlog, and the accept would block; Winsock
+    /// keeps it there and hands it out, reset, so the accept returns at once, for TCP and for
+    /// AF_UNIX listeners alike.
+    #[cfg(windows)]
+    #[test]
+    fn a_connection_reset_in_the_backlog_does_not_block_accept() {
+        fn returns_after_a_reset<L: AsRawListener + Send + 'static>(
+            listener: L,
+            client: TcpStream,
+            accept: fn(&L) -> io::Result<TcpStream>,
+        ) {
+            let stop = Stop::new().unwrap();
+            let socket = raw_listener(&listener);
+            assert_eq!(
+                pending(&[socket], &stop, Some(Duration::from_secs(5))).unwrap(),
+                [0]
+            );
+            reset_on_close(raw(&client));
+            drop(client);
+            thread::sleep(Duration::from_millis(200));
+            let (sender, accepted) = std::sync::mpsc::channel();
+            thread::spawn(move || {
+                let read = accept(&listener).and_then(|stream| (&stream).read(&mut [0]));
+                let _ = sender.send(read.map_err(|error| error.kind()));
+            });
+            assert_eq!(
+                accepted.recv_timeout(Duration::from_secs(5)),
+                Ok(Err(io::ErrorKind::ConnectionReset))
+            );
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        returns_after_a_reset(listener, client, accept_tcp);
+
+        let dir = std::env::temp_dir().join(format!("sandy-relay-backlog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s");
+        let listener = unix::Listener::bind(&path).unwrap();
+        let client = unix::connect_to(&path).unwrap();
+        returns_after_a_reset(listener, client, unix::Listener::accept);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn refuses_unix_socket_paths_beyond_the_limit() {

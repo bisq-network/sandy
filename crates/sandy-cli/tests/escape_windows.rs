@@ -4709,3 +4709,160 @@ fn refused_junctions_are_a_conflict_and_stay_untouched() {
     assert_eq!(junction_capability_entries(&link), 0);
     fs::remove_dir(&link).unwrap();
 }
+
+/// A listening socket on `address` with `SO_REUSEADDR`, which on Windows lets a socket share an
+/// address that another socket holds unless that one is exclusive.
+fn reuse_listener(address: std::net::SocketAddrV4) -> std::io::Result<TcpListener> {
+    use std::os::windows::io::FromRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, SO_REUSEADDR, SOCK_STREAM, SOCKADDR_IN,
+        SOL_SOCKET, WSAGetLastError, bind, htons, listen, setsockopt, socket,
+    };
+    // Starts Winsock for the raw calls below.
+    drop(TcpListener::bind("127.0.0.1:0"));
+    // SAFETY: WSAGetLastError has no preconditions.
+    let last = || std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() });
+    // SAFETY: socket has no memory safety preconditions.
+    let handle = unsafe { socket(i32::from(AF_INET), SOCK_STREAM, 0) };
+    if handle == INVALID_SOCKET {
+        return Err(last());
+    }
+    // SAFETY: handle is a new socket that nothing else owns.
+    let listener = unsafe { TcpListener::from_raw_socket(handle as u64) };
+    let on: u32 = 1;
+    // SAFETY: handle is a valid socket; on is a u32 whose size is passed.
+    let set = unsafe {
+        setsockopt(
+            handle,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            (&on as *const u32).cast(),
+            std::mem::size_of::<u32>() as i32,
+        )
+    };
+    if set != 0 {
+        return Err(last());
+    }
+    let sockaddr = SOCKADDR_IN {
+        sin_family: AF_INET,
+        // SAFETY: htons byte-swaps a u16.
+        sin_port: unsafe { htons(address.port()) },
+        sin_addr: IN_ADDR {
+            S_un: IN_ADDR_0 {
+                S_addr: u32::from_ne_bytes(address.ip().octets()),
+            },
+        },
+        sin_zero: [0; 8],
+    };
+    // SAFETY: sockaddr is a SOCKADDR_IN and its size is passed.
+    let bound = unsafe {
+        bind(
+            handle,
+            (&sockaddr as *const SOCKADDR_IN).cast(),
+            std::mem::size_of::<SOCKADDR_IN>() as i32,
+        )
+    };
+    // SAFETY: handle is a bound socket.
+    if bound != 0 || unsafe { listen(handle, 1) } != 0 {
+        return Err(last());
+    }
+    Ok(listener)
+}
+
+/// Waits until sandy `run` has started the program, which it does only once its relays have
+/// written "ready", after they listen.
+fn wait_until_relays_listen(run: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child_processes(run.id(), "sandy-probe.exe").is_empty() {
+        assert!(run.try_wait().unwrap().is_none(), "sandy ended early");
+        assert!(
+            Instant::now() < deadline,
+            "sandy {} started no program",
+            run.id()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// No socket can share the address of a relay's listener with `SO_REUSEADDR` and take its
+/// connections: neither a process of this user outside the sandbox, nor one in the program's
+/// AppContainer, for the forward listener the relay creates inside and for the expose listener
+/// sandy creates outside. Windows refuses such a bind (`WSAEACCES`) for a socket that holds the
+/// address without `SO_REUSEADDR` itself, also in the same process, so the listeners need no
+/// `SO_EXCLUSIVEADDRUSE`. Control: the same bind on a free port succeeds.
+#[test]
+fn no_socket_shares_the_address_of_a_relay_listener() {
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    let refused = |result: std::io::Result<TcpListener>, what: &str| {
+        let error = result
+            .err()
+            .unwrap_or_else(|| panic!("{what}: the bind succeeded"));
+        assert_eq!(error.raw_os_error(), Some(10013), "{what}: {error}");
+    };
+    assert!(reuse_listener(SocketAddrV4::new(Ipv4Addr::LOCALHOST, free_port())).is_ok());
+
+    let fixture = Fixture::new("reuse-relay");
+    let holder = TcpListener::bind("127.0.0.1:0").unwrap();
+    let inner = free_port();
+    let mut run = Command::new(sandy_path())
+        .args(run_args(
+            &forward_args(&fixture, inner, holder.local_addr().unwrap().port()),
+            &[("sleep", "3000")],
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until_relays_listen(&mut run);
+    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, inner);
+    refused(reuse_listener(address), "forward listener, outside");
+    let inside = Command::new(probe_path())
+        .args([
+            "appcontainer-run",
+            &format!(
+                "{}\u{1f}S-1-15-3-2,S-1-15-3-3\u{1f}tcp-listen-reuse\u{1f}{address}",
+                appcontainer_name()
+            ),
+        ])
+        .output()
+        .unwrap();
+    let line = parse_line(
+        String::from_utf8_lossy(&inside.stdout)
+            .lines()
+            .next()
+            .unwrap(),
+    );
+    assert_eq!(
+        line.result, "denied",
+        "forward listener, same AppContainer: {line:?}"
+    );
+    assert!(line.detail.contains("10013"), "{line:?}");
+    let output = run.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let (inner, outer) = (free_port(), free_port());
+    let mut sandbox_args = fixture.access_args();
+    sandbox_args.extend(args(&[
+        "--ip",
+        "all",
+        "--expose",
+        &format!("127.0.0.1:{outer}={inner}"),
+    ]));
+    let mut run = Command::new(sandy_path())
+        .args(run_args(
+            &sandbox_args,
+            &[("tcp-accept", &format!("127.0.0.1:{inner}"))],
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until_relays_listen(&mut run);
+    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, outer);
+    refused(reuse_listener(address), "expose listener, outside");
+    // Ends the program, which waits for one connection.
+    let _client = TcpStream::connect_timeout(&address.into(), Duration::from_secs(5)).unwrap();
+    let output = run.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+}

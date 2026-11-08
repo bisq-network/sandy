@@ -1066,6 +1066,21 @@ to `port` on its own loopback address, without the loopback exemption:
    after that line, so the program's first connection cannot come too early.
 4. The relay passes each connection it accepts to the AF_UNIX socket named after its port.
 
+A reset crosses the AF_UNIX hop as a reset, as docs/DESIGN.md "Forwarded ports" rule 7 asks: an
+AF_UNIX socket closed with `SO_LINGER` 0 makes the read at the other end fail with
+`WSAECONNRESET`, not end, so the relay on the other side resets its TCP peer in turn, in both
+directions (`a_reset_crosses_the_unix_socket_hop`, measured on Windows 11 build 26200).
+
+The relays' listeners are blocking sockets without `SO_EXCLUSIVEADDRUSE`, and neither is needed
+(measured on Windows 11 build 26200). A socket with `SO_REUSEADDR` cannot bind the address of a
+listener that holds it without that option: the bind fails with `WSAEACCES` for a process of the
+same user outside the sandbox, for one in the program's AppContainer, and even in the process
+that holds the listener, for the forward listener inside and the expose listener outside
+(`no_socket_shares_the_address_of_a_relay_listener`). And where Linux can drop a connection
+that is reset between the poll and the accept from the backlog, so that a blocking accept would
+wait for the next one, Winsock leaves it there and the accept returns it at once, reset, for TCP
+and AF_UNIX listeners alike (`a_connection_reset_in_the_backlog_does_not_block_accept`).
+
 Why this works: a listener that sandy creates outside the AppContainer is outside it, and the
 program's connection to it is blocked like any connection to a loopback listener outside. A
 listener that the relay creates inside the AppContainer takes the program's connection, because
