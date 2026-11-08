@@ -752,6 +752,15 @@ fn the_program_listens_on_its_exposed_port_at_every_address() {
     }
 }
 
+/// `--explain` names the broker's refusals and their reasons (`assert_egress_explained`), also
+/// though the macOS backend cannot name denied paths.
+#[test]
+fn explain_names_the_refusals_of_the_broker() {
+    let fixture = Fixture::new("egress-explain");
+    let port = free_port();
+    assert_egress_explained(&private_egress(&fixture, port, "public"), port);
+}
+
 /// The probe's `socks5-connect` target: the broker on `port`, then the destination.
 fn through(port: u16, destination: &str) -> String {
     format!("127.0.0.1:{port}\u{1f}{destination}")

@@ -5,8 +5,9 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr};
+use std::fs::File;
 use std::io;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::ptr;
@@ -82,7 +83,19 @@ pub fn launch(
         }
     }
     if let Some(config) = &sandbox.broker {
-        let (started, handover) = broker::start(config, ended_for("the egress broker")?)?;
+        let report = command
+            .explain
+            .then(|| {
+                std::io::stderr()
+                    .as_fd()
+                    .try_clone_to_owned()
+                    .map(File::from)
+                    .map_err(|error| {
+                        SandboxError::io("cannot give the egress broker standard error", error)
+                    })
+            })
+            .transpose()?;
+        let (started, handover) = broker::start(config, ended_for("the egress broker")?, report)?;
         handovers.push(handover);
         if sandbox.contain {
             helpers.push(contain::Helper {

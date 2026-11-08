@@ -2020,8 +2020,10 @@ thread, and `nice` works only for the calling thread through ID 0.
 
 ## Diagnostic mode
 
-`sandy run --explain` names the paths of a run that the policy does not grant. It is off by
-default. Its reason, and why observing this way does not weaken the sandbox, are in
+`sandy run --explain` names the paths of a run that the policy does not grant, and with
+`network.egress` the connections the egress broker refuses or cannot make (README, "Finding the
+grants a program needs"). It is off by default. The broker writes to a copy of sandy's standard
+error, which it keeps only in this mode. Its reason, and why observing this way does not weaken the sandbox, are in
 [DESIGN.md](DESIGN.md), "Diagnostic mode".
 
 How it works:

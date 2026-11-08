@@ -118,7 +118,20 @@ impl Backend for MacosBackend {
         }
         if let Some(egress) = policy.egress {
             let hold = broker_holds(policy);
-            let pid = broker::start(egress, hold.as_ref(), &seatbelt, ended_copy()?)?;
+            let report = command
+                .explain
+                .then(|| {
+                    use std::os::fd::AsFd;
+                    std::io::stderr()
+                        .as_fd()
+                        .try_clone_to_owned()
+                        .map(std::fs::File::from)
+                        .map_err(|error| {
+                            SandboxError::io("cannot give the egress broker standard error", error)
+                        })
+                })
+                .transpose()?;
+            let pid = broker::start(egress, hold.as_ref(), &seatbelt, ended_copy()?, report)?;
             helpers.push(contain::Helper {
                 pid,
                 name: "the egress broker",

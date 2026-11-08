@@ -264,6 +264,11 @@ impl Subnet {
         (prefix <= bits).then_some(Subnet { address, prefix })
     }
 
+    /// The first of `subnets` that holds `ip`, for a report that names it.
+    pub fn holding(subnets: &[Subnet], ip: IpAddr) -> Option<Subnet> {
+        subnets.iter().copied().find(|subnet| subnet.contains(ip))
+    }
+
     /// Whether `ip` is on this subnet. An address of the other family never is.
     pub fn contains(&self, ip: IpAddr) -> bool {
         match (self.address, ip) {
@@ -271,6 +276,12 @@ impl Subnet {
             (IpAddr::V6(network), IpAddr::V6(ip)) => v6_contains(network, self.prefix, ip),
             _ => false,
         }
+    }
+}
+
+impl fmt::Display for Subnet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.address, self.prefix)
     }
 }
 

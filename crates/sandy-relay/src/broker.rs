@@ -17,14 +17,17 @@
 //! The handshake is the only thing it parses. The backend decides where the broker runs, how it
 //! is confined, which `HostNetwork` it asks, and when it stops.
 
-use std::io;
-use std::net::TcpStream;
+use std::collections::HashSet;
+use std::io::{self, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use sandy_core::EgressReach;
-use sandy_core::destination::{self, HostNetwork, Refusal};
+use sandy_core::destination::{self, HostNetwork, Refusal, Subnet};
+use sandy_core::{EXPLAIN_PREFIX, EgressReach};
 
-use crate::socks::{self, Reply};
+use crate::report::Lines;
+use crate::socks::{self, Refused, Reply};
 use crate::{
     AsRawListener, CONNECT_TIMEOUT, Connections, HALF_CLOSED_IDLE, Stop, raw, relay_streams_with,
     reset_on_close, serve_connections_until,
@@ -49,13 +52,15 @@ pub(crate) const THREAD_STACK: usize = 256 * 1024;
 /// the process ends (`abort_all`). `accept` takes one connection from `listener`, which on
 /// Windows may be an AF_UNIX one (`unix::Listener`).
 ///
-/// `reach` and `host` decide the destinations (`sandy_core::destination::check`). On Unix the
-/// caller raises the descriptor limit first (`raise_descriptor_limit`).
+/// `reach` and `host` decide the destinations (`sandy_core::destination::check`). With
+/// `explain` (`run --explain`) the broker names every connection it refuses or cannot make. On
+/// Unix the caller raises the descriptor limit first (`raise_descriptor_limit`).
 pub fn serve<L, A, H>(
     listener: L,
     accept: A,
     reach: EgressReach,
     host: H,
+    explain: Option<Explain>,
     stop: &Stop,
     drain: Duration,
 ) where
@@ -63,12 +68,89 @@ pub fn serve<L, A, H>(
     A: FnMut(&L) -> io::Result<TcpStream>,
     H: HostNetwork + Send + Sync + 'static,
 {
+    let explain = explain.map(Arc::new);
     let broker = Broker {
         reach,
         host,
         reached_host,
+        explain: explain.clone(),
     };
     serve_broker(listener, accept, broker, stop, drain);
+    if let Some(explain) = explain {
+        explain.finish();
+    }
+}
+
+/// The most lines `Explain` writes in one run. The program decides how many destinations it
+/// tries, and the report keeps every line it wrote so that it writes each one once.
+pub const MOST_LINES: usize = 1000;
+
+/// The broker's part of the diagnostic mode (`run --explain`): a line on `out` for each
+/// connection it refuses or cannot make, and why, each distinct line once. It decides nothing:
+/// the broker answers every connection the same with it or without it. The lines go through
+/// `report::Lines`, so a standard error that nobody reads holds up no connection.
+pub struct Explain {
+    state: Mutex<ExplainState>,
+    lines: Lines,
+}
+
+impl std::fmt::Debug for Explain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Explain").finish_non_exhaustive()
+    }
+}
+
+struct ExplainState {
+    /// What identifies the lines given so far, each once.
+    seen: HashSet<String>,
+    ended: bool,
+}
+
+impl Explain {
+    pub fn new(out: impl Write + Send + 'static) -> Explain {
+        Explain {
+            state: Mutex::new(ExplainState {
+                seen: HashSet::new(),
+                ended: false,
+            }),
+            lines: Lines::start(out, EXPLAIN_PREFIX, "egress"),
+        }
+    }
+
+    /// Ends the report (`report::Lines::finish`). The broker calls it when it stops serving,
+    /// because a connection thread can still hold the report then.
+    pub fn finish(&self) {
+        self.lines.finish();
+    }
+
+    /// Reports `line` unless it was reported before.
+    pub fn report(&self, line: String) {
+        self.report_as(line.clone(), || line);
+    }
+
+    /// Reports the line that `line` makes, unless one with the same `key` was reported before.
+    /// `line` runs only for a new key, and outside the lock, so that what it costs is paid once.
+    fn report_as(&self, key: String, line: impl FnOnce() -> String) {
+        let ending = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if state.ended || state.seen.contains(&key) {
+                return;
+            }
+            if state.seen.len() < MOST_LINES {
+                state.seen.insert(key);
+                false
+            } else {
+                state.ended = true;
+                true
+            }
+        };
+        let line = if ending {
+            format!("{MOST_LINES} egress lines written, the most in one run; no more follow")
+        } else {
+            line()
+        };
+        self.lines.send(format!("{EXPLAIN_PREFIX}{line}\n"));
+    }
 }
 
 /// Raises this process's soft limit of open descriptors so that `MAX_CONNECTIONS` fit, two
@@ -90,9 +172,15 @@ fn serve_broker<L, A, H, R>(
     H: HostNetwork + Send + Sync + 'static,
     R: Fn(&TcpStream) -> bool + Send + Sync + 'static,
 {
-    let connections = Connections::new(MAX_CONNECTIONS, Some(THREAD_STACK), move |client| {
+    let explain = broker.explain.clone();
+    let mut connections = Connections::new(MAX_CONNECTIONS, Some(THREAD_STACK), move |client| {
         let _ = broker.handle(client);
     });
+    if let Some(explain) = explain {
+        connections = connections.reporting_full(Arc::new(move |limit| {
+            explain.report(full_line(limit));
+        }));
+    }
     serve_connections_until(vec![(listener, connections)], accept, stop, drain);
 }
 
@@ -102,6 +190,13 @@ struct Broker<H, R> {
     reach: EgressReach,
     host: H,
     reached_host: R,
+    explain: Option<Arc<Explain>>,
+}
+
+/// The line for a connection closed at once because `limit` connections are open. A relay in
+/// front of the broker (Windows) writes it too.
+pub fn full_line(limit: usize) -> String {
+    format!("an egress connection was closed at once: {limit} are open, the most the broker serves")
 }
 
 impl<H, R> Broker<H, R>
@@ -112,23 +207,127 @@ where
     fn handle(&self, client: TcpStream) -> io::Result<()> {
         // A listener that does not block may pass that on to the connections it accepts.
         client.set_nonblocking(false)?;
-        let requested = socks::read_request(&client)?;
+        let requested = match socks::read_request(&client) {
+            Ok(requested) => requested,
+            Err(error) => {
+                if let Some(line) = request_line(&error) {
+                    self.explain(|| line);
+                }
+                return Err(error);
+            }
+        };
         let destination = match destination::check(requested, self.reach, &self.host) {
             Ok(destination) => destination,
-            Err(Refusal::HostUnknown) => return socks::reply(&client, Reply::GeneralFailure),
-            Err(_) => return socks::reply(&client, Reply::NotAllowed),
+            Err(refusal) => {
+                let reply = match refusal {
+                    Refusal::HostUnknown => Reply::GeneralFailure,
+                    _ => Reply::NotAllowed,
+                };
+                let replied = socks::reply(&client, reply);
+                if let Some(explain) = &self.explain {
+                    let key = format!("{requested} {refusal:?}");
+                    explain.report_as(key, || self.refusal_line(requested, &refusal, reply));
+                }
+                return replied;
+            }
         };
         let server = match TcpStream::connect_timeout(&destination, CONNECT_TIMEOUT) {
             Ok(server) => server,
-            Err(error) => return socks::reply(&client, Reply::for_connect_error(&error)),
+            Err(error) => {
+                let reply = Reply::for_connect_error(&error);
+                let replied = socks::reply(&client, reply);
+                self.explain(|| {
+                    format!(
+                        "egress to {destination} failed with reply {}: the connect failed: {error}",
+                        reply as u8
+                    )
+                });
+                return replied;
+            }
         };
         if (self.reached_host)(&server) {
             reset_on_close(raw(&server));
-            return socks::reply(&client, Reply::NotAllowed);
+            let replied = socks::reply(&client, Reply::NotAllowed);
+            self.explain(|| {
+                format!(
+                    "egress to {destination} refused with reply 2: the connection reached this host"
+                )
+            });
+            return replied;
         }
         socks::reply(&client, Reply::Succeeded)?;
         relay_streams_with(client, server, HALF_CLOSED_IDLE, Some(THREAD_STACK))
     }
+
+    fn explain(&self, line: impl FnOnce() -> String) {
+        if let Some(explain) = &self.explain {
+            explain.report(line());
+        }
+    }
+
+    /// The line for a destination that `check` refused with `reply`: the reason, the subnet that
+    /// makes an address the local network, and whether `public-and-local` would allow it.
+    fn refusal_line(&self, requested: SocketAddr, refusal: &Refusal, reply: Reply) -> String {
+        let ip = requested.ip().to_canonical();
+        let reason = match refusal {
+            Refusal::HostSubnet => match self
+                .host
+                .subnets()
+                .ok()
+                .and_then(|subnets| Subnet::holding(&subnets, ip))
+            {
+                Some(subnet) => format!(
+                    "on {subnet}, a network this host reaches without a router, which is the local network"
+                ),
+                None => refusal.to_string(),
+            },
+            _ => refusal.to_string(),
+        };
+        let mut line = format!(
+            "egress to {requested} refused with reply {}: {reason}",
+            reply as u8
+        );
+        // After a host query that failed, another one tells nothing about this refusal.
+        if *refusal != Refusal::HostUnknown
+            && self.reach == EgressReach::Public
+            && destination::check(requested, EgressReach::PublicAndLocal, &self.host).is_ok()
+        {
+            line.push_str("; reach = \"public-and-local\" allows it");
+        }
+        line
+    }
+}
+
+/// The line for a request that `read_request` refused or could not read. The end of the stream
+/// before a request names nothing: a client that only checks the port does that.
+fn request_line(error: &io::Error) -> Option<String> {
+    Some(match Refused::of(error) {
+        Some(refused) if refused.reason == socks::NAMES_NOT_RESOLVED => {
+            "egress to a name refused with reply 8: the broker resolves no names, so the program \
+             has to resolve the name and ask for an address"
+                .to_string()
+        }
+        Some(Refused {
+            reply: Some(reply),
+            reason,
+        }) => format!(
+            "egress request refused with reply {}: {reason}",
+            reply as u8
+        ),
+        Some(Refused {
+            reply: None,
+            reason,
+        }) => format!("egress request refused: {reason}"),
+        None if error.kind() == io::ErrorKind::UnexpectedEof => return None,
+        None if error.kind() == io::ErrorKind::TimedOut => format!(
+            "egress connection closed: no SOCKS5 request within {} seconds",
+            socks::HANDSHAKE_TIMEOUT.as_secs()
+        ),
+        None if error.kind() == io::ErrorKind::InvalidData => {
+            format!("egress connection closed: the program does not speak SOCKS5 to it: {error}")
+        }
+        None => format!("egress connection closed while it read the request: {error}"),
+    })
 }
 
 /// Whether the connection `server` ended at this host after all: its local address is loopback,
@@ -277,6 +476,16 @@ mod tests {
         host: TestHost,
         exempt: Option<IpAddr>,
     ) -> (SocketAddr, Stop, thread::JoinHandle<()>) {
+        start_explained(reach, host, exempt, None)
+    }
+
+    /// `start` with the diagnostic report going to `explain`.
+    fn start_explained(
+        reach: EgressReach,
+        host: TestHost,
+        exempt: Option<IpAddr>,
+        explain: Option<Arc<Explain>>,
+    ) -> (SocketAddr, Stop, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let stop = Stop::new().unwrap();
@@ -288,6 +497,7 @@ mod tests {
                 let peer = server.peer_addr().map(|peer| peer.ip()).ok();
                 peer.is_none() || (peer != exempt && reached_host(server))
             },
+            explain,
         };
         let server = thread::spawn(move || {
             serve_broker(
@@ -639,6 +849,7 @@ mod tests {
                 server.peer_addr().map(|peer| peer.ip()).ok() != Some(stand_in)
                     && reached_host(server)
             },
+            explain: None,
         };
         let server = thread::spawn(move || {
             serve_broker(
@@ -710,6 +921,7 @@ mod tests {
             reach: EgressReach::PublicAndLocal,
             host: host_without(stand_in),
             reached_host: |_: &TcpStream| false,
+            explain: None,
         };
         // The broker ends as soon as the connection has, so a drain longer than `DRAIN` costs
         // nothing here and keeps a slow host from cutting the connection.
@@ -779,6 +991,7 @@ mod tests {
                 },
                 EgressReach::Public,
                 TestHost::default(),
+                None,
                 &request,
                 drain,
             );
@@ -806,10 +1019,16 @@ mod tests {
     fn connections_beyond_the_limit_are_closed() {
         let (release, released) = mpsc::channel::<()>();
         let released = std::sync::Mutex::new(released);
+        let closed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&closed);
         let connections = Connections::new(2, Some(THREAD_STACK), move |client: TcpStream| {
             let _ = released.lock().unwrap().recv();
             let _ = (&client).write_all(b"served");
-        });
+        })
+        .reporting_full(Arc::new(move |limit| {
+            assert_eq!(limit, 2);
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let mut clients = Vec::new();
@@ -824,6 +1043,7 @@ mod tests {
         third.read_to_end(&mut answer).unwrap();
         assert!(answer.is_empty());
         assert_eq!(connections.active(), 2);
+        assert_eq!(closed.load(std::sync::atomic::Ordering::Relaxed), 1);
         for _ in 0..2 {
             release.send(()).unwrap();
         }
@@ -837,5 +1057,209 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(connections.active(), 0);
+    }
+
+    /// A shared buffer for the lines of `Explain`.
+    #[derive(Clone, Default)]
+    struct Lines(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Lines {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Lines {
+        fn read(&self) -> Vec<String> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .map(String::from)
+                .collect()
+        }
+    }
+
+    fn explained(
+        reach: EgressReach,
+        host: TestHost,
+        exempt: Option<IpAddr>,
+    ) -> (SocketAddr, Stop, thread::JoinHandle<()>, Lines) {
+        let lines = Lines::default();
+        let explain = Arc::new(Explain::new(lines.clone()));
+        let (broker, stop, server) = start_explained(reach, host, exempt, Some(explain));
+        (broker, stop, server, lines)
+    }
+
+    /// The report names the reason of each refusal once, the subnet that makes an address the
+    /// local network, and whether `public-and-local` would allow it. The replies stay the same.
+    #[test]
+    fn explain_names_each_refusal_once_with_its_reason() {
+        let host = TestHost {
+            subnets: vec![
+                Subnet::new("10.1.2.0".parse().unwrap(), 24).unwrap(),
+                Subnet::new("1.2.3.0".parse().unwrap(), 24).unwrap(),
+            ],
+            ..TestHost::default()
+        };
+        let (broker, stop, server, lines) = explained(EgressReach::Public, host, None);
+        let local: SocketAddr = "1.2.3.4:80".parse().unwrap();
+        let private: SocketAddr = "10.1.2.3:80".parse().unwrap();
+        let loopback: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        for destination in [local, local, private, loopback] {
+            assert_eq!(connect_through(broker, destination).1, 2, "{destination}");
+        }
+        stop.request();
+        server.join().unwrap();
+        let lines = lines.read();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines.iter().all(|line| line.starts_with(EXPLAIN_PREFIX)),
+            "{lines:?}"
+        );
+        let hint = "; reach = \"public-and-local\" allows it";
+        assert!(
+            lines[0].ends_with(&format!(
+                "egress to 1.2.3.4:80 refused with reply 2: on 1.2.3.0/24, a network this host \
+                 reaches without a router, which is the local network{hint}"
+            )),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].contains("egress to 10.1.2.3:80 refused with reply 2: ")
+                && lines[1].ends_with(hint),
+            "{lines:?}"
+        );
+        assert!(
+            lines[2].contains("egress to 127.0.0.1:80 refused with reply 2: ")
+                && !lines[2].contains("public-and-local"),
+            "{lines:?}"
+        );
+    }
+
+    /// A host that cannot tell, a name and a failed connect each get a line with their reply.
+    #[test]
+    fn explain_names_unknown_hosts_names_and_failed_connects() {
+        let host = TestHost {
+            fails: true,
+            ..TestHost::default()
+        };
+        let (broker, stop, server, lines) = explained(EgressReach::Public, host, None);
+        assert_eq!(connect_through(broker, "1.1.1.1:80".parse().unwrap()).1, 1);
+        let mut stream = TcpStream::connect(broker).unwrap();
+        let mut request = vec![5, 1, 0, 5, 1, 0, 3, 9];
+        request.extend(b"localhost");
+        request.extend([0, 80]);
+        stream.write_all(&request).unwrap();
+        let mut answer = Vec::new();
+        stream.read_to_end(&mut answer).unwrap();
+        // A connection that ends before its request names nothing.
+        drop(TcpStream::connect(broker).unwrap());
+        stop.request();
+        server.join().unwrap();
+        let lines = lines.read();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].ends_with(
+                "egress to 1.1.1.1:80 refused with reply 1: this host could not tell whether the \
+                 address is its own"
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].contains("egress to a name refused with reply 8"),
+            "{lines:?}"
+        );
+
+        let Some(stand_in) = stand_in() else {
+            eprintln!("skipped: this host has no address besides loopback");
+            return;
+        };
+        let unused = TcpListener::bind((stand_in, 0)).unwrap();
+        let target = unused.local_addr().unwrap();
+        drop(unused);
+        let (broker, stop, server, lines) = explained(
+            EgressReach::PublicAndLocal,
+            host_without(stand_in),
+            Some(stand_in),
+        );
+        assert_eq!(connect_through(broker, target).1, 5);
+        stop.request();
+        server.join().unwrap();
+        let lines = lines.read();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains(&format!(
+                "egress to {target} failed with reply 5: the connect failed: "
+            )),
+            "{lines:?}"
+        );
+    }
+
+    /// The report stops after `MOST_LINES` distinct lines and says so once. Lines the queue
+    /// could not take are counted in the report instead.
+    #[test]
+    fn explain_stops_after_its_most_lines() {
+        let lines = Lines::default();
+        let explain = Explain::new(lines.clone());
+        for n in 0..MOST_LINES + 5 {
+            explain.report(format!("line {n}"));
+            explain.report("line 0".to_string());
+        }
+        drop(explain);
+        let lines = lines.read();
+        let dropped: usize = lines
+            .iter()
+            .filter_map(|line| {
+                line.strip_prefix(EXPLAIN_PREFIX)?
+                    .split_once(" egress lines dropped")
+            })
+            .map(|(count, _)| count.parse::<usize>().unwrap())
+            .sum();
+        let named = lines.iter().filter(|line| line.contains(" line ")).count();
+        // The line that ends the report goes through the queue too, so it is written or counted
+        // among the dropped ones.
+        let ended = lines
+            .iter()
+            .filter(|line| line.contains("no more follow"))
+            .count();
+        assert!(ended <= 1, "{lines:?}");
+        assert_eq!(named + dropped + ended, MOST_LINES + 1, "{lines:?}");
+    }
+
+    /// A standard error that takes nothing holds up no report: the lines that do not fit the
+    /// queue are dropped at once, and the end of the broker waits at most `FINAL_WRITE`.
+    #[test]
+    fn a_stalled_standard_error_holds_up_no_report() {
+        struct Stalled(Arc<Mutex<mpsc::Receiver<()>>>);
+        impl Write for Stalled {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let _ = self.0.lock().unwrap().recv();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (release, stalled) = mpsc::channel::<()>();
+        let explain = Explain::new(Stalled(Arc::new(Mutex::new(stalled))));
+        let started = Instant::now();
+        for n in 0..MOST_LINES {
+            explain.report(format!("line {n}"));
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(explain.lines.dropped() > 0);
+        let ending = Instant::now();
+        drop(explain);
+        assert!(ending.elapsed() < crate::report::FINAL_WRITE + Duration::from_secs(1));
+        drop(release);
     }
 }

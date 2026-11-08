@@ -837,7 +837,7 @@ often invisible: a program that cannot read a path treats the file as missing an
 less than it was built for, and neither its output nor its logs say so. Without the mode the
 only way to find such a path is to widen the policy until the program behaves differently.
 
-The mode is off by default, and it must not weaken the sandbox. Three rules follow from that.
+The mode is off by default, and it must not weaken the sandbox. Four rules follow from that.
 
 **Observing is sound where deciding would not be.** On Linux the mode installs one more seccomp
 filter in the program, which returns `SECCOMP_RET_USER_NOTIF` for the calls that take a path and
@@ -866,19 +866,32 @@ answer, and the calls that take two paths are not watched. An integrator who rea
 "nothing was denied" would be wrong, so a backend that cannot report at all refuses the option
 instead of printing nothing.
 
-What the mode costs: two context switches per watched call, sandy as the program's parent, a
-program that outlives sandy whose watched calls then fail with `ENOSYS`, and `EINTR` from a
-watched call that a signal interrupts while it waits, in a program whose handler does not
-restart calls. That is why it is opt in and documented as a tool for working out a policy. It
-also runs a watcher in sandy's own process for as long as the program runs, which parses bytes
-the program controls; it reads at most one path of bounded length per call and never acts on
-what it reads. On Linux the watcher is a thread with a seccomp filter of its own, which ends
-sandy at any call the watcher does not need. The thread shares its memory with sandy's
-unconfined main thread, so the filter narrows what a flaw in the parsing reaches without walling
-it off. The lines go to standard error through a queue that a thread of sandy writes from, so a
-standard error that nobody reads holds up neither the watcher nor the end of sandy: lines that
-do not fit are dropped and counted in the report, and at the end sandy waits at most a second
-for what is queued.
+**The egress broker reports what it decides, on every platform.** The broker already decides
+every connection itself (see "Egress broker"), so with `--explain` it writes one line for each
+connection it refuses or cannot make: the destination, the SOCKS5 reply, the reason, and whether
+`reach = "public-and-local"` would allow it. Nothing is observed from outside, so this part
+misses no refusal of the broker by itself: each reaches the report, up to 1000 distinct lines a
+run, unless the queue below is full, and then the report says how many lines it dropped. It
+reports after it answered, through a bounded queue to a thread of its own that writes each line
+with one write, drops what does not fit and says how many lines it dropped, and ignores a failed
+write, so neither the report nor a standard error that nobody reads can change or delay an
+answer. A backend that cannot name denied paths (macOS, Windows) accepts `--explain` for a
+policy with `network.egress`, says in its first line that paths are not named, and refuses the
+option for a policy without one.
+
+What the path report of Linux costs: two context switches per watched call, sandy as the
+program's parent, a program that outlives sandy whose watched calls then fail with `ENOSYS`, and
+`EINTR` from a watched call that a signal interrupts while it waits, in a program whose handler
+does not restart calls. That is why it is opt in and documented as a tool for working out a
+policy. It also runs a watcher in sandy's own process for as long as the program runs, which
+parses bytes the program controls; it reads at most one path of bounded length per call and
+never acts on what it reads. On Linux the watcher is a thread with a seccomp filter of its own,
+which ends sandy at any call the watcher does not need. The thread shares its memory with
+sandy's unconfined main thread, so the filter narrows what a flaw in the parsing reaches without
+walling it off. The lines go to standard error through a queue that a thread of sandy writes
+from, so a standard error that nobody reads holds up neither the watcher nor the end of sandy:
+lines that do not fit are dropped and counted in the report, and at the end sandy waits at most
+a second for what is queued.
 
 ## Mechanisms (each backend section is owned by its backend)
 

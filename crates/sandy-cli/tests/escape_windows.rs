@@ -4389,6 +4389,15 @@ fn egress_refuses_a_name() {
     assert_eq!(line.detail, "reply 8", "{line:?}");
 }
 
+/// `--explain` names the broker's refusals and their reasons (`assert_egress_explained`), also
+/// though the Windows backend cannot name denied paths.
+#[test]
+fn egress_explain_names_the_refusals() {
+    let fixture = Fixture::new("egress-explain");
+    let port = free_port();
+    assert_egress_explained(&egress_args(&fixture, port, "public"), port);
+}
+
 /// The broker is in the program's relay job, so it ends with the program, and sandy waits until
 /// it is gone before it exits. Its process is a `sandy.exe` child of the run, like the relays.
 #[test]

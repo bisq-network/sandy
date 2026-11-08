@@ -1162,6 +1162,16 @@ fn the_broker_refuses_names_with_reply_8() {
     }
 }
 
+/// `--explain` names the broker's refusals and their reasons (`assert_egress_explained`).
+#[test]
+fn explain_names_the_refusals_of_the_broker() {
+    if !private_network_works() {
+        return;
+    }
+    let port = free_port();
+    assert_egress_explained(&egress(port, "public"), port);
+}
+
 /// The inode of a socket at 127.0.0.1:`port` in `state` (`0A` listens, `01` is connected) in
 /// the network namespace of process `pid`, which sees that namespace in `/proc/PID/net/tcp`.
 fn socket_at(pid: u32, port: u16, state: &str) -> Option<String> {

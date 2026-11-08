@@ -518,6 +518,36 @@ pub fn probe_inside(sandbox_args: &[String], actions: &[(&str, &str)]) -> Vec<Pr
     lines
 }
 
+/// With `--explain`, the egress broker on `port` names each refusal on standard error with its
+/// reply and reason, and answers the program as without it. Control: the same run without
+/// `--explain` prints no such line. `sandbox_args` set up the broker under `reach = "public"`.
+pub fn assert_egress_explained(sandbox_args: &[String], port: u16) {
+    let private = format!("127.0.0.1:{port}\u{1f}10.1.2.3:80");
+    let name = format!("127.0.0.1:{port}\u{1f}example.com:80");
+    let actions = [
+        ("socks5-connect", private.as_str()),
+        ("socks5-connect", name.as_str()),
+    ];
+    let mut explained = sandbox_args.to_vec();
+    explained.push("--explain".to_string());
+    for (args, explain) in [(sandbox_args.to_vec(), false), (explained, true)] {
+        let output = sandy(run_args(&args, &actions));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{output:?}");
+        let lines = parse(&output);
+        assert_eq!(lines[0].detail, "reply 2", "{lines:?}");
+        assert_eq!(lines[1].detail, "reply 8", "{lines:?}");
+        let expected = [
+            "sandy explain: on for egress.",
+            "sandy explain: egress to 10.1.2.3:80 refused with reply 2: ",
+            "sandy explain: egress to a name refused with reply 8: ",
+        ];
+        for line in expected {
+            assert_eq!(stderr.contains(line), explain, "{line} in {stderr}");
+        }
+    }
+}
+
 /// Runs `actions` outside and inside the sandbox. All must succeed outside.
 pub fn controlled(sandbox_args: &[String], actions: &[(&str, &str)]) -> Vec<ProbeLine> {
     for line in probe_outside(actions) {
