@@ -187,9 +187,9 @@ writable and executable through a second name is the link question of "Links and
 
 `check` reads the permissions of the path itself. When `run` adds the entry, it also walks the
 tree below the path and refuses a descendant whose own permissions may give one of them execute,
-below a `read_exec` path one that may give them write, in the same walk that refuses junctions. The walk runs only where sandy changes something, so it
-does not slow down a plan, and `check` can report a policy as enforceable that `run` then
-refuses for a file below the path. What outside software adds after the walk is not seen; the
+below a `read_exec` path one that may give them write, in the same walk that refuses junctions.
+The walk runs only where sandy changes something, so it does not slow down a plan, and `check`
+can report a policy as enforceable that `run` then refuses for a file below the path. What outside software adds after the walk is not seen; the
 program cannot add it, because it holds no right to change permissions outside its profile
 folder.
 
@@ -262,9 +262,28 @@ create, remove and move what lies below the path, and write a read-write file, b
 remove nor move the path itself, as on Linux, where removing an entry is a right on its parent,
 and on macOS, whose profile denies it. Measured on Windows 11 build 26200 before the split: the
 program removed an empty read-write directory and moved a read-write directory and a read-write
-file into another read-write path (`a_read_write_path_itself_cannot_be_removed_or_moved`). A
-grant that an earlier version of sandy wrote with `DELETE` on the path is replaced by the two
-entries at the next run.
+file into another read-write path (`a_read_write_path_itself_cannot_be_removed_or_moved`).
+
+A grant that an earlier version of sandy wrote, one entry with `DELETE` on the path, is not the
+grant `acl::lacks_grant` looks for, so the next run replaces it with the two entries like a new
+grant. For a directory that means, once per such path, what a first grant costs: the walk of the
+tree below it (see "What every AppContainer can read") and a write of the DACL with
+`SetNamedSecurityInfoW`, which propagates the inherited entries to every file and directory
+below. Some consequences of treating it as a new grant:
+
+- The walk can refuse a policy that worked with the earlier version, when a file or directory
+  below the path has gained a junction or an entry that the walk refuses since the old grant was
+  written.
+- Replacing the entries needs the right to change the DACL of the path (`WRITE_DAC`), as a
+  first grant does. A path whose old grant came from a run with rights the current user lacks,
+  an elevated one for example, is now a conflict of `check` and `run` for this user, as any
+  policy path whose grant the current user may not add, until a run with those rights replaces
+  it.
+- Runs of an earlier and of this version on the same path each find the other's entries not
+  theirs and write their own, so the entries change at every run that alternates, with a walk and
+  a propagation each time. While a run of the earlier version holds its entry, a program of this
+  version on the same path can remove or move the path itself. One version of sandy per machine
+  avoids it.
 
 Without `FILE_EXECUTE`, Windows does not load a file as a program or library. The program can
 still read the bytes of a file; this backend, like the others, does not prevent code that the
@@ -565,6 +584,11 @@ about the others, because the programs outside the sandbox may run with another 
 `XDG_CONFIG_HOME`, which Git for Windows honours too, and `.config` below each `<home>`. The
 git, SSH, GnuPG and cargo rows are the list of Linux and macOS (`sandy_core::trust::tool_configs`),
 so one policy is refused on every platform for the same files.
+`refuses_a_writable_path_over_the_git_and_gnupg_configuration` checks them with `USERPROFILE` and
+`HOME` pointed at a fixture, `refuses_a_writable_path_over_the_git_configuration_of_other_homes`
+with `HOMEDRIVE` and `HOMEPATH` and with a `HOME` without a drive. A location that does not
+exist counts, because the program could create it. Paths are compared by file identity, as rules
+3 and 4 compare them (see "Links and identity").
 
 Git's system configuration on Windows, `C:\Program Files\Git\etc\gitconfig` for both Git for
 Windows and libgit2, lies in a system directory, which no writable path may reach anyway.
@@ -577,11 +601,6 @@ folder holding `Git\config`, `git config --show-origin --list --system` listed o
 protected from the known folder and from the variable, like the profile, and
 `refuses_a_writable_path_over_the_program_data_git_configuration` checks it with `PROGRAMDATA`
 pointed at a fixture.
-`refuses_a_writable_path_over_the_git_and_gnupg_configuration` checks them with `USERPROFILE` and
-`HOME` pointed at a fixture, `refuses_a_writable_path_over_the_git_configuration_of_other_homes`
-with `HOMEDRIVE` and `HOMEPATH` and with a `HOME` without a drive. A location that does not exist counts,
-because the program could create it. Paths are compared by file identity, as rules 3 and 4 compare
-them (see "Links and identity").
 
 Every absolute directory on sandy's `PATH` (`sys::path_locations`) is such a location too, and
 rule 12 warns about it instead of refusing it, because a writable path that holds one is

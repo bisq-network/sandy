@@ -1715,7 +1715,8 @@ mod tests {
         assert_eq!(check_rights(&executable(&own), &[]), Ok(()));
         assert!(matches!(
             check_rights(&executable(&own), std::slice::from_ref(&program)),
-            Err(Problem::Conflict(reason)) if reason.contains("SID S-1-15-2-99 of the sandbox's own token")
+            Err(Problem::Conflict(reason))
+                if reason.contains("SID S-1-15-2-99 of the sandbox's own token")
         ));
 
         let below = directory("exec-below");
