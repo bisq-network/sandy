@@ -975,6 +975,8 @@ fn same_object_among_ancestors(inner: &Path, outer: &Path) -> Option<bool> {
 struct Mounts {
     /// Mount point and the path of the mount's root inside its file system, in mount order.
     entries: Vec<(PathBuf, PathBuf)>,
+    /// The file system of each entry: the device of its superblock, as `8:2`.
+    filesystems: Vec<String>,
 }
 
 #[cfg(target_os = "linux")]
@@ -993,18 +995,26 @@ impl Mounts {
         Ok(Mounts::parse(&text))
     }
 
-    /// Fields 4 and 5 of each line are the mount root and the mount point (`proc(5)`).
+    /// Fields 4 and 5 of each line are the mount root and the mount point, and field 3 the
+    /// device of the file system, `major:minor` of its superblock (`proc(5)`): bind mounts and
+    /// btrfs subvolumes of one file system share it, whatever source the mount names.
     fn parse(table: &[u8]) -> Mounts {
-        let entries = table
-            .split(|byte| *byte == b'\n')
-            .filter_map(|line| {
-                let mut fields = line.split(|byte| *byte == b' ');
-                let root = unescape(fields.nth(3)?);
-                let point = unescape(fields.next()?);
-                Some((point, root))
-            })
-            .collect();
-        Mounts { entries }
+        let mut entries = Vec::new();
+        let mut filesystems = Vec::new();
+        for line in table.split(|byte| *byte == b'\n') {
+            let fields: Vec<&[u8]> = line.split(|byte| *byte == b' ').collect();
+            let (Some(device), Some(root), Some(point)) =
+                (fields.get(2), fields.get(3), fields.get(4))
+            else {
+                continue;
+            };
+            entries.push((unescape(point), unescape(root)));
+            filesystems.push(String::from_utf8_lossy(device).into_owned());
+        }
+        Mounts {
+            entries,
+            filesystems,
+        }
     }
 
     /// The location of `path` inside the file system that holds it, or `None` when no mount
@@ -1025,6 +1035,31 @@ impl Mounts {
         }
         let (point, root) = best?;
         Some(root.join(path.strip_prefix(point).ok()?))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Mounts {
+    /// Every mount point, as the table names them, with its file system, in mount order.
+    fn points(&self) -> Vec<(PathBuf, String)> {
+        self.entries
+            .iter()
+            .zip(&self.filesystems)
+            .map(|((point, _), filesystem)| (point.clone(), filesystem.clone()))
+            .collect()
+    }
+
+    /// The file system of the mount that holds `path`: of the longest mount point on its way,
+    /// the last one mounted there. `path` must be canonical. `None` when no mount matches.
+    fn filesystem_of(&self, path: &Path) -> Option<String> {
+        let mut best: Option<(usize, &String)> = None;
+        for ((point, _), filesystem) in self.entries.iter().zip(&self.filesystems) {
+            let length = point.as_os_str().len();
+            if path.starts_with(point) && best.is_none_or(|(longest, _)| length >= longest) {
+                best = Some((length, filesystem));
+            }
+        }
+        best.map(|(_, filesystem)| filesystem.clone())
     }
 }
 
@@ -1100,6 +1135,72 @@ impl Mounts {
     fn read() -> Result<Mounts, PolicyError> {
         Ok(Mounts)
     }
+}
+
+/// Every mount point (`getfsstat`) with its file system, its `f_fsid`, as given and canonical,
+/// so that one below a writable path is found whichever spelling the path has. An empty list
+/// when the call fails: the walk then covers the writable paths themselves.
+#[cfg(target_os = "macos")]
+impl Mounts {
+    fn points(&self) -> Vec<(PathBuf, String)> {
+        use std::ffi::CStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        // SAFETY: a null buffer asks only for the number of mounted file systems.
+        let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+        let Ok(count) = usize::try_from(count) else {
+            return Vec::new();
+        };
+        // Room for a few mounts that appear in between.
+        let mut entries: Vec<libc::statfs> = Vec::with_capacity(count + 8);
+        let size = entries.capacity() * size_of::<libc::statfs>();
+        // SAFETY: the buffer holds `capacity` entries, whose size in bytes is passed; the call
+        // writes at most that many and returns how many it wrote.
+        let written =
+            unsafe { libc::getfsstat(entries.as_mut_ptr(), size as libc::c_int, libc::MNT_NOWAIT) };
+        let Ok(written) = usize::try_from(written) else {
+            return Vec::new();
+        };
+        // SAFETY: getfsstat initialized the first `written` entries, at most the capacity.
+        unsafe { entries.set_len(written.min(entries.capacity())) };
+        let mut points = Vec::new();
+        for entry in &entries {
+            // SAFETY: f_mntonname is a NUL-terminated array.
+            let name = unsafe { CStr::from_ptr(entry.f_mntonname.as_ptr()) };
+            let filesystem = fsid(entry);
+            let point = PathBuf::from(std::ffi::OsStr::from_bytes(name.to_bytes()));
+            if let Ok(canonical) = point.canonicalize()
+                && canonical != point
+            {
+                points.push((canonical, filesystem.clone()));
+            }
+            points.push((point, filesystem));
+        }
+        points
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Mounts {
+    /// The file system that holds `path`, by `statfs`, which follows a firmlink to the volume
+    /// it leads to, so `/Users` and `/System/Volumes/Data/Users` name one. `None` when it fails.
+    fn filesystem_of(&self, path: &Path) -> Option<String> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        // SAFETY: an all-zero statfs is a valid value of the plain C struct.
+        let mut info: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: the path is NUL-terminated and info a statfs the call writes.
+        (unsafe { libc::statfs(path.as_ptr(), &mut info) } == 0).then(|| fsid(&info))
+    }
+}
+
+/// The file system ID of `info`, which tells one mounted volume from another.
+#[cfg(target_os = "macos")]
+fn fsid(info: &libc::statfs) -> String {
+    // SAFETY: fsid_t is two 32-bit integers, whose field the libc crate keeps private.
+    let [first, second]: [i32; 2] = unsafe { std::mem::transmute(info.f_fsid) };
+    format!("{first}:{second}")
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1284,66 +1385,134 @@ fn linked_file(path: &Path) -> Result<Option<FileId>, PolicyError> {
     Ok(entry.linked.then_some(entry.id))
 }
 
+/// The files sandy itself trusts, which no policy path names: a second name inside a writable
+/// path would let the program rewrite them for the next start, whoever made it. Only a file with
+/// more than one name is looked for.
+fn check_no_writable_trusted_name(
+    files: &[PathBuf],
+    rules: &[PathRule],
+    mounts: &Mounts,
+) -> Result<(), PolicyError> {
+    let mut linked = Vec::new();
+    for file in files {
+        if let Some(id) = linked_file(file)? {
+            linked.push((file, id));
+        }
+    }
+    if linked.is_empty() {
+        return Ok(());
+    }
+    match second_name(&linked, rules, mounts)? {
+        Some((file, name)) => Err(PolicyError::TrustedFileWritable {
+            path: file.clone(),
+            through: name.path,
+            writable: name.writable,
+        }),
+        None => Ok(()),
+    }
+}
+
 /// A name inside a writable path, and the writable path that holds it.
-#[derive(Clone)]
 struct WritableName {
     path: PathBuf,
     writable: PathBuf,
 }
 
-/// The names inside the writable paths that files with more than one name have there. On Unix
-/// the writable trees are walked once, when the first question needs it.
-struct WritableNames<'a> {
-    rules: &'a [PathRule],
-    #[cfg(unix)]
-    walked: Option<std::collections::HashMap<FileId, WritableName>>,
-}
+/// The first of `linked` that has a name inside a writable path, with that name. A hard link
+/// stays on its file system, so only the parts of the writable trees on the file systems of
+/// `linked` are walked. A file system is the device of a mount's superblock on Linux and the
+/// volume `statfs` names on macOS (`Mounts::filesystem_of`): each writable path whose file
+/// system, and each mount point inside one whose file system, is one of theirs, is a root of the
+/// walk, and a mount point of another file system is not entered. A change of device that no
+/// mount shows, as a btrfs subvolume or an overlay's layers make, stays inside the walk. A path
+/// whose file system cannot be told counts as one of theirs. The mount points are those of
+/// the table read at the start; one mounted since is walked as part of the tree that holds it.
+#[cfg(unix)]
+fn second_name<'a>(
+    linked: &[(&'a PathBuf, FileId)],
+    rules: &[PathRule],
+    mounts: &Mounts,
+) -> Result<Option<(&'a PathBuf, WritableName)>, PolicyError> {
+    use std::collections::{HashMap, HashSet};
 
-impl<'a> WritableNames<'a> {
-    fn new(rules: &'a [PathRule]) -> Self {
-        WritableNames {
-            rules,
-            #[cfg(unix)]
-            walked: None,
+    // The file system at each mount point: the last mount there covers the earlier ones.
+    let mut at: HashMap<PathBuf, String> = HashMap::new();
+    for (point, filesystem) in mounts.points() {
+        at.insert(point, filesystem);
+    }
+    let filesystem_of = |path: &Path| mounts.filesystem_of(path);
+    let wanted: Vec<Option<String>> = linked.iter().map(|(file, _)| filesystem_of(file)).collect();
+    let theirs = |filesystem: Option<&String>| {
+        filesystem.is_none()
+            || wanted
+                .iter()
+                .any(|w| w.is_none() || w.as_ref() == filesystem)
+    };
+    for rule in rules
+        .iter()
+        .filter(|rule| rule.access == PathAccess::ReadWrite)
+    {
+        let inside: Vec<(&PathBuf, &String)> = at
+            .iter()
+            .filter(|(point, _)| point.starts_with(&rule.path) && **point != rule.path)
+            .collect();
+        let mut roots = Vec::new();
+        if theirs(filesystem_of(&rule.path).as_ref()) {
+            roots.push(rule.path.clone());
+        }
+        let mut skip = HashSet::new();
+        for (point, filesystem) in &inside {
+            if theirs(Some(filesystem)) {
+                roots.push((*point).clone());
+            } else {
+                skip.insert((*point).clone());
+            }
+        }
+        let mut found = None;
+        let mut entered = HashSet::new();
+        for root in roots {
+            for_each_linked_file(&root, &skip, &mut entered, &mut |path, id| match linked
+                .iter()
+                .find(|(_, linked)| *linked == id)
+            {
+                Some((file, _)) => {
+                    found = Some((
+                        *file,
+                        WritableName {
+                            path: path.to_path_buf(),
+                            writable: rule.path.clone(),
+                        },
+                    ));
+                    ControlFlow::Break(())
+                }
+                None => ControlFlow::Continue(()),
+            })
+            .map_err(|source| PolicyError::Unreadable {
+                path: rule.path.clone(),
+                source,
+            })?;
+            if found.is_some() {
+                return Ok(found);
+            }
         }
     }
+    Ok(None)
+}
 
-    /// Every name below a writable path that its file shares with another name, by identity.
-    #[cfg(unix)]
-    fn walked(&mut self) -> Result<&std::collections::HashMap<FileId, WritableName>, PolicyError> {
-        let walked = match self.walked.take() {
-            Some(walked) => walked,
-            None => writable_names(self.rules)?,
-        };
-        Ok(self.walked.insert(walked))
-    }
-
-    /// The name inside a writable path of the file at `path`, whose identity is `id`.
-    #[cfg(unix)]
-    fn of_file(
-        &mut self,
-        _path: &Path,
-        id: FileId,
-        _mounts: &Mounts,
-    ) -> Result<Option<WritableName>, PolicyError> {
-        Ok(self.walked()?.get(&id).cloned())
-    }
-
-    /// Windows lists the names of a file, so a single file needs no walk. That matters there:
-    /// the programs in `System32` have a second name in the component store.
-    #[cfg(windows)]
-    fn of_file(
-        &mut self,
-        path: &Path,
-        _id: FileId,
-        mounts: &Mounts,
-    ) -> Result<Option<WritableName>, PolicyError> {
-        let names = windows::names(path).map_err(|source| PolicyError::Unreadable {
-            path: path.to_path_buf(),
+/// Windows lists the names of a file, so a file needs no walk. That matters there: the programs
+/// in `System32` have a second name in the component store.
+#[cfg(windows)]
+fn second_name<'a>(
+    linked: &[(&'a PathBuf, FileId)],
+    rules: &[PathRule],
+    mounts: &Mounts,
+) -> Result<Option<(&'a PathBuf, WritableName)>, PolicyError> {
+    for (file, _) in linked {
+        let names = windows::names(file).map_err(|source| PolicyError::Unreadable {
+            path: file.to_path_buf(),
             source,
         })?;
-        let writable = self
-            .rules
+        let writable = rules
             .iter()
             .filter(|rule| rule.access == PathAccess::ReadWrite);
         for rule in writable {
@@ -1351,67 +1520,22 @@ impl<'a> WritableNames<'a> {
                 .iter()
                 .find(|name| is_within(name, &rule.path, mounts))
             {
-                return Ok(Some(WritableName {
-                    path: name.clone(),
-                    writable: rule.path.clone(),
-                }));
+                return Ok(Some((
+                    *file,
+                    WritableName {
+                        path: name.clone(),
+                        writable: rule.path.clone(),
+                    },
+                )));
             }
         }
-        Ok(None)
     }
-}
-
-/// The files sandy itself trusts, which no policy path names: a second name inside a writable
-/// path would let the program rewrite them for the next start, whoever made it.
-fn check_no_writable_trusted_name(
-    files: &[PathBuf],
-    rules: &[PathRule],
-    mounts: &Mounts,
-) -> Result<(), PolicyError> {
-    let mut writable = WritableNames::new(rules);
-    for file in files {
-        let Some(id) = linked_file(file)? else {
-            continue;
-        };
-        if let Some(name) = writable.of_file(file, id, mounts)? {
-            return Err(PolicyError::TrustedFileWritable {
-                path: file.clone(),
-                through: name.path,
-                writable: name.writable,
-            });
-        }
-    }
-    Ok(())
-}
-
-/// Every name below a writable path that its file shares with another name, by identity.
-#[cfg(unix)]
-fn writable_names(
-    rules: &[PathRule],
-) -> Result<std::collections::HashMap<FileId, WritableName>, PolicyError> {
-    let mut names = std::collections::HashMap::new();
-    let writable = rules
-        .iter()
-        .filter(|rule| rule.access == PathAccess::ReadWrite);
-    for rule in writable {
-        for_each_linked_file(&rule.path, &mut |path, id| {
-            names.entry(id).or_insert_with(|| WritableName {
-                path: path.to_path_buf(),
-                writable: rule.path.clone(),
-            });
-            ControlFlow::Continue(())
-        })
-        .map_err(|source| PolicyError::Unreadable {
-            path: rule.path.clone(),
-            source,
-        })?;
-    }
-    Ok(names)
+    Ok(None)
 }
 
 /// Calls `visit` for every regular file with more than one name at or below `root`. Symbolic
-/// links (on Windows also junctions) are not followed, and a directory is entered once, so an
-/// alias of a directory inside itself cannot make the walk endless.
+/// links are not followed, the directories `skip` are not entered, and a directory is entered
+/// once (`entered`), so an alias of a directory inside itself cannot make the walk endless.
 ///
 /// Entries that disappear while the walk runs are skipped, and so are directories this user may
 /// not list: the program runs as the same user, so it cannot list them either, and a name it
@@ -1420,9 +1544,10 @@ fn writable_names(
 #[cfg(unix)]
 fn for_each_linked_file(
     root: &Path,
+    skip: &std::collections::HashSet<PathBuf>,
+    entered: &mut std::collections::HashSet<FileId>,
     visit: &mut impl FnMut(&Path, FileId) -> ControlFlow<()>,
 ) -> std::io::Result<()> {
-    let mut entered = std::collections::HashSet::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(path) = pending.pop() {
         let entry = match entry(&path) {
@@ -1436,7 +1561,7 @@ fn for_each_linked_file(
             }
             continue;
         }
-        if !entered.insert(entry.id) {
+        if skip.contains(&path) || !entered.insert(entry.id) {
             continue;
         }
         let entries = match std::fs::read_dir(&path) {
@@ -2892,6 +3017,163 @@ mod tests {
                 if *through == data.join("other.toml")),
             "{error}"
         );
+    }
+
+    /// The walk enters no directory it is told to skip, as it skips the mount points of other
+    /// file systems. Control: the same walk without the skip finds both names.
+    #[cfg(unix)]
+    #[test]
+    fn the_second_name_walk_skips_what_it_is_told_to() {
+        let root = temp_dir();
+        let below = root.join("below");
+        fs::create_dir_all(&below).unwrap();
+        fs::write(below.join("file"), b"").unwrap();
+        fs::hard_link(below.join("file"), below.join("name")).unwrap();
+        let walk = |skip: std::collections::HashSet<PathBuf>| {
+            let mut found = Vec::new();
+            for_each_linked_file(&root, &skip, &mut Default::default(), &mut |path, _| {
+                found.push(path.to_path_buf());
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+            found
+        };
+        assert_eq!(walk(Default::default()).len(), 2);
+        assert!(walk([below].into()).is_empty());
+    }
+
+    /// A mount of the linked file's file system inside a writable path of another one is a root
+    /// of the walk of its own: a writable path on one tmpfs, with the directory of a linked file
+    /// on a second tmpfs bound inside it, holds a second name of the file. Control: without the
+    /// bind mount nothing is found. Mounting needs a user and mount namespace; the test runs
+    /// itself again inside one and passes without one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_mount_inside_a_writable_path_is_walked_for_second_names() {
+        if !in_mount_namespace("a_mount_inside_a_writable_path_is_walked_for_second_names") {
+            return;
+        }
+        let root = temp_dir();
+        let (files, writable) = (root.join("files"), root.join("writable"));
+        fs::create_dir_all(&files).unwrap();
+        fs::create_dir_all(&writable).unwrap();
+        let trusted = files.join("sandy");
+        let mount = |args: &[&str]| {
+            let status = std::process::Command::new("mount")
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "mount {args:?}");
+        };
+        // Two tmpfs are two file systems for the walk.
+        mount(&["-t", "tmpfs", "tmpfs", files.to_str().unwrap()]);
+        fs::write(&trusted, b"").unwrap();
+        fs::hard_link(&trusted, files.join("second")).unwrap();
+        mount(&["-t", "tmpfs", "tmpfs", writable.to_str().unwrap()]);
+        let inside = writable.join("bound");
+        fs::create_dir(&inside).unwrap();
+        let rules = [PathRule {
+            path: writable.clone(),
+            access: PathAccess::ReadWrite,
+            is_dir: true,
+        }];
+        let id = linked_file(&trusted).unwrap().unwrap();
+        let found = |rules: &[PathRule]| {
+            // The table as it is now: `Mounts::read` keeps the first one of the namespace.
+            let table = Mounts::parse(&fs::read(Mounts::TABLE).unwrap());
+            second_name(&[(&trusted, id)], rules, &table)
+                .unwrap()
+                .map(|(_, name)| name.path)
+        };
+        assert_eq!(found(&rules), None);
+        mount(&["--bind", files.to_str().unwrap(), inside.to_str().unwrap()]);
+        let name = found(&rules).expect("the second name below the mount");
+        assert!(name.starts_with(&inside), "{}", name.display());
+    }
+
+    /// Runs the test `name` again as root of a user and mount namespace of its own and returns
+    /// false, or returns true inside that namespace. A host without the namespaces skips it.
+    #[cfg(target_os = "linux")]
+    fn in_mount_namespace(name: &str) -> bool {
+        const INSIDE: &str = "SANDY_CORE_TEST_IN_MOUNT_NAMESPACE";
+        if std::env::var_os(INSIDE).is_some() {
+            return true;
+        }
+        let output = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                &format!("resolve::tests::{name}"),
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env(INSIDE, "1")
+            .output();
+        match output {
+            Ok(output) if String::from_utf8_lossy(&output.stdout).contains("running 1 test") => {
+                assert!(output.status.success(), "{output:?}");
+            }
+            other => eprintln!("skipped: no user and mount namespace: {other:?}"),
+        }
+        false
+    }
+
+    /// An overlay without `xino` whose layers lie on different file systems reports the
+    /// overlay's device for its directories and the layer's for its files. The walk judges
+    /// mounts by their file system, not directories by their device, so the second name of a
+    /// file seen through the overlay is found. A kernel without overlays in user namespaces
+    /// skips it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_second_name_walk_enters_an_overlay() {
+        use std::os::unix::fs::MetadataExt;
+
+        if !in_mount_namespace("the_second_name_walk_enters_an_overlay") {
+            return;
+        }
+        let root = temp_dir();
+        let [lower, upper, merged] = ["lower", "upper", "merged"].map(|name| root.join(name));
+        for dir in [&lower, &upper, &merged] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let mount = |args: &[&str], dir: &Path| {
+            std::process::Command::new("mount")
+                .args(args)
+                .arg(dir)
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(mount(&["-t", "tmpfs", "tmpfs"], &lower));
+        assert!(mount(&["-t", "tmpfs", "tmpfs"], &upper));
+        fs::create_dir_all(lower.join("d")).unwrap();
+        fs::write(lower.join("d/sandy"), b"").unwrap();
+        fs::hard_link(lower.join("d/sandy"), lower.join("d/second")).unwrap();
+        fs::create_dir_all(upper.join("data")).unwrap();
+        fs::create_dir_all(upper.join("work")).unwrap();
+        let options = format!(
+            "lowerdir={},upperdir={},workdir={},xino=off",
+            lower.display(),
+            upper.join("data").display(),
+            upper.join("work").display()
+        );
+        if !mount(&["-t", "overlay", "overlay", "-o", &options], &merged) {
+            eprintln!("skipped: no overlay in a user namespace here");
+            return;
+        }
+        let trusted = merged.join("d/sandy");
+        let file = fs::metadata(&trusted).unwrap().dev();
+        let directory = fs::metadata(merged.join("d")).unwrap().dev();
+        assert_ne!(file, directory, "the layout this test needs");
+        let rules = [PathRule {
+            path: merged.clone(),
+            access: PathAccess::ReadWrite,
+            is_dir: true,
+        }];
+        let id = linked_file(&trusted).unwrap().unwrap();
+        let table = Mounts::parse(&fs::read(Mounts::TABLE).unwrap());
+        let found = second_name(&[(&trusted, id)], &rules, &table).unwrap();
+        assert!(found.is_some(), "the second name in the overlay");
     }
 
     /// A bind mount of a subdirectory of a writable path shares no ancestor with it, so only the
