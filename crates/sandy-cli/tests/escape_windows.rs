@@ -2742,6 +2742,10 @@ fn refuses_a_writable_path_over_the_program_data_git_configuration() {
 /// own executable directory is the control.
 #[test]
 fn refuses_an_executable_path_in_the_appcontainer_profile_folder() {
+    // The control starts a program in the sandbox.
+    if appcontainer_children_blocked() {
+        return;
+    }
     let name = format!("{}.ac-exec", appcontainer_name());
     delete_profile(&name);
     let fixture = Fixture::new("ac-exec");
