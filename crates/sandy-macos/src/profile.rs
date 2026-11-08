@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use sandy_core::{
     ChildProcesses, IpAccess, NetworkAccess, PathAccess, Relays, ResolvedPolicy, SignalScope,
-    SystemAccess,
+    Symlinks, SystemAccess,
 };
 
 use crate::system::{self, SystemAccess as Grant};
@@ -614,16 +614,27 @@ fn protection_rules(writer: &mut Writer, policy: &ResolvedPolicy) {
         &["file-write-unlink", "file-write-create"],
         &filters,
     );
-    writer.comment(
-        "No new symbolic links, named pipes or devices, as on Linux: a process outside that\n\
-         later opens a name in a writable path would follow a link or wait on a pipe that the\n\
-         target left there. Seatbelt checks the type of the new name, also when a rename or a\n\
-         clone creates it.",
-    );
-    writer.line(
-        "(deny file-write-create (vnode-type SYMLINK) (vnode-type FIFO) \
-         (vnode-type CHARACTER-DEVICE) (vnode-type BLOCK-DEVICE))",
-    );
+    if policy.symlinks == Symlinks::Deny {
+        writer.comment(
+            "No new symbolic links, named pipes or devices, as on Linux: a process outside that\n\
+             later opens a name in a writable path would follow a link or wait on a pipe that\n\
+             the target left there. Seatbelt checks the type of the new name, also when a\n\
+             rename or a clone creates it.",
+        );
+        writer.line(
+            "(deny file-write-create (vnode-type SYMLINK) (vnode-type FIFO) \
+             (vnode-type CHARACTER-DEVICE) (vnode-type BLOCK-DEVICE))",
+        );
+    } else {
+        writer.comment(
+            "symlinks = \"allow\": no new named pipes or devices, as on Linux. Seatbelt checks\n\
+             the type of the new name, also when a rename or a clone creates it.",
+        );
+        writer.line(
+            "(deny file-write-create (vnode-type FIFO) (vnode-type CHARACTER-DEVICE) \
+             (vnode-type BLOCK-DEVICE))",
+        );
+    }
     writer.comment(
         "A clone of a directory copies the whole tree, and Seatbelt checks only the new\n\
          directory, not the links and pipes inside it. Clones of files stay possible.",
@@ -759,6 +770,7 @@ mod tests {
             forward: Vec::new(),
             egress: None,
             view: sandy_core::FileView::All,
+            symlinks: sandy_core::Symlinks::Deny,
             signals: SignalScope::Any,
             children: sandy_core::ChildProcesses::Allowed,
             end_with_parent: false,
@@ -870,9 +882,9 @@ mod tests {
   (literal (param "ANCHOR_0")))
 
 ; No new symbolic links, named pipes or devices, as on Linux: a process outside that
-; later opens a name in a writable path would follow a link or wait on a pipe that the
-; target left there. Seatbelt checks the type of the new name, also when a rename or a
-; clone creates it.
+; later opens a name in a writable path would follow a link or wait on a pipe that
+; the target left there. Seatbelt checks the type of the new name, also when a
+; rename or a clone creates it.
 (deny file-write-create (vnode-type SYMLINK) (vnode-type FIFO) (vnode-type CHARACTER-DEVICE) (vnode-type BLOCK-DEVICE))
 
 ; A clone of a directory copies the whole tree, and Seatbelt checks only the new
@@ -1382,6 +1394,38 @@ mod tests {
             .find("(deny mach-lookup (xpc-service-name-prefix \"\"))")
             .unwrap();
         assert!(text.find(allowances[0]).unwrap() > deny);
+    }
+
+    /// `symlinks = "allow"` takes only the symbolic links out of the rule: named pipes,
+    /// devices and directory clones stay denied.
+    #[test]
+    fn symlinks_allow_drops_only_the_link_type() {
+        let deny_lines = |policy: &ResolvedPolicy| -> Vec<String> {
+            generate(policy)
+                .text
+                .lines()
+                .filter(|line| line.contains("vnode-type"))
+                .map(str::to_string)
+                .collect()
+        };
+        let mut policy = typical("/srv");
+        assert_eq!(
+            deny_lines(&policy),
+            [
+                "(deny file-write-create (vnode-type SYMLINK) (vnode-type FIFO) \
+                 (vnode-type CHARACTER-DEVICE) (vnode-type BLOCK-DEVICE))",
+                "(deny file-clone (vnode-type DIRECTORY))",
+            ]
+        );
+        policy.symlinks = Symlinks::Allow;
+        assert_eq!(
+            deny_lines(&policy),
+            [
+                "(deny file-write-create (vnode-type FIFO) (vnode-type CHARACTER-DEVICE) \
+                 (vnode-type BLOCK-DEVICE))",
+                "(deny file-clone (vnode-type DIRECTORY))",
+            ]
+        );
     }
 
     #[test]

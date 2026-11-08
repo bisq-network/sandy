@@ -718,6 +718,7 @@ mod tests {
             forward: Vec::new(),
             egress: None,
             view: sandy_core::FileView::All,
+            symlinks: sandy_core::Symlinks::Deny,
             signals,
             children: sandy_core::ChildProcesses::Allowed,
             end_with_parent: false,

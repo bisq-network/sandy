@@ -1464,7 +1464,7 @@ before the sandbox is refused on a standard stream and closed on every other des
 |---|---|
 | `read` | read file, read directory |
 | `read_exec` | read file, read directory, execute |
-| `read_write` | read file, read directory, write file, truncate, remove file, remove directory, make directory, make regular file, refer (move between writable directories), device ioctl; make socket only with `unix_sockets = "all"` |
+| `read_write` | read file, read directory, write file, truncate, remove file, remove directory, make directory, make regular file, refer (move between writable directories), device ioctl; make socket only with `unix_sockets = "all"`; make symbolic link only with `symlinks = "allow"` |
 
 Execute is the right to start a file with `execve`; Landlock checks nothing else as execute.
 Without `filesystem.view = "policy"` a file of a `read` or `read_write` path can therefore be
@@ -1487,9 +1487,15 @@ A writable path never gets these rights:
 
 - **Execute.** The policy rule against writable and executable paths. Mapping as code is not
   execute, see above.
-- **Make symbolic link.** A process outside the sandbox that later writes a file in the writable
-  directory (for example a configuration file that it writes before every start) would follow a
-  planted link to any file of the user.
+- **Make symbolic link**, unless `filesystem.symlinks = "allow"`. A process outside the sandbox
+  that later writes a file in the writable directory (for example a configuration file that it
+  writes before every start) would follow a link the program left there to any file of the user.
+  Landlock asks the same right when a rename or a link gives an existing symbolic link a new
+  name. With `"allow"` the program can make links that point anywhere: Landlock never sees the
+  target of a new link, so no rule can keep a link to a file outside the policy out, and
+  `sandy check` warns (`symlinks-followed-outside`). The program gains nothing through such a
+  link, because Landlock checks the file a path resolves to: a link to a file outside the policy
+  is refused like the file (`symlinks_allow_makes_links_that_reach_nothing_new`).
 - **Make named pipe.** A planted FIFO blocks a process outside the sandbox that opens the path.
 - **Make character or block device.** Never needed; it also needs `CAP_MKNOD`.
 - **Make socket** when Unix sockets are denied. Binding a pathname socket needs an `AF_UNIX`
@@ -2560,6 +2566,14 @@ exit code 125 and the paths it compared.
   keeps the default view. The test `a_read_only_descriptor_changes_only_the_mode_and_the_times`
   records it. With `filesystem.view = "policy"` these paths are read-only mounts, where both calls
   fail with `EROFS`, so the exception does not apply there (see "File system view").
+- **Tools that make symbolic links.** A writable path gets no right to make symbolic links (see
+  "Rights per access level"), so `ln -s` there fails with "Permission denied", npm and pnpm
+  cannot make the links of `node_modules/.bin`, Emacs cannot make its lock links `.#NAME`,
+  `python3 -m venv` fails with `EACCES` when it links `lib64` (Python 3.14), and `git init` and
+  `git clone` set `core.symlinks = false`, so git checks out a link of the repository as a plain
+  file holding the link's target, without an error (measured on Linux 7.2 for `ln`, Python and
+  git 2.56). `filesystem.symlinks = "allow"` (`--symlinks allow`) grants the right on writable
+  paths; named pipes and devices stay denied (README.md, "Symbolic links").
 - **Files the program writes can be executed outside the sandbox.** The program gets no execute
   right in a writable path, but a file it writes keeps the mode it gives it: the filter strips
   only the setuid and setgid bits, and Landlock has no right over the execute bit. A process

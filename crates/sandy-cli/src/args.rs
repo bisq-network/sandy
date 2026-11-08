@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use lexopt::prelude::*;
 use sandy_core::{
     ChildProcesses, Egress, EgressReach, ExposedPort, FileView, ForwardedPort, IpAccess, Junctions,
-    MachService, NetworkAccess, PathMetadata, Policy, Relays, SignalScope, SystemAccess, Warning,
-    WarningId, Win32k,
+    MachService, NetworkAccess, PathMetadata, Policy, Relays, SignalScope, Symlinks, SystemAccess,
+    Warning, WarningId, Win32k,
 };
 
 pub const USAGE: &str = "\
@@ -34,6 +34,8 @@ Options (they extend the policy file):
   --read-write PATH          allow reading and writing PATH (repeatable)
   --system minimal|none      add the minimal system paths (default: minimal)
   --view all|policy          policy makes paths outside the policy look missing (default: all)
+  --symlinks deny|allow      whether the program may create symbolic links in its read-write
+                             paths; no effect on Windows (default: deny)
   --ip all|client|private|none
                              IP networking; client connects out but takes no connections;
                              private keeps the program on a loopback of its own, reached only
@@ -157,6 +159,7 @@ pub struct Overrides {
     read_write: Vec<PathBuf>,
     system: Option<SystemAccess>,
     view: Option<FileView>,
+    symlinks: Option<Symlinks>,
     ip: Option<IpAccess>,
     egress: Option<Egress>,
     unix_sockets: Option<NetworkAccess>,
@@ -180,6 +183,7 @@ impl Overrides {
     fn keys(&self) -> Vec<(&'static str, &'static str)> {
         [
             ("--view", "filesystem.view", self.view.is_some()),
+            ("--symlinks", "filesystem.symlinks", self.symlinks.is_some()),
             ("--ip", "network.ip", self.ip.is_some()),
             ("--egress", "network.egress", self.egress.is_some()),
             (
@@ -268,6 +272,12 @@ impl Overrides {
                 note("--view", "all", "view", "policy");
             }
             policy.filesystem.view = view;
+        }
+        if let Some(symlinks) = self.symlinks {
+            if symlinks.lets_program_link() && !policy.filesystem.symlinks.lets_program_link() {
+                note("--symlinks", "allow", "symlinks", "deny");
+            }
+            policy.filesystem.symlinks = symlinks;
         }
         if let Some(ip) = self.ip {
             if ip_strictness(ip) < ip_strictness(policy.network.ip) {
@@ -597,6 +607,13 @@ where
                     "all" => FileView::All,
                     "policy" => FileView::Policy,
                     other => return Err(format!("invalid --view value {other:?}").into()),
+                })
+            }
+            Long("symlinks") => {
+                overrides.symlinks = Some(match parser.value()?.string()?.as_str() {
+                    "deny" => Symlinks::Deny,
+                    "allow" => Symlinks::Allow,
+                    other => return Err(format!("invalid --symlinks value {other:?}").into()),
                 })
             }
             Long("egress") => {
@@ -1160,6 +1177,37 @@ mod tests {
         );
         assert!(weakened(Win32k::Allow, "deny").is_empty());
         assert!(parse_strs(&["check", "--windows-win32k", "none"]).is_err());
+    }
+
+    /// `--symlinks allow` over a file with `symlinks = "deny"` lets the program leave links in
+    /// its writable paths, so it is named; the other way round it is not.
+    #[test]
+    fn symlinks_allowed_over_a_file_that_denies_them_is_named() {
+        let applied = |file: Symlinks, option: &str| {
+            let mut policy = Policy::default();
+            policy.filesystem.symlinks = file;
+            let weakened = invocation(&["check", "--symlinks", option])
+                .overrides
+                .apply(&mut policy, true)
+                .map(widened)
+                .unwrap();
+            (policy.filesystem.symlinks, weakened)
+        };
+        let named = if cfg!(windows) {
+            Vec::new()
+        } else {
+            vec![
+                "--symlinks allow replaces symlinks = \"deny\" from the policy file and allows \
+                 more than the file does"
+                    .to_string(),
+            ]
+        };
+        assert_eq!(applied(Symlinks::Deny, "allow"), (Symlinks::Allow, named));
+        assert_eq!(
+            applied(Symlinks::Allow, "deny"),
+            (Symlinks::Deny, Vec::new())
+        );
+        assert!(parse_strs(&["check", "--symlinks", "none"]).is_err());
     }
 
     /// `--windows-junctions grant` over a file with `junctions = "refuse"` lets sandy change

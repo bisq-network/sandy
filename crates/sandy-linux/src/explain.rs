@@ -132,8 +132,8 @@ impl Need {
     }
 
     /// The policy grant that would allow it, if any does. sandy never lets a writable path hold
-    /// a symbolic link, a device or a named pipe (see `plan::policy_rights`), so for those the
-    /// report names no grant instead of advice that does not work.
+    /// a device or a named pipe (see `plan::policy_rights`), so for those the report names no
+    /// grant instead of advice that does not work.
     fn grant(self) -> Option<&'static str> {
         match self {
             Need::Read | Need::List => Some("read"),
@@ -144,9 +144,18 @@ impl Need {
             | Need::CreateDirectory
             | Need::Remove
             | Need::RemoveDirectory => Some("read_write"),
-            Need::Symlink | Need::Device | Need::Fifo => None,
-            // Only with unix_sockets = "all"; `policy_rights` adds MakeSock then.
-            Need::Socket => Some("read_write with unix_sockets = \"all\""),
+            Need::Symlink | Need::Socket => Some("read_write"),
+            Need::Device | Need::Fifo => None,
+        }
+    }
+
+    /// The setting that the use needs next to its grant, and the option that sets it:
+    /// `policy_rights` adds MakeSym and MakeSock only with these.
+    fn setting(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Need::Symlink => Some(("filesystem.symlinks = \"allow\"", "--symlinks allow")),
+            Need::Socket => Some(("network.unix_sockets = \"all\"", "--unix-sockets all")),
+            _ => None,
         }
     }
 
@@ -375,6 +384,7 @@ impl Rules {
             path: path.to_path_buf(),
             need,
             covered_by: self.covering(checked).first().map(|rule| rule.path.clone()),
+            writable: self.granted(checked).contains(AccessFs::WriteFile),
         })
     }
 }
@@ -386,6 +396,8 @@ struct Gap {
     need: Need,
     /// The deepest rule that covers the path but not this use of it.
     covered_by: Option<PathBuf>,
+    /// Whether the rules already make the path writable, so that only a setting is missing.
+    writable: bool,
 }
 
 impl Gap {
@@ -396,9 +408,13 @@ impl Gap {
             (None, Some(directory)) => format!("no rule covers {}", directory.display()),
             (None, None) => "no rule covers it".to_string(),
         };
-        let advice = match self.need.grant() {
-            Some(grant) => format!("grant it with {grant}"),
-            None => "no grant of sandy allows that".to_string(),
+        let advice = match (self.need.grant(), self.need.setting()) {
+            (_, Some((setting, option))) if self.writable => {
+                format!("allow it with {setting} ({option})")
+            }
+            (Some(grant), Some((setting, _))) => format!("grant it with {grant} and {setting}"),
+            (Some(grant), None) => format!("grant it with {grant}"),
+            (None, _) => "no grant of sandy allows that".to_string(),
         };
         format!(
             "cannot {} {}: {what}; {advice} ({call} in process {pid})",
@@ -1262,9 +1278,44 @@ mod tests {
             "cannot write to /a/b: the rule /a does not allow it; grant it with read_write \
              (openat in process 7)"
         );
-        // sandy grants no rule that allows a symbolic link, so the report names no option.
-        let line = gap(&rules, "/a/b", Need::Symlink).expect("no rule allows a symbolic link");
+        let line = gap(&rules, "/a/b", Need::Symlink).expect("read does not allow a link");
+        assert!(
+            line.contains("grant it with read_write and filesystem.symlinks = \"allow\""),
+            "{line}"
+        );
+        // sandy grants no rule that allows a named pipe, so the report names no option.
+        let line = gap(&rules, "/a/b", Need::Fifo).expect("no rule allows a named pipe");
         assert!(line.contains("no grant of sandy allows that"), "{line}");
+    }
+
+    /// Under a read_write rule only the setting is missing for a link or a socket, so the report
+    /// names only that setting; under a read rule it names the whole grant.
+    #[test]
+    fn a_writable_path_names_only_the_missing_setting() {
+        // What `policy_rights` grants a read_write path without the two settings.
+        let read_write = READ
+            | make_bitflags!(AccessFs::{
+                WriteFile | Truncate | RemoveDir | RemoveFile | MakeDir | MakeReg | Refer
+                    | IoctlDev
+            });
+        let rules = rules(vec![rule("/a", READ), rule("/rw", read_write)]);
+        let line = gap(&rules, "/rw/b", Need::Symlink).expect("no link without the setting");
+        assert_eq!(
+            line,
+            "cannot create a symbolic link at /rw/b: the rule /rw does not allow it; allow it \
+             with filesystem.symlinks = \"allow\" (--symlinks allow) (openat in process 7)"
+        );
+        let line = gap(&rules, "/rw/b", Need::Socket).expect("no socket without the setting");
+        assert_eq!(
+            line,
+            "cannot create a socket at /rw/b: the rule /rw does not allow it; allow it with \
+             network.unix_sockets = \"all\" (--unix-sockets all) (openat in process 7)"
+        );
+        let line = gap(&rules, "/a/b", Need::Socket).expect("read does not allow a socket");
+        assert!(
+            line.contains("grant it with read_write and network.unix_sockets = \"all\""),
+            "{line}"
+        );
     }
 
     /// Landlock checks only the rights the ruleset handles, so a call that needs another one is

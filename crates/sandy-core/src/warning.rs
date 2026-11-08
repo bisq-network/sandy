@@ -37,6 +37,8 @@ warning_ids! {
     EgressProbing => "egress-probing",
     /// `path_metadata = "allow"`.
     PathMetadataAllow => "path-metadata-allow",
+    /// `symlinks = "allow"`: links the program leaves in writable paths and processes outside.
+    SymlinksFollowedOutside => "symlinks-followed-outside",
     /// A writable path that holds the home directory.
     WritableHome => "writable-home",
     /// A path that holds /dev/pts, with the terminals of this user.

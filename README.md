@@ -494,7 +494,8 @@ level it tried, and last `level: NAME`, the level that `run` takes, or `level: n
 `check --json` prints the same as one JSON object instead (see [Fallback levels](#fallback-levels)).
 
 Four kinds of finding get a `warning:` line on standard error: a setting that gives up part of the
-isolation (`unix_sockets = "all"`, `signals = "any"`, `path_metadata = "allow"`), an option that
+isolation (`unix_sockets = "all"`, `signals = "any"`, `path_metadata = "allow"`,
+`symlinks = "allow"`), an option that
 replaced a stricter value of the policy file, a guarantee of the policy that this platform gives
 only in part (for example `signals = "isolated"` on macOS, which leaves SIGIO open; the list is in
 [docs/DESIGN.md](docs/DESIGN.md), "Requirements and the enforcement plan"), and a fact about this
@@ -564,6 +565,7 @@ it does nothing.
 | `--read-write PATH` | Allow reading, creating, changing and deleting below `PATH`. Never executing. | |
 | `--system minimal\|none` | Add the minimal set of system paths programs need to start. | `minimal` |
 | `--view all\|policy` | `policy` makes every path outside the policy look missing. See [The file system view](#the-file-system-view). | `all` |
+| `--symlinks deny\|allow` | Whether the program may create symbolic links in its `read_write` paths. No effect on Windows. See [Symbolic links](#symbolic-links). | `deny` |
 | `--ip all\|client\|private\|none` | IPv4 and IPv6 networking, including loopback. `client` connects out but cannot listen or accept. `private` keeps the program on a loopback of its own. | `none` |
 | `--unix-sockets all\|none` | Unix domain sockets. Read the warning below before using `all`. | `none` |
 | `--signals any\|isolated` | Whether the program may signal processes outside its sandbox. | `any` |
@@ -613,6 +615,7 @@ releases.
 | `signals-any` | all | `signals = "any"` lets the program signal every process of this user |
 | `egress-probing` | all | what the egress broker's answers tell the program about this host's addresses |
 | `path-metadata-allow` | all | `path_metadata = "allow"` |
+| `symlinks-followed-outside` | Linux, macOS | `symlinks = "allow"`: a process outside the sandbox follows the links the program leaves in writable paths |
 | `writable-home` | all | a writable path holds the home directory |
 | `terminals-reachable` | Linux | a policy path holds `/dev/pts`, with the other terminals of this user |
 | `writable-path-directory` | all | a writable path reaches a directory on `PATH` |
@@ -758,6 +761,7 @@ read = ["/path"]                # read files, list directories
 read_exec = ["/path"]           # read, list, execute
 read_write = ["/path"]          # read, list, create, change, delete; never execute
 view = "all"                    # "all" | "policy"; policy hides paths outside the policy
+symlinks = "deny"               # "deny" | "allow"; allow: new symbolic links in read_write paths
 
 [network]
 ip = "none"                     # "none" | "private" | "client" | "all"
@@ -1042,6 +1046,32 @@ about 600 on a Mac with 16 addresses. A run beyond the limit fails before the pr
   `unix_sockets = "all"`. Windows cannot hide paths and refuses the setting. See
   docs/DESIGN.md, "The file system view".
 
+### Symbolic links
+
+With the default `symlinks = "deny"`, the program cannot create symbolic links, named pipes or
+devices anywhere, also not in its `read_write` paths, and a rename or a clone that would give an
+existing link or named pipe a new name there fails too. A process outside the sandbox that later
+opens a name in a writable path, a configuration file it writes before every start for example,
+would otherwise follow a link the program left there to any file of the user.
+
+Some tools need links. npm and pnpm put the commands of a package in `node_modules/.bin` as
+links, and Emacs marks a file it edits with a lock link `.#NAME`; under `"deny"` these fail
+("Permission denied" on Linux, "Operation not permitted" on macOS). `python3 -m venv` links the
+interpreter into the environment: Python 3.14 on Linux fails, Python 3.9 on macOS prints "Unable
+to symlink" and copies it. git checks out a link of a repository as a plain file holding the
+link's target, because `git init` and `git clone` find that they cannot make links and set
+`core.symlinks = false` (measured with git 2.56 on Linux and 2.54 on macOS).
+
+`symlinks = "allow"` (`--symlinks allow`) lets the program create symbolic links in its
+`read_write` paths; named pipes and devices stay denied. The program gains no access through a
+link: the sandbox checks the path the link resolves to, so a link to a file outside the policy
+leads nowhere for it. A link can point anywhere, though, and neither Landlock nor Seatbelt can
+check its target when it is created, so whatever runs outside the sandbox and opens names in a
+writable path follows the links there with its own rights; `sandy check` warns about it. Grant it
+only when no process outside the sandbox relies on the content of the writable paths, and never
+for a path that one of your own programs reads as configuration or runs from. Windows refuses
+an AppContainer every symbolic link, so there the setting changes nothing.
+
 ### Linux metadata
 
 Landlock does not control `chmod`, `chown`, `utimensat` and `setxattr`. With the default
@@ -1105,9 +1135,9 @@ windows.appcontainer_name = "example.app.host"
   `filesystem.view`, `network.ip`, `network.unix_sockets`, `network.egress` (a table, or `"none"`
   for no broker), `process.signals`, `process.children`, `process.end_with_parent`,
   `linux.path_metadata`, `macos.relays`, `windows.win32k` and `windows.appcontainer_name`. The
-  paths, `system`, the environment, `expose`, `forward` and `macos.mach_services` are the same in
-  every level, so the program finds the same files and ports in each. Any other key in a level is an
-  error.
+  paths, `system`, `symlinks`, the environment, `expose`, `forward` and `macos.mach_services` are
+  the same in every level, so the program finds the same files and ports in each. Any other key in a
+  level is an error.
 - **Every level is checked as a policy of its own on every host**, so a level that could never
   run (for example `children = "contained"` with `signals = "any"`) is an error everywhere, not
   a surprise on the one host that reaches it.

@@ -7,7 +7,7 @@ use crate::plan::Requirement;
 use crate::policy::{
     ChildProcesses, Egress, EnvironmentPolicy, ExposedPort, FileView, ForwardedPort, IpAccess,
     MachService, MacosPolicy, NetworkAccess, NetworkPolicy, PathMetadata, Policy, PolicyError,
-    ProcessPolicy, Relays, SignalScope, SystemAccess, Win32k, WindowsPolicy,
+    ProcessPolicy, Relays, SignalScope, Symlinks, SystemAccess, Win32k, WindowsPolicy,
 };
 use crate::warning::{Warning, WarningId};
 
@@ -153,6 +153,7 @@ pub struct ResolvedPolicy {
     pub forward: Vec<ForwardedPort>,
     pub egress: Option<Egress>,
     pub view: FileView,
+    pub symlinks: Symlinks,
     pub signals: SignalScope,
     pub children: ChildProcesses,
     pub end_with_parent: bool,
@@ -296,6 +297,7 @@ impl ResolvedPolicy {
             forward: policy.network.forward.clone(),
             egress: policy.network.egress,
             view: policy.filesystem.view,
+            symlinks: policy.filesystem.symlinks,
             signals: policy.process.signals,
             children: policy.process.children,
             end_with_parent: policy.process.end_with_parent,
@@ -428,6 +430,21 @@ impl ResolvedPolicy {
                  of this host that redirects outgoing connections takes the broker's \
                  connections to the local service it names, which the broker cannot see \
                  (docs/DESIGN.md, \"Egress broker\")",
+            ));
+        }
+        let writable = self
+            .paths
+            .iter()
+            .any(|rule| rule.access == PathAccess::ReadWrite);
+        if self.symlinks.lets_program_link() && writable {
+            warnings.push(Warning::new(
+                WarningId::SymlinksFollowedOutside,
+                "symlinks = \"allow\" lets the program leave symbolic links in its writable paths \
+                 that lead anywhere, and a process outside the sandbox that later opens such a \
+                 name follows the link to wherever it points, with its own rights; the \
+                 program itself reaches nothing through them, because the sandbox checks the \
+                 path a link resolves to, and no rule can check a link's target when it is \
+                 created (README.md, \"Symbolic links\")",
             ));
         }
         if self.path_metadata == PathMetadata::Allow {
@@ -3023,6 +3040,35 @@ mod tests {
         );
         assert!(warnings(&policy_with(&[], &[], &[ptmx])).is_empty());
         assert!(warnings(&policy_with(&[], &[], &[&temp_dir()])).is_empty());
+    }
+
+    /// Links the program makes in writable paths are a matter for the processes outside; on
+    /// Windows the program can make none, and without a writable path it can make none anywhere.
+    #[test]
+    fn warns_about_symbolic_links_where_the_program_can_make_them() {
+        let dir = temp_dir();
+        let mut read_only = policy_with(&[&dir], &[], &[]);
+        read_only.process.signals = SignalScope::Isolated;
+        read_only.filesystem.symlinks = Symlinks::Allow;
+        let mut policy = policy_with(&[], &[], &[&dir]);
+        policy.process.signals = SignalScope::Isolated;
+        let ids = |policy: &Policy| -> Vec<WarningId> {
+            let resolved = ResolvedPolicy::resolve(policy, None).unwrap();
+            resolved
+                .warnings(None)
+                .iter()
+                .map(|warning| warning.id)
+                .collect()
+        };
+        assert_eq!(ids(&read_only), []);
+        assert_eq!(ids(&policy), []);
+        policy.filesystem.symlinks = Symlinks::Allow;
+        let expected: &[WarningId] = if cfg!(windows) {
+            &[]
+        } else {
+            &[WarningId::SymlinksFollowedOutside]
+        };
+        assert_eq!(ids(&policy), expected);
     }
 
     #[test]

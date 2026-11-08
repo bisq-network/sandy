@@ -61,6 +61,8 @@ read = ["/opt/app/share"]     # read files, list directories
 read_exec = ["/opt/app/bin"]  # read, list, execute
 read_write = ["/var/lib/app"] # read, list, create, change, delete; never execute
 view = "all"                  # "all" | "policy"; policy: paths outside the policy look missing
+symlinks = "deny"             # "deny" | "allow"; allow: new symbolic links in read_write paths;
+                              # see rule 14
 
 [network]
 ip = "none"                   # "none" | "private" | "client" | "all"; IPv4 and IPv6 including
@@ -280,6 +282,18 @@ Rules:
    terminal, is accepted. Linux knows a master by its device number, macOS by the major number
    of `/dev/ptmx` (see the platform docs); Windows has no such device. `check` cannot report
    any of this: the streams it is given are not the streams of the later `run`.
+14. A writable path never gets new named pipes or devices, and new symbolic links only with
+   `filesystem.symlinks = "allow"`. The names of a writable path stay there after the run, and a
+   process outside the sandbox that opens one of them, a configuration file it writes before every
+   start for example, would follow a link the program left there to any file of the user, or wait on
+   a FIFO. A rename or a clone that gives an existing link or FIFO a new name counts as a new one.
+   The default `deny` costs tools that make links (README.md, "Symbolic links"). `allow` gives the
+   program nothing it could not reach otherwise, because Landlock and Seatbelt check the file a link
+   resolves to, but a link can point anywhere: neither can look at its target when it is created, so
+   no rule can keep a link to a file outside the policy out, and `check` warns that processes
+   outside follow such links (`symlinks-followed-outside`). Rule 4 still holds: a policy path
+   reached through a link in a writable path is refused. Windows refuses an AppContainer every
+   symbolic link, so there the setting changes nothing.
 
 ## Links and file identity
 
@@ -717,12 +731,12 @@ probes, instead of in every program that embeds it.
    program is isolated: `filesystem.view`, `network.ip`, `network.unix_sockets`,
    `network.egress`, `process.signals`, `process.children`, `process.end_with_parent`,
    `linux.path_metadata`, `macos.relays`, `windows.win32k` and `windows.appcontainer_name`.
-   Paths, `system`, the environment, `expose` and `forward` are the same in every level, so the
-   program finds the same files and ports in each, and the path rules (rules 2 to 4 and 8 of
-   README.md), checked once, cover every level: no level's writable path can reach a path of
-   another. `ResolvedPolicy::resolve_levels` resolves the paths once and checks the settings of
-   each level as a policy of its own, on every host, so a level that could never run is an
-   error everywhere.
+   Paths, `system`, `symlinks`, the environment, `expose` and `forward` are the same in every
+   level, so the program finds the same files and ports in each, and the path rules (rules 2 to
+   4 and 8 of README.md), checked once, cover every level: no level's writable path can reach a
+   path of another. `ResolvedPolicy::resolve_levels` resolves the paths once and checks the
+   settings of each level as a policy of its own, on every host, so a level that could never run
+   is an error everywhere.
 2. **A level is skipped only for a lasting shortfall of the host**: its plan is not enforceable,
    and every report that is not enforced is `Unavailable` or `NeedsSetup`. An `Indeterminate`
    report or a `Conflict` stops the choice with status 125, also when a weaker level would be
@@ -900,16 +914,16 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   the root and detaches the old one. Landlock decides access as without the view. It requires
   the fix of Landlock erratum 3, read from the errata bitmask; `run` refuses a directory on a
   standard stream, through which the program would reach the hidden paths by name.
-- Landlock (ABI 1 or newer, read from the kernel at run time) handles every file system right of
-  the ABI. Writable paths never get execute, symbolic link, named pipe or device rights. Each
-  rule path is opened without following links and must still be the file sandy planned with. ABI 6
-  scopes signals (required for `signals = "isolated"`, unless `children = "contained"` runs the
-  program in a PID namespace) and abstract Unix sockets; ABI 9 denies
-  pathname Unix sockets when `unix_sockets = "none"`; ABI 4 denies TCP when `ip = "none"`. With
-  `ip = "client"` a second ruleset, built with raw system calls because the `landlock` crate
+- Landlock (ABI 1 or newer, read from the kernel at run time) handles every file system right of the
+  ABI. Writable paths never get execute, named pipe or device rights, and symbolic link rights only
+  with `symlinks = "allow"`. Each rule path is opened without following links and must still be the
+  file sandy planned with. ABI 6 scopes signals (required for `signals = "isolated"`, unless
+  `children = "contained"` runs the program in a PID namespace) and abstract Unix sockets; ABI 9
+  denies pathname Unix sockets when `unix_sockets = "none"`; ABI 4 denies TCP when `ip = "none"`.
+  With `ip = "client"` a second ruleset, built with raw system calls because the `landlock` crate
   does not know the UDP right, lets sockets bind only port 0, a port the kernel chooses: TCP from
-  ABI 4, UDP from ABI 10. It decides nothing about listening: `listen` on an unbound socket picks
-  a port without that check.
+  ABI 4, UDP from ABI 10. It decides nothing about listening: `listen` on an unbound socket picks a
+  port without that check.
 - Seccomp allowlist: the reviewed system call table of Linux 7.2; every other number, x32 numbers,
   `clone3`, `openat2`, `fanotify_init` and `name_to_handle_at` fail with `ENOSYS`; other CPU
   architectures are killed.
@@ -1034,10 +1048,10 @@ Details, the minimal system set and the known limitations are in [linux.md](linu
   `chdir` and the path from `getattrlist` answer for every path again, because a connect to a
   socket outside the policy needs that check. `kill(pid, 0)` still tells a live process ID from
   an unused one.
-- Hard links are denied, and writable paths never get new symbolic links, named pipes or
-  devices, as on Linux; clones (`std::fs::copy`) work only of files, only into writable paths
-  and only from files the target may read. ptrace attach is denied (Seatbelt checks it as
-  `system-debug`).
+- Hard links are denied, and writable paths never get new named pipes or devices, and new
+  symbolic links only with `symlinks = "allow"`, as on Linux; clones (`std::fs::copy`) work
+  only of files, only into writable paths and only from files the target may read. ptrace
+  attach is denied (Seatbelt checks it as `system-debug`).
 - dyld needs the root directory itself (only the names in `/`) to find the shared cache, so the
   minimal system set contains it; with `system = "none"` no program can start on macOS, so the
   backend refuses that unless a policy path covers "/".

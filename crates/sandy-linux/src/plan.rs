@@ -13,7 +13,7 @@ use landlock::{ABI, Access, AccessFs, AccessNet, BitFlags, Scope, make_bitflags}
 use sandy_core::{
     ChildProcesses, FileView, IpAccess, NetworkAccess, PathAccess, PathIdentity, PathMetadata,
     PathRule, PlanItem, PolicyError, ProtectedPath, Requirement, ResolvedPolicy, SignalScope,
-    SystemAccess, Warning, WarningId,
+    Symlinks, SystemAccess, Warning, WarningId,
 };
 
 use crate::broker::BrokerConfig;
@@ -1111,7 +1111,7 @@ fn landlock_config(
         .map(|rule| PathRights {
             path: rule.path.clone(),
             is_dir: rule.is_dir,
-            access: fit(policy_rights(rule.access, unix_all), rule.is_dir),
+            access: fit(policy_rights(rule.access, policy), rule.is_dir),
         })
         .collect();
     if policy.system == SystemAccess::Minimal {
@@ -1145,10 +1145,10 @@ fn landlock_config(
 
 const READ: BitFlags<AccessFs> = make_bitflags!(AccessFs::{ReadFile | ReadDir});
 
-/// Writable paths never get execute, symbolic links, named pipes or device nodes. A symbolic
-/// link or a named pipe in a directory that a process outside the sandbox also uses could
-/// redirect or block that process.
-fn policy_rights(access: PathAccess, unix_all: bool) -> BitFlags<AccessFs> {
+/// Writable paths never get execute, named pipes or device nodes, and symbolic links only with
+/// `symlinks = "allow"`. A symbolic link or a named pipe in a directory that a process outside
+/// the sandbox also uses could redirect or block that process.
+fn policy_rights(access: PathAccess, policy: &ResolvedPolicy) -> BitFlags<AccessFs> {
     match access {
         PathAccess::Read => READ,
         PathAccess::ReadExec => READ | AccessFs::Execute,
@@ -1158,8 +1158,11 @@ fn policy_rights(access: PathAccess, unix_all: bool) -> BitFlags<AccessFs> {
                     WriteFile | Truncate | RemoveDir | RemoveFile | MakeDir | MakeReg | Refer
                         | IoctlDev
                 });
-            if unix_all {
+            if policy.unix_sockets == NetworkAccess::All {
                 rights |= AccessFs::MakeSock;
+            }
+            if policy.symlinks == Symlinks::Allow {
+                rights |= AccessFs::MakeSym;
             }
             rights
         }
@@ -1289,6 +1292,7 @@ mod tests {
             forward: Vec::new(),
             egress: None,
             view: sandy_core::FileView::All,
+            symlinks: sandy_core::Symlinks::Deny,
             signals: SignalScope::Isolated,
             children: sandy_core::ChildProcesses::Allowed,
             end_with_parent: false,
@@ -2236,6 +2240,23 @@ mod tests {
         host.seccomp = Err("no seccomp".to_string());
         let plan = plan_for(&policy(), &host);
         assert!(unavailable(&plan).contains(&Requirement::FilesystemConfined));
+    }
+
+    #[test]
+    fn writable_paths_make_symbolic_links_only_when_the_policy_allows() {
+        for symlinks in [Symlinks::Deny, Symlinks::Allow] {
+            let mut policy = policy();
+            policy.symlinks = symlinks;
+            let plan = plan_for(&policy, &host(Some(9)));
+            let data = rights(&plan, "/data");
+            assert_eq!(
+                data.contains(AccessFs::MakeSym),
+                symlinks == Symlinks::Allow
+            );
+            let forbidden = make_bitflags!(AccessFs::{Execute | MakeChar | MakeBlock | MakeFifo});
+            assert!((data & forbidden).is_empty(), "{data:?}");
+            assert!(!rights(&plan, "/srv/share").contains(AccessFs::MakeSym));
+        }
     }
 
     #[test]

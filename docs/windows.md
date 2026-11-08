@@ -396,6 +396,10 @@ them. On Windows:
   refused a hard link to a file it may not write, a junction that leaves its writable paths, and
   a symbolic link of any kind (it holds no `SeCreateSymbolicLinkPrivilege`), all measured on
   Windows 11 build 26200 (`the_program_cannot_plant_a_link_reaching_outside_its_writable_paths`).
+  `filesystem.symlinks = "allow"`, which lets the program make symbolic links on Linux and
+  macOS, therefore changes nothing on Windows: sandy accepts the setting and the program still
+  makes no symbolic link. It can still make a junction within its writable paths under either
+  value, as without the setting.
   The check runs at the start, so a second name that a process outside the sandbox makes while
   the program runs is not seen, as on the other platforms.
 - `sandy` is checked under the name it was started under, which `current_exe` reports on

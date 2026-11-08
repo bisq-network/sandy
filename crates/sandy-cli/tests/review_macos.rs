@@ -345,6 +345,56 @@ fn links_and_fifos_in_writable_paths_get_no_new_name() {
     }
 }
 
+/// `symlinks = "allow"` takes only the symbolic links out of the rule: the program can make and
+/// rename links in its writable paths, FIFOs and links in read paths stay refused, and a link to a
+/// file outside the policy leads nowhere, because Seatbelt checks the path a link resolves to. A
+/// link to a file of the writable path works. Each call works outside.
+#[test]
+fn symlinks_allow_makes_links_that_reach_nothing_new() {
+    let fixture = Fixture::new("macos-symlinks-allow");
+    let make = |link: &str, target: &str| format!("{}::{}", fixture.arg(link), fixture.arg(target));
+    let outside_link = make("rw/outside", "secret/file");
+    let inside_link = make("rw/inside", "rw/file");
+    let read_link = make("ro/link", "ro/file");
+    let fifo = fixture.arg("rw/fifo");
+    let renamed = format!(
+        "{}{ARGUMENT_SEPARATOR}{}",
+        fixture.arg("rw/inside"),
+        fixture.arg("rw/renamed")
+    );
+    let actions = [
+        ("symlink", outside_link.as_str()),
+        ("symlink", inside_link.as_str()),
+        ("symlink", read_link.as_str()),
+        ("mkfifo", fifo.as_str()),
+        ("rename", renamed.as_str()),
+    ];
+    for line in probe_outside(&actions) {
+        line.assert_ok();
+    }
+    fixture.reset();
+
+    let allow = with(fixture.access_args(), &["--symlinks", "allow"]);
+    let (through_outside, through_renamed) = (fixture.arg("rw/outside"), fixture.arg("rw/renamed"));
+    let mut reads = actions.to_vec();
+    reads.extend([
+        ("read", through_outside.as_str()),
+        ("read", through_renamed.as_str()),
+    ]);
+    let lines = probe_inside(&allow, &reads);
+    lines[0].assert_ok();
+    lines[1].assert_ok();
+    assert_not_permitted(&lines[2]);
+    assert_not_permitted(&lines[3]);
+    lines[4].assert_ok();
+    lines[5].assert_blocked();
+    lines[6].assert_ok();
+    assert_eq!(
+        fs::read_link(fixture.path("rw/outside")).unwrap(),
+        fixture.path("secret/file")
+    );
+}
+
 /// `clonefile` of a directory copies the whole tree, and Seatbelt checks only the directory it
 /// creates, not the links and FIFOs inside (measured on macOS 27.0.1: the clone of a tree with
 /// both was allowed). The profile therefore refuses directory clones, from a read path and within

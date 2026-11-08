@@ -91,7 +91,7 @@ compiler fail, and sandy fails closed.
 
 | Requirement | Mechanism |
 |---|---|
-| `FilesystemConfined` | Profile: `(deny default)`, and every path outside the policy answers `ENOENT`; `file-read*` for every policy path and the system set; `file-write*` only for `read_write` paths; `process-exec*` and `file-map-executable` only for `read_exec` paths, the program and system code. No hard links, and no new symbolic links, FIFOs or devices; clones only of files, only into `read_write` paths and only from files the target may read. No Mach or XPC service, so no other process acts on files for the target. Policy paths cannot be deleted or replaced. |
+| `FilesystemConfined` | Profile: `(deny default)`, and every path outside the policy answers `ENOENT`; `file-read*` for every policy path and the system set; `file-write*` only for `read_write` paths; `process-exec*` and `file-map-executable` only for `read_exec` paths, the program and system code. No hard links, and no new FIFOs or devices, and new symbolic links only with `symlinks = "allow"`; clones only of files, only into `read_write` paths and only from files the target may read. No Mach or XPC service, so no other process acts on files for the target. Policy paths cannot be deleted or replaced. |
 | `NoPrivilegeEscalation` | Only policy paths execute. Sandbox.kext refuses to execute setuid or setgid files from any sandboxed process, and the profile also denies `process-exec*` for files with mode bit `#o4000` or `#o2000`. No Mach service (authorization, privileged helpers, launchd). |
 | `ProcessMemoryIsolated` | Profile: `process-info*` (allowed by default) is denied with `ESRCH` and then allowed only for `(target self)`; task ports are denied (`mach-priv*`, `mach-task-name`, `mach-task-read`, `mach-task-inspect`); `ptrace` attach, which Seatbelt checks as `system-debug`, is denied. |
 | `InheritedHandlesClosed` | `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`; descriptors 0, 1 and 2 are named with `posix_spawn_file_actions_addinherit_np`. The kernel closes every other descriptor during the exec. With `children = "contained"` the forked target, a single thread, marks every descriptor above 2 close-on-exec (`PROC_PIDLISTFDS`) right before `execve`. |
@@ -326,6 +326,14 @@ of earlier definitions"), so the protections come last. The unit test
       types follow from the rule but are not measured
       (`symlink_and_fifo_in_writable_paths_are_denied`,
       `links_and_fifos_in_writable_paths_get_no_new_name`).
+
+      With `filesystem.symlinks = "allow"` the rule leaves out `(vnode-type SYMLINK)`, so the
+      program can make links in its `read_write` paths, and named pipes and devices stay denied.
+      Seatbelt checks the path a link resolves to, so a link to a file outside the policy gives
+      the program nothing (`symlinks_allow_makes_links_that_reach_nothing_new`). The profile
+      cannot look at the target of a new link: no filter of `file-write-create` names it, so a
+      link may point anywhere, and `sandy check` warns that processes outside follow such links
+      (`symlinks-followed-outside`).
     - `(deny file-clone (vnode-type DIRECTORY))`. `clonefile(2)` of a directory copies the whole
       tree in one call, and Seatbelt checks only the directory it creates: on macOS 27.0.1 the
       clone of a directory that held a symbolic link and a FIFO, from a `read` path and within a
@@ -993,11 +1001,11 @@ nothing (reject, blackhole), and whose interface is not point-to-point (`IFF_POI
 `getifaddrs`, such as `utun`, `gif` and `ppp`; the 6to4 interface `stf0` is not, `ifconfig`
 shows `flags=0<>` on macOS 27.0.1, and its prefix `2002::/16` is never allowed anyway). That
 covers the on-link prefix of router advertisements beside an address of another prefix, such as
-a DHCPv6 address, and a route into a link where the Mac has no address of its prefix. What a route sends into a tunnel goes to its
-other end, which takes it on as a router does, so a VPN that splits the default route into
-`0/1` and `128.0/1` on its `utun` leaves the internet public; the subnet of the tunnel's own
-address still counts (`routes_into_a_tunnel_name_no_network`). On the test Mac that leaves out
-the `fe80::/64` routes of its eight `utun` interfaces.
+a DHCPv6 address, and a route into a link where the Mac has no address of its prefix. What a
+route sends into a tunnel goes to its other end, which takes it on as a router does, so a VPN
+that splits the default route into `0/1` and `128.0/1` on its `utun` leaves the internet public;
+the subnet of the tunnel's own address still counts (`routes_into_a_tunnel_name_no_network`). On
+the test Mac that leaves out the `fe80::/64` routes of its eight `utun` interfaces.
 
 `getifaddrs` reads the routing sysctl (`CTL_NET`, `PF_ROUTE`, `NET_RT_IFLIST2`); inside a
 profile only `(sysctl-name-prefix "net.route")` allows it, neither the exact name `net.route`
@@ -1505,10 +1513,17 @@ none, so the backend answers nothing and sandy refuses the option.
   conflict. The locks are advisory and give no access (measured on macOS 27.0.1, test
   `a_lock_on_a_readable_file_holds_off_other_processes`).
 - `link(2)` fails everywhere (see the hard link rule above).
-- `symlink(2)`, `mkfifo(3)` and `mknod(2)` fail everywhere, also in writable paths, as on Linux, and so
-  does a rename or a clone of an existing symbolic link or FIFO (see the protections above). Tools
-  that make links fail: `ln -s` in a `read_write` path answers "Operation not permitted"
-  (measured on macOS 27.0.1).
+- `symlink(2)`, `mkfifo(3)` and `mknod(2)` fail everywhere, also in writable paths, as on Linux,
+  and so does a rename or a clone of an existing symbolic link or FIFO, and a clone of a directory
+  (see the protections above). Tools that make links fail or work differently: `ln -s` in a
+  `read_write` path answers "Operation not permitted", npm and pnpm cannot make the links of
+  `node_modules/.bin`, Emacs cannot make its lock links `.#NAME`, `python3 -m venv` (Python 3.9)
+  prints "Unable to symlink" and copies the interpreter, and `git init` and `git clone` set
+  `core.symlinks = false`, so git checks out a link of the repository as a plain file holding
+  the link's target, without an error (measured on macOS 27.0.1 for `ln`, Python and git 2.54).
+  `filesystem.symlinks = "allow"` (`--symlinks allow`) lets the program make symbolic links in
+  its `read_write` paths again; FIFOs, devices and directory clones stay denied (see the
+  protections above and README.md, "Symbolic links").
 - With `system = "none"` no program starts on macOS: every program is linked dynamically, and dyld
   itself needs the root directory and the shared cache from the system set. sandy refuses such a
   policy unless a policy path covers "/", which is the only way a policy can bring those paths
