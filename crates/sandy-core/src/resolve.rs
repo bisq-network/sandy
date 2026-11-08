@@ -1155,9 +1155,11 @@ impl Mounts {
     }
 }
 
-/// Every mount point (`getfsstat`) with its file system, its `f_fsid`, as given and canonical,
-/// so that one below a writable path is found whichever spelling the path has. An empty list
-/// when the call fails: the walk then covers the writable paths themselves.
+/// Every mount point (`getfsstat`) with its file system, its `f_fsid`, as given and, for a local
+/// file system, canonical, so that one below a writable path is found whichever spelling the
+/// path has. A network mount is taken as given: resolving its path asks its server, which may
+/// not answer. An empty list when the call fails: the walk then covers the writable paths
+/// themselves.
 #[cfg(target_os = "macos")]
 impl Mounts {
     fn points(&self) -> Vec<(PathBuf, String)> {
@@ -1187,7 +1189,9 @@ impl Mounts {
             let name = unsafe { CStr::from_ptr(entry.f_mntonname.as_ptr()) };
             let filesystem = fsid(entry);
             let point = PathBuf::from(std::ffi::OsStr::from_bytes(name.to_bytes()));
-            if let Ok(canonical) = point.canonicalize()
+            let local = entry.f_flags & libc::MNT_LOCAL as u32 != 0;
+            if local
+                && let Ok(canonical) = point.canonicalize()
                 && canonical != point
             {
                 points.push((canonical, filesystem.clone()));
@@ -1606,7 +1610,6 @@ fn for_each_linked_file(
 fn skipped(error: &std::io::Error) -> bool {
     use std::io::ErrorKind;
 
-    #[cfg(unix)]
     if error.raw_os_error() == Some(libc::ESRCH) {
         return true;
     }
@@ -3068,7 +3071,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_mount_inside_a_writable_path_is_walked_for_second_names() {
-        if !in_mount_namespace("a_mount_inside_a_writable_path_is_walked_for_second_names") {
+        if !in_mount_namespace() {
             return;
         }
         let root = temp_dir();
@@ -3109,22 +3112,19 @@ mod tests {
         assert!(name.starts_with(&inside), "{}", name.display());
     }
 
-    /// Runs the test `name` again as root of a user and mount namespace of its own and returns
+    /// Runs the current test again as root of a user and mount namespace of its own and returns
     /// false, or returns true inside that namespace. A host without the namespaces skips it.
     #[cfg(target_os = "linux")]
-    fn in_mount_namespace(name: &str) -> bool {
+    fn in_mount_namespace() -> bool {
         const INSIDE: &str = "SANDY_CORE_TEST_IN_MOUNT_NAMESPACE";
         if std::env::var_os(INSIDE).is_some() {
             return true;
         }
+        let name = std::thread::current().name().unwrap().to_string();
         let output = std::process::Command::new("unshare")
             .args(["--user", "--map-root-user", "--mount"])
             .arg(std::env::current_exe().unwrap())
-            .args([
-                &format!("resolve::tests::{name}"),
-                "--exact",
-                "--test-threads=1",
-            ])
+            .args([&name, "--exact", "--test-threads=1"])
             .env(INSIDE, "1")
             .output();
         match output {
@@ -3146,7 +3146,7 @@ mod tests {
     fn the_second_name_walk_enters_an_overlay() {
         use std::os::unix::fs::MetadataExt;
 
-        if !in_mount_namespace("the_second_name_walk_enters_an_overlay") {
+        if !in_mount_namespace() {
             return;
         }
         let root = temp_dir();
