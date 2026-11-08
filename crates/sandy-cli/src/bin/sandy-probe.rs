@@ -66,6 +66,11 @@ fn perform(action: &str, target: &str) -> io::Result<String> {
         "open-rdonly-trunc" => open_read_only_truncate(target),
         "delete" => fs::remove_file(target).map(|()| String::new()),
         "mkdir" => fs::create_dir(target).map(|()| String::new()),
+        "rmdir" => fs::remove_dir(target).map(|()| String::new()),
+        "rename" => {
+            let (from, to) = pair(target)?;
+            fs::rename(from, to).map(|()| String::new())
+        }
         "set-readonly" => set_readonly(target, true),
         "set-writable" => set_readonly(target, false),
         "exec" => {
@@ -3736,8 +3741,6 @@ mod macos {
         "posix-spawn",
         "execve",
         "thread",
-        "rename",
-        "rmdir",
         "host-uuid",
         "fcntl-read-only",
         "exception-ports",
@@ -3805,11 +3808,6 @@ mod macos {
             }),
             "necp-open" => necp_open(),
             "mach-lookup" => mach_lookup(target),
-            "rename" => {
-                let (from, to) = super::pair(target)?;
-                fs::rename(from, to).map(|()| String::new())
-            }
-            "rmdir" => fs::remove_dir(target).map(|()| String::new()),
             "host-uuid" => host_uuid(),
             "fcntl-read-only" => fcntl_read_only(target),
             "fork" => fork(false),

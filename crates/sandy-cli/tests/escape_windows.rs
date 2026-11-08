@@ -315,6 +315,74 @@ fn the_program_cannot_plant_a_link_reaching_outside_its_writable_paths() {
     }
 }
 
+/// The program removes and moves what lies below a read-write path but not the path itself, also
+/// not a read-write file, as on Linux, where removing an entry is a right on its parent, and on
+/// macOS: the grant leaves `DELETE` off the path (docs/windows.md, "What sandy grants"). Before,
+/// the program could remove an empty writable directory and move a writable directory or file
+/// into another writable path (measured on Windows 11 build 26200). The outside run is the
+/// control that every action works for the owner.
+#[test]
+fn a_read_write_path_itself_cannot_be_removed_or_moved() {
+    let fixture = Fixture::new("rw-root");
+    let prepare = || {
+        fixture.reset();
+        for dir in ["rw/sub/empty", "rw2/sub", "rw3"] {
+            fs::create_dir_all(fixture.path(dir)).unwrap();
+        }
+        for file in ["wfile", "rw/child", "rw/other"] {
+            fs::write(fixture.path(file), b"content").unwrap();
+        }
+    };
+    let p = |from: &str, to: &str| format!("{}\u{1f}{}", fixture.arg(from), fixture.arg(to));
+    let (wfile, rw3) = (fixture.arg("wfile"), fixture.arg("rw3"));
+    let (empty, moved_child) = (fixture.arg("rw/sub/empty"), fixture.arg("rw/sub/child"));
+    let (move_dir, over_file, move_file) = (
+        p("rw2", "rw/moved"),
+        p("rw/other", "wfile"),
+        p("wfile", "rw/moved-file"),
+    );
+    let (move_child, rename_child) = (p("rw/child", "rw/sub/child"), p("rw2/sub", "rw2/renamed"));
+    let actions = [
+        ("write", wfile.as_str()),
+        ("rename", move_child.as_str()),
+        ("delete", moved_child.as_str()),
+        ("rmdir", empty.as_str()),
+        ("rename", rename_child.as_str()),
+        ("rename", move_dir.as_str()),
+        ("rmdir", rw3.as_str()),
+        ("rename", over_file.as_str()),
+        ("rename", move_file.as_str()),
+        ("delete", wfile.as_str()),
+    ];
+    let roots = 5;
+    // Outside, each root action runs on a fresh tree: one that succeeds removes the root that a
+    // later one needs.
+    prepare();
+    for line in probe_outside(&actions[..roots]) {
+        line.assert_ok();
+    }
+    for action in &actions[roots..] {
+        prepare();
+        probe_outside(std::slice::from_ref(action))[0].assert_ok();
+    }
+
+    prepare();
+    let mut args = fixture.access_args();
+    for writable in ["rw2", "rw3", "wfile"] {
+        args.extend(["--read-write".to_string(), fixture.arg(writable)]);
+    }
+    let lines = probe_inside(&args, &actions);
+    for line in &lines[..roots] {
+        line.assert_ok();
+    }
+    for line in &lines[roots..] {
+        line.assert_blocked();
+    }
+    for root in ["rw2/renamed", "rw3", "wfile", "rw/other"] {
+        assert!(fixture.path(root).exists(), "{root} was moved or deleted");
+    }
+}
+
 #[test]
 fn refuses_to_grant_through_a_junction() {
     let fixture = Fixture::new("junction");

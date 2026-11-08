@@ -236,10 +236,22 @@ profile and with it any entry left there.
 |---|---|---|
 | read | `FILE_GENERIC_READ` (read data, list, attributes, extended attributes, permissions) | `FILE_EXECUTE`, any write right |
 | read-exec | `FILE_GENERIC_READ`, `FILE_GENERIC_EXECUTE` | any write right |
-| read-write | `FILE_GENERIC_READ`, `FILE_GENERIC_WRITE`, `DELETE`, `FILE_DELETE_CHILD` | `FILE_EXECUTE`, `WRITE_DAC`, `WRITE_OWNER` |
+| read-write | `FILE_GENERIC_READ`, `FILE_GENERIC_WRITE`, `FILE_DELETE_CHILD`, and `DELETE` below the path | `FILE_EXECUTE`, `WRITE_DAC`, `WRITE_OWNER`, `DELETE` on the path itself |
 
 On a directory the ACE has the flags object inherit and container inherit, so files and
 directories below it receive the same rights. The program file gets read and execute.
+
+A read-write path gets two entries when it is a directory (`access::grant_entries`): the rights
+above without `DELETE`, inherited by everything below, and an inherit-only entry with `DELETE`
+alone, so a file or directory below the path has every right of the level and the path itself
+lacks `DELETE`. A read-write file gets the first entry only. The program can therefore change,
+create, remove and move what lies below the path, and write a read-write file, but can neither
+remove nor move the path itself, as on Linux, where removing an entry is a right on its parent,
+and on macOS, whose profile denies it. Measured on Windows 11 build 26200 before the split: the
+program removed an empty read-write directory and moved a read-write directory and a read-write
+file into another read-write path (`a_read_write_path_itself_cannot_be_removed_or_moved`). A
+grant that an earlier version of sandy wrote with `DELETE` on the path is replaced by the two
+entries at the next run.
 
 Without `FILE_EXECUTE`, Windows does not load a file as a program or library. The program can
 still read the bytes of a file; this backend, like the others, does not prevent code that the
@@ -264,15 +276,16 @@ capability SID (`S-1-15-3-1024-...`, `DeriveCapabilitySidsFromName`) from the na
 sandy.grant.<r|rx|rw>.<volume serial>.<file ID>.<AppContainer name>
 ```
 
-adds one ACE for that SID, and starts the program with the capabilities of the current policy
-only. Chromium grants its install directory to capability SIDs in the same way [Chromium
-install]. The file ID names the object, not the path: a renamed directory keeps its grant, and a
-new object at the old path needs a new one.
+adds one ACE for that SID (two for a read-write directory, see "What sandy grants"), and
+starts the program with the capabilities of the current policy only. Chromium grants its install
+directory to capability SIDs in the same way [Chromium install]. The file ID names the object,
+not the path: a renamed directory keeps its grant, and a new object at the old path needs a new
+one.
 
 The consequences:
 
 - **Grants stay on disk.** A run never removes them; `sandy setup --remove` does (see "Removing
-  the changes"). A run checks for its ACE and changes nothing when the ACE exists.
+  the changes"). A run checks for its ACEs and changes nothing when they exist.
 - **Old grants grant nothing.** When a path leaves the policy, or its level changes, no later
   process holds the old capability. The escape test
   `a_path_removed_from_the_policy_is_denied_at_the_next_run` checks this.

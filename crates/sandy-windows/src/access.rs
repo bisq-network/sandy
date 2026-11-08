@@ -82,6 +82,37 @@ pub fn ace_flags(is_dir: bool) -> u8 {
     }
 }
 
+/// One allow entry that sandy adds for a policy path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrantEntry {
+    pub mask: u32,
+    pub flags: u8,
+}
+
+/// The entries of the grant on a policy path: the rights of `access` (`access_mask`), on a
+/// directory also for everything below it. A read-write path lacks `DELETE` on itself, so the
+/// program can change what it holds but can neither remove nor move the path, as on Linux, where
+/// removing an entry is a right on its parent, and on macOS. Below a directory an inherit-only
+/// entry gives `DELETE` back.
+pub fn grant_entries(access: PathAccess, is_dir: bool) -> Vec<GrantEntry> {
+    let mask = access_mask(access);
+    let flags = ace_flags(is_dir);
+    if access != PathAccess::ReadWrite {
+        return vec![GrantEntry { mask, flags }];
+    }
+    let mut entries = vec![GrantEntry {
+        mask: mask & !DELETE,
+        flags,
+    }];
+    if is_dir {
+        entries.push(GrantEntry {
+            mask: DELETE,
+            flags: flags | INHERIT_ONLY_ACE,
+        });
+    }
+    entries
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AceKind {
     Allow,
@@ -358,6 +389,58 @@ mod tests {
         // An entry that lost only FILE_EXECUTE keeps WRITE_DAC and WRITE_OWNER, so it still
         // needs reducing.
         assert_ne!((FILE_ALL_ACCESS & !FILE_EXECUTE) & PROFILE_DENIED, 0);
+    }
+
+    /// A read-write path keeps every right of its level except `DELETE` on itself; everything
+    /// below a directory has them all, so a child can be removed or moved and the path cannot.
+    #[test]
+    fn a_read_write_path_cannot_delete_itself() {
+        let read_write = access_mask(PathAccess::ReadWrite);
+        let below = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+        let entries = |is_dir| grant_entries(PathAccess::ReadWrite, is_dir);
+        assert_eq!(
+            entries(false),
+            [GrantEntry {
+                mask: read_write & !DELETE,
+                flags: 0
+            }]
+        );
+        let on_dir = entries(true);
+        assert_eq!(
+            on_dir,
+            [
+                GrantEntry {
+                    mask: read_write & !DELETE,
+                    flags: below
+                },
+                GrantEntry {
+                    mask: DELETE,
+                    flags: below | INHERIT_ONLY_ACE
+                },
+            ]
+        );
+        let aces: Vec<Ace<'_>> = on_dir
+            .iter()
+            .map(|entry| allow(entry.flags, entry.mask, OTHER))
+            .collect();
+        assert!(!grants(&aces, OTHER, DELETE, false));
+        assert!(grants(&aces, OTHER, read_write & !DELETE, true));
+        let children: Vec<Ace<'_>> = aces
+            .iter()
+            .map(|ace| allow(ace.flags & !INHERIT_ONLY_ACE, ace.mask, OTHER))
+            .collect();
+        assert!(grants(&children, OTHER, read_write, false));
+        for access in [PathAccess::Read, PathAccess::ReadExec] {
+            for is_dir in [false, true] {
+                assert_eq!(
+                    grant_entries(access, is_dir),
+                    [GrantEntry {
+                        mask: access_mask(access),
+                        flags: ace_flags(is_dir)
+                    }]
+                );
+            }
+        }
     }
 
     #[test]

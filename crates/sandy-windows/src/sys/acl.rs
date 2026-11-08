@@ -1,5 +1,6 @@
-//! File grants for the AppContainer: one access control entry (ACE) per policy path, for a
-//! capability that names the path's object and access level (see `name::grant_capability_name`).
+//! File grants for the AppContainer: one access control entry (ACE) per policy path, two for a
+//! read-write directory (`access::grant_entries`), for a capability that names the path's object
+//! and access level (see `name::grant_capability_name`).
 
 use std::cell::OnceCell;
 use std::fs;
@@ -14,9 +15,9 @@ use windows_sys::Win32::Foundation::{
     INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ACCESS_MODE, EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, GetSecurityInfo, NO_MULTIPLE_TRUSTEE,
-    REVOKE_ACCESS, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW, SetNamedSecurityInfoW,
-    SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ACCESS_MODE, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, GetSecurityInfo,
+    NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW,
+    SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
     ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION, GetAce,
@@ -40,9 +41,9 @@ use super::lockfile::{LOCKS, SERIALIZE, UserLock};
 use super::util::{LocalBox, Sid, last_error, wide_nul, win32_error};
 use crate::access::{
     ADDS_LIBRARY, ALL_APPLICATION_PACKAGES, ALL_RESTRICTED_APPLICATION_PACKAGES, Ace, AceKind,
-    CHANGES_CONTENT, CHANGES_FILE, CONTAINER_INHERIT_ACE, FILE_EXECUTE, INHERITED_ACE,
+    CHANGES_CONTENT, CHANGES_FILE, CONTAINER_INHERIT_ACE, FILE_EXECUTE, GrantEntry, INHERITED_ACE,
     OBJECT_INHERIT_ACE, PROFILE_DENIED, REPLACES_ENTRY, access_mask, ace_flags,
-    changeable_by_others, grants, has_explicit_ace, map_generic, may_grant,
+    changeable_by_others, grant_entries, grants, has_explicit_ace, map_generic, may_grant,
 };
 use crate::name::{FileIdentity, grant_capability_name, junction_capability_name};
 use crate::plan::Problem;
@@ -58,7 +59,7 @@ pub fn grant(appcontainer: &str, rule: &PathRule, held: &[Sid]) -> Result<Sid, S
     if !lacks_grant(rule, &capability, &Dacl::read(&path, &rule.path)?)? {
         return Ok(capability);
     }
-    // A change reads the DACL, adds one ACE and writes the whole DACL back. Without the lock,
+    // A change reads the DACL, adds the ACEs and writes the whole DACL back. Without the lock,
     // two runs that add different ACEs to the same object at the same time could each overwrite
     // the ACE of the other. If a run died while it held the lock during propagation, some
     // children may lack the inherited ACE, which denies access, never grants it.
@@ -81,8 +82,7 @@ pub fn grant(appcontainer: &str, rule: &PathRule, held: &[Sid]) -> Result<Sid, S
             &rule.path,
             &dacl,
             &capability,
-            access_mask(rule.access),
-            ace_flags(rule.is_dir),
+            &grant_entries(rule.access, rule.is_dir),
         )?;
     }
     Ok(capability)
@@ -994,7 +994,10 @@ fn lacks_grant(rule: &PathRule, capability: &Sid, dacl: &Dacl) -> Result<bool, S
     let mask = access_mask(rule.access);
     let aces = dacl.aces(&rule.path)?;
     let entries = aces.entries();
-    if has_explicit_ace(&entries, capability.bytes(), mask, ace_flags(rule.is_dir)) {
+    if grant_entries(rule.access, rule.is_dir)
+        .iter()
+        .all(|grant| has_explicit_ace(&entries, capability.bytes(), grant.mask, grant.flags))
+    {
         return Ok(false);
     }
     // Paths in the system set, such as the program C:\Windows\System32\cmd.exe, already
@@ -1446,23 +1449,25 @@ fn parse_acl(acl: *const ACL) -> Result<ParsedAces, SandboxError> {
     Ok(parsed)
 }
 
+/// Replaces the explicit entries of `capability` on `path` with `entries`: the first replaces
+/// them (`SET_ACCESS`), the others join it (`GRANT_ACCESS`), each an ACE of its own because
+/// their flags differ.
 fn add_ace(
     path: &[u16],
     display: &Path,
     current: &Dacl,
     capability: &Sid,
-    mask: u32,
-    flags: u8,
+    entries: &[GrantEntry],
 ) -> Result<(), SandboxError> {
-    set_access(
-        Object::Path(path),
-        display,
-        current,
-        capability,
-        SET_ACCESS,
-        mask,
-        flags,
-    )
+    let changes: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let mode = if index == 0 { SET_ACCESS } else { GRANT_ACCESS };
+            (mode, entry.mask, entry.flags)
+        })
+        .collect();
+    write_entries(Object::Path(path), display, current, capability, &changes)
 }
 
 /// Rewrites the explicit ACEs for `sid` in the DACL of `path` and writes the DACL back, keeping
@@ -1478,22 +1483,43 @@ fn set_access(
     mask: u32,
     flags: u8,
 ) -> Result<(), SandboxError> {
-    let access = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: mask,
-        grfAccessMode: mode,
-        grfInheritance: u32::from(flags),
-        Trustee: TRUSTEE_W {
-            pMultipleTrustee: ptr::null_mut(),
-            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_UNKNOWN,
-            ptstrName: sid.as_psid().cast(),
-        },
-    };
+    write_entries(object, display, current, sid, &[(mode, mask, flags)])
+}
+
+/// `set_access` with several changes for `sid` in one write, applied in order.
+fn write_entries(
+    object: Object<'_>,
+    display: &Path,
+    current: &Dacl,
+    sid: &Sid,
+    changes: &[(ACCESS_MODE, u32, u8)],
+) -> Result<(), SandboxError> {
+    let access: Vec<EXPLICIT_ACCESS_W> = changes
+        .iter()
+        .map(|&(mode, mask, flags)| EXPLICIT_ACCESS_W {
+            grfAccessPermissions: mask,
+            grfAccessMode: mode,
+            grfInheritance: u32::from(flags),
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: ptr::null_mut(),
+                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_UNKNOWN,
+                ptstrName: sid.as_psid().cast(),
+            },
+        })
+        .collect();
     let mut merged: *mut ACL = ptr::null_mut();
-    // SAFETY: access describes one entry whose SID outlives the call; current.acl is the valid,
-    // non-null DACL of the path (checked in `aces`).
-    let error = unsafe { SetEntriesInAclW(1, &access, current.acl, &mut merged) };
+    // SAFETY: access holds access.len() entries whose SID outlives the call; current.acl is the
+    // valid, non-null DACL of the path (checked in `aces`).
+    let error = unsafe {
+        SetEntriesInAclW(
+            access.len() as u32,
+            access.as_ptr(),
+            current.acl,
+            &mut merged,
+        )
+    };
     if error != 0 {
         return Err(win32_error("cannot build the access control list", error));
     }
@@ -1712,6 +1738,77 @@ mod tests {
         for dir in [plain, shared, own, below] {
             let _ = fs::remove_dir_all(dir);
         }
+    }
+
+    /// The explicit entries of `sid` on `path`, as sandy writes them.
+    fn explicit_entries(path: &Path, sid: &Sid) -> Vec<GrantEntry> {
+        let wide = wide_nul(path.as_os_str());
+        let dacl = Dacl::read(&wide, path).unwrap();
+        let aces = dacl.aces(path).unwrap();
+        aces.entries()
+            .iter()
+            .filter(|ace| ace.sid == sid.bytes() && ace.flags & INHERITED_ACE == 0)
+            .map(|ace| GrantEntry {
+                mask: ace.mask,
+                flags: ace.flags,
+            })
+            .collect()
+    }
+
+    /// A read-write grant gives the path itself every right of its level but `DELETE`, and
+    /// everything below a directory all of them. An entry with `DELETE` on the path, as sandy
+    /// wrote it before, is replaced; a second grant changes nothing, and the removal takes both
+    /// entries away.
+    #[test]
+    fn a_read_write_grant_leaves_delete_off_the_path_itself() {
+        const NAME: &str = "sandy.acl-rw-root";
+        let dir = directory("rw-root");
+        let child = dir.join("child");
+        fs::write(&child, b"").unwrap();
+        let file = directory("rw-root-file").join("file");
+        fs::write(&file, b"").unwrap();
+        let rules = [
+            writable(&dir),
+            PathRule {
+                path: file.clone(),
+                access: PathAccess::ReadWrite,
+                is_dir: false,
+            },
+        ];
+        for rule in &rules {
+            let wide = wide_nul(rule.path.as_os_str());
+            let capability = grant_capability(NAME, rule, &wide).unwrap();
+            allow_on(
+                &rule.path,
+                capability.bytes(),
+                access_mask(PathAccess::ReadWrite),
+                ace_flags(rule.is_dir),
+            );
+            assert_eq!(grant(NAME, rule, &[]).unwrap(), capability);
+            let expected = grant_entries(rule.access, rule.is_dir);
+            assert_eq!(explicit_entries(&rule.path, &capability), expected);
+            assert!(
+                !lacks_grant(rule, &capability, &Dacl::read(&wide, &rule.path).unwrap()).unwrap()
+            );
+        }
+        let capability = grant_capability(NAME, &rules[0], &wide_nul(dir.as_os_str())).unwrap();
+        let wide = wide_nul(child.as_os_str());
+        let below = Dacl::read(&wide, &child).unwrap();
+        let below = below.aces(&child).unwrap();
+        assert!(grants(
+            &below.entries(),
+            capability.bytes(),
+            access_mask(PathAccess::ReadWrite),
+            false
+        ));
+        for rule in &rules {
+            let wide = wide_nul(rule.path.as_os_str());
+            let capability = grant_capability(NAME, rule, &wide).unwrap();
+            revoke(NAME, rule).unwrap();
+            assert_eq!(explicit_entries(&rule.path, &capability), []);
+        }
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(file.parent().unwrap());
     }
 
     fn junction(link: &Path, target: &Path) {

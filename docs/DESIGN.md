@@ -1130,7 +1130,9 @@ Details, limitations and sources: `docs/windows.md`.
   (`sandy setup --remove` does) and serializes its DACL changes with a lock file of the user, so
   concurrent runs do not conflict.
   Read and read-write never contain `FILE_EXECUTE`; read levels contain no right that changes
-  metadata. sandy refuses to propagate a grant through junctions or symbolic links, and refuses
+  metadata. The root of a read-write path lacks `DELETE` (a second, inherit-only ACE gives it to
+  everything below), so the program cannot remove or move the path itself, as on Linux and
+  macOS. sandy refuses to propagate a grant through junctions or symbolic links, and refuses
   a policy path on a network share. The system set is what Windows grants ALL APPLICATION
   PACKAGES; `system = "none"` is unavailable.
 - Network capabilities `internetClientServer` and `privateNetworkClientServer` only with
