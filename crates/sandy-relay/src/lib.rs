@@ -11,6 +11,7 @@
 //! bytes as the relay does; the handshake is the only thing it parses.
 
 pub mod broker;
+pub mod report;
 pub mod socks;
 
 use std::io::{self, Read, Write};

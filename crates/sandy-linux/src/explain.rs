@@ -33,11 +33,12 @@ use std::io::{self, Read, Write};
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
 use landlock::{AccessFs, BitFlags};
 use sandy_core::{SandboxError, StatusReport, canonical_location};
+use sandy_relay::report::Lines;
 use seccompiler::BpfProgram;
 
 use crate::contain::{SIGNALED, START_FAILED, default_child_action};
@@ -67,11 +68,24 @@ const PATH_MAX: usize = 4096;
 /// here.
 const MOST_PATHS: usize = 1000;
 
-/// Writes one line of the report. Not `eprintln!`, which panics when standard error is gone:
-/// the watcher would end and every watched call of the program would fail with ENOSYS from
-/// then on.
+/// The writer of the report once the watcher runs (`Explain::start`). A standard error that
+/// nobody reads fills its pipe, and a blocking write would then hold up the watcher, and with
+/// it every watched call of the program, and the end of sandy; the writer drops lines instead
+/// and says how many (`sandy_relay::report`). It starts after the fork, because sandy forks
+/// only while it has one thread.
+static WRITER: OnceLock<Lines> = OnceLock::new();
+
+/// Writes one line of the report, whole. Not `eprintln!`, which panics when standard error is
+/// gone: the watcher would end and every watched call of the program would fail with ENOSYS
+/// from then on.
 fn report(line: &str) {
-    let _ = writeln!(std::io::stderr(), "{PREFIX}{line}");
+    let line = format!("{PREFIX}{line}\n");
+    match WRITER.get() {
+        Some(writer) => writer.send(line),
+        None => {
+            let _ = std::io::stderr().write_all(line.as_bytes());
+        }
+    }
 }
 
 /// What a watched call needs from Landlock, in the words of the report.
@@ -535,6 +549,7 @@ impl Explain {
         drop(self.send.take());
         // A report that nobody reads must not end sandy: the program would lose its watcher.
         ignore(libc::SIGPIPE)?;
+        let _ = WRITER.set(Lines::start(std::io::stderr(), PREFIX, "path"));
         let (stop_read, stop_write) = pipe("the watcher's stop pipe")?;
         self.stop = Some(stop_write);
         let receive = self.receive.take().expect("the watcher starts once");
@@ -555,6 +570,9 @@ impl Explain {
         };
         let counts = watcher.join().unwrap_or_default();
         report(&counts.summary());
+        if let Some(writer) = WRITER.get() {
+            writer.finish();
+        }
     }
 }
 

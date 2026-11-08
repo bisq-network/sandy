@@ -557,8 +557,9 @@ fn the_program_keeps_its_exit_status_when_the_caller_ignores_sigchld() {
 /// The watcher thread confines itself with a seccomp filter of its own, because it parses bytes
 /// the program controls outside the sandbox, and sandy's main thread, which forwards signals and
 /// waits for the program, has none (docs/linux.md, "Diagnostic mode"). The kernel shows the number
-/// of filters of every thread in its status file. Both threads also have the filters this test
-/// runs under, which sandy inherits, so the watcher has exactly one more than the main thread.
+/// of filters of every thread in its status file. Every thread also has the filters this test
+/// runs under, which sandy inherits, so the watcher has exactly one more than the main thread
+/// and the thread that writes the report.
 #[test]
 fn the_watcher_thread_confines_itself() {
     let inherited: u32 = probe_outside(&[("status-field", "Seccomp_filters")])[0]
@@ -599,10 +600,9 @@ fn the_watcher_thread_confines_itself() {
     }
     kill_process(sandy.id());
     let _ = sandy.wait();
-    assert_eq!(seen.len(), 2, "sandy and its watcher: {seen:?}");
-    assert!(seen.contains(&inherited), "{seen:?}, inherited {inherited}");
-    assert!(
-        seen.contains(&(inherited + 1)),
-        "{seen:?}, inherited {inherited}"
-    );
+    // sandy's main thread, its report writer and its watcher.
+    assert_eq!(seen.len(), 3, "sandy, its writer and its watcher: {seen:?}");
+    let with = |count: u32| seen.iter().filter(|&&seen| seen == count).count();
+    assert_eq!(with(inherited), 2, "{seen:?}, inherited {inherited}");
+    assert_eq!(with(inherited + 1), 1, "{seen:?}, inherited {inherited}");
 }

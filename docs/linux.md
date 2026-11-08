@@ -2138,7 +2138,8 @@ one it denied. That is a wrong report, not a weaker sandbox: see DESIGN.md.
   coreutils ran under `--explain` with the filter in the glibc and musl builds.
 - The report goes to sandy's standard error, which is usually the program's as well. A reader
   that goes away does not end the run: sandy ignores `SIGPIPE` (the program gets the default
-  action back before it confines itself), and a line that cannot be written is dropped.
+  action back before it confines itself), and the report is written from a queue: lines that
+  do not fit are dropped and counted in the report.
   Without that, sandy would die and the program would lose its watcher.
 - A run with `--explain` is otherwise the same run: the Landlock ruleset and the other filters
   are built exactly as without it.

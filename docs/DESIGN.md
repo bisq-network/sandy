@@ -871,7 +871,10 @@ the program controls; it reads at most one path of bounded length per call and n
 what it reads. On Linux the watcher is a thread with a seccomp filter of its own, which ends
 sandy at any call the watcher does not need. The thread shares its memory with sandy's
 unconfined main thread, so the filter narrows what a flaw in the parsing reaches without walling
-it off.
+it off. The lines go to standard error through a queue that a thread of sandy writes from, so a
+standard error that nobody reads holds up neither the watcher nor the end of sandy: lines that
+do not fit are dropped and counted in the report, and at the end sandy waits at most a second
+for what is queued.
 
 ## Mechanisms (each backend section is owned by its backend)
 
