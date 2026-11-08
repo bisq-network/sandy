@@ -2504,6 +2504,61 @@ fn refuses_a_writable_path_over_the_startup_folder() {
     assert!(report.contains("runs outside the sandbox"), "{report}");
 }
 
+/// The configuration of git and GnuPG below the profile, and below HOME, which Git for Windows
+/// reads, is refused as a writable path as on Linux and macOS: the program could name a command
+/// there that the next git or gpg command of the user runs outside the sandbox. USERPROFILE and
+/// HOME lead to the fixture, so the result does not depend on the account; a writable folder
+/// next to them stays allowed.
+#[test]
+fn refuses_a_writable_path_over_the_git_and_gnupg_configuration() {
+    let fixture = Fixture::new("trusted-tools");
+    for dir in [
+        "profile/.config/git",
+        "profile/.gnupg",
+        "home/.gnupg",
+        "profile/work",
+    ] {
+        fs::create_dir_all(fixture.path(dir)).unwrap();
+    }
+    for file in ["profile/.gitconfig", "home/.gitconfig"] {
+        fs::write(fixture.path(file), "").unwrap();
+    }
+    let check = |writable: &str| {
+        Command::new(sandy_path())
+            .args([
+                "check",
+                "--appcontainer",
+                &appcontainer_name(),
+                "--read-write",
+                &fixture.arg(writable),
+            ])
+            .env("PATH", "C:\\Windows\\system32")
+            .env("USERPROFILE", fixture.path("profile"))
+            .env("HOME", fixture.path("home"))
+            .output()
+            .unwrap()
+    };
+    let allowed = check("profile/work");
+    assert_eq!(allowed.status.code(), Some(0), "{allowed:?}");
+    for writable in [
+        "profile/.gitconfig",
+        "profile/.config/git",
+        "profile/.config",
+        "profile/.gnupg",
+        "home/.gitconfig",
+        "home/.gnupg",
+    ] {
+        let refused = check(writable);
+        let report = String::from_utf8_lossy(&refused.stdout);
+        assert_eq!(
+            refused.status.code(),
+            Some(EXIT_CONFLICT),
+            "{writable}: {report}"
+        );
+        assert!(report.contains("runs outside the sandbox"), "{report}");
+    }
+}
+
 /// A junction or a directory symbolic link this test made with `mklink`. Dropping it removes the
 /// link itself, never what it leads to.
 struct DirectoryLink(PathBuf);

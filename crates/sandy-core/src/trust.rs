@@ -4,8 +4,8 @@
 //! runs outside the sandbox at the next login, the next shell or the next run of the tool, so a
 //! writable path that reaches one is refused (rule 12 in DESIGN.md). The Linux and macOS backends
 //! add the locations of their platform (`locations`) and compare the whole set with
-//! `ResolvedPolicy::writable_conflict`. Windows keeps a list of its own and shares only cargo's
-//! configuration (`cargo_configs`).
+//! `ResolvedPolicy::writable_conflict`. Windows keeps a list of its own and shares the
+//! configuration of the tools that read it there too (`tool_configs`).
 //!
 //! The directories a shell looks commands up in are the same kind of location, but rule 12 warns
 //! about them instead of refusing them (`path_locations`).
@@ -19,10 +19,9 @@ use std::path::PathBuf;
 
 use crate::{ProtectedPath, path_directories};
 
-/// Files below the home directory that a shell or a tool reads at its start. A missing one
-/// counts, because the program could create it. Debian's `.bashrc` sources `.bash_aliases`. In
-/// `.gitconfig`, `core.fsmonitor`, `core.sshCommand`, `core.pager` and `!` aliases run commands.
-const HOME_FILES: &[&str] = &[
+/// Files below the home directory that a shell reads at its start. A missing one counts, because
+/// the program could create it. Debian's `.bashrc` sources `.bash_aliases`.
+const SHELL_FILES: &[&str] = &[
     ".bashrc",
     ".bash_profile",
     ".bash_login",
@@ -34,18 +33,25 @@ const HOME_FILES: &[&str] = &[
     ".zshrc",
     ".zlogin",
     ".zlogout",
-    ".gitconfig",
 ];
 
-/// Directories below the home directory whose content decides what other programs of this user
-/// run: the files Fedora's `.bashrc` sources, the SSH configuration (`ProxyCommand`,
-/// `LocalCommand`, `authorized_keys`) and the GnuPG configuration (`pinentry-program`,
-/// `photo-viewer`).
-const HOME_TREES: &[&str] = &[".bashrc.d", ".ssh", ".gnupg"];
+/// The files Fedora's `.bashrc` sources.
+const SHELL_TREES: &[&str] = &[".bashrc.d"];
 
-/// Directories below the configuration directory: the startup files of fish, and the git
-/// configuration that git reads besides `.gitconfig`.
-const CONFIG_TREES: &[&str] = &["fish", "git"];
+/// The startup files of fish, below the configuration directory.
+const SHELL_CONFIG_TREES: &[&str] = &["fish"];
+
+/// Files below the home directory that a tool reads at its start. In `.gitconfig`,
+/// `core.fsmonitor`, `core.sshCommand`, `core.pager` and `!` aliases run commands.
+const TOOL_FILES: &[&str] = &[".gitconfig"];
+
+/// Directories below the home directory whose content decides what a tool of this user runs:
+/// the SSH configuration (`ProxyCommand`, `LocalCommand`, `authorized_keys`) and the GnuPG
+/// configuration (`pinentry-program`, `photo-viewer`).
+const TOOL_TREES: &[&str] = &[".ssh", ".gnupg"];
+
+/// The git configuration that git reads besides `.gitconfig`, below the configuration directory.
+const TOOL_CONFIG_TREES: &[&str] = &["git"];
 
 /// Files in cargo's home that name programs the next cargo command runs: `build.rustc`,
 /// `build.rustc-wrapper` and target runners. `config` is the name before `config.toml`, and cargo
@@ -66,34 +72,54 @@ const LOCAL_BIN_DIRECTORIES: &[&str] = &["/usr/local/bin", "/usr/local/sbin"];
 /// reported with the file that makes it dangerous. It protects only itself: the usual policies
 /// make a directory below it writable, which stays allowed.
 pub fn locations(homes: &[PathBuf], platform: Vec<ProtectedPath>) -> Vec<ProtectedPath> {
+    let mut locations = below_homes(homes, SHELL_FILES, SHELL_TREES, SHELL_CONFIG_TREES);
+    locations.extend(tool_configs(homes));
+    locations.extend(platform);
+    locations.extend(homes.iter().map(ProtectedPath::entry));
+    locations
+}
+
+/// The configuration of the tools that read it on every platform, Windows included: git, SSH,
+/// GnuPG and cargo, below every home directory and the directories their variables name.
+pub fn tool_configs(homes: &[PathBuf]) -> Vec<ProtectedPath> {
+    let mut locations = below_homes(homes, TOOL_FILES, TOOL_TREES, TOOL_CONFIG_TREES);
+    locations.extend(cargo_configs(homes));
+    locations
+}
+
+/// `files` and `trees` below every home directory, and `config_trees` below every configuration
+/// directory.
+fn below_homes(
+    homes: &[PathBuf],
+    files: &[&str],
+    trees: &[&str],
+    config_trees: &[&str],
+) -> Vec<ProtectedPath> {
     let mut locations = Vec::new();
     for home in homes {
         locations.extend(
-            HOME_FILES
+            files
                 .iter()
                 .map(|name| ProtectedPath::entry(home.join(name))),
         );
         locations.extend(
-            HOME_TREES
+            trees
                 .iter()
                 .map(|name| ProtectedPath::tree(home.join(name))),
         );
     }
     for config in user_directories("XDG_CONFIG_HOME", homes, ".config") {
         locations.extend(
-            CONFIG_TREES
+            config_trees
                 .iter()
                 .map(|name| ProtectedPath::tree(config.join(name))),
         );
     }
-    locations.extend(cargo_configs(homes));
-    locations.extend(platform);
-    locations.extend(homes.iter().map(ProtectedPath::entry));
     locations
 }
 
 /// cargo's configuration files in `CARGO_HOME` and in `.cargo` below every home directory.
-pub fn cargo_configs(homes: &[PathBuf]) -> Vec<ProtectedPath> {
+fn cargo_configs(homes: &[PathBuf]) -> Vec<ProtectedPath> {
     user_directories("CARGO_HOME", homes, ".cargo")
         .iter()
         .flat_map(|cargo| {

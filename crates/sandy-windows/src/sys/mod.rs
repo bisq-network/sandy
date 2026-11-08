@@ -30,7 +30,8 @@ use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 use windows_sys::Win32::UI::Shell::{
     FOLDERID_CommonStartup, FOLDERID_Documents, FOLDERID_LocalAppData, FOLDERID_Profile,
-    FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_Startup, KF_FLAG_DONT_VERIFY,
+    FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_RoamingAppData, FOLDERID_Startup,
+    KF_FLAG_DONT_VERIFY,
 };
 
 use crate::cmdline::{command_line, refused_program, without_verbatim_prefix};
@@ -699,8 +700,8 @@ fn held_sids(policy: &ResolvedPolicy, container: &Sid) -> Result<Vec<Sid>, Sandb
 
 /// Locations of this user that programs outside the sandbox read or execute later: the folders
 /// Windows runs programs from at logon, the PowerShell profile folders, the app execution
-/// aliases, the SSH configuration, cargo's configuration (shared with the Unix backends,
-/// `sandy_core::trust::cargo_configs`) and sandy's own state. A writable path that reaches one of
+/// aliases, the configuration of git, SSH, GnuPG and cargo (shared with the Unix backends,
+/// `sandy_core::trust::tool_configs`), Gpg4win's GnuPG folder and sandy's own state. A writable path that reaches one of
 /// them lets the program leave a file there that runs outside the sandbox at the next logon or
 /// the next build, and a file the program creates keeps the user's own rights on it, including
 /// the right to execute it (see "Trusted user locations" in docs/windows.md). Such a path is
@@ -734,15 +735,38 @@ fn trusted_locations() -> Result<Vec<ProtectedPath>, SandboxError> {
         // The state that decides which policy may join a running AppContainer.
         ProtectedPath::tree(state_directory()?),
     ];
+    // Where Gpg4win keeps the GnuPG configuration; GnuPG of MSYS2 and Git for Windows reads
+    // `.gnupg` below HOME.
+    locations.push(ProtectedPath::tree(
+        folder(
+            &FOLDERID_RoamingAppData,
+            "cannot find the roaming application data folder",
+        )?
+        .join("gnupg"),
+    ));
     let profiles = user_profiles()?;
-    locations.extend(sandy_core::trust::cargo_configs(&profiles));
-    for profile in profiles {
-        locations.push(ProtectedPath::tree(profile.join(".ssh")));
-        // After the folders in it, so that a writable profile is reported with the folder that
-        // makes it dangerous.
-        locations.push(ProtectedPath::entry(profile));
-    }
+    locations.extend(sandy_core::trust::tool_configs(&tool_homes(
+        &profiles,
+        std::env::var_os("HOME"),
+    )));
+    // After the folders in it, so that a writable profile is reported with the folder that makes
+    // it dangerous.
+    locations.extend(profiles.into_iter().map(ProtectedPath::entry));
     Ok(locations)
+}
+
+/// The home directories the tools of `sandy_core::trust::tool_configs` read their configuration
+/// below: the profile folders and HOME, when it is absolute. Git for Windows reads `.gitconfig`
+/// and `.config\git` below HOME when it is set (measured on Windows 11 with Git for Windows
+/// 2.54); a tool that does not only makes the list longer.
+fn tool_homes(profiles: &[std::path::PathBuf], home: Option<OsString>) -> Vec<std::path::PathBuf> {
+    let named = home
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute());
+    let mut homes: Vec<std::path::PathBuf> = profiles.iter().cloned().chain(named).collect();
+    homes.sort();
+    homes.dedup();
+    homes
 }
 
 /// The directories on sandy's PATH, which only warn. A program the sandboxed one leaves in one
@@ -1011,6 +1035,14 @@ fn network_capability_sid(capability: NetworkCapability) -> Result<Sid, SandboxE
 
 #[cfg(test)]
 mod tests {
+    use std::os::windows::ffi::OsStringExt;
+    use std::path::PathBuf;
+
+    use sandy_core::ProtectedPath;
+
+    use super::{
+        FOLDERID_RoamingAppData, known_folder, tool_homes, trusted_locations, user_profiles,
+    };
     use crate::{access, probe};
     use windows_sys::Win32::Foundation as f;
     use windows_sys::Win32::Security as ss;
@@ -1029,6 +1061,56 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("batch files run in cmd.exe"), "{error}");
+    }
+
+    /// The configuration of git and GnuPG is protected below the profile as it is below the
+    /// home directory on Linux and macOS, and Gpg4win's GnuPG folder with it.
+    #[test]
+    fn trusted_locations_cover_git_and_gnupg() {
+        let locations = trusted_locations().unwrap();
+        let profile = user_profiles().unwrap().remove(0);
+        let roaming = PathBuf::from(std::ffi::OsString::from_wide(
+            &known_folder(&FOLDERID_RoamingAppData, "no roaming folder").unwrap(),
+        ));
+        for expected in [
+            ProtectedPath::entry(profile.join(".gitconfig")),
+            ProtectedPath::tree(profile.join(".config").join("git")),
+            ProtectedPath::tree(profile.join(".gnupg")),
+            ProtectedPath::tree(profile.join(".ssh")),
+            ProtectedPath::entry(profile.join(".cargo").join("config.toml")),
+            ProtectedPath::tree(roaming.join("gnupg")),
+        ] {
+            assert!(locations.contains(&expected), "{expected:?}: {locations:?}");
+        }
+        assert!(
+            locations
+                .iter()
+                .position(|l| *l == ProtectedPath::entry(&profile))
+                > locations
+                    .iter()
+                    .position(|l| *l == ProtectedPath::tree(profile.join(".gnupg")))
+        );
+    }
+
+    /// HOME adds a home directory for the tools only when it is absolute, and each once.
+    #[test]
+    fn tool_homes_add_an_absolute_home() {
+        let profile = PathBuf::from(r"C:\Users\someone");
+        let moved = PathBuf::from(r"D:\home");
+        let profiles = std::slice::from_ref(&profile);
+        assert_eq!(tool_homes(profiles, None), vec![profile.clone()]);
+        assert_eq!(
+            tool_homes(profiles, Some("relative".into())),
+            vec![profile.clone()]
+        );
+        assert_eq!(
+            tool_homes(profiles, Some(profile.clone().into())),
+            vec![profile.clone()]
+        );
+        assert_eq!(
+            tool_homes(profiles, Some(moved.clone().into())),
+            vec![profile, moved]
+        );
     }
 
     #[test]

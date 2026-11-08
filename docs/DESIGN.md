@@ -213,7 +213,8 @@ Rules:
    user services, `~/Library/LaunchAgents`, the Startup folders, the PowerShell profile folders,
    `WindowsApps` and, on Windows, sandy's own state folder, which decides which policy may join a
    running AppContainer. Linux and macOS share one list for what every Unix has
-   (`sandy_core::trust`), so one policy is refused on both for the same files. A file the program
+   (`sandy_core::trust`), so one policy is refused on both for the same files, and Windows shares
+   the git, SSH, GnuPG and cargo part of it (`trust::tool_configs`). A file the program
    leaves in one of the others runs outside the sandbox with the user's rights at the next login,
    the next shell or the next run of the tool, which would make the whole policy pointless. The
    backend checks this, because only it knows the locations of its platform, and it compares

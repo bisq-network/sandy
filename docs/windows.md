@@ -492,12 +492,21 @@ The locations that are refused are in `sys::trusted_locations`:
 | `FOLDERID_Startup`, `FOLDERID_CommonStartup` | the tree | Windows runs what is there at the next logon |
 | `Documents\WindowsPowerShell`, `Documents\PowerShell` | the tree | the profile scripts of PowerShell 5 and PowerShell 7 |
 | `%LOCALAPPDATA%\Microsoft\WindowsApps` | the tree | the app execution aliases, which the default `PATH` holds |
-| `<profile>\.ssh` | the tree | `ProxyCommand` and `LocalCommand` in the configuration run programs |
-| `<profile>\.cargo\config.toml`, `<profile>\.cargo\config`, and both in `CARGO_HOME` | the file | `build.rustc`, `build.rustc-wrapper` and target runners name programs that the next cargo command runs; the list is shared with Linux and macOS (`sandy_core::trust::cargo_configs`) |
+| `<home>\.gitconfig`, `<config>\git` | the file, the tree | `core.fsmonitor`, `core.sshCommand`, `core.pager` and `!` aliases run commands at the next git command |
+| `<home>\.ssh` | the tree | `ProxyCommand` and `LocalCommand` in the configuration run programs |
+| `<home>\.gnupg`, `%APPDATA%\gnupg` (`FOLDERID_RoamingAppData`) | the tree | `pinentry-program` and `photo-viewer` name programs that gpg runs; Gpg4win keeps its configuration in the second |
+| `<home>\.cargo\config.toml`, `<home>\.cargo\config`, and both in `CARGO_HOME` | the file | `build.rustc`, `build.rustc-wrapper` and target runners name programs that the next cargo command runs |
 | `%LOCALAPPDATA%\sandy` | the tree | sandy's own state: the policy of each running AppContainer, the lock files and the forwarded-port sockets |
 
 The profile folder comes from the known folder and from `USERPROFILE`, because a service that
-starts sandy with a minimal environment sets no variable. A location that does not exist counts,
+starts sandy with a minimal environment sets no variable. `<home>` is each profile folder and
+`HOME` when it is absolute: Git for Windows reads `.gitconfig` and `.config\git` below `HOME`
+when it is set (measured on Windows 11 build 26200 with Git for Windows 2.54). `<config>` is
+`XDG_CONFIG_HOME`, which Git for Windows honours too, and `.config` below each `<home>`. The
+git, SSH, GnuPG and cargo rows are the list of Linux and macOS (`sandy_core::trust::tool_configs`),
+so one policy is refused on every platform for the same files.
+`refuses_a_writable_path_over_the_git_and_gnupg_configuration` checks them with `USERPROFILE` and
+`HOME` pointed at a fixture. A location that does not exist counts,
 because the program could create it. Paths are compared by file identity, as rules 3 and 4 compare
 them (see "Links and identity").
 
