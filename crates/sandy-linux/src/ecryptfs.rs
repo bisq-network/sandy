@@ -13,10 +13,10 @@
 //!
 //! The lower names are encrypted when the mount encrypts file names, so the lower directory is
 //! found by inode: eCryptfs gives each of its files the inode number of its lower file. The walk
-//! starts at the mount's source, checks that the source is the lower root (the file system ID
-//! eCryptfs reports and the inode of the mount's root), and follows each name of the granted
-//! path to the one lower directory with the inode of the eCryptfs directory, without following a
-//! symbolic link or leaving the source's file system.
+//! starts at the lower directory of the mount's point, which must lie on the file system whose ID
+//! eCryptfs reports and have the inode of the point (`lower_point`), and follows each name of the
+//! granted path to the one lower directory with the inode of the eCryptfs directory, without
+//! following a symbolic link or leaving that file system.
 
 use std::os::unix::fs::{DirEntryExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
@@ -103,7 +103,7 @@ fn reached(path: &Path, mounts: &[Mount]) -> Vec<(PathBuf, Option<PathBuf>)> {
     let mut reached = Vec::new();
     for mount in mounts {
         if mount.point.starts_with(path) && mount.point != path {
-            reached.push((mount.point.clone(), lower_of(mount, &mount.point)));
+            reached.push((mount.point.clone(), lower_of(mount, &mount.point, mounts)));
         }
     }
     // statfs mounts an automount point, so only a path below an eCryptfs mount gets one.
@@ -113,38 +113,16 @@ fn reached(path: &Path, mounts: &[Mount]) -> Vec<(PathBuf, Option<PathBuf>)> {
             .filter(|mount| path.starts_with(&mount.point))
             .filter(|mount| device_of(path) == Some(mount.device))
             .max_by_key(|mount| mount.point.as_os_str().len());
-        let lower = holder.and_then(|mount| lower_of(mount, path));
+        let lower = holder.and_then(|mount| lower_of(mount, path, mounts));
         reached.push((path.to_path_buf(), lower));
     }
     reached
 }
 
-/// The lower directory of the eCryptfs directory `path` of `mount`.
-fn lower_of(mount: &Mount, path: &Path) -> Option<PathBuf> {
-    // A bind mount of an eCryptfs subdirectory names its root by plain names, which need not be
-    // the lower ones. No standard setup makes one.
-    if mount.root != Path::new("/") {
-        return None;
-    }
-    // The source is often named through a link inside the mount itself (an encrypted home
-    // directory holds `.Private`), which a program granted that directory can replace. So the
-    // directory it leads to counts only when it is the lower root: eCryptfs reports the file
-    // system ID of the lower file system and gives its root the inode of the lower root, and one
-    // file system has one directory with that inode.
-    let source = mount.source.canonicalize().ok()?;
-    let source_metadata = source.symlink_metadata().ok()?;
-    let (_, lower_id) = file_system(&mount.point)?;
-    let (source_type, source_id) = file_system(&source)?;
-    if !source_metadata.is_dir()
-        || source_type == MAGIC
-        || lower_id == [0, 0]
-        || source_id != lower_id
-        || source_metadata.ino() != mount.point.symlink_metadata().ok()?.ino()
-    {
-        return None;
-    }
+/// The lower directory of the eCryptfs directory `path` of `mount`, a mount of `mounts`.
+fn lower_of(mount: &Mount, path: &Path, mounts: &[Mount]) -> Option<PathBuf> {
+    let (mut lower, device) = lower_point(mount, mounts)?;
     let mut upper = mount.point.clone();
-    let mut lower = source;
     for component in path.strip_prefix(&mount.point).ok()?.components() {
         let Component::Normal(name) = component else {
             return None;
@@ -154,9 +132,63 @@ fn lower_of(mount: &Mount, path: &Path) -> Option<PathBuf> {
         if !wanted.is_dir() {
             return None;
         }
-        lower = lower_entry(&lower, name, wanted.ino(), source_metadata.dev())?;
+        lower = lower_entry(&lower, name, wanted.ino(), device)?;
     }
     Some(lower)
+}
+
+/// The lower directory of the mount point of `mount`, with its device. Whatever leads to it, a
+/// directory counts only when it lies on the file system whose ID eCryptfs reports, not on
+/// eCryptfs itself, and has the inode of the mount point (`is_lower_point`): eCryptfs gives a
+/// directory the inode of its lower directory, and one file system has one directory with that
+/// inode. A way that leads elsewhere therefore finds nothing, and the next way is tried.
+///
+/// For a mount of the whole file system the way is the mount's source. The source is often named
+/// through a link inside the mount itself (an encrypted home directory holds `.Private`), which a
+/// program granted that directory can replace. A mount of a subdirectory names its root by the
+/// names inside eCryptfs, which are not the lower ones when names are encrypted: it is found
+/// through a mount of the whole file system in the table, by inode as any directory below one,
+/// and otherwise by the same names below the source, which holds them when the mount does not
+/// encrypt names.
+fn lower_point(mount: &Mount, mounts: &[Mount]) -> Option<(PathBuf, u64)> {
+    let inside = mount.root.strip_prefix("/").ok()?;
+    let accept = |found: PathBuf| is_lower_point(mount, found);
+    if inside.as_os_str().is_empty() {
+        return accept(mount.source.canonicalize().ok()?);
+    }
+    mounts
+        .iter()
+        .filter(|whole| whole.device == mount.device && whole.root == Path::new("/"))
+        .find_map(|whole| accept(lower_of(whole, &whole.point.join(inside), mounts)?))
+        .or_else(|| accept(by_names(&mount.source, inside)?))
+}
+
+/// `inside` below the canonical `source`, by its names, through no link.
+fn by_names(source: &Path, inside: &Path) -> Option<PathBuf> {
+    let mut lower = source.canonicalize().ok()?;
+    for component in inside.components() {
+        let Component::Normal(name) = component else {
+            return None;
+        };
+        lower.push(name);
+        if !lower.symlink_metadata().ok()?.is_dir() {
+            return None;
+        }
+    }
+    Some(lower)
+}
+
+/// `found`, with its device, when it is the lower directory of the point of `mount`.
+fn is_lower_point(mount: &Mount, found: PathBuf) -> Option<(PathBuf, u64)> {
+    let metadata = found.symlink_metadata().ok()?;
+    let (_, lower_id) = file_system(&mount.point)?;
+    let (found_type, found_id) = file_system(&found)?;
+    let is_lower = metadata.is_dir()
+        && found_type != MAGIC
+        && lower_id != [0, 0]
+        && found_id == lower_id
+        && metadata.ino() == mount.point.symlink_metadata().ok()?.ino();
+    is_lower.then(|| (found, metadata.dev()))
 }
 
 /// The directory in `lower` with inode `inode` on device `device`. A directory has one name, so
@@ -316,8 +348,11 @@ mod tests {
         let root = scratch("walk");
         std::fs::create_dir_all(root.join("a/b")).unwrap();
         let mount = mount_onto_itself(&root);
-        assert_eq!(lower_of(&mount, &root.join("a/b")), Some(root.join("a/b")));
-        assert_eq!(lower_of(&mount, &root), Some(root.clone()));
+        assert_eq!(
+            lower_of(&mount, &root.join("a/b"), &[]),
+            Some(root.join("a/b"))
+        );
+        assert_eq!(lower_of(&mount, &root, &[]), Some(root.clone()));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -357,7 +392,7 @@ mod tests {
             source: root.join("lower"),
             ..mount_onto_itself(&root.join("upper"))
         };
-        assert_eq!(lower_of(&mount, &root.join("upper/data")), None);
+        assert_eq!(lower_of(&mount, &root.join("upper/data"), &[]), None);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -373,18 +408,108 @@ mod tests {
             Some(root.join("data"))
         );
         let mount = mount_onto_itself(&root);
-        assert_eq!(lower_of(&mount, &root.join("via")), None);
+        assert_eq!(lower_of(&mount, &root.join("via"), &[]), None);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// A mount of a subdirectory, `sub` of the file system mounted at `whole`, has the inode of
+    /// `sub` at its point. Here the point is `sub` itself, so the inodes match as on eCryptfs.
+    fn mount_of_subdirectory(whole: &Path, sub: &str) -> Mount {
+        Mount {
+            point: whole.join(sub),
+            root: Path::new("/").join(sub),
+            ..mount_onto_itself(whole)
+        }
+    }
+
+    /// Without a mount of the whole file system, a mount of a subdirectory is found by the same
+    /// names below the source, as without name encryption.
     #[test]
-    fn a_mount_of_a_subdirectory_is_not_walked() {
+    fn a_mount_of_a_subdirectory_is_found_by_its_names() {
         let root = scratch("bind");
-        let mount = Mount {
-            root: PathBuf::from("/sub"),
+        std::fs::create_dir_all(root.join("sub/deeper/data")).unwrap();
+        let mount = mount_of_subdirectory(&root, "sub/deeper");
+        let point = root.join("sub/deeper");
+        assert_eq!(lower_of(&mount, &point, &[]), Some(point.clone()));
+        assert_eq!(
+            lower_of(&mount, &point.join("data"), &[]),
+            Some(point.join("data"))
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// With a mount of the whole file system in the table, a mount of a subdirectory is found
+    /// through it, by inode as any directory below that mount, which also works with encrypted
+    /// names. The source of the mount of the subdirectory leads nowhere here, so only that way
+    /// finds it; the upper and lower trees are one here, so it does not show the walk by inode,
+    /// which `lower_entry` tests.
+    #[test]
+    fn a_mount_of_a_subdirectory_is_found_through_the_mount_of_the_whole() {
+        let root = scratch("whole");
+        std::fs::create_dir_all(root.join("sub/data")).unwrap();
+        let whole = mount_onto_itself(&root);
+        let bind = Mount {
+            source: root.join("missing"),
+            ..mount_of_subdirectory(&root, "sub")
+        };
+        assert_eq!(
+            lower_of(&bind, &bind.point, &[]),
+            None,
+            "without the whole mount"
+        );
+        let mounts = [whole];
+        assert_eq!(
+            lower_of(&bind, &bind.point.join("data"), &mounts),
+            Some(root.join("sub/data"))
+        );
+        // A mount of another file system is not the whole of this one.
+        let other = Mount {
+            device: mounts[0].device + 1,
             ..mount_onto_itself(&root)
         };
-        assert_eq!(lower_of(&mount, &root), None);
+        assert_eq!(lower_of(&bind, &bind.point, &[other]), None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A mount of the whole file system that does not lead to the mount of a subdirectory, as
+    /// where a later mount covers part of the way, leaves the way by names.
+    #[test]
+    fn a_whole_mount_that_leads_nowhere_leaves_the_way_by_names() {
+        let root = scratch("fallback");
+        std::fs::create_dir_all(root.join("tree/sub")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        let bind = mount_of_subdirectory(&root.join("tree"), "sub");
+        let whole = Mount {
+            device: bind.device,
+            ..mount_onto_itself(&root.join("elsewhere"))
+        };
+        assert_eq!(
+            lower_of(&bind, &bind.point, &[whole]),
+            Some(root.join("tree/sub"))
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A name below the source that leads elsewhere through a link is not followed, also where
+    /// the link is not the last name, and a directory of the same names with another inode is
+    /// not the one.
+    #[test]
+    fn a_mount_of_a_subdirectory_is_not_found_through_a_link_or_another_inode() {
+        let root = scratch("bind-link");
+        let [upper, lower] = ["upper", "lower"].map(|name| root.join(name));
+        std::fs::create_dir_all(upper.join("a/sub")).unwrap();
+        std::fs::create_dir_all(&lower).unwrap();
+        std::os::unix::fs::symlink(upper.join("a"), lower.join("a")).unwrap();
+        let bind = Mount {
+            point: upper.join("a/sub"),
+            root: PathBuf::from("/a/sub"),
+            source: lower.clone(),
+            ..mount_onto_itself(&upper)
+        };
+        assert_eq!(lower_of(&bind, &bind.point, &[]), None, "through a link");
+        std::fs::remove_file(lower.join("a")).unwrap();
+        std::fs::create_dir_all(lower.join("a/sub")).unwrap();
+        assert_eq!(lower_of(&bind, &bind.point, &[]), None, "another inode");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

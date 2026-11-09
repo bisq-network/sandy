@@ -98,4 +98,5 @@ view_linux the_view_works_with_the_process_modes user-namespaces
 # systemd-resolved's directory runs only on the others (seen on ubuntu-22.04 and ubuntu-24.04).
 ? escape_linux the_resolver_directory_is_granted_with_ip resolver-directory
 # Only the ubuntu-24.04 entry installs ecryptfs-utils, so the test cannot mount eCryptfs.
+escape_linux a_bind_mount_on_ecryptfs_without_name_encryption_can_be_listed ecryptfs
 escape_linux a_directory_on_ecryptfs_can_be_listed_and_its_lower_directory_stays_closed ecryptfs
