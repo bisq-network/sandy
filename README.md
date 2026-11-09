@@ -16,7 +16,7 @@ sandy run \
   -- /srv/app/bin/server --port 8080
 ```
 
-Version 1.1.0. Policies use format `version = 1`.
+Version 1.2.0. Policies use format `version = 1`.
 
 ## Contents
 
@@ -70,7 +70,7 @@ toolchain check and the crates of `Cargo.lock`:
 ```sh
 git clone https://github.com/bisq-network/sandy.git sandy
 cd sandy
-git checkout v1.1.0
+git checkout v1.2.0
 scripts/verify-toolchain.sh          # installs and checks the pinned Rust toolchain
 cargo build --locked --release -p sandy-cli --bin sandy
 ```
@@ -151,7 +151,7 @@ in `scripts/check-release.sh` and here together.
 Linux or macOS, and one command in a clone of this repository:
 
 ```sh
-XWIN_ACCEPT_LICENSE=true scripts/check-release.sh v1.1.0
+XWIN_ACCEPT_LICENSE=true scripts/check-release.sh v1.2.0
 ```
 
 It checks that `SHA256SUMS.asc` of the release is signed by the release key, whose fingerprint the
@@ -169,7 +169,7 @@ their `SHA256SUMS` to `DIRECTORY`, by default `dist/reproduced/COMMIT/` of the c
 ignores:
 
 ```sh
-XWIN_ACCEPT_LICENSE=true scripts/reproduce.sh v1.1.0 ~/sandy-v1.1.0
+XWIN_ACCEPT_LICENSE=true scripts/reproduce.sh v1.2.0 ~/sandy-v1.2.0
 ```
 
 The container (`scripts/reproduce.Dockerfile`) is an x86_64 Linux host, the triple every release
@@ -197,11 +197,11 @@ checkout of the release tag and packed with `scripts/release-pack.sh TARGET`. Fe
 the project's remote first, since a clone can hold a tag of the same name for other code:
 
 ```sh
-git fetch https://github.com/bisq-network/sandy.git tag v1.1.0 --force
-git checkout v1.1.0
+git fetch https://github.com/bisq-network/sandy.git tag v1.2.0 --force
+git checkout v1.2.0
 scripts/release-build.sh x86_64-unknown-linux-musl
 scripts/release-pack.sh x86_64-unknown-linux-musl
-sha256sum dist/sandy-1.1.0-x86_64-unknown-linux-musl.tar.gz
+sha256sum dist/sandy-1.2.0-x86_64-unknown-linux-musl.tar.gz
 ```
 
 Both scripts run with only the variables a release build may depend on (`scripts/release-env.sh`):
