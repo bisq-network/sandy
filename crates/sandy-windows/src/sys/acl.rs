@@ -11,8 +11,8 @@ use std::ptr;
 
 use sandy_core::{PathAccess, PathRule, ResolvedPolicy, SandboxError};
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GetLastError, HANDLE,
-    INVALID_HANDLE_VALUE,
+    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_PATH_NOT_FOUND,
+    GetLastError, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::{
     ACCESS_MODE, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, GetSecurityInfo,
@@ -698,30 +698,16 @@ fn junction_grantable(
 
 /// The owner of the junction, `None` when it has none sandy can read.
 fn owner_of(opened: &OpenJunction, link: &Path) -> Result<Option<Sid>, SandboxError> {
-    let mut owner: PSID = ptr::null_mut();
-    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-    // SAFETY: the handle is open with READ_CONTROL; the out pointers are valid.
-    let error = unsafe {
-        GetSecurityInfo(
-            opened.raw(),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            &mut owner,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            &mut descriptor,
-        )
-    };
-    if error != 0 {
-        return Err(win32_error(
-            format!("cannot read the owner of {}", link.display()),
-            error,
-        ));
-    }
-    let _descriptor = LocalBox(descriptor);
+    let read = security_info(Object::Handle(opened.raw()), OWNER_SECURITY_INFORMATION).map_err(
+        |error| {
+            win32_error(
+                format!("cannot read the owner of {}", link.display()),
+                error,
+            )
+        },
+    )?;
     // SAFETY: owner is null or points to the owner SID inside the descriptor, still allocated.
-    Ok(unsafe { Sid::copy_from(owner) }.ok())
+    Ok(unsafe { Sid::copy_from(read.owner) }.ok())
 }
 
 /// The SIDs of this process's token that decide about a junction: `owners`, its user and its
@@ -1121,30 +1107,18 @@ pub fn administrators_only(path: &Path) -> Result<PathBuf, String> {
 /// Who other than administrators holds `rights` on `path` or owns it, `None` when no one does.
 fn changeable_by(path: &Path, rights: u32) -> Result<Option<String>, String> {
     let wide = wide_nul(path.as_os_str());
-    let (mut owner, mut acl): (PSID, *mut ACL) = (ptr::null_mut(), ptr::null_mut());
-    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-    // SAFETY: wide is NUL-terminated; the out pointers are valid or null for the parts not
-    // requested.
-    let error = unsafe {
-        GetNamedSecurityInfoW(
-            wide.as_ptr(),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-            &mut owner,
-            ptr::null_mut(),
-            &mut acl,
-            ptr::null_mut(),
-            &mut descriptor,
-        )
-    };
-    if error != 0 {
-        return Err(format!(
+    let read = security_info(
+        Object::Path(&wide),
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+    )
+    .map_err(|error| {
+        format!(
             "cannot read the permissions of {}: {}",
             path.display(),
             std::io::Error::from_raw_os_error(error as i32)
-        ));
-    }
-    let _descriptor = LocalBox(descriptor);
+        )
+    })?;
+    let (owner, acl) = (read.owner, read.acl);
     if owner.is_null() {
         return Ok(Some("whoever takes ownership".to_string()));
     }
@@ -1172,6 +1146,83 @@ enum Object<'a> {
     Handle(HANDLE),
 }
 
+/// A security descriptor that `security_info` read, with the owner and the DACL inside it, each
+/// null when not asked for or not there.
+struct SecurityInfo {
+    descriptor: LocalBox,
+    owner: PSID,
+    acl: *mut ACL,
+}
+
+/// How often `security_info` reads a descriptor that changed while it was read.
+const SECURITY_INFO_TRIES: usize = 10;
+
+/// Reads the parts `parts` of the security descriptor of the file `object`. The call learns the
+/// descriptor's size and then copies it, so another process that grows the descriptor in between,
+/// as a grant of another sandy on the same file does, makes it fail with
+/// `ERROR_INSUFFICIENT_BUFFER` once the descriptor is long: with about 150 entries growing by
+/// one, in 49 to 99 of 20,000 reads on Windows 11 build 26200 and Windows 10 build 19044. The
+/// read is then made again, and only a descriptor that keeps changing still fails.
+fn security_info(object: Object<'_>, parts: u32) -> Result<SecurityInfo, u32> {
+    let mut error = 0;
+    for _ in 0..SECURITY_INFO_TRIES {
+        let mut owner: PSID = ptr::null_mut();
+        let mut acl: *mut ACL = ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        let want_owner = if parts & OWNER_SECURITY_INFORMATION != 0 {
+            &raw mut owner
+        } else {
+            ptr::null_mut()
+        };
+        let want_acl = if parts & DACL_SECURITY_INFORMATION != 0 {
+            &raw mut acl
+        } else {
+            ptr::null_mut()
+        };
+        error = match object {
+            // SAFETY: path is NUL-terminated; the out pointers are valid or null for the parts not
+            // requested.
+            Object::Path(path) => unsafe {
+                GetNamedSecurityInfoW(
+                    path.as_ptr(),
+                    SE_FILE_OBJECT,
+                    parts,
+                    want_owner,
+                    ptr::null_mut(),
+                    want_acl,
+                    ptr::null_mut(),
+                    &mut descriptor,
+                )
+            },
+            // SAFETY: the handle is open with READ_CONTROL; the out pointers are as above.
+            Object::Handle(handle) => unsafe {
+                GetSecurityInfo(
+                    handle,
+                    SE_FILE_OBJECT,
+                    parts,
+                    want_owner,
+                    ptr::null_mut(),
+                    want_acl,
+                    ptr::null_mut(),
+                    &mut descriptor,
+                )
+            },
+        };
+        match error {
+            0 => {
+                return Ok(SecurityInfo {
+                    descriptor: LocalBox(descriptor),
+                    owner,
+                    acl,
+                });
+            }
+            ERROR_INSUFFICIENT_BUFFER => continue,
+            _ => return Err(error),
+        }
+    }
+    Err(error)
+}
+
 /// The DACL of a file from `GetNamedSecurityInfoW` or `GetSecurityInfo`, in its security
 /// descriptor.
 struct Dacl {
@@ -1185,46 +1236,15 @@ impl Dacl {
     }
 
     fn read_object(object: Object<'_>, display: &Path) -> Result<Dacl, SandboxError> {
-        let mut acl: *mut ACL = ptr::null_mut();
-        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-        let error = match object {
-            // SAFETY: path is NUL-terminated; the out pointers are valid or null for the parts
-            // not requested.
-            Object::Path(path) => unsafe {
-                GetNamedSecurityInfoW(
-                    path.as_ptr(),
-                    SE_FILE_OBJECT,
-                    DACL_SECURITY_INFORMATION,
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    &mut acl,
-                    ptr::null_mut(),
-                    &mut descriptor,
-                )
-            },
-            // SAFETY: the handle is open with READ_CONTROL; the out pointers are as above.
-            Object::Handle(handle) => unsafe {
-                GetSecurityInfo(
-                    handle,
-                    SE_FILE_OBJECT,
-                    DACL_SECURITY_INFORMATION,
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    &mut acl,
-                    ptr::null_mut(),
-                    &mut descriptor,
-                )
-            },
-        };
-        if error != 0 {
-            return Err(win32_error(
+        let read = security_info(object, DACL_SECURITY_INFORMATION).map_err(|error| {
+            win32_error(
                 format!("cannot read the permissions of {}", display.display()),
                 error,
-            ));
-        }
+            )
+        })?;
         Ok(Dacl {
-            descriptor: LocalBox(descriptor),
-            acl,
+            descriptor: read.descriptor,
+            acl: read.acl,
         })
     }
 
@@ -2063,6 +2083,95 @@ mod tests {
             },
         };
         assert_eq!(error, 0, "{text}");
+    }
+
+    /// Another process that grows a file's DACL while sandy reads it, as a grant of another sandy
+    /// on the same program does, makes a read fail with `ERROR_INSUFFICIENT_BUFFER` once the DACL
+    /// is long. A thread here grows and shrinks a DACL of about the length the test program's
+    /// file reaches in a run of the suite by one capability entry, while four threads read it,
+    /// each in the plain way, which shows the failure, and through `security_info`, which must
+    /// never fail.
+    #[test]
+    fn a_dacl_that_grows_while_it_is_read_is_read_again() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        const ENTRIES: usize = 150;
+        const READERS: usize = 4;
+        const READS: usize = 5000;
+        let dir = directory("growing");
+        let file = dir.join("file");
+        fs::write(&file, "").unwrap();
+        let wide = wide_nul(file.as_os_str());
+        // A capability SID has the length of the ones sandy grants.
+        let entry = |n: usize| {
+            format!(
+                "(A;;0x1200a9;;;S-1-15-3-1024-{n}-2876514063-3209893522-3183520384-\
+                 4015590133-1016438925-2373155637-3061542010)"
+            )
+        };
+        let shorter = (0..ENTRIES).fold(
+            "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)".to_string(),
+            |text, n| text + &entry(n),
+        );
+        let longer = shorter.clone() + &entry(ENTRIES);
+        let plain = |wide: &[u16]| {
+            let mut acl: *mut ACL = ptr::null_mut();
+            let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+            // SAFETY: wide is NUL-terminated; the out pointers are valid.
+            let error = unsafe {
+                GetNamedSecurityInfoW(
+                    wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut acl,
+                    ptr::null_mut(),
+                    &mut descriptor,
+                )
+            };
+            drop(LocalBox(descriptor));
+            error
+        };
+        let stop = AtomicBool::new(false);
+        let (plain_failures, failures) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    set_sddl(Object::Path(&wide), &shorter);
+                    set_sddl(Object::Path(&wide), &longer);
+                }
+            });
+            let readers: Vec<_> = (0..READERS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        for _ in 0..READS {
+                            if plain(&wide) == ERROR_INSUFFICIENT_BUFFER {
+                                plain_failures.fetch_add(1, Ordering::Relaxed);
+                            }
+                            if Dacl::read(&wide, &file).is_err() {
+                                failures.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for reader in readers {
+                reader.join().unwrap();
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        println!(
+            "plain reads that failed: {} of {}",
+            plain_failures.into_inner(),
+            READERS * READS
+        );
+        assert_eq!(
+            failures.into_inner(),
+            0,
+            "reads through security_info that failed"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// DACLs of the shapes that sandy's merge must keep as they are: inherited entries,
