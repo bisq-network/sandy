@@ -335,8 +335,9 @@ write the other changes what programs read.
   other software on them. It looks for a second name inside the
   writable paths only of the files it trusts itself, its own executable and the policy file,
   which a program must not rewrite for the next start. On Unix that walks the writable trees
-  only when one of those files has more than one name; on Windows a file lists its own names
-  (`FindFirstFileNameW`).
+  only when one of those files has more than one name, and only the parts on the file systems
+  of those files: a hard link stays on its file system, so a mount of another one is not
+  entered. On Windows a file lists its own names (`FindFirstFileNameW`).
 - **What stays open.** A hard link between a writable path and any other file, also one of a
   `read_exec` path or the program file, is allowed: the program can change that file through the
   writable name. Refusing it would cost a walk of the writable trees at every start, and package
@@ -574,8 +575,8 @@ everywhere; a backend adds only its answer about its own addresses (`HostNetwork
    sysctl, and keeps the routes until a routing socket reports a message; it has no local route
    without an interface address. Windows asks `GetAdaptersAddresses`, `GetBestRoute2` and
    `GetIpForwardTable2`, and keeps all but the best route until a change notification of an
-   address, an interface or a route. Where the system lets a broker not watch for changes, it
-   reads everything for every connection.
+   address, an interface or a route. Where a broker cannot watch for changes, it reads
+   everything for every connection.
 4. The broker connects to the address it checked, an IPv4-mapped one as IPv4, within 10
    seconds. A refused, unreachable or timed-out connect gets reply 5, 3 or 4, any other failure
    reply 1. It judges only the address: a router that maps a public address back to this host,

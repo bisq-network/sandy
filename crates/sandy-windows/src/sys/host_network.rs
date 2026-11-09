@@ -6,9 +6,11 @@
 //! questions for every connection, so a destination that is this machine never leaves through
 //! the broker even when the program picked it. The addresses, the point-to-point links and the
 //! on-link networks are kept until Windows reports a change of an address, an IP interface or a
-//! route (`NotifyUnicastIpAddressChange`, `NotifyIpInterfaceChange`, `NotifyRouteChange2`); the
-//! best route of a destination is asked for every connection. The AppContainer's own loopback isolation stops
-//! it from reaching this machine at the kernel level as well (docs/windows.md, "Egress broker").
+//! route (`NotifyUnicastIpAddressChange`, `NotifyIpInterfaceChange`, `NotifyRouteChange2`), so a
+//! connection made between the change and its notice still sees the old networks. The best
+//! route of a destination is asked for every connection. The AppContainer's own loopback
+//! isolation stops it from reaching this machine at the kernel level as well (docs/windows.md,
+//! "Egress broker").
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

@@ -1688,6 +1688,36 @@ mod tests {
         }
     }
 
+    /// `changed` reads what waits, and an empty queue is no change. A datagram socket pair
+    /// stands in for the netlink socket.
+    #[test]
+    fn changed_drains_what_waits() {
+        let mut fds = [0; 2];
+        // SAFETY: socketpair writes two descriptors into the array.
+        let made = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        assert_eq!(made, 0, "{}", io::Error::last_os_error());
+        // SAFETY: socketpair returned two new descriptors that nothing else owns.
+        let [changes, sender] = fds.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
+        let send = |count: usize| {
+            for _ in 0..count {
+                // SAFETY: one byte is read from a live buffer.
+                let sent = unsafe { libc::send(sender.as_raw_fd(), [0u8].as_ptr().cast(), 1, 0) };
+                assert_eq!(sent, 1, "{}", io::Error::last_os_error());
+            }
+        };
+        assert!(!changed(&changes), "an empty queue");
+        send(3);
+        assert!(changed(&changes), "three messages");
+        assert!(!changed(&changes), "the messages were read");
+    }
+
     /// The addresses and networks are kept between connections and read anew after the kernel
     /// reports a change: an address added while the broker runs is this host, and its subnet
     /// the local network, from the next lookup on; once removed, neither is. A route added
@@ -1708,6 +1738,12 @@ mod tests {
         use sandy_core::EgressReach::Public;
         use sandy_core::destination::{Refusal, check};
         let routes = Routes::open().unwrap();
+        // Without the watch every lookup reads again, and the steps below would pass anyway.
+        assert!(
+            routes.changes.is_some(),
+            "no change socket: {:?}",
+            change_socket()
+        );
         let ip = |command: &str| {
             let status = std::process::Command::new("sh")
                 .args(["-c", command])

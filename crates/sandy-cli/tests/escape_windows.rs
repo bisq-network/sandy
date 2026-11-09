@@ -4676,6 +4676,43 @@ fn another_appcontainer_cannot_open_the_egress_broker() {
     }
 }
 
+/// Holds the lock that sandy takes to change the loopback exemption list
+/// (`set_loopback_exempt`), until drop.
+fn exemption_lock() -> fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LockFileEx,
+    };
+
+    let directory = PathBuf::from(std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA is set"))
+        .join("sandy")
+        .join("locks");
+    fs::create_dir_all(&directory).unwrap();
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(directory.join("loopback-exemptions"))
+        .unwrap();
+    // SAFETY: an all-zero OVERLAPPED names byte 0, the byte sandy locks.
+    let mut overlapped = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is an open file and overlapped outlives this synchronous call.
+    let locked = unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    assert_ne!(locked, 0, "{}", std::io::Error::last_os_error());
+    file
+}
+
 /// The broker's AppContainer must not be exempt from loopback isolation, or nothing below the
 /// destination check keeps the broker off this machine. sandy refuses the broker's name for a
 /// policy, so only an administrator can exempt it, by hand; `check` then names setup (status 2),
@@ -4691,13 +4728,6 @@ fn setup_takes_the_loopback_exemption_from_the_egress_broker() {
             .output()
             .unwrap()
     };
-    if !exemption("-a").status.success() {
-        skip(
-            "administrator-rights",
-            "CheckNetIsolation cannot exempt the broker's AppContainer",
-        );
-        return;
-    }
     let port = free_port().to_string();
     let policy = [
         "--appcontainer",
@@ -4708,11 +4738,27 @@ fn setup_takes_the_loopback_exemption_from_the_egress_broker() {
         &port,
     ];
     let check = || sandy(["check"].iter().chain(&policy));
-    let refused = check();
+    // Windows keeps one exemption list for the machine, which other tests change through sandy
+    // while this one runs. Each writes back the list it read, so the hand-made change is made
+    // under sandy's lock, and `check`, which only reads, runs before the lock is released.
+    let refused = {
+        let _serialized = exemption_lock();
+        if !exemption("-a").status.success() {
+            skip(
+                "administrator-rights",
+                "CheckNetIsolation cannot exempt the broker's AppContainer",
+            );
+            return;
+        }
+        check()
+    };
     let setup = sandy(["setup"].iter().chain(&policy));
     let checked = check();
     // Also when an assertion fails below.
-    exemption("-d");
+    {
+        let _serialized = exemption_lock();
+        exemption("-d");
+    }
     assert_eq!(refused.status.code(), Some(EXIT_NEEDS_SETUP), "{refused:?}");
     let stdout = String::from_utf8_lossy(&refused.stdout);
     assert!(

@@ -525,7 +525,8 @@ mod tests {
     /// the real profile, in a child process of its own, and connects to listeners at 127.0.0.1,
     /// at ::1 and at this Mac's address on the local network: each is refused. The control is the
     /// same profile without the deny, which reaches each. The child also reads this Mac's addresses
-    /// and routing table, which the destination check needs under the profile.
+    /// and routing table, which the destination check needs under the profile, and a routing
+    /// socket opened before the profile still receives messages under it.
     #[test]
     fn the_broker_profile_keeps_this_mac_out_of_reach() {
         if let Ok(trial) = std::env::var(BROKER_TRIAL) {
@@ -568,6 +569,10 @@ mod tests {
             }
             assert!(stdout.contains("trial addresses read"), "{mode}: {stdout}");
             assert!(stdout.contains("trial routes read"), "{mode}: {stdout}");
+            assert!(
+                stdout.contains("trial watch sees a change"),
+                "{mode}: {stdout}"
+            );
         }
     }
 
@@ -580,7 +585,21 @@ mod tests {
                 .text
                 .replace(crate::profile::BROKER_LOCALHOST_DENY, "");
         }
+        // Opened before the profile, as the broker opens its own.
+        let mut watch = interfaces::Interfaces::watching();
+        let sender = interfaces::test_routing_socket().unwrap();
         Seatbelt::load().unwrap().apply(&profile).unwrap();
+        watch.check_watch();
+        // What waits from before the profile; a busy Mac sends more, so this is bounded.
+        for _ in 0..100 {
+            if !watch.sees_a_change() {
+                break;
+            }
+        }
+        interfaces::send_route_lookup(&sender);
+        if watch.sees_a_change() {
+            println!("trial watch sees a change");
+        }
         for target in fields {
             let address: std::net::SocketAddr = target.parse().unwrap();
             let result =
