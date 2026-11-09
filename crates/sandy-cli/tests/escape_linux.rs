@@ -2406,19 +2406,21 @@ fn path_arg(path: &Path) -> String {
     path.to_str().unwrap().to_string()
 }
 
-/// An eCryptfs mount over a directory of this test, made with `sudo -n` and file name
-/// encryption, as Linux Mint and Ubuntu make an encrypted home directory. Unmounted on drop.
+/// An eCryptfs mount over a directory of this test, made with `sudo -n`, with file name
+/// encryption as Linux Mint and Ubuntu make an encrypted home directory, or without. Unmounted
+/// on drop.
 struct Ecryptfs {
     root: PathBuf,
     upper: PathBuf,
     lower: PathBuf,
-    /// Bind mounts of directories of `upper`, unmounted first.
+    /// Bind mounts of directories of `upper` and mounts over `upper`, unmounted first, the last
+    /// one first.
     binds: Vec<PathBuf>,
 }
 
 impl Ecryptfs {
     /// `None`, with a skip recorded, where this host cannot make one.
-    fn mount(name: &str) -> Option<Ecryptfs> {
+    fn mount(name: &str, encrypted_names: bool) -> Option<Ecryptfs> {
         let sudo = |args: &[&str]| {
             Command::new("sudo")
                 .arg("-n")
@@ -2474,6 +2476,9 @@ impl Ecryptfs {
             lower,
             binds: Vec::new(),
         };
+        if !encrypted_names {
+            return Some(mounted);
+        }
         // The key of the file names is the one of the contents, whose signature only the
         // mount tells.
         let table = fs::read_to_string("/proc/self/mountinfo").unwrap();
@@ -2503,6 +2508,33 @@ impl Ecryptfs {
             .unwrap();
         assert!(status.success());
         self.binds.push(at.to_path_buf());
+    }
+
+    /// Covers `upper` with an empty tmpfs, so that the mount table holds the eCryptfs mount of
+    /// the whole file system no longer at a point it leads to, as where only a bind mount of a
+    /// subdirectory is visible. `uncover` takes it away.
+    fn cover(&mut self) {
+        let status = Command::new("sudo")
+            .args(["-n", "mount", "-t", "tmpfs", "tmpfs"])
+            .arg(&self.upper)
+            .stdin(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        self.binds.push(self.upper.clone());
+    }
+
+    fn uncover(&mut self) {
+        assert_eq!(self.binds.last(), Some(&self.upper));
+        let status = Command::new("sudo")
+            .args(["-n", "umount"])
+            .arg(&self.upper)
+            .stdin(Stdio::null())
+            .status()
+            .unwrap();
+        // Forgotten only once it is gone, so a failure leaves it to drop.
+        assert!(status.success());
+        self.binds.pop();
     }
 
     /// The lower directory or file of `upper`, found as eCryptfs keeps it: by inode.
@@ -2537,13 +2569,55 @@ impl Drop for Ecryptfs {
     }
 }
 
+/// Without name encryption the lower names are the upper ones, so a bind mount of an eCryptfs
+/// subdirectory is found by its names below the source, also where the mount of the whole file
+/// system is not visible.
+#[test]
+fn a_bind_mount_on_ecryptfs_without_name_encryption_can_be_listed() {
+    let Some(mut mount) = Ecryptfs::mount("plain", false) else {
+        return;
+    };
+    let data = mount.upper.join("app").join("data");
+    fs::create_dir_all(data.join("keys")).unwrap();
+    fs::write(data.join("state"), "state").unwrap();
+    assert_eq!(
+        mount.lower_of(&data).file_name(),
+        data.file_name(),
+        "names encrypted"
+    );
+    let lower_state = path_arg(&mount.lower_of(&data.join("state")));
+    let lower_root = path_arg(&mount.lower);
+    let bound = mount.root.join("bound");
+    mount.bind(&mount.upper.join("app"), &bound);
+    mount.cover();
+    let (bound_arg, keys) = (path_arg(&bound), path_arg(&bound.join("data/keys")));
+    let check = sandy(["check", "--read-write", &bound_arg]);
+    assert!(
+        !String::from_utf8_lossy(&check.stderr).contains("ecryptfs-unlisted"),
+        "{check:?}"
+    );
+    let lines = probe_inside(
+        &args(&["--read-write", &bound_arg]),
+        &[
+            ("list", bound_arg.as_str()),
+            ("list", keys.as_str()),
+            ("list", lower_root.as_str()),
+            ("read", lower_state.as_str()),
+        ],
+    );
+    lines[0].assert_ok();
+    lines[1].assert_ok();
+    lines[2].assert_blocked();
+    lines[3].assert_blocked();
+}
+
 /// eCryptfs opens the lower directory of a directory with the credentials of the program, so
 /// Landlock checks that open too. sandy lets the program list the lower directory of a granted
 /// directory and nothing else there: not the files in it, not the lower directory of a directory
 /// outside the policy.
 #[test]
 fn a_directory_on_ecryptfs_can_be_listed_and_its_lower_directory_stays_closed() {
-    let Some(mut mount) = Ecryptfs::mount("list") else {
+    let Some(mut mount) = Ecryptfs::mount("list", true) else {
         return;
     };
     let data = mount.upper.join("app").join("data");
@@ -2621,11 +2695,33 @@ fn a_directory_on_ecryptfs_can_be_listed_and_its_lower_directory_stays_closed() 
         "{check:?}"
     );
 
-    // A bind mount of an eCryptfs subdirectory names no lower directory sandy can trust, so it
-    // gets no rule, and check says that the program cannot list it.
+    // A bind mount of an eCryptfs subdirectory names its root by the upper names. sandy finds
+    // its lower directory through the mount of the whole file system, by inode.
     let bound = mount.root.join("bound");
     mount.bind(&other, &bound);
     let bound_arg = path_arg(&bound);
+    let check = sandy(["check", "--read-write", &bound_arg]);
+    assert!(
+        !String::from_utf8_lossy(&check.stderr).contains("ecryptfs-unlisted"),
+        "{check:?}"
+    );
+    // The rule is for the lower directory of `other` and grants only listing it.
+    let lower_secret = path_arg(&mount.lower_of(&other.join("secret")));
+    let bound_lines = [
+        ("list", bound_arg.as_str()),
+        ("list", lower_other_arg.as_str()),
+        ("list", lower_parent_arg.as_str()),
+        ("read", lower_secret.as_str()),
+    ];
+    let lines = probe_inside(&args(&["--read-write", &bound_arg]), &bound_lines);
+    lines[0].assert_ok();
+    lines[1].assert_ok();
+    lines[2].assert_blocked();
+    lines[3].assert_blocked();
+
+    // Where the mount of the whole is not visible, the encrypted names lead nowhere: no rule,
+    // and check says that the program cannot list it.
+    mount.cover();
     let check = sandy(["check", "--read-write", &bound_arg]);
     let warnings = String::from_utf8_lossy(&check.stderr);
     assert!(
@@ -2637,6 +2733,7 @@ fn a_directory_on_ecryptfs_can_be_listed_and_its_lower_directory_stays_closed() 
         &[("list", &bound_arg)],
     )[0]
     .assert_blocked();
+    mount.uncover();
 
     // The view does not show the lower directories, and the granted listings still work, since
     // Landlock checks the lower directory by its inode.

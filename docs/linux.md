@@ -1649,22 +1649,32 @@ the lower files' contents. The rule exists only for Landlock: the file system vi
 the lower directory. `check --explain-path` names such a rule as one that allows "list".
 
 The lower names are encrypted when the mount encrypts file names, as an encrypted home directory
-does, so sandy finds the lower directory by inode: eCryptfs gives each file the inode number of
-its lower file. It starts at the mount's source in `/proc/self/mountinfo`. That source is often
-named through a link inside the mount itself (an encrypted home directory holds
-`.Private -> /home/.ecryptfs/<user>/.Private`), which a program granted the home directory could
-replace, so sandy uses the directory it leads to only when that is the lower root: a directory on
-the file system whose ID eCryptfs reports for the mount (`statfs`, which eCryptfs answers for its
-lower file system), with the inode of the mount's root, and not on eCryptfs itself. On a file
-system with unique inode numbers, as the ones that hold home directories have (ext4, xfs,
-btrfs, whose subvolumes have IDs of their own), one directory has that inode, so a replaced
-link leads either to the lower root or to nothing sandy uses; a file system that reports no ID,
-such as tmpfs on older kernels or FUSE, is never trusted. Pointing the link at a slow network
-file system can delay the next `check` or `run`, but widens nothing. From there sandy follows each name of the policy path to the one lower
-directory with the inode of the eCryptfs directory, on the same device, without following a
-symbolic link. The rule binds that directory like any other rule path (see "Rule paths").
+does, so sandy finds the lower directory by inode: eCryptfs gives each file the inode number of its
+lower file. For a mount of the whole file system it starts at the mount's source in
+`/proc/self/mountinfo`. That source is often named through a link inside the mount itself (an
+encrypted home directory holds `.Private -> /home/.ecryptfs/<user>/.Private`), which a program
+granted the home directory could replace, so sandy uses the directory it leads to only when that is
+the lower root: a directory on the file system whose ID eCryptfs reports for the mount (`statfs`,
+which eCryptfs answers for its lower file system), with the inode of the mount's root, and not on
+eCryptfs itself. On a file system with unique inode numbers, as the ones that hold home directories
+have (ext4, xfs, btrfs, whose subvolumes have IDs of their own), one directory has that inode, so a
+replaced link leads either to the lower root or to nothing sandy uses; a file system that reports no
+ID, such as tmpfs on older kernels or FUSE, is never trusted. Pointing the link at a slow network
+file system can delay the next `check` or `run`, but widens nothing. From there sandy follows each
+name of the policy path to the one lower directory with the inode of the eCryptfs directory, on the
+same device, without following a symbolic link. The rule binds that directory like any other rule
+path (see "Rule paths").
+
+A bind mount of an eCryptfs subdirectory names its root by the names inside eCryptfs, which are
+not the lower ones when names are encrypted. sandy finds its lower directory through a mount of
+the whole file system in the mount table, by inode as any directory below that mount, and
+otherwise by the same names below the source, through no symbolic link, which holds them when
+the mount does not encrypt names. Either way the directory it reaches counts only when it lies on
+the lower file system and has the inode of the bind mount's point, so a way that leads elsewhere
+finds nothing and the next way is tried.
 
 Where sandy finds no lower directory, for example for a bind mount of an eCryptfs subdirectory
+with encrypted names whose whole file system is not mounted where this mount namespace sees it,
 or a file system that reports no ID, it adds no rule, and `check` warns (`ecryptfs-unlisted`)
 that the program cannot list the directory.
 
