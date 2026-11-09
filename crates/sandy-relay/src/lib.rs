@@ -545,11 +545,13 @@ fn relay_streams_with(
 ) -> io::Result<()> {
     let _registered = Registered::new(&client, &server);
     let state = Connection::default();
-    // Without a timeout a read would block until the peer sends, also after an abort. Both are
-    // set before either direction starts: macOS refuses socket options (EINVAL) on a socket
-    // whose two directions have ended, although its unread bytes can still be read, and the
-    // other direction's half close can end the second one at any moment. Before anything is
-    // relayed, a socket refuses it only once it has been reset.
+    // On Unix a read waits on the receive timeout (see `read_tick`); without one it would block
+    // until the peer sends, also after an abort. Both are set before either direction starts:
+    // macOS refuses socket options (EINVAL) on a socket whose two directions have ended,
+    // although its unread bytes can still be read, and the other direction's half close can end
+    // the second one at any moment. Before anything is relayed, a socket refuses it only once it
+    // has been reset.
+    #[cfg(unix)]
     if client.set_read_timeout(Some(READ_TICK)).is_err()
         || server.set_read_timeout(Some(READ_TICK)).is_err()
     {
@@ -605,9 +607,9 @@ impl Connection {
 
 /// Copies `from` to `to` until `from` ends, the connection is aborted, or the other direction
 /// has ended and this one stayed idle for `idle`. `[ended, other_ended]` are the end flags of
-/// this direction and of the other one. `from` must have a read timeout.
+/// this direction and of the other one. On Unix `from` must have a read timeout of `READ_TICK`.
 fn pump(
-    mut from: &TcpStream,
+    from: &TcpStream,
     mut to: &TcpStream,
     [ended, other_ended]: [&AtomicBool; 2],
     idle: Duration,
@@ -617,7 +619,7 @@ fn pump(
     let mut active = Instant::now();
     let mut saw_other_end = false;
     while !connection.aborted.load(Ordering::Acquire) {
-        match from.read(&mut buffer) {
+        match read_tick(from, &mut buffer) {
             Ok(0) => {
                 let _ = to.shutdown(Shutdown::Write);
                 break;
@@ -656,6 +658,41 @@ fn pump(
         }
     }
     ended.store(true, Ordering::Release);
+}
+
+/// Reads what `socket` has, or fails with `TimedOut` (or `WouldBlock`) when nothing arrives
+/// within `READ_TICK`. On Unix the socket's receive timeout ends the wait.
+#[cfg(unix)]
+fn read_tick(mut socket: &TcpStream, buffer: &mut [u8]) -> io::Result<usize> {
+    socket.read(buffer)
+}
+
+/// Reads what `socket` has, or fails with `TimedOut` when nothing arrives within `READ_TICK`.
+///
+/// Windows leaves a socket whose receive timed out (`SO_RCVTIMEO`) in an indeterminate state. A
+/// reset that arrives as the timeout runs out can make that receive fail with
+/// `ERROR_IO_PENDING`, and on an AF_UNIX socket it can be lost: no later receive reports it, so
+/// the relay never resets the other peer and the connection stays open (measured on Windows 11
+/// build 26200). The wait is therefore a `WSAPoll`, and the socket is read only once it has data,
+/// an end or an error, so no receive ever times out.
+#[cfg(windows)]
+fn read_tick(mut socket: &TcpStream, buffer: &mut [u8]) -> io::Result<usize> {
+    use windows_sys::Win32::Networking::WinSock::{
+        POLLRDNORM, SOCKET, SOCKET_ERROR, WSAGetLastError, WSAPOLLFD, WSAPoll,
+    };
+    let mut entry = WSAPOLLFD {
+        fd: raw(socket) as SOCKET,
+        events: POLLRDNORM,
+        revents: 0,
+    };
+    let millis = i32::try_from(millis_rounded_up(READ_TICK)).unwrap_or(i32::MAX);
+    // SAFETY: entry is one valid WSAPOLLFD.
+    match unsafe { WSAPoll(&mut entry, 1, millis) } {
+        // SAFETY: WSAGetLastError has no preconditions.
+        SOCKET_ERROR => Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() })),
+        0 => Err(io::ErrorKind::TimedOut.into()),
+        _ => socket.read(buffer),
+    }
 }
 
 #[cfg(unix)]
