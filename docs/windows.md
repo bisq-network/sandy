@@ -1211,7 +1211,14 @@ to `port` on its own loopback address, without the loopback exemption:
 A reset crosses the AF_UNIX hop as a reset, as docs/DESIGN.md "Forwarded ports" rule 7 asks: an
 AF_UNIX socket closed with `SO_LINGER` 0 makes the read at the other end fail with
 `WSAECONNRESET`, not end, so the relay on the other side resets its TCP peer in turn, in both
-directions (`a_reset_crosses_the_unix_socket_hop`, measured on Windows 11 build 26200).
+directions (`a_reset_crosses_the_unix_socket_hop`, measured on Windows 11 build 26200). That
+holds only for a read without a receive timeout. A reset that arrives as an `SO_RCVTIMEO` runs
+out can be lost on an AF_UNIX socket, so that no later read reports it, or makes the timed-out
+read fail with `ERROR_IO_PENDING`, on TCP as well (13 and 3 of 500 tries with a timeout of
+20 ms). The relay therefore waits for each read with `WSAPoll` and reads only once data, an end
+or an error is there. With a receive timeout, the test lost the reset in 15 of 400 runs, four at
+once; with `WSAPoll`, in none of 500 runs on Windows 11 build 26200 and none of 100 on Windows 10
+build 19044.
 
 The relays' listeners are blocking sockets without `SO_EXCLUSIVEADDRUSE`, and neither is needed
 (measured on Windows 11 build 26200). A socket with `SO_REUSEADDR` cannot bind the address of a
