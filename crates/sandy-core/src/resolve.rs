@@ -8,7 +8,7 @@ use crate::plan::Requirement;
 use crate::policy::{
     ChildProcesses, Egress, EnvironmentPolicy, ExposedPort, FileView, ForwardedPort, IpAccess,
     MachService, MacosPolicy, NetworkAccess, NetworkPolicy, PathMetadata, Policy, PolicyError,
-    ProcessPolicy, Relays, SignalScope, Symlinks, SystemAccess, Win32k, WindowsPolicy,
+    ProcessPolicy, Reading, Relays, SignalScope, Symlinks, SystemAccess, Win32k, WindowsPolicy,
 };
 use crate::warning::{Warning, WarningId};
 
@@ -1006,6 +1006,7 @@ impl Mounts {
         }
         let text = std::fs::read(Self::TABLE).map_err(|source| PolicyError::Unreadable {
             path: PathBuf::from(Self::TABLE),
+            reading: Reading::Contents,
             source,
         })?;
         let mounts = Arc::new(Mounts::parse(&text));
@@ -1402,6 +1403,7 @@ fn entry(path: &Path) -> std::io::Result<Entry> {
 fn linked_file(path: &Path) -> Result<Option<FileId>, PolicyError> {
     let entry = entry(path).map_err(|source| PolicyError::Unreadable {
         path: path.to_path_buf(),
+        reading: Reading::Attributes,
         source,
     })?;
     Ok(entry.linked.then_some(entry.id))
@@ -1513,6 +1515,7 @@ fn second_name<'a>(
             })
             .map_err(|source| PolicyError::Unreadable {
                 path: rule.path.clone(),
+                reading: Reading::Tree,
                 source,
             })?;
             if found.is_some() {
@@ -1534,6 +1537,7 @@ fn second_name<'a>(
     for (file, _) in linked {
         let names = windows::names(file).map_err(|source| PolicyError::Unreadable {
             path: file.to_path_buf(),
+            reading: Reading::Names,
             source,
         })?;
         let writable = rules
