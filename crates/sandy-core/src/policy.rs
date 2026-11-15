@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -773,6 +773,30 @@ pub enum Win32k {
     Deny,
 }
 
+/// The step that failed when sandy could not read a path it checks before the start. Opening a
+/// file for its attributes and listing its hard links can fail apart, and each needs another fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reading {
+    Contents,
+    Attributes,
+    /// Walking a writable tree for the second names of trusted files.
+    Tree,
+    /// Listing the hard links of a file.
+    Names,
+}
+
+impl Reading {
+    fn describe(self, path: &Path) -> String {
+        let path = path.display();
+        match self {
+            Reading::Contents => format!("read {path}"),
+            Reading::Attributes => format!("read the attributes of {path}"),
+            Reading::Tree => format!("read the files under {path}"),
+            Reading::Names => format!("list the hard links of {path}"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum PolicyError {
     /// The length of the text, longer than `MAX_POLICY_LEN`.
@@ -809,6 +833,7 @@ pub enum PolicyError {
     },
     Unreadable {
         path: PathBuf,
+        reading: Reading,
         source: io::Error,
     },
     InvalidExpose {
@@ -927,10 +952,14 @@ impl fmt::Display for PolicyError {
                 through.display(),
                 writable.display()
             ),
-            PolicyError::Unreadable { path, source } => write!(
+            PolicyError::Unreadable {
+                path,
+                reading,
+                source,
+            } => write!(
                 f,
-                "cannot read {}, which sandy checks before it starts the program: {source}",
-                path.display()
+                "cannot {}, which sandy checks before it starts the program: {source}",
+                reading.describe(path)
             ),
             PolicyError::ChildrenNeedUnixSocketsDenied(children) => write!(
                 f,
@@ -1024,6 +1053,31 @@ impl std::error::Error for PolicyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal names the step that failed: on Windows, opening a file for its attributes and
+    /// listing its hard links can fail apart, and each needs another fix.
+    #[test]
+    fn an_unreadable_path_names_the_step_that_failed() {
+        let message = |reading| {
+            PolicyError::Unreadable {
+                path: PathBuf::from("/opt/sandy"),
+                reading,
+                source: io::Error::from(io::ErrorKind::PermissionDenied),
+            }
+            .to_string()
+        };
+        for (reading, step) in [
+            (Reading::Contents, "cannot read /opt/sandy, "),
+            (
+                Reading::Attributes,
+                "cannot read the attributes of /opt/sandy, ",
+            ),
+            (Reading::Tree, "cannot read the files under /opt/sandy, "),
+            (Reading::Names, "cannot list the hard links of /opt/sandy, "),
+        ] {
+            assert!(message(reading).starts_with(step), "{}", message(reading));
+        }
+    }
 
     #[test]
     fn a_policy_nested_deeper_than_the_limit_is_refused() {

@@ -1450,6 +1450,7 @@ mod tests {
     fn an_unreadable_mount_table_is_unavailable_only_without_proc() {
         let unreadable = |errno| PolicyError::Unreadable {
             path: PathBuf::from("/proc/self/mountinfo"),
+            reading: sandy_core::Reading::Contents,
             source: io::Error::from_raw_os_error(errno),
         };
         assert!(matches!(
