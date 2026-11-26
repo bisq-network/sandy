@@ -1508,6 +1508,15 @@ Independent reviews tried to escape the sandbox on every platform. Their finding
 are written down as limitations in the platform documents. Either way a test holds the result
 (`crates/sandy-cli/tests/review_*.rs`).
 
+## Contributing
+
+Bisq has temporarily paused paid development for new contributors and routine review of their pull requests.
+Before starting work, ask the maintainers about priorities, review capacity, and funding. Compensation requires
+Bisq DAO approval. Read the [announcement on contributions and compensation](https://bisq.network/blog/open-source-development-in-the-age-of-ai/).
+
+Report suspected security issues privately using **Report a vulnerability** on the
+[Sandy Security Advisories page](https://github.com/bisq-network/sandy/security/advisories). See the [security policy](SECURITY.md) for what to include.
+
 ## Building and testing
 
 ```sh
